@@ -27,13 +27,6 @@ Your computer does the work. Your phone becomes the interface.
 ---
 
 ## 🧠 How It Works
-Mobile App (iOS / Android)
-⇅ secure websocket
-Local remodecode Server (Desktop)
-⇅
-Claude Code / Codex CLI
-⇅
-Your local repositories
 
 ### 1. Local Server
 
