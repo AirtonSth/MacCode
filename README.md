@@ -1,5 +1,7 @@
 # remodecode.io
 
+![Mobile UI](https://raw.githubusercontent.com/samuelfaj/remotecode.io/main/mobile.png)
+
 **Code anywhere. Continue everywhere.**
 
 remodecode.io lets developers continue their local AI coding sessions (Claude Code or Codex) directly from their mobile devices.
