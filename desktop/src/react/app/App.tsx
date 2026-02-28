@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { Electroview } from "electrobun/view";
 import { RemoteCodeApi, RemoteCodeApiError } from "../shared/api/remotecode-http";
 import {
 	RemoteCodeRealtime,
@@ -49,6 +50,62 @@ const normalizeProjectPath = (projectPath: string): string => {
 	return projectPath.trim().replace(/^["']+|["']+$/gu, "");
 };
 
+const extractSelectedProjectPath = (candidates: unknown): string | null => {
+	if (typeof candidates === "string") {
+		const normalized = normalizeProjectPath(candidates);
+		return normalized.length > 0 ? normalized : null;
+	}
+
+	if (candidates && typeof candidates === "object" && !Array.isArray(candidates)) {
+		const nestedPaths = (candidates as { paths?: unknown[] }).paths;
+		if (Array.isArray(nestedPaths) && nestedPaths.length > 0 && typeof nestedPaths[0] === "string") {
+			const normalized = normalizeProjectPath(nestedPaths[0]);
+			return normalized.length > 0 ? normalized : null;
+		}
+	}
+
+	if (!Array.isArray(candidates) || candidates.length === 0) {
+		return null;
+	}
+
+	const first = candidates[0];
+	if (typeof first !== "string") {
+		if (first && typeof first === "object" && "paths" in first) {
+			const nestedPaths = (first as { paths?: unknown[] }).paths;
+			if (Array.isArray(nestedPaths) && nestedPaths.length > 0 && typeof nestedPaths[0] === "string") {
+				const normalized = normalizeProjectPath(nestedPaths[0] as string);
+				return normalized.length > 0 ? normalized : null;
+			}
+		}
+
+		return null;
+	}
+
+	const normalized = normalizeProjectPath(first);
+	return normalized.length > 0 ? normalized : null;
+};
+
+const getFolderFallbackName = (projectPath: string): string => {
+	const normalizedPath = projectPath.replace(/\\/g, "/").replace(/\/+$/u, "");
+	const segments = normalizedPath.split("/").filter(Boolean);
+	return segments[segments.length - 1] ?? "Project";
+};
+
+const electrobunView = (() => {
+	try {
+		return new Electroview({
+			rpc: Electroview.defineRPC({
+				handlers: {
+					requests: {},
+					messages: {},
+				},
+			}),
+		});
+	} catch {
+		return null;
+	}
+})();
+
 const SUGGESTION_CARDS = [
 	"Build a classic Snake game in this repo.",
 	"Create a one-page PDF that summarizes this app.",
@@ -84,9 +141,7 @@ const App = (): JSX.Element => {
 		? state.streamingByChat[selectedChatIdRef.current] ?? ""
 		: "";
 
-	const [isOpenProjectFormVisible, setIsOpenProjectFormVisible] = useState(false);
-	const [openProjectPath, setOpenProjectPath] = useState("");
-	const [openProjectName, setOpenProjectName] = useState("");
+	const [isOpeningProject, setIsOpeningProject] = useState(false);
 
 	useEffect(() => {
 		selectedChatIdRef.current = state.selectedChatId;
@@ -432,38 +487,34 @@ const App = (): JSX.Element => {
 		dispatch({ type: "CLEAR_ERRORS" });
 	}, [dispatch]);
 
-	const handleOpenProject = useCallback(() => {
-		setIsOpenProjectFormVisible(true);
-	}, []);
-
-	const handleSubmitOpenProject = useCallback(
-		async (event: FormEvent) => {
-			event.preventDefault();
-
-			const normalizedPath = normalizeProjectPath(openProjectPath);
-			if (!normalizedPath) {
-				addError("Project path is required", "rest", "missing_path");
+	const handleOpenProject = useCallback(async () => {
+		setIsOpeningProject(true);
+		try {
+			if (!electrobunView) {
+				addError("Native file dialog is unavailable", "rest", "native_rpc_unavailable");
 				return;
 			}
 
-			const hasCreatedProject = await handleCreateProject({
-				name: openProjectName.trim() || undefined,
-				path: normalizedPath,
-			});
-			if (hasCreatedProject) {
-				setOpenProjectPath("");
-				setOpenProjectName("");
-				setIsOpenProjectFormVisible(false);
+			const selectedPaths = await electrobunView.rpc.request.openProjectDirectory();
+			const selectedPath = extractSelectedProjectPath(selectedPaths);
+			if (!selectedPath) {
+				return;
 			}
-		},
-		[addError, handleCreateProject, openProjectName, openProjectPath],
-	);
 
-	const handleCancelOpenProject = useCallback(() => {
-		setOpenProjectPath("");
-		setOpenProjectName("");
-		setIsOpenProjectFormVisible(false);
-	}, []);
+			await handleCreateProject({
+				name: getFolderFallbackName(selectedPath),
+				path: selectedPath,
+			});
+		} catch (error) {
+			addError(
+				error instanceof Error ? error.message : "Unable to open native folder picker",
+				"rest",
+				"open_folder_error",
+			);
+		} finally {
+			setIsOpeningProject(false);
+		}
+	}, [addError, handleCreateProject]);
 
 	const connectionMessage = useMemo(() => {
 		switch (state.connectionState) {
@@ -573,42 +624,16 @@ const App = (): JSX.Element => {
 					<header className="codex-main-header">
 						<h1>{selectedChat ? selectedChat.title : "New thread"}</h1>
 						<div className="header-actions">
-							{!isOpenProjectFormVisible ? (
-								<button className="header-pill primary" onClick={handleOpenProject} type="button">
-									Open
-								</button>
-							) : (
-								<form className="open-project-form" onSubmit={handleSubmitOpenProject}>
-									<input
-										id="open-project-path"
-										onChange={(event) => {
-											setOpenProjectPath(event.target.value);
-										}}
-										placeholder="/absolute/path/to/project"
-										value={openProjectPath}
-									/>
-									<input
-										id="open-project-name"
-										onChange={(event) => {
-											setOpenProjectName(event.target.value);
-										}}
-										placeholder="Project name (optional)"
-										value={openProjectName}
-									/>
-									<div className="header-actions">
-										<button
-											className="header-pill primary"
-											disabled={state.isCreatingProject}
-											type="submit"
-										>
-											{state.isCreatingProject ? "Opening..." : "Open project"}
-										</button>
-										<button className="header-pill" onClick={handleCancelOpenProject} type="button">
-											Cancel
-										</button>
-									</div>
-								</form>
-							)}
+							<button
+								className="header-pill primary"
+								disabled={isOpeningProject}
+								onClick={() => {
+									void handleOpenProject();
+								}}
+								type="button"
+							>
+								{isOpeningProject ? "Opening..." : "Open"}
+							</button>
 							<button
 								className="header-pill"
 								onClick={() => {

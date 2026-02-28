@@ -3,6 +3,47 @@ import { BrowserWindow, Updater } from "electrobun/bun";
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
 
+const { BrowserView, Utils } = require("electrobun/bun") as {
+	BrowserView: {
+		defineRPC: <T>(config: {
+			maxRequestTime?: number;
+			handlers: {
+				requests: Record<string, (...args: never[]) => unknown>;
+				messages: Record<string, (...args: never[]) => void>;
+			};
+		}) => T;
+	};
+	Utils: {
+		openFileDialog: (options: {
+			allowedFileTypes?: string;
+			allowsMultipleSelection?: boolean;
+			canChooseDirectory?: boolean;
+			canChooseFiles?: boolean;
+			startingFolder?: string;
+		}) => Promise<string[]>;
+		paths: {
+			home: string;
+		};
+	};
+};
+
+const appRPC = BrowserView.defineRPC({
+	handlers: {
+		requests: {
+			openProjectDirectory: async () => {
+				return Utils.openFileDialog({
+					allowedFileTypes: "*",
+					allowsMultipleSelection: false,
+					canChooseDirectory: true,
+					canChooseFiles: false,
+					startingFolder: Utils.paths.home,
+				});
+			},
+		},
+		messages: {},
+	},
+});
+
 const DEV_SERVER_PORT = 5173;
 const DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
 const HEALTH_URL = `http://127.0.0.1:${serverConfig.port}/v1/projects`;
@@ -68,6 +109,7 @@ const mainWindow = new BrowserWindow({
 	},
 	title: "Remotecode + Electrobun",
 	url,
+	rpc: appRPC,
 });
 
 const webview = mainWindow.webview;

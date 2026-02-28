@@ -13,12 +13,35 @@ declare module "electrobun/bun" {
 		};
 		title?: string;
 		url?: string;
+		rpc?: unknown;
 	}
 
 	export class BrowserWindow {
 		constructor(options?: BrowserWindowConfig);
 		webview: WebView;
 	}
+
+	export interface BrowserViewConfig {
+		id?: string;
+	}
+
+	export class BrowserView {
+		constructor(options?: BrowserViewConfig);
+		id: string;
+		rpc: unknown;
+	}
+
+	export const BrowserView: {
+		defineRPC: <T>(config: {
+			handlers: {
+				requests: Record<string, (...args: never[]) => unknown>;
+				messages: Record<string, (...args: never[]) => void>;
+			};
+			maxRequestTime?: number;
+		}) => T;
+		getById: (id: string) => BrowserView;
+		getAll: () => BrowserView[];
+	};
 
 	export interface UpdaterLocalInfo {
 		channel(): Promise<string | undefined>;
