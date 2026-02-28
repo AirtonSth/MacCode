@@ -10,3 +10,5 @@
 
 - Keep changes aligned with the active architecture and test strategy defined by this repository.
 - Preserve compatibility requirements and existing public contracts unless explicitly requested otherwise.
+- Desktop UI must always be designed to run inside ElectroBun (native window chrome).
+- Do not add simulated desktop chrome in-app: no outer fake window padding, no fake minimize/maximize/close controls, and no fake title bars.
