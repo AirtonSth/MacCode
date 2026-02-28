@@ -1,4 +1,9 @@
 declare module "electrobun/bun" {
+	export interface WebView {
+		openDevTools: () => void;
+		on: (event: string, listener: (...args: unknown[]) => void) => void;
+	}
+
 	export interface BrowserWindowConfig {
 		frame?: {
 			height?: number;
@@ -12,6 +17,7 @@ declare module "electrobun/bun" {
 
 	export class BrowserWindow {
 		constructor(options?: BrowserWindowConfig);
+		webview: WebView;
 	}
 
 	export interface UpdaterLocalInfo {

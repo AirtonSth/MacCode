@@ -30,13 +30,17 @@ const url = await getMainViewUrl();
 const mainWindow = new BrowserWindow({
 	frame: {
 		height: 700,
-		width: 900,
+		width: 1200,
 		x: 200,
 		y: 200,
 	},
-
 	title: "Remotecode + Electrobun",
 	url,
+});
+
+const webview = mainWindow.webview;
+webview.on("dom-ready", () => {
+	webview.openDevTools();
 });
 
 void mainWindow;

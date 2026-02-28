@@ -2,6 +2,15 @@ import { Elysia } from "elysia";
 
 import { serverConfig } from "../../config";
 
+const setCorsHeaders = (request: Request, headers: Record<string, string>) => {
+	const origin = request.headers.get("origin");
+
+	headers["access-control-allow-origin"] = origin || "*";
+	headers["access-control-allow-methods"] = "GET,POST,PATCH,OPTIONS";
+	headers["access-control-allow-headers"] = "authorization,content-type";
+	headers["access-control-max-age"] = "86400";
+};
+
 export const AuthService = {
 	isAuthorized(request: Request): boolean {
 		const token = AuthService.isWebSocketRoute(request)
@@ -57,6 +66,14 @@ export const AuthService = {
 
 	withRestAuth() {
 		return new Elysia().onRequest(({ request, set }) => {
+			setCorsHeaders(request, set.headers);
+
+			if (request.method === "OPTIONS") {
+				set.status = 204;
+
+				return "";
+			}
+
 			const token = AuthService.isWebSocketRoute(request)
 				? AuthService.resolveWsToken(request)
 				: AuthService.readHeaderToken(request);
