@@ -5,6 +5,37 @@ import { serverConfig } from "./server/config";
 
 const DEV_SERVER_PORT = 5173;
 const DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
+const HEALTH_URL = `http://127.0.0.1:${serverConfig.port}/v1/projects`;
+const HEALTH_CHECK_TIMEOUT_MS = 30_000;
+const HEALTH_CHECK_INTERVAL_MS = 250;
+
+const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitForBackendReady = async () => {
+	const start = Date.now();
+
+	while (Date.now() - start < HEALTH_CHECK_TIMEOUT_MS) {
+		try {
+			const response = await fetch(HEALTH_URL, {
+				headers: {
+					authorization: `Bearer ${serverConfig.token}`,
+				},
+				method: "GET",
+			});
+
+			if (response.ok) {
+				console.log("Backend is ready:", HEALTH_URL);
+				return;
+			}
+		} catch {
+			// wait for backend to finish booting
+		}
+
+		await wait(HEALTH_CHECK_INTERVAL_MS);
+	}
+
+	throw new Error(`Backend readiness timeout: ${serverConfig.port}`);
+};
 
 async function getMainViewUrl() {
 	const channel = await Updater.localInfo.channel();
@@ -24,6 +55,7 @@ async function getMainViewUrl() {
 }
 
 await createBackendServer({ port: serverConfig.port });
+await waitForBackendReady();
 
 const url = await getMainViewUrl();
 
