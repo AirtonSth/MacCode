@@ -20,7 +20,7 @@ export class WsController {
 		return new WsController(service).build();
 	}
 
-private static parseEventPayload(message: unknown): ClientWsEvent | null {
+	private static parseEventPayload(message: unknown): ClientWsEvent | null {
 		if (message === null) {
 			return null;
 		}
@@ -45,21 +45,50 @@ private static parseEventPayload(message: unknown): ClientWsEvent | null {
 			const candidate = message as { data?: unknown; event?: unknown };
 
 			if (typeof candidate.event === "string" && candidate.data && typeof candidate.data === "object") {
-				return candidate as ClientWsEvent;
+				return {
+					event: candidate.event as ClientWsEvent["event"],
+					data: candidate.data as ClientWsEvent["data"],
+				};
+			}
+
+			const nested = candidate.data as { data?: unknown; event?: unknown } | undefined;
+
+			if (
+				nested &&
+				typeof nested.event === "string" &&
+				nested.data &&
+				typeof nested.data === "object"
+			) {
+				return {
+					event: nested.event as ClientWsEvent["event"],
+					data: nested.data as ClientWsEvent["data"],
+				};
+			}
+
+			if (typeof nested === "string") {
+				return WsController.parseEventPayload(nested);
+			}
+
+			if (nested instanceof ArrayBuffer || nested instanceof Uint8Array) {
+				return WsController.parseEventPayload(nested);
+			}
+
+			if (nested && typeof nested === "object") {
+				return WsController.parseEventPayload(nested);
 			}
 		}
 
 		return null;
 	}
 
-private readonly subscriptions = new Map<string, Set<BroadcastSocket>>();
+	private readonly subscriptions = new Map<string, Set<BroadcastSocket>>();
 
 	constructor(private readonly service: WsService) {}
 
 	
 
 	
-private joinChat(chatId: string, socket: BroadcastSocket) {
+	private joinChat(chatId: string, socket: BroadcastSocket) {
 		const previous = this.subscriptions.get(chatId);
 
 		if (previous) {
@@ -103,23 +132,7 @@ private joinChat(chatId: string, socket: BroadcastSocket) {
 
 	build() {
 		return new Elysia({ name: "ws-controller" }).ws("/v1/ws", {
-			body: t.Union([
-				t.Object({
-					data: t.Object({
-						chatId: t.String(),
-					}),
-
-					event: t.Literal("join_chat"),
-				}),
-				t.Object({
-					data: t.Object({
-						chatId: t.String(),
-						text: t.String(),
-					}),
-
-					event: t.Literal("user_message"),
-				}),
-			]),
+			body: t.Any(),
 
 			close: (ws) => {
 				this.leaveSocket(ws as BroadcastSocket);
@@ -133,8 +146,8 @@ private joinChat(chatId: string, socket: BroadcastSocket) {
 						(ws as BroadcastSocket).send(
 							{
 								data: {
-									code: "bad_payload",
-									message: "invalid websocket message format",
+									code: "validation_error",
+									message: "validation error: invalid websocket message format",
 								},
 
 								event: "error",
@@ -169,15 +182,15 @@ private joinChat(chatId: string, socket: BroadcastSocket) {
 					}
 
 					if (payload.event === "user_message") {
-						const text = payload.data.text.trim();
+						const text = typeof payload.data.text === "string" ? payload.data.text.trim() : "";
 
 						if (!text) {
 							(ws as BroadcastSocket).send(
 								{
 									data: {
 										chatId: payload.data.chatId,
-										code: "invalid_text",
-										message: "message text is required",
+										code: "validation_error",
+										message: "validation error: message text is required",
 									},
 
 									event: "error",
@@ -202,11 +215,12 @@ private joinChat(chatId: string, socket: BroadcastSocket) {
 					}
 
 					(ws as BroadcastSocket).send(
-						{
-							data: {
-								code: "bad_event",
-								message: "unsupported event",
-							},
+					{
+						data: {
+							chatId: payload.data.chatId,
+							code: "validation_error",
+							message: "validation error: unsupported event",
+						},
 
 							event: "error",
 						},
@@ -218,7 +232,7 @@ private joinChat(chatId: string, socket: BroadcastSocket) {
 				const token = resolveWsToken(ws.data.request);
 
 				if (!token || token !== serverConfig.token) {
-					ws.close(1008, "unauthorized");
+					ws.close(4401, "unauthorized");
 				}
 			},
 		});

@@ -30,7 +30,7 @@ export const TestServerFactory = {
 		});
 
 		const port = toPort(backend.server);
-		const baseUrl = `https://127.0.0.1:${port}`;
+		const baseUrl = `http://127.0.0.1:${port}`;
 		const client = createEdenClient({ baseUrl });
 
 		return {
