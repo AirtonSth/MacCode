@@ -11,6 +11,7 @@ interface MessageComposerProps {
 	sending: boolean;
 	chatStatus: ChatStatus | null;
 	onSend: (text: string) => void;
+	focusMode?: boolean;
 }
 
 const MAX_MESSAGE_LENGTH = 4000;
@@ -20,6 +21,7 @@ export const MessageComposer = ({
 	sending,
 	chatStatus,
 	onSend,
+	focusMode = false,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
 	const [validationError, setValidationError] = useState<string | null>(null);
@@ -92,47 +94,94 @@ export const MessageComposer = ({
 	const buttonLabel = isRunning ? "Wait" : sending ? "Sending..." : "Send";
 
 	return (
-		<section className="rounded-[24px] border border-white/10 bg-slate-950/65 p-3 backdrop-blur-2xl">
-			<form className="space-y-3" onSubmit={submit}>
-				<div
-					className={cn(
-						"rounded-2xl border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]",
-						isLocked ? "opacity-85" : "",
-					)}
-				>
-					<Textarea
-						aria-label="Message input"
-						className="min-h-[92px] resize-y border-0 bg-transparent px-1 py-1 text-sm leading-6 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 disabled:cursor-not-allowed"
-						disabled={isLocked}
-						maxLength={MAX_MESSAGE_LENGTH}
-						onChange={handleInputChange}
-						onKeyDown={handleInputKeyDown}
-						placeholder={
-							disabled
-								? "Select a project to start."
-								: isRunning
-									? "Waiting for assistant response..."
-									: "Type a message to the coding assistant"
-						}
-						rows={3}
-						value={value}
-					/>
-				</div>
-				<div aria-live="polite" className="flex flex-wrap items-center justify-between gap-3">
-					<span className={cn("text-xs", validationError ? "text-rose-300" : "text-slate-400")}>
-						{statusText}
-					</span>
-					<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.98 }}>
-						<Button className="min-w-[112px] gap-2 rounded-xl" disabled={submitDisabled} type="submit">
-							{buttonLabel}
-							{sending || isRunning ? (
-								<Loader2 className="h-4 w-4 animate-spin" />
-							) : (
-								<ArrowUp className="h-4 w-4" />
+		<section className={cn(focusMode ? "w-full" : "rounded-[24px] border border-white/10 bg-slate-950/65 p-3 backdrop-blur-2xl")}>
+			<form className={cn(focusMode ? "space-y-2" : "space-y-3")} onSubmit={submit}>
+				{focusMode ? (
+					<div className="relative">
+						<div
+							className={cn(
+								"rounded-[1.6rem] border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]",
+								isLocked ? "opacity-85" : "",
 							)}
-						</Button>
-					</motion.div>
-				</div>
+						>
+							<Textarea
+								aria-label="Message input"
+								className={cn(
+									"min-h-[74px] max-h-[300px] resize-none border-0 bg-transparent px-1 py-1 pr-12 text-[15px] leading-7 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 disabled:cursor-not-allowed",
+								)}
+								disabled={isLocked}
+								maxLength={MAX_MESSAGE_LENGTH}
+								onChange={handleInputChange}
+								onKeyDown={handleInputKeyDown}
+								placeholder={
+									disabled
+										? "Select a project to start."
+										: isRunning
+											? "Waiting for assistant response..."
+											: "Type a message to the coding assistant"
+								}
+								rows={3}
+								value={value}
+							/>
+						</div>
+						<div className="absolute right-2 bottom-2">
+							<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
+								<Button
+									aria-label={buttonLabel}
+									className="h-10 w-10 rounded-full p-0 shadow-[0_10px_24px_rgba(56,189,248,0.25)]"
+									disabled={submitDisabled}
+									type="submit"
+								>
+									{sending || isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
+								</Button>
+							</motion.div>
+						</div>
+					</div>
+				) : (
+					<div
+						className={cn(
+							"rounded-[1.6rem] border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]",
+							isLocked ? "opacity-85" : "",
+						)}
+					>
+						<Textarea
+							aria-label="Message input"
+							className={cn(
+								"min-h-[92px] resize-y border-0 bg-transparent px-1 py-1 text-sm leading-6 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 disabled:cursor-not-allowed",
+							)}
+							disabled={isLocked}
+							maxLength={MAX_MESSAGE_LENGTH}
+							onChange={handleInputChange}
+							onKeyDown={handleInputKeyDown}
+							placeholder={
+								disabled
+									? "Select a project to start."
+									: isRunning
+										? "Waiting for assistant response..."
+										: "Type a message to the coding assistant"
+							}
+							rows={3}
+							value={value}
+						/>
+					</div>
+				)}
+				{!focusMode && (
+					<div aria-live="polite" className="flex flex-wrap items-center justify-between gap-3">
+						<span className={cn("text-xs", validationError ? "text-rose-300" : "text-slate-400")}>
+							{statusText}
+						</span>
+						<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.98 }}>
+							<Button className="min-w-[112px] gap-2 rounded-xl" disabled={submitDisabled} type="submit">
+								{buttonLabel}
+								{sending || isRunning ? (
+									<Loader2 className="h-4 w-4 animate-spin" />
+								) : (
+									<ArrowUp className="h-4 w-4" />
+								)}
+							</Button>
+						</motion.div>
+					</div>
+				)}
 			</form>
 		</section>
 	);

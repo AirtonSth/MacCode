@@ -780,18 +780,22 @@ const App = (): JSX.Element => {
 		}
 	}, [state.connectionState]);
 	const hasProjects = state.projects.length > 0;
+	const isThreadFocusMode = Boolean(state.selectedChatId);
 
 	return (
-		<TooltipProvider delayDuration={120}>
+				<TooltipProvider delayDuration={120}>
 			<div className="relative h-full w-full overflow-hidden">
 				<div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_48%_84%,rgba(55,150,255,0.22),transparent_44%)]" />
 				<motion.div
-					style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
-					animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
-					className="grid h-full w-full min-h-0 grid-cols-[var(--desktop-sidebar-width)_12px_minmax(0,1fr)] border border-white/10 bg-slate-950/55 backdrop-blur-2xl max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
-					initial={shouldReduceMotion ? undefined : { opacity: 0, y: 12 }}
-					transition={{ duration: 0.32, ease: "easeOut" }}
-				>
+						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
+						className={cn(
+							"grid h-full w-full min-h-0 border border-white/10 bg-slate-950/55 backdrop-blur-2xl max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]",
+							"grid-cols-[var(--desktop-sidebar-width)_12px_minmax(0,1fr)]",
+						)}
+						initial={shouldReduceMotion ? undefined : { opacity: 0, y: 12 }}
+						transition={{ duration: 0.32, ease: "easeOut" }}
+					>
 					<span className="noise-mask" />
 
 					<aside className="relative z-10 flex min-h-0 flex-col border-r border-sidebar-border/80 bg-sidebar/65 p-3 backdrop-blur-3xl max-[920px]:border-b max-[920px]:border-r-0">
@@ -961,7 +965,7 @@ const App = (): JSX.Element => {
 								)}
 							</div>
 						</ScrollArea>
-					</aside>
+						</aside>
 
 					<button
 						aria-label="Resize sidebar"
@@ -973,181 +977,207 @@ const App = (): JSX.Element => {
 						type="button"
 					/>
 
-					<main className="relative z-10 flex min-h-0 flex-col bg-slate-950/35">
+					<main className={cn("relative z-10 flex min-h-0 flex-col", isThreadFocusMode ? "bg-transparent" : "bg-slate-950/35")}>
 						{hasProjects ? (
-							<>
-								<header className="flex h-16 items-center justify-between gap-3 border-b border-white/10 px-4 lg:px-5">
-									<div className="min-w-0">
-										<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-											Workspace
-										</p>
-										<h1 className="truncate text-sm font-semibold text-slate-100">
-											{selectedChat ? selectedChat.title : "New thread"}
-										</h1>
-									</div>
-									<div className="flex shrink-0 items-center gap-2">
-										<Tooltip>
-											<TooltipTrigger asChild>
-												<Button
-													disabled={isOpeningProject}
-													onClick={() => {
-														void handleOpenProject();
-													}}
-													size="icon"
-													type="button"
-													variant="outline"
-												>
-													<FolderOpen className="h-4 w-4" />
-												</Button>
-											</TooltipTrigger>
-											<TooltipContent>Open folder</TooltipContent>
-										</Tooltip>
-										<Tooltip>
-											<TooltipTrigger asChild>
-												<Button
-													onClick={() => {
-														void loadProjects();
-													}}
-													size="icon"
-													type="button"
-													variant="outline"
-												>
-													<RefreshCcw className="h-4 w-4" />
-												</Button>
-											</TooltipTrigger>
-											<TooltipContent>Reload</TooltipContent>
-										</Tooltip>
-										{state.errors.length > 0 ? (
-											<Tooltip>
-												<TooltipTrigger asChild>
-													<Button onClick={clearAllErrors} size="icon" type="button" variant="destructive">
-														<AlertTriangle className="h-4 w-4" />
-													</Button>
-												</TooltipTrigger>
-												<TooltipContent>Clear {state.errors.length} errors</TooltipContent>
-											</Tooltip>
-										) : null}
-										<Badge className={getConnectionPillClass(state.connectionState)} variant="outline">
-											{connectionMessage}
-										</Badge>
-									</div>
-								</header>
-
-								<section className="flex min-h-0 flex-1 flex-col gap-3 p-3 lg:p-4">
-									<AnimatePresence initial={false}>
-										{state.errors.length > 0 ? (
-											<motion.div
-												animate={{ opacity: 1, y: 0 }}
-												className="space-y-2"
-												exit={{ opacity: 0, y: -8 }}
-												initial={{ opacity: 0, y: -8 }}
-											>
-												{state.errors.map((error) => (
-													<motion.article
-														className="flex items-start gap-3 rounded-2xl border border-rose-300/30 bg-rose-500/10 px-3 py-2.5 text-xs text-rose-100"
-														key={error.id}
-														layout={!shouldReduceMotion}
-													>
-														<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-														<div className="min-w-0 flex-1">
-															<p className="truncate font-semibold">{error.code}</p>
-															<p className="truncate">{error.message}</p>
-														</div>
-														<Button
-															aria-label={`Dismiss ${error.message}`}
-															className="h-7 w-7 rounded-lg"
-															onClick={() => {
-																dispatch({ payload: error.id, type: "REMOVE_ERROR" });
-															}}
-															size="icon"
-															type="button"
-															variant="ghost"
-														>
-															<X className="h-3.5 w-3.5" />
-														</Button>
-													</motion.article>
-												))}
-											</motion.div>
-										) : null}
-									</AnimatePresence>
-
+							isThreadFocusMode ? (
+								<section className="flex min-h-0 flex-1 flex-col">
 									<div className="relative min-h-0 flex-1">
-										{state.selectedChatId ? (
-											<ConversationPanel
-												chat={selectedChat}
-												hasRestError={state.errors.some((error) => error.source === "rest")}
-												loading={state.messagesLoading}
-												messages={state.messages}
-												streamingText={streamingText}
-											/>
-										) : (
-											<motion.div
-												animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
-												className="grid h-full place-items-center rounded-[28px] border border-white/10 bg-slate-950/45 p-6 text-center backdrop-blur-2xl"
-												initial={shouldReduceMotion ? undefined : { opacity: 0, y: 10 }}
-												transition={{ duration: 0.28 }}
-											>
-												<div>
-													<div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl border border-white/20 bg-white/[0.04]">
-														<Sparkles className="h-5 w-5 text-sky-200" />
-													</div>
-													<h2 className="text-[clamp(1.4rem,2.5vw,2.2rem)] font-bold text-slate-100">
-														Let&apos;s build
-													</h2>
-													<p className="mt-1 text-[clamp(1rem,1.9vw,1.3rem)] text-slate-400">
-														{selectedProject?.name ?? "remotecode.io"}
-													</p>
-												</div>
-											</motion.div>
-										)}
+										<ConversationPanel
+											chat={selectedChat}
+											focusMode
+											hasRestError={state.errors.some((error) => error.source === "rest")}
+											loading={state.messagesLoading}
+											messages={state.messages}
+											streamingText={streamingText}
+										/>
 									</div>
 
-									<div className="space-y-3">
-										<div className="grid gap-2 md:grid-cols-3">
-											{SUGGESTION_CARDS.map((card) => (
-												<button
-													className="group cursor-pointer rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-left text-sm text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06]"
-													key={card}
-													type="button"
-												>
-													<span className="mb-2 inline-flex h-6 w-6 items-center justify-center rounded-lg border border-white/15 bg-white/[0.03]">
-														<Sparkles className="h-3.5 w-3.5 text-slate-300/80 group-hover:text-sky-200" />
-													</span>
-													<span className="block leading-5">{card}</span>
-												</button>
-											))}
-										</div>
-										
-
-										<MessageComposer
-											chatStatus={selectedChat?.status ?? null}
-											disabled={!state.selectedProjectId}
-											onSend={handleSendMessage}
-											sending={state.isSendingMessage}
-										/>
-
-										<Separator />
-
-										<div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-											<span className="inline-flex items-center gap-1.5">
-												<span
-													className={cn(
-														"h-1.5 w-1.5 rounded-full",
-														state.connectionState === "connected"
-															? "bg-emerald-300"
-															: state.connectionState === "disconnected"
-																? "bg-rose-300"
-																: "bg-amber-300",
-													)}
-												/>
-												Local
-											</span>
-											<span>{connectionMessage}</span>
-											<span>{selectedProject?.name ?? "No workspace selected"}</span>
+									<div className="border-t border-white/10 bg-slate-950/35 px-3 pb-4 pt-3 sm:px-6">
+										<div className="mx-auto w-full max-w-3xl">
+											<MessageComposer
+												chatStatus={selectedChat?.status ?? null}
+												disabled={!state.selectedProjectId}
+												focusMode
+												onSend={handleSendMessage}
+												sending={state.isSendingMessage}
+											/>
 										</div>
 									</div>
 								</section>
-							</>
+							) : (
+								<>
+									<header className="flex h-16 items-center justify-between gap-3 border-b border-white/10 px-4 lg:px-5">
+										<div className="min-w-0">
+											<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+												Workspace
+											</p>
+											<h1 className="truncate text-sm font-semibold text-slate-100">
+												{selectedChat ? selectedChat.title : "New thread"}
+											</h1>
+										</div>
+										<div className="flex shrink-0 items-center gap-2">
+											<Tooltip>
+												<TooltipTrigger asChild>
+													<Button
+														disabled={isOpeningProject}
+														onClick={() => {
+															void handleOpenProject();
+														}}
+														size="icon"
+														type="button"
+														variant="outline"
+													>
+														<FolderOpen className="h-4 w-4" />
+													</Button>
+												</TooltipTrigger>
+												<TooltipContent>Open folder</TooltipContent>
+											</Tooltip>
+											<Tooltip>
+												<TooltipTrigger asChild>
+													<Button
+														onClick={() => {
+															void loadProjects();
+														}}
+														size="icon"
+														type="button"
+														variant="outline"
+													>
+														<RefreshCcw className="h-4 w-4" />
+													</Button>
+												</TooltipTrigger>
+												<TooltipContent>Reload</TooltipContent>
+											</Tooltip>
+											{state.errors.length > 0 ? (
+												<Tooltip>
+													<TooltipTrigger asChild>
+														<Button onClick={clearAllErrors} size="icon" type="button" variant="destructive">
+															<AlertTriangle className="h-4 w-4" />
+														</Button>
+													</TooltipTrigger>
+													<TooltipContent>Clear {state.errors.length} errors</TooltipContent>
+												</Tooltip>
+											) : null}
+											<Badge className={getConnectionPillClass(state.connectionState)} variant="outline">
+												{connectionMessage}
+											</Badge>
+										</div>
+									</header>
+
+									<section className="flex min-h-0 flex-1 flex-col gap-3 p-3 lg:p-4">
+										<AnimatePresence initial={false}>
+											{state.errors.length > 0 ? (
+												<motion.div
+													animate={{ opacity: 1, y: 0 }}
+													className="space-y-2"
+													exit={{ opacity: 0, y: -8 }}
+													initial={{ opacity: 0, y: -8 }}
+												>
+													{state.errors.map((error) => (
+														<motion.article
+															className="flex items-start gap-3 rounded-2xl border border-rose-300/30 bg-rose-500/10 px-3 py-2.5 text-xs text-rose-100"
+															key={error.id}
+															layout={!shouldReduceMotion}
+														>
+															<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+															<div className="min-w-0 flex-1">
+																<p className="truncate font-semibold">{error.code}</p>
+																<p className="truncate">{error.message}</p>
+															</div>
+															<Button
+																aria-label={`Dismiss ${error.message}`}
+																className="h-7 w-7 rounded-lg"
+																onClick={() => {
+																	dispatch({ payload: error.id, type: "REMOVE_ERROR" });
+																}}
+																size="icon"
+																type="button"
+																variant="ghost"
+															>
+																<X className="h-3.5 w-3.5" />
+															</Button>
+														</motion.article>
+													))}
+												</motion.div>
+											) : null}
+										</AnimatePresence>
+
+										<div className="relative min-h-0 flex-1">
+											{state.selectedChatId ? (
+												<ConversationPanel
+													chat={selectedChat}
+													hasRestError={state.errors.some((error) => error.source === "rest")}
+													loading={state.messagesLoading}
+													messages={state.messages}
+													streamingText={streamingText}
+												/>
+											) : (
+												<motion.div
+													animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
+													className="grid h-full place-items-center rounded-[28px] border border-white/10 bg-slate-950/45 p-6 text-center backdrop-blur-2xl"
+													initial={shouldReduceMotion ? undefined : { opacity: 0, y: 10 }}
+													transition={{ duration: 0.28 }}
+												>
+													<div>
+														<div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl border border-white/20 bg-white/[0.04]">
+															<Sparkles className="h-5 w-5 text-sky-200" />
+														</div>
+														<h2 className="text-[clamp(1.4rem,2.5vw,2.2rem)] font-bold text-slate-100">
+															Let&apos;s build
+														</h2>
+														<p className="mt-1 text-[clamp(1rem,1.9vw,1.3rem)] text-slate-400">
+															{selectedProject?.name ?? "remotecode.io"}
+														</p>
+													</div>
+												</motion.div>
+											)}
+										</div>
+
+										<div className="space-y-3">
+											<div className="grid gap-2 md:grid-cols-3">
+												{SUGGESTION_CARDS.map((card) => (
+													<button
+														className="group cursor-pointer rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-left text-sm text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06]"
+														key={card}
+														type="button"
+													>
+														<span className="mb-2 inline-flex h-6 w-6 items-center justify-center rounded-lg border border-white/15 bg-white/[0.03]">
+															<Sparkles className="h-3.5 w-3.5 text-slate-300/80 group-hover:text-sky-200" />
+														</span>
+														<span className="block leading-5">{card}</span>
+													</button>
+												))}
+											</div>
+
+											<MessageComposer
+												chatStatus={selectedChat?.status ?? null}
+												disabled={!state.selectedProjectId}
+												onSend={handleSendMessage}
+												sending={state.isSendingMessage}
+											/>
+
+											<Separator />
+
+											<div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+												<span className="inline-flex items-center gap-1.5">
+													<span
+														className={cn(
+															"h-1.5 w-1.5 rounded-full",
+															state.connectionState === "connected"
+																? "bg-emerald-300"
+																: state.connectionState === "disconnected"
+																	? "bg-rose-300"
+																	: "bg-amber-300",
+														)}
+													/>
+													Local
+												</span>
+												<span>{connectionMessage}</span>
+												<span>{selectedProject?.name ?? "No workspace selected"}</span>
+											</div>
+										</div>
+									</section>
+								</>
+							)
 						) : (
 							<motion.div
 								animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
