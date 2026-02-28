@@ -263,3 +263,83 @@ test("WsService persists providerThreadId returned by codex runner", async () =>
 	]);
 	expect(collector.events.some((event) => event.event === "assistant_done")).toBe(true);
 });
+
+test("WsService.startUserMessage forwards intermediate assistant deltas in order", async () => {
+	const chat = createChat();
+	let updateCallCount = 0;
+	const chatRepository = {
+		findChatById: () => {
+			updateCallCount += 1;
+
+			if (updateCallCount === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+			...chat,
+			status: "running",
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => ({
+			chatId: chat.id,
+			content: "",
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role: "assistant" as const,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({
+			createdAt: "",
+			id: "project-id",
+			isFavorite: false,
+			name: "p",
+			path: "/tmp",
+			updatedAt: "",
+		}),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({ onDelta }: { onDelta: (delta: string) => void }) => {
+			onDelta("Thinking...\n");
+			onDelta("Tool calling: /bin/zsh -lc pwd\n");
+			onDelta("Tool output: /tmp\n");
+			onDelta("final answer");
+			return {
+				assistantText: "final answer",
+				diffAdded: 12,
+				diffRemoved: 0,
+				status: "completed" as const,
+				threadId: "thread-stream-1",
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	const deltas = collector.events
+		.filter((event) => event.event === "assistant_delta")
+		.map((event) => event.data.delta);
+
+	expect(deltas).toEqual([
+		"Thinking...\n",
+		"Tool calling: /bin/zsh -lc pwd\n",
+		"Tool output: /tmp\n",
+		"final answer",
+	]);
+});

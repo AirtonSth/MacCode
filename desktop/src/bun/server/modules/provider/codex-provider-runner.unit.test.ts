@@ -25,6 +25,19 @@ test("parseCodexJsonLine captures thread id from thread.started", () => {
 	});
 });
 
+test("parseCodexJsonLine emits thinking status on turn.started", () => {
+	const parsed = parseCodexJsonLine(
+		JSON.stringify({
+			type: "turn.started",
+		}),
+	);
+
+	expect(parsed).toEqual({
+		delta: "Thinking...\n",
+		statusDelta: true,
+	});
+});
+
 test("parseCodexJsonLine emits friendly deltas for command start and completion", () => {
 	const started = parseCodexJsonLine(
 		JSON.stringify({
@@ -46,15 +59,18 @@ test("parseCodexJsonLine emits friendly deltas for command start and completion"
 		}),
 	);
 
-	expect(started?.delta).toContain("Running command:");
-	expect(completed?.delta).toContain("Command output:");
+	expect(started?.delta).toContain("Tool calling:");
+	expect(started?.statusDelta).toBe(true);
+	expect(completed?.delta).toContain("Tool output:");
 	expect(completed?.delta).toContain("file-1 file-2");
+	expect(completed?.statusDelta).toBe(true);
 });
 
 test("parseCodexJsonLine extracts assistant final text from agent_message", () => {
 	const parsed = parseCodexJsonLine(
 		JSON.stringify({
 			item: {
+				id: "msg-1",
 				text: "Final answer",
 				type: "agent_message",
 			},
@@ -63,25 +79,142 @@ test("parseCodexJsonLine extracts assistant final text from agent_message", () =
 	);
 
 	expect(parsed).toEqual({
+		agentMessageCompleted: true,
+		agentMessageItemId: "msg-1",
 		assistantMessage: "Final answer",
 		delta: "Final answer",
 	});
 });
 
-test("parseCodexJsonLine maps reasoning completion into user-friendly status delta", () => {
+test("parseCodexJsonLine maps reasoning completion into concise thinking delta", () => {
 	const parsed = parseCodexJsonLine(
 		JSON.stringify({
 			item: {
-				text: "**Thinking**",
+				text: "**Running shell command with update**",
 				type: "reasoning",
 			},
 			type: "item.completed",
 		}),
 	);
 
+	expect(parsed?.statusDelta).toBe(true);
+	expect(parsed?.delta).toContain("Thinking:");
+	expect(parsed?.delta).toContain("Running shell command with update");
+});
+
+test("parseCodexJsonLine extracts agent_message token deltas from item.delta", () => {
+	const parsed = parseCodexJsonLine(
+		JSON.stringify({
+			item: {
+				delta: "Hello",
+				id: "msg-2",
+				type: "agent_message",
+			},
+			type: "item.delta",
+		}),
+	);
+
 	expect(parsed).toEqual({
-		delta: "Codex is thinking...\n",
+		agentMessageDelta: true,
+		agentMessageItemId: "msg-2",
+		delta: "Hello",
 	});
+});
+
+test("CodexProviderRunner suppresses duplicate status deltas and keeps final assistant message only", async () => {
+	const runner = new CodexProviderRunner(() => ({
+		exitCode: 0,
+		exited: Promise.resolve(0),
+		stderr: toStream(""),
+		stdout: toStream(
+			[
+				JSON.stringify({ thread_id: "thread-1", type: "thread.started" }),
+				JSON.stringify({ type: "turn.started" }),
+				JSON.stringify({ item: { type: "reasoning" }, type: "item.started" }),
+				JSON.stringify({ item: { type: "agent_message" }, type: "item.started" }),
+				JSON.stringify({ item: { type: "agent_message" }, type: "item.started" }),
+				JSON.stringify({ item: { id: "msg-1", text: "Interim answer", type: "agent_message" }, type: "item.completed" }),
+				JSON.stringify({ item: { id: "msg-2", text: "Final answer", type: "agent_message" }, type: "item.completed" }),
+				JSON.stringify({ type: "turn.completed" }),
+				"",
+			].join("\n"),
+		),
+	}));
+
+	const deltas: string[] = [];
+	const result = await runner.run({
+		chatId: "chat-1",
+		onDelta: (delta) => {
+			deltas.push(delta);
+		},
+		text: "hello",
+		workspacePath: "/tmp",
+	});
+
+	expect(result.status).toBe("completed");
+	expect(result.assistantText).toBe("Final answer");
+	expect(deltas).toEqual(["Thinking...\n", "Writing response...\n", "Interim answer", "Final answer"]);
+});
+
+test("CodexProviderRunner does not duplicate final agent message when item.delta already streamed", async () => {
+	const runner = new CodexProviderRunner(() => ({
+		exitCode: 0,
+		exited: Promise.resolve(0),
+		stderr: toStream(""),
+		stdout: toStream(
+			[
+				JSON.stringify({ type: "turn.started" }),
+				JSON.stringify({ item: { delta: "Hel", id: "msg-1", type: "agent_message" }, type: "item.delta" }),
+				JSON.stringify({ item: { delta: "lo", id: "msg-1", type: "agent_message" }, type: "item.delta" }),
+				JSON.stringify({ item: { id: "msg-1", text: "Hello", type: "agent_message" }, type: "item.completed" }),
+				JSON.stringify({ type: "turn.completed" }),
+				"",
+			].join("\n"),
+		),
+	}));
+
+	const deltas: string[] = [];
+	const result = await runner.run({
+		chatId: "chat-1",
+		onDelta: (delta) => {
+			deltas.push(delta);
+		},
+		text: "hello",
+		workspacePath: "/tmp",
+	});
+
+	expect(result.status).toBe("completed");
+	expect(result.assistantText).toBe("Hello");
+	expect(deltas).toEqual(["Thinking...\n", "Hel", "lo"]);
+});
+
+test("CodexProviderRunner completes with delta-only agent_message stream", async () => {
+	const runner = new CodexProviderRunner(() => ({
+		exitCode: 0,
+		exited: Promise.resolve(0),
+		stderr: toStream(""),
+		stdout: toStream(
+			[
+				JSON.stringify({ type: "turn.started" }),
+				JSON.stringify({ item: { delta: "delta-only ", id: "msg-1", type: "agent_message" }, type: "item.delta" }),
+				JSON.stringify({ item: { delta: "answer", id: "msg-1", type: "agent_message" }, type: "item.delta" }),
+				JSON.stringify({ type: "turn.completed" }),
+				"",
+			].join("\n"),
+		),
+	}));
+
+	const result = await runner.run({
+		chatId: "chat-1",
+		onDelta: () => {
+			// no-op
+		},
+		text: "hello",
+		workspacePath: "/tmp",
+	});
+
+	expect(result.status).toBe("completed");
+	expect(result.assistantText).toBe("delta-only answer");
 });
 
 test("CodexProviderRunner returns failed when turn completes without final assistant message", async () => {
@@ -112,7 +245,7 @@ test("CodexProviderRunner returns failed when turn completes without final assis
 	expect(result.status).toBe("failed");
 	expect(result.error).toBe("codex produced no final assistant message");
 	expect(result.threadId).toBe("thread-1");
-	expect(deltas).toEqual([]);
+	expect(deltas).toEqual(["Thinking...\n"]);
 });
 
 test("CodexProviderRunner uses resolved process exit code when subprocess fails", async () => {

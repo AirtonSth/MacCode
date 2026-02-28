@@ -81,7 +81,7 @@ const codexAvailability = getCodexAvailability();
 const codexTest = test.skipIf(!codexAvailability.available);
 const skipReasonSuffix = codexAvailability.available ? "" : ` (skip: ${codexAvailability.reason})`;
 
-codexTest(`WS emits real-time codex stream followed by assistant_done and completed chat${skipReasonSuffix}`, async () => {
+codexTest(`WS emits intermediate thinking/tool deltas before assistant_done${skipReasonSuffix}`, async () => {
 	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-codex-flow-"));
 	const { baseUrl, cleanup, client } = await createTestServer();
 
@@ -106,16 +106,23 @@ codexTest(`WS emits real-time codex stream followed by assistant_done and comple
 		});
 
 		ws.send({
-			data: { chatId, text: "Respond with exactly: ws-codex-flow-ok" },
+			data: {
+				chatId,
+				text: "Run exactly one shell command: pwd. After that, reply with exactly: ws-codex-flow-ok",
+			},
 			event: "user_message",
 		});
 
 		await waitForCondition(
 			() =>
-				events.some((event) => event.event === "assistant_done") &&
-				events.some((event) => event.event === "chat_updated" && event.data.status === "completed"),
-			90_000,
+				(events.some((event) => event.event === "assistant_done") &&
+					events.some((event) => event.event === "chat_updated" && event.data.status === "completed")) ||
+				events.some((event) => event.event === "error"),
+			150_000,
 		);
+
+		const providerError = events.find((event) => event.event === "error");
+		expect(providerError).toBeUndefined();
 
 		const runningIndex = events.findIndex(
 			(event) => event.event === "chat_updated" && event.data.status === "running",
@@ -131,6 +138,15 @@ codexTest(`WS emits real-time codex stream followed by assistant_done and comple
 		expect(doneIndex).toBeGreaterThan(deltaIndex);
 		expect(completedIndex).toBeGreaterThan(doneIndex);
 
+		const deltas = events.filter((event) => event.event === "assistant_delta").map((event) => event.data.delta ?? "");
+		const hasThinkingDelta = deltas.some((delta) => delta.includes("Thinking"));
+		const hasToolDelta = deltas.some(
+			(delta) => delta.includes("Tool calling") || delta.includes("Tool output") || delta.includes("Tool finished"),
+		);
+
+		expect(hasThinkingDelta).toBe(true);
+		expect(hasToolDelta).toBe(true);
+
 		const messages = await client.v1.chats({ id: chatId }).messages.get();
 		const storedMessages = (messages.data as { messages: { content: string; role: "user" | "assistant" }[] })
 			.messages;
@@ -143,7 +159,7 @@ codexTest(`WS emits real-time codex stream followed by assistant_done and comple
 		await cleanup();
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
-}, 120_000);
+}, 180_000);
 
 codexTest(`WS keeps codex thread context after websocket reconnect${skipReasonSuffix}`, async () => {
 	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-codex-resume-"));

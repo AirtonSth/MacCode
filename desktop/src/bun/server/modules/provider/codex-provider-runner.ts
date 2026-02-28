@@ -4,27 +4,38 @@ interface CodexCommandExecutionItem {
 	aggregated_output?: unknown;
 	command?: unknown;
 	exit_code?: unknown;
+	id?: unknown;
+	status?: unknown;
 	type?: unknown;
 }
 
 interface CodexEventItem {
 	content?: unknown;
+	delta?: unknown;
+	id?: unknown;
+	status?: unknown;
 	text?: unknown;
 	type?: unknown;
 }
 
 interface CodexJsonEvent {
+	delta?: unknown;
 	error?: unknown;
 	item?: CodexEventItem | CodexCommandExecutionItem;
 	message?: unknown;
+	text?: unknown;
 	thread_id?: unknown;
 	type?: unknown;
 }
 
 export interface CodexParsedEvent {
+	agentMessageCompleted?: boolean;
+	agentMessageDelta?: boolean;
+	agentMessageItemId?: string;
 	assistantMessage?: string;
 	delta?: string;
 	error?: string;
+	statusDelta?: boolean;
 	threadId?: string;
 	turnCompleted?: boolean;
 }
@@ -37,8 +48,11 @@ interface CodexSpawnedProcess {
 }
 
 interface CodexRunnerState {
-	assistantMessages: string[];
+	agentMessageDeltaText: string;
+	assistantMessage?: string;
 	errorMessage?: string;
+	lastStatusDelta?: string;
+	streamedAgentMessageItemIds: Set<string>;
 	threadId?: string;
 	turnCompleted: boolean;
 }
@@ -67,6 +81,9 @@ const truncate = (value: string, maxLength: number): string => {
 
 const normalizeLine = (value: string): string => value.replace(/\s+/g, " ").trim();
 
+const sanitizeStatusLabel = (value: string): string =>
+	normalizeLine(value.replace(/[*_`#>~]/g, " ").replace(/\[(.*?)\]\((.*?)\)/g, "$1"));
+
 const summarizeCommandOutput = (output: string): string | null => {
 	const normalized = normalizeLine(output);
 	if (!normalized) {
@@ -79,10 +96,10 @@ const summarizeCommandOutput = (output: string): string | null => {
 const buildCommandStartDelta = (command: unknown): string => {
 	const commandText = asString(command);
 	if (!commandText) {
-		return "Running command...\n";
+		return "Tool calling...\n";
 	}
 
-	return `Running command: ${truncate(commandText, 140)}\n`;
+	return `Tool calling: ${truncate(commandText, 140)}\n`;
 };
 
 const buildCommandCompletedDelta = (
@@ -93,13 +110,13 @@ const buildCommandCompletedDelta = (
 	const summary = summarizeCommandOutput(typeof commandOutput === "string" ? commandOutput : "");
 
 	if (exitCode === 0) {
-		return summary ? `Command output: ${summary}\n` : "Command finished.\n";
+		return summary ? `Tool output: ${summary}\n` : "Tool finished.\n";
 	}
 
 	const exitLabel = exitCode === null ? "unknown" : String(exitCode);
 	return summary
-		? `Command failed (exit ${exitLabel}): ${summary}\n`
-		: `Command failed (exit ${exitLabel}).\n`;
+		? `Tool failed (exit ${exitLabel}): ${summary}\n`
+		: `Tool failed (exit ${exitLabel}).\n`;
 };
 
 const extractTextContent = (value: unknown): string | null => {
@@ -129,6 +146,20 @@ const extractTextContent = (value: unknown): string | null => {
 	}
 
 	return textParts.join("\n");
+};
+
+const buildThinkingDelta = (text: unknown): string => {
+	const raw = extractTextContent(text);
+	if (!raw) {
+		return "Thinking...\n";
+	}
+
+	const normalized = sanitizeStatusLabel(raw);
+	if (!normalized) {
+		return "Thinking...\n";
+	}
+
+	return `Thinking: ${truncate(normalized, 180)}\n`;
 };
 
 const extractAssistantText = (item: CodexEventItem | CodexCommandExecutionItem | undefined): string | null => {
@@ -177,11 +208,18 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 		return threadId ? { threadId } : null;
 	}
 
+	if (type === "turn.started") {
+		return {
+			delta: "Thinking...\n",
+			statusDelta: true,
+		};
+	}
+
 	if (type === "turn.completed") {
 		return { turnCompleted: true };
 	}
 
-	if (type === "process.failed" || type === "turn.failed" || type === "error") {
+	if (type === "process.failed" || type === "turn.failed" || type === "item.failed" || type === "error") {
 		return {
 			error: parseProcessErrorMessage(payload) || "provider failed",
 		};
@@ -193,6 +231,21 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 	if (type === "item.started" && itemType === "command_execution") {
 		return {
 			delta: buildCommandStartDelta((item as CodexCommandExecutionItem).command),
+			statusDelta: true,
+		};
+	}
+
+	if (type === "item.started" && itemType === "reasoning") {
+		return {
+			delta: "Thinking...\n",
+			statusDelta: true,
+		};
+	}
+
+	if (type === "item.started" && itemType === "agent_message") {
+		return {
+			delta: "Writing response...\n",
+			statusDelta: true,
 		};
 	}
 
@@ -200,12 +253,14 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 		const commandItem = item as CodexCommandExecutionItem;
 		return {
 			delta: buildCommandCompletedDelta(commandItem.aggregated_output, commandItem.exit_code),
+			statusDelta: true,
 		};
 	}
 
 	if (type === "item.completed" && itemType === "reasoning") {
 		return {
-			delta: "Codex is thinking...\n",
+			delta: buildThinkingDelta((item as CodexEventItem).text ?? (item as CodexEventItem).content),
+			statusDelta: true,
 		};
 	}
 
@@ -216,8 +271,28 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 		}
 
 		return {
+			agentMessageCompleted: true,
+			agentMessageItemId: asString((item as CodexEventItem).id) ?? undefined,
 			assistantMessage,
 			delta: assistantMessage,
+		};
+	}
+
+	if (type === "item.delta" && itemType === "agent_message") {
+		const delta = extractTextContent(
+			(item as CodexEventItem).delta ??
+				(item as CodexEventItem).text ??
+				payload.delta ??
+				payload.text,
+		);
+		if (!delta) {
+			return null;
+		}
+
+		return {
+			agentMessageDelta: true,
+			agentMessageItemId: asString((item as CodexEventItem).id) ?? undefined,
+			delta,
 		};
 	}
 
@@ -233,12 +308,41 @@ const applyParsedEvent = (
 		state.threadId = event.threadId;
 	}
 
+	if (event.agentMessageDelta && event.agentMessageItemId) {
+		state.streamedAgentMessageItemIds.add(event.agentMessageItemId);
+	}
+
+	if (event.agentMessageDelta && event.delta) {
+		state.agentMessageDeltaText += event.delta;
+	}
+
 	if (event.delta) {
-		onDelta(event.delta);
+		let shouldEmitDelta = true;
+
+		if (event.statusDelta) {
+			const normalizedStatus = normalizeLine(event.delta);
+			if (normalizedStatus && state.lastStatusDelta === normalizedStatus) {
+				shouldEmitDelta = false;
+			} else if (normalizedStatus) {
+				state.lastStatusDelta = normalizedStatus;
+			}
+		}
+
+		if (
+			event.agentMessageCompleted &&
+			event.agentMessageItemId &&
+			state.streamedAgentMessageItemIds.has(event.agentMessageItemId)
+		) {
+			shouldEmitDelta = false;
+		}
+
+		if (shouldEmitDelta) {
+			onDelta(event.delta);
+		}
 	}
 
 	if (event.assistantMessage) {
-		state.assistantMessages.push(event.assistantMessage);
+		state.assistantMessage = event.assistantMessage;
 	}
 
 	if (event.turnCompleted) {
@@ -315,7 +419,8 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 		}
 
 		const state: CodexRunnerState = {
-			assistantMessages: [],
+			agentMessageDeltaText: "",
+			streamedAgentMessageItemIds: new Set<string>(),
 			threadId: options.threadId,
 			turnCompleted: false,
 		};
@@ -402,7 +507,7 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 			}
 		}
 
-		const assistantText = state.assistantMessages.join("\n\n").trim();
+		const assistantText = (state.assistantMessage ?? state.agentMessageDeltaText).trim();
 		const exitCode = resolvedExitCode;
 
 		if (exitCode !== 0) {
