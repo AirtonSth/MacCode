@@ -35,14 +35,24 @@ export const messages = sqliteTable("messages", {
 	role: text("role").notNull(),
 });
 
+export const workspaceSelection = sqliteTable("workspace_selection", {
+	id: text("id").primaryKey(),
+	selectedProjectId: text("selectedProjectId").references(() => projects.id, { onDelete: "set null" }),
+	selectedChatId: text("selectedChatId").references(() => chats.id, { onDelete: "set null" }),
+	updatedAt: text("updatedAt").notNull(),
+});
+
 export type ChatRow = typeof chats.$inferSelect;
 
 export type MessageRow = typeof messages.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
+export type WorkspaceSelectionRow = typeof workspaceSelection.$inferSelect;
 export class DatabaseSchema {
 	static readonly projects = projects;
 
 	static readonly chats = chats;
 
 	static readonly messages = messages;
+
+	static readonly workspaceSelection = workspaceSelection;
 }

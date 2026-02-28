@@ -31,6 +31,11 @@ export interface MessageDTO {
 	createdAt: string;
 }
 
+export interface WorkspaceSelection {
+	selectedProjectId: string | null;
+	selectedChatId: string | null;
+}
+
 export class RemoteCodeApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -68,8 +73,17 @@ interface RestListMessagesResponse {
 	messages: MessageDTO[];
 }
 
+interface RestWorkspaceSelectionResponse {
+	selectedProjectId: string | null;
+	selectedChatId: string | null;
+}
+
+interface RestDeleteResponse {
+	deleted: boolean;
+}
+
 interface RequestInput {
-	method: "GET" | "POST" | "PATCH";
+	method: "GET" | "POST" | "PATCH" | "DELETE";
 	path: string;
 	body?: unknown;
 }
@@ -206,6 +220,39 @@ export const RemoteCodeApi = {
 				});
 
 				return payload.messages;
+			},
+
+			getWorkspaceSelection: async (): Promise<WorkspaceSelection> => {
+				return await request<RestWorkspaceSelectionResponse>({
+					method: "GET",
+					path: "/selection",
+				});
+			},
+
+			updateWorkspaceSelection: async (
+				input: { selectedProjectId: string | null; selectedChatId: string | null },
+			): Promise<WorkspaceSelection> => {
+				const payload = await request<RestWorkspaceSelectionResponse>({
+					body: input,
+					method: "PATCH",
+					path: "/selection",
+				});
+
+				return payload;
+			},
+
+			deleteProject: async (id: string): Promise<RestDeleteResponse> => {
+				return await request<RestDeleteResponse>({
+					method: "DELETE",
+					path: `/projects/${id}`,
+				});
+			},
+
+			deleteChat: async (id: string): Promise<RestDeleteResponse> => {
+				return await request<RestDeleteResponse>({
+					method: "DELETE",
+					path: `/chats/${id}`,
+				});
 			},
 		};
 	},

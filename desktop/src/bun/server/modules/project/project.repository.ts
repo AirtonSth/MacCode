@@ -75,6 +75,12 @@ private readonly database: DrizzleDatabaseClient["orm"];
 		return rows[0] ? ProjectRepository.toProjectDto(rows[0]) : null;
 	}
 
+	deleteProject(id: string): boolean {
+		const result = this.database.delete(projects).where(eq(projects.id, id)).run() as { changes?: number };
+
+		return (result.changes ?? 0) > 0;
+	}
+
 	findProjectByPath(path: string): ProjectDTO | null {
 		const rows = this.database
 			.select()

@@ -105,6 +105,12 @@ private readonly database: DrizzleDatabaseClient["orm"];
 
 		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
 	}
+
+	deleteChat(id: string): boolean {
+		const result = this.database.delete(chats).where(eq(chats.id, id)).run() as { changes?: number };
+
+		return (result.changes ?? 0) > 0;
+	}
 }
 
 export const createChatRepository = (databaseClient: DrizzleDatabaseClient["orm"]) => new ChatRepository(databaseClient);

@@ -39,7 +39,7 @@ export class DatabaseBootstrap {
 				updatedAt TEXT NOT NULL
 			)
 		`);
-		database.exec(`
+			database.exec(`
 			CREATE TABLE IF NOT EXISTS messages (
 				id TEXT PRIMARY KEY,
 				chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -48,12 +48,22 @@ export class DatabaseBootstrap {
 				createdAt TEXT NOT NULL
 			)
 		`);
+
+		database.exec(`
+			CREATE TABLE IF NOT EXISTS workspace_selection (
+				id TEXT PRIMARY KEY,
+				selectedProjectId TEXT REFERENCES projects(id) ON DELETE SET NULL,
+				selectedChatId TEXT REFERENCES chats(id) ON DELETE SET NULL,
+				updatedAt TEXT NOT NULL
+			)
+		`);
 	}
 
 	private static createIndexes(database: Database): void {
 		database.exec("CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_chats_project ON chats(projectId, updatedAt DESC)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chatId, createdAt ASC)");
+		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_selection_project ON workspace_selection(selectedProjectId)");
 	}
 }
 

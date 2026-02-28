@@ -73,3 +73,43 @@ test("POST /v1/projects/:id/chats returns 404 for missing project", async () => 
 		await cleanup();
 	}
 });
+
+test("DELETE /v1/chats/:id deletes thread", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "temporary thread" });
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		const deleted = await client.v1.chats({ id: chatId }).delete();
+		const deletePayload = deleted.data as { deleted: boolean };
+
+		expect(deleted.status).toBe(200);
+		expect(deletePayload.deleted).toBe(true);
+
+		const list = await client.v1.projects({ id: projectId }).chats.get();
+		const chatList = (list.data as { chats: { id: string }[] }).chats;
+		expect(chatList.some((item) => item.id === chatId)).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("DELETE /v1/chats/:id returns 404 for missing chat", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const response = await client.v1.chats({ id: "missing-chat" }).delete();
+		const errorPayload = response.error && "value" in response.error
+			? (response.error as { value: { error?: string } }).value
+			: undefined;
+
+		expect(response.status).toBe(404);
+		expect(errorPayload?.error).toBe("chat not found");
+	} finally {
+		await cleanup();
+	}
+});

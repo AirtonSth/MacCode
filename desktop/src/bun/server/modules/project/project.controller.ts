@@ -69,7 +69,18 @@ constructor(private readonly service: ProjectService) {}
 						isFavorite: t.Boolean(),
 					}),
 				},
-			);
+			)
+			.delete("/projects/:id", async ({ params: parameters, set }) => {
+				const deleted = await this.service.deleteProject(parameters.id);
+
+				if (!deleted) {
+					set.status = 404;
+
+					return { error: "project not found" };
+				}
+
+				return { deleted: true };
+			});
 	}
 }
 

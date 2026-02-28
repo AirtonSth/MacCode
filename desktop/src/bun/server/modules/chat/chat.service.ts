@@ -10,6 +10,7 @@ export interface ChatServiceContract {
 		chatId: string,
 		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>,
 	) => Promise<ChatDTO | null>;
+	deleteChat: (id: string) => Promise<boolean>;
 }
 
 export class ChatService implements ChatServiceContract {
@@ -58,6 +59,10 @@ async createChat(projectId: string, title: string): Promise<ChatDTO | null> {
 		};
 
 		return this.chatRepository.updateChat(chatId, merged);
+	}
+
+	async deleteChat(id: string): Promise<boolean> {
+		return this.chatRepository.deleteChat(id);
 	}
 }
 

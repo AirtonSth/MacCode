@@ -22,6 +22,7 @@ export interface ProjectServiceContract {
 	getProjectById: (id: string) => Promise<ProjectDTO | null>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	setFavorite: (id: string, isFavorite: boolean) => Promise<ProjectDTO | null>;
+	deleteProject: (id: string) => Promise<boolean>;
 }
 
 export class ProjectService implements ProjectServiceContract {
@@ -79,6 +80,10 @@ async createProject({
 
 	async setFavorite(id: string, isFavorite: boolean): Promise<ProjectDTO | null> {
 		return this.repository.updateProjectFavorite(id, isFavorite);
+	}
+
+	async deleteProject(id: string): Promise<boolean> {
+		return this.repository.deleteProject(id);
 	}
 }
 

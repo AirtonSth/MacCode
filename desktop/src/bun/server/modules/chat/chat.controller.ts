@@ -47,7 +47,18 @@ constructor(private readonly service: ChatService) {}
 						title: t.Optional(t.String()),
 					}),
 				},
-			);
+			)
+			.delete("/chats/:id", async ({ params: parameters, set }) => {
+				const deleted = await this.service.deleteChat(parameters.id);
+
+				if (!deleted) {
+					set.status = 404;
+
+					return { error: "chat not found" };
+				}
+
+				return { deleted: true };
+			});
 	}
 }
 

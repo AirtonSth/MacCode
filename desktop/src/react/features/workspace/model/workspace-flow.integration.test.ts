@@ -25,6 +25,13 @@ type RuntimeRoutes = {
 	createProject: (input: { name?: string; path: string }) => ProjectDTO;
 	createChat: (projectId: string, input: { title?: string }) => ChatDTO;
 	listMessages: (chatId: string) => MessageDTO[];
+	listChats?: (projectId: string) => ChatDTO[];
+	getWorkspaceSelection?: () => { selectedChatId: string | null; selectedProjectId: string | null };
+	updateWorkspaceSelection?: (
+		selection: { selectedChatId: string | null; selectedProjectId: string | null },
+	) => { selectedChatId: string | null; selectedProjectId: string | null };
+	deleteProject?: (id: string) => { deleted: boolean };
+	deleteChat?: (id: string) => { deleted: boolean };
 };
 
 const json = (body: unknown, status = 200): Response => {
@@ -69,11 +76,42 @@ const setupMockFetch = (routes: RuntimeRoutes) => {
 			return json({ created: true, project: routes.createProject(payload) });
 		}
 
+		if (method === "GET" && path === "/v1/selection") {
+			const selection = routes.getWorkspaceSelection?.() ?? {
+				selectedChatId: null,
+				selectedProjectId: null,
+			};
+			return json(selection);
+		}
+
+		if (method === "PATCH" && path === "/v1/selection") {
+			const payload = body as { selectedChatId: string | null; selectedProjectId: string | null };
+			const saved = routes.updateWorkspaceSelection?.(payload) ?? payload;
+			return json(saved);
+		}
+
 		const createChatMatch = /^\/v1\/projects\/([^/]+)\/chats$/.exec(path);
 		if (method === "POST" && createChatMatch) {
 			const projectId = createChatMatch[1];
 			const payload = body as { title?: string };
 			return json({ chat: routes.createChat(projectId, payload) });
+		}
+		if (method === "GET" && createChatMatch) {
+			const projectId = createChatMatch[1];
+			const chats = routes.listChats?.(projectId) ?? [];
+			return json({ chats });
+		}
+
+		const projectDeleteMatch = /^\/v1\/projects\/([^/]+)$/.exec(path);
+		if (method === "DELETE" && projectDeleteMatch) {
+			const payload = routes.deleteProject?.(projectDeleteMatch[1]) ?? { deleted: false };
+			return json(payload);
+		}
+
+		const chatDeleteMatch = /^\/v1\/chats\/([^/]+)$/.exec(path);
+		if (method === "DELETE" && chatDeleteMatch) {
+			const payload = routes.deleteChat?.(chatDeleteMatch[1]) ?? { deleted: false };
+			return json(payload);
 		}
 
 		const listMessagesMatch = /^\/v1\/chats\/([^/]+)\/messages$/.exec(path);
@@ -379,6 +417,7 @@ const createWorkspaceFlowHarness = () => {
 		token: state.value.token,
 	});
 	let wsRef: ReturnType<typeof RemoteCodeRealtime.createClient> | null = null;
+	let persistedSelectedChatIdRef: string | null = null;
 
 	const addError = (message: string, source: "rest" | "ws", code = "unknown") => {
 		dispatch({
@@ -402,6 +441,64 @@ const createWorkspaceFlowHarness = () => {
 			addError("Unable to fetch messages from chat", "rest", "NETWORK");
 		} finally {
 			dispatch({ type: "SET_MESSAGES_LOADING", payload: false });
+		}
+	};
+
+	const persistWorkspaceSelection = async (selectedProjectId: string | null, selectedChatId: string | null) => {
+		try {
+			await api.updateWorkspaceSelection({
+				selectedChatId,
+				selectedProjectId,
+			});
+		} catch {
+			addError("Unable to persist selection", "rest", "NETWORK");
+		}
+	};
+
+	const loadChatsForProject = async (projectId: string | null, preferredChatId: string | null = null) => {
+		if (!projectId) {
+			dispatch({ type: "SET_CHATS", payload: [] });
+			dispatch({ type: "SET_SELECTED_CHAT", payload: null });
+			dispatch({ type: "SET_CHATS_LOADING", payload: false });
+			return;
+		}
+
+		dispatch({ type: "SET_CHATS_LOADING", payload: true });
+		dispatch({ type: "SET_SELECTED_CHAT", payload: null });
+		try {
+			const chats = await api.listChats(projectId);
+			dispatch({ type: "SET_CHATS", payload: chats });
+			if (preferredChatId && chats.some((chat) => chat.id === preferredChatId)) {
+				dispatch({ type: "SET_SELECTED_CHAT", payload: preferredChatId });
+			}
+		} catch {
+			addError("Unable to load chats for project", "rest", "NETWORK");
+			dispatch({ type: "SET_CHATS", payload: [] });
+		} finally {
+			dispatch({ type: "SET_CHATS_LOADING", payload: false });
+			persistedSelectedChatIdRef = null;
+		}
+	};
+
+	const loadProjectsFromSelection = async () => {
+		dispatch({ type: "SET_PROJECTS_LOADING", payload: true });
+		try {
+			const [projects, selection] = await Promise.all([
+				api.listProjects(),
+				api.getWorkspaceSelection().catch(() => ({ selectedChatId: null, selectedProjectId: null })),
+			]);
+
+			const hasSelection = selection.selectedProjectId ? projects.some((project) => project.id === selection.selectedProjectId) : false;
+			const selectedProjectId = hasSelection ? selection.selectedProjectId : projects[0]?.id ?? null;
+			persistedSelectedChatIdRef = hasSelection ? selection.selectedChatId : null;
+
+			dispatch({ type: "SET_PROJECTS", payload: projects });
+			dispatch({ type: "SET_SELECTED_PROJECT", payload: selectedProjectId });
+			await loadChatsForProject(selectedProjectId, persistedSelectedChatIdRef);
+		} catch {
+			addError("Unable to load projects", "rest", "NETWORK");
+		} finally {
+			dispatch({ type: "SET_PROJECTS_LOADING", payload: false });
 		}
 	};
 
@@ -495,6 +592,19 @@ const createWorkspaceFlowHarness = () => {
 		}
 	};
 
+	const createProjectWithSelection = async (input: { name?: string; path: string }) => {
+		dispatch({ type: "SET_CREATING_PROJECT", payload: true });
+		try {
+			const project = await api.createProject(input);
+			dispatch({ type: "UPSERT_PROJECT", payload: project });
+			dispatch({ type: "SET_SELECTED_PROJECT", payload: project.id });
+			await persistWorkspaceSelection(project.id, null);
+			return project;
+		} finally {
+			dispatch({ type: "SET_CREATING_PROJECT", payload: false });
+		}
+	};
+
 	const createChat = async (title?: string) => {
 		if (!state.value.selectedProjectId) {
 			addError("Select a project before creating a chat", "rest", "missing_project");
@@ -508,6 +618,83 @@ const createWorkspaceFlowHarness = () => {
 			return chat;
 		} finally {
 			dispatch({ type: "SET_CREATING_CHAT", payload: false });
+		}
+	};
+
+	const createChatWithSelection = async (title?: string) => {
+		if (!state.value.selectedProjectId) {
+			addError("Select a project before creating a chat", "rest", "missing_project");
+			return null;
+		}
+
+		dispatch({ type: "SET_CREATING_CHAT", payload: true });
+		try {
+			const chat = await api.createChat(state.value.selectedProjectId, title);
+			dispatch({ type: "UPSERT_CHAT", payload: chat });
+			persistedSelectedChatIdRef = chat.id;
+			await persistWorkspaceSelection(state.value.selectedProjectId, chat.id);
+			return chat;
+		} finally {
+			dispatch({ type: "SET_CREATING_CHAT", payload: false });
+		}
+	};
+
+	const selectProject = (projectId: string) => {
+		if (projectId === state.value.selectedProjectId) {
+			return;
+		}
+
+		dispatch({ type: "SET_SELECTED_CHAT", payload: null });
+		dispatch({ type: "SET_SELECTED_PROJECT", payload: projectId });
+		persistedSelectedChatIdRef = null;
+		void persistWorkspaceSelection(projectId, null);
+	};
+
+	const selectChat = (chatId: string) => {
+		if (chatId === state.value.selectedChatId) {
+			return;
+		}
+
+		dispatch({ type: "SET_SELECTED_CHAT", payload: chatId });
+		persistedSelectedChatIdRef = chatId;
+		void persistWorkspaceSelection(state.value.selectedProjectId, chatId);
+	};
+
+	const deleteProject = async (projectId: string) => {
+		try {
+			const deleted = await api.deleteProject(projectId);
+			if (!deleted.deleted) {
+				throw new Error("Unable to delete workspace");
+			}
+
+			if (state.value.selectedProjectId === projectId) {
+				await persistWorkspaceSelection(null, null);
+			}
+
+			await loadProjectsFromSelection();
+		} catch {
+			addError("Unable to delete workspace", "rest", "NETWORK");
+		}
+	};
+
+	const deleteChat = async (chatId: string) => {
+		try {
+			const deleted = await api.deleteChat(chatId);
+			if (!deleted.deleted) {
+				throw new Error("Unable to delete thread");
+			}
+
+			const preferredChatId = state.value.selectedChatId === chatId ? null : state.value.selectedChatId;
+
+			if (state.value.selectedChatId === chatId && state.value.selectedProjectId) {
+				await persistWorkspaceSelection(state.value.selectedProjectId, null);
+			}
+
+			if (state.value.selectedProjectId) {
+				await loadChatsForProject(state.value.selectedProjectId, preferredChatId);
+			}
+		} catch {
+			addError("Unable to delete thread", "rest", "NETWORK");
 		}
 	};
 
@@ -552,11 +739,19 @@ const createWorkspaceFlowHarness = () => {
 	return {
 		getState: () => state.value,
 		bootstrap,
+		loadProjectsFromSelection,
 		createProject,
+		createProjectWithSelection,
 		createChat,
+		createChatWithSelection,
 		sendMessage,
 		connectRealtime,
 		handleWsEvent,
+		handleWsState,
+		selectProject,
+		selectChat,
+		deleteProject,
+		deleteChat,
 	};
 };
 
@@ -839,6 +1034,626 @@ describe("workspace frontend flow coverage", () => {
 		} finally {
 			globalThis.setTimeout = originalSetTimeout;
 			globalThis.clearTimeout = originalClearTimeout;
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("loadProjectsFromSelection restores selected project and chat from persisted selection", async () => {
+		const chatsByProject = {
+			"project-1": [
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-11",
+					projectId: "project-1",
+					provider: "fake",
+					status: "pending",
+					title: "Chat A",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-12",
+					projectId: "project-1",
+					provider: "fake",
+					status: "pending",
+					title: "Chat B",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				},
+			],
+			"project-2": [
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-21",
+					projectId: "project-2",
+					provider: "fake",
+					status: "pending",
+					title: "Chat C",
+					updatedAt: "2026-01-01T12:00:02.000Z",
+				},
+			],
+		};
+
+		const routeFixture = {
+			listProjects: () => [
+				{
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-1",
+					isFavorite: false,
+					name: "Project 1",
+					path: "/tmp/project-1",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+				{
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-2",
+					isFavorite: false,
+					name: "Project 2",
+					path: "/tmp/project-2",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+			],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "unused",
+				isFavorite: false,
+				name,
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: () => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: "unused",
+				projectId: "unused",
+				provider: "fake",
+				status: "pending",
+				title: "unused",
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			listMessages: () => [],
+			listChats: (projectId: string) => chatsByProject[projectId] ?? [],
+			getWorkspaceSelection: () => ({
+				selectedProjectId: "project-2",
+				selectedChatId: "chat-21",
+			}),
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.loadProjectsFromSelection();
+
+			const state = harness.getState();
+
+			expect(state.selectedProjectId).toBe("project-2");
+			expect(state.selectedChatId).toBe("chat-21");
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("loadProjectsFromSelection falls back to first project when saved project is missing", async () => {
+		const chatsByProject = {
+			"project-1": [
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-11",
+					projectId: "project-1",
+					provider: "fake",
+					status: "pending",
+					title: "Chat A",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+			],
+			"project-2": [
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-21",
+					projectId: "project-2",
+					provider: "fake",
+					status: "pending",
+					title: "Chat B",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				},
+			],
+		};
+
+		const routeFixture = {
+			listProjects: () => [
+				{
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-1",
+					isFavorite: false,
+					name: "Project 1",
+					path: "/tmp/project-1",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+				{
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-2",
+					isFavorite: false,
+					name: "Project 2",
+					path: "/tmp/project-2",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+			],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "unused",
+				isFavorite: false,
+				name,
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: () => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: "unused",
+				projectId: "unused",
+				provider: "fake",
+				status: "pending",
+				title: "unused",
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			listMessages: () => [],
+			listChats: (projectId: string) => chatsByProject[projectId] ?? [],
+			getWorkspaceSelection: () => ({
+				selectedProjectId: "missing-project",
+				selectedChatId: "missing-chat",
+			}),
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.loadProjectsFromSelection();
+
+			const state = harness.getState();
+
+			expect(state.selectedProjectId).toBe("project-1");
+			expect(state.selectedChatId).toBe("chat-11");
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("createProjectWithSelection persists workspace selection", async () => {
+		let persistedSelection: { selectedProjectId: string | null; selectedChatId: string | null } = {
+			selectedProjectId: null,
+			selectedChatId: null,
+		};
+
+		const routeFixture = {
+			listProjects: () => [],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: () => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: "unused",
+				projectId: "unused",
+				provider: "fake",
+				status: "pending",
+				title: "unused",
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			listMessages: () => [],
+			updateWorkspaceSelection: (selection) => {
+				persistedSelection = selection;
+				return selection;
+			},
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			const project = await harness.createProjectWithSelection({
+				name: "Workspace with persistence",
+				path: "/tmp/project",
+			});
+
+			expect(project.id).toBe("project-1");
+			expect(persistedSelection).toEqual({
+				selectedProjectId: project.id,
+				selectedChatId: null,
+			});
+			expect(harness.getState().selectedProjectId).toBe(project.id);
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("createChatWithSelection persists selected chat and workspace selection", async () => {
+		let persistedSelection: { selectedProjectId: string | null; selectedChatId: string | null } = {
+			selectedProjectId: null,
+			selectedChatId: null,
+		};
+
+		const routeFixture = {
+			listProjects: () => [],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (projectId, { title }) => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: "chat-1",
+				projectId,
+				provider: "fake",
+				status: "pending",
+				title: title ?? "Chat",
+				updatedAt: "2026-01-01T12:00:01.000Z",
+			}),
+			listMessages: () => [],
+			listChats: () => [],
+			updateWorkspaceSelection: (selection) => {
+				persistedSelection = selection;
+				return selection;
+			},
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			const project = await harness.createProjectWithSelection({
+				name: "Project",
+				path: "/tmp/project",
+			});
+			const chat = await harness.createChatWithSelection("Chat with selection");
+
+			expect(project.id).toBe("project-1");
+			expect(chat?.id).toBe("chat-1");
+			expect(persistedSelection).toEqual({
+				selectedProjectId: project.id,
+				selectedChatId: "chat-1",
+			});
+			expect(harness.getState().selectedChatId).toBe("chat-1");
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("selectProject persists workspace selection", async () => {
+		let persistedSelection: { selectedProjectId: string | null; selectedChatId: string | null } = {
+			selectedProjectId: null,
+			selectedChatId: null,
+		};
+
+		const routeFixture = {
+			listProjects: () => [],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: name?.includes("Second") ? "project-2" : "project-1",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (projectId, { title }) => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: `${projectId}-chat`,
+				projectId,
+				provider: "fake",
+				status: "pending",
+				title: title ?? "Chat",
+				updatedAt: "2026-01-01T12:00:01.000Z",
+			}),
+			listMessages: () => [],
+			updateWorkspaceSelection: (selection) => {
+				persistedSelection = selection;
+				return selection;
+			},
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.createProjectWithSelection({
+				name: "First project",
+				path: "/tmp/first",
+			});
+			await harness.createProject({
+				name: "Second project",
+				path: "/tmp/second",
+			});
+
+			await harness.selectProject("project-2");
+			const state = harness.getState();
+
+			expect(state.selectedProjectId).toBe("project-2");
+			expect(persistedSelection).toEqual({
+				selectedProjectId: "project-2",
+				selectedChatId: null,
+			});
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("selectChat persists workspace selection", async () => {
+		const persistedSelections: Array<{ selectedProjectId: string | null; selectedChatId: string | null }> = [];
+
+		const routeFixture = {
+			listProjects: () => [],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (_projectId, { title }) => {
+				const id = title?.includes("Second") ? "chat-2" : "chat-1";
+				return {
+					diffAdded: 0,
+					diffRemoved: 0,
+					id,
+					projectId: "project-1",
+					provider: "fake",
+					status: "pending",
+					title: title ?? "Chat",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				};
+			},
+			listMessages: () => [],
+			updateWorkspaceSelection: (selection) => {
+				persistedSelections.push(selection);
+				return selection;
+			},
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.createProjectWithSelection({
+				name: "Project",
+				path: "/tmp/project",
+			});
+			await harness.createChat("First chat");
+			await harness.createChat("Second chat");
+			await harness.selectChat("chat-1");
+
+			expect(persistedSelections.at(-1)).toEqual({
+				selectedProjectId: "project-1",
+				selectedChatId: "chat-1",
+			});
+			expect(harness.getState().selectedChatId).toBe("chat-1");
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("deleteChat when selected clears selected chat through persisted selection", async () => {
+		let persistedSelection: { selectedProjectId: string | null; selectedChatId: string | null } = {
+			selectedProjectId: null,
+			selectedChatId: null,
+		};
+
+			const chatsByProject: Record<string, ChatDTO[]> = {
+			"project-1": [
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-1",
+					projectId: "project-1",
+					provider: "fake",
+					status: "pending",
+					title: "First chat",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-2",
+					projectId: "project-1",
+					provider: "fake",
+					status: "pending",
+					title: "Second chat",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				},
+			],
+		};
+
+		const routeFixture = {
+			listProjects: () => [
+				{
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-1",
+					isFavorite: false,
+					name: "Project",
+					path: "/tmp/project",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+			],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (projectId, { title }) => {
+				const id = title?.includes("Second") ? "chat-2" : "chat-1";
+				const chat = {
+					diffAdded: 0,
+					diffRemoved: 0,
+					id,
+					projectId,
+					provider: "fake",
+					status: "pending",
+					title: title ?? "Chat",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				};
+				chatsByProject[projectId] = [...(chatsByProject[projectId] ?? []), chat];
+				return chat;
+			},
+			listMessages: () => [],
+			listChats: (projectId: string) => chatsByProject[projectId] ?? [],
+			getWorkspaceSelection: () => ({
+				selectedProjectId: "project-1",
+				selectedChatId: "chat-2",
+			}),
+			updateWorkspaceSelection: (selection) => {
+				persistedSelection = selection;
+				return selection;
+			},
+			deleteChat: (chatId) => {
+				chatsByProject["project-1"] = chatsByProject["project-1"].filter((chat) => chat.id !== chatId);
+				return { deleted: true };
+			},
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.loadProjectsFromSelection();
+			await harness.deleteChat("chat-2");
+
+			expect(harness.getState().selectedProjectId).toBe("project-1");
+			expect(harness.getState().selectedChatId).toBe("chat-1");
+			expect(persistedSelection).toEqual({
+				selectedProjectId: "project-1",
+				selectedChatId: null,
+			});
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
+	test("deleteProject when selected clears project and chat and reloads projects", async () => {
+		let projects = [
+			{
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: "Project 1",
+				path: "/tmp/project-1",
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			},
+			{
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-2",
+				isFavorite: false,
+				name: "Project 2",
+				path: "/tmp/project-2",
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			},
+		];
+			const chatsByProject: Record<string, ChatDTO[]> = {
+			"project-1": [],
+			"project-2": [
+				{
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-21",
+					projectId: "project-2",
+					provider: "fake",
+					status: "pending",
+					title: "New chat",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				},
+			],
+		};
+		let persistedSelection: { selectedProjectId: string | null; selectedChatId: string | null } = {
+			selectedProjectId: null,
+			selectedChatId: null,
+		};
+
+		const routeFixture = {
+			listProjects: () => projects,
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: name?.includes("ignored") ? "project-ignored" : "project-generated",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (projectId, { title }) => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: "chat-created",
+				projectId,
+				provider: "fake",
+				status: "pending",
+				title: title ?? "Chat",
+				updatedAt: "2026-01-01T12:00:01.000Z",
+			}),
+			listMessages: () => [],
+			listChats: (projectId: string) => {
+				return chatsByProject[projectId] ?? [];
+			},
+			getWorkspaceSelection: () => ({
+				selectedProjectId: "project-1",
+				selectedChatId: "chat-11",
+			}),
+			updateWorkspaceSelection: (selection) => {
+				persistedSelection = selection;
+				return selection;
+			},
+			deleteProject: (projectId) => {
+				projects = projects.filter((project) => project.id !== projectId);
+				return { deleted: true };
+			},
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.loadProjectsFromSelection();
+			await harness.deleteProject("project-1");
+
+			expect(persistedSelection).toEqual({
+				selectedProjectId: null,
+				selectedChatId: null,
+			});
+			expect(harness.getState().selectedProjectId).toBe("project-2");
+			expect(harness.getState().selectedChatId).toBe("chat-21");
+			expect(harness.getState().projects).toHaveLength(1);
+		} finally {
 			fetchMock.restore();
 			wsMock.restore();
 		}

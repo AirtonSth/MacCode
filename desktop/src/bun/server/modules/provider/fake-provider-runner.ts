@@ -4,14 +4,75 @@ import { fileURLToPath } from "node:url";
 
 import type { FakeProviderResult, FakeProviderRunOptions } from "../../shared/core/server.types";
 
-const providerPath = join(
-	dirname(fileURLToPath(import.meta.url)),
-	"..",
-	"..",
-	"..",
-	"providers",
-	"fake-codex-provider.mjs",
-);
+const fakeProviderFile = "fake-codex-provider.mjs";
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const chunkText = (value: string, size = 20): string[] => {
+	const chunks: string[] = [];
+
+	for (let index = 0; index < value.length; index += size) {
+		chunks.push(value.slice(index, index + size));
+	}
+
+	return chunks;
+};
+
+const resolveFakeProviderPath = (): string | null => {
+	const moduleDir = dirname(fileURLToPath(import.meta.url));
+	const cwd = process.cwd();
+	const candidateBases = new Set<string>([moduleDir, cwd]);
+	let moduleCursor = moduleDir;
+	let cwdCursor = cwd;
+
+	for (let index = 0; index < 5; index += 1) {
+		const next = dirname(moduleCursor);
+
+		if (next === moduleCursor) {
+			break;
+		}
+
+		candidateBases.add(next);
+		moduleCursor = next;
+	}
+
+	for (let index = 0; index < 5; index += 1) {
+		const next = dirname(cwdCursor);
+
+		if (next === cwdCursor) {
+			break;
+		}
+
+		candidateBases.add(next);
+		cwdCursor = next;
+	}
+
+	const candidates = Array.from(candidateBases).flatMap((base) => [
+		join(base, "src", "bun", "providers", fakeProviderFile),
+		join(base, "providers", fakeProviderFile),
+	]);
+
+	return candidates.find(existsSync) ?? null;
+};
+
+const runFallbackFakeProvider = async ({
+	onDelta,
+	text,
+}: Pick<FakeProviderRunOptions, "onDelta" | "text">): Promise<FakeProviderResult> => {
+	const assistantText = `Echo: ${text}`;
+
+	for (const chunk of chunkText(assistantText)) {
+		await sleep(10);
+		onDelta(chunk);
+	}
+
+	return {
+		assistantText,
+		diffAdded: assistantText.length,
+		diffRemoved: Math.max(0, assistantText.length - 1),
+		status: "completed",
+	};
+};
 
 interface ProviderEventMap {
 	delta?: unknown;
@@ -149,14 +210,10 @@ const emitEventFromLine = (line: string, onDelta: (delta: string) => void): Fake
 
 export const FakeProviderRunner = {
 	async run({ chatId, onDelta, text }: FakeProviderRunOptions): Promise<FakeProviderResult> {
-		if (!existsSync(providerPath)) {
-			return {
-				assistantText: "",
-				diffAdded: 0,
-				diffRemoved: 0,
-				error: "fake provider missing",
-				status: "failed",
-			};
+		const providerPath = resolveFakeProviderPath();
+
+		if (!providerPath) {
+			return runFallbackFakeProvider({ onDelta, text });
 		}
 
 		const command = [
@@ -169,11 +226,33 @@ export const FakeProviderRunner = {
 			...(process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL === "1" ? ["--fail"] : []),
 		];
 
-		const proc = Bun.spawn({
-			cmd: command,
-			stderr: "pipe",
-			stdout: "pipe",
-		});
+		let proc: ReturnType<typeof Bun.spawn> | undefined;
+
+		try {
+			proc = Bun.spawn({
+				cmd: command,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+		} catch (error) {
+			return {
+				assistantText: "",
+				diffAdded: 0,
+				diffRemoved: 0,
+				error: `fake provider failed to start: ${error instanceof Error ? error.message : "unknown"}`,
+				status: "failed",
+			};
+		}
+
+		if (!proc) {
+			return {
+				assistantText: "",
+				diffAdded: 0,
+				diffRemoved: 0,
+				error: "fake provider failed to start",
+				status: "failed",
+			};
+		}
 
 		const decoder = new TextDecoder();
 

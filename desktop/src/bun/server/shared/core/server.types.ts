@@ -55,6 +55,11 @@ export interface MessageDTO {
 	role: "user" | "assistant";
 }
 
+export interface WorkspaceSelectionDTO {
+	selectedProjectId: string | null;
+	selectedChatId: string | null;
+}
+
 export interface ProjectDTO {
 	createdAt: string;
 	id: string;

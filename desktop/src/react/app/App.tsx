@@ -9,6 +9,7 @@ import {
 	RefreshCcw,
 	Sparkles,
 	Star,
+	Trash2,
 	X,
 } from "lucide-react";
 
@@ -170,6 +171,7 @@ const App = (): JSX.Element => {
 	const shouldReduceMotion = useReducedMotion();
 	const wsRef = useRef<ReturnType<(typeof RemoteCodeRealtime)["createClient"]> | null>(null);
 	const selectedChatIdRef = useRef<string | null>(null);
+	const persistedSelectedChatIdRef = useRef<string | null>(null);
 	const sidebarWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
 	const isSidebarResizingRef = useRef<boolean>(false);
 	const sidebarResizeStartXRef = useRef<number>(0);
@@ -297,6 +299,24 @@ const App = (): JSX.Element => {
 		return error instanceof Error ? error.message : fallback;
 	}, []);
 
+	const persistWorkspaceSelection = useCallback(
+		async (selectedProjectId: string | null, selectedChatId: string | null) => {
+			try {
+				await api.updateWorkspaceSelection({
+					selectedChatId,
+					selectedProjectId,
+				});
+			} catch (error) {
+				addError(
+					formatApiErrorMessage(error, "Unable to persist selection"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			}
+		},
+		[addError, api, formatApiErrorCode, formatApiErrorMessage],
+	);
+
 	const loadMessagesForChat = useCallback(
 		async (chatId: string | null) => {
 			if (!chatId) {
@@ -323,7 +343,7 @@ const App = (): JSX.Element => {
 	);
 
 	const loadChatsForProject = useCallback(
-		async (projectId: string | null) => {
+		async (projectId: string | null, preferredChatId: string | null = null) => {
 			if (!projectId) {
 				dispatch({ payload: [], type: "SET_CHATS" });
 				dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
@@ -336,6 +356,9 @@ const App = (): JSX.Element => {
 			try {
 				const chats = await api.listChats(projectId);
 				dispatch({ payload: chats, type: "SET_CHATS" });
+				if (preferredChatId && chats.some((chat) => chat.id === preferredChatId)) {
+					dispatch({ payload: preferredChatId, type: "SET_SELECTED_CHAT" });
+				}
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to load chats for project"),
@@ -345,6 +368,7 @@ const App = (): JSX.Element => {
 				dispatch({ payload: [], type: "SET_CHATS" });
 			} finally {
 				dispatch({ payload: false, type: "SET_CHATS_LOADING" });
+				persistedSelectedChatIdRef.current = null;
 			}
 		},
 		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
@@ -353,12 +377,19 @@ const App = (): JSX.Element => {
 	const loadProjects = useCallback(async () => {
 		dispatch({ payload: true, type: "SET_PROJECTS_LOADING" });
 		try {
-			const projects = await api.listProjects();
+			const [projects, selection] = await Promise.all([
+				api.listProjects(),
+				api.getWorkspaceSelection().catch(() => ({ selectedChatId: null, selectedProjectId: null })),
+			]);
+			const hasSelection = selection.selectedProjectId
+				? projects.some((project) => project.id === selection.selectedProjectId)
+				: false;
+			const selectedProjectId = hasSelection ? selection.selectedProjectId : projects[0]?.id ?? null;
+			const selectedChatId = hasSelection ? selection.selectedChatId : null;
+
+			persistedSelectedChatIdRef.current = selectedChatId;
 			dispatch({ payload: projects, type: "SET_PROJECTS" });
-			dispatch({
-				payload: projects[0]?.id ?? null,
-				type: "SET_SELECTED_PROJECT",
-			});
+			dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
 		} catch (error) {
 			addError(
 				formatApiErrorMessage(error, "Unable to load projects"),
@@ -457,7 +488,7 @@ const App = (): JSX.Element => {
 	}, [handleBootstrap]);
 
 	useEffect(() => {
-		void loadChatsForProject(state.selectedProjectId);
+		void loadChatsForProject(state.selectedProjectId, persistedSelectedChatIdRef.current);
 	}, [loadChatsForProject, state.selectedProjectId]);
 
 	useEffect(() => {
@@ -495,6 +526,7 @@ const App = (): JSX.Element => {
 				const project = await api.createProject(input);
 				dispatch({ payload: project, type: "UPSERT_PROJECT" });
 				dispatch({ payload: project.id, type: "SET_SELECTED_PROJECT" });
+				await persistWorkspaceSelection(project.id, null);
 				return project;
 			} catch (error) {
 				addError(
@@ -507,7 +539,7 @@ const App = (): JSX.Element => {
 				dispatch({ payload: false, type: "SET_CREATING_PROJECT" });
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
+		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
 	);
 
 	const handleToggleFavorite = useCallback(
@@ -538,6 +570,7 @@ const App = (): JSX.Element => {
 			try {
 				const chat = await api.createChat(state.selectedProjectId, title);
 				dispatch({ payload: chat, type: "UPSERT_CHAT" });
+				await persistWorkspaceSelection(state.selectedProjectId, chat.id);
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to create chat"),
@@ -548,7 +581,7 @@ const App = (): JSX.Element => {
 				dispatch({ payload: false, type: "SET_CREATING_CHAT" });
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, state.selectedProjectId],
+		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection, state.selectedProjectId],
 	);
 
 	const handleSendMessage = useCallback(
@@ -600,8 +633,10 @@ const App = (): JSX.Element => {
 
 			dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
 			dispatch({ payload: projectId, type: "SET_SELECTED_PROJECT" });
+			persistedSelectedChatIdRef.current = null;
+			void persistWorkspaceSelection(projectId, null);
 		},
-		[dispatch, state.selectedProjectId],
+		[dispatch, persistWorkspaceSelection, state.selectedProjectId],
 	);
 
 	const handleSelectChat = useCallback(
@@ -611,8 +646,78 @@ const App = (): JSX.Element => {
 			}
 
 			dispatch({ payload: chatId, type: "SET_SELECTED_CHAT" });
+			persistedSelectedChatIdRef.current = chatId;
+			void persistWorkspaceSelection(state.selectedProjectId, chatId);
 		},
-		[dispatch, state.selectedChatId],
+		[dispatch, persistWorkspaceSelection, state.selectedChatId, state.selectedProjectId],
+	);
+
+	const handleDeleteProject = useCallback(
+		async (projectId: string) => {
+			try {
+				const deletionResult = await api.deleteProject(projectId);
+				if (!deletionResult.deleted) {
+					throw new Error("Unable to delete workspace");
+				}
+				if (state.selectedProjectId === projectId) {
+					await persistWorkspaceSelection(null, null);
+				}
+
+				await loadProjects();
+			} catch (error) {
+				addError(
+					formatApiErrorMessage(error, "Unable to delete workspace"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			}
+		},
+		[
+			addError,
+			api,
+			formatApiErrorCode,
+			formatApiErrorMessage,
+			loadProjects,
+			persistWorkspaceSelection,
+			state.selectedProjectId,
+		],
+	);
+
+	const handleDeleteChat = useCallback(
+		async (chatId: string) => {
+			try {
+				const deletionResult = await api.deleteChat(chatId);
+				if (!deletionResult.deleted) {
+					throw new Error("Unable to delete thread");
+				}
+
+				const preferredChatId = state.selectedChatId === chatId ? null : state.selectedChatId;
+
+				if (state.selectedChatId === chatId && state.selectedProjectId) {
+					await persistWorkspaceSelection(state.selectedProjectId, null);
+				}
+
+				if (state.selectedProjectId) {
+					await loadChatsForProject(state.selectedProjectId, preferredChatId);
+				}
+			} catch (error) {
+				addError(
+					formatApiErrorMessage(error, "Unable to delete thread"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			}
+		},
+		[
+			addError,
+			api,
+			formatApiErrorCode,
+			formatApiErrorMessage,
+			loadChatsForProject,
+			persistWorkspaceSelection,
+			state.selectedChatId,
+			state.selectedProjectId,
+		],
 	);
 
 	const clearAllErrors = useCallback(() => {
@@ -678,11 +783,6 @@ const App = (): JSX.Element => {
 					<span className="noise-mask" />
 
 					<aside className="relative z-10 flex min-h-0 flex-col border-r border-sidebar-border/80 bg-sidebar/65 p-3 backdrop-blur-3xl max-[920px]:border-b max-[920px]:border-r-0">
-						<div className="mb-3 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2">
-							<p className="text-xs font-semibold tracking-wide text-slate-200">Threads</p>
-							<p className="mt-0.5 text-[11px] text-slate-400">Running in ElectroBun</p>
-						</div>
-
 						<Button
 							className="w-full justify-start gap-2 rounded-xl border border-white/15 bg-white/[0.05] text-slate-200 hover:bg-white/[0.09]"
 							disabled={isOpeningProject}
@@ -718,7 +818,7 @@ const App = (): JSX.Element => {
 												)}
 												key={project.id}
 												layout={!shouldReduceMotion}
-											>
+												>
 												<div className="flex items-start gap-2">
 													<button
 														aria-label={`Select ${project.name}`}
@@ -768,6 +868,24 @@ const App = (): JSX.Element => {
 															{project.isFavorite ? "Remove favorite" : "Mark as favorite"}
 														</TooltipContent>
 													</Tooltip>
+													<Tooltip>
+														<TooltipTrigger asChild>
+															<Button
+																aria-label={`Delete ${project.name}`}
+																className="shrink-0 text-rose-300 hover:text-rose-100"
+																onClick={(event) => {
+																	event.stopPropagation();
+																	void handleDeleteProject(project.id);
+																}}
+																size="icon"
+																type="button"
+																variant="ghost"
+															>
+																<Trash2 className="h-4 w-4" />
+															</Button>
+														</TooltipTrigger>
+														<TooltipContent>Delete workspace</TooltipContent>
+													</Tooltip>
 												</div>
 
 												{isSelectedProject ? (
@@ -779,27 +897,47 @@ const App = (): JSX.Element => {
 														) : (
 															state.chats.map((chat) => (
 																<motion.li key={chat.id} layout={!shouldReduceMotion}>
-																	<button
-																		aria-label={`Open ${chat.title}`}
+																	<div
 																		className={cn(
-																			"flex w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left text-sm transition",
+																			"flex items-center gap-2 rounded-xl border px-2.5 py-2 text-left text-sm transition",
 																			state.selectedChatId === chat.id
 																				? "border-sky-300/30 bg-sky-400/10 text-sky-100"
 																				: "border-transparent text-slate-300 hover:border-white/10 hover:bg-white/[0.04]",
 																		)}
-																		onClick={() => {
-																			handleSelectChat(chat.id);
-																		}}
-																		type="button"
 																	>
-																		<span className="inline-flex min-w-0 items-center gap-2">
+																		<button
+																			aria-label={`Open ${chat.title}`}
+																			className="inline-flex min-w-0 flex-1 items-center gap-2"
+																			onClick={() => {
+																				handleSelectChat(chat.id);
+																			}}
+																			type="button"
+																		>
 																			<MessageSquareText className="h-3.5 w-3.5 shrink-0 opacity-80" />
 																			<span className="truncate">{chat.title}</span>
-																		</span>
+																		</button>
 																		<span className="shrink-0 text-[11px] text-slate-400">
 																			{formatRelativeTime(chat.updatedAt)}
 																		</span>
-																	</button>
+																		<Tooltip>
+																			<TooltipTrigger asChild>
+																				<Button
+																					aria-label={`Delete ${chat.title}`}
+																					className="shrink-0 text-rose-300 hover:text-rose-100"
+																					onClick={(event) => {
+																						event.stopPropagation();
+																						void handleDeleteChat(chat.id);
+																					}}
+																					size="icon"
+																					type="button"
+																					variant="ghost"
+																				>
+																					<Trash2 className="h-4 w-4" />
+																				</Button>
+																			</TooltipTrigger>
+																			<TooltipContent>Delete thread</TooltipContent>
+																		</Tooltip>
+																	</div>
 																</motion.li>
 															))
 														)}

@@ -10,6 +10,9 @@ import { MessageService } from "./modules/message/message.service";
 import { ProjectController } from "./modules/project/project.controller";
 import { ProjectRepository } from "./modules/project/project.repository";
 import { ProjectService } from "./modules/project/project.service";
+import { SelectionController } from "./modules/selection/selection.controller";
+import { createSelectionRepository } from "./modules/selection/selection.repository";
+import { createSelectionService } from "./modules/selection/selection.service";
 import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
@@ -24,10 +27,12 @@ export const ServerBootstrap = {
 		const projectRepository = new ProjectRepository(databaseClient.orm);
 		const chatRepository = new ChatRepository(databaseClient.orm);
 		const messageRepository = new MessageRepository(databaseClient.orm);
+		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
 		const messageService = new MessageService(chatRepository, messageRepository);
+		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
 		const wsService = new WsService(chatRepository, messageRepository);
 
 		const app = new Elysia()
@@ -35,7 +40,8 @@ export const ServerBootstrap = {
 				group
 					.use(ProjectController.build(projectService))
 					.use(ChatController.build(chatService))
-					.use(MessageController.build(messageService)),
+					.use(MessageController.build(messageService))
+					.use(SelectionController.build(workspaceSelectionService)),
 			)
 			.use(WsController.build(wsService));
 
