@@ -299,9 +299,7 @@ const App = (): JSX.Element => {
 			try {
 				const project = await api.createProject(input);
 				dispatch({ type: "UPSERT_PROJECT", payload: project });
-				if (!state.selectedProjectId) {
-					dispatch({ type: "SET_SELECTED_PROJECT", payload: project.id });
-				}
+				dispatch({ type: "SET_SELECTED_PROJECT", payload: project.id });
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to create project"),
@@ -312,7 +310,7 @@ const App = (): JSX.Element => {
 				dispatch({ type: "SET_CREATING_PROJECT", payload: false });
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, state.selectedProjectId],
+		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
 	);
 
 	const handleToggleFavorite = useCallback(
@@ -430,7 +428,9 @@ const App = (): JSX.Element => {
 			return;
 		}
 
-		const trimmedPath = projectPath.trim();
+		const trimmedPath = projectPath
+			.trim()
+			.replace(/^"+|"+$/g, "");
 		if (!trimmedPath) {
 			return;
 		}
@@ -459,27 +459,8 @@ const App = (): JSX.Element => {
 
 	return (
 		<div className="codex-desktop">
-			<div className="codex-window">
-				<aside className="codex-sidebar">
-					<nav className="sidebar-nav" aria-label="Workspace navigation">
-						<button
-							className="nav-entry active"
-							disabled={!selectedProject || state.isCreatingChat}
-							onClick={() => {
-								void handleCreateChat("New thread");
-							}}
-							type="button"
-						>
-							New thread
-						</button>
-						<button className="nav-entry" type="button">
-							Automations
-						</button>
-						<button className="nav-entry" type="button">
-							Skills
-						</button>
-					</nav>
-
+				<div className="codex-window">
+					<aside className="codex-sidebar">
 					<div className="sidebar-caption">Threads</div>
 					<div className="thread-scroller">
 						{state.projectsLoading ? (
@@ -563,11 +544,6 @@ const App = (): JSX.Element => {
 						)}
 					</div>
 
-					<footer className="sidebar-footer">
-						<button className="sidebar-settings" type="button">
-							Settings
-						</button>
-					</footer>
 				</aside>
 
 				<main className="codex-main">
@@ -640,6 +616,16 @@ const App = (): JSX.Element => {
 						<div className="composer-dock">
 							{!state.selectedChatId ? (
 								<div className="suggestions">
+									<button
+										className="header-pill"
+										onClick={() => {
+											void handleCreateChat("New thread");
+										}}
+										disabled={state.isCreatingChat}
+										type="button"
+									>
+										{state.isCreatingChat ? "Creating..." : "New thread"}
+									</button>
 									{SUGGESTION_CARDS.map((card) => (
 										<button className="suggestion-card" key={card} type="button">
 											{card}
