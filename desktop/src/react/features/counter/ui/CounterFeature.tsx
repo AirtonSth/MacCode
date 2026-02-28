@@ -9,13 +9,13 @@ export function CounterFeature(): JSX.Element {
 				<h2>Contador</h2>
 				<p className="value">Valor atual: {count}</p>
 				<div className="actions">
-					<button type="button" onClick={increment}>
+					<button onClick={increment} type="button">
 						+1
 					</button>
-					<button type="button" onClick={decrement}>
+					<button onClick={decrement} type="button">
 						-1
 					</button>
-					<button type="button" onClick={reset}>
+					<button onClick={reset} type="button">
 						Reset
 					</button>
 				</div>

@@ -1,0 +1,202 @@
+import { expect, test } from "bun:test";
+
+import { createEdenClient, createEdenWsClient } from "../../eden-client";
+import { createTestServer } from "../../shared/core/test-server";
+
+type ServerEvent =
+	| {
+			data: {
+				chatId: string;
+				code?: string;
+				delta?: string;
+				diffAdded?: number;
+				diffRemoved?: number;
+				message?: string;
+				status?: "pending" | "running" | "completed" | "failed";
+				updatedAt?: string;
+			};
+			event: "assistant_delta" | "assistant_done" | "chat_updated" | "error";
+	  };
+
+const parseEvent = (raw: unknown): ServerEvent | null => {
+	if (typeof raw === "string") {
+		try {
+			return parseEvent(JSON.parse(raw));
+		} catch {
+			return null;
+		}
+	}
+
+	if (!raw || typeof raw !== "object") {
+		return null;
+	}
+
+	const value = raw as { data: unknown; event: string };
+
+	if (typeof value.event !== "string") {
+		return null;
+	}
+
+	if (typeof value.data !== "object" || value.data === null) {
+		return null;
+	}
+
+	const payload = value.data as { chatId?: unknown };
+
+	if (typeof payload.chatId !== "string") {
+		return null;
+	}
+
+	return {
+		data: value.data as ServerEvent["data"],
+		event: value.event as ServerEvent["event"],
+	};
+};
+
+const waitForCondition = async (predicate: () => boolean, timeoutMs = 4000): Promise<void> =>
+	{ await new Promise<void>((resolve, reject) => {
+		const startedAt = performance.now();
+		const timer = setInterval(() => {
+			if (!predicate()) {
+				if (performance.now() - startedAt >= timeoutMs) {
+					clearInterval(timer);
+					reject(new Error("timed out waiting for ws condition"));
+				}
+
+				return;
+			}
+
+			clearInterval(timer);
+			resolve();
+		}, 20);
+	}); };
+
+test("join_chat não faz replay e stream gera assistant_delta + done", async () => {
+	const { baseUrl, cleanup, client } = await createTestServer();
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "chat" });
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		const authClient = createEdenClient({ baseUrl });
+		const ws = await createEdenWsClient(authClient);
+		const events: ServerEvent[] = [];
+
+		ws.subscribe((event) => {
+			const parsed = parseEvent((event as { data: unknown }).data);
+
+			if (!parsed) {
+				return;
+			}
+
+			events.push(parsed);
+		});
+
+		ws.send({ data: { chatId }, event: "join_chat" });
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(events.length).toBe(0);
+
+		ws.send({ data: { chatId, text: "ping" }, event: "user_message" });
+		await waitForCondition(() =>
+			events.some(
+				(event) => event.event === "assistant_done" && event.data.chatId === chatId,
+			),
+		);
+
+		const orderedEvents = events.filter((event) => event.data.chatId === chatId);
+		const runningIndex = orderedEvents.findIndex(
+			(event) => event.event === "chat_updated" && event.data.status === "running",
+		);
+		const doneIndex = orderedEvents.findIndex(
+			(event) => event.event === "assistant_done" && event.data.chatId === chatId,
+		);
+		const completedIndex = orderedEvents.findIndex(
+			event => event.event === "chat_updated" && event.data.status === "completed",
+		);
+		const deltaIndex = orderedEvents.findIndex((event) => event.event === "assistant_delta");
+
+		expect(runningIndex).toBeGreaterThanOrEqual(0);
+		expect(deltaIndex).toBeGreaterThan(runningIndex);
+		expect(doneIndex).toBeGreaterThan(deltaIndex);
+		expect(completedIndex).toBeGreaterThan(doneIndex);
+
+		const messages = await client.v1.chats({ id: chatId }).messages.get();
+		const messagesResult = (messages.data as { messages: { role: "user" | "assistant" }[] }).messages;
+
+		expect(messagesResult.length).toBe(2);
+		expect(messagesResult[0].role).toBe("user");
+		expect(messagesResult[1].role).toBe("assistant");
+		ws.close();
+	} finally {
+		await cleanup();
+	}
+});
+
+test("Provider fake falha marca chat como failed", async () => {
+	const { baseUrl, cleanup, client } = await createTestServer();
+	const previous = process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL;
+
+	process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL = "1";
+
+	let failureObserved = false;
+	let chatUpdatedFailed = false;
+	let ended = false;
+	let socket: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "falha" });
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		socket = await createEdenWsClient(createEdenClient({ baseUrl }));
+		await new Promise<void>((resolve) => {
+			socket?.subscribe((event: any) => {
+				const {data} = event;
+
+				let payload: any = data;
+
+				if (typeof data === "string") {
+					try {
+						payload = JSON.parse(data);
+					} catch {
+						return;
+					}
+				}
+
+				if (!payload || typeof payload !== "object") {
+					return;
+				}
+
+				if (payload.event === "error" && payload.data?.code === "provider_failed") {
+					failureObserved = true;
+				}
+
+				if (payload.event === "chat_updated" && payload.data?.status === "failed") {
+					chatUpdatedFailed = true;
+				}
+
+				if (failureObserved && chatUpdatedFailed) {
+					ended = true;
+					resolve();
+				}
+			});
+			socket?.send({ data: { chatId, text: "vai falhar" }, event: "user_message" });
+		});
+
+		expect(ended).toBe(true);
+		expect(failureObserved).toBe(true);
+		expect(chatUpdatedFailed).toBe(true);
+	} finally {
+		if (previous === undefined) {
+			delete process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL;
+		} else {
+			process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL = previous;
+		}
+
+		socket?.close();
+		await cleanup();
+	}
+});

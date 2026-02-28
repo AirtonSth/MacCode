@@ -14,7 +14,12 @@
 		"strict": true,
 		"noUnusedLocals": true,
 		"noUnusedParameters": true,
-		"noFallthroughCasesInSwitch": true
+		"noFallthroughCasesInSwitch": true,
+		"baseUrl": ".",
+		"paths": {
+			"electrobun": ["./src/bun/types/electrobun-bun.d.ts"],
+			"electrobun/*": ["./src/bun/types/electrobun-bun.d.ts"]
+		}
 	},
 	"include": ["src"],
 	"exclude": ["node_modules", "dist", "build", "../../package/dist"]

@@ -1,23 +1,23 @@
-import { useState } from "react";
+import { useCallback,useState } from "react";
 
-type UseCounterProps = {
-	initialValue?: number;
-};
-
-export type UseCounterResult = {
+export interface UseCounterResult {
 	count: number;
-	increment: () => void;
 	decrement: () => void;
+	increment: () => void;
 	reset: () => void;
-};
+}
+
+interface UseCounterProps {
+	initialValue?: number;
+}
 
 export function useCounter({ initialValue = 0 }: UseCounterProps = {}): UseCounterResult {
 	const [count, setCount] = useState(initialValue);
 
 	return {
 		count,
-		increment: () => setCount((value) => value + 1),
-		decrement: () => setCount((value) => value - 1),
-		reset: () => setCount(initialValue),
+		decrement: useCallback(() => { setCount((value) => value - 1); }, []),
+		increment: useCallback(() => { setCount((value) => value + 1); }, []),
+		reset: useCallback(() => { setCount(initialValue); }, []),
 	};
 }

@@ -1,37 +1,42 @@
 {
-	"name": "remotecode-electrobun",
-	"version": "1.0.0",
-	"description": "Electrobun app with React + Vite",
-	"scripts": {
-		"start": "vite build && electrobun dev",
-		"dev": "electrobun dev --watch",
-		"dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
-		"hmr": "vite --port 5173",
-		"build:canary": "vite build && electrobun build --env=canary",
-		"typecheck": "bun run tsc --noEmit",
-		"lint": "bunx eslint --fix ."
-	},
-	"dependencies": {
-		"electrobun": "1.14.4",
-		"react": "^18.3.1",
-		"react-dom": "^18.3.1"
-	},
-	"devDependencies": {
-		"@types/bun": "latest",
-		"@types/react": "^18.3.12",
-		"@types/react-dom": "^18.3.1",
-		"@vitejs/plugin-react": "^4.3.4",
-		"concurrently": "^9.1.0",
-		"eslint": "8.57.1",
-		"eslint-config-hardcore": "^49.0.0",
-		"husky": "^9.1.7",
-		"lint-staged": "^16.3.0",
-		"typescript": "^5.7.2",
-		"vite": "^6.0.3"
-	},
-	"lint-staged": {
-		"*.{ts,tsx,js,jsx}": [
-			"bunx eslint --fix"
-		]
-	}
+  "name": "remotecode-electrobun",
+  "version": "1.0.0",
+  "description": "Electrobun app with React + Vite",
+  "scripts": {
+    "start": "vite build && electrobun dev",
+    "dev": "electrobun dev --watch",
+    "dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
+    "hmr": "vite --port 5173",
+    "build:canary": "vite build && electrobun build --env=canary",
+    "test:backend": "bun test ./src/bun/server --pattern '.*\\.test\\.ts$'",
+    "typecheck": "bun run tsc --noEmit",
+    "lint": "bunx eslint --fix ."
+  },
+  "dependencies": {
+    "@elysiajs/eden": "^1.4.3",
+    "electrobun": "1.14.4",
+    "elysia": "^1.4.9",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "drizzle-orm": "^0.39.3",
+    "drizzle-kit": "^0.30.4"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "eslint": "8.57.1",
+    "eslint-config-hardcore": "^49.0.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.3.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx}": [
+      "bunx eslint --fix"
+    ]
+  }
 }

@@ -1,5 +1,8 @@
 import { BrowserWindow, Updater } from "electrobun/bun";
 
+import { createBackendServer } from "./server/app";
+import { serverConfig } from "./server/config";
+
 const DEV_SERVER_PORT = 5173;
 const DEV_SERVER_URL = `http://localhost:${DEV_SERVER_PORT}`;
 
@@ -21,6 +24,8 @@ async function getMainViewUrl() {
 
 	return "views://react/index.html";
 }
+
+await createBackendServer({ port: serverConfig.port });
 
 const url = await getMainViewUrl();
 
