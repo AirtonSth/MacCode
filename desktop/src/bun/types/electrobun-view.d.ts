@@ -28,6 +28,7 @@ export interface RPCConfig {
 
 	export namespace Electroview {
 		function defineRPC<T>(config: {
+			maxRequestTime?: number;
 			handlers: {
 				requests: Record<string, (...args: unknown[]) => unknown>;
 				messages: Record<string, (...args: unknown[]) => unknown>;

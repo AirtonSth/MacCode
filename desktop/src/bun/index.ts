@@ -4,6 +4,7 @@ import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
 
 const appRPC = BrowserView.defineRPC({
+	maxRequestTime: 120_000,
 	handlers: {
 		requests: {
 			openProjectDirectory: async () => {

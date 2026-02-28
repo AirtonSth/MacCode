@@ -91,10 +91,13 @@ const getFolderFallbackName = (projectPath: string): string => {
 	return segments[segments.length - 1] ?? "Project";
 };
 
+const OPEN_PROJECT_RPC_TIMEOUT_MS = 120_000;
+
 const electrobunView = (() => {
 	try {
 		return new Electroview({
 			rpc: Electroview.defineRPC({
+				maxRequestTime: OPEN_PROJECT_RPC_TIMEOUT_MS,
 				handlers: {
 					requests: {},
 					messages: {},
