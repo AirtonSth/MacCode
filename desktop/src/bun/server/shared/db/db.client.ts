@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { Database } from "bun:sqlite";
@@ -29,6 +30,11 @@ export class DatabaseClientFactory {
 	}
 
 private static getUserDataPath(): string {
+		const configuredUserDataPath = process.env.REMOTECODE_USER_DATA_PATH?.trim();
+		if (configuredUserDataPath) {
+			return configuredUserDataPath;
+		}
+
 		try {
 			const electrobun = requireModule("electrobun/bun") as {
 				Utils?: {
@@ -38,10 +44,15 @@ private static getUserDataPath(): string {
 				};
 			};
 
-			return electrobun.Utils?.paths?.userData || join(process.cwd(), ".remotecode");
+			const electrobunUserDataPath = electrobun.Utils?.paths?.userData?.trim();
+			if (electrobunUserDataPath) {
+				return electrobunUserDataPath;
+			}
 		} catch {
-			return join(process.cwd(), ".remotecode");
+			// Fallback below
 		}
+
+		return join(homedir(), ".remotecode");
 	}
 
 static async create(pathOverride?: string): Promise<DrizzleDatabaseClient> {

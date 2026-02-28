@@ -109,7 +109,7 @@ export const MessageComposer = ({
 						onKeyDown={handleInputKeyDown}
 						placeholder={
 							disabled
-								? "Select a chat to start."
+								? "Select a project to start."
 								: isRunning
 									? "Waiting for assistant response..."
 									: "Type a message to the coding assistant"

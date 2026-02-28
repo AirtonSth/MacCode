@@ -80,3 +80,43 @@ test("WsService runs streaming flow with provider and persists assistant message
 		rmSync(root, { force: true, recursive: true });
 	}
 });
+
+test("WsService.startUserMessage emits chat_not_found when chat is missing", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-missing-chat-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
+
+	try {
+		initializeDatabaseSchema(client.sqlite);
+
+		const chatRepository = createChatRepository(client.orm);
+		const messageRepository = createMessageRepository(client.orm);
+		const service = new WsService(chatRepository, messageRepository);
+
+		const events: ServerEvent[] = [];
+
+		await service.startUserMessage({
+			chatId: "missing-chat",
+			emit: (event) => {
+				if (typeof event === "object" && typeof event.event === "string") {
+					events.push(event);
+				}
+			},
+			text: "hello",
+		});
+
+		expect(events).toEqual([
+			{
+				data: {
+					chatId: "missing-chat",
+					code: "chat_not_found",
+					message: "chat not found",
+				},
+				event: "error",
+			},
+		]);
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});

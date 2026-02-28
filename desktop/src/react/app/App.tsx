@@ -5,7 +5,6 @@ import {
 	Folder,
 	FolderOpen,
 	MessageSquareText,
-	Plus,
 	RefreshCcw,
 	Sparkles,
 	Star,
@@ -22,6 +21,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../com
 import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
 import { useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
+import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
 import { RemoteCodeApi, RemoteCodeApiError } from "../shared/api/remotecode-http";
 import {
@@ -355,10 +355,14 @@ const App = (): JSX.Element => {
 			dispatch({ payload: true, type: "SET_CHATS_LOADING" });
 			try {
 				const chats = await api.listChats(projectId);
+				const hasPreferredChat = preferredChatId ? chats.some((chat) => chat.id === preferredChatId) : false;
+				const selectedChatId = hasPreferredChat ? preferredChatId : chats[0]?.id ?? null;
+
 				dispatch({ payload: chats, type: "SET_CHATS" });
-				if (preferredChatId && chats.some((chat) => chat.id === preferredChatId)) {
+				if (hasPreferredChat) {
 					dispatch({ payload: preferredChatId, type: "SET_SELECTED_CHAT" });
 				}
+				await persistWorkspaceSelection(projectId, selectedChatId);
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to load chats for project"),
@@ -371,7 +375,7 @@ const App = (): JSX.Element => {
 				persistedSelectedChatIdRef.current = null;
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
+		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
 	);
 
 	const loadProjects = useCallback(async () => {
@@ -390,6 +394,13 @@ const App = (): JSX.Element => {
 			persistedSelectedChatIdRef.current = selectedChatId;
 			dispatch({ payload: projects, type: "SET_PROJECTS" });
 			dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
+
+			if (
+				selection.selectedProjectId !== selectedProjectId ||
+				selection.selectedChatId !== selectedChatId
+			) {
+				await persistWorkspaceSelection(selectedProjectId, selectedChatId);
+			}
 		} catch (error) {
 			addError(
 				formatApiErrorMessage(error, "Unable to load projects"),
@@ -399,7 +410,7 @@ const App = (): JSX.Element => {
 		} finally {
 			dispatch({ payload: false, type: "SET_PROJECTS_LOADING" });
 		}
-	}, [addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage]);
+	}, [addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection]);
 
 	const handleWsEvent = useCallback(
 		async (event: ServerWsEvent) => {
@@ -563,7 +574,7 @@ const App = (): JSX.Element => {
 		async (title: string) => {
 			if (!state.selectedProjectId) {
 				addError("Select a project before creating a chat", "rest", "missing_project");
-				return;
+				return null;
 			}
 
 			dispatch({ payload: true, type: "SET_CREATING_CHAT" });
@@ -571,12 +582,14 @@ const App = (): JSX.Element => {
 				const chat = await api.createChat(state.selectedProjectId, title);
 				dispatch({ payload: chat, type: "UPSERT_CHAT" });
 				await persistWorkspaceSelection(state.selectedProjectId, chat.id);
+				return chat;
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to create chat"),
 					"rest",
 					formatApiErrorCode(error),
 				);
+				return null;
 			} finally {
 				dispatch({ payload: false, type: "SET_CREATING_CHAT" });
 			}
@@ -586,47 +599,46 @@ const App = (): JSX.Element => {
 
 	const handleSendMessage = useCallback(
 		async (text: string) => {
-			if (!state.selectedChatId) {
-				return;
-			}
-
-			const chatId = state.selectedChatId;
-
-			dispatch({
-				payload: true,
-				type: "SET_SENDING_MESSAGE",
-			});
-			dispatch({
-				payload: {
-					chatId,
-					content: text,
-					createdAt: new Date().toISOString(),
-					id: crypto.randomUUID(),
-					role: "user",
+			await sendWorkspaceMessage({
+				createChatId: async () => {
+					const chat = await handleCreateChat("New thread");
+					return chat?.id ?? null;
 				},
-				type: "APPEND_MESSAGE",
+				createTimestamp: () => new Date().toISOString(),
+				generateMessageId: () => crypto.randomUUID(),
+				hasOpenWebSocket: Boolean(wsRef.current),
+				onAppendMessage: (message) => {
+					dispatch({
+						payload: message,
+						type: "APPEND_MESSAGE",
+					});
+				},
+				onClearStreaming: (chatId) => {
+					dispatch({
+						payload: { chatId },
+						type: "CLEAR_STREAMING",
+					});
+				},
+				onCreateMessageError: addError,
+				onSendUserMessage: (chatId, messageText) => {
+					wsRef.current?.sendUserMessage(chatId, messageText);
+				},
+				onSetSending: (sending) => {
+					dispatch({
+						payload: sending,
+						type: "SET_SENDING_MESSAGE",
+					});
+				},
+				selectedChatId: state.selectedChatId,
+				selectedProjectId: state.selectedProjectId,
+				text,
 			});
-			dispatch({
-				payload: { chatId },
-				type: "CLEAR_STREAMING",
-			});
-
-			if (!wsRef.current) {
-				addError("WebSocket client is not ready", "ws", "not_ready");
-				dispatch({
-					payload: false,
-					type: "SET_SENDING_MESSAGE",
-				});
-				return;
-			}
-
-			wsRef.current.sendUserMessage(chatId, text);
 		},
-		[addError, dispatch, state.selectedChatId],
+		[addError, dispatch, handleCreateChat, state.selectedChatId, state.selectedProjectId],
 	);
 
 	const handleSelectProject = useCallback(
-		(projectId: string) => {
+		async (projectId: string) => {
 			if (projectId === state.selectedProjectId) {
 				return;
 			}
@@ -634,20 +646,20 @@ const App = (): JSX.Element => {
 			dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
 			dispatch({ payload: projectId, type: "SET_SELECTED_PROJECT" });
 			persistedSelectedChatIdRef.current = null;
-			void persistWorkspaceSelection(projectId, null);
+			await persistWorkspaceSelection(projectId, null);
 		},
 		[dispatch, persistWorkspaceSelection, state.selectedProjectId],
 	);
 
 	const handleSelectChat = useCallback(
-		(chatId: string) => {
+		async (chatId: string) => {
 			if (chatId === state.selectedChatId) {
 				return;
 			}
 
 			dispatch({ payload: chatId, type: "SET_SELECTED_CHAT" });
 			persistedSelectedChatIdRef.current = chatId;
-			void persistWorkspaceSelection(state.selectedProjectId, chatId);
+			await persistWorkspaceSelection(state.selectedProjectId, chatId);
 		},
 		[dispatch, persistWorkspaceSelection, state.selectedChatId, state.selectedProjectId],
 	);
@@ -824,7 +836,7 @@ const App = (): JSX.Element => {
 														aria-label={`Select ${project.name}`}
 														className="flex min-w-0 flex-1 items-start gap-2 rounded-xl border border-transparent px-2 py-1.5 text-left transition hover:border-white/10 hover:bg-white/[0.03]"
 														onClick={() => {
-															handleSelectProject(project.id);
+															void handleSelectProject(project.id);
 														}}
 														type="button"
 													>
@@ -909,7 +921,7 @@ const App = (): JSX.Element => {
 																			aria-label={`Open ${chat.title}`}
 																			className="inline-flex min-w-0 flex-1 items-center gap-2"
 																			onClick={() => {
-																				handleSelectChat(chat.id);
+																				void handleSelectChat(chat.id);
 																			}}
 																			type="button"
 																		>
@@ -1091,40 +1103,25 @@ const App = (): JSX.Element => {
 									</div>
 
 									<div className="space-y-3">
-										{!state.selectedChatId ? (
-											<div className="space-y-3">
-												<Button
-													className="rounded-xl"
-													disabled={state.isCreatingChat}
-													onClick={() => {
-														void handleCreateChat("New thread");
-													}}
+										<div className="grid gap-2 md:grid-cols-3">
+											{SUGGESTION_CARDS.map((card) => (
+												<button
+													className="group cursor-pointer rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-left text-sm text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06]"
+													key={card}
 													type="button"
-													variant="secondary"
 												>
-													<Plus className="h-4 w-4" />
-													{state.isCreatingChat ? "Creating..." : "New thread"}
-												</Button>
-												<div className="grid gap-2 md:grid-cols-3">
-													{SUGGESTION_CARDS.map((card) => (
-														<button
-															className="group cursor-pointer rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-left text-sm text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06]"
-															key={card}
-															type="button"
-														>
-															<span className="mb-2 inline-flex h-6 w-6 items-center justify-center rounded-lg border border-white/15 bg-white/[0.03]">
-																<Sparkles className="h-3.5 w-3.5 text-slate-300/80 group-hover:text-sky-200" />
-															</span>
-															<span className="block leading-5">{card}</span>
-														</button>
-													))}
-												</div>
-											</div>
-										) : null}
+													<span className="mb-2 inline-flex h-6 w-6 items-center justify-center rounded-lg border border-white/15 bg-white/[0.03]">
+														<Sparkles className="h-3.5 w-3.5 text-slate-300/80 group-hover:text-sky-200" />
+													</span>
+													<span className="block leading-5">{card}</span>
+												</button>
+											))}
+										</div>
+										
 
 										<MessageComposer
 											chatStatus={selectedChat?.status ?? null}
-											disabled={!state.selectedChatId}
+											disabled={!state.selectedProjectId}
 											onSend={handleSendMessage}
 											sending={state.isSendingMessage}
 										/>

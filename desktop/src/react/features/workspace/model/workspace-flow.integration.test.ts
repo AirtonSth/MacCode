@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { RemoteCodeApi } from "../../shared/api/remotecode-http";
+import { RemoteCodeApi } from "../../../shared/api/remotecode-http";
 import {
 	RemoteCodeRealtime,
 	type ConnectionState,
 	type ServerWsEvent,
-} from "../../shared/realtime/remotecode-ws";
+} from "../../../shared/realtime/remotecode-ws";
 import type {
 	WorkspaceAction,
 	WorkspaceState,
@@ -13,6 +13,7 @@ import type {
 	type MessageDTO,
 	type ProjectDTO,
 } from "./useWorkspaceStore";
+import { sendWorkspaceMessage } from "./send-message";
 
 type HttpRequest = {
 	method: string;
@@ -699,29 +700,36 @@ const createWorkspaceFlowHarness = () => {
 	};
 
 	const sendMessage = async (text: string) => {
-		if (!state.value.selectedChatId || !wsRef) {
-			addError("No chat selected", "ws", "missing_chat");
+		if (!state.value.selectedProjectId) {
+			addError("Select a project before sending a message", "rest", "missing_project");
 			return;
 		}
 
-		const chatId = state.value.selectedChatId;
-
-		dispatch({ type: "SET_SENDING_MESSAGE", payload: true });
-		dispatch({
-			type: "APPEND_MESSAGE",
-			payload: {
-				id: `local-${chatId}-${Date.now()}`,
-				chatId,
-				role: "user",
-				content: text,
-				createdAt: new Date().toISOString(),
+		await sendWorkspaceMessage({
+			createChatId: async () => {
+				const chat = await createChatWithSelection("New thread");
+				return chat?.id ?? null;
 			},
+			createTimestamp: () => new Date().toISOString(),
+			generateMessageId: () => `local-${Date.now()}`,
+			hasOpenWebSocket: Boolean(wsRef),
+			onAppendMessage: (message) => {
+				dispatch({ type: "APPEND_MESSAGE", payload: message });
+			},
+			onClearStreaming: (chatId) => {
+				dispatch({ type: "CLEAR_STREAMING", payload: { chatId } });
+			},
+			onCreateMessageError: addError,
+			onSendUserMessage: (chatId, messageText) => {
+				wsRef?.sendUserMessage(chatId, messageText);
+			},
+			onSetSending: (sending) => {
+				dispatch({ type: "SET_SENDING_MESSAGE", payload: sending });
+			},
+			selectedChatId: state.value.selectedChatId,
+			selectedProjectId: state.value.selectedProjectId,
+			text,
 		});
-		dispatch({
-			type: "CLEAR_STREAMING",
-			payload: { chatId },
-		});
-		wsRef.sendUserMessage(chatId, text);
 	};
 
 	const connectRealtime = () => {
@@ -756,6 +764,77 @@ const createWorkspaceFlowHarness = () => {
 };
 
 describe("workspace frontend flow coverage", () => {
+	test("sendMessage auto-creates chat when no chat is selected", async () => {
+		const routeFixture = {
+			listProjects: () => [
+				{
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-1",
+					isFavorite: false,
+					name: "Project",
+					path: "/tmp/demo",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				},
+			],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: name ?? "Project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (projectId, { title }) => ({
+				diffAdded: 0,
+				diffRemoved: 0,
+				id: "chat-1",
+				projectId,
+				provider: "fake",
+				status: "pending",
+				title: title ?? "New chat",
+				updatedAt: "2026-01-01T12:00:01.000Z",
+			}),
+			listMessages: () => [],
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.bootstrap();
+			harness.connectRealtime();
+			MockWebSocket.instances[0]?.triggerOpen();
+
+			await harness.sendMessage("Start my thread");
+
+			const state = harness.getState();
+			const sent = MockWebSocket.instances[0]?.sent ?? [];
+			const sendEvent = sent.find((payload) => {
+				try {
+					const parsed = JSON.parse(payload);
+					return parsed.event === "user_message" && parsed.data?.chatId === "chat-1";
+				} catch {
+					return false;
+				}
+			});
+
+			expect(state.selectedProjectId).toBe("project-1");
+			expect(state.selectedChatId).toBe("chat-1");
+			expect(state.messages.at(-1)?.content).toBe("Start my thread");
+			expect(fetchMock.requests).toContainEqual(
+				expect.objectContaining({
+					method: "POST",
+					path: "/v1/projects/project-1/chats",
+				}),
+			);
+			expect(sendEvent).toBeDefined();
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
 	test("project creation -> chat creation -> send -> assistant_delta/assistant_done", async () => {
 		let messageLoads = 0;
 

@@ -72,6 +72,25 @@ const waitForCondition = async (predicate: () => boolean, timeoutMs = 4000): Pro
 	});
 };
 
+const waitForEvent = async (predicate: () => boolean, timeoutMs = 4000): Promise<void> => {
+	await new Promise<void>((resolve, reject) => {
+		const startedAt = performance.now();
+		const timer = setInterval(() => {
+			if (!predicate()) {
+				if (performance.now() - startedAt >= timeoutMs) {
+					clearInterval(timer);
+					reject(new Error("timed out waiting for ws event"));
+				}
+
+				return;
+			}
+
+			clearInterval(timer);
+			resolve();
+		}, 20);
+	});
+};
+
 test("join_chat does not replay and stream emits assistant_delta + done", async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
 
@@ -231,6 +250,44 @@ test("WS emits validation error for invalid payload", async () => {
 		await new Promise((resolve) => setTimeout(resolve, 80));
 
 		expect(events.some((event) => event.includes("validation"))).toBe(true);
+	} finally {
+		socket?.close();
+		await cleanup();
+	}
+});
+
+test("WS returns chat_not_found when user sends message to missing chat", async () => {
+	const { baseUrl, cleanup, client } = await createTestServer();
+
+	let missingChatError: ServerEvent | null = null;
+	let socket: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+
+	try {
+		await client.v1.projects.post({ path: "/tmp" });
+
+		socket = await createEdenWsClient(createEdenClient({ baseUrl }));
+		socket?.subscribe((raw) => {
+			const event = parseEvent((raw as { data: unknown }).data);
+
+			if (!event) {
+				return;
+			}
+
+			if (event.event === "error" && event.data.code === "chat_not_found") {
+				missingChatError = event;
+			}
+		});
+
+		socket?.send({ data: { chatId: "missing-chat-id", text: "should fail" }, event: "user_message" });
+		await waitForEvent(() => missingChatError !== null, 5000);
+
+		expect(missingChatError).toMatchObject({
+			data: {
+				chatId: "missing-chat-id",
+				code: "chat_not_found",
+			},
+			event: "error",
+		});
 	} finally {
 		socket?.close();
 		await cleanup();
