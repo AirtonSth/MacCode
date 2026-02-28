@@ -7,17 +7,11 @@ import { chats } from "../../shared/db/db.schema";
 import type { ChatDTO, ChatStatus } from "../../types";
 
 export class ChatRepository {
-	private readonly database: DrizzleDatabaseClient["orm"];
-
-	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
-		this.database = databaseClient;
-	}
-
 	private static toNumber(value: number | null | undefined): number {
 		return Number(value ?? 0);
 	}
 
-	private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
+private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
 		return {
 			diffAdded: ChatRepository.toNumber(row.diffAdded),
 			diffRemoved: ChatRepository.toNumber(row.diffRemoved),
@@ -29,6 +23,16 @@ export class ChatRepository {
 			updatedAt: row.updatedAt,
 		};
 	}
+
+private readonly database: DrizzleDatabaseClient["orm"];
+
+	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
+		this.database = databaseClient;
+	}
+
+	
+
+	
 
 	createChat(projectId: string, title: string): ChatDTO {
 		const now = new Date().toISOString();

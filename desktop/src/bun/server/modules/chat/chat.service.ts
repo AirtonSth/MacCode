@@ -18,7 +18,11 @@ export class ChatService implements ChatServiceContract {
 		private readonly projectRepository: ProjectRepository,
 	) {}
 
-	async createChat(projectId: string, title: string): Promise<ChatDTO | null> {
+	async getChatById(chatId: string): Promise<ChatDTO | null> {
+		return this.chatRepository.findChatById(chatId);
+	}
+
+async createChat(projectId: string, title: string): Promise<ChatDTO | null> {
 		const project = await this.projectRepository.findProjectById(projectId);
 
 		if (!project) {
@@ -28,9 +32,7 @@ export class ChatService implements ChatServiceContract {
 		return this.chatRepository.createChat(projectId, title);
 	}
 
-	getChatById(chatId: string): Promise<ChatDTO | null> {
-		return Promise.resolve(this.chatRepository.findChatById(chatId));
-	}
+	
 
 	async listByProjectId(projectId: string): Promise<ChatDTO[] | null> {
 		const project = await this.projectRepository.findProjectById(projectId);

@@ -20,8 +20,8 @@ const toPort = (server: unknown): number => {
 	return (server as { port?: number }).port ?? 3001;
 };
 
-export class TestServerFactory {
-	static async create(): Promise<RunningServer> {
+export const TestServerFactory = {
+	async create(): Promise<RunningServer> {
 		const root = mkdtempSync(join(tmpdir(), "remotecode-tests-"));
 		const databasePath = join(root, "remodecode.sqlite");
 		const backend = await createBackendServer({
@@ -30,20 +30,22 @@ export class TestServerFactory {
 		});
 
 		const port = toPort(backend.server);
-		const baseUrl = `http://127.0.0.1:${port}`;
+		const baseUrl = `https://127.0.0.1:${port}`;
 		const client = createEdenClient({ baseUrl });
 
 		return {
 			backend,
 			baseUrl,
+
 			cleanup: async () => {
 				await backend.app.stop(true);
 				backend.db.close();
 				rmSync(root, { force: true, recursive: true });
 			},
+
 			client,
 		};
-	}
-}
+	},
+};
 
-export const createTestServer = async (): Promise<RunningServer> => TestServerFactory.create();
+export const createTestServer = async (): Promise<RunningServer> => await TestServerFactory.create();

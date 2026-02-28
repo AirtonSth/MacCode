@@ -147,8 +147,8 @@ const emitEventFromLine = (line: string, onDelta: (delta: string) => void): Fake
 	return null;
 };
 
-export class FakeProviderRunner {
-	static async run({ chatId, onDelta, text }: FakeProviderRunOptions): Promise<FakeProviderResult> {
+export const FakeProviderRunner = {
+	async run({ chatId, onDelta, text }: FakeProviderRunOptions): Promise<FakeProviderResult> {
 		if (!existsSync(providerPath)) {
 			return {
 				assistantText: "",
@@ -298,8 +298,8 @@ export class FakeProviderRunner {
 			diffRemoved,
 			status: "completed",
 		};
-	}
-}
+	},
+};
 
 export const runFakeProvider = async (options: FakeProviderRunOptions): Promise<FakeProviderResult> =>
-	FakeProviderRunner.run(options);
+	await FakeProviderRunner.run(options);

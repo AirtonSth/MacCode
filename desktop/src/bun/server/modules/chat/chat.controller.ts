@@ -4,11 +4,13 @@ import { withRestAuth } from "../../shared/auth/auth.service";
 import type { ChatService } from "./chat.service";
 
 export class ChatController {
-	constructor(private readonly service: ChatService) {}
-
 	static build(service: ChatService) {
 		return new ChatController(service).build();
 	}
+
+constructor(private readonly service: ChatService) {}
+
+	
 
 	build() {
 		return new Elysia({ name: "chat-controller" })

@@ -2,8 +2,24 @@ import { Elysia } from "elysia";
 
 import { serverConfig } from "../../config";
 
-export class AuthService {
-	static readHeaderToken(request: Request): string | null {
+export const AuthService = {
+	isAuthorized(request: Request): boolean {
+		const token = AuthService.isWebSocketRoute(request)
+			? AuthService.resolveWsToken(request)
+			: AuthService.readHeaderToken(request);
+
+		return Boolean(token && token === serverConfig.token);
+	},
+
+	isWebSocketRoute(request: Request): boolean {
+		try {
+			return new URL(request.url).pathname.includes("/v1/ws");
+		} catch {
+			return request.url.includes("/v1/ws");
+		}
+	},
+
+	readHeaderToken(request: Request): string | null {
 		const rawToken = request.headers.get("authorization");
 
 		if (!rawToken) {
@@ -15,9 +31,9 @@ export class AuthService {
 		}
 
 		return rawToken.trim();
-	}
+	},
 
-	static readQueryToken(request: Request): string | null {
+	readQueryToken(request: Request): string | null {
 		const queryStart = request.url.indexOf("?");
 
 		if (queryStart === -1) {
@@ -33,29 +49,13 @@ export class AuthService {
 		} catch {
 			return null;
 		}
-	}
+	},
 
-	static isWebSocketRoute(request: Request): boolean {
-		try {
-			return new URL(request.url).pathname.includes("/v1/ws");
-		} catch {
-			return request.url.includes("/v1/ws");
-		}
-	}
-
-	static resolveWsToken(request: Request): string | null {
+	resolveWsToken(request: Request): string | null {
 		return AuthService.readHeaderToken(request) ?? AuthService.readQueryToken(request);
-	}
+	},
 
-	static isAuthorized(request: Request): boolean {
-		const token = AuthService.isWebSocketRoute(request)
-			? AuthService.resolveWsToken(request)
-			: AuthService.readHeaderToken(request);
-
-		return Boolean(token && token === serverConfig.token);
-	}
-
-	static withRestAuth() {
+	withRestAuth() {
 		return new Elysia().onRequest(({ request, set }) => {
 			const token = AuthService.isWebSocketRoute(request)
 				? AuthService.resolveWsToken(request)
@@ -68,12 +68,12 @@ export class AuthService {
 				return { error: "unauthorized" };
 			}
 		});
-	}
-}
+	},
+};
 
-export const readHeaderToken = AuthService.readHeaderToken;
-export const readQueryToken = AuthService.readQueryToken;
-export const isWebSocketRoute = AuthService.isWebSocketRoute;
-export const resolveWsToken = AuthService.resolveWsToken;
-export const isAuthorized = AuthService.isAuthorized;
-export const withRestAuth = AuthService.withRestAuth;
+export const {readHeaderToken} = AuthService;
+export const {readQueryToken} = AuthService;
+export const {isWebSocketRoute} = AuthService;
+export const {resolveWsToken} = AuthService;
+export const {isAuthorized} = AuthService;
+export const {withRestAuth} = AuthService;

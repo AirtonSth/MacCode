@@ -35,12 +35,14 @@ export const messages = sqliteTable("messages", {
 	role: text("role").notNull(),
 });
 
-export class DatabaseSchema {
-	static readonly projects = projects;
-	static readonly chats = chats;
-	static readonly messages = messages;
-}
-
 export type ChatRow = typeof chats.$inferSelect;
+
 export type MessageRow = typeof messages.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
+export class DatabaseSchema {
+	static readonly projects = projects;
+
+	static readonly chats = chats;
+
+	static readonly messages = messages;
+}

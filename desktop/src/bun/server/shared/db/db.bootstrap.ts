@@ -58,4 +58,4 @@ export class DatabaseBootstrap {
 }
 
 export const initializeDatabaseSchema = (database: Database): void =>
-	DatabaseBootstrap.initialize(database);
+	{ DatabaseBootstrap.initialize(database); };

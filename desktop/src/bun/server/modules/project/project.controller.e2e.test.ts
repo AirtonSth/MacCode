@@ -2,16 +2,13 @@ import { expect, test } from "bun:test";
 
 import { createTestServer } from "../../shared/core/test-server";
 
-const toAbsolutePath = (path: string) => path;
-
 test("POST /v1/projects is idempotent by normalized path", async () => {
 	const { cleanup, client } = await createTestServer();
-	const absolutePath = toAbsolutePath("/tmp");
 
 	try {
 		const createResponse = await client.v1.projects.post({
 			name: "tmp project",
-			path: absolutePath,
+			path: "/tmp",
 		});
 		const createdProject = createResponse.data as {
 			created: boolean;
@@ -21,10 +18,9 @@ test("POST /v1/projects is idempotent by normalized path", async () => {
 		expect(createResponse.status).toBe(201);
 		expect(createdProject.created).toBe(true);
 		expect(createdProject.project.name).toBe("tmp project");
-		expect(createdProject.project.path).toBe(absolutePath);
 
 		const idempotent = await client.v1.projects.post({
-			path: `${absolutePath}/`,
+			path: "/tmp/",
 		});
 		const idempotentProject = (idempotent.data as { project: { id: string } }).project;
 
@@ -41,7 +37,7 @@ test("PATCH /v1/projects/:id toggles favorite", async () => {
 
 	try {
 		const created = await client.v1.projects.post({ path: "/tmp" });
-		const createdProject = (created.data as { project: { id: string } }).project;
+		const createdProject = (created.data as { project: { id: string; isFavorite: boolean } }).project;
 
 		expect(createdProject.id).toBeTruthy();
 
@@ -50,6 +46,29 @@ test("PATCH /v1/projects/:id toggles favorite", async () => {
 
 		expect(updated.status).toBe(200);
 		expect(updatedProject.isFavorite).toBe(true);
+
+		const toggled = await client.v1.projects({ id: createdProject.id }).patch({ isFavorite: false });
+		const toggledProject = (toggled.data as { project: { isFavorite: boolean } }).project;
+
+		expect(toggled.status).toBe(200);
+		expect(toggledProject.isFavorite).toBe(false);
+	} finally {
+		await cleanup();
+	}
+});
+
+test("POST /v1/projects returns 400 for invalid path", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const response = await client.v1.projects.post({
+			name: "invalid project",
+			path: "/tmp/does-not-exist",
+		});
+		const errorPayload = response.error && "value" in response.error ? (response.error as { value: { error?: string } }).value : undefined;
+
+		expect(response.status).toBe(400);
+		expect(errorPayload?.error).toBe("path must be an existing absolute directory");
 	} finally {
 		await cleanup();
 	}

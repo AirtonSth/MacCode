@@ -4,11 +4,13 @@ import { withRestAuth } from "../../shared/auth/auth.service";
 import type { MessageService } from "./message.service";
 
 export class MessageController {
-	constructor(private readonly service: MessageService) {}
-
 	static build(service: MessageService) {
 		return new MessageController(service).build();
 	}
+
+constructor(private readonly service: MessageService) {}
+
+	
 
 	build() {
 		return new Elysia({ name: "message-controller" })

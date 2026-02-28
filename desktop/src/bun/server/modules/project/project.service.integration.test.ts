@@ -11,14 +11,14 @@ import { createProjectService } from "./project.service";
 
 test("project service normalizePath and create idempotent", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-project-service-"));
-	const path = join(root, "remodecode.sqlite");
-	const client = await createDatabaseClient(path);
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
 
 	try {
 		initializeDatabaseSchema(client.sqlite);
 
-		const repo = createProjectRepository(client.orm);
-		const service = createProjectService(repo);
+		const repository = createProjectRepository(client.orm);
+		const service = createProjectService(repository);
 		const first = await service.createProject({ name: "Test", path: "/tmp" });
 
 		if ("type" in first) {
@@ -35,6 +35,33 @@ test("project service normalizePath and create idempotent", async () => {
 
 		expect(second.created).toBe(false);
 		expect(second.project.id).toBe(first.project.id);
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("project repository preserves normalized lookup and list order", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-project-service-list-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
+
+	try {
+		initializeDatabaseSchema(client.sqlite);
+
+		const repository = createProjectRepository(client.orm);
+		const service = createProjectService(repository);
+
+		const createResult = await service.createProject({ path: "/tmp" });
+
+		if ("type" in createResult) {
+			throw new Error(`unexpected project service error: ${createResult.type}`);
+		}
+
+		const projects = await service.listProjects();
+
+		expect(createResult.project.path).toBe("/tmp");
+		expect(projects.map((project) => project.id)).toContain(createResult.project.id);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

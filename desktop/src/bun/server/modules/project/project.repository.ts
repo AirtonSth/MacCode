@@ -7,12 +7,6 @@ import { projects } from "../../shared/db/db.schema";
 import type { ProjectDTO } from "../../types";
 
 export class ProjectRepository {
-	private readonly database: DrizzleDatabaseClient["orm"];
-
-	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
-		this.database = databaseClient;
-	}
-
 	private static toBoolean(value: number | boolean | null | undefined): boolean {
 		if (value === true) {
 			return true;
@@ -25,7 +19,7 @@ export class ProjectRepository {
 		return false;
 	}
 
-	private static toProjectDto(row: typeof projects.$inferSelect): ProjectDTO {
+private static toProjectDto(row: typeof projects.$inferSelect): ProjectDTO {
 		return {
 			createdAt: row.createdAt,
 			id: row.id,
@@ -35,6 +29,16 @@ export class ProjectRepository {
 			updatedAt: row.updatedAt,
 		};
 	}
+
+private readonly database: DrizzleDatabaseClient["orm"];
+
+	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
+		this.database = databaseClient;
+	}
+
+	
+
+	
 
 	createProject(path: string, name: string): ProjectDTO {
 		const now = new Date().toISOString();

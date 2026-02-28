@@ -39,7 +39,11 @@ export class ProjectService implements ProjectServiceContract {
 
 	constructor(private readonly repository: ProjectRepository) {}
 
-	async createProject({
+	async getProjectById(id: string): Promise<ProjectDTO | null> {
+		return this.repository.findProjectById(id);
+	}
+
+async createProject({
 		name,
 		path,
 	}: CreateProjectInput): Promise<CreateProjectResult | CreateProjectError> {
@@ -67,16 +71,14 @@ export class ProjectService implements ProjectServiceContract {
 		};
 	}
 
-	getProjectById(id: string): Promise<ProjectDTO | null> {
-		return Promise.resolve(this.repository.findProjectById(id));
+	
+
+	async listProjects(): Promise<ProjectDTO[]> {
+		return this.repository.listProjects();
 	}
 
-	listProjects(): Promise<ProjectDTO[]> {
-		return Promise.resolve(this.repository.listProjects());
-	}
-
-	setFavorite(id: string, isFavorite: boolean): Promise<ProjectDTO | null> {
-		return Promise.resolve(this.repository.updateProjectFavorite(id, isFavorite));
+	async setFavorite(id: string, isFavorite: boolean): Promise<ProjectDTO | null> {
+		return this.repository.updateProjectFavorite(id, isFavorite);
 	}
 }
 

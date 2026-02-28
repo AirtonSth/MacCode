@@ -27,17 +27,19 @@ test("message service preserva ordem asc por createdAt", async () => {
 			message: messageRepository,
 		});
 
-	const project = await projectRepository.createProject("/tmp", "tmp");
-	const chat = await chatRepository.createChat(project.id, "chat");
+		const project = await projectRepository.createProject("/tmp", "tmp");
+		const chat = await chatRepository.createChat(project.id, "chat");
 
-	await messageRepository.createMessage(chat.id, "assistant", "b");
-	await new Promise((resolve) => setTimeout(resolve, 2));
-	await messageRepository.createMessage(chat.id, "user", "a");
+		await messageRepository.createMessage(chat.id, "user", "a");
+		await new Promise((resolve) => setTimeout(resolve, 2));
+		await messageRepository.createMessage(chat.id, "assistant", "b");
 
 		const result = await service.listByChatId(chat.id);
 
 		expect(result.chatExists).toBe(true);
-		expect(result.messages[0].content).toBe("b");
+		expect(result.messages).toHaveLength(2);
+		expect(result.messages[0].content).toBe("a");
+		expect(result.messages[1].content).toBe("b");
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

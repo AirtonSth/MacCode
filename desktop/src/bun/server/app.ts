@@ -1,22 +1,22 @@
 import { Elysia } from "elysia";
 
 import { serverConfig } from "./config";
-import { ProjectController } from "./modules/project/project.controller";
-import { ProjectRepository } from "./modules/project/project.repository";
-import { ProjectService } from "./modules/project/project.service";
 import { ChatController } from "./modules/chat/chat.controller";
 import { ChatRepository } from "./modules/chat/chat.repository";
 import { ChatService } from "./modules/chat/chat.service";
 import { MessageController } from "./modules/message/message.controller";
 import { MessageRepository } from "./modules/message/message.repository";
 import { MessageService } from "./modules/message/message.service";
+import { ProjectController } from "./modules/project/project.controller";
+import { ProjectRepository } from "./modules/project/project.repository";
+import { ProjectService } from "./modules/project/project.service";
 import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
 import { DatabaseClientFactory } from "./shared/db/db.client";
 
-export class ServerBootstrap {
-	static async buildServerApp(databasePath?: string) {
+export const ServerBootstrap = {
+	async buildServerApp(databasePath?: string) {
 		const databaseClient = await DatabaseClientFactory.create(databasePath);
 
 		DatabaseBootstrap.initialize(databaseClient.sqlite);
@@ -46,9 +46,9 @@ export class ServerBootstrap {
 				close: databaseClient.close,
 			},
 		};
-	}
+	},
 
-	static async createBackendServer(options?: { databasePath?: string; port?: number }): Promise<BackendHandle> {
+	async createBackendServer(options?: { databasePath?: string; port?: number }): Promise<BackendHandle> {
 		const port = options?.port;
 		const handle = await ServerBootstrap.buildServerApp(options?.databasePath);
 
@@ -67,10 +67,10 @@ export class ServerBootstrap {
 			...handle,
 			server: serverReference as { port: number },
 		};
-	}
-}
+	},
+};
 
-export const buildServerApp = (databasePath?: string) => ServerBootstrap.buildServerApp(databasePath);
+export const buildServerApp = async (databasePath?: string) => await ServerBootstrap.buildServerApp(databasePath);
 
 export interface BackendHandle {
 	app: Awaited<ReturnType<typeof buildServerApp>>["app"];
@@ -80,7 +80,7 @@ export interface BackendHandle {
 	server: unknown;
 }
 
-export const createBackendServer = (options?: { databasePath?: string; port?: number }): Promise<BackendHandle> =>
-	ServerBootstrap.createBackendServer(options);
+export const createBackendServer = async (options?: { databasePath?: string; port?: number }): Promise<BackendHandle> =>
+	await ServerBootstrap.createBackendServer(options);
 
 export type ServerApp = Awaited<ReturnType<typeof buildServerApp>>["app"];

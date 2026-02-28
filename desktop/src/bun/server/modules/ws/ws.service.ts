@@ -21,14 +21,22 @@ export class WsService implements WsServiceContract {
 		};
 	}
 
-	private readonly runningChats = new Set<string>();
+	static createClientErrorEvent(code: string, message: string, chatId?: string): ServerWsEvent {
+		return WsService.buildClientErrorEvent(code, message, chatId);
+	}
+
+private readonly runningChats = new Set<string>();
 
 	constructor(
 		private readonly chatRepository: ChatRepository,
 		private readonly messageRepository: MessageRepository,
 	) {}
 
-	private async emitRunningState(
+	isChatRunning(chatId: string): boolean {
+		return this.runningChats.has(chatId);
+	}
+
+private async emitRunningState(
 		chatId: string,
 		emit: (event: ServerWsEvent) => void,
 	): Promise<ChatDTO | null> {
@@ -53,17 +61,13 @@ export class WsService implements WsServiceContract {
 		return updated;
 	}
 
-	static createClientErrorEvent(code: string, message: string, chatId?: string): ServerWsEvent {
-		return WsService.buildClientErrorEvent(code, message, chatId);
+	
+
+	async getChatById(chatId: string): Promise<ChatDTO | null> {
+		return this.chatRepository.findChatById(chatId);
 	}
 
-	getChatById(chatId: string): Promise<ChatDTO | null> {
-		return Promise.resolve(this.chatRepository.findChatById(chatId));
-	}
-
-	isChatRunning(chatId: string): boolean {
-		return this.runningChats.has(chatId);
-	}
+	
 
 	async startUserMessage({ chatId, emit, text }: WsServiceInput): Promise<void> {
 		const chat = await this.chatRepository.findChatById(chatId);
@@ -103,6 +107,7 @@ export class WsService implements WsServiceContract {
 		try {
 			const providerResult = await runFakeProvider({
 				chatId,
+
 				onDelta: (delta: string) => {
 					emit({
 						data: {
@@ -113,6 +118,7 @@ export class WsService implements WsServiceContract {
 						event: "assistant_delta",
 					});
 				},
+
 				text,
 			});
 
@@ -159,4 +165,4 @@ export const createWsService = (repositories: {
 	message: MessageRepository;
 }) => new WsService(repositories.chat, repositories.message);
 
-export const createClientErrorEvent = WsService.createClientErrorEvent;
+export const {createClientErrorEvent} = WsService;

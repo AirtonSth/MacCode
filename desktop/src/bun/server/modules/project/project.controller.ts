@@ -4,11 +4,13 @@ import { withRestAuth } from "../../shared/auth/auth.service";
 import type { ProjectService } from "./project.service";
 
 export class ProjectController {
-	constructor(private readonly service: ProjectService) {}
-
 	static build(service: ProjectService) {
 		return new ProjectController(service).build();
 	}
+
+constructor(private readonly service: ProjectService) {}
+
+	
 
 	build() {
 		return new Elysia({ name: "project-controller" })

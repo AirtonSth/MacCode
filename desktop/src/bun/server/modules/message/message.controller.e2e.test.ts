@@ -13,12 +13,14 @@ test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "stream" });
 		const chatId = (chat.data as { chat: { id: string } }).chat.id;
 
-		const events: { data: unknown; event: string; }[] = [];
+		const events: { data: unknown; event: string }[] = [];
 		const url = new URL(`${baseUrl}/v1/ws?token=local-dev-token`);
 
 		ws = new WebSocket(url);
 		await new Promise<void>((resolve, reject) => {
-			ws!.addEventListener("open", () => { resolve(); });
+			ws!.addEventListener("open", () => {
+				resolve();
+			});
 			ws!.addEventListener("error", (event) => {
 				reject(new Error(`ws open error: ${String(event)}`));
 			});
@@ -38,7 +40,7 @@ test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
 		);
 
 		await new Promise<void>((resolve) => {
-			const id = setInterval(() => {
+			const interval = setInterval(() => {
 				const hasDone = events.some((item) => {
 					if (typeof item.data !== "string") {
 						return false;
@@ -54,7 +56,7 @@ test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
 				});
 
 				if (hasDone) {
-					clearInterval(id);
+					clearInterval(interval);
 					resolve();
 				}
 			}, 40);
@@ -69,6 +71,20 @@ test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
 		expect(sortedMessages[1].role).toBe("assistant");
 	} finally {
 		ws?.close();
+		await cleanup();
+	}
+});
+
+test("GET /v1/chats/:id/messages retorna 404 para chat inexistente", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const response = await client.v1.chats({ id: "non-existing" }).messages.get();
+		const errorPayload = response.error && "value" in response.error ? (response.error as { value: { error?: string } }).value : undefined;
+
+		expect(response.status).toBe(404);
+		expect(errorPayload?.error).toBe("chat not found");
+	} finally {
 		await cleanup();
 	}
 });

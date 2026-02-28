@@ -43,7 +43,7 @@ const parseEvent = (raw: unknown): ServerEvent | null => {
 
 	const payload = value.data as { chatId?: unknown };
 
-	if (typeof payload.chatId !== "string") {
+	if (typeof payload.chatId !== "string" && value.event !== "error") {
 		return null;
 	}
 
@@ -53,8 +53,8 @@ const parseEvent = (raw: unknown): ServerEvent | null => {
 	};
 };
 
-const waitForCondition = async (predicate: () => boolean, timeoutMs = 4000): Promise<void> =>
-	{ await new Promise<void>((resolve, reject) => {
+const waitForCondition = async (predicate: () => boolean, timeoutMs = 4000): Promise<void> => {
+	await new Promise<void>((resolve, reject) => {
 		const startedAt = performance.now();
 		const timer = setInterval(() => {
 			if (!predicate()) {
@@ -69,7 +69,8 @@ const waitForCondition = async (predicate: () => boolean, timeoutMs = 4000): Pro
 			clearInterval(timer);
 			resolve();
 		}, 20);
-	}); };
+	});
+};
 
 test("join_chat não faz replay e stream gera assistant_delta + done", async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
@@ -113,7 +114,7 @@ test("join_chat não faz replay e stream gera assistant_delta + done", async () 
 			(event) => event.event === "assistant_done" && event.data.chatId === chatId,
 		);
 		const completedIndex = orderedEvents.findIndex(
-			event => event.event === "chat_updated" && event.data.status === "completed",
+			(event) => event.event === "chat_updated" && event.data.status === "completed",
 		);
 		const deltaIndex = orderedEvents.findIndex((event) => event.event === "assistant_delta");
 
@@ -154,27 +155,19 @@ test("Provider fake falha marca chat como failed", async () => {
 		socket = await createEdenWsClient(createEdenClient({ baseUrl }));
 		await new Promise<void>((resolve) => {
 			socket?.subscribe((event: any) => {
-				const {data} = event;
+				const data = event?.data as { data?: unknown; event?: string } | undefined;
 
-				let payload: any = data;
-
-				if (typeof data === "string") {
-					try {
-						payload = JSON.parse(data);
-					} catch {
-						return;
-					}
-				}
-
-				if (!payload || typeof payload !== "object") {
+				if (!data || typeof data.event !== "string") {
 					return;
 				}
 
-				if (payload.event === "error" && payload.data?.code === "provider_failed") {
+				const payload = data.data as { code?: string; status?: string } | undefined;
+
+				if (data.event === "error" && payload?.code === "provider_failed") {
 					failureObserved = true;
 				}
 
-				if (payload.event === "chat_updated" && payload.data?.status === "failed") {
+				if (data.event === "chat_updated" && payload?.status === "failed") {
 					chatUpdatedFailed = true;
 				}
 
@@ -196,6 +189,49 @@ test("Provider fake falha marca chat como failed", async () => {
 			process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL = previous;
 		}
 
+		socket?.close();
+		await cleanup();
+	}
+});
+
+test("WS emite erro de validação para payload inválido", async () => {
+	const { baseUrl, cleanup } = await createTestServer();
+
+	let socket: WebSocket | undefined;
+
+	const events: string[] = [];
+
+	try {
+		socket = new WebSocket(`${baseUrl}/v1/ws?token=local-dev-token`);
+		await new Promise<void>((resolve) => {
+			socket!.addEventListener("open", () => {
+				resolve();
+			});
+		});
+
+		socket.addEventListener("message", (event) => {
+			const {data} = event;
+
+			if (typeof data === "string") {
+				events.push(data);
+
+				return;
+			}
+
+			try {
+				events.push(JSON.stringify(data));
+			} catch {
+				// ignore non-serializable payloads
+			}
+		});
+
+		socket.send(JSON.stringify({ data: { bad: true }, event: "user_message" }));
+		socket.send(JSON.stringify({ data: { chatId: "missing" }, event: "unknown" }));
+
+		await new Promise((resolve) => setTimeout(resolve, 80));
+
+		expect(events.some((event) => event.includes("validation"))).toBe(true);
+	} finally {
 		socket?.close();
 		await cleanup();
 	}

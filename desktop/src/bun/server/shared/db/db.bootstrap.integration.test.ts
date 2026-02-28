@@ -68,13 +68,11 @@ test("DB initialization creates schema, indices and pragmas", async () => {
 		expect(messageIndexes).toContain("idx_messages_chat");
 
 		expect(
-			(client.sqlite.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number })
-				.foreign_keys,
+			(client.sqlite.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys,
 		).toBe(1);
-		expect(
-			(client.sqlite.prepare("PRAGMA journal_mode").get() as { journal_mode: string })
-				.journal_mode,
-		).toBe("wal");
+		expect((client.sqlite.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe(
+			"wal",
+		);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

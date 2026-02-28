@@ -7,12 +7,6 @@ import { messages } from "../../shared/db/db.schema";
 import type { MessageDTO } from "../../types";
 
 export class MessageRepository {
-	private readonly database: DrizzleDatabaseClient["orm"];
-
-	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
-		this.database = databaseClient;
-	}
-
 	private static toMessageDto(row: typeof messages.$inferSelect): MessageDTO {
 		return {
 			chatId: row.chatId,
@@ -22,6 +16,14 @@ export class MessageRepository {
 			role: row.role as MessageDTO["role"],
 		};
 	}
+
+private readonly database: DrizzleDatabaseClient["orm"];
+
+	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
+		this.database = databaseClient;
+	}
+
+	
 
 	createMessage(chatId: string, role: MessageDTO["role"], content: string): MessageDTO {
 		const id = randomUUID();

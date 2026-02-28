@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { createEdenClient, createEdenWsClient } from "../../eden-client";
+import { createEdenClient } from "../../eden-client";
 import { createTestServer } from "../core/test-server";
 
 test("REST sem token retorna 401", async () => {
@@ -58,15 +58,3 @@ test("WS sem token é rejeitado", async () => {
 		await cleanup();
 	}
 });
-
-export const canCreateWsWithoutToken = async () => {
-	const { baseUrl, cleanup } = await createTestServer();
-
-	try {
-		await createEdenWsClient(createEdenClient({ baseUrl }), { token: "" });
-
-		return false;
-	} finally {
-		await cleanup();
-	}
-};

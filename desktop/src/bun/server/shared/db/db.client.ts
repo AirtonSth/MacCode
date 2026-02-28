@@ -18,7 +18,33 @@ export interface DrizzleDatabaseClient {
 }
 
 export class DatabaseClientFactory {
-	static async create(pathOverride?: string): Promise<DrizzleDatabaseClient> {
+	private static resolveDatabasePath(): string {
+		const configuredPath = serverConfig.databasePath;
+
+		if (configuredPath) {
+			return configuredPath;
+		}
+
+		return join(DatabaseClientFactory.getUserDataPath(), "remodecode-server", "remodecode.sqlite");
+	}
+
+private static getUserDataPath(): string {
+		try {
+			const electrobun = requireModule("electrobun/bun") as {
+				Utils?: {
+					paths?: {
+						userData?: string;
+					};
+				};
+			};
+
+			return electrobun.Utils?.paths?.userData || join(process.cwd(), ".remotecode");
+		} catch {
+			return join(process.cwd(), ".remotecode");
+		}
+	}
+
+static async create(pathOverride?: string): Promise<DrizzleDatabaseClient> {
 		const databasePath = pathOverride ?? DatabaseClientFactory.resolveDatabasePath();
 
 		mkdirSync(dirname(databasePath), { recursive: true });
@@ -44,31 +70,9 @@ export class DatabaseClientFactory {
 		};
 	}
 
-	private static resolveDatabasePath(): string {
-		const configuredPath = serverConfig.databasePath;
+	
 
-		if (configuredPath) {
-			return configuredPath;
-		}
-
-		return join(DatabaseClientFactory.getUserDataPath(), "remodecode-server", "remodecode.sqlite");
-	}
-
-	private static getUserDataPath(): string {
-		try {
-			const electrobun = requireModule("electrobun/bun") as {
-				Utils?: {
-					paths?: {
-						userData?: string;
-					};
-				};
-			};
-
-			return electrobun.Utils?.paths?.userData || join(process.cwd(), ".remotecode");
-		} catch {
-			return join(process.cwd(), ".remotecode");
-		}
-	}
+	
 }
 
-export const createDatabaseClient = (pathOverride?: string) => DatabaseClientFactory.create(pathOverride);
+export const createDatabaseClient = async (pathOverride?: string) => await DatabaseClientFactory.create(pathOverride);

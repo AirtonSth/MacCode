@@ -5,9 +5,9 @@ import { resolveWsToken } from "../../shared/auth/auth.service";
 import type { ClientWsEvent, ServerWsEvent } from "../../types";
 import type { WsService } from "./ws.model";
 
-type BroadcastSocket = WsLike & {
+interface BroadcastSocket extends WsLike {
 	send: (message: unknown) => void;
-};
+}
 
 interface WsLike {
 	data: {
@@ -16,15 +16,50 @@ interface WsLike {
 }
 
 export class WsController {
-	private readonly subscriptions = new Map<string, Set<BroadcastSocket>>();
-
-	constructor(private readonly service: WsService) {}
-
 	static build(service: WsService) {
 		return new WsController(service).build();
 	}
 
-	private joinChat(chatId: string, socket: BroadcastSocket) {
+private static parseEventPayload(message: unknown): ClientWsEvent | null {
+		if (message === null) {
+			return null;
+		}
+
+		if (typeof message === "string") {
+			try {
+				return JSON.parse(message) as ClientWsEvent;
+			} catch {
+				return null;
+			}
+		}
+
+		if (message instanceof ArrayBuffer) {
+			return WsController.parseEventPayload(new TextDecoder().decode(message));
+		}
+
+		if (message instanceof Uint8Array) {
+			return WsController.parseEventPayload(new TextDecoder().decode(message));
+		}
+
+		if (typeof message === "object") {
+			const candidate = message as { data?: unknown; event?: unknown };
+
+			if (typeof candidate.event === "string" && candidate.data && typeof candidate.data === "object") {
+				return candidate as ClientWsEvent;
+			}
+		}
+
+		return null;
+	}
+
+private readonly subscriptions = new Map<string, Set<BroadcastSocket>>();
+
+	constructor(private readonly service: WsService) {}
+
+	
+
+	
+private joinChat(chatId: string, socket: BroadcastSocket) {
 		const previous = this.subscriptions.get(chatId);
 
 		if (previous) {
@@ -64,37 +99,7 @@ export class WsController {
 		}
 	}
 
-	private static parseEventPayload(message: unknown): ClientWsEvent | null {
-		if (message === null) {
-			return null;
-		}
-
-		if (typeof message === "string") {
-			try {
-				return JSON.parse(message) as ClientWsEvent;
-			} catch {
-				return null;
-			}
-		}
-
-		if (message instanceof ArrayBuffer) {
-			return WsController.parseEventPayload(new TextDecoder().decode(message));
-		}
-
-		if (message instanceof Uint8Array) {
-			return WsController.parseEventPayload(new TextDecoder().decode(message));
-		}
-
-		if (typeof message === "object") {
-			const candidate = message as { data?: unknown; event?: unknown };
-
-			if (typeof candidate.event === "string" && candidate.data && typeof candidate.data === "object") {
-				return candidate as ClientWsEvent;
-			}
-		}
-
-		return null;
-	}
+	
 
 	build() {
 		return new Elysia({ name: "ws-controller" }).ws("/v1/ws", {
@@ -131,6 +136,7 @@ export class WsController {
 									code: "bad_payload",
 									message: "invalid websocket message format",
 								},
+
 								event: "error",
 							},
 						);
@@ -145,10 +151,11 @@ export class WsController {
 							(ws as BroadcastSocket).send(
 								{
 									data: {
+										chatId: payload.data.chatId,
 										code: "chat_not_found",
 										message: "chat not found",
-										chatId: payload.data.chatId,
 									},
+
 									event: "error",
 								},
 							);
@@ -168,10 +175,11 @@ export class WsController {
 							(ws as BroadcastSocket).send(
 								{
 									data: {
+										chatId: payload.data.chatId,
 										code: "invalid_text",
 										message: "message text is required",
-										chatId: payload.data.chatId,
 									},
+
 									event: "error",
 								},
 							);
@@ -182,9 +190,11 @@ export class WsController {
 						this.joinChat(payload.data.chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
 							chatId: payload.data.chatId,
+
 							emit: (event) => {
 								this.broadcastToChat(payload.data.chatId, event);
 							},
+
 							text,
 						});
 
@@ -197,6 +207,7 @@ export class WsController {
 								code: "bad_event",
 								message: "unsupported event",
 							},
+
 							event: "error",
 						},
 					);

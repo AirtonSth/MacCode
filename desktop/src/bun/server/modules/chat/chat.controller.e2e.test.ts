@@ -49,15 +49,26 @@ test("POST /v1/projects/:id/chats cria chat pending e GET lista por project em o
 		expect(secondChat.status).toBe("pending");
 
 		const list = await client.v1.projects({ id: projectId }).chats.get();
-		const {chats} = (list.data as { chats: { id: string }[] });
+		const { chats } = (list.data as { chats: { id: string }[] });
 
 		expect(list.status).toBe(200);
 		expect(chats.length).toBe(2);
-		expect(chats[0].id === firstChat.id || chats[0].id === secondChat.id).toBe(
-			true,
-		);
-		expect(chats.map((chat: { id: string }) => chat.id)).toContain(firstChat.id);
-		expect(chats.map((chat: { id: string }) => chat.id)).toContain(secondChat.id);
+		expect(chats).toContainEqual(expect.objectContaining({ id: firstChat.id }));
+		expect(chats).toContainEqual(expect.objectContaining({ id: secondChat.id }));
+	} finally {
+		await cleanup();
+	}
+});
+
+test("POST /v1/projects/:id/chats retorna 404 para projeto inexistente", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const response = await client.v1.projects({ id: "non-existing" }).chats.post({ title: "sem projeto" });
+		const errorPayload = response.error && "value" in response.error ? (response.error as { value: { error?: string } }).value : undefined;
+
+		expect(response.status).toBe(404);
+		expect(errorPayload?.error).toBe("project not found");
 	} finally {
 		await cleanup();
 	}
