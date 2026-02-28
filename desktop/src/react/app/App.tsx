@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
 import { RemoteCodeApi, RemoteCodeApiError } from "../shared/api/remotecode-http";
 import {
@@ -45,6 +45,10 @@ const formatProjectMeta = (absolutePath: string): string => {
 	return segments[segments.length - 2];
 };
 
+const normalizeProjectPath = (projectPath: string): string => {
+	return projectPath.trim().replace(/^["']+|["']+$/gu, "");
+};
+
 const SUGGESTION_CARDS = [
 	"Build a classic Snake game in this repo.",
 	"Create a one-page PDF that summarizes this app.",
@@ -79,6 +83,10 @@ const App = (): JSX.Element => {
 	const streamingText = selectedChatIdRef.current
 		? state.streamingByChat[selectedChatIdRef.current] ?? ""
 		: "";
+
+	const [isOpenProjectFormVisible, setIsOpenProjectFormVisible] = useState(false);
+	const [openProjectPath, setOpenProjectPath] = useState("");
+	const [openProjectName, setOpenProjectName] = useState("");
 
 	useEffect(() => {
 		selectedChatIdRef.current = state.selectedChatId;
@@ -300,12 +308,14 @@ const App = (): JSX.Element => {
 				const project = await api.createProject(input);
 				dispatch({ type: "UPSERT_PROJECT", payload: project });
 				dispatch({ type: "SET_SELECTED_PROJECT", payload: project.id });
+				return project;
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to create project"),
 					"rest",
 					formatApiErrorCode(error),
 				);
+				return null;
 			} finally {
 				dispatch({ type: "SET_CREATING_PROJECT", payload: false });
 			}
@@ -423,24 +433,37 @@ const App = (): JSX.Element => {
 	}, [dispatch]);
 
 	const handleOpenProject = useCallback(() => {
-		const projectPath = window.prompt("Enter the absolute project path");
-		if (projectPath === null) {
-			return;
-		}
+		setIsOpenProjectFormVisible(true);
+	}, []);
 
-		const trimmedPath = projectPath
-			.trim()
-			.replace(/^"+|"+$/g, "");
-		if (!trimmedPath) {
-			return;
-		}
+	const handleSubmitOpenProject = useCallback(
+		async (event: FormEvent) => {
+			event.preventDefault();
 
-		const nameInput = window.prompt("Project name (optional)") ?? "";
-		void handleCreateProject({
-			name: nameInput.trim().length > 0 ? nameInput.trim() : undefined,
-			path: trimmedPath,
-		});
-	}, [handleCreateProject]);
+			const normalizedPath = normalizeProjectPath(openProjectPath);
+			if (!normalizedPath) {
+				addError("Project path is required", "rest", "missing_path");
+				return;
+			}
+
+			const hasCreatedProject = await handleCreateProject({
+				name: openProjectName.trim() || undefined,
+				path: normalizedPath,
+			});
+			if (hasCreatedProject) {
+				setOpenProjectPath("");
+				setOpenProjectName("");
+				setIsOpenProjectFormVisible(false);
+			}
+		},
+		[addError, handleCreateProject, openProjectName, openProjectPath],
+	);
+
+	const handleCancelOpenProject = useCallback(() => {
+		setOpenProjectPath("");
+		setOpenProjectName("");
+		setIsOpenProjectFormVisible(false);
+	}, []);
 
 	const connectionMessage = useMemo(() => {
 		switch (state.connectionState) {
@@ -550,9 +573,42 @@ const App = (): JSX.Element => {
 					<header className="codex-main-header">
 						<h1>{selectedChat ? selectedChat.title : "New thread"}</h1>
 						<div className="header-actions">
-							<button className="header-pill primary" onClick={handleOpenProject} type="button">
-								Open
-							</button>
+							{!isOpenProjectFormVisible ? (
+								<button className="header-pill primary" onClick={handleOpenProject} type="button">
+									Open
+								</button>
+							) : (
+								<form className="open-project-form" onSubmit={handleSubmitOpenProject}>
+									<input
+										id="open-project-path"
+										onChange={(event) => {
+											setOpenProjectPath(event.target.value);
+										}}
+										placeholder="/absolute/path/to/project"
+										value={openProjectPath}
+									/>
+									<input
+										id="open-project-name"
+										onChange={(event) => {
+											setOpenProjectName(event.target.value);
+										}}
+										placeholder="Project name (optional)"
+										value={openProjectName}
+									/>
+									<div className="header-actions">
+										<button
+											className="header-pill primary"
+											disabled={state.isCreatingProject}
+											type="submit"
+										>
+											{state.isCreatingProject ? "Opening..." : "Open project"}
+										</button>
+										<button className="header-pill" onClick={handleCancelOpenProject} type="button">
+											Cancel
+										</button>
+									</div>
+								</form>
+							)}
 							<button
 								className="header-pill"
 								onClick={() => {
