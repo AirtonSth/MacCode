@@ -15,7 +15,7 @@ export interface ProjectDTO {
 export interface ChatDTO {
 	id: string;
 	projectId: string;
-	provider: "fake";
+	provider: "fake" | "codex";
 	title: string;
 	status: "pending" | "running" | "completed" | "failed";
 	diffAdded: number;

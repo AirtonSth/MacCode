@@ -26,7 +26,7 @@ test("POST /v1/projects/:id/chats creates pending chat and lists by project orde
 		}).chat;
 
 		expect(first.status).toBe(201);
-		expect(firstChat.provider).toBe("fake");
+		expect(firstChat.provider).toBe("codex");
 		expect(firstChat.status).toBe("pending");
 
 		const second = await client.v1.projects({ id: projectId }).chats.post({

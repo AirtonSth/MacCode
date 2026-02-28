@@ -6,6 +6,7 @@ import { expect, test } from "bun:test";
 
 import { initializeDatabaseSchema } from "../../shared/db/db.bootstrap";
 import { createDatabaseClient } from "../../shared/db/db.client";
+import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
 import { createChatRepository } from "../chat/chat.repository";
 import { createMessageRepository } from "../message/message.repository";
 import { createProjectRepository } from "../project/project.repository";
@@ -15,6 +16,7 @@ type ServerEvent =
 	| {
 			data: {
 				chatId?: string;
+				code?: string;
 				delta?: string;
 				diffAdded?: number;
 				diffRemoved?: number;
@@ -24,7 +26,7 @@ type ServerEvent =
 			event: "assistant_delta" | "assistant_done" | "chat_updated" | "error";
 	  };
 
-test("WsService runs streaming flow with provider and persists assistant message", async () => {
+test("WsService runs streaming flow with codex runner and persists assistant message", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-"));
 	const databasePath = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(databasePath);
@@ -35,7 +37,24 @@ test("WsService runs streaming flow with provider and persists assistant message
 		const projectRepository = createProjectRepository(client.orm);
 		const chatRepository = createChatRepository(client.orm);
 		const messageRepository = createMessageRepository(client.orm);
-		const service = new WsService(chatRepository, messageRepository);
+		const runner = {
+			run: async ({
+				onDelta,
+			}: {
+				onDelta: (delta: string) => void;
+			}) => {
+				onDelta("Codex is thinking...\n");
+				onDelta("Final answer");
+				return {
+					assistantText: "Final answer",
+					diffAdded: 12,
+					diffRemoved: 0,
+					status: "completed" as const,
+					threadId: "thread-integration-1",
+				};
+			},
+		} as CodexProviderRunnerContract;
+		const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
 
 		const project = projectRepository.createProject("/tmp", "tmp");
 		const chat = chatRepository.createChat(project.id, "stream");
@@ -43,60 +62,73 @@ test("WsService runs streaming flow with provider and persists assistant message
 
 		await service.startUserMessage({
 			chatId: chat.id,
-
 			emit: (event) => {
 				if (typeof event === "object" && typeof event.event === "string") {
 					events.push(event);
 				}
 			},
-
 			text: "hello",
 		});
 
-		const hasRunning = events.some(
-			(event) => event.event === "chat_updated" && event.data.status === "running",
+		expect(events.some((event) => event.event === "chat_updated" && event.data.status === "running")).toBe(
+			true,
 		);
-		const hasDone = events.some((event) => event.event === "assistant_done");
-		const hasCompleted = events.some(
-			(event) => event.event === "chat_updated" && event.data.status === "completed",
+		expect(events.some((event) => event.event === "assistant_delta")).toBe(true);
+		expect(events.some((event) => event.event === "assistant_done")).toBe(true);
+		expect(events.some((event) => event.event === "chat_updated" && event.data.status === "completed")).toBe(
+			true,
 		);
 
-		expect(hasRunning).toBe(true);
-		expect(hasDone).toBe(true);
-		expect(hasCompleted).toBe(true);
-
-		const updated = await chatRepository.findChatById(chat.id);
-
+		const updated = chatRepository.findChatById(chat.id);
 		expect(updated?.status).toBe("completed");
-		expect(updated?.diffAdded).toBeGreaterThan(0);
+		expect(updated?.diffAdded).toBe(12);
+		expect(chatRepository.findProviderThreadIdByChatId(chat.id)).toBe("thread-integration-1");
 
 		const messages = messageRepository.listMessagesByChatId(chat.id);
-
 		expect(messages).toHaveLength(2);
 		expect(messages[0].role).toBe("user");
 		expect(messages[1].role).toBe("assistant");
+		expect(messages[1].content).toBe("Final answer");
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });
 	}
 });
 
-test("WsService.startUserMessage emits chat_not_found when chat is missing", async () => {
-	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-missing-chat-"));
+test("WsService.startUserMessage emits legacy_chat_provider for fake chat", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-legacy-"));
 	const databasePath = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(databasePath);
 
 	try {
 		initializeDatabaseSchema(client.sqlite);
 
+		const projectRepository = createProjectRepository(client.orm);
 		const chatRepository = createChatRepository(client.orm);
 		const messageRepository = createMessageRepository(client.orm);
-		const service = new WsService(chatRepository, messageRepository);
+		const service = new WsService(
+			chatRepository,
+			messageRepository,
+			projectRepository,
+			{
+				run: async () => ({
+					assistantText: "unexpected",
+					diffAdded: 0,
+					diffRemoved: 0,
+					status: "completed" as const,
+				}),
+			},
+		);
+
+		const project = projectRepository.createProject("/tmp/ws-legacy", "tmp");
+		const createdChat = chatRepository.createChat(project.id, "legacy");
+		client.sqlite
+			.prepare("UPDATE chats SET provider = 'fake' WHERE id = ?")
+			.run(createdChat.id);
 
 		const events: ServerEvent[] = [];
-
 		await service.startUserMessage({
-			chatId: "missing-chat",
+			chatId: createdChat.id,
 			emit: (event) => {
 				if (typeof event === "object" && typeof event.event === "string") {
 					events.push(event);
@@ -108,9 +140,10 @@ test("WsService.startUserMessage emits chat_not_found when chat is missing", asy
 		expect(events).toEqual([
 			{
 				data: {
-					chatId: "missing-chat",
-					code: "chat_not_found",
-					message: "chat not found",
+					chatId: createdChat.id,
+					code: "legacy_chat_provider",
+					message:
+						"legacy fake-provider chats are read-only. create a new codex chat to send messages",
 				},
 				event: "error",
 			},

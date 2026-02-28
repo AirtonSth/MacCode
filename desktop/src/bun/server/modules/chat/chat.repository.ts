@@ -4,35 +4,35 @@ import { desc, eq } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { chats } from "../../shared/db/db.schema";
-import type { ChatDTO, ChatStatus } from "../../types";
+import type { ChatDTO, ChatProvider, ChatStatus } from "../../types";
 
 export class ChatRepository {
-	private static toNumber(value: number | null | undefined): number {
-		return Number(value ?? 0);
-	}
-
-private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
-		return {
-			diffAdded: ChatRepository.toNumber(row.diffAdded),
-			diffRemoved: ChatRepository.toNumber(row.diffRemoved),
-			id: row.id,
-			projectId: row.projectId,
-			provider: "fake",
-			status: row.status as ChatStatus,
-			title: row.title,
-			updatedAt: row.updatedAt,
-		};
-	}
-
-private readonly database: DrizzleDatabaseClient["orm"];
+	private readonly database: DrizzleDatabaseClient["orm"];
 
 	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
 		this.database = databaseClient;
 	}
 
-	
+	private static toNumber(value: number | null | undefined): number {
+		return Number(value ?? 0);
+	}
 
-	
+	private static normalizeProvider(provider: string): ChatProvider {
+		return provider === "codex" ? "codex" : "fake";
+	}
+
+	private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
+		return {
+			diffAdded: ChatRepository.toNumber(row.diffAdded),
+			diffRemoved: ChatRepository.toNumber(row.diffRemoved),
+			id: row.id,
+			projectId: row.projectId,
+			provider: ChatRepository.normalizeProvider(row.provider),
+			status: row.status as ChatStatus,
+			title: row.title,
+			updatedAt: row.updatedAt,
+		};
+	}
 
 	createChat(projectId: string, title: string): ChatDTO {
 		const now = new Date().toISOString();
@@ -45,7 +45,8 @@ private readonly database: DrizzleDatabaseClient["orm"];
 				diffRemoved: 0,
 				id: chatId,
 				projectId,
-				provider: "fake",
+				provider: "codex",
+				providerThreadId: null,
 				status: "pending",
 				title,
 				updatedAt: now,
@@ -69,6 +70,16 @@ private readonly database: DrizzleDatabaseClient["orm"];
 			.all() as typeof chats.$inferSelect[];
 
 		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
+	}
+
+	findProviderThreadIdByChatId(id: string): string | null {
+		const rows = this.database
+			.select({ providerThreadId: chats.providerThreadId })
+			.from(chats)
+			.where(eq(chats.id, id))
+			.all() as Array<{ providerThreadId: string | null }>;
+
+		return rows[0]?.providerThreadId ?? null;
 	}
 
 	getChatsByProjectId(projectId: string): ChatDTO[] {
@@ -106,11 +117,30 @@ private readonly database: DrizzleDatabaseClient["orm"];
 		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
 	}
 
+	updateProviderThreadId(chatId: string, providerThreadId: string | null): ChatDTO | null {
+		this.database
+			.update(chats)
+			.set({
+				providerThreadId,
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(chats.id, chatId))
+			.run();
+
+		const rows = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.id, chatId))
+			.all() as typeof chats.$inferSelect[];
+
+		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
+	}
+
 	deleteChat(id: string): boolean {
 		const result = this.database.delete(chats).where(eq(chats.id, id)).run() as { changes?: number };
-
 		return (result.changes ?? 0) > 0;
 	}
 }
 
-export const createChatRepository = (databaseClient: DrizzleDatabaseClient["orm"]) => new ChatRepository(databaseClient);
+export const createChatRepository = (databaseClient: DrizzleDatabaseClient["orm"]) =>
+	new ChatRepository(databaseClient);

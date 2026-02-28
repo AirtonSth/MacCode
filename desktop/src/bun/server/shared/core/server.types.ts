@@ -8,7 +8,7 @@ export interface ChatDTO {
 	title: string;
 	updatedAt: string;
 }
-export type ChatProvider = "fake";
+export type ChatProvider = "fake" | "codex";
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
 
@@ -45,6 +45,23 @@ export interface FakeProviderRunOptions {
 	chatId: string;
 	onDelta: (delta: string) => void;
 	text: string;
+}
+
+export interface CodexProviderResult {
+	assistantText: string;
+	diffAdded: number;
+	diffRemoved: number;
+	error?: string;
+	status: "completed" | "failed";
+	threadId?: string;
+}
+
+export interface CodexProviderRunOptions {
+	chatId: string;
+	onDelta: (delta: string) => void;
+	text: string;
+	threadId?: string;
+	workspacePath: string;
 }
 
 export interface MessageDTO {

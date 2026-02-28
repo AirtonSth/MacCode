@@ -3,7 +3,21 @@ import { expect, test } from "bun:test";
 import type { ChatDTO, ServerWsEvent } from "../../types";
 import type { ChatRepository } from "../chat/chat.repository";
 import type { MessageRepository } from "../message/message.repository";
+import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
+import type { ProjectRepository } from "../project/project.repository";
 import { WsService } from "./ws.service";
+
+const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
+	diffAdded: 0,
+	diffRemoved: 0,
+	id: "chat-id",
+	projectId: "project-id",
+	provider: "codex",
+	status: "pending",
+	title: "Chat",
+	updatedAt: new Date().toISOString(),
+	...overrides,
+});
 
 const collectEvents = async (emit: (event: ServerWsEvent) => void) => {
 	const events: ServerWsEvent[] = [];
@@ -13,7 +27,6 @@ const collectEvents = async (emit: (event: ServerWsEvent) => void) => {
 			events.push(event);
 			emit(event);
 		},
-
 		events,
 	};
 };
@@ -21,7 +34,6 @@ const collectEvents = async (emit: (event: ServerWsEvent) => void) => {
 test("WsService.startUserMessage returns chat_not_found for missing chat", async () => {
 	const chatRepository = {
 		findChatById: () => null,
-		updateChat: () => null,
 	} as unknown as ChatRepository;
 
 	const messageRepository = {
@@ -30,7 +42,20 @@ test("WsService.startUserMessage returns chat_not_found for missing chat", async
 		},
 	} as unknown as MessageRepository;
 
-	const service = new WsService(chatRepository, messageRepository);
+	const projectRepository = {
+		findProjectById: () => null,
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async () => ({
+			assistantText: "never",
+			diffAdded: 0,
+			diffRemoved: 0,
+			status: "completed" as const,
+		}),
+	} as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
 	const collector = await collectEvents(() => {});
 
 	await service.startUserMessage({ chatId: "missing", emit: collector.emit, text: "hi" });
@@ -42,27 +67,17 @@ test("WsService.startUserMessage returns chat_not_found for missing chat", async
 				code: "chat_not_found",
 				message: "chat not found",
 			},
-
 			event: "error",
 		},
 	]);
 });
 
-test("WsService.startUserMessage blocks chat_running when already running", async () => {
-	const runningChat: ChatDTO = {
-		diffAdded: 0,
-		diffRemoved: 0,
-		id: "chat-id",
-		projectId: "project-id",
-		provider: "fake",
-		status: "running",
-		title: "Test",
-		updatedAt: new Date().toISOString(),
-	};
-
+test("WsService.startUserMessage blocks legacy fake chats", async () => {
 	const chatRepository = {
-		findChatById: () => runningChat,
-		updateChat: () => null,
+		findChatById: () =>
+			createChat({
+				provider: "fake",
+			}),
 	} as unknown as ChatRepository;
 
 	const messageRepository = {
@@ -71,7 +86,58 @@ test("WsService.startUserMessage blocks chat_running when already running", asyn
 		},
 	} as unknown as MessageRepository;
 
-	const service = new WsService(chatRepository, messageRepository);
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async () => {
+			throw new Error("should not call");
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(collector.events).toEqual([
+		{
+			data: {
+				chatId: "chat-id",
+				code: "legacy_chat_provider",
+				message: "legacy fake-provider chats are read-only. create a new codex chat to send messages",
+			},
+			event: "error",
+		},
+	]);
+});
+
+test("WsService.startUserMessage blocks chat_running when already running", async () => {
+	const chatRepository = {
+		findChatById: () =>
+			createChat({
+				status: "running",
+			}),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => {
+			throw new Error("should not call");
+		},
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async () => {
+			throw new Error("should not call");
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
 	const collector = await collectEvents(() => {});
 
 	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
@@ -83,8 +149,117 @@ test("WsService.startUserMessage blocks chat_running when already running", asyn
 				code: "chat_running",
 				message: "chat is already running",
 			},
-
 			event: "error",
 		},
 	]);
+});
+
+test("WsService.startUserMessage emits project_not_found when project does not exist", async () => {
+	const chatRepository = {
+		findChatById: () => createChat(),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => {
+			throw new Error("should not call");
+		},
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => null,
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async () => {
+			throw new Error("should not call");
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(collector.events).toEqual([
+		{
+			data: {
+				chatId: "chat-id",
+				code: "project_not_found",
+				message: "project not found",
+			},
+			event: "error",
+		},
+	]);
+});
+
+test("WsService persists providerThreadId returned by codex runner", async () => {
+	const chat = createChat();
+	const updates: Array<{ chatId: string; providerThreadId: string | null }> = [];
+
+	let updateCallCount = 0;
+	const chatRepository = {
+		findChatById: () => {
+			updateCallCount += 1;
+
+			if (updateCallCount === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+			...chat,
+			status: "running",
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: (chatId: string, providerThreadId: string | null) => {
+			updates.push({ chatId, providerThreadId });
+			return chat;
+		},
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => ({
+			chatId: chat.id,
+			content: "",
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role: "assistant" as const,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({ onDelta }: { onDelta: (delta: string) => void }) => {
+			onDelta("hello");
+			return {
+				assistantText: "hello",
+				diffAdded: 5,
+				diffRemoved: 0,
+				status: "completed" as const,
+				threadId: "thread-42",
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(updates).toEqual([
+		{
+			chatId: "chat-id",
+			providerThreadId: "thread-42",
+		},
+	]);
+	expect(collector.events.some((event) => event.event === "assistant_done")).toBe(true);
 });

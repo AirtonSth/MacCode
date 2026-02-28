@@ -1,8 +1,31 @@
 import { expect, test } from "bun:test";
 
+import { getCodexAvailability } from "../provider/codex-test-gate";
 import { createTestServer } from "../../shared/core/test-server";
 
-test("GET /v1/chats/:id/messages returns messages in ascending createdAt order", async () => {
+const codexAvailability = getCodexAvailability();
+const codexTest = test.skipIf(!codexAvailability.available);
+const skipReasonSuffix = codexAvailability.available ? "" : ` (skip: ${codexAvailability.reason})`;
+
+const waitForCondition = async (predicate: () => boolean, timeoutMs = 90_000): Promise<void> => {
+	await new Promise<void>((resolve, reject) => {
+		const startedAt = performance.now();
+		const timer = setInterval(() => {
+			if (predicate()) {
+				clearInterval(timer);
+				resolve();
+				return;
+			}
+
+			if (performance.now() - startedAt >= timeoutMs) {
+				clearInterval(timer);
+				reject(new Error("timed out waiting for websocket message"));
+			}
+		}, 40);
+	});
+};
+
+codexTest(`GET /v1/chats/:id/messages returns messages in ascending createdAt order${skipReasonSuffix}`, async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: WebSocket | undefined;
@@ -39,28 +62,20 @@ test("GET /v1/chats/:id/messages returns messages in ascending createdAt order",
 			}),
 		);
 
-		await new Promise<void>((resolve) => {
-			const interval = setInterval(() => {
-				const hasDone = events.some((item) => {
-					if (typeof item.data !== "string") {
-						return false;
-					}
-
-					try {
-						const parsed = JSON.parse(item.data);
-
-						return parsed?.event === "assistant_done" && parsed?.data?.chatId === chatId;
-					} catch {
-						return false;
-					}
-				});
-
-				if (hasDone) {
-					clearInterval(interval);
-					resolve();
+		await waitForCondition(() =>
+			events.some((item) => {
+				if (typeof item.data !== "string") {
+					return false;
 				}
-			}, 40);
-		});
+
+				try {
+					const parsed = JSON.parse(item.data);
+					return parsed?.event === "assistant_done" && parsed?.data?.chatId === chatId;
+				} catch {
+					return false;
+				}
+			}),
+		);
 
 		const messages = await client.v1.chats({ id: chatId }).messages.get();
 		const sortedMessages = (messages.data as { messages: { role: "user" | "assistant" }[] }).messages;
@@ -73,7 +88,7 @@ test("GET /v1/chats/:id/messages returns messages in ascending createdAt order",
 		ws?.close();
 		await cleanup();
 	}
-});
+}, 120_000);
 
 test("GET /v1/chats/:id/messages returns 404 for missing chat", async () => {
 	const { cleanup, client } = await createTestServer();

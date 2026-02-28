@@ -1,37 +1,17 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { RemoteCodeApi } from "../../../shared/api/remotecode-http";
-import { RemoteCodeRealtime, type ServerWsEvent } from "../../../shared/realtime/remotecode-ws";
-import { createTestServer } from "../../../bun/server/shared/core/test-server";
+import { createTestServer } from "../../../../bun/server/shared/core/test-server";
 import { sendWorkspaceMessage } from "./send-message";
 
-const waitForCondition = async (
-	predicate: () => boolean,
-	timeoutMs = 5000,
-	intervalMs = 25,
-): Promise<void> => {
-	await new Promise<void>((resolve, reject) => {
-		const start = Date.now();
-		const timer = setInterval(() => {
-			if (predicate()) {
-				clearInterval(timer);
-				resolve();
-				return;
-			}
-
-			if (Date.now() - start >= timeoutMs) {
-				clearInterval(timer);
-				reject(new Error("Timed out waiting for e2e condition"));
-			}
-		}, intervalMs);
-	});
-};
-
 test("frontend e2e message send auto-creates thread when none selected", async () => {
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-frontend-send-e2e-"));
 	const { baseUrl, cleanup } = await createTestServer();
-	let connectionState: "idle" | "connected" | "disconnected" | "connecting" | "reconnecting" = "idle";
-	const assistantDoneChats = new Set<string>();
-	const capturedErrors: Array<ServerWsEvent> = [];
+	const sentPayloads: Array<{ chatId: string; text: string }> = [];
 	const token = "local-dev-token";
 	let selectedProjectId: string | null = null;
 	let selectedChatId: string | null = null;
@@ -40,29 +20,10 @@ test("frontend e2e message send auto-creates thread when none selected", async (
 		baseUrl,
 		token,
 	});
-	const ws = RemoteCodeRealtime.createClient({
-		baseUrl,
-		onConnectionStateChange: (state) => {
-			connectionState = state;
-		},
-		onEvent: (event) => {
-			if (event.event === "assistant_done") {
-				assistantDoneChats.add(event.data.chatId);
-			}
-
-			if (event.event === "error") {
-				capturedErrors.push(event);
-			}
-		},
-		token,
-	});
 
 	try {
-		const project = await api.createProject({ name: "Frontend e2e", path: "/tmp/frontend-e2e-project" });
+		const project = await api.createProject({ name: "Frontend e2e", path: workspaceRoot });
 		selectedProjectId = project.id;
-
-		ws.connect();
-		await waitForCondition(() => connectionState === "connected");
 
 		const result = await sendWorkspaceMessage({
 			createChatId: async () => {
@@ -70,7 +31,7 @@ test("frontend e2e message send auto-creates thread when none selected", async (
 					return null;
 				}
 
-				const chat = await api.createChat(selectedProjectId, { title: "Auto thread" });
+				const chat = await api.createChat(selectedProjectId, "Auto thread");
 				selectedChatId = chat.id;
 				return chat.id;
 			},
@@ -89,32 +50,110 @@ test("frontend e2e message send auto-creates thread when none selected", async (
 				// no-op for this e2e
 			},
 			onSendUserMessage: (chatId, text) => {
-				ws.sendUserMessage(chatId, text);
+				sentPayloads.push({ chatId, text });
 			},
 			selectedChatId,
+			selectedChatProvider: null,
 			selectedProjectId,
 			text: "Hello auto thread",
 		});
 
-		const createdChatId = result.chatId;
-		await waitForCondition(() => {
-			if (!createdChatId) {
-				return false;
-			}
-
-			return assistantDoneChats.has(createdChatId);
-		});
-
-		const messages = await api.listMessages(createdChatId!);
-		const stored = messages.map((item) => item.content);
+		const chats = await api.listChats(selectedProjectId!);
 
 		expect(result.chatId).toBe(selectedChatId);
 		expect(result.sent).toBe(true);
 		expect(result.createdNewChat).toBe(true);
-		expect(stored).toEqual(expect.arrayContaining(["Hello auto thread"]));
-		expect(capturedErrors).toHaveLength(0);
+		expect(chats.some((chat) => chat.id === result.chatId && chat.provider === "codex")).toBe(true);
+		expect(sentPayloads).toEqual([
+			{
+				chatId: result.chatId!,
+				text: "Hello auto thread",
+			},
+		]);
 	} finally {
-		ws.disconnect();
 		await cleanup();
+		rmSync(workspaceRoot, { force: true, recursive: true });
+	}
+});
+
+test("frontend e2e message send creates a new codex chat when selected chat is legacy fake", async () => {
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-frontend-send-legacy-"));
+	const { baseUrl, cleanup, databasePath } = await createTestServer();
+	const sentPayloads: Array<{ chatId: string; text: string }> = [];
+	const token = "local-dev-token";
+	let selectedProjectId: string | null = null;
+	let selectedChatId: string | null = null;
+	let selectedChatProvider: "fake" | "codex" | null = null;
+
+	const api = RemoteCodeApi.createClient({
+		baseUrl,
+		token,
 	});
+
+	try {
+		const project = await api.createProject({ name: "Frontend e2e legacy", path: workspaceRoot });
+		selectedProjectId = project.id;
+
+		const legacyChat = await api.createChat(selectedProjectId, "Legacy thread");
+		selectedChatId = legacyChat.id;
+		selectedChatProvider = "fake";
+
+		const sqlite = new Database(databasePath);
+		try {
+			sqlite.prepare("UPDATE chats SET provider = 'fake' WHERE id = ?").run(selectedChatId);
+		} finally {
+			sqlite.close();
+		}
+
+		const result = await sendWorkspaceMessage({
+			createChatId: async () => {
+				if (!selectedProjectId) {
+					return null;
+				}
+
+				const chat = await api.createChat(selectedProjectId, "Auto codex thread");
+				selectedChatId = chat.id;
+				selectedChatProvider = chat.provider;
+				return chat.id;
+			},
+			createTimestamp: () => "2026-01-01T00:00:00.000Z",
+			hasOpenWebSocket: true,
+			onAppendMessage: () => {
+				// no-op for this e2e
+			},
+			onClearStreaming: () => {
+				// no-op for this e2e
+			},
+			onCreateMessageError: () => {
+				// no-op for this e2e
+			},
+			onSetSending: () => {
+				// no-op for this e2e
+			},
+			onSendUserMessage: (chatId, text) => {
+				sentPayloads.push({ chatId, text });
+			},
+			selectedChatId,
+			selectedChatProvider,
+			selectedProjectId,
+			text: "Continue from legacy",
+		});
+
+		const chats = await api.listChats(selectedProjectId!);
+
+		expect(result.sent).toBe(true);
+		expect(result.createdNewChat).toBe(true);
+		expect(result.chatId).not.toBe(legacyChat.id);
+		expect(chats.some((chat) => chat.id === legacyChat.id && chat.provider === "fake")).toBe(true);
+		expect(chats.some((chat) => chat.id === result.chatId && chat.provider === "codex")).toBe(true);
+		expect(sentPayloads).toEqual([
+			{
+				chatId: result.chatId!,
+				text: "Continue from legacy",
+			},
+		]);
+	} finally {
+		await cleanup();
+		rmSync(workspaceRoot, { force: true, recursive: true });
+	}
 });

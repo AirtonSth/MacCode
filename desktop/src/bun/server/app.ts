@@ -33,7 +33,7 @@ export const ServerBootstrap = {
 		const chatService = new ChatService(chatRepository, projectRepository);
 		const messageService = new MessageService(chatRepository, messageRepository);
 		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
-		const wsService = new WsService(chatRepository, messageRepository);
+		const wsService = new WsService(chatRepository, messageRepository, projectRepository);
 
 		const app = new Elysia()
 			.group("/v1", (group) =>

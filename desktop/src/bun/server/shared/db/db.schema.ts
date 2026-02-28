@@ -13,6 +13,7 @@ export const chats = sqliteTable("chats", {
 	diffAdded: integer("diffAdded").notNull().default(0),
 	diffRemoved: integer("diffRemoved").notNull().default(0),
 	id: text("id").primaryKey(),
+	providerThreadId: text("providerThreadId"),
 
 	projectId: text("projectId")
 		.notNull()

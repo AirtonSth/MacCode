@@ -24,6 +24,11 @@ const createCollector = () => {
 			errors,
 			sendingFlags,
 		},
+		messages,
+		clearCalls,
+		sentPayloads,
+		errors,
+		sendingFlags,
 		onAppendMessage: (message: MessageDTO) => {
 			messages.push(message);
 		},
@@ -122,6 +127,43 @@ test("sendWorkspaceMessage auto-creates a chat when no chat is selected", async 
 		},
 	]);
 	expect(callbacks.errors).toHaveLength(0);
+});
+
+test("sendWorkspaceMessage auto-creates a codex chat when selected chat is legacy fake", async () => {
+	const callbacks = createCollector();
+	let createCount = 0;
+
+	const result = await sendWorkspaceMessage({
+		createChatId: async () => {
+			createCount += 1;
+			return "chat-codex";
+		},
+		createTimestamp: () => "2026-01-01T00:00:00.000Z",
+		generateMessageId: () => "message-legacy",
+		hasOpenWebSocket: true,
+		onAppendMessage: callbacks.onAppendMessage,
+		onClearStreaming: callbacks.onClearStreaming,
+		onCreateMessageError: callbacks.onCreateMessageError,
+		onSetSending: callbacks.onSetSending,
+		onSendUserMessage: callbacks.onSendUserMessage,
+		selectedChatId: "legacy-chat",
+		selectedChatProvider: "fake",
+		selectedProjectId: "project-1",
+		text: "continue in codex",
+	});
+
+	expect(result).toEqual({
+		chatId: "chat-codex",
+		sent: true,
+		createdNewChat: true,
+	});
+	expect(createCount).toBe(1);
+	expect(callbacks.sentPayloads).toEqual([
+		{
+			chatId: "chat-codex",
+			text: "continue in codex",
+		},
+	]);
 });
 
 test("sendWorkspaceMessage does not send when websocket is not connected", async () => {

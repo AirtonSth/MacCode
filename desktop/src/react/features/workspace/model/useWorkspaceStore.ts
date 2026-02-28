@@ -15,7 +15,7 @@ export interface ChatDTO {
 	id: string;
 	projectId: string;
 	title: string;
-	provider: "fake";
+	provider: "fake" | "codex";
 	status: ChatStatus;
 	diffAdded: number;
 	diffRemoved: number;
@@ -75,6 +75,7 @@ export type WorkspaceAction =
 	| { type: "SET_CHATS"; payload: ChatDTO[] }
 	| { type: "UPSERT_CHAT"; payload: ChatDTO }
 	| { type: "UPDATE_CHAT"; payload: Partial<ChatDTO> & { id: string } }
+	| { type: "REMOVE_CHAT"; payload: { chatId: string; nextSelectedChatId: string | null } }
 	| { type: "SET_SELECTED_CHAT"; payload: string | null }
 	| { type: "RESET_SELECTED_CHAT" }
 	| { type: "SET_MESSAGES_LOADING"; payload: boolean }
@@ -217,6 +218,22 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 					chat.id === action.payload.id ? { ...chat, ...action.payload } : chat,
 				),
 			};
+
+		case "REMOVE_CHAT": {
+			const nextStreamingByChat = { ...state.streamingByChat };
+			const nextStreamingActiveByChat = { ...state.streamingActiveByChat };
+			delete nextStreamingByChat[action.payload.chatId];
+			delete nextStreamingActiveByChat[action.payload.chatId];
+
+			return {
+				...state,
+				chats: state.chats.filter((chat) => chat.id !== action.payload.chatId),
+				selectedChatId: action.payload.nextSelectedChatId,
+				messages: state.selectedChatId === action.payload.chatId ? [] : state.messages,
+				streamingByChat: nextStreamingByChat,
+				streamingActiveByChat: nextStreamingActiveByChat,
+			};
+		}
 
 			case "SET_SELECTED_CHAT":
 				return {

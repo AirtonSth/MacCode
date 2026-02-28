@@ -68,6 +68,17 @@
 }
 
 @layer components {
+	.codex-sidebar {
+		font-family:
+			"SF Pro Text",
+			"SF Pro Display",
+			-apple-system,
+			BlinkMacSystemFont,
+			"Segoe UI",
+			"Inter",
+			sans-serif;
+	}
+
 	.glass-shell {
 		@apply relative overflow-hidden rounded-[30px] border border-white/10 bg-slate-950/55 shadow-2xl backdrop-blur-2xl;
 		box-shadow: var(--window-shadow);

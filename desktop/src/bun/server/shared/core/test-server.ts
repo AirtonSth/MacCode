@@ -8,6 +8,7 @@ import { createEdenClient } from "../../eden-client";
 export interface RunningServer {
 	backend: BackendHandle;
 	baseUrl: string;
+	databasePath: string;
 	cleanup: () => Promise<void>;
 	client: ReturnType<typeof createEdenClient>;
 }
@@ -36,6 +37,7 @@ export const TestServerFactory = {
 		return {
 			backend,
 			baseUrl,
+			databasePath,
 
 			cleanup: async () => {
 				await backend.app.stop(true);
