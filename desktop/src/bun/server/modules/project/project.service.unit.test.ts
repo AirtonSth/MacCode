@@ -26,7 +26,7 @@ const createProject = (id: string, path: string, name = `project-${id}`): Projec
 	updatedAt: new Date().toISOString(),
 });
 
-test("ProjectService.createProject normaliza e rejeita caminhos inválidos", async () => {
+test("ProjectService.createProject normalizes and rejects invalid paths", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-project-service-unit-"));
 	const validDirectory = join(root, "repo");
 	const invalidDirectory = join(root, "not-a-directory");
@@ -92,7 +92,7 @@ test("ProjectService.createProject normaliza e rejeita caminhos inválidos", asy
 	rmSync(root, { force: true, recursive: true });
 });
 
-	test("ProjectService listProjects e setFavorite delegam para repositório", async () => {
+	test("ProjectService listProjects and setFavorite delegate to repository", async () => {
 	const repo = {
 		createProject: () => null,
 		findProjectById: () => createMemoryProject("project-id", "/tmp"),

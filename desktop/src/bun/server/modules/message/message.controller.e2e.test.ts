@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import { createTestServer } from "../../shared/core/test-server";
 
-test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
+test("GET /v1/chats/:id/messages returns messages in ascending createdAt order", async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: WebSocket | undefined;
@@ -34,7 +34,7 @@ test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
 
 		ws.send(
 			JSON.stringify({
-				data: { chatId, text: "teste de mensagem" },
+				data: { chatId, text: "message test" },
 				event: "user_message",
 			}),
 		);
@@ -75,7 +75,7 @@ test("GET /v1/chats/:id/messages retorna ordem asc por createdAt", async () => {
 	}
 });
 
-test("GET /v1/chats/:id/messages retorna 404 para chat inexistente", async () => {
+test("GET /v1/chats/:id/messages returns 404 for missing chat", async () => {
 	const { cleanup, client } = await createTestServer();
 
 	try {

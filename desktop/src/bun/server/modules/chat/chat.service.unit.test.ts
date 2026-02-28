@@ -17,7 +17,7 @@ const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
 	...overrides,
 });
 
-test("ChatService.createChat retorna null quando projeto não existe", async () => {
+test("ChatService.createChat returns null when project does not exist", async () => {
 	const service = new ChatService(
 		{ createChat: () => createChat(), findChatById: () => null, getChatsByProjectId: () => [] } as unknown as ChatRepository,
 		{ findProjectById: () => null } as unknown as ProjectRepository,
@@ -28,7 +28,7 @@ test("ChatService.createChat retorna null quando projeto não existe", async () 
 	expect(result).toBeNull();
 });
 
-test("ChatService.listByProjectId lista apenas para projeto existente", async () => {
+test("ChatService.listByProjectId returns results only for an existing project", async () => {
 	const service = new ChatService(
 		{ findChatById: () => null, getChatsByProjectId: () => [] } as unknown as ChatRepository,
 		{
@@ -46,7 +46,7 @@ test("ChatService.listByProjectId lista apenas para projeto existente", async ()
 	expect(missing).toBeNull();
 });
 
-test("ChatService.updateChat mescla estado existente", async () => {
+test("ChatService.updateChat merges existing state", async () => {
 	const chat = createChat({ diffAdded: 2, diffRemoved: 1, status: "running" });
 
 	let capturedUpdate: {

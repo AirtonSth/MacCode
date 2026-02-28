@@ -6,7 +6,7 @@ import { expect, test } from "bun:test";
 
 import { DatabaseClientFactory } from "./db.client";
 
-test("DatabaseClientFactory.create respeita path explícito", async () => {
+test("DatabaseClientFactory.create respects explicit path", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-db-client-"));
 	const databasePath = join(root, "custom.sqlite");
 	const client = await DatabaseClientFactory.create(databasePath);

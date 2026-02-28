@@ -11,7 +11,7 @@ import { createProjectRepository } from "../project/project.repository";
 import { createMessageRepository } from "./message.repository";
 import { createMessageService } from "./message.service";
 
-test("message service preserva ordem asc por createdAt", async () => {
+test("message service preserves ascending order by createdAt", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-message-service-"));
 	const path = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(path);

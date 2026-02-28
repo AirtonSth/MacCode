@@ -72,7 +72,7 @@ const waitForCondition = async (predicate: () => boolean, timeoutMs = 4000): Pro
 	});
 };
 
-test("join_chat não faz replay e stream gera assistant_delta + done", async () => {
+test("join_chat does not replay and stream emits assistant_delta + done", async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	try {
@@ -135,7 +135,7 @@ test("join_chat não faz replay e stream gera assistant_delta + done", async () 
 	}
 });
 
-test("Provider fake falha marca chat como failed", async () => {
+test("Provider fake failure marks chat as failed", async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
 	const previous = process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL;
 
@@ -149,7 +149,7 @@ test("Provider fake falha marca chat como failed", async () => {
 	try {
 		const project = await client.v1.projects.post({ path: "/tmp" });
 		const projectId = (project.data as { project: { id: string } }).project.id;
-		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "falha" });
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "failure" });
 		const chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		socket = await createEdenWsClient(createEdenClient({ baseUrl }));
@@ -176,7 +176,7 @@ test("Provider fake falha marca chat como failed", async () => {
 					resolve();
 				}
 			});
-			socket?.send({ data: { chatId, text: "vai falhar" }, event: "user_message" });
+			socket?.send({ data: { chatId, text: "will fail" }, event: "user_message" });
 		});
 
 		expect(ended).toBe(true);
@@ -194,7 +194,7 @@ test("Provider fake falha marca chat como failed", async () => {
 	}
 });
 
-test("WS emite erro de validação para payload inválido", async () => {
+test("WS emits validation error for invalid payload", async () => {
 	const { baseUrl, cleanup } = await createTestServer();
 
 	let socket: WebSocket | undefined;

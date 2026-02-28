@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import { createTestServer } from "../../shared/core/test-server";
 
-test("POST /v1/projects/:id/chats cria chat pending e GET lista por project em ordem", async () => {
+test("POST /v1/projects/:id/chats creates pending chat and lists by project order", async () => {
 	const { cleanup, client } = await createTestServer();
 
 	try {
@@ -30,7 +30,7 @@ test("POST /v1/projects/:id/chats cria chat pending e GET lista por project em o
 		expect(firstChat.status).toBe("pending");
 
 		const second = await client.v1.projects({ id: projectId }).chats.post({
-			title: "Segundo",
+			title: "Second",
 		});
 		const secondChat = (second.data as {
 			chat: {
@@ -60,11 +60,11 @@ test("POST /v1/projects/:id/chats cria chat pending e GET lista por project em o
 	}
 });
 
-test("POST /v1/projects/:id/chats retorna 404 para projeto inexistente", async () => {
+test("POST /v1/projects/:id/chats returns 404 for missing project", async () => {
 	const { cleanup, client } = await createTestServer();
 
 	try {
-		const response = await client.v1.projects({ id: "non-existing" }).chats.post({ title: "sem projeto" });
+		const response = await client.v1.projects({ id: "non-existing" }).chats.post({ title: "missing project" });
 		const errorPayload = response.error && "value" in response.error ? (response.error as { value: { error?: string } }).value : undefined;
 
 		expect(response.status).toBe(404);

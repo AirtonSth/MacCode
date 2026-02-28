@@ -12,13 +12,11 @@ async function getMainViewUrl() {
 	if (channel === "dev") {
 		try {
 			await fetch(DEV_SERVER_URL, { method: "HEAD" });
-			console.log(`HMR ativo: usando Vite em ${DEV_SERVER_URL}`);
+			console.log(`HMR active: using Vite at ${DEV_SERVER_URL}`);
 
 			return DEV_SERVER_URL;
 		} catch {
-			console.log(
-				"Servidor Vite não encontrado. Rode 'bun run dev:hmr' para HMR.",
-			);
+			console.log("Vite dev server not found. Run 'bun run dev:hmr' for HMR.");
 		}
 	}
 

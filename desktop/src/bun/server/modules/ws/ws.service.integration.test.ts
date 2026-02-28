@@ -24,7 +24,7 @@ type ServerEvent =
 			event: "assistant_delta" | "assistant_done" | "chat_updated" | "error";
 	  };
 
-test("WsService dispara fluxo de stream para provider e persiste mensagem assistente", async () => {
+test("WsService runs streaming flow with provider and persists assistant message", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-"));
 	const databasePath = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(databasePath);

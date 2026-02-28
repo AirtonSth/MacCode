@@ -18,7 +18,7 @@ const collectEvents = async (emit: (event: ServerWsEvent) => void) => {
 	};
 };
 
-test("WsService.startUserMessage retorna chat_not_found para chat inexistente", async () => {
+test("WsService.startUserMessage returns chat_not_found for missing chat", async () => {
 	const chatRepository = {
 		findChatById: () => null,
 		updateChat: () => null,
@@ -33,7 +33,7 @@ test("WsService.startUserMessage retorna chat_not_found para chat inexistente", 
 	const service = new WsService(chatRepository, messageRepository);
 	const collector = await collectEvents(() => {});
 
-	await service.startUserMessage({ chatId: "missing", emit: collector.emit, text: "oi" });
+	await service.startUserMessage({ chatId: "missing", emit: collector.emit, text: "hi" });
 
 	expect(collector.events).toEqual([
 		{
@@ -48,7 +48,7 @@ test("WsService.startUserMessage retorna chat_not_found para chat inexistente", 
 	]);
 });
 
-test("WsService.startUserMessage bloqueia chat_running quando já em execução", async () => {
+test("WsService.startUserMessage blocks chat_running when already running", async () => {
 	const runningChat: ChatDTO = {
 		diffAdded: 0,
 		diffRemoved: 0,
@@ -74,7 +74,7 @@ test("WsService.startUserMessage bloqueia chat_running quando já em execução"
 	const service = new WsService(chatRepository, messageRepository);
 	const collector = await collectEvents(() => {});
 
-	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "oi" });
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
 
 	expect(collector.events).toEqual([
 		{

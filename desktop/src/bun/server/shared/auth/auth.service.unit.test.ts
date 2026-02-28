@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import { AuthService } from "./auth.service";
 
-test("readHeaderToken remove prefixo Bearer quando presente", () => {
+test("readHeaderToken removes Bearer prefix when present", () => {
 	const request = new Request("http://localhost/v1/projects", {
 		headers: {
 			Authorization: "Bearer abc123",
@@ -12,13 +12,13 @@ test("readHeaderToken remove prefixo Bearer quando presente", () => {
 	expect(AuthService.readHeaderToken(request)).toBe("abc123");
 });
 
-test("readQueryToken lê token da query para ws", () => {
+test("readQueryToken reads token from query for ws", () => {
 	const request = new Request("http://localhost/v1/ws?token=ws-token");
 
 	expect(AuthService.readQueryToken(request)).toBe("ws-token");
 });
 
-test("isWebSocketRoute detecta endpoint de websocket", () => {
+test("isWebSocketRoute detects websocket endpoint", () => {
 	const request = new Request("http://localhost/v1/ws?token=abc");
 
 	expect(AuthService.isWebSocketRoute(request)).toBe(true);

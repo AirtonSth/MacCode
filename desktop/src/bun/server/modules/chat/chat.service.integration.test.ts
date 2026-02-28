@@ -10,7 +10,7 @@ import { createProjectRepository } from "../project/project.repository";
 import { createChatRepository } from "./chat.repository";
 import { createChatService } from "./chat.service";
 
-test("chat service requires project and lista chats por updatedAt desc", async () => {
+test("chat service requires project and lists chats by updatedAt desc", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-chat-service-"));
 	const path = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(path);

@@ -71,7 +71,7 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 4000): Promise<void
 	});
 };
 
-test("FakeProviderRunner participa do fluxo end-to-end via WS", async () => {
+test("FakeProviderRunner participates in end-to-end WS flow", async () => {
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;

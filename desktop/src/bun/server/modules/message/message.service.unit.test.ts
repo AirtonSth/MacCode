@@ -7,14 +7,14 @@ import { MessageService } from "./message.service";
 
 const createMessage = (overrides: Partial<MessageDTO> = {}): MessageDTO => ({
 	chatId: "chat-id",
-	content: "texto",
+	content: "text",
 	createdAt: new Date().toISOString(),
 	id: "message-id",
 	role: "assistant",
 	...overrides,
 });
 
-test("MessageService.listByChatId retorna vazio para chat inexistente", async () => {
+test("MessageService.listByChatId returns empty for missing chat", async () => {
 	const service = new MessageService(
 		{ findChatById: () => null } as unknown as ChatRepository,
 		{ listMessagesByChatId: () => [] } as unknown as MessageRepository,
@@ -25,10 +25,10 @@ test("MessageService.listByChatId retorna vazio para chat inexistente", async ()
 	expect(result.messages).toEqual([]);
 });
 
-test("MessageService.listByChatId retorna mensagens de chat existente", async () => {
+test("MessageService.listByChatId returns messages for existing chat", async () => {
 	const messages = [
-		createMessage({ content: "ola", id: "1", role: "user" }),
-		createMessage({ content: "ola também", id: "2", role: "assistant" }),
+		createMessage({ content: "hello", id: "1", role: "user" }),
+		createMessage({ content: "hello as well", id: "2", role: "assistant" }),
 	];
 
 	const service = new MessageService(

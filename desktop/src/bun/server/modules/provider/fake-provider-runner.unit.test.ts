@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import { runFakeProvider } from "./fake-provider-runner";
 
-test("runFakeProvider retorna sucesso com texto do provedor", async () => {
+test("runFakeProvider returns completed with provider text output", async () => {
 	const result = await runFakeProvider({
 		chatId: "provider-unit-chat",
 

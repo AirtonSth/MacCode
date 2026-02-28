@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 
 import { runFakeProvider } from "./fake-provider-runner";
 
-test("FakeProviderRunner retorna completed com diff e texto do provider", async () => {
+test("FakeProviderRunner returns completed with provider diff and text", async () => {
 	const providerResult = await runFakeProvider({
 		chatId: "unit-chat-id",
 
@@ -20,7 +20,7 @@ test("FakeProviderRunner retorna completed com diff e texto do provider", async 
 	expect(providerResult.error).toBeUndefined();
 });
 
-test("FakeProviderRunner propaga falha quando forçado", async () => {
+test("FakeProviderRunner propagates failure when forced", async () => {
 	const previous = process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL;
 
 	process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL = "1";

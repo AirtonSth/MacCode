@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { createEdenClient } from "../../eden-client";
 import { createTestServer } from "../core/test-server";
 
-test("REST sem token retorna 401", async () => {
+test("REST without token returns 401", async () => {
 	const { baseUrl, cleanup } = await createTestServer();
 
 	try {
@@ -16,7 +16,7 @@ test("REST sem token retorna 401", async () => {
 	}
 });
 
-test("WS sem token é rejeitado", async () => {
+test("WS without token is rejected", async () => {
 	const { baseUrl, cleanup } = await createTestServer();
 
 	let socket: WebSocket | undefined;
