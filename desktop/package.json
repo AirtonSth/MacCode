@@ -2,16 +2,17 @@
   "name": "remotecode-electrobun",
   "version": "1.0.0",
   "description": "Electrobun app with React + Vite",
-  "scripts": {
-    "start": "vite build && electrobun dev",
-    "dev": "electrobun dev --watch",
-    "dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
-    "hmr": "vite --port 5173",
-    "build:canary": "vite build && electrobun build --env=canary",
-    "test:backend": "bun test ./src/bun/server --pattern '.*\\.test\\.ts$'",
-    "typecheck": "bun run tsc --noEmit",
-    "lint": "bunx eslint --fix ."
-  },
+	"scripts": {
+		"start": "vite build && electrobun dev",
+    "build:vite": "vite build",
+		"dev": "electrobun dev --watch",
+		"dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
+		"hmr": "bun run scripts/hmr.mjs",
+		"build:canary": "vite build && electrobun build --env=canary",
+		"test:backend": "bun test ./src/bun/server --pattern '.*\\.test\\.ts$'",
+		"typecheck": "bun run tsc --noEmit",
+		"lint": "bunx eslint --fix ."
+	},
   "dependencies": {
     "@elysiajs/eden": "^1.4.3",
     "electrobun": "1.14.4",
@@ -32,7 +33,7 @@
     "husky": "^9.1.7",
     "lint-staged": "^16.3.0",
     "typescript": "^5.7.2",
-    "vite": "^6.0.3"
+    "vite": "5.4.11"
   },
   "lint-staged": {
     "*.{ts,tsx,js,jsx}": [
