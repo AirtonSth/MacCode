@@ -7,10 +7,49 @@ import {
 	type ServerWsEvent,
 } from "../shared/realtime/remotecode-ws";
 import { useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
-import { ChatsSection } from "../features/chats/ui/ChatsSection";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
 import { MessageComposer } from "../features/composer/ui/MessageComposer";
-import { ProjectsSection } from "../features/projects/ui/ProjectsSection";
+
+const formatRelativeTime = (dateString: string): string => {
+	const timestamp = new Date(dateString).getTime();
+	if (Number.isNaN(timestamp)) {
+		return "now";
+	}
+
+	const difference = Math.max(0, Date.now() - timestamp);
+	if (difference < 60_000) {
+		return "now";
+	}
+
+	const minutes = Math.floor(difference / 60_000);
+	if (minutes < 60) {
+		return `${minutes}m`;
+	}
+
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) {
+		return `${hours}h`;
+	}
+
+	const days = Math.floor(hours / 24);
+	return `${days}d`;
+};
+
+const formatProjectMeta = (absolutePath: string): string => {
+	const cleanPath = absolutePath.trim().replace(/\\/g, "/").replace(/\/+$/u, "");
+	const segments = cleanPath.split("/").filter(Boolean);
+	if (segments.length < 2) {
+		return "local";
+	}
+
+	return segments[segments.length - 2];
+};
+
+const SUGGESTION_CARDS = [
+	"Build a classic Snake game in this repo.",
+	"Create a one-page PDF that summarizes this app.",
+	"Create a plan to improve the backend architecture.",
+];
 
 const App = (): JSX.Element => {
 	const { dispatch, state } = useWorkspaceStore();
@@ -52,7 +91,7 @@ const App = (): JSX.Element => {
 				payload: { source, code, message },
 			});
 		},
-		dispatch,
+		[dispatch],
 	);
 
 	const formatApiErrorCode = useCallback((error: unknown) => {
@@ -385,14 +424,32 @@ const App = (): JSX.Element => {
 		dispatch({ type: "CLEAR_ERRORS" });
 	}, [dispatch]);
 
+	const handleOpenProject = useCallback(() => {
+		const projectPath = window.prompt("Enter the absolute project path");
+		if (projectPath === null) {
+			return;
+		}
+
+		const trimmedPath = projectPath.trim();
+		if (!trimmedPath) {
+			return;
+		}
+
+		const nameInput = window.prompt("Project name (optional)") ?? "";
+		void handleCreateProject({
+			name: nameInput.trim().length > 0 ? nameInput.trim() : undefined,
+			path: trimmedPath,
+		});
+	}, [handleCreateProject]);
+
 	const connectionMessage = useMemo(() => {
 		switch (state.connectionState) {
 			case "connected":
 				return "Connected";
 			case "connecting":
-				return "Connecting…";
+				return "Connecting...";
 			case "reconnecting":
-				return "Reconnecting…";
+				return "Reconnecting...";
 			case "disconnected":
 				return "Disconnected";
 			default:
@@ -401,74 +458,208 @@ const App = (): JSX.Element => {
 	}, [state.connectionState]);
 
 	return (
-		<div className="app-shell">
-			<header className="main-header">
-				<h1>Remotecode IDE</h1>
-				<p className="small-muted">{connectionMessage}</p>
-			</header>
-			<div className="toolbar">
-				<button onClick={() => void loadProjects()} type="button">
-					Reload projects
-				</button>
-				{state.errors.length > 0 ? (
-					<button onClick={clearAllErrors} type="button">
-						Clear errors
-					</button>
-				) : null}
-			</div>
-			<div className="workspace-layout">
-				<aside className="sidebar">
-					<ProjectsSection
-						creating={state.isCreatingProject}
-						loading={state.projectsLoading}
-						onCreateProject={handleCreateProject}
-						onSelectProject={handleSelectProject}
-						onToggleFavorite={handleToggleFavorite}
-						projects={state.projects}
-						selectedProjectId={state.selectedProjectId}
-					/>
-					<ChatsSection
-						chats={state.chats}
-						creating={state.isCreatingChat}
-						loading={state.chatsLoading}
-						onCreateChat={handleCreateChat}
-						onSelectChat={handleSelectChat}
-						projectSelected={Boolean(selectedProject)}
-						selectedChatId={state.selectedChatId}
-					/>
+		<div className="codex-desktop">
+			<div className="codex-window">
+				<aside className="codex-sidebar">
+					<nav className="sidebar-nav" aria-label="Workspace navigation">
+						<button
+							className="nav-entry active"
+							disabled={!selectedProject || state.isCreatingChat}
+							onClick={() => {
+								void handleCreateChat("New thread");
+							}}
+							type="button"
+						>
+							New thread
+						</button>
+						<button className="nav-entry" type="button">
+							Automations
+						</button>
+						<button className="nav-entry" type="button">
+							Skills
+						</button>
+					</nav>
+
+					<div className="sidebar-caption">Threads</div>
+					<div className="thread-scroller">
+						{state.projectsLoading ? (
+							<p className="small-muted">Loading workspaces...</p>
+						) : (
+							state.projects.map((project) => {
+								const isSelectedProject = project.id === state.selectedProjectId;
+								return (
+									<section
+										className={`project-group ${isSelectedProject ? "selected" : ""}`}
+										key={project.id}
+									>
+										<div className="project-row">
+											<button
+												aria-label={`Select ${project.name}`}
+												className="project-select"
+												onClick={() => {
+													handleSelectProject(project.id);
+												}}
+												type="button"
+											>
+												<span className="folder-icon" aria-hidden="true">
+													<svg viewBox="0 0 24 24">
+														<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v1H3V7z" />
+														<path d="M3 10h18v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7z" />
+													</svg>
+												</span>
+												<span className="project-meta">
+													<span className="project-title">{project.name}</span>
+													<span className="project-subtitle">
+														{formatProjectMeta(project.path)}
+													</span>
+												</span>
+											</button>
+											<button
+												aria-label={
+													project.isFavorite
+														? "Remove from favorites"
+														: "Add to favorites"
+												}
+												className={`favorite-toggle ${project.isFavorite ? "active" : ""}`}
+												onClick={() => {
+													void handleToggleFavorite(project.id, !project.isFavorite);
+												}}
+												type="button"
+											>
+												*
+											</button>
+										</div>
+
+										{isSelectedProject ? (
+											<ul className="thread-list">
+												{state.chatsLoading ? (
+													<li className="thread-empty">Loading threads...</li>
+												) : state.chats.length === 0 ? (
+													<li className="thread-empty">No threads yet.</li>
+												) : (
+													state.chats.map((chat) => (
+														<li key={chat.id}>
+															<button
+																aria-label={`Open ${chat.title}`}
+																className={`thread-item ${state.selectedChatId === chat.id ? "active" : ""}`}
+																onClick={() => {
+																	handleSelectChat(chat.id);
+																}}
+																type="button"
+															>
+																<span className="thread-title">{chat.title}</span>
+																<span className="thread-time">
+																	{formatRelativeTime(chat.updatedAt)}
+																</span>
+															</button>
+														</li>
+													))
+												)}
+											</ul>
+										) : null}
+									</section>
+								);
+							})
+						)}
+					</div>
+
+					<footer className="sidebar-footer">
+						<button className="sidebar-settings" type="button">
+							Settings
+						</button>
+					</footer>
 				</aside>
-				<main className="content-panel">
-					{state.errors.length > 0 ? (
-						<div className="error-stack">
-							{state.errors.map((error) => (
-								<div className="error-item" key={error.id}>
-									<button
-									aria-label={`Dismiss ${error.message}`}
-									onClick={() => {
-										dispatch({ type: "REMOVE_ERROR", payload: error.id });
-									}}
-									type="button"
-								>
-									×
+
+				<main className="codex-main">
+					<header className="codex-main-header">
+						<h1>{selectedChat ? selectedChat.title : "New thread"}</h1>
+						<div className="header-actions">
+							<button className="header-pill primary" onClick={handleOpenProject} type="button">
+								Open
+							</button>
+							<button
+								className="header-pill"
+								onClick={() => {
+									void loadProjects();
+								}}
+								type="button"
+							>
+								Reload
+							</button>
+							{state.errors.length > 0 ? (
+								<button className="header-icon danger" onClick={clearAllErrors} type="button">
+									!
 								</button>
-								<strong>{error.code}</strong> · {error.message}
-							</div>
-							))}
+							) : null}
 						</div>
-					) : null}
-					<ConversationPanel
-						chat={selectedChat}
-						loading={state.messagesLoading}
-						hasRestError={state.errors.some((error) => error.source === "rest")}
-						messages={state.messages}
-						streamingText={streamingText}
-					/>
-					<MessageComposer
-						chatStatus={selectedChat?.status ?? null}
-						disabled={!state.selectedChatId}
-						onSend={handleSendMessage}
-						sending={state.isSendingMessage}
-					/>
+					</header>
+
+					<section className="codex-main-body">
+						{state.errors.length > 0 ? (
+							<div className="error-stack">
+								{state.errors.map((error) => (
+									<div className="error-item" key={error.id}>
+										<button
+											aria-label={`Dismiss ${error.message}`}
+											onClick={() => {
+												dispatch({ type: "REMOVE_ERROR", payload: error.id });
+											}}
+											type="button"
+										>
+											x
+										</button>
+										<strong>{error.code}</strong>
+										<span>{error.message}</span>
+									</div>
+								))}
+							</div>
+						) : null}
+
+						<div className="stage-content">
+							{state.selectedChatId ? (
+								<ConversationPanel
+									chat={selectedChat}
+									loading={state.messagesLoading}
+									hasRestError={state.errors.some((error) => error.source === "rest")}
+									messages={state.messages}
+									streamingText={streamingText}
+								/>
+							) : (
+								<div className="codex-empty-state">
+									<div className="codex-logo" aria-hidden="true">
+										<svg viewBox="0 0 24 24">
+											<path d="M12 3.5a4.8 4.8 0 0 1 4.74 4.13 4.7 4.7 0 0 1 3.76 4.57 4.7 4.7 0 0 1-4.69 4.69H15v2.1H9v-2.1H8.2a4.7 4.7 0 0 1-.56-9.37A4.8 4.8 0 0 1 12 3.5z" />
+										</svg>
+									</div>
+									<h2>Let&apos;s build</h2>
+									<p>{selectedProject?.name ?? "remotecode.io"}</p>
+								</div>
+							)}
+						</div>
+
+						<div className="composer-dock">
+							{!state.selectedChatId ? (
+								<div className="suggestions">
+									{SUGGESTION_CARDS.map((card) => (
+										<button className="suggestion-card" key={card} type="button">
+											{card}
+										</button>
+									))}
+								</div>
+							) : null}
+							<MessageComposer
+								chatStatus={selectedChat?.status ?? null}
+								disabled={!state.selectedChatId}
+								onSend={handleSendMessage}
+								sending={state.isSendingMessage}
+							/>
+							<div className="composer-status-row">
+								<span>Local</span>
+								<span>{connectionMessage}</span>
+								<span>{selectedProject?.name ?? "No workspace"}</span>
+							</div>
+						</div>
+					</section>
 				</main>
 			</div>
 		</div>
