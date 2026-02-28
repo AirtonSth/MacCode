@@ -1,33 +1,42 @@
 import { randomUUID } from "node:crypto";
 
-import { desc,eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { chats } from "../../shared/db/db.schema";
 import type { ChatDTO, ChatStatus } from "../../types";
 
-const toNumber = (value: number | null | undefined): number => Number(value ?? 0);
+export class ChatRepository {
+	private readonly database: DrizzleDatabaseClient["orm"];
 
-const toChatDto = (row: typeof chats.$inferSelect): ChatDTO => ({
-	diffAdded: toNumber(row.diffAdded),
-	diffRemoved: toNumber(row.diffRemoved),
-	id: row.id,
-	projectId: row.projectId,
-	provider: "fake",
-	status: row.status as ChatStatus,
-	title: row.title,
-	updatedAt: row.updatedAt,
-});
+	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
+		this.database = databaseClient;
+	}
 
-export const createChatRepository = (databaseClient: DrizzleDatabaseClient["orm"]) => {
-	const database = databaseClient;
+	private static toNumber(value: number | null | undefined): number {
+		return Number(value ?? 0);
+	}
 
-	return {
-		createChat: (projectId: string, title: string) => {
-			const now = new Date().toISOString();
-			const chatId = randomUUID();
+	private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
+		return {
+			diffAdded: ChatRepository.toNumber(row.diffAdded),
+			diffRemoved: ChatRepository.toNumber(row.diffRemoved),
+			id: row.id,
+			projectId: row.projectId,
+			provider: "fake",
+			status: row.status as ChatStatus,
+			title: row.title,
+			updatedAt: row.updatedAt,
+		};
+	}
 
-			database.insert(chats).values({
+	createChat(projectId: string, title: string): ChatDTO {
+		const now = new Date().toISOString();
+		const chatId = randomUUID();
+
+		this.database
+			.insert(chats)
+			.values({
 				diffAdded: 0,
 				diffRemoved: 0,
 				id: chatId,
@@ -36,51 +45,62 @@ export const createChatRepository = (databaseClient: DrizzleDatabaseClient["orm"
 				status: "pending",
 				title,
 				updatedAt: now,
-			}).run();
+			})
+			.run();
 
-			const rows = database.select().from(chats).where(eq(chats.id, chatId)).all() as typeof chats.$inferSelect[];
+		const rows = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.id, chatId))
+			.all() as typeof chats.$inferSelect[];
 
-			return toChatDto(rows[0]);
-		},
+		return ChatRepository.toChatDto(rows[0]);
+	}
 
-		findChatById: (id: string) => {
-			const rows = database
-				.select()
-				.from(chats)
-				.where(eq(chats.id, id))
-				.all() as typeof chats.$inferSelect[];
+	findChatById(id: string): ChatDTO | null {
+		const rows = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.id, id))
+			.all() as typeof chats.$inferSelect[];
 
-			return rows[0] ? toChatDto(rows[0]) : null;
-		},
+		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
+	}
 
-		getChatsByProjectId: (projectId: string) => {
-			const rows = database
-				.select()
-				.from(chats)
-				.where(eq(chats.projectId, projectId))
-				.orderBy(desc(chats.updatedAt))
-				.all() as typeof chats.$inferSelect[];
+	getChatsByProjectId(projectId: string): ChatDTO[] {
+		const rows = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.projectId, projectId))
+			.orderBy(desc(chats.updatedAt))
+			.all() as typeof chats.$inferSelect[];
 
-			return rows.map(toChatDto);
-		},
+		return rows.map(ChatRepository.toChatDto);
+	}
 
-		updateChat: (chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => {
-			database
-				.update(chats)
-				.set({
-					...(update.status === undefined ? {} : { status: update.status }),
-					...(update.diffAdded === undefined ? {} : { diffAdded: update.diffAdded }),
-					...(update.diffRemoved === undefined ? {} : { diffRemoved: update.diffRemoved }),
-					updatedAt: new Date().toISOString(),
-				})
-				.where(eq(chats.id, chatId))
-				.run();
+	updateChat(
+		chatId: string,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>,
+	): ChatDTO | null {
+		this.database
+			.update(chats)
+			.set({
+				...(update.status === undefined ? {} : { status: update.status }),
+				...(update.diffAdded === undefined ? {} : { diffAdded: update.diffAdded }),
+				...(update.diffRemoved === undefined ? {} : { diffRemoved: update.diffRemoved }),
+				updatedAt: new Date().toISOString(),
+			})
+			.where(eq(chats.id, chatId))
+			.run();
 
-			const rows = database.select().from(chats).where(eq(chats.id, chatId)).all() as typeof chats.$inferSelect[];
+		const rows = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.id, chatId))
+			.all() as typeof chats.$inferSelect[];
 
-			return rows[0] ? toChatDto(rows[0]) : null;
-		},
-	};
-};
+		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
+	}
+}
 
-export type ChatRepository = ReturnType<typeof createChatRepository>;
+export const createChatRepository = (databaseClient: DrizzleDatabaseClient["orm"]) => new ChatRepository(databaseClient);

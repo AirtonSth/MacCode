@@ -1,55 +1,60 @@
 import { randomUUID } from "node:crypto";
 
-import { asc,eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { messages } from "../../shared/db/db.schema";
 import type { MessageDTO } from "../../types";
 
-const toMessageDto = (row: typeof messages.$inferSelect): MessageDTO => ({
-	chatId: row.chatId,
-	content: row.content,
-	createdAt: row.createdAt,
-	id: row.id,
-	role: row.role as MessageDTO["role"],
-});
+export class MessageRepository {
+	private readonly database: DrizzleDatabaseClient["orm"];
 
-export const createMessageRepository = (databaseClient: DrizzleDatabaseClient["orm"]) => {
-	const database = databaseClient;
+	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
+		this.database = databaseClient;
+	}
 
-	return {
-		createMessage: (chatId: string, role: MessageDTO["role"], content: string) => {
-			const id = randomUUID();
-			const now = new Date().toISOString();
+	private static toMessageDto(row: typeof messages.$inferSelect): MessageDTO {
+		return {
+			chatId: row.chatId,
+			content: row.content,
+			createdAt: row.createdAt,
+			id: row.id,
+			role: row.role as MessageDTO["role"],
+		};
+	}
 
-			database.insert(messages).values({
-				chatId,
-				content,
-				createdAt: now,
-				id,
-				role,
-			}).run();
+	createMessage(chatId: string, role: MessageDTO["role"], content: string): MessageDTO {
+		const id = randomUUID();
+		const now = new Date().toISOString();
 
-			return {
-				chatId,
-				content,
-				createdAt: now,
-				id,
-				role,
-			};
-		},
+		this.database.insert(messages).values({
+			chatId,
+			content,
+			createdAt: now,
+			id,
+			role,
+		}).run();
 
-		listMessagesByChatId: (chatId: string) => {
-			const rows = database
-				.select()
-				.from(messages)
-				.where(eq(messages.chatId, chatId))
-				.orderBy(asc(messages.createdAt))
-				.all() as typeof messages.$inferSelect[];
+		return {
+			chatId,
+			content,
+			createdAt: now,
+			id,
+			role,
+		};
+	}
 
-			return rows.map(toMessageDto);
-		},
-	};
-};
+	listMessagesByChatId(chatId: string): MessageDTO[] {
+		const rows = this.database
+			.select()
+			.from(messages)
+			.where(eq(messages.chatId, chatId))
+			.orderBy(asc(messages.createdAt))
+			.all() as typeof messages.$inferSelect[];
 
-export type MessageRepository = ReturnType<typeof createMessageRepository>;
+		return rows.map(MessageRepository.toMessageDto);
+	}
+}
+
+export const createMessageRepository = (databaseClient: DrizzleDatabaseClient["orm"]) =>
+	new MessageRepository(databaseClient);

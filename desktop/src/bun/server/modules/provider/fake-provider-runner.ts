@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { dirname,join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { FakeProviderResult, FakeProviderRunOptions } from "../../shared/core/server.types";
@@ -26,7 +26,15 @@ interface ProviderEventMap {
 	};
 	message?: string;
 	text?: unknown;
-	type: "item.delta" | "turn.completed" | "item.completed" | "process.failed" | "thread.started" | "turn.started" | "item.started" | string;
+	type:
+		| "item.delta"
+		| "turn.completed"
+		| "item.completed"
+		| "process.failed"
+		| "thread.started"
+		| "turn.started"
+		| "item.started"
+		| string;
 	usage?: {
 		diff?: {
 			added?: number;
@@ -55,13 +63,11 @@ const extractDiffFromPayload = (
 		};
 	}
 
-	const {usage} = payload;
+	const { usage } = payload;
 
 	if (usage?.diff) {
-		const diffAdded =
-			typeof usage.diff.added === "number" ? usage.diff.added : undefined;
-		const diffRemoved =
-			typeof usage.diff.removed === "number" ? usage.diff.removed : undefined;
+		const diffAdded = typeof usage.diff.added === "number" ? usage.diff.added : undefined;
+		const diffRemoved = typeof usage.diff.removed === "number" ? usage.diff.removed : undefined;
 
 		if (diffAdded !== undefined && diffRemoved !== undefined) {
 			return {
@@ -74,10 +80,7 @@ const extractDiffFromPayload = (
 	return null;
 };
 
-const emitEventFromLine = (
-	line: string,
-	onDelta: (delta: string) => void,
-): FakeProviderResult | null => {
+const emitEventFromLine = (line: string, onDelta: (delta: string) => void): FakeProviderResult | null => {
 	const trimmed = line.trim();
 
 	if (!trimmed) {
@@ -115,7 +118,7 @@ const emitEventFromLine = (
 	}
 
 	if (payload.type === "item.completed") {
-		const {item} = payload;
+		const { item } = payload;
 		const text = extractString(payload.text, item?.text);
 
 		if (text && item?.type === "assistant_message") {
@@ -129,7 +132,8 @@ const emitEventFromLine = (
 	}
 
 	if (payload.type === "process.failed") {
-		const message = extractString(payload.message, (payload as { error?: string }).error) || "provider failed";
+		const message =
+			extractString(payload.message, (payload as { error?: string }).error) || "provider failed";
 
 		return {
 			assistantText: "",
@@ -143,158 +147,159 @@ const emitEventFromLine = (
 	return null;
 };
 
-export const runFakeProvider = async ({
-	chatId,
-	onDelta,
-	text,
-}: FakeProviderRunOptions): Promise<FakeProviderResult> => {
-	if (!existsSync(providerPath)) {
-		return {
-			assistantText: "",
-			diffAdded: 0,
-			diffRemoved: 0,
-			error: "fake provider missing",
-			status: "failed",
-		};
-	}
+export class FakeProviderRunner {
+	static async run({ chatId, onDelta, text }: FakeProviderRunOptions): Promise<FakeProviderResult> {
+		if (!existsSync(providerPath)) {
+			return {
+				assistantText: "",
+				diffAdded: 0,
+				diffRemoved: 0,
+				error: "fake provider missing",
+				status: "failed",
+			};
+		}
 
-	const command = [
-		"node",
-		providerPath,
-		"--chat-id",
-		chatId,
-		"--text",
-		text,
-		...(process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL === "1" ? ["--fail"] : []),
-	];
+		const command = [
+			"node",
+			providerPath,
+			"--chat-id",
+			chatId,
+			"--text",
+			text,
+			...(process.env.REMOTECODE_FAKE_PROVIDER_FORCE_FAIL === "1" ? ["--fail"] : []),
+		];
 
-	const proc = Bun.spawn({
-		cmd: command,
-		stderr: "pipe",
-		stdout: "pipe",
-	});
+		const proc = Bun.spawn({
+			cmd: command,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
 
-	const decoder = new TextDecoder();
+		const decoder = new TextDecoder();
 
-	let assistantText = "";
-	let diffAdded = 0;
-	let diffRemoved = 0;
-	let hasFailure = false;
-	let failureMessage: string | undefined;
+		let assistantText = "";
+		let diffAdded = 0;
+		let diffRemoved = 0;
+		let hasFailure = false;
+		let failureMessage: string | undefined;
 
-	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
-	try {
-		if (proc.stdout) {
-			const out = proc.stdout as ReadableStream<Uint8Array>;
+		try {
+			if (proc.stdout) {
+				const out = proc.stdout as ReadableStream<Uint8Array>;
 
-			reader = out.getReader();
+				reader = out.getReader();
 
-			let pending = "";
+				let pending = "";
 
-			while (true) {
-				const { done, value } = await reader.read();
+				while (true) {
+					const { done, value } = await reader.read();
 
-				if (done) {
-					break;
-				}
-
-				pending += decoder.decode(value);
-
-				const lines = pending.split("\n");
-
-				pending = lines.pop() ?? "";
-
-				for (const line of lines) {
-					const event = emitEventFromLine(line, (delta) => {
-						assistantText += delta;
-						onDelta(delta);
-					});
-
-					if (!event) {
-						continue;
+					if (done) {
+						break;
 					}
 
-					if (event.status === "failed") {
-						hasFailure = true;
-						failureMessage = event.error;
-					}
+					pending += decoder.decode(value);
 
-					if (event.status === "completed" && event.assistantText) {
-						assistantText = event.assistantText;
-					}
+					const lines = pending.split("\n");
 
-					if (event.diffAdded !== 0) {
-						diffAdded = event.diffAdded;
-					}
+					pending = lines.pop() ?? "";
 
-					if (event.diffRemoved !== 0) {
-						diffRemoved = event.diffRemoved;
+					for (const line of lines) {
+						const event = emitEventFromLine(line, (delta) => {
+							assistantText += delta;
+							onDelta(delta);
+						});
+
+						if (!event) {
+							continue;
+						}
+
+						if (event.status === "failed") {
+							hasFailure = true;
+							failureMessage = event.error;
+						}
+
+						if (event.status === "completed" && event.assistantText) {
+							assistantText = event.assistantText;
+						}
+
+						if (event.diffAdded !== 0) {
+							diffAdded = event.diffAdded;
+						}
+
+						if (event.diffRemoved !== 0) {
+							diffRemoved = event.diffRemoved;
+						}
 					}
 				}
 			}
-		}
 
-		if (proc.stderr) {
-			const stderr = await new Response(proc.stderr).text();
+			if (proc.stderr) {
+				const stderr = await new Response(proc.stderr).text();
 
-			if (stderr && !hasFailure) {
-				hasFailure = true;
-				failureMessage = stderr.trim();
+				if (stderr && !hasFailure) {
+					hasFailure = true;
+					failureMessage = stderr.trim();
+				}
+			}
+
+			await proc.exited;
+		} finally {
+			if (reader) {
+				try {
+					reader.releaseLock();
+				} catch {
+					// no-op: best-effort cleanup
+				}
+			}
+
+			if (proc.stdout) {
+				try {
+					proc.stdout.cancel();
+				} catch {
+					// no-op on best-effort cleanup
+				}
+			}
+
+			if (proc.stderr) {
+				try {
+					proc.stderr.cancel();
+				} catch {
+					// no-op on best-effort cleanup
+				}
 			}
 		}
 
-		await proc.exited;
-	} finally {
-		if (reader) {
-			try {
-				reader.releaseLock();
-			} catch {
-				// no-op: best-effort cleanup
-			}
+		if (proc.exitCode !== 0 || hasFailure) {
+			return {
+				assistantText,
+				diffAdded,
+				diffRemoved,
+				error: failureMessage || `provider process failed with code ${proc.exitCode}`,
+				status: "failed",
+			};
 		}
 
-		if (proc.stdout) {
-			try {
-				proc.stdout.cancel();
-			} catch {
-				// no-op on best-effort cleanup
-			}
+		if (!assistantText) {
+			return {
+				assistantText: "",
+				diffAdded,
+				diffRemoved,
+				error: "provider produced empty response",
+				status: "failed",
+			};
 		}
 
-		if (proc.stderr) {
-			try {
-				proc.stderr.cancel();
-			} catch {
-				// no-op on best-effort cleanup
-			}
-		}
-	}
-
-	if (proc.exitCode !== 0 || hasFailure) {
 		return {
 			assistantText,
 			diffAdded,
 			diffRemoved,
-			error: failureMessage || `provider process failed with code ${proc.exitCode}`,
-			status: "failed",
+			status: "completed",
 		};
 	}
+}
 
-	if (!assistantText) {
-		return {
-			assistantText: "",
-			diffAdded,
-			diffRemoved,
-			error: "provider produced empty response",
-			status: "failed",
-		};
-	}
-
-	return {
-		assistantText,
-		diffAdded,
-		diffRemoved,
-		status: "completed",
-	};
-};
+export const runFakeProvider = async (options: FakeProviderRunOptions): Promise<FakeProviderResult> =>
+	FakeProviderRunner.run(options);

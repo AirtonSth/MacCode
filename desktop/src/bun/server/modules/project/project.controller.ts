@@ -3,61 +3,72 @@ import { Elysia, t } from "elysia";
 import { withRestAuth } from "../../shared/auth/auth.service";
 import type { ProjectService } from "./project.service";
 
-export const createProjectController = (service: ProjectService) =>
-	new Elysia({ name: "project-controller" })
-		.use(withRestAuth())
-		.get("/projects", async () => {
-			const projects = await service.listProjects();
+export class ProjectController {
+	constructor(private readonly service: ProjectService) {}
 
-			return { projects };
-		})
-		.post(
-			"/projects",
-			async ({ body, set }) => {
-				const result = await service.createProject(body);
+	static build(service: ProjectService) {
+		return new ProjectController(service).build();
+	}
 
-				if ("type" in result) {
-					set.status = 400;
+	build() {
+		return new Elysia({ name: "project-controller" })
+			.use(withRestAuth())
+			.get("/projects", async () => {
+				const projects = await this.service.listProjects();
 
-					return { error: "path must be an existing absolute directory" };
-				}
+				return { projects };
+			})
+			.post(
+				"/projects",
+				async ({ body, set }) => {
+					const result = await this.service.createProject(body);
 
-				if (!result.created) {
-					set.status = 200;
-				}
+					if ("type" in result) {
+						set.status = 400;
 
-				if (result.created) {
-					set.status = 201;
-				}
+						return { error: "path must be an existing absolute directory" };
+					}
 
-				return {
-					created: result.created,
-					project: result.project,
-				};
-			},
-			{
-				body: t.Object({
-					name: t.Optional(t.String()),
-					path: t.String(),
-				}),
-			},
-		)
-		.patch(
-			"/projects/:id",
-			async ({ body, params: parameters, set }) => {
-				const project = await service.setFavorite(parameters.id, body.isFavorite);
+					if (!result.created) {
+						set.status = 200;
+					}
 
-				if (!project) {
-					set.status = 404;
+					if (result.created) {
+						set.status = 201;
+					}
 
-					return { error: "project not found" };
-				}
+					return {
+						created: result.created,
+						project: result.project,
+					};
+				},
+				{
+					body: t.Object({
+						name: t.Optional(t.String()),
+						path: t.String(),
+					}),
+				},
+			)
+			.patch(
+				"/projects/:id",
+				async ({ body, params: parameters, set }) => {
+					const project = await this.service.setFavorite(parameters.id, body.isFavorite);
 
-				return { project };
-			},
-			{
-				body: t.Object({
-					isFavorite: t.Boolean(),
-				}),
-			},
-		);
+					if (!project) {
+						set.status = 404;
+
+						return { error: "project not found" };
+					}
+
+					return { project };
+				},
+				{
+					body: t.Object({
+						isFavorite: t.Boolean(),
+					}),
+				},
+			);
+	}
+}
+
+export const createProjectController = (service: ProjectService) => ProjectController.build(service);

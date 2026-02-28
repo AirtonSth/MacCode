@@ -6,16 +6,6 @@ import type { ProjectDTO } from "../../types";
 import type { CreateProjectInput } from "./project.model";
 import type { ProjectRepository } from "./project.repository";
 
-const normalizeProjectPath = (value: string): string => normalize(resolve(value));
-
-const isExistingDirectory = (value: string): boolean => {
-	if (!isAbsolute(value) || !existsSync(value)) {
-		return false;
-	}
-
-	return statSync(value).isDirectory();
-};
-
 export interface CreateProjectError {
 	type: "invalid_path";
 }
@@ -25,46 +15,71 @@ export interface CreateProjectResult {
 	project: ProjectDTO;
 }
 
-export interface ProjectService {
+export interface ProjectServiceContract {
 	createProject: (
 		input: CreateProjectInput,
-	) => Promise<{ created: boolean; project: ProjectDTO; } | { type: "invalid_path" }>;
+	) => Promise<{ created: boolean; project: ProjectDTO } | { type: "invalid_path" }>;
 	getProjectById: (id: string) => Promise<ProjectDTO | null>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	setFavorite: (id: string, isFavorite: boolean) => Promise<ProjectDTO | null>;
 }
 
-export const createProjectService = (repository: ProjectRepository): ProjectService => ({
-		createProject: async ({ name, path }) => {
-			const normalizedPath = normalizeProjectPath(path);
+export class ProjectService implements ProjectServiceContract {
+	private static normalizeProjectPath(value: string): string {
+		return normalize(resolve(value));
+	}
 
-			if (!isExistingDirectory(normalizedPath)) {
-				return { type: "invalid_path" };
-			}
+	private static isExistingDirectory(value: string): boolean {
+		if (!isAbsolute(value) || !existsSync(value)) {
+			return false;
+		}
 
-			const existing = await repository.findProjectByPath(normalizedPath);
+		return statSync(value).isDirectory();
+	}
 
-			if (existing) {
-				return {
-					created: false,
-					project: existing,
-				};
-			}
+	constructor(private readonly repository: ProjectRepository) {}
 
-			const resolvedName = (name?.trim().length ? name.trim() : basename(normalizedPath)) || randomUUID();
-			const project = await repository.createProject(normalizedPath, resolvedName);
+	async createProject({
+		name,
+		path,
+	}: CreateProjectInput): Promise<CreateProjectResult | CreateProjectError> {
+		const normalizedPath = ProjectService.normalizeProjectPath(path);
 
+		if (!ProjectService.isExistingDirectory(normalizedPath)) {
+			return { type: "invalid_path" };
+		}
+
+		const existing = await this.repository.findProjectByPath(normalizedPath);
+
+		if (existing) {
 			return {
-				created: true,
-				project,
+				created: false,
+				project: existing,
 			};
-		},
+		}
 
-		getProjectById: async (id) => repository.findProjectById(id),
+		const resolvedName = (name?.trim().length ? name.trim() : basename(normalizedPath)) || randomUUID();
+		const project = await this.repository.createProject(normalizedPath, resolvedName);
 
-		listProjects: async () => repository.listProjects(),
+		return {
+			created: true,
+			project,
+		};
+	}
 
-		setFavorite: async (id, isFavorite) => repository.updateProjectFavorite(id, isFavorite),
-	});
+	getProjectById(id: string): Promise<ProjectDTO | null> {
+		return Promise.resolve(this.repository.findProjectById(id));
+	}
+
+	listProjects(): Promise<ProjectDTO[]> {
+		return Promise.resolve(this.repository.listProjects());
+	}
+
+	setFavorite(id: string, isFavorite: boolean): Promise<ProjectDTO | null> {
+		return Promise.resolve(this.repository.updateProjectFavorite(id, isFavorite));
+	}
+}
+
+export const createProjectService = (repository: ProjectRepository) => new ProjectService(repository);
 
 export const createProjectServiceFromRepository = createProjectService;

@@ -6,35 +6,9 @@ import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 
 import { serverConfig } from "../../config";
-import { chats, messages, projects } from "./db.schema";
+import { DatabaseSchema } from "./db.schema";
 
 const requireModule = createRequire(import.meta.url);
-
-const getUserDataPath = (): string => {
-	try {
-		const electrobun = requireModule("electrobun/bun") as {
-			Utils?: {
-				paths?: {
-					userData?: string;
-				};
-			};
-		};
-
-		return electrobun.Utils?.paths?.userData || join(process.cwd(), ".remotecode");
-	} catch {
-		return join(process.cwd(), ".remotecode");
-	}
-};
-
-const resolveDatabasePath = () => {
-	const configuredPath = serverConfig.databasePath;
-
-	if (configuredPath) {
-		return configuredPath;
-	}
-
-	return join(getUserDataPath(), "remodecode-server", "remodecode.sqlite");
-};
 
 export interface DrizzleDatabaseClient {
 	close: () => void;
@@ -43,28 +17,58 @@ export interface DrizzleDatabaseClient {
 	readonly sqlite: Database;
 }
 
-export const createDatabaseClient = async (pathOverride?: string): Promise<DrizzleDatabaseClient> => {
-	const databasePath = pathOverride ?? resolveDatabasePath();
+export class DatabaseClientFactory {
+	static async create(pathOverride?: string): Promise<DrizzleDatabaseClient> {
+		const databasePath = pathOverride ?? DatabaseClientFactory.resolveDatabasePath();
 
-	mkdirSync(dirname(databasePath), { recursive: true });
+		mkdirSync(dirname(databasePath), { recursive: true });
 
-	const sqlite = new Database(databasePath);
-	const orm = drizzle(sqlite, {
-		schema: {
-			chats,
-			messages,
-			projects,
-		},
-	});
+		const sqlite = new Database(databasePath);
+		const orm = drizzle(sqlite, {
+			schema: {
+				chats: DatabaseSchema.chats,
+				messages: DatabaseSchema.messages,
+				projects: DatabaseSchema.projects,
+			},
+		});
 
-	return {
-		close: () => {
-			sqlite.close();
-		},
+		return {
+			close: () => {
+				sqlite.close();
+			},
 
-		dbPath: databasePath,
-		orm,
+			dbPath: databasePath,
+			orm,
 
-		sqlite,
-	};
-};
+			sqlite,
+		};
+	}
+
+	private static resolveDatabasePath(): string {
+		const configuredPath = serverConfig.databasePath;
+
+		if (configuredPath) {
+			return configuredPath;
+		}
+
+		return join(DatabaseClientFactory.getUserDataPath(), "remodecode-server", "remodecode.sqlite");
+	}
+
+	private static getUserDataPath(): string {
+		try {
+			const electrobun = requireModule("electrobun/bun") as {
+				Utils?: {
+					paths?: {
+						userData?: string;
+					};
+				};
+			};
+
+			return electrobun.Utils?.paths?.userData || join(process.cwd(), ".remotecode");
+		} catch {
+			return join(process.cwd(), ".remotecode");
+		}
+	}
+}
+
+export const createDatabaseClient = (pathOverride?: string) => DatabaseClientFactory.create(pathOverride);

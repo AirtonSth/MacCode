@@ -6,99 +6,111 @@ import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { projects } from "../../shared/db/db.schema";
 import type { ProjectDTO } from "../../types";
 
-const toBoolean = (value: number | boolean | null | undefined): boolean => {
-	if (value === true) {
-		return true;
+export class ProjectRepository {
+	private readonly database: DrizzleDatabaseClient["orm"];
+
+	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
+		this.database = databaseClient;
 	}
 
-	if (value === 1) {
-		return true;
+	private static toBoolean(value: number | boolean | null | undefined): boolean {
+		if (value === true) {
+			return true;
+		}
+
+		if (value === 1) {
+			return true;
+		}
+
+		return false;
 	}
 
-	return false;
-};
+	private static toProjectDto(row: typeof projects.$inferSelect): ProjectDTO {
+		return {
+			createdAt: row.createdAt,
+			id: row.id,
+			isFavorite: ProjectRepository.toBoolean(row.isFavorite as number | boolean | null | undefined),
+			name: row.name,
+			path: row.path,
+			updatedAt: row.updatedAt,
+		};
+	}
 
-const toProjectDto = (row: typeof projects.$inferSelect): ProjectDTO => ({
-	createdAt: row.createdAt,
-	id: row.id,
-	isFavorite: toBoolean(row.isFavorite as number | boolean | null | undefined),
-	name: row.name,
-	path: row.path,
-	updatedAt: row.updatedAt,
-});
+	createProject(path: string, name: string): ProjectDTO {
+		const now = new Date().toISOString();
+		const id = randomUUID();
 
-export const createProjectRepository = (databaseClient: DrizzleDatabaseClient["orm"]) => {
-	const database = databaseClient;
-
-	return {
-		createProject: (path: string, name: string) => {
-			const now = new Date().toISOString();
-			const id = randomUUID();
-
-			database.insert(projects).values({
+		this.database
+			.insert(projects)
+			.values({
 				createdAt: now,
 				id,
 				isFavorite: 0,
 				name,
 				path,
 				updatedAt: now,
-			}).run();
+			})
+			.run();
 
-			const rows = database
-				.select()
-				.from(projects)
-				.where(eq(projects.id, id))
-				.all() as typeof projects.$inferSelect[];
+		const rows = this.database
+			.select()
+			.from(projects)
+			.where(eq(projects.id, id))
+			.all() as typeof projects.$inferSelect[];
 
-			return toProjectDto(rows[0]);
-		},
+		return ProjectRepository.toProjectDto(rows[0]);
+	}
 
-		findProjectById: (id: string) => {
-			const rows = database
-				.select()
-				.from(projects)
-				.where(eq(projects.id, id))
-				.all() as typeof projects.$inferSelect[];
+	findProjectById(id: string): ProjectDTO | null {
+		const rows = this.database
+			.select()
+			.from(projects)
+			.where(eq(projects.id, id))
+			.all() as typeof projects.$inferSelect[];
 
-			return rows[0] ? toProjectDto(rows[0]) : null;
-		},
+		return rows[0] ? ProjectRepository.toProjectDto(rows[0]) : null;
+	}
 
-		findProjectByPath: (path: string) => {
-			const rows = database
-				.select()
-				.from(projects)
-				.where(eq(projects.path, path))
-				.all() as typeof projects.$inferSelect[];
+	findProjectByPath(path: string): ProjectDTO | null {
+		const rows = this.database
+			.select()
+			.from(projects)
+			.where(eq(projects.path, path))
+			.all() as typeof projects.$inferSelect[];
 
-			return rows[0] ? toProjectDto(rows[0]) : null;
-		},
+		return rows[0] ? ProjectRepository.toProjectDto(rows[0]) : null;
+	}
 
-		listProjects: () => {
-			const rows = database.select().from(projects).orderBy(desc(projects.updatedAt)).all() as typeof projects.$inferSelect[];
+	listProjects(): ProjectDTO[] {
+		const rows = this.database
+			.select()
+			.from(projects)
+			.orderBy(desc(projects.updatedAt))
+			.all() as typeof projects.$inferSelect[];
 
-			return rows.map(toProjectDto);
-		},
+		return rows.map(ProjectRepository.toProjectDto);
+	}
 
-		updateProjectFavorite: (id: string, isFavorite: boolean) => {
-			database
-				.update(projects)
-				.set({ isFavorite: isFavorite ? 1 : 0, updatedAt: new Date().toISOString() })
-				.where(eq(projects.id, id))
-				.run();
+	updateProjectFavorite(id: string, isFavorite: boolean): ProjectDTO | null {
+		this.database
+			.update(projects)
+			.set({ isFavorite: isFavorite ? 1 : 0, updatedAt: new Date().toISOString() })
+			.where(eq(projects.id, id))
+			.run();
 
-			const rows = database
-				.select()
-				.from(projects)
-				.where(eq(projects.id, id))
-				.all() as typeof projects.$inferSelect[];
+		const rows = this.database
+			.select()
+			.from(projects)
+			.where(eq(projects.id, id))
+			.all() as typeof projects.$inferSelect[];
 
-			if (rows.length === 0) {
-				return null;
-			}
+		if (rows.length === 0) {
+			return null;
+		}
 
-			return toProjectDto(rows[0]);
-		},
-	};
-};
+		return ProjectRepository.toProjectDto(rows[0]);
+	}
+}
 
-export type ProjectRepository = ReturnType<typeof createProjectRepository>;
+export const createProjectRepository = (databaseClient: DrizzleDatabaseClient["orm"]) =>
+	new ProjectRepository(databaseClient);
