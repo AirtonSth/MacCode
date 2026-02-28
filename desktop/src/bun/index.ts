@@ -1,31 +1,7 @@
-import { BrowserWindow, Updater } from "electrobun/bun";
+import { BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
 
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
-
-const { BrowserView, Utils } = require("electrobun/bun") as {
-	BrowserView: {
-		defineRPC: <T>(config: {
-			maxRequestTime?: number;
-			handlers: {
-				requests: Record<string, (...args: never[]) => unknown>;
-				messages: Record<string, (...args: never[]) => void>;
-			};
-		}) => T;
-	};
-	Utils: {
-		openFileDialog: (options: {
-			allowedFileTypes?: string;
-			allowsMultipleSelection?: boolean;
-			canChooseDirectory?: boolean;
-			canChooseFiles?: boolean;
-			startingFolder?: string;
-		}) => Promise<string[]>;
-		paths: {
-			home: string;
-		};
-	};
-};
 
 const appRPC = BrowserView.defineRPC({
 	handlers: {

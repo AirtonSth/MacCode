@@ -52,4 +52,19 @@ declare module "electrobun/bun" {
 	}
 
 	export const Updater: UpdaterNamespace;
+
+	export interface UtilsNamespace {
+		paths: {
+			home: string;
+		};
+		openFileDialog: (options: {
+			allowedFileTypes?: string;
+			allowsMultipleSelection?: boolean;
+			canChooseDirectory?: boolean;
+			canChooseFiles?: boolean;
+			startingFolder?: string;
+		}) => Promise<string[]>;
+	}
+
+	export const Utils: UtilsNamespace;
 }
