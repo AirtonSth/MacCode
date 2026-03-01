@@ -1178,7 +1178,7 @@ const App = (): JSX.Element => {
 
 						{isSidebarVisible ? (
 							<>
-									<aside className="codex-sidebar relative z-10 flex min-h-0 flex-col border-r border-sidebar-border/45 px-2 py-2 max-[920px]:border-b max-[920px]:border-r-0">
+									<aside className="codex-sidebar relative z-10 flex min-h-0 flex-col px-2 py-2 max-[920px]:border-b">
 									<div className="flex items-center justify-between px-1.5 pb-2 pt-1">
 										<h2 className="text-[19px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
 										<div className="flex items-center gap-0.5">
@@ -1413,7 +1413,17 @@ const App = (): JSX.Element => {
 							</>
 						) : null}
 
-					<main className={cn("relative z-10 flex min-h-0 flex-col", isThreadFocusMode ? "bg-transparent" : "bg-slate-950/35")}>
+						<main
+							className={cn(
+								"relative z-10 flex min-h-0 flex-col",
+								isThreadFocusMode
+									? cn(
+										"bg-[linear-gradient(98deg,#13161b_0%,#111419_52%,#0f1217_100%)]",
+										isSidebarVisible ? "shadow-[-20px_0_45px_rgba(4,7,14,0.55)]" : "",
+									)
+									: "bg-slate-950/35",
+							)}
+						>
 						{hasProjects ? (
 								isThreadFocusMode ? (
 									<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
@@ -1473,7 +1483,7 @@ const App = (): JSX.Element => {
 											/>
 										</div>
 
-									<div className="shrink-0 border-t border-white/10 bg-slate-950/35 px-3 pb-4 pt-3 sm:px-6">
+									<div className="shrink-0 px-3 pb-4 pt-3 sm:px-6">
 										<div className="mx-auto w-full max-w-3xl">
 											<MessageComposer
 												availableModels={availableModels}
