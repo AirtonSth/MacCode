@@ -1413,61 +1413,61 @@ const App = (): JSX.Element => {
 							</>
 						) : null}
 
-						<main
-							className={cn(
-								"relative z-10 flex min-h-0 flex-col",
-								isThreadFocusMode
-									? cn(
-										"bg-[linear-gradient(98deg,#13161b_0%,#111419_52%,#0f1217_100%)]",
-										isSidebarVisible ? "shadow-[-20px_0_45px_rgba(4,7,14,0.55)]" : "",
-									)
-									: "bg-slate-950/35",
-							)}
-						>
-						{hasProjects ? (
-								isThreadFocusMode ? (
-									<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-										<header className="flex h-14 items-center justify-between gap-3 border-b border-white/10 px-4">
-											<div className="flex min-w-0 items-center gap-2">
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<Button
-															aria-label={sidebarToggleLabel}
-															className="h-8 w-8 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
-															onClick={() => {
-																setIsSidebarVisible((current) => !current);
-															}}
-															size="icon"
-															type="button"
-															variant="ghost"
+								<main
+									className={cn(
+										"relative z-10 flex min-h-0 flex-col",
+										isThreadFocusMode
+											? cn(
+												"bg-[linear-gradient(98deg,#13161b_0%,#111419_52%,#0f1217_100%)]",
+												isSidebarVisible ? "shadow-[-20px_0_45px_rgba(4,7,14,0.55)]" : "",
+											)
+											: "bg-slate-950/35",
+									)}
+								>
+									{hasProjects ? (
+											isThreadFocusMode ? (
+												<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+												<header className="flex h-10 items-center justify-between gap-2 border-b border-white/10 px-4">
+													<div className="flex min-w-0 items-center gap-2">
+														<Tooltip>
+															<TooltipTrigger asChild>
+																<Button
+																	aria-label={sidebarToggleLabel}
+																	className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
+																	onClick={() => {
+																	setIsSidebarVisible((current) => !current);
+																}}
+																size="icon"
+																type="button"
+																variant="ghost"
 														>
 															<PanelLeft className="h-4 w-4" />
 														</Button>
-													</TooltipTrigger>
-													<TooltipContent>{sidebarToggleLabel}</TooltipContent>
-												</Tooltip>
-												<div className="min-w-0">
-													<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Thread</p>
-													<h2 className="truncate text-sm font-semibold text-slate-100">
-														{selectedChat?.title ?? "No thread selected"}
-													</h2>
+														</TooltipTrigger>
+														<TooltipContent>{sidebarToggleLabel}</TooltipContent>
+													</Tooltip>
+													<div className="min-w-0">
+														<h2 className="truncate text-sm font-semibold text-slate-100">
+															{selectedChat?.title ?? "No thread selected"}
+														</h2>
+													</div>
 												</div>
-											</div>
-											<Button
-											className={cn(
-												"gap-2",
-												isTerminalOpen
-													? "border-sky-300/30 bg-sky-400/10 text-sky-100 hover:bg-sky-400/20"
-													: "border-white/10 text-slate-200 hover:bg-white/[0.06]",
-											)}
-											onClick={handleToggleTerminal}
-											type="button"
-											variant="outline"
-										>
-											<SquareTerminal className="h-4 w-4" />
-											<span className="sr-only">{isTerminalOpen ? "Hide terminal" : "Show terminal"}</span>
-										</Button>
-									</header>
+							<Button
+														className={cn(
+															"rounded-lg h-8 w-8 gap-1.5 bg-transparent transition-colors hover:bg-sky-400/10 hover:text-sky-100 active:bg-sky-400/10 active:text-sky-100 focus-visible:bg-sky-400/10 focus-visible:text-sky-100",
+															isTerminalOpen
+																? "bg-sky-400/10 text-sky-100"
+																: "text-slate-200",
+														)}
+														size="icon"
+														onClick={handleToggleTerminal}
+														type="button"
+														variant="ghost"
+													>
+														<SquareTerminal className="h-4 w-4" />
+														<span className="sr-only">{isTerminalOpen ? "Hide terminal" : "Show terminal"}</span>
+													</Button>
+											</header>
 
 										<div className="relative min-h-0 flex-1 overflow-hidden">
 											<ConversationPanel
@@ -1522,81 +1522,86 @@ const App = (): JSX.Element => {
 										</div>
 									) : null}
 								</section>
-							) : (
-								<>
-										<header className="flex h-16 items-center justify-between gap-3 border-b border-white/10 px-4 lg:px-5">
-											<div className="flex min-w-0 items-center gap-2">
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<Button
-															aria-label={sidebarToggleLabel}
-															className="h-8 w-8 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
-															onClick={() => {
-																setIsSidebarVisible((current) => !current);
-															}}
-															size="icon"
-															type="button"
-															variant="ghost"
-														>
-															<PanelLeft className="h-4 w-4" />
+											) : (
+												<>
+													<header className="flex h-10 items-center justify-between gap-2 border-b border-white/10 px-4 lg:px-5">
+														<div className="flex min-w-0 items-center gap-2">
+															<Tooltip>
+																<TooltipTrigger asChild>
+																	<Button
+																		aria-label={sidebarToggleLabel}
+																		className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
+																		onClick={() => {
+																		setIsSidebarVisible((current) => !current);
+																	}}
+																	size="icon"
+																	type="button"
+																	variant="ghost"
+																>
+																<PanelLeft className="h-4 w-4" />
+															</Button>
+															</TooltipTrigger>
+															<TooltipContent>{sidebarToggleLabel}</TooltipContent>
+														</Tooltip>
+														<div className="min-w-0">
+															<h1 className="truncate text-sm font-semibold text-slate-100">
+																{selectedChat ? selectedChat.title : "New thread"}
+															</h1>
+														</div>
+													</div>
+													<div className="flex shrink-0 items-center gap-2">
+														<Tooltip>
+															<TooltipTrigger asChild>
+																<Button
+																	className="h-7 w-7"
+																	disabled={isOpeningProject}
+																	onClick={() => {
+																	void handleOpenProject();
+																}}
+																	size="icon"
+																	type="button"
+																	variant="outline"
+															>
+															<FolderOpen className="h-3.5 w-3.5" />
 														</Button>
-													</TooltipTrigger>
-													<TooltipContent>{sidebarToggleLabel}</TooltipContent>
-												</Tooltip>
-												<div className="min-w-0">
-													<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-														Workspace
-													</p>
-													<h1 className="truncate text-sm font-semibold text-slate-100">
-														{selectedChat ? selectedChat.title : "New thread"}
-													</h1>
-												</div>
-											</div>
-											<div className="flex shrink-0 items-center gap-2">
-											<Tooltip>
-												<TooltipTrigger asChild>
-													<Button
-														disabled={isOpeningProject}
-														onClick={() => {
-															void handleOpenProject();
-														}}
-														size="icon"
-														type="button"
-														variant="outline"
-													>
-														<FolderOpen className="h-4 w-4" />
-													</Button>
-												</TooltipTrigger>
-												<TooltipContent>Open folder</TooltipContent>
-											</Tooltip>
-											<Tooltip>
-												<TooltipTrigger asChild>
-													<Button
-														onClick={() => {
-															void Promise.all([loadProjects(), loadCodexModels()]);
-														}}
-														size="icon"
-														type="button"
-														variant="outline"
-													>
-														<RefreshCcw className="h-4 w-4" />
-													</Button>
-												</TooltipTrigger>
-												<TooltipContent>Reload</TooltipContent>
-											</Tooltip>
-											{state.errors.length > 0 ? (
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<Button onClick={clearAllErrors} size="icon" type="button" variant="destructive">
-															<AlertTriangle className="h-4 w-4" />
+														</TooltipTrigger>
+														<TooltipContent>Open folder</TooltipContent>
+													</Tooltip>
+														<Tooltip>
+															<TooltipTrigger asChild>
+																<Button
+																	className="h-7 w-7"
+																	onClick={() => {
+																	void Promise.all([loadProjects(), loadCodexModels()]);
+																}}
+																	size="icon"
+																	type="button"
+																	variant="outline"
+															>
+															<RefreshCcw className="h-3.5 w-3.5" />
 														</Button>
-													</TooltipTrigger>
-													<TooltipContent>Clear {state.errors.length} errors</TooltipContent>
-												</Tooltip>
-											) : null}
-											<Badge className={getConnectionPillClass(state.connectionState)} variant="outline">
-												{connectionMessage}
-											</Badge>
+														</TooltipTrigger>
+														<TooltipContent>Reload</TooltipContent>
+														</Tooltip>
+														{state.errors.length > 0 ? (
+															<Tooltip>
+																<TooltipTrigger asChild>
+																	<Button
+																		className="h-7 w-7"
+																		onClick={clearAllErrors}
+																		size="icon"
+																		type="button"
+																		variant="destructive"
+																	>
+																<AlertTriangle className="h-3.5 w-3.5" />
+															</Button>
+															</TooltipTrigger>
+															<TooltipContent>Clear {state.errors.length} errors</TooltipContent>
+														</Tooltip>
+														) : null}
+														<Badge className={getConnectionPillClass(state.connectionState)} variant="outline">
+															{connectionMessage}
+														</Badge>
 										</div>
 									</header>
 
