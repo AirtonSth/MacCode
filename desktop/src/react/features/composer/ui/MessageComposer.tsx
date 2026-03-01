@@ -1,6 +1,6 @@
 import { ChangeEvent, FormEvent, KeyboardEvent, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
-import { ArrowUp, Loader2 } from "lucide-react";
+import { ArrowUp, ChevronDown, Loader2, Plus } from "lucide-react";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
@@ -117,162 +117,132 @@ export const MessageComposer = ({
 
 	const submitDisabled = isLocked || hasValidationError;
 	const buttonLabel = isRunning ? "Wait" : sending ? "Sending..." : "Send";
+	const subtleSelectClass =
+		"h-7 appearance-none bg-transparent px-1 pr-5 text-[13px] text-slate-400 transition-colors hover:text-slate-200 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
 
 	return (
 		<section className={cn(focusMode ? "w-full" : "rounded-[24px] border border-white/10 bg-slate-950/65 p-3 backdrop-blur-2xl")}>
-			<form className={cn(focusMode ? "space-y-2" : "space-y-3")} onSubmit={submit}>
-				{focusMode ? (
-					<div className="relative">
-						<div
-							className={cn(
-								"rounded-[1.6rem] border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]",
-								isLocked ? "opacity-85" : "",
-							)}
-						>
-							<Textarea
-								aria-label="Message input"
-								className={cn(
-									"min-h-[74px] max-h-[300px] resize-none border-0 bg-transparent px-1 py-1 pr-12 text-[15px] leading-7 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 disabled:cursor-not-allowed",
-								)}
-								disabled={isLocked}
-								maxLength={MAX_MESSAGE_LENGTH}
-								onChange={handleInputChange}
-								onKeyDown={handleInputKeyDown}
-								placeholder={
-									disabled
-										? "Select a project to start."
-										: isRunning
-											? "Waiting for assistant response..."
-											: "Type a message to the coding assistant"
-								}
-								rows={3}
-								value={value}
-							/>
-						</div>
-						<div className="absolute right-2 bottom-2">
-							<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
-								<Button
-									aria-label={buttonLabel}
-									className="h-10 w-10 rounded-full p-0 shadow-[0_10px_24px_rgba(56,189,248,0.25)]"
-									disabled={submitDisabled}
-									type="submit"
-								>
-									{sending || isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
-								</Button>
-							</motion.div>
-						</div>
-					</div>
-				) : (
-					<div
+			<form className={cn(focusMode ? "space-y-0" : "space-y-2")} onSubmit={submit}>
+				<div
+					className={cn(
+						"rounded-[1.6rem] border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),_0_16px_30px_rgba(0,0,0,0.32)]",
+						isLocked ? "opacity-85" : "",
+					)}
+				>
+					<Textarea
+						aria-label="Message input"
 						className={cn(
-							"rounded-[1.6rem] border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]",
-							isLocked ? "opacity-85" : "",
+							focusMode
+								? "min-h-[74px] max-h-[300px] resize-none border-0 bg-transparent px-1 py-1 text-[15px] leading-7 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed"
+								: "min-h-[92px] max-h-[300px] resize-none border-0 bg-transparent px-1 py-1 text-sm leading-6 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed",
 						)}
-					>
-						<Textarea
-							aria-label="Message input"
-							className={cn(
-								"min-h-[92px] resize-y border-0 bg-transparent px-1 py-1 text-sm leading-6 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 disabled:cursor-not-allowed",
-							)}
-							disabled={isLocked}
-							maxLength={MAX_MESSAGE_LENGTH}
-							onChange={handleInputChange}
-							onKeyDown={handleInputKeyDown}
-							placeholder={
-								disabled
-									? "Select a project to start."
-									: isRunning
-										? "Waiting for assistant response..."
-										: "Type a message to the coding assistant"
-							}
-							rows={3}
-							value={value}
-						/>
-					</div>
-				)}
-				<div className="grid gap-2 px-1 sm:grid-cols-3">
-					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
-						<label className="text-[11px] uppercase tracking-[0.16em] text-slate-400" htmlFor={modelSelectId}>
-							Model
-						</label>
-						<select
-							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
-							disabled={isLocked || availableModels.length === 0}
-							id={modelSelectId}
-							onChange={(event) => {
-								onModelChange(event.target.value);
-							}}
-							value={selectedModel ?? availableModels[0]?.model ?? ""}
-						>
-							{availableModels.length === 0 ? <option value="">No models</option> : null}
-							{availableModels.map((model) => (
-								<option key={model.id} value={model.model}>
-									{model.displayName}
-								</option>
-							))}
-						</select>
-					</div>
-					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
-						<label
-							className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
-							htmlFor={reasoningSelectId}
-						>
-							Reasoning
-						</label>
-						<select
-							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
-							disabled={isLocked || availableReasoningEfforts.length === 0}
-							id={reasoningSelectId}
-							onChange={(event) => {
-								onReasoningEffortChange(event.target.value as CodexReasoningEffort);
-							}}
-							value={selectedReasoningEffort ?? availableReasoningEfforts[0] ?? ""}
-						>
-							{availableReasoningEfforts.length === 0 ? <option value="">No reasoning levels</option> : null}
-							{availableReasoningEfforts.map((effort) => (
-								<option key={effort} value={effort}>
-									{formatCodexReasoningEffortLabel(effort)}
-								</option>
-							))}
-						</select>
-					</div>
-					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
-						<label
-							className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
-							htmlFor={permissionSelectId}
-						>
-							Permissions
-						</label>
-						<select
-							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
-							disabled={isLocked}
-							id={permissionSelectId}
-							onChange={(event) => {
-								onPermissionModeChange(event.target.value as CodexPermissionMode);
-							}}
-							value={permissionMode}
-						>
-							<option value="plan">Plan mode</option>
-							<option value="default">Default mode</option>
-							<option value="full">Full access</option>
-						</select>
-					</div>
-				</div>
-				{!focusMode && (
-					<div aria-live="polite" className="flex flex-wrap items-center justify-between gap-3">
-						<span className={cn("text-xs", validationError ? "text-rose-300" : "text-slate-400")}>
-							{statusText}
-						</span>
-						<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.98 }}>
-							<Button className="min-w-[112px] gap-2 rounded-xl" disabled={submitDisabled} type="submit">
-								{buttonLabel}
-								{sending || isRunning ? (
-									<Loader2 className="h-4 w-4 animate-spin" />
-								) : (
-									<ArrowUp className="h-4 w-4" />
-								)}
+						disabled={isLocked}
+						maxLength={MAX_MESSAGE_LENGTH}
+						onChange={handleInputChange}
+						onKeyDown={handleInputKeyDown}
+						placeholder={
+							disabled
+								? "Select a project to start."
+								: isRunning
+									? "Waiting for assistant response..."
+									: "Type a message to the coding assistant"
+						}
+						rows={3}
+						value={value}
+					/>
+
+					<div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
+						<div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+							<Button
+								aria-label="Attach context"
+								className="h-7 w-7 shrink-0 rounded-full p-0 text-slate-400 hover:bg-white/[0.04] hover:text-slate-100"
+								disabled={isLocked}
+								size="icon"
+								type="button"
+								variant="ghost"
+							>
+								<Plus className="h-4 w-4" />
+							</Button>
+
+							<div className="relative shrink-0">
+								<select
+									aria-label="Model"
+									className={cn(subtleSelectClass, "min-w-[180px]")}
+									disabled={isLocked || availableModels.length === 0}
+									id={modelSelectId}
+									onChange={(event) => {
+										onModelChange(event.target.value);
+									}}
+									value={selectedModel ?? availableModels[0]?.model ?? ""}
+								>
+									{availableModels.length === 0 ? <option value="">No models</option> : null}
+									{availableModels.map((model) => (
+										<option key={model.id} value={model.model}>
+											{model.displayName}
+										</option>
+									))}
+								</select>
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+							</div>
+
+							<div className="relative shrink-0">
+								<select
+									aria-label="Reasoning"
+									className={cn(subtleSelectClass, "min-w-[132px]")}
+									disabled={isLocked || availableReasoningEfforts.length === 0}
+									id={reasoningSelectId}
+									onChange={(event) => {
+										onReasoningEffortChange(event.target.value as CodexReasoningEffort);
+									}}
+									value={selectedReasoningEffort ?? availableReasoningEfforts[0] ?? ""}
+								>
+									{availableReasoningEfforts.length === 0 ? <option value="">No reasoning levels</option> : null}
+									{availableReasoningEfforts.map((effort) => (
+										<option key={effort} value={effort}>
+											{formatCodexReasoningEffortLabel(effort)}
+										</option>
+									))}
+								</select>
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+							</div>
+
+							<div className="relative shrink-0">
+								<select
+									aria-label="Permission mode"
+									className={cn(subtleSelectClass, "min-w-[128px]")}
+									disabled={isLocked}
+									id={permissionSelectId}
+									onChange={(event) => {
+										onPermissionModeChange(event.target.value as CodexPermissionMode);
+									}}
+									value={permissionMode}
+								>
+									<option value="plan">Plan</option>
+									<option value="default">Default</option>
+									<option value="full">Full access</option>
+								</select>
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+							</div>
+						</div>
+
+						<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
+							<Button
+								aria-label={buttonLabel}
+								className="h-10 w-10 shrink-0 rounded-full bg-white p-0 text-slate-900 shadow-[0_12px_26px_rgba(0,0,0,0.35)] hover:bg-white/90"
+								disabled={submitDisabled}
+								type="submit"
+							>
+								{sending || isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
 							</Button>
 						</motion.div>
+					</div>
+				</div>
+
+				{!focusMode && (
+					<div aria-live="polite" className="px-1">
+						<span className={cn("text-xs", validationError ? "text-rose-300" : "text-slate-400/90")}>
+							{statusText}
+						</span>
 					</div>
 				)}
 			</form>
