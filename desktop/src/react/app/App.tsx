@@ -155,6 +155,7 @@ const SUGGESTION_CARDS = [
 	"Create a one-page PDF that summarizes this app.",
 	"Create a plan to improve the backend architecture.",
 ];
+const SIDEBAR_MAX_VISIBLE_THREADS = 3;
 
 const clampSidebarWidth = (width: number): number => {
 	const bounded = Number.isFinite(width) ? width : DEFAULT_SIDEBAR_WIDTH;
@@ -207,6 +208,8 @@ const App = (): JSX.Element => {
 		: "";
 
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
+	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
+	const [projectThreadsOpen, setProjectThreadsOpen] = useState<Record<string, boolean>>({});
 	const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
 		if (typeof window === "undefined") {
 			return DEFAULT_SIDEBAR_WIDTH;
@@ -688,8 +691,17 @@ const App = (): JSX.Element => {
 	const handleSelectProject = useCallback(
 		async (projectId: string) => {
 			if (projectId === state.selectedProjectId) {
+				setProjectThreadsOpen((current) => ({
+					...current,
+					[projectId]: !(current[projectId] ?? true),
+				}));
 				return;
 			}
+
+			setProjectThreadsOpen((current) => ({
+				...current,
+				[projectId]: true,
+			}));
 
 			dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
 			dispatch({ payload: projectId, type: "SET_SELECTED_PROJECT" });
@@ -794,6 +806,13 @@ const App = (): JSX.Element => {
 		dispatch({ type: "CLEAR_ERRORS" });
 	}, [dispatch]);
 
+	const handleShowMoreThreads = useCallback((projectId: string) => {
+		setExpandedProjectThreads((current) => ({
+			...current,
+			[projectId]: true,
+		}));
+	}, []);
+
 	const handleOpenProject = useCallback(async () => {
 		setIsOpeningProject(true);
 		try {
@@ -888,9 +907,9 @@ const App = (): JSX.Element => {
 
 						{isSidebarVisible ? (
 							<>
-								<aside className="codex-sidebar relative z-10 flex min-h-0 flex-col border-r border-sidebar-border/70 bg-[#101319]/92 px-2 py-2 backdrop-blur-xl max-[920px]:border-b max-[920px]:border-r-0">
+									<aside className="codex-sidebar relative z-10 flex min-h-0 flex-col border-r border-sidebar-border/45 px-2 py-2 max-[920px]:border-b max-[920px]:border-r-0">
 									<div className="flex items-center justify-between px-1.5 pb-2 pt-1">
-										<h2 className="text-[23px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
+										<h2 className="text-[19px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
 										<div className="flex items-center gap-0.5">
 											<Tooltip>
 												<TooltipTrigger asChild>
@@ -934,27 +953,35 @@ const App = (): JSX.Element => {
 									<ScrollArea className="mt-1 min-h-0 flex-1 pr-0.5">
 										<div className="space-y-1 pb-1">
 											{state.projectsLoading ? (
-												<p className="px-2 py-1.5 text-[12px] text-slate-400">Loading workspaces...</p>
+												<p className="px-2 py-1.5 text-[11px] text-slate-400">Loading workspaces...</p>
 											) : state.projects.length === 0 ? (
-												<p className="rounded-md border border-dashed border-white/10 bg-white/[0.01] px-2.5 py-3 text-[12px] text-slate-400">
+												<p className="rounded-md border border-dashed border-white/10 px-2.5 py-3 text-[11px] text-slate-400">
 													No workspaces yet. Open a project folder to begin.
 												</p>
 											) : (
 												state.projects.map((project) => {
 													const isSelectedProject = project.id === state.selectedProjectId;
+													const isThreadListOpen = isSelectedProject ? projectThreadsOpen[project.id] !== false : false;
+													const isThreadListExpanded = Boolean(expandedProjectThreads[project.id]);
+													const hasMoreThreads =
+														isThreadListOpen &&
+														isSelectedProject &&
+														state.chats.length > SIDEBAR_MAX_VISIBLE_THREADS &&
+														!isThreadListExpanded;
+													const visibleChats =
+														isThreadListOpen && isThreadListExpanded
+														? state.chats
+														: state.chats.slice(0, SIDEBAR_MAX_VISIBLE_THREADS);
 													return (
 														<motion.section
-															className={cn(
-																"rounded-lg px-1 py-0.5 transition-colors duration-150",
-																isSelectedProject ? "bg-white/[0.03]" : "hover:bg-white/[0.02]",
-															)}
+															className="px-1 py-0.5 transition-colors duration-150"
 															key={project.id}
 															layout={!shouldReduceMotion}
 														>
 															<div className="group flex items-center gap-1.5">
 																<button
 																	aria-label={`Select ${project.name}`}
-																	className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-transparent px-1.5 py-1 text-left transition hover:border-white/10 hover:bg-white/[0.02]"
+																	className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 py-1 text-left transition hover:text-slate-100"
 																	onClick={() => {
 																		void handleSelectProject(project.id);
 																	}}
@@ -963,7 +990,7 @@ const App = (): JSX.Element => {
 																	<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />
 																	<span className="min-w-0">
 																		<span
-																			className="block truncate text-[15px] font-medium text-slate-100"
+																			className="block truncate text-[13px] font-medium text-slate-100"
 																			title={formatProjectMeta(project.path)}
 																		>
 																			{project.name}
@@ -1020,57 +1047,78 @@ const App = (): JSX.Element => {
 																</Tooltip>
 															</div>
 
-															{isSelectedProject ? (
+															{isSelectedProject && isThreadListOpen ? (
 																<ul className="ml-3 mt-1.5 space-y-0.5 border-l border-white/8 pl-2.5">
 																	{state.chatsLoading ? (
-																		<li className="px-1.5 py-1 text-[12px] text-slate-400">Loading threads...</li>
+																		<li className="px-1.5 py-1 text-[11px] text-slate-400">Loading threads...</li>
 																	) : state.chats.length === 0 ? (
-																		<li className="px-1.5 py-1 text-[12px] text-slate-400">No threads yet.</li>
+																		<li className="px-1.5 py-1 text-[11px] text-slate-400">No threads yet.</li>
 																	) : (
-																		state.chats.map((chat) => (
-																			<motion.li key={chat.id} layout={!shouldReduceMotion}>
-																				<div
-																					className={cn(
-																						"group flex items-center gap-2 rounded-md border border-transparent px-1.5 py-1.5 text-left text-[14px] transition duration-150",
-																						state.selectedChatId === chat.id
-																							? "bg-white/[0.07] text-slate-100"
-																							: "text-slate-300 hover:bg-white/[0.04]",
-																					)}
-																				>
-																					<button
-																						aria-label={`Open ${chat.title}`}
-																						className="inline-flex min-w-0 flex-1 items-center"
-																						onClick={() => {
-																							void handleSelectChat(chat.id);
-																						}}
-																						type="button"
+																		<>
+																			{visibleChats.map((chat) => (
+																				<motion.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
+																					<div
+																						className={cn(
+																							"group grid w-full min-h-[2rem] grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-[13px] transition duration-150",
+																							state.selectedChatId === chat.id
+																								? "bg-white/[0.07] text-slate-100"
+																								: "text-slate-300 hover:bg-white/[0.03] hover:text-slate-100",
+																						)}
 																					>
-																						<span className="truncate leading-5">{chat.title}</span>
-																					</button>
-																					<span className="shrink-0 text-[12px] text-slate-500">
-																						{formatRelativeTime(chat.updatedAt)}
-																					</span>
-																					<Tooltip>
-																						<TooltipTrigger asChild>
-																							<Button
-																								aria-label={`Delete ${chat.title}`}
-																								className="h-6 w-6 shrink-0 text-rose-300/80 opacity-0 transition-opacity hover:text-rose-100 group-hover:opacity-100 focus-visible:opacity-100"
-																								onClick={(event) => {
-																									event.stopPropagation();
-																									void handleDeleteChat(chat.id);
-																								}}
-																								size="icon"
-																								type="button"
-																								variant="ghost"
-																							>
-																								<Trash2 className="h-4 w-4" />
-																							</Button>
-																						</TooltipTrigger>
-																						<TooltipContent>Delete thread</TooltipContent>
-																					</Tooltip>
-																				</div>
-																			</motion.li>
-																		))
+																						<button
+																							aria-label={`Open ${chat.title}`}
+																							className={cn(
+																								"inline-flex min-w-0 items-center",
+																								state.selectedChatId === chat.id ? "self-center" : "",
+																							)}
+																							onClick={() => {
+																								void handleSelectChat(chat.id);
+																							}}
+																							type="button"
+																						>
+																							<span className="truncate leading-5">{chat.title}</span>
+																						</button>
+																						<span className="justify-self-end text-[11px] text-slate-500">
+																							{formatRelativeTime(chat.updatedAt)}
+																						</span>
+																						<Tooltip>
+																							<TooltipTrigger asChild>
+																								<Button
+																									aria-label={`Delete ${chat.title}`}
+																									className="h-6 w-6 shrink-0 text-rose-300/80 opacity-0 transition-opacity hover:text-rose-100 group-hover:opacity-100 focus-visible:opacity-100"
+																									onClick={(event) => {
+																										event.stopPropagation();
+																										void handleDeleteChat(chat.id);
+																									}}
+																									size="icon"
+																									type="button"
+																									variant="ghost"
+																								>
+																									<Trash2 className="h-4 w-4" />
+																								</Button>
+																							</TooltipTrigger>
+																							<TooltipContent>Delete thread</TooltipContent>
+																						</Tooltip>
+																					</div>
+																				</motion.li>
+																			))}
+																			{hasMoreThreads ? (
+																				<li className="px-1">
+																					<Button
+																						aria-label="Show more threads"
+																						className="h-7 px-1.5 text-[11px] text-slate-300 hover:text-slate-100"
+																						onClick={() => {
+																							handleShowMoreThreads(project.id);
+																						}}
+																						size="sm"
+																						type="button"
+																						variant="ghost"
+																					>
+																						Show More
+																						</Button>
+																				</li>
+																			) : null}
+																		</>
 																	)}
 																</ul>
 															) : null}
