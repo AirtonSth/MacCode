@@ -194,7 +194,9 @@ test("WsService.startUserMessage emits project_not_found when project does not e
 
 test("WsService.startUserMessage forwards explicit permission mode to codex runner", async () => {
 	const chat = createChat();
+	let capturedModel: string | undefined;
 	let capturedPermissionMode: string | undefined;
+	let capturedReasoningEffort: string | undefined;
 	let findChatCalls = 0;
 
 	const chatRepository = {
@@ -233,8 +235,15 @@ test("WsService.startUserMessage forwards explicit permission mode to codex runn
 	} as unknown as ProjectRepository;
 
 	const runner = {
-		run: async (options: { onDelta: (delta: string) => void; permissionMode?: string }) => {
+		run: async (options: {
+			model?: string;
+			onDelta: (delta: string) => void;
+			permissionMode?: string;
+			reasoningEffort?: string;
+		}) => {
+			capturedModel = options.model;
 			capturedPermissionMode = options.permissionMode;
+			capturedReasoningEffort = options.reasoningEffort;
 			options.onDelta("hello");
 			return {
 				assistantText: "hello",
@@ -251,11 +260,15 @@ test("WsService.startUserMessage forwards explicit permission mode to codex runn
 	await service.startUserMessage({
 		chatId: "chat-id",
 		emit: collector.emit,
+		model: "gpt-5.3-codex",
 		permissionMode: "plan",
+		reasoningEffort: "xhigh",
 		text: "hi",
 	});
 
+	expect(capturedModel).toBe("gpt-5.3-codex");
 	expect(capturedPermissionMode).toBe("plan");
+	expect(capturedReasoningEffort).toBe("xhigh");
 });
 
 test("WsService.startUserMessage defaults permission mode to default", async () => {
@@ -299,8 +312,15 @@ test("WsService.startUserMessage defaults permission mode to default", async () 
 	} as unknown as ProjectRepository;
 
 	const runner = {
-		run: async (options: { onDelta: (delta: string) => void; permissionMode?: string }) => {
+		run: async (options: {
+			model?: string;
+			onDelta: (delta: string) => void;
+			permissionMode?: string;
+			reasoningEffort?: string;
+		}) => {
 			capturedPermissionMode = options.permissionMode;
+			expect(options.model).toBeUndefined();
+			expect(options.reasoningEffort).toBeUndefined();
 			options.onDelta("hello");
 			return {
 				assistantText: "hello",

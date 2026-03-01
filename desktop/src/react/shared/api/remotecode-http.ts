@@ -1,3 +1,5 @@
+import type { CodexModelsCatalog } from "../../../shared/codex-model-config";
+
 export interface ApiConfig {
 	baseUrl: string;
 	token: string;
@@ -123,6 +125,8 @@ interface RestTerminalExecResponse {
 	command: TerminalCommandDTO;
 	entries: TerminalEntryDTO[];
 }
+
+type RestCodexModelsResponse = CodexModelsCatalog;
 
 interface RequestInput {
 	method: "GET" | "POST" | "PATCH" | "DELETE";
@@ -252,6 +256,13 @@ export const RemoteCodeApi = {
 				});
 
 				return payload.chat;
+			},
+
+			listCodexModels: async (): Promise<CodexModelsCatalog> => {
+				return await request<RestCodexModelsResponse>({
+					method: "GET",
+					path: "/providers/codex/models",
+				});
 			},
 
 			listMessages: async (chatId: string): Promise<MessageDTO[]> => {

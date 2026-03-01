@@ -374,11 +374,17 @@ const buildPermissionFlags = (permissionMode: CodexPermissionMode | undefined): 
 
 const buildCommand = (options: CodexProviderRunOptions): string[] => {
 	const permissionFlags = buildPermissionFlags(options.permissionMode);
+	const modelFlags = options.model ? ["-m", options.model] : [];
+	const reasoningFlags = options.reasoningEffort
+		? ["-c", `model_reasoning_effort="${options.reasoningEffort}"`]
+		: [];
 
 	if (options.threadId) {
 		return [
 			"codex",
 			...permissionFlags,
+			...modelFlags,
+			...reasoningFlags,
 			"exec",
 			"resume",
 			"--json",
@@ -391,6 +397,8 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 	return [
 		"codex",
 		...permissionFlags,
+		...modelFlags,
+		...reasoningFlags,
 		"exec",
 		"--json",
 		"--skip-git-repo-check",

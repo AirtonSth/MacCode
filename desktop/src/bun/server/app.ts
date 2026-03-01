@@ -10,6 +10,8 @@ import { MessageService } from "./modules/message/message.service";
 import { ProjectController } from "./modules/project/project.controller";
 import { ProjectRepository } from "./modules/project/project.repository";
 import { ProjectService } from "./modules/project/project.service";
+import { ProviderController } from "./modules/provider/provider.controller";
+import { CodexModelsService } from "./modules/provider/codex-models.service";
 import { SelectionController } from "./modules/selection/selection.controller";
 import { createSelectionRepository } from "./modules/selection/selection.repository";
 import { createSelectionService } from "./modules/selection/selection.service";
@@ -43,6 +45,7 @@ export const ServerBootstrap = {
 			terminal: terminalRepository,
 		});
 		const wsService = new WsService(chatRepository, messageRepository, projectRepository);
+		const codexModelsService = new CodexModelsService();
 
 		const app = new Elysia()
 			.group("/v1", (group) =>
@@ -50,6 +53,7 @@ export const ServerBootstrap = {
 					.use(ProjectController.build(projectService))
 					.use(ChatController.build(chatService))
 					.use(MessageController.build(messageService))
+					.use(ProviderController.build(codexModelsService))
 					.use(SelectionController.build(workspaceSelectionService))
 					.use(TerminalController.build(terminalService)),
 			)

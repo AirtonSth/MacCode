@@ -32,6 +32,11 @@ import {
 	parseCodexPermissionMode,
 	type CodexPermissionMode,
 } from "../../shared/codex-permission-mode";
+import {
+	parseCodexReasoningEffort,
+	type CodexModelDescriptor,
+	type CodexReasoningEffort,
+} from "../../shared/codex-model-config";
 import { RemoteCodeApi, RemoteCodeApiError } from "../shared/api/remotecode-http";
 import {
 	RemoteCodeRealtime,
@@ -136,6 +141,8 @@ const getConnectionPillClass = (connectionState: ConnectionState): string => {
 const OPEN_PROJECT_RPC_TIMEOUT_MS = 120_000;
 const SIDEBAR_WIDTH_STORAGE_KEY = "remotecode-desktop-sidebar-width";
 const PERMISSION_MODE_STORAGE_KEY = "remotecode:permission-mode";
+const MODEL_STORAGE_KEY = "remotecode:model";
+const REASONING_EFFORT_STORAGE_KEY = "remotecode:reasoning-effort";
 const DEFAULT_SIDEBAR_WIDTH = 272;
 const SIDEBAR_WIDTH_MIN = 208;
 const SIDEBAR_WIDTH_MAX = 560;
@@ -175,6 +182,57 @@ const parseSidebarWidth = (value: string | null): number => {
 	}
 
 	return clampSidebarWidth(parsed);
+};
+
+const resolveSelectedModel = (
+	models: CodexModelDescriptor[],
+	preferredModel: string | null,
+): string | null => {
+	if (models.length === 0) {
+		return null;
+	}
+
+	if (preferredModel && models.some((item) => item.model === preferredModel)) {
+		return preferredModel;
+	}
+
+	const defaultModel = models.find((item) => item.isDefault);
+	return defaultModel?.model ?? models[0]?.model ?? null;
+};
+
+const getModelDescriptorByName = (
+	models: CodexModelDescriptor[],
+	modelName: string | null,
+): CodexModelDescriptor | null => {
+	if (!modelName) {
+		return null;
+	}
+
+	return models.find((item) => item.model === modelName) ?? null;
+};
+
+const resolveSelectedReasoningEffort = (
+	model: CodexModelDescriptor | null,
+	preferredEffort: CodexReasoningEffort | null,
+): CodexReasoningEffort | null => {
+	if (!model) {
+		return null;
+	}
+
+	const supported = model.supportedReasoningEfforts.map((item) => item.reasoningEffort);
+	if (supported.length === 0) {
+		return null;
+	}
+
+	if (preferredEffort && supported.includes(preferredEffort)) {
+		return preferredEffort;
+	}
+
+	if (supported.includes(model.defaultReasoningEffort)) {
+		return model.defaultReasoningEffort;
+	}
+
+	return supported[0] ?? null;
 };
 
 const App = (): JSX.Element => {
@@ -234,6 +292,31 @@ const App = (): JSX.Element => {
 			DEFAULT_CODEX_PERMISSION_MODE
 		);
 	});
+	const [availableModels, setAvailableModels] = useState<CodexModelDescriptor[]>([]);
+	const [selectedModel, setSelectedModel] = useState<string | null>(() => {
+		if (typeof window === "undefined") {
+			return null;
+		}
+
+		const savedModel = window.localStorage.getItem(MODEL_STORAGE_KEY);
+		return typeof savedModel === "string" && savedModel.trim().length > 0 ? savedModel.trim() : null;
+	});
+	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<CodexReasoningEffort | null>(() => {
+		if (typeof window === "undefined") {
+			return null;
+		}
+
+		return parseCodexReasoningEffort(window.localStorage.getItem(REASONING_EFFORT_STORAGE_KEY));
+	});
+
+	const selectedModelDescriptor = useMemo(
+		() => getModelDescriptorByName(availableModels, selectedModel),
+		[availableModels, selectedModel],
+	);
+	const availableReasoningEfforts = useMemo(
+		() => selectedModelDescriptor?.supportedReasoningEfforts.map((item) => item.reasoningEffort) ?? [],
+		[selectedModelDescriptor],
+	);
 
 	useEffect(() => {
 		sidebarWidthRef.current = sidebarWidth;
@@ -250,6 +333,56 @@ const App = (): JSX.Element => {
 			// Ignore storage failures in restricted environments
 		}
 	}, [permissionMode]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		try {
+			if (!selectedModel) {
+				window.localStorage.removeItem(MODEL_STORAGE_KEY);
+				return;
+			}
+
+			window.localStorage.setItem(MODEL_STORAGE_KEY, selectedModel);
+		} catch {
+			// Ignore storage failures in restricted environments
+		}
+	}, [selectedModel]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		try {
+			if (!selectedReasoningEffort) {
+				window.localStorage.removeItem(REASONING_EFFORT_STORAGE_KEY);
+				return;
+			}
+
+			window.localStorage.setItem(REASONING_EFFORT_STORAGE_KEY, selectedReasoningEffort);
+		} catch {
+			// Ignore storage failures in restricted environments
+		}
+	}, [selectedReasoningEffort]);
+
+	useEffect(() => {
+		const resolvedModel = resolveSelectedModel(availableModels, selectedModel);
+		if (resolvedModel !== selectedModel) {
+			setSelectedModel(resolvedModel);
+			return;
+		}
+
+		const resolvedEffort = resolveSelectedReasoningEffort(
+			getModelDescriptorByName(availableModels, resolvedModel),
+			selectedReasoningEffort,
+		);
+		if (resolvedEffort !== selectedReasoningEffort) {
+			setSelectedReasoningEffort(resolvedEffort);
+		}
+	}, [availableModels, selectedModel, selectedReasoningEffort]);
 
 	const persistSidebarWidth = useCallback((width: number) => {
 		if (typeof window === "undefined") {
@@ -480,6 +613,20 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection]);
 
+	const loadCodexModels = useCallback(async () => {
+		try {
+			const catalog = await api.listCodexModels();
+			setAvailableModels(catalog.models);
+		} catch (error) {
+			setAvailableModels([]);
+			addError(
+				formatApiErrorMessage(error, "Unable to load codex models"),
+				"rest",
+				formatApiErrorCode(error),
+			);
+		}
+	}, [addError, api, formatApiErrorCode, formatApiErrorMessage]);
+
 	const handleWsEvent = useCallback(
 		async (event: ServerWsEvent) => {
 			switch (event.event) {
@@ -559,8 +706,8 @@ const App = (): JSX.Element => {
 			payload: { baseUrl, token },
 			type: "BOOTSTRAP_CONFIG",
 		});
-		return loadProjects();
-	}, [baseUrl, dispatch, loadProjects, token]);
+		return Promise.all([loadProjects(), loadCodexModels()]);
+	}, [baseUrl, dispatch, loadCodexModels, loadProjects, token]);
 
 	useEffect(() => {
 		void handleBootstrap();
@@ -692,7 +839,13 @@ const App = (): JSX.Element => {
 				},
 				onCreateMessageError: addError,
 				onSendUserMessage: (chatId, messageText) => {
-					wsRef.current?.sendUserMessage(chatId, messageText, permissionMode);
+					wsRef.current?.sendUserMessage(
+						chatId,
+						messageText,
+						permissionMode,
+						selectedModel ?? undefined,
+						selectedReasoningEffort ?? undefined,
+					);
 				},
 				onSetSending: (sending) => {
 					dispatch({
@@ -711,11 +864,28 @@ const App = (): JSX.Element => {
 			dispatch,
 			handleCreateChat,
 			permissionMode,
+			selectedModel,
+			selectedReasoningEffort,
 			selectedChat?.provider,
 			state.selectedChatId,
 			state.selectedProjectId,
 		],
 	);
+
+	const handleModelChange = useCallback(
+		(nextModel: string) => {
+			setSelectedModel(nextModel);
+			const nextModelDescriptor = getModelDescriptorByName(availableModels, nextModel);
+			setSelectedReasoningEffort((current) =>
+				resolveSelectedReasoningEffort(nextModelDescriptor, current),
+			);
+		},
+		[availableModels],
+	);
+
+	const handleReasoningEffortChange = useCallback((effort: CodexReasoningEffort) => {
+		setSelectedReasoningEffort(effort);
+	}, []);
 
 	const handleSelectProject = useCallback(
 		async (projectId: string) => {
@@ -1231,12 +1401,18 @@ const App = (): JSX.Element => {
 									<div className="shrink-0 border-t border-white/10 bg-slate-950/35 px-3 pb-4 pt-3 sm:px-6">
 										<div className="mx-auto w-full max-w-3xl">
 											<MessageComposer
+												availableModels={availableModels}
+												availableReasoningEfforts={availableReasoningEfforts}
 												chatStatus={selectedChat?.status ?? null}
 												disabled={!state.selectedProjectId}
 												focusMode
+												onModelChange={handleModelChange}
 												onPermissionModeChange={setPermissionMode}
+												onReasoningEffortChange={handleReasoningEffortChange}
 												onSend={handleSendMessage}
 												permissionMode={permissionMode}
+												selectedModel={selectedModel}
+												selectedReasoningEffort={selectedReasoningEffort}
 												sending={state.isSendingMessage}
 											/>
 										</div>
@@ -1312,7 +1488,7 @@ const App = (): JSX.Element => {
 												<TooltipTrigger asChild>
 													<Button
 														onClick={() => {
-															void loadProjects();
+															void Promise.all([loadProjects(), loadCodexModels()]);
 														}}
 														size="icon"
 														type="button"
@@ -1425,11 +1601,17 @@ const App = (): JSX.Element => {
 											</div>
 
 											<MessageComposer
+												availableModels={availableModels}
+												availableReasoningEfforts={availableReasoningEfforts}
 												chatStatus={selectedChat?.status ?? null}
 												disabled={!state.selectedProjectId}
+												onModelChange={handleModelChange}
 												onPermissionModeChange={setPermissionMode}
+												onReasoningEffortChange={handleReasoningEffortChange}
 												onSend={handleSendMessage}
 												permissionMode={permissionMode}
+												selectedModel={selectedModel}
+												selectedReasoningEffort={selectedReasoningEffort}
 												sending={state.isSendingMessage}
 											/>
 

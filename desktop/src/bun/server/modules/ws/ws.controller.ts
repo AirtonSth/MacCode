@@ -3,6 +3,7 @@ import { Elysia, t } from "elysia";
 import { serverConfig } from "../../config";
 import { resolveWsToken } from "../../shared/auth/auth.service";
 import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
+import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
 import type { ClientWsEvent, ServerWsEvent } from "../../types";
 import type { WsService } from "./ws.model";
 
@@ -211,12 +212,43 @@ export class WsController {
 							});
 							return;
 						}
+						const rawModel = (payload.data as { model?: unknown }).model;
+						const model =
+							typeof rawModel === "string" && rawModel.trim().length > 0
+								? rawModel.trim()
+								: null;
+						if (rawModel !== undefined && model === null) {
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: invalid model",
+								},
+								event: "error",
+							});
+							return;
+						}
+						const rawReasoningEffort = (payload.data as { reasoningEffort?: unknown }).reasoningEffort;
+						const reasoningEffort = parseCodexReasoningEffort(rawReasoningEffort);
+						if (rawReasoningEffort !== undefined && reasoningEffort === null) {
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: invalid reasoning effort",
+								},
+								event: "error",
+							});
+							return;
+						}
 
 						this.joinChat(chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
 							chatId,
 							emit,
+							model: model ?? undefined,
 							permissionMode: permissionMode ?? undefined,
+							reasoningEffort: reasoningEffort ?? undefined,
 							text,
 						});
 						return;

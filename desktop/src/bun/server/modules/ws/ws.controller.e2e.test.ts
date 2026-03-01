@@ -292,11 +292,33 @@ test("WS emits validation error for invalid payload", async () => {
 				event: "user_message",
 			}),
 		);
+		socket.send(
+			JSON.stringify({
+				data: {
+					chatId: "missing",
+					model: "   ",
+					text: "hello",
+				},
+				event: "user_message",
+			}),
+		);
+		socket.send(
+			JSON.stringify({
+				data: {
+					chatId: "missing",
+					reasoningEffort: "super-high",
+					text: "hello",
+				},
+				event: "user_message",
+			}),
+		);
 
 		await new Promise((resolve) => setTimeout(resolve, 80));
 
 		expect(events.some((event) => event.includes("validation"))).toBe(true);
 		expect(events.some((event) => event.includes("invalid permission mode"))).toBe(true);
+		expect(events.some((event) => event.includes("invalid model"))).toBe(true);
+		expect(events.some((event) => event.includes("invalid reasoning effort"))).toBe(true);
 	} finally {
 		socket?.close();
 		await cleanup();

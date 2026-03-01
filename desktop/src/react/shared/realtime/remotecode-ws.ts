@@ -1,4 +1,5 @@
 import type { CodexPermissionMode } from "../../../shared/codex-permission-mode";
+import type { CodexReasoningEffort } from "../../../shared/codex-model-config";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
@@ -14,8 +15,10 @@ export interface ClientJoinEvent {
 export interface ClientMessageEvent {
 	data: {
 		chatId: string;
+		model?: string;
 		text: string;
 		permissionMode?: CodexPermissionMode;
+		reasoningEffort?: CodexReasoningEffort;
 	};
 	event: "user_message";
 }
@@ -382,12 +385,20 @@ export const RemoteCodeRealtime = {
 				send({ data: { chatId }, event: "join_chat" });
 			},
 
-			sendUserMessage(chatId: string, text: string, permissionMode?: CodexPermissionMode) {
+			sendUserMessage(
+				chatId: string,
+				text: string,
+				permissionMode?: CodexPermissionMode,
+				model?: string,
+				reasoningEffort?: CodexReasoningEffort,
+			) {
 				send({
 					data: {
 						chatId,
+						...(model ? { model } : {}),
 						text,
 						...(permissionMode ? { permissionMode } : {}),
+						...(reasoningEffort ? { reasoningEffort } : {}),
 					},
 					event: "user_message",
 				});

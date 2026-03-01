@@ -289,10 +289,12 @@ test("CodexProviderRunner builds plan mode command for fresh exec", async () => 
 
 	const result = await runner.run({
 		chatId: "chat-plan",
+		model: "gpt-5.3-codex",
 		onDelta: () => {
 			// no-op
 		},
 		permissionMode: "plan",
+		reasoningEffort: "high",
 		text: "hello",
 		workspacePath: "/tmp/workspace",
 	});
@@ -304,6 +306,10 @@ test("CodexProviderRunner builds plan mode command for fresh exec", async () => 
 		"read-only",
 		"--ask-for-approval",
 		"never",
+		"-m",
+		"gpt-5.3-codex",
+		"-c",
+		'model_reasoning_effort="high"',
 		"exec",
 		"--json",
 		"--skip-git-repo-check",
@@ -376,10 +382,12 @@ test("CodexProviderRunner builds full access command for resume flow", async () 
 
 	const result = await runner.run({
 		chatId: "chat-full",
+		model: "gpt-5.3-codex-spark",
 		onDelta: () => {
 			// no-op
 		},
 		permissionMode: "full",
+		reasoningEffort: "xhigh",
 		text: "hello",
 		threadId: "thread-1",
 		workspacePath: "/tmp/workspace",
@@ -389,6 +397,10 @@ test("CodexProviderRunner builds full access command for resume flow", async () 
 	expect(capturedCommand).toEqual([
 		"codex",
 		"--dangerously-bypass-approvals-and-sandbox",
+		"-m",
+		"gpt-5.3-codex-spark",
+		"-c",
+		'model_reasoning_effort="xhigh"',
 		"exec",
 		"resume",
 		"--json",

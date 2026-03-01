@@ -6,6 +6,11 @@ import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
 import type { ChatStatus } from "../../workspace/model/useWorkspaceStore";
 import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
+import {
+	formatCodexReasoningEffortLabel,
+	type CodexModelDescriptor,
+	type CodexReasoningEffort,
+} from "../../../../shared/codex-model-config";
 
 interface MessageComposerProps {
 	disabled: boolean;
@@ -14,6 +19,12 @@ interface MessageComposerProps {
 	onSend: (text: string) => void;
 	permissionMode: CodexPermissionMode;
 	onPermissionModeChange: (mode: CodexPermissionMode) => void;
+	availableModels: CodexModelDescriptor[];
+	selectedModel: string | null;
+	onModelChange: (model: string) => void;
+	availableReasoningEfforts: CodexReasoningEffort[];
+	selectedReasoningEffort: CodexReasoningEffort | null;
+	onReasoningEffortChange: (effort: CodexReasoningEffort) => void;
 	focusMode?: boolean;
 }
 
@@ -26,6 +37,12 @@ export const MessageComposer = ({
 	onSend,
 	permissionMode,
 	onPermissionModeChange,
+	availableModels,
+	selectedModel,
+	onModelChange,
+	availableReasoningEfforts,
+	selectedReasoningEffort,
+	onReasoningEffortChange,
 	focusMode = false,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
@@ -95,6 +112,8 @@ export const MessageComposer = ({
 				? "Sending message..."
 				: validationError ?? (hasText ? `${value.length}/${MAX_MESSAGE_LENGTH}` : "Type a message to send.");
 	const permissionSelectId = focusMode ? "permission-mode-focus" : "permission-mode";
+	const modelSelectId = focusMode ? "model-focus" : "model";
+	const reasoningSelectId = focusMode ? "reasoning-focus" : "reasoning";
 
 	const submitDisabled = isLocked || hasValidationError;
 	const buttonLabel = isRunning ? "Wait" : sending ? "Sending..." : "Send";
@@ -171,26 +190,73 @@ export const MessageComposer = ({
 						/>
 					</div>
 				)}
-				<div className="flex items-center justify-between gap-3 px-1">
-					<label
-						className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
-						htmlFor={permissionSelectId}
-					>
-						Permissions
-					</label>
-					<select
-						className="h-8 min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
-						disabled={isLocked}
-						id={permissionSelectId}
-						onChange={(event) => {
-							onPermissionModeChange(event.target.value as CodexPermissionMode);
-						}}
-						value={permissionMode}
-					>
-						<option value="plan">Plan mode</option>
-						<option value="default">Default mode</option>
-						<option value="full">Full access</option>
-					</select>
+				<div className="grid gap-2 px-1 sm:grid-cols-3">
+					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
+						<label
+							className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
+							htmlFor={permissionSelectId}
+						>
+							Permissions
+						</label>
+						<select
+							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
+							disabled={isLocked}
+							id={permissionSelectId}
+							onChange={(event) => {
+								onPermissionModeChange(event.target.value as CodexPermissionMode);
+							}}
+							value={permissionMode}
+						>
+							<option value="plan">Plan mode</option>
+							<option value="default">Default mode</option>
+							<option value="full">Full access</option>
+						</select>
+					</div>
+					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
+						<label className="text-[11px] uppercase tracking-[0.16em] text-slate-400" htmlFor={modelSelectId}>
+							Model
+						</label>
+						<select
+							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
+							disabled={isLocked || availableModels.length === 0}
+							id={modelSelectId}
+							onChange={(event) => {
+								onModelChange(event.target.value);
+							}}
+							value={selectedModel ?? availableModels[0]?.model ?? ""}
+						>
+							{availableModels.length === 0 ? <option value="">No models</option> : null}
+							{availableModels.map((model) => (
+								<option key={model.id} value={model.model}>
+									{model.displayName}
+								</option>
+							))}
+						</select>
+					</div>
+					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
+						<label
+							className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
+							htmlFor={reasoningSelectId}
+						>
+							Reasoning
+						</label>
+						<select
+							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
+							disabled={isLocked || availableReasoningEfforts.length === 0}
+							id={reasoningSelectId}
+							onChange={(event) => {
+								onReasoningEffortChange(event.target.value as CodexReasoningEffort);
+							}}
+							value={selectedReasoningEffort ?? availableReasoningEfforts[0] ?? ""}
+						>
+							{availableReasoningEfforts.length === 0 ? <option value="">No reasoning levels</option> : null}
+							{availableReasoningEfforts.map((effort) => (
+								<option key={effort} value={effort}>
+									{formatCodexReasoningEffortLabel(effort)}
+								</option>
+							))}
+						</select>
+					</div>
 				</div>
 				{!focusMode && (
 					<div aria-live="polite" className="flex flex-wrap items-center justify-between gap-3">

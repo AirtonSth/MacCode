@@ -125,6 +125,7 @@ export class WsService implements WsServiceContract {
 			const permissionMode = input.permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
 			const providerResult = await this.codexProviderRunner.run({
 				chatId,
+				model: input.model,
 				onDelta: (delta: string) => {
 					emit({
 						data: {
@@ -135,6 +136,7 @@ export class WsService implements WsServiceContract {
 					});
 				},
 				permissionMode,
+				reasoningEffort: input.reasoningEffort,
 				text,
 				threadId: this.chatRepository.findProviderThreadIdByChatId(chatId) ?? undefined,
 				workspacePath: project.path,

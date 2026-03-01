@@ -1,4 +1,5 @@
 import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
+import type { CodexReasoningEffort } from "../../../../shared/codex-model-config";
 
 export interface ChatDTO {
 	diffAdded: number;
@@ -25,7 +26,9 @@ export interface ClientJoinEvent {
 export interface ClientMessageEvent {
 	data: {
 		chatId: string;
+		model?: string;
 		permissionMode?: CodexPermissionMode;
+		reasoningEffort?: CodexReasoningEffort;
 		text: string;
 	};
 	event: "user_message";
@@ -62,8 +65,10 @@ export interface CodexProviderResult {
 
 export interface CodexProviderRunOptions {
 	chatId: string;
+	model?: string;
 	onDelta: (delta: string) => void;
 	permissionMode?: CodexPermissionMode;
+	reasoningEffort?: CodexReasoningEffort;
 	text: string;
 	threadId?: string;
 	workspacePath: string;

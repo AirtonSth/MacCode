@@ -11,6 +11,8 @@ export interface WsService {
 export interface WsServiceInput {
 	chatId: string;
 	emit: (event: ServerWsEvent) => void;
+	model?: ClientMessageEvent["data"]["model"];
 	permissionMode?: ClientMessageEvent["data"]["permissionMode"];
+	reasoningEffort?: ClientMessageEvent["data"]["reasoningEffort"];
 	text: string;
 }

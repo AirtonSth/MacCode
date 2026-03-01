@@ -86,6 +86,58 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 	}
 });
 
+test("RemoteCodeApi returns codex model catalog from GET /v1/providers/codex/models", async () => {
+	let method = "";
+	let path = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		return jsonResponse({
+			data: {
+				models: [
+					{
+						defaultReasoningEffort: "medium",
+						description: "Latest frontier agentic coding model.",
+						displayName: "gpt-5.3-codex",
+						id: "gpt-5.3-codex",
+						isDefault: true,
+						model: "gpt-5.3-codex",
+						supportedReasoningEfforts: [
+							{ description: "Low", reasoningEffort: "low" },
+							{ description: "Medium", reasoningEffort: "medium" },
+							{ description: "High", reasoningEffort: "high" },
+							{ description: "Extra high", reasoningEffort: "xhigh" },
+						],
+					},
+				],
+				nextCursor: null,
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001/",
+			token: "unit-token",
+		});
+		const catalog = await client.listCodexModels();
+
+		expect(method).toBe("GET");
+		expect(path).toBe("/v1/providers/codex/models");
+		expect(catalog.models).toHaveLength(1);
+		expect(catalog.models[0]?.model).toBe("gpt-5.3-codex");
+		expect(catalog.models[0]?.supportedReasoningEfforts.map((item) => item.reasoningEffort)).toEqual([
+			"low",
+			"medium",
+			"high",
+			"xhigh",
+		]);
+		expect(catalog.nextCursor).toBeNull();
+	} finally {
+		restore();
+	}
+});
+
 test("RemoteCodeApi issues delete requests for projects and chats", async () => {
 	const calls: string[] = [];
 	const restore = createMockFetch((url) => {

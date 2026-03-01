@@ -91,22 +91,26 @@ export const ConversationPanel = ({
 				{children}
 			</a>
 		),
-		code: ({ inline, children, ...props }) =>
-			inline ? (
+		code: (props) => {
+			const { children, className, ...rest } = props;
+			const inline = !className?.includes("language-");
+			return inline ? (
 				<code
 					className={cn(
 						"rounded bg-white/10 px-1.5 py-0.5 font-mono text-[13px] leading-none tracking-tight",
 						focusMode ? "text-slate-100/95" : "text-cyan-100",
+						className,
 					)}
-					{...props}
+					{...rest}
 				>
 					{children}
 				</code>
 			) : (
-				<code className="block" {...props}>
+				<code className={cn("block", className)} {...rest}>
 					{children}
 				</code>
-			),
+			);
+		},
 		pre: ({ children, ...props }) => (
 			<pre
 				className={cn(
