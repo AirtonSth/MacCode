@@ -1427,7 +1427,7 @@ const App = (): JSX.Element => {
 									{hasProjects ? (
 											isThreadFocusMode ? (
 												<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-												<header className="flex h-10 items-center justify-between gap-2 border-b border-white/10 px-4">
+													<header className="flex h-10 items-center justify-between gap-2 px-4">
 													<div className="flex min-w-0 items-center gap-2">
 														<Tooltip>
 															<TooltipTrigger asChild>
@@ -1524,7 +1524,7 @@ const App = (): JSX.Element => {
 								</section>
 											) : (
 												<>
-													<header className="flex h-10 items-center justify-between gap-2 border-b border-white/10 px-4 lg:px-5">
+														<header className="flex h-10 items-center justify-between gap-2 px-4 lg:px-5">
 														<div className="flex min-w-0 items-center gap-2">
 															<Tooltip>
 																<TooltipTrigger asChild>

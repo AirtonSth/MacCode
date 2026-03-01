@@ -158,7 +158,7 @@ export const ConversationPanel = ({
 			)}
 		>
 			{focusMode ? null : (
-				<header className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-4">
+					<header className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
 					<div>
 						<h2 className="m-0 text-sm font-semibold tracking-wide text-slate-100">
 							{chat ? chat.title : "No chat selected"}
