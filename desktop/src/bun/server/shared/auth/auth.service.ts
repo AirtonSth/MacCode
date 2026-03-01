@@ -6,7 +6,7 @@ const setCorsHeaders = (request: Request, headers: Record<string, string | numbe
 	const origin = request.headers.get("origin");
 
 	headers["access-control-allow-origin"] = origin || "*";
-	headers["access-control-allow-methods"] = "GET,POST,PATCH,OPTIONS";
+	headers["access-control-allow-methods"] = "GET,POST,PATCH,DELETE,OPTIONS";
 	headers["access-control-allow-headers"] = "authorization,content-type";
 	headers["access-control-max-age"] = "86400";
 };

@@ -745,13 +745,11 @@ const App = (): JSX.Element => {
 
 	const handleDeleteChat = useCallback(
 		async (chatId: string) => {
-			let wasDeleted = false;
 			try {
 				const deletionResult = await api.deleteChat(chatId);
 				if (!deletionResult.deleted) {
 					throw new Error("Unable to delete thread");
 				}
-				wasDeleted = true;
 			} catch (error) {
 				if (formatApiErrorCode(error) !== "HTTP_404") {
 					addError(
@@ -761,7 +759,6 @@ const App = (): JSX.Element => {
 					);
 					return;
 				}
-				wasDeleted = true;
 			}
 
 			const preferredChatId = state.selectedChatId === chatId ? null : state.selectedChatId;
@@ -776,19 +773,8 @@ const App = (): JSX.Element => {
 				type: "REMOVE_CHAT",
 			});
 
-			try {
-				if (state.selectedProjectId) {
-					await persistWorkspaceSelection(state.selectedProjectId, nextSelectedChatId);
-				}
-			} catch (error) {
-				addError(
-					formatApiErrorMessage(
-						error,
-						wasDeleted ? "Thread deleted, but failed to persist selection." : "Unable to delete thread",
-					),
-					"rest",
-					formatApiErrorCode(error),
-				);
+			if (state.selectedProjectId) {
+				await loadChatsForProject(state.selectedProjectId, nextSelectedChatId);
 			}
 		},
 		[
@@ -797,7 +783,7 @@ const App = (): JSX.Element => {
 			dispatch,
 			formatApiErrorCode,
 			formatApiErrorMessage,
-			persistWorkspaceSelection,
+			loadChatsForProject,
 			state.chats,
 			state.selectedChatId,
 			state.selectedProjectId,
