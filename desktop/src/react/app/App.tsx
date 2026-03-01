@@ -1136,30 +1136,6 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, electrobunView, selectedProject?.path]);
 
-	const handleWindowControl = useCallback(
-		async (action: "closeWindow" | "minimizeWindow" | "toggleMaximizeWindow") => {
-			if (!electrobunView) {
-				return;
-			}
-
-			const request = electrobunView.rpc.request[action];
-			if (typeof request !== "function") {
-				return;
-			}
-
-			try {
-				await request();
-			} catch (error) {
-				addError(
-					error instanceof Error ? error.message : "Unable to control native window",
-					"rest",
-					"window_control_error",
-				);
-			}
-		},
-		[electrobunView, addError],
-	);
-
 	const handleToggleTerminal = useCallback(() => {
 		if (!state.selectedChatId) {
 			return;
@@ -1205,56 +1181,6 @@ const App = (): JSX.Element => {
 	const isTerminalOpen = Boolean(selectedThreadTerminal?.isOpen);
 	const sidebarToggleLabel = isSidebarVisible ? "Hide sidebar" : "Show sidebar";
 	const threadPanelBgClass = isThreadFocusMode ? "bg-[#13161b]" : "bg-slate-950/35";
-	const hiddenSidebarWindowControls = electrobunView && !isSidebarVisible ? (
-		<div className="relative z-10 flex items-center gap-2">
-			<Tooltip>
-				<TooltipTrigger asChild>
-					<Button
-						aria-label="Close window"
-						className="relative z-10 h-3 w-3 rounded-full border border-[#d04c46] bg-[#ff6059] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
-						onClick={() => {
-							void handleWindowControl("closeWindow");
-						}}
-						size="icon"
-						type="button"
-						variant="ghost"
-					/>
-				</TooltipTrigger>
-				<TooltipContent>Close window</TooltipContent>
-			</Tooltip>
-			<Tooltip>
-				<TooltipTrigger asChild>
-					<Button
-						aria-label="Minimize window"
-						className="relative z-10 h-3 w-3 rounded-full border border-[#d5a42b] bg-[#ffbd2f] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
-						onClick={() => {
-							void handleWindowControl("minimizeWindow");
-						}}
-						size="icon"
-						type="button"
-						variant="ghost"
-					/>
-				</TooltipTrigger>
-				<TooltipContent>Minimize window</TooltipContent>
-			</Tooltip>
-			<Tooltip>
-				<TooltipTrigger asChild>
-					<Button
-						aria-label="Maximize window"
-						className="relative z-10 h-3 w-3 rounded-full border border-[#1eb24f] bg-[#28ca42] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
-						onClick={() => {
-							void handleWindowControl("toggleMaximizeWindow");
-						}}
-						size="icon"
-						type="button"
-						variant="ghost"
-					/>
-				</TooltipTrigger>
-				<TooltipContent>Maximize window</TooltipContent>
-			</Tooltip>
-		</div>
-	) : null;
-
 	return (
 				<TooltipProvider delayDuration={120}>
 			<div className="relative h-full w-full overflow-hidden">
@@ -1263,7 +1189,7 @@ const App = (): JSX.Element => {
 						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
 						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
 							className={cn(
-								"grid h-full w-full min-h-0 overflow-hidden rounded-[14px] border border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
+								"grid h-full w-full min-h-0 overflow-hidden rounded-b-[14px] border border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
 								isSidebarVisible
 									? "grid-cols-[var(--desktop-sidebar-width)_8px_minmax(0,1fr)] max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
 									: "grid-cols-[minmax(0,1fr)]",
@@ -1276,66 +1202,15 @@ const App = (): JSX.Element => {
 									{isSidebarVisible ? (
 							<>
 									<aside
-										className="codex-sidebar relative z-10 flex min-h-0 flex-col overflow-hidden rounded-l-2xl px-2 py-2 max-[920px]:rounded-none"
+										className="codex-sidebar relative z-10 flex min-h-0 flex-col overflow-hidden rounded-bl-2xl px-2 py-2 max-[920px]:rounded-none"
 										style={{
 											background: "linear-gradient(180deg, #131722 0%, #1a1b29 34%, #2a1a31 68%, #2b1d25 100%)",
-											borderRadius: "16px 0 0 16px",
+											borderRadius: "0 0 0 16px",
 											boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 18px 38px rgba(0, 0, 0, 0.35)",
 										}}
 									>
 									<div className="relative flex items-center justify-between px-1.5 pb-2 pt-1">
-										{electrobunView ? <div className="electrobun-webkit-app-region-drag absolute inset-x-0 top-1 h-7 rounded-sm" /> : null}
-										{electrobunView ? (
-											<div className="relative z-10 flex items-center gap-2">
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<Button
-															aria-label="Close window"
-															className="relative z-10 h-3 w-3 rounded-full border border-[#d04c46] bg-[#ff6059] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
-															onClick={() => {
-																void handleWindowControl("closeWindow");
-															}}
-															size="icon"
-															type="button"
-															variant="ghost"
-														/>
-													</TooltipTrigger>
-													<TooltipContent>Close window</TooltipContent>
-												</Tooltip>
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<Button
-															aria-label="Minimize window"
-															className="relative z-10 h-3 w-3 rounded-full border border-[#d5a42b] bg-[#ffbd2f] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
-															onClick={() => {
-																void handleWindowControl("minimizeWindow");
-															}}
-															size="icon"
-															type="button"
-															variant="ghost"
-														/>
-													</TooltipTrigger>
-													<TooltipContent>Minimize window</TooltipContent>
-												</Tooltip>
-												<Tooltip>
-													<TooltipTrigger asChild>
-														<Button
-															aria-label="Maximize window"
-															className="relative z-10 h-3 w-3 rounded-full border border-[#1eb24f] bg-[#28ca42] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
-															onClick={() => {
-																void handleWindowControl("toggleMaximizeWindow");
-															}}
-															size="icon"
-															type="button"
-															variant="ghost"
-														/>
-													</TooltipTrigger>
-													<TooltipContent>Maximize window</TooltipContent>
-												</Tooltip>
-											</div>
-										) : (
-											<h2 className="text-[19px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
-										)}
+										<h2 className="text-[19px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
 										<div className="relative z-10 flex items-center gap-0.5">
 											<Tooltip>
 												<TooltipTrigger asChild>
@@ -1579,17 +1454,13 @@ const App = (): JSX.Element => {
 									)}
 								>
 									{hasProjects ? (
-											isThreadFocusMode ? (
-												<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-													<header className="relative flex h-10 items-center justify-between gap-2 px-4">
-														{electrobunView ? (
-															<div className="electrobun-webkit-app-region-drag absolute inset-x-0 inset-y-0" />
-														) : null}
-													<div className="relative z-10 flex min-w-0 items-center gap-2">
-														{hiddenSidebarWindowControls}
-														<Tooltip>
-															<TooltipTrigger asChild>
-																<Button
+												isThreadFocusMode ? (
+													<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+														<header className="relative flex h-10 items-center justify-between gap-2 px-4">
+														<div className="relative z-10 flex min-w-0 items-center gap-2">
+															<Tooltip>
+																<TooltipTrigger asChild>
+																	<Button
 																	aria-label={sidebarToggleLabel}
 																	className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
 																	onClick={() => {
@@ -1710,17 +1581,13 @@ const App = (): JSX.Element => {
 										</div>
 									) : null}
 								</section>
-											) : (
-												<>
-														<header className="relative flex h-10 items-center justify-between gap-2 px-4 lg:px-5">
-															{electrobunView ? (
-																<div className="electrobun-webkit-app-region-drag absolute inset-x-0 inset-y-0" />
-															) : null}
-														<div className="relative z-10 flex min-w-0 items-center gap-2">
-															{hiddenSidebarWindowControls}
-															<Tooltip>
-																<TooltipTrigger asChild>
-																	<Button
+												) : (
+													<>
+															<header className="relative flex h-10 items-center justify-between gap-2 px-4 lg:px-5">
+															<div className="relative z-10 flex min-w-0 items-center gap-2">
+																<Tooltip>
+																	<TooltipTrigger asChild>
+																		<Button
 																		aria-label={sidebarToggleLabel}
 																		className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
 																		onClick={() => {

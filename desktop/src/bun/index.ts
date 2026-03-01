@@ -131,7 +131,7 @@ installMacShortcutsMenu();
 const url = await getMainViewUrl();
 
 const mainWindow = new BrowserWindow({
-	titleBarStyle: "hidden",
+	titleBarStyle: "default",
 	transparent: true,
 	frame: {
 		height: 700,
