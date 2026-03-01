@@ -1513,7 +1513,7 @@ const App = (): JSX.Element => {
 														{electrobunView ? (
 															<div className="electrobun-webkit-app-region-drag absolute inset-x-0 inset-y-0" />
 														) : null}
-													<div className="flex min-w-0 items-center gap-2">
+													<div className="relative z-10 flex min-w-0 items-center gap-2">
 														<Tooltip>
 															<TooltipTrigger asChild>
 																<Button
@@ -1613,7 +1613,7 @@ const App = (): JSX.Element => {
 															{electrobunView ? (
 																<div className="electrobun-webkit-app-region-drag absolute inset-x-0 inset-y-0" />
 															) : null}
-														<div className="flex min-w-0 items-center gap-2">
+														<div className="relative z-10 flex min-w-0 items-center gap-2">
 															<Tooltip>
 																<TooltipTrigger asChild>
 																	<Button
