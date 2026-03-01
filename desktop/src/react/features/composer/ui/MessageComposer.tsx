@@ -1,6 +1,6 @@
-import { ChangeEvent, FormEvent, KeyboardEvent, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, useLayoutEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
-import { ArrowUp, ChevronDown, Loader2, Plus } from "lucide-react";
+import { ArrowUp, ChevronDown, Loader2, Mic, Plus } from "lucide-react";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
@@ -46,6 +46,7 @@ export const MessageComposer = ({
 	focusMode = false,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
+	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const shouldReduceMotion = useReducedMotion();
 	const isRunning = chatStatus === "running";
@@ -94,6 +95,15 @@ export const MessageComposer = ({
 		}
 	};
 
+	useLayoutEffect(() => {
+		const textarea = textareaRef.current;
+		if (!textarea) {
+			return;
+		}
+		textarea.style.height = "auto";
+		textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+	}, [value]);
+
 	const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
 		if (event.key !== "Enter") {
 			return;
@@ -117,24 +127,26 @@ export const MessageComposer = ({
 
 	const submitDisabled = isLocked || hasValidationError;
 	const buttonLabel = isRunning ? "Wait" : sending ? "Sending..." : "Send";
+	const composerTextClass = "text-sm leading-6 text-[#e5e7eb]";
 	const subtleSelectClass =
-		"h-7 appearance-none bg-transparent px-1 pr-5 text-[13px] text-slate-400 transition-colors hover:text-slate-200 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+		"h-6 appearance-none bg-transparent px-1 pr-4 text-xs leading-4 font-normal text-[#9a9da5] transition-colors hover:text-[#c8ccd6] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
 
 	return (
 		<section className={cn(focusMode ? "w-full" : "rounded-[24px] border border-white/10 bg-slate-950/65 p-3 backdrop-blur-2xl")}>
 			<form className={cn(focusMode ? "space-y-0" : "space-y-2")} onSubmit={submit}>
 				<div
 					className={cn(
-						"rounded-[1.6rem] border border-white/10 bg-slate-900/70 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),_0_16px_30px_rgba(0,0,0,0.32)]",
+						`codex-sidebar rounded-2xl border border-[#2c3038] bg-[linear-gradient(180deg,#181a1f_0%,#15171b_100%)] px-4 pb-1 pt-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04),_0_16px_30px_rgba(0,0,0,0.35)] ${composerTextClass}`,
 						isLocked ? "opacity-85" : "",
 					)}
 				>
 					<Textarea
+						ref={textareaRef}
 						aria-label="Message input"
 						className={cn(
 							focusMode
-								? "min-h-[74px] max-h-[300px] resize-none border-0 bg-transparent px-1 py-1 text-[15px] leading-7 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed"
-								: "min-h-[92px] max-h-[300px] resize-none border-0 bg-transparent px-1 py-1 text-sm leading-6 text-slate-100 placeholder:text-slate-500 focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed",
+								? `min-h-[56px] max-h-[220px] resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`
+								: `min-h-[56px] max-h-[220px] resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`,
 						)}
 						disabled={isLocked}
 						maxLength={MAX_MESSAGE_LENGTH}
@@ -145,23 +157,23 @@ export const MessageComposer = ({
 								? "Select a project to start."
 								: isRunning
 									? "Waiting for assistant response..."
-									: "Type a message to the coding assistant"
+									: "Ask for follow-up changes"
 						}
-						rows={3}
+						rows={2}
 						value={value}
 					/>
 
-					<div className="mt-2 flex items-center justify-between gap-2 border-t border-white/10 pt-2">
+					<div className={cn("mt-1 flex items-center justify-between gap-2 border-t border-[#2b3038] pt-1", composerTextClass)}>
 						<div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
 							<Button
 								aria-label="Attach context"
-								className="h-7 w-7 shrink-0 rounded-full p-0 text-slate-400 hover:bg-white/[0.04] hover:text-slate-100"
+								className="h-6 w-6 shrink-0 rounded-full p-0 text-[#9a9da5] hover:bg-white/[0.04] hover:text-[#c8ccd6]"
 								disabled={isLocked}
 								size="icon"
 								type="button"
 								variant="ghost"
 							>
-								<Plus className="h-4 w-4" />
+								<Plus className="h-3 w-3" />
 							</Button>
 
 							<div className="relative shrink-0">
@@ -182,7 +194,7 @@ export const MessageComposer = ({
 										</option>
 									))}
 								</select>
-								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
 
 							<div className="relative shrink-0">
@@ -203,7 +215,7 @@ export const MessageComposer = ({
 										</option>
 									))}
 								</select>
-								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
 
 							<div className="relative shrink-0">
@@ -221,14 +233,27 @@ export const MessageComposer = ({
 									<option value="default">Default</option>
 									<option value="full">Full access</option>
 								</select>
-								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
 						</div>
 
-						<motion.div whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
+						<div className="flex items-center gap-1">
+							<Button
+								aria-label="Voice input"
+								className="h-6 w-6 shrink-0 rounded-full p-0 text-[#9a9da5] hover:bg-white/[0.04] hover:text-[#c8ccd6]"
+								disabled={isLocked}
+								size="icon"
+								type="button"
+								variant="ghost"
+							>
+								<Mic className="h-3 w-3" />
+							</Button>
+						</div>
+
+						<motion.div className="ml-1" whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
 							<Button
 								aria-label={buttonLabel}
-								className="h-10 w-10 shrink-0 rounded-full bg-white p-0 text-slate-900 shadow-[0_12px_26px_rgba(0,0,0,0.35)] hover:bg-white/90"
+								className="h-8 w-8 shrink-0 rounded-full bg-[#aeb2bb] p-0 text-[#181a20] shadow-none hover:bg-[#c0c5ce]"
 								disabled={submitDisabled}
 								type="submit"
 							>
@@ -240,7 +265,7 @@ export const MessageComposer = ({
 
 				{!focusMode && (
 					<div aria-live="polite" className="px-1">
-						<span className={cn("text-xs", validationError ? "text-rose-300" : "text-slate-400/90")}>
+						<span className={cn(composerTextClass, validationError ? "text-rose-300" : "text-slate-400/90")}>
 							{statusText}
 						</span>
 					</div>
