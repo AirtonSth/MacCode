@@ -1,0 +1,49 @@
+import "react-native-reanimated";
+
+import { QueryClientProvider } from "@tanstack/react-query";
+import * as SplashScreen from "expo-splash-screen";
+import { Stack } from "expo-router";
+import { useEffect } from "react";
+
+import { ApiConfigProvider } from "@/shared/api/api-config-provider";
+import { queryClient } from "@/shared/api/query-client";
+import { theme } from "@/shared/theme/tokens";
+
+export {
+	ErrorBoundary,
+} from "expo-router";
+
+SplashScreen.preventAutoHideAsync();
+
+export default function RootLayout() {
+	useEffect(() => {
+		void SplashScreen.hideAsync();
+	}, []);
+
+	return (
+		<ApiConfigProvider>
+			<QueryClientProvider client={queryClient}>
+				<Stack
+					screenOptions={{
+						contentStyle: {
+							backgroundColor: theme.colors.background,
+						},
+						headerStyle: {
+							backgroundColor: theme.colors.panelBackground,
+						},
+						headerTintColor: theme.colors.textPrimary,
+					}}
+				>
+					<Stack.Screen name="index" options={{ headerShown: false }} />
+					<Stack.Screen
+						name="settings"
+						options={{
+							presentation: "modal",
+							title: "Connection Settings",
+						}}
+					/>
+				</Stack>
+			</QueryClientProvider>
+		</ApiConfigProvider>
+	);
+}

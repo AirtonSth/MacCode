@@ -19,6 +19,12 @@
     "sonarjs/no-one-iteration-loop": "off",
     "putout/putout": "off",
     "total-functions/require-strict-mode": "off",
+    "@typescript-eslint/no-use-before-define": [
+      "error",
+      {
+        "ignoreTypeReferences": true
+      }
+    ],
     "strict": "off",
     "@typescript-eslint/naming-convention": "off",
     "@stylistic/no-tabs": "off",

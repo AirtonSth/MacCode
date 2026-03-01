@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "desktop/**/*.ts",
+    "desktop/**/*.tsx",
+    "desktop/**/*.js",
+    "desktop/**/*.jsx",
+    "mobile/**/*.ts",
+    "mobile/**/*.tsx",
+    "mobile/**/*.js",
+    "mobile/**/*.jsx",
+    "packages/contracts/**/*.ts",
+    "packages/contracts/**/*.tsx",
+    "packages/contracts/**/*.js",
+    "packages/contracts/**/*.jsx"
+  ]
+}

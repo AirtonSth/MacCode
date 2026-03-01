@@ -1,0 +1,24 @@
+{
+  "root": true,
+  "parserOptions": {
+    "project": "./tsconfig.json",
+    "projectService": true
+  },
+  "extends": [
+    "hardcore",
+    "hardcore/ts",
+    "hardcore/fp"
+  ],
+  "env": {
+    "node": true
+  },
+  "rules": {
+    "putout/putout": "off",
+    "total-functions/require-strict-mode": "off",
+    "strict": "off",
+    "@stylistic/no-tabs": "off",
+    "import/no-unused-modules": "off",
+    "functional/no-conditional-statements": "off",
+    "functional/no-expression-statements": "off"
+  }
+}

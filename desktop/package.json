@@ -16,7 +16,8 @@
     "test:e2e:frontend": "bunx concurrently \"bun run e2e:serve\" \"bunx wait-on tcp:127.0.0.1:4173 && bun run e2e:run:frontend\" --kill-others --success first",
     "test:backend": "bun test ./src/bun/server --pattern '.*\\.test\\.ts$'",
     "typecheck": "bun run tsc --noEmit",
-    "lint": "bunx eslint --fix ."
+    "lint": "bunx eslint --fix .",
+    "lint:check": "bunx eslint ."
   },
   "dependencies": {
     "@elysiajs/eden": "^1.4.3",

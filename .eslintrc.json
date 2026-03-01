@@ -1,0 +1,38 @@
+{
+  "root": true,
+  "ignorePatterns": [
+    "desktop/**",
+    "mobile/**",
+    ".remotecode/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "bun.lock",
+    "package-lock.json"
+  ],
+  "parserOptions": {
+    "project": "./tsconfig.eslint.json",
+    "projectService": true
+  },
+  "extends": [
+    "hardcore",
+    "hardcore/ts",
+    "hardcore/fp"
+  ],
+  "env": {
+    "node": true
+  },
+  "rules": {
+    "putout/putout": "off",
+    "total-functions/require-strict-mode": "off",
+    "@typescript-eslint/no-use-before-define": [
+      "error",
+      {
+        "ignoreTypeReferences": true
+      }
+    ],
+    "strict": "off",
+    "@stylistic/no-tabs": "off",
+    "import/no-unused-modules": "off"
+  }
+}

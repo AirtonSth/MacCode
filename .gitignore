@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+**/node_modules/
+
+# build outputs
+dist/
+build/
+**/dist/
+**/build/
+
+# Expo
+.expo/
+**/.expo/
+web-build/
+**/web-build/
+.metro-health-check*
+expo-env.d.ts
+
+# native generated
+android/
+ios/
+**/android/
+**/ios/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# environment files
+.env
+.env.local
+.env.*.local
+
+# Bun
+bun.lockb
+
+# system
+.DS_Store
+
