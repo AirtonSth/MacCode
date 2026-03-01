@@ -17,7 +17,9 @@ export const config = {
 	waitforTimeout: 15_000,
 	connectionRetryTimeout: 120_000,
 	connectionRetryCount: 1,
+	services: ["chromedriver"],
 	framework: "mocha",
+	hostname: "127.0.0.1",
 	reporters: ["spec"],
 	mochaOpts: {
 		timeout: 60_000,
