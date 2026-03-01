@@ -1182,6 +1182,55 @@ const App = (): JSX.Element => {
 	const isTerminalOpen = Boolean(selectedThreadTerminal?.isOpen);
 	const sidebarToggleLabel = isSidebarVisible ? "Hide sidebar" : "Show sidebar";
 	const threadPanelBgClass = isThreadFocusMode ? "bg-[#13161b]" : "bg-slate-950/35";
+	const hiddenSidebarWindowControls = electrobunView && !isSidebarVisible ? (
+		<div className="relative z-10 flex items-center gap-2">
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<Button
+						aria-label="Close window"
+						className="relative z-10 h-3 w-3 rounded-full border border-[#d04c46] bg-[#ff6059] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
+						onClick={() => {
+							void handleWindowControl("closeWindow");
+						}}
+						size="icon"
+						type="button"
+						variant="ghost"
+					/>
+				</TooltipTrigger>
+				<TooltipContent>Close window</TooltipContent>
+			</Tooltip>
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<Button
+						aria-label="Minimize window"
+						className="relative z-10 h-3 w-3 rounded-full border border-[#d5a42b] bg-[#ffbd2f] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
+						onClick={() => {
+							void handleWindowControl("minimizeWindow");
+						}}
+						size="icon"
+						type="button"
+						variant="ghost"
+					/>
+				</TooltipTrigger>
+				<TooltipContent>Minimize window</TooltipContent>
+			</Tooltip>
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<Button
+						aria-label="Maximize window"
+						className="relative z-10 h-3 w-3 rounded-full border border-[#1eb24f] bg-[#28ca42] p-0 text-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.15)]"
+						onClick={() => {
+							void handleWindowControl("toggleMaximizeWindow");
+						}}
+						size="icon"
+						type="button"
+						variant="ghost"
+					/>
+				</TooltipTrigger>
+				<TooltipContent>Maximize window</TooltipContent>
+			</Tooltip>
+		</div>
+	) : null;
 
 	return (
 				<TooltipProvider delayDuration={120}>
@@ -1514,6 +1563,7 @@ const App = (): JSX.Element => {
 															<div className="electrobun-webkit-app-region-drag absolute inset-x-0 inset-y-0" />
 														) : null}
 													<div className="relative z-10 flex min-w-0 items-center gap-2">
+														{hiddenSidebarWindowControls}
 														<Tooltip>
 															<TooltipTrigger asChild>
 																<Button
@@ -1530,13 +1580,13 @@ const App = (): JSX.Element => {
 														</Button>
 														</TooltipTrigger>
 														<TooltipContent>{sidebarToggleLabel}</TooltipContent>
-													</Tooltip>
-													<div className="min-w-0">
-														<h2 className="truncate text-sm font-semibold text-slate-100">
-															{selectedChat?.title ?? "No thread selected"}
-														</h2>
+															</Tooltip>
+														<div className="min-w-0">
+															<h2 className="truncate text-sm font-semibold text-slate-100">
+																{selectedChat?.title ?? "No thread selected"}
+															</h2>
+														</div>
 													</div>
-												</div>
 							<Button
 														className={cn(
 															"rounded-lg h-8 w-8 gap-1.5 bg-transparent transition-colors hover:bg-sky-400/10 hover:text-sky-100 active:bg-sky-400/10 active:text-sky-100 focus-visible:bg-sky-400/10 focus-visible:text-sky-100",
@@ -1614,6 +1664,7 @@ const App = (): JSX.Element => {
 																<div className="electrobun-webkit-app-region-drag absolute inset-x-0 inset-y-0" />
 															) : null}
 														<div className="relative z-10 flex min-w-0 items-center gap-2">
+															{hiddenSidebarWindowControls}
 															<Tooltip>
 																<TooltipTrigger asChild>
 																	<Button
@@ -1628,7 +1679,7 @@ const App = (): JSX.Element => {
 																>
 																<PanelLeft className="h-4 w-4" />
 															</Button>
-															</TooltipTrigger>
+														</TooltipTrigger>
 															<TooltipContent>{sidebarToggleLabel}</TooltipContent>
 														</Tooltip>
 														<div className="min-w-0">
