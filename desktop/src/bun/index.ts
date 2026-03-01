@@ -3,7 +3,15 @@ import { BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
 
-const appRPC = BrowserView.defineRPC({
+const appRPC = (BrowserView as unknown as {
+	defineRPC: <T>(config: {
+		maxRequestTime?: number;
+		handlers: {
+			requests: Record<string, (...args: never[]) => unknown>;
+			messages: Record<string, (...args: never[]) => void>;
+		};
+	}) => T;
+}).defineRPC({
 	maxRequestTime: 120_000,
 	handlers: {
 		requests: {

@@ -119,7 +119,6 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 					chatId,
 					delta,
 				},
-
 				event: "assistant_delta",
 			};
 		}
@@ -130,7 +129,6 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 			data: {
 				chatId,
 			},
-
 			event: "assistant_done",
 		};
 	}
@@ -151,7 +149,6 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				status: data.status,
 				updatedAt: data.updatedAt,
 			},
-
 			event: "chat_updated",
 		};
 	}
@@ -163,7 +160,6 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				code: data.code,
 				message: data.message,
 			},
-
 			event: "error",
 		};
 	}
@@ -174,7 +170,9 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 const buildWsUrl = (baseUrl: string, token: string): string => {
 	const normalized = baseUrl.replace(/\/+$/, "");
 	const wsBase =
-		normalized.startsWith("https://") ? normalized.replace(/^https:\/\//, "wss://") : normalized.replace(/^http:\/\//, "ws://");
+		normalized.startsWith("https://")
+			? normalized.replace(/^https:\/\//, "wss://")
+			: normalized.replace(/^http:\/\//, "ws://");
 
 	return `${wsBase}/v1/ws?token=${encodeURIComponent(token)}`;
 };
@@ -228,7 +226,6 @@ export const RemoteCodeRealtime = {
 		const enqueueMessage = (payload: ClientWsEvent) => {
 			if (payload.event === "join_chat") {
 				const queuedJoinChatIds = getQueuedJoinChatIds();
-
 				if (queuedJoinChatIds.has(payload.data.chatId)) {
 					return;
 				}
@@ -242,13 +239,12 @@ export const RemoteCodeRealtime = {
 		};
 
 		const flushQueue = () => {
-			if (!socket || socket.readyState !== 1) {
+			if (!socket || socket.readyState !== WebSocket.OPEN) {
 				return;
 			}
 
 			while (sendQueue.length > 0) {
 				const payload = sendQueue.shift();
-
 				if (!payload) {
 					continue;
 				}
@@ -274,31 +270,18 @@ export const RemoteCodeRealtime = {
 			try {
 				socket.close();
 			} catch {
-				// no-op: cleanup best effort
+				// no-op
 			}
 		};
 
 		const scheduleReconnect = () => {
-			if (stopped) {
+			if (stopped || isConnecting || reconnectScheduled) {
 				return;
 			}
 
-			if (isConnecting) {
-				return;
-			}
-
-			if (reconnectScheduled) {
-				return;
-			}
-
-			const delay = Math.min(
-				reconnectBaseDelay * 2 ** reconnectAttempts,
-				reconnectMaxDelay,
-			);
-
+			const delay = Math.min(reconnectBaseDelay * 2 ** reconnectAttempts, reconnectMaxDelay);
 			reconnectAttempts += 1;
 			reconnectScheduled = true;
-
 			notifyState("reconnecting");
 
 			reconnectTimeout = setTimeout(() => {
@@ -309,19 +292,11 @@ export const RemoteCodeRealtime = {
 		};
 
 		const connect = () => {
-			if (stopped) {
+			if (stopped || isConnecting) {
 				return;
 			}
 
-			if (isConnecting) {
-				return;
-			}
-
-			if (socket && socket.readyState === WebSocket.OPEN) {
-				return;
-			}
-
-			if (socket && socket.readyState === WebSocket.CONNECTING) {
+			if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
 				return;
 			}
 
@@ -338,13 +313,13 @@ export const RemoteCodeRealtime = {
 				isConnecting = false;
 				clearReconnectTimeout();
 				notifyState("connected");
+
 				const queuedJoinChatIds = getQueuedJoinChatIds();
 				flushQueue();
 				for (const chatId of activeChats) {
 					if (queuedJoinChatIds.has(chatId)) {
 						continue;
 					}
-
 					socket?.send(JSON.stringify({ data: { chatId }, event: "join_chat" }));
 				}
 			});
@@ -367,11 +342,9 @@ export const RemoteCodeRealtime = {
 
 			socket.addEventListener("message", (message) => {
 				const payload = parseServerWsEvent(message.data);
-
 				if (!payload) {
 					return;
 				}
-
 				options.onEvent(payload);
 			});
 		};

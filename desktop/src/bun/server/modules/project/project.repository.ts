@@ -76,7 +76,9 @@ private readonly database: DrizzleDatabaseClient["orm"];
 	}
 
 	deleteProject(id: string): boolean {
-		const result = this.database.delete(projects).where(eq(projects.id, id)).run() as { changes?: number };
+		const result = this.database.delete(projects).where(eq(projects.id, id)).run() as unknown as {
+			changes?: number;
+		};
 
 		return (result.changes ?? 0) > 0;
 	}

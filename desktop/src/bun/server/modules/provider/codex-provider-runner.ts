@@ -481,14 +481,14 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 
 				resolvedExitCode = exitCode;
 				stderrText = stderrOutput.trim();
-		} finally {
-			if (stdoutReader) {
-				try {
-					stdoutReader.releaseLock();
-				} catch {
-					// no-op on best effort cleanup
+			} finally {
+				if (stdoutReader) {
+					try {
+						(stdoutReader as ReadableStreamDefaultReader<Uint8Array>).releaseLock();
+					} catch {
+						// no-op on best effort cleanup
+					}
 				}
-			}
 
 			if (spawnedProcess.stdout) {
 				try {

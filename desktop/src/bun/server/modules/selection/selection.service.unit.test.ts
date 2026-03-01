@@ -35,7 +35,7 @@ test("Selection service saves workspace selection through repository", async () 
 		selectedProjectId: "project-id",
 	});
 
-	let saved: WorkspaceSelection | null = null;
+	let saved: WorkspaceSelection | undefined;
 
 	const repository = {
 		getWorkspaceSelection: () => createSelection({ selectedChatId: null, selectedProjectId: null }),
@@ -52,6 +52,7 @@ test("Selection service saves workspace selection through repository", async () 
 	const service = new WorkspaceSelectionService(repository);
 	const savedSelection = await service.saveWorkspaceSelection(input);
 
+	expect(saved).toBeDefined();
 	expect(saved).toEqual(input);
 	expect(savedSelection).toEqual(input);
 });

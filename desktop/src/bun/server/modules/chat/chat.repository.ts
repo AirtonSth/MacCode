@@ -137,7 +137,9 @@ export class ChatRepository {
 	}
 
 	deleteChat(id: string): boolean {
-		const result = this.database.delete(chats).where(eq(chats.id, id)).run() as { changes?: number };
+		const result = this.database.delete(chats).where(eq(chats.id, id)).run() as unknown as {
+			changes?: number;
+		};
 		return (result.changes ?? 0) > 0;
 	}
 }

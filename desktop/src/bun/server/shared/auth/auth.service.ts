@@ -2,7 +2,7 @@ import { Elysia } from "elysia";
 
 import { serverConfig } from "../../config";
 
-const setCorsHeaders = (request: Request, headers: Record<string, string>) => {
+const setCorsHeaders = (request: Request, headers: Record<string, string | number>) => {
 	const origin = request.headers.get("origin");
 
 	headers["access-control-allow-origin"] = origin || "*";

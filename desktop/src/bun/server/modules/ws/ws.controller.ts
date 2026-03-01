@@ -48,21 +48,15 @@ export class WsController {
 				return {
 					event: candidate.event as ClientWsEvent["event"],
 					data: candidate.data as ClientWsEvent["data"],
-				};
+				} as ClientWsEvent;
 			}
 
 			const nested = candidate.data as { data?: unknown; event?: unknown } | undefined;
-
-			if (
-				nested &&
-				typeof nested.event === "string" &&
-				nested.data &&
-				typeof nested.data === "object"
-			) {
+			if (nested && typeof nested.event === "string" && nested.data && typeof nested.data === "object") {
 				return {
 					event: nested.event as ClientWsEvent["event"],
 					data: nested.data as ClientWsEvent["data"],
-				};
+				} as ClientWsEvent;
 			}
 
 			if (typeof nested === "string") {
@@ -85,15 +79,16 @@ export class WsController {
 
 	constructor(private readonly service: WsService) {}
 
-	
-
-	
 	private joinChat(chatId: string, socket: BroadcastSocket) {
 		const previous = this.subscriptions.get(chatId);
-
 		if (previous) {
-			previous.add(socket);
+			for (const existingSocket of previous) {
+				if (existingSocket.data.request === socket.data.request) {
+					return;
+				}
+			}
 
+			previous.add(socket);
 			return;
 		}
 
@@ -114,7 +109,6 @@ export class WsController {
 
 	private broadcastToChat(chatId: string, event: ServerWsEvent) {
 		const targets = this.subscriptions.get(chatId);
-
 		if (!targets) {
 			return;
 		}
@@ -128,7 +122,22 @@ export class WsController {
 		}
 	}
 
-	
+	private sendValidationError(socket: BroadcastSocket, chatId: string, message: string) {
+		socket.send({
+			data: {
+				chatId,
+				code: "validation_error",
+				message: `validation error: ${message}`,
+			},
+			event: "error",
+		});
+	}
+
+	private createChatEmitter(chatId: string) {
+		return (event: ServerWsEvent) => {
+			this.broadcastToChat(chatId, event);
+		};
+	}
 
 	build() {
 		return new Elysia({ name: "ws-controller" }).ws("/v1/ws", {
@@ -143,94 +152,67 @@ export class WsController {
 					const payload = WsController.parseEventPayload(message as unknown);
 
 					if (!payload?.data.chatId) {
-						(ws as BroadcastSocket).send(
-							{
-								data: {
-									code: "validation_error",
-									message: "validation error: invalid websocket message format",
-								},
-
-								event: "error",
+						(ws as BroadcastSocket).send({
+							data: {
+								code: "validation_error",
+								message: "validation error: invalid websocket message format",
 							},
-						);
-
+							event: "error",
+						});
 						return;
 					}
 
+					const chatId = payload.data.chatId;
+					const emit = this.createChatEmitter(chatId);
+
 					if (payload.event === "join_chat") {
-						const chat = await this.service.getChatById(payload.data.chatId);
+						const chat = await this.service.getChatById(chatId);
 
 						if (!chat) {
-							(ws as BroadcastSocket).send(
-								{
-									data: {
-										chatId: payload.data.chatId,
-										code: "chat_not_found",
-										message: "chat not found",
-									},
-
-									event: "error",
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "chat_not_found",
+									message: "chat not found",
 								},
-							);
-
+								event: "error",
+							});
 							return;
 						}
 
-						this.joinChat(payload.data.chatId, ws as BroadcastSocket);
-
+						this.joinChat(chatId, ws as BroadcastSocket);
 						return;
 					}
 
 					if (payload.event === "user_message") {
 						const text = typeof payload.data.text === "string" ? payload.data.text.trim() : "";
-
 						if (!text) {
-							(ws as BroadcastSocket).send(
-								{
-									data: {
-										chatId: payload.data.chatId,
-										code: "validation_error",
-										message: "validation error: message text is required",
-									},
-
-									event: "error",
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: message text is required",
 								},
-							);
-
+								event: "error",
+							});
 							return;
 						}
 
-						this.joinChat(payload.data.chatId, ws as BroadcastSocket);
+						this.joinChat(chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
-							chatId: payload.data.chatId,
-
-							emit: (event) => {
-								this.broadcastToChat(payload.data.chatId, event);
-							},
-
+							chatId,
+							emit,
 							text,
 						});
-
 						return;
 					}
 
-					(ws as BroadcastSocket).send(
-					{
-						data: {
-							chatId: payload.data.chatId,
-							code: "validation_error",
-							message: "validation error: unsupported event",
-						},
-
-							event: "error",
-						},
-					);
+					this.sendValidationError(ws as BroadcastSocket, chatId, "unsupported event");
 				})();
 			},
 
 			open: (ws) => {
 				const token = resolveWsToken(ws.data.request);
-
 				if (!token || token !== serverConfig.token) {
 					ws.close(4401, "unauthorized");
 				}

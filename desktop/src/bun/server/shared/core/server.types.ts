@@ -8,6 +8,7 @@ export interface ChatDTO {
 	title: string;
 	updatedAt: string;
 }
+
 export type ChatProvider = "fake" | "codex";
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
@@ -85,6 +86,32 @@ export interface ProjectDTO {
 	path: string;
 	updatedAt: string;
 }
+
+export type TerminalCommandStatus = "running" | "completed" | "failed" | "timeout";
+
+export interface TerminalCommandDTO {
+	chatId: string;
+	command: string;
+	cwd: string;
+	durationMs: number | null;
+	exitCode: number | null;
+	finishedAt: string | null;
+	id: string;
+	shell: string;
+	startedAt: string;
+	status: TerminalCommandStatus;
+}
+
+export interface TerminalEntryDTO {
+	chatId: string;
+	commandId: string;
+	createdAt: string;
+	data: string;
+	id: number;
+	stream: "stdout" | "stderr";
+}
+
+export type TerminalEntryStream = TerminalEntryDTO["stream"];
 
 export type ServerWsEvent =
 	| {

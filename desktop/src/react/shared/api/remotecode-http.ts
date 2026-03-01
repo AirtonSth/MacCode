@@ -36,6 +36,38 @@ export interface WorkspaceSelection {
 	selectedChatId: string | null;
 }
 
+export interface TerminalCommandDTO {
+	id: string;
+	chatId: string;
+	command: string;
+	cwd: string;
+	shell: string;
+	status: "running" | "completed" | "failed" | "timeout";
+	exitCode: number | null;
+	durationMs: number | null;
+	startedAt: string;
+	finishedAt: string | null;
+}
+
+export interface TerminalEntryDTO {
+	id: number;
+	commandId: string;
+	chatId: string;
+	stream: "stdout" | "stderr";
+	data: string;
+	createdAt: string;
+}
+
+export interface TerminalHistoryDTO {
+	commands: TerminalCommandDTO[];
+	entries: TerminalEntryDTO[];
+}
+
+export interface TerminalExecDTO {
+	command: TerminalCommandDTO;
+	entries: TerminalEntryDTO[];
+}
+
 export class RemoteCodeApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -82,6 +114,16 @@ interface RestDeleteResponse {
 	deleted: boolean;
 }
 
+interface RestTerminalHistoryResponse {
+	commands: TerminalCommandDTO[];
+	entries: TerminalEntryDTO[];
+}
+
+interface RestTerminalExecResponse {
+	command: TerminalCommandDTO;
+	entries: TerminalEntryDTO[];
+}
+
 interface RequestInput {
 	method: "GET" | "POST" | "PATCH" | "DELETE";
 	path: string;
@@ -97,7 +139,6 @@ const toErrorText = (body: unknown, fallback: string): string => {
 	}
 
 	const errorValue = body.error;
-
 	if (typeof errorValue === "string" && errorValue.trim().length > 0) {
 		return errorValue;
 	}
@@ -252,6 +293,38 @@ export const RemoteCodeApi = {
 				return await request<RestDeleteResponse>({
 					method: "DELETE",
 					path: `/chats/${id}`,
+				});
+			},
+
+			getTerminalHistory: async (
+				chatId: string,
+				options?: { cursor?: number; limit?: number },
+			): Promise<TerminalHistoryDTO> => {
+				const query = new URLSearchParams();
+				if (typeof options?.cursor === "number" && Number.isFinite(options.cursor) && options.cursor > 0) {
+					query.set("cursor", String(Math.floor(options.cursor)));
+				}
+				if (typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+					query.set("limit", String(Math.floor(options.limit)));
+				}
+
+				const suffix = query.toString();
+				const path = suffix ? `/chats/${chatId}/terminal?${suffix}` : `/chats/${chatId}/terminal`;
+
+				return await request<RestTerminalHistoryResponse>({
+					method: "GET",
+					path,
+				});
+			},
+
+			execTerminalCommand: async (
+				chatId: string,
+				input: { command: string; timeoutMs?: number },
+			): Promise<TerminalExecDTO> => {
+				return await request<RestTerminalExecResponse>({
+					body: input,
+					method: "POST",
+					path: `/chats/${chatId}/terminal/exec`,
 				});
 			},
 		};

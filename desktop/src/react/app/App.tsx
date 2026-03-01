@@ -6,6 +6,7 @@ import {
 	FolderOpen,
 	MessageSquareText,
 	RefreshCcw,
+	SquareTerminal,
 	Sparkles,
 	Star,
 	Trash2,
@@ -20,6 +21,8 @@ import { Separator } from "../components/ui/separator";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
 import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
+import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
+import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
 import { useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
@@ -176,6 +179,7 @@ const App = (): JSX.Element => {
 	const isSidebarResizingRef = useRef<boolean>(false);
 	const sidebarResizeStartXRef = useRef<number>(0);
 	const sidebarResizeStartWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
+	const terminalOpenByChatRef = useRef<Record<string, boolean>>({});
 
 	const baseUrl = useMemo(() => {
 		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:3001").trim();
@@ -237,7 +241,7 @@ const App = (): JSX.Element => {
 		persistSidebarWidth(sidebarWidthRef.current);
 	}, [persistSidebarWidth]);
 
-	const handleSidebarResizePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+	const handleSidebarResizePointerMove = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
 		if (!isSidebarResizingRef.current) {
 			return;
 		}
@@ -248,7 +252,7 @@ const App = (): JSX.Element => {
 		setSidebarWidth(nextWidth);
 	}, []);
 
-	const startSidebarResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+	const startSidebarResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
 		event.preventDefault();
 		if (event.button !== 0 || !event.isPrimary || typeof window === "undefined") {
 			return;
@@ -263,7 +267,7 @@ const App = (): JSX.Element => {
 	}, []);
 
 	const handleSidebarResizePointerUp = useCallback(
-		(event: ReactPointerEvent<HTMLDivElement>) => {
+		(event: ReactPointerEvent<HTMLButtonElement>) => {
 			if (event.currentTarget.hasPointerCapture(event.pointerId)) {
 				event.currentTarget.releasePointerCapture(event.pointerId);
 			}
@@ -298,6 +302,33 @@ const App = (): JSX.Element => {
 	const formatApiErrorMessage = useCallback((error: unknown, fallback: string) => {
 		return error instanceof Error ? error.message : fallback;
 	}, []);
+
+	const {
+		state: terminalState,
+		setOpen: setTerminalOpen,
+		syncHistory: syncTerminalHistory,
+		runCommand: runTerminalCommand,
+	} = useThreadTerminalSession({
+		execCommand: async (chatId, input) => {
+			return await api.execTerminalCommand(chatId, input);
+		},
+		historyLimit: 1_000,
+		getHistory: async (chatId, options) => {
+			return await api.getTerminalHistory(chatId, options);
+		},
+		onError: (message) => {
+			addError(message, "rest", "terminal_error");
+		},
+	});
+
+	useEffect(() => {
+		const openByChat: Record<string, boolean> = {};
+		for (const [chatId, chatState] of Object.entries(terminalState.chats)) {
+			openByChat[chatId] = chatState.isOpen;
+		}
+
+		terminalOpenByChatRef.current = openByChat;
+	}, [terminalState.chats]);
 
 	const persistWorkspaceSelection = useCallback(
 		async (selectedProjectId: string | null, selectedChatId: string | null) => {
@@ -531,8 +562,11 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		if (state.connectionState === "connected" && state.selectedChatId) {
 			wsRef.current?.sendJoinChat(state.selectedChatId);
+			if (terminalOpenByChatRef.current[state.selectedChatId]) {
+				void syncTerminalHistory(state.selectedChatId);
+			}
 		}
-	}, [state.connectionState, state.selectedChatId]);
+	}, [state.connectionState, state.selectedChatId, syncTerminalHistory]);
 
 	const handleCreateProject = useCallback(
 		async (input: { name?: string; path: string }) => {
@@ -801,6 +835,29 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, handleCreateProject]);
 
+	const handleToggleTerminal = useCallback(() => {
+		if (!state.selectedChatId) {
+			return;
+		}
+
+		const nextOpen = !Boolean(terminalOpenByChatRef.current[state.selectedChatId]);
+		setTerminalOpen(state.selectedChatId, nextOpen);
+		if (nextOpen) {
+			void syncTerminalHistory(state.selectedChatId);
+		}
+	}, [setTerminalOpen, state.selectedChatId, syncTerminalHistory]);
+
+	const handleTerminalRun = useCallback(
+		async (command: string) => {
+			if (!state.selectedChatId) {
+				return;
+			}
+
+			await runTerminalCommand(state.selectedChatId, command);
+		},
+		[runTerminalCommand, state.selectedChatId],
+	);
+
 	const connectionMessage = useMemo(() => {
 		switch (state.connectionState) {
 			case "connected":
@@ -817,6 +874,10 @@ const App = (): JSX.Element => {
 	}, [state.connectionState]);
 	const hasProjects = state.projects.length > 0;
 	const isThreadFocusMode = Boolean(state.selectedChatId);
+	const selectedThreadTerminal = state.selectedChatId
+		? terminalState.chats[state.selectedChatId] ?? null
+		: null;
+	const isTerminalOpen = Boolean(selectedThreadTerminal?.isOpen);
 
 	return (
 				<TooltipProvider delayDuration={120}>
@@ -1040,20 +1101,43 @@ const App = (): JSX.Element => {
 
 					<main className={cn("relative z-10 flex min-h-0 flex-col", isThreadFocusMode ? "bg-transparent" : "bg-slate-950/35")}>
 						{hasProjects ? (
-							isThreadFocusMode ? (
-								<section className="flex min-h-0 flex-1 flex-col">
-									<div className="relative min-h-0 flex-1">
-										<ConversationPanel
-											chat={selectedChat}
-											focusMode
-											hasRestError={state.errors.some((error) => error.source === "rest")}
-											loading={state.messagesLoading}
-											messages={state.messages}
-											streamingText={streamingText}
-										/>
-									</div>
+								isThreadFocusMode ? (
+									<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+									<header className="flex h-14 items-center justify-between gap-3 border-b border-white/10 px-4">
+										<div className="min-w-0">
+											<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Thread</p>
+											<h2 className="truncate text-sm font-semibold text-slate-100">
+												{selectedChat?.title ?? "No thread selected"}
+											</h2>
+										</div>
+										<Button
+											className={cn(
+												"gap-2",
+												isTerminalOpen
+													? "border-sky-300/30 bg-sky-400/10 text-sky-100 hover:bg-sky-400/20"
+													: "border-white/10 text-slate-200 hover:bg-white/[0.06]",
+											)}
+											onClick={handleToggleTerminal}
+											type="button"
+											variant="outline"
+										>
+											<SquareTerminal className="h-4 w-4" />
+											{isTerminalOpen ? "Hide terminal" : "Show terminal"}
+										</Button>
+									</header>
 
-									<div className="border-t border-white/10 bg-slate-950/35 px-3 pb-4 pt-3 sm:px-6">
+										<div className="relative min-h-0 flex-1 overflow-hidden">
+											<ConversationPanel
+												chat={selectedChat}
+												focusMode
+												hasRestError={state.errors.some((error) => error.source === "rest")}
+												loading={state.messagesLoading}
+												messages={state.messages}
+												streamingText={streamingText}
+											/>
+										</div>
+
+									<div className="shrink-0 border-t border-white/10 bg-slate-950/35 px-3 pb-4 pt-3 sm:px-6">
 										<div className="mx-auto w-full max-w-3xl">
 											<MessageComposer
 												chatStatus={selectedChat?.status ?? null}
@@ -1064,6 +1148,25 @@ const App = (): JSX.Element => {
 											/>
 										</div>
 									</div>
+
+									{isTerminalOpen && state.selectedChatId ? (
+										<div className="shrink-0 border-t border-white/10">
+											<div className="h-[42vh] min-h-[220px]">
+												<ThreadTerminalPanel
+													chatId={state.selectedChatId}
+													className="h-full rounded-none border-0"
+													error={selectedThreadTerminal?.error ?? null}
+													isExecuting={Boolean(selectedThreadTerminal?.isExecuting)}
+													isLoading={Boolean(selectedThreadTerminal?.isLoading)}
+													items={selectedThreadTerminal?.items ?? []}
+													key={state.selectedChatId}
+													onRun={(command) => {
+														void handleTerminalRun(command);
+													}}
+												/>
+											</div>
+										</div>
+									) : null}
 								</section>
 							) : (
 								<>

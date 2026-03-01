@@ -43,11 +43,42 @@ export const workspaceSelection = sqliteTable("workspace_selection", {
 	updatedAt: text("updatedAt").notNull(),
 });
 
+export const terminalCommands = sqliteTable("terminal_commands", {
+	id: text("id").primaryKey(),
+	chatId: text("chatId")
+		.notNull()
+		.references(() => chats.id, { onDelete: "cascade" }),
+	command: text("command").notNull(),
+	shell: text("shell").notNull(),
+	cwd: text("cwd").notNull(),
+	status: text("status").notNull(),
+	exitCode: integer("exitCode"),
+	durationMs: integer("durationMs"),
+	startedAt: text("startedAt").notNull(),
+	finishedAt: text("finishedAt"),
+});
+
+export const terminalEntries = sqliteTable("terminal_entries", {
+	id: integer("id").primaryKey({ autoIncrement: true }),
+	commandId: text("commandId")
+		.notNull()
+		.references(() => terminalCommands.id, { onDelete: "cascade" }),
+	chatId: text("chatId")
+		.notNull()
+		.references(() => chats.id, { onDelete: "cascade" }),
+	stream: text("stream").notNull(),
+	data: text("data").notNull(),
+	createdAt: text("createdAt").notNull(),
+});
+
 export type ChatRow = typeof chats.$inferSelect;
 
 export type MessageRow = typeof messages.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
 export type WorkspaceSelectionRow = typeof workspaceSelection.$inferSelect;
+export type TerminalCommandRow = typeof terminalCommands.$inferSelect;
+export type TerminalEntryRow = typeof terminalEntries.$inferSelect;
+
 export class DatabaseSchema {
 	static readonly projects = projects;
 
@@ -56,4 +87,8 @@ export class DatabaseSchema {
 	static readonly messages = messages;
 
 	static readonly workspaceSelection = workspaceSelection;
+
+	static readonly terminalCommands = terminalCommands;
+
+	static readonly terminalEntries = terminalEntries;
 }

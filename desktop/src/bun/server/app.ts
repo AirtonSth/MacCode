@@ -13,6 +13,9 @@ import { ProjectService } from "./modules/project/project.service";
 import { SelectionController } from "./modules/selection/selection.controller";
 import { createSelectionRepository } from "./modules/selection/selection.repository";
 import { createSelectionService } from "./modules/selection/selection.service";
+import { TerminalController } from "./modules/terminal/terminal.controller";
+import { createTerminalRepository } from "./modules/terminal/terminal.repository";
+import { createTerminalService } from "./modules/terminal/terminal.service";
 import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
@@ -28,11 +31,17 @@ export const ServerBootstrap = {
 		const chatRepository = new ChatRepository(databaseClient.orm);
 		const messageRepository = new MessageRepository(databaseClient.orm);
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
+		const terminalRepository = createTerminalRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
 		const messageService = new MessageService(chatRepository, messageRepository);
 		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
+		const terminalService = createTerminalService({
+			chat: chatRepository,
+			project: projectRepository,
+			terminal: terminalRepository,
+		});
 		const wsService = new WsService(chatRepository, messageRepository, projectRepository);
 
 		const app = new Elysia()
@@ -41,7 +50,8 @@ export const ServerBootstrap = {
 					.use(ProjectController.build(projectService))
 					.use(ChatController.build(chatService))
 					.use(MessageController.build(messageService))
-					.use(SelectionController.build(workspaceSelectionService)),
+					.use(SelectionController.build(workspaceSelectionService))
+					.use(TerminalController.build(terminalService)),
 			)
 			.use(WsController.build(wsService));
 
@@ -49,7 +59,9 @@ export const ServerBootstrap = {
 			app,
 
 			db: {
-				close: databaseClient.close,
+				close: () => {
+					databaseClient.close();
+				},
 			},
 		};
 	},

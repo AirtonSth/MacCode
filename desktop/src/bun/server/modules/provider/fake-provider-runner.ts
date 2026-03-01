@@ -254,7 +254,9 @@ export const FakeProviderRunner = {
 			};
 		}
 
-		const decoder = new TextDecoder();
+			const decoder = new TextDecoder();
+			const stdout = proc.stdout instanceof ReadableStream ? proc.stdout : null;
+			const stderr = proc.stderr instanceof ReadableStream ? proc.stderr : null;
 
 		let assistantText = "";
 		let diffAdded = 0;
@@ -265,10 +267,8 @@ export const FakeProviderRunner = {
 		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
 		try {
-			if (proc.stdout) {
-				const out = proc.stdout as ReadableStream<Uint8Array>;
-
-				reader = out.getReader();
+				if (stdout) {
+					reader = stdout.getReader();
 
 				let pending = "";
 
@@ -315,14 +315,14 @@ export const FakeProviderRunner = {
 				}
 			}
 
-			if (proc.stderr) {
-				const stderr = await new Response(proc.stderr).text();
+				if (stderr) {
+					const stderrText = await new Response(stderr).text();
 
-				if (stderr && !hasFailure) {
-					hasFailure = true;
-					failureMessage = stderr.trim();
+					if (stderrText && !hasFailure) {
+						hasFailure = true;
+						failureMessage = stderrText.trim();
+					}
 				}
-			}
 
 			await proc.exited;
 		} finally {
@@ -334,21 +334,21 @@ export const FakeProviderRunner = {
 				}
 			}
 
-			if (proc.stdout) {
-				try {
-					proc.stdout.cancel();
-				} catch {
-					// no-op on best-effort cleanup
+				if (stdout) {
+					try {
+						await stdout.cancel();
+					} catch {
+						// no-op on best-effort cleanup
+					}
 				}
-			}
 
-			if (proc.stderr) {
-				try {
-					proc.stderr.cancel();
-				} catch {
-					// no-op on best-effort cleanup
+				if (stderr) {
+					try {
+						await stderr.cancel();
+					} catch {
+						// no-op on best-effort cleanup
+					}
 				}
-			}
 		}
 
 		if (proc.exitCode !== 0 || hasFailure) {

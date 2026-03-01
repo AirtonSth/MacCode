@@ -9,9 +9,9 @@ import {
 import type {
 	WorkspaceAction,
 	WorkspaceState,
-	type ChatDTO,
-	type MessageDTO,
-	type ProjectDTO,
+	ChatDTO,
+	MessageDTO,
+	ProjectDTO,
 } from "./useWorkspaceStore";
 import { sendWorkspaceMessage } from "./send-message";
 
@@ -124,7 +124,7 @@ const setupMockFetch = (routes: RuntimeRoutes) => {
 		return json({ error: "route not mocked" }, 501);
 	};
 
-	globalThis.fetch = mockFetch;
+	globalThis.fetch = mockFetch as typeof fetch;
 
 	return {
 		requests,
@@ -765,7 +765,7 @@ const createWorkspaceFlowHarness = () => {
 
 describe("workspace frontend flow coverage", () => {
 	test("sendMessage auto-creates chat when no chat is selected", async () => {
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [
 				{
 					createdAt: "2026-01-01T12:00:00.000Z",
@@ -838,7 +838,7 @@ describe("workspace frontend flow coverage", () => {
 	test("project creation -> chat creation -> send -> assistant_delta/assistant_done", async () => {
 		let messageLoads = 0;
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -919,7 +919,7 @@ describe("workspace frontend flow coverage", () => {
 
 			expect(chat?.id).toBe("chat-1");
 			expect(state.selectedProjectId).toBe(project.id);
-			expect(state.selectedChatId).toBe(chat?.id);
+			expect(state.selectedChatId).toBe(chat?.id ?? null);
 			expect(state.messages.at(-1)?.role).toBe("assistant");
 			expect(state.streamingByChat["chat-1"]).toBe("");
 			expect(state.isSendingMessage).toBe(false);
@@ -937,7 +937,7 @@ describe("workspace frontend flow coverage", () => {
 	});
 
 	test("error path handles provider_failed websocket errors", async () => {
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -1000,7 +1000,7 @@ describe("workspace frontend flow coverage", () => {
 	});
 
 	test("chat_updated event applies running status", async () => {
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -1053,16 +1053,16 @@ describe("workspace frontend flow coverage", () => {
 	});
 
 	test("reconnect re-joins selected chat", async () => {
-		const routeFixture = {
-			listProjects: () => [],
-			createProject: ({ name, path }) => ({
-				createdAt: "2026-01-01T12:00:00.000Z",
-				id: "project-1",
-				isFavorite: false,
-				name,
-				path,
-				updatedAt: "2026-01-01T12:00:00.000Z",
-			}),
+			const routeFixture: RuntimeRoutes = {
+				listProjects: () => [],
+				createProject: ({ name, path }) => ({
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "project-1",
+					isFavorite: false,
+					name: name ?? "Project",
+					path,
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				}),
 			createChat: (projectId, { title }) => ({
 				diffAdded: 0,
 				diffRemoved: 0,
@@ -1082,11 +1082,15 @@ describe("workspace frontend flow coverage", () => {
 		const originalSetTimeout = globalThis.setTimeout;
 		const originalClearTimeout = globalThis.clearTimeout;
 
-		try {
-			globalThis.setTimeout = ((callback) => {
-				pendingReconnect.push(() => callback());
-				return 1 as ReturnType<typeof setTimeout>;
-			}) as typeof setTimeout;
+			try {
+				globalThis.setTimeout = (((callback: TimerHandler) => {
+					pendingReconnect.push(() => {
+						if (typeof callback === "function") {
+							callback();
+						}
+					});
+					return 1 as unknown as ReturnType<typeof setTimeout>;
+				}) as unknown) as typeof setTimeout;
 
 			globalThis.clearTimeout = (() => undefined) as typeof clearTimeout;
 
@@ -1119,7 +1123,7 @@ describe("workspace frontend flow coverage", () => {
 	});
 
 	test("loadProjectsFromSelection restores selected project and chat from persisted selection", async () => {
-		const chatsByProject = {
+		const chatsByProject: Record<string, ChatDTO[]> = {
 			"project-1": [
 				{
 					diffAdded: 0,
@@ -1156,7 +1160,7 @@ describe("workspace frontend flow coverage", () => {
 			],
 		};
 
-		const routeFixture = {
+			const routeFixture: RuntimeRoutes = {
 			listProjects: () => [
 				{
 					createdAt: "2026-01-01T12:00:00.000Z",
@@ -1175,14 +1179,14 @@ describe("workspace frontend flow coverage", () => {
 					updatedAt: "2026-01-01T12:00:00.000Z",
 				},
 			],
-			createProject: ({ name, path }) => ({
-				createdAt: "2026-01-01T12:00:00.000Z",
-				id: "unused",
-				isFavorite: false,
-				name,
-				path,
-				updatedAt: "2026-01-01T12:00:00.000Z",
-			}),
+				createProject: ({ name, path }) => ({
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "unused",
+					isFavorite: false,
+					name: name ?? "unused",
+					path,
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				}),
 			createChat: () => ({
 				diffAdded: 0,
 				diffRemoved: 0,
@@ -1219,7 +1223,7 @@ describe("workspace frontend flow coverage", () => {
 	});
 
 	test("loadProjectsFromSelection falls back to first project when saved project is missing", async () => {
-		const chatsByProject = {
+		const chatsByProject: Record<string, ChatDTO[]> = {
 			"project-1": [
 				{
 					diffAdded: 0,
@@ -1246,7 +1250,7 @@ describe("workspace frontend flow coverage", () => {
 			],
 		};
 
-		const routeFixture = {
+			const routeFixture: RuntimeRoutes = {
 			listProjects: () => [
 				{
 					createdAt: "2026-01-01T12:00:00.000Z",
@@ -1265,14 +1269,14 @@ describe("workspace frontend flow coverage", () => {
 					updatedAt: "2026-01-01T12:00:00.000Z",
 				},
 			],
-			createProject: ({ name, path }) => ({
-				createdAt: "2026-01-01T12:00:00.000Z",
-				id: "unused",
-				isFavorite: false,
-				name,
-				path,
-				updatedAt: "2026-01-01T12:00:00.000Z",
-			}),
+				createProject: ({ name, path }) => ({
+					createdAt: "2026-01-01T12:00:00.000Z",
+					id: "unused",
+					isFavorite: false,
+					name: name ?? "unused",
+					path,
+					updatedAt: "2026-01-01T12:00:00.000Z",
+				}),
 			createChat: () => ({
 				diffAdded: 0,
 				diffRemoved: 0,
@@ -1314,7 +1318,7 @@ describe("workspace frontend flow coverage", () => {
 			selectedChatId: null,
 		};
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -1369,7 +1373,7 @@ describe("workspace frontend flow coverage", () => {
 			selectedChatId: null,
 		};
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -1427,7 +1431,7 @@ describe("workspace frontend flow coverage", () => {
 			selectedChatId: null,
 		};
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -1485,7 +1489,7 @@ describe("workspace frontend flow coverage", () => {
 	test("selectChat persists workspace selection", async () => {
 		const persistedSelections: Array<{ selectedProjectId: string | null; selectedChatId: string | null }> = [];
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [],
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",
@@ -1570,7 +1574,7 @@ describe("workspace frontend flow coverage", () => {
 			],
 		};
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => [
 				{
 					createdAt: "2026-01-01T12:00:00.000Z",
@@ -1589,12 +1593,12 @@ describe("workspace frontend flow coverage", () => {
 				path,
 				updatedAt: "2026-01-01T12:00:00.000Z",
 			}),
-			createChat: (projectId, { title }) => {
-				const id = title?.includes("Second") ? "chat-2" : "chat-1";
-				const chat = {
-					diffAdded: 0,
-					diffRemoved: 0,
-					id,
+				createChat: (projectId, { title }) => {
+					const id = title?.includes("Second") ? "chat-2" : "chat-1";
+					const chat: ChatDTO = {
+						diffAdded: 0,
+						diffRemoved: 0,
+						id,
 					projectId,
 					provider: "fake",
 					status: "pending",
@@ -1679,7 +1683,7 @@ describe("workspace frontend flow coverage", () => {
 			selectedChatId: null,
 		};
 
-		const routeFixture = {
+		const routeFixture: RuntimeRoutes = {
 			listProjects: () => projects,
 			createProject: ({ name, path }) => ({
 				createdAt: "2026-01-01T12:00:00.000Z",

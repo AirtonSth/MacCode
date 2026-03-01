@@ -6,25 +6,14 @@ import { expect, test } from "bun:test";
 
 import { initializeDatabaseSchema } from "../../shared/db/db.bootstrap";
 import { createDatabaseClient } from "../../shared/db/db.client";
+import type { ServerWsEvent } from "../../types";
 import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
 import { createChatRepository } from "../chat/chat.repository";
 import { createMessageRepository } from "../message/message.repository";
 import { createProjectRepository } from "../project/project.repository";
 import { WsService } from "./ws.service";
 
-type ServerEvent =
-	| {
-			data: {
-				chatId?: string;
-				code?: string;
-				delta?: string;
-				diffAdded?: number;
-				diffRemoved?: number;
-				status?: "pending" | "running" | "completed" | "failed";
-				updatedAt?: string;
-			};
-			event: "assistant_delta" | "assistant_done" | "chat_updated" | "error";
-	  };
+type ServerEvent = ServerWsEvent;
 
 test("WsService runs streaming flow with codex runner and persists assistant message", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-"));

@@ -14,6 +14,32 @@ const chatsCreateSql = `
 	)
 `;
 
+const terminalCommandsCreateSql = `
+	CREATE TABLE IF NOT EXISTS terminal_commands (
+		id TEXT PRIMARY KEY,
+		chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+		command TEXT NOT NULL,
+		shell TEXT NOT NULL,
+		cwd TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'timeout')),
+		exitCode INTEGER,
+		durationMs INTEGER,
+		startedAt TEXT NOT NULL,
+		finishedAt TEXT
+	)
+`;
+
+const terminalEntriesCreateSql = `
+	CREATE TABLE IF NOT EXISTS terminal_entries (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		commandId TEXT NOT NULL REFERENCES terminal_commands(id) ON DELETE CASCADE,
+		chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+		stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
+		data TEXT NOT NULL,
+		createdAt TEXT NOT NULL
+	)
+`;
+
 export class DatabaseBootstrap {
 	static initialize(database: Database): void {
 		this.enableForeignKeys(database);
@@ -22,6 +48,9 @@ export class DatabaseBootstrap {
 		this.createOrMigrateChatsTable(database);
 		this.createMessagesTable(database);
 		this.createWorkspaceSelectionTable(database);
+		this.createTerminalCommandsTable(database);
+		this.createOrMigrateTerminalEntriesTable(database);
+		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
 	}
 
@@ -176,12 +205,74 @@ export class DatabaseBootstrap {
 		`);
 	}
 
+	private static createTerminalCommandsTable(database: Database): void {
+		database.exec(terminalCommandsCreateSql);
+	}
+
+	private static createOrMigrateTerminalEntriesTable(database: Database): void {
+		if (!this.hasTable(database, "terminal_entries")) {
+			database.exec(terminalEntriesCreateSql);
+			return;
+		}
+
+		const hasCommandId = this.hasColumn(database, "terminal_entries", "commandId");
+		const hasStream = this.hasColumn(database, "terminal_entries", "stream");
+
+		if (hasCommandId && hasStream) {
+			return;
+		}
+
+		database.exec("PRAGMA foreign_keys = OFF;");
+		database.exec("BEGIN;");
+
+		try {
+			database.exec(`
+				CREATE TABLE terminal_entries_next (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					commandId TEXT NOT NULL REFERENCES terminal_commands(id) ON DELETE CASCADE,
+					chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+					stream TEXT NOT NULL CHECK(stream IN ('stdout', 'stderr')),
+					data TEXT NOT NULL,
+					createdAt TEXT NOT NULL
+				)
+			`);
+
+			database.exec("DROP TABLE terminal_entries;");
+			database.exec("ALTER TABLE terminal_entries_next RENAME TO terminal_entries;");
+			database.exec("COMMIT;");
+		} catch (error) {
+			database.exec("ROLLBACK;");
+			throw error;
+		} finally {
+			database.exec("PRAGMA foreign_keys = ON;");
+		}
+	}
+
+	private static dropLegacyTerminalSessionsTable(database: Database): void {
+		if (!this.hasTable(database, "terminal_sessions")) {
+			return;
+		}
+
+		database.exec("PRAGMA foreign_keys = OFF;");
+		database.exec("DROP TABLE terminal_sessions;");
+		database.exec("PRAGMA foreign_keys = ON;");
+	}
+
 	private static createIndexes(database: Database): void {
 		database.exec("CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_chats_project ON chats(projectId, updatedAt DESC)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chatId, createdAt ASC)");
 		database.exec(
 			"CREATE INDEX IF NOT EXISTS idx_workspace_selection_project ON workspace_selection(selectedProjectId)",
+		);
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_terminal_commands_chat_id_desc ON terminal_commands(chatId, id DESC)",
+		);
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_terminal_entries_chat_id ON terminal_entries(chatId, id ASC)",
+		);
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_terminal_entries_command_id ON terminal_entries(commandId, id ASC)",
 		);
 	}
 }

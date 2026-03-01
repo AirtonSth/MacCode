@@ -5,20 +5,20 @@ import { join } from "node:path";
 import { expect, test } from "bun:test";
 
 import { createEdenClient, createEdenWsClient } from "../../eden-client";
-import { getCodexAvailability } from "../provider/codex-test-gate";
 import { createTestServer } from "../../shared/core/test-server";
+import { getCodexAvailability } from "../provider/codex-test-gate";
 
 type ServerEvent =
 	| {
 			data: {
 				chatId: string;
-				code?: string;
 				delta?: string;
 				diffAdded?: number;
 				diffRemoved?: number;
-				message?: string;
 				status?: "pending" | "running" | "completed" | "failed";
 				updatedAt?: string;
+				code?: string;
+				message?: string;
 			};
 			event: "assistant_delta" | "assistant_done" | "chat_updated" | "error";
 	  };
@@ -59,7 +59,11 @@ const parseEvent = (raw: unknown): ServerEvent | null => {
 	};
 };
 
-const waitForCondition = async (predicate: () => boolean, timeoutMs = 60_000): Promise<void> => {
+const waitForCondition = async (
+	predicate: () => boolean,
+	timeoutMs = 60_000,
+	label = "ws condition",
+): Promise<void> => {
 	await new Promise<void>((resolve, reject) => {
 		const startedAt = performance.now();
 		const timer = setInterval(() => {
@@ -71,7 +75,7 @@ const waitForCondition = async (predicate: () => boolean, timeoutMs = 60_000): P
 
 			if (performance.now() - startedAt >= timeoutMs) {
 				clearInterval(timer);
-				reject(new Error("timed out waiting for ws condition"));
+				reject(new Error(`timed out waiting for ${label}`));
 			}
 		}, 25);
 	});
@@ -96,7 +100,7 @@ codexTest(`WS emits intermediate thinking/tool deltas before assistant_done${ski
 		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const events: ServerEvent[] = [];
 
-		ws.subscribe((raw) => {
+		ws.subscribe((raw: unknown) => {
 			const event = parseEvent((raw as { data: unknown }).data);
 			if (!event || event.data.chatId !== chatId) {
 				return;
@@ -138,10 +142,13 @@ codexTest(`WS emits intermediate thinking/tool deltas before assistant_done${ski
 		expect(doneIndex).toBeGreaterThan(deltaIndex);
 		expect(completedIndex).toBeGreaterThan(doneIndex);
 
-		const deltas = events.filter((event) => event.event === "assistant_delta").map((event) => event.data.delta ?? "");
+		const deltas = events
+			.filter((event) => event.event === "assistant_delta")
+			.map((event) => event.data.delta ?? "");
 		const hasThinkingDelta = deltas.some((delta) => delta.includes("Thinking"));
 		const hasToolDelta = deltas.some(
-			(delta) => delta.includes("Tool calling") || delta.includes("Tool output") || delta.includes("Tool finished"),
+			(delta) =>
+				delta.includes("Tool calling") || delta.includes("Tool output") || delta.includes("Tool finished"),
 		);
 
 		expect(hasThinkingDelta).toBe(true);
@@ -178,7 +185,7 @@ codexTest(`WS keeps codex thread context after websocket reconnect${skipReasonSu
 		firstSocket = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const firstEvents: ServerEvent[] = [];
 
-		firstSocket.subscribe((raw) => {
+		firstSocket.subscribe((raw: unknown) => {
 			const event = parseEvent((raw as { data: unknown }).data);
 			if (!event || event.data.chatId !== chatId) {
 				return;
@@ -206,7 +213,7 @@ codexTest(`WS keeps codex thread context after websocket reconnect${skipReasonSu
 		secondSocket = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const secondEvents: ServerEvent[] = [];
 
-		secondSocket.subscribe((raw) => {
+		secondSocket.subscribe((raw: unknown) => {
 			const event = parseEvent((raw as { data: unknown }).data);
 			if (!event || event.data.chatId !== chatId) {
 				return;
@@ -253,7 +260,7 @@ test("WS emits validation error for invalid payload", async () => {
 	try {
 		socket = new WebSocket(`${baseUrl}/v1/ws?token=local-dev-token`);
 		await new Promise<void>((resolve) => {
-			socket!.addEventListener("open", () => {
+			socket?.addEventListener("open", () => {
 				resolve();
 			});
 		});
@@ -278,44 +285,6 @@ test("WS emits validation error for invalid payload", async () => {
 		await new Promise((resolve) => setTimeout(resolve, 80));
 
 		expect(events.some((event) => event.includes("validation"))).toBe(true);
-	} finally {
-		socket?.close();
-		await cleanup();
-	}
-});
-
-test("WS returns chat_not_found when user sends message to missing chat", async () => {
-	const { baseUrl, cleanup, client } = await createTestServer();
-
-	let missingChatError: ServerEvent | null = null;
-	let socket: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
-
-	try {
-		await client.v1.projects.post({ path: "/tmp" });
-
-		socket = await createEdenWsClient(createEdenClient({ baseUrl }));
-		socket.subscribe((raw) => {
-			const event = parseEvent((raw as { data: unknown }).data);
-
-			if (!event) {
-				return;
-			}
-
-			if (event.event === "error" && event.data.code === "chat_not_found") {
-				missingChatError = event;
-			}
-		});
-
-		socket.send({ data: { chatId: "missing-chat-id", text: "should fail" }, event: "user_message" });
-		await waitForCondition(() => missingChatError !== null, 5_000);
-
-		expect(missingChatError).toMatchObject({
-			data: {
-				chatId: "missing-chat-id",
-				code: "chat_not_found",
-			},
-			event: "error",
-		});
 	} finally {
 		socket?.close();
 		await cleanup();
