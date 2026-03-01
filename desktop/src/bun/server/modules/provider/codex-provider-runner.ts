@@ -3,6 +3,11 @@ import {
 	DEFAULT_CODEX_PERMISSION_MODE,
 	type CodexPermissionMode,
 } from "../../../../shared/codex-permission-mode";
+import type {
+	AssistantStreamEvent,
+	AssistantStreamItemState,
+	AssistantStreamItemType,
+} from "../../../../shared/assistant-stream-event";
 
 interface CodexCommandExecutionItem {
 	aggregated_output?: unknown;
@@ -32,16 +37,26 @@ interface CodexJsonEvent {
 	type?: unknown;
 }
 
+type ParsedCodexEventType =
+	| "thread_started"
+	| "turn_started"
+	| "turn_completed"
+	| "item_started"
+	| "item_delta"
+	| "item_completed"
+	| "item_failed"
+	| "error";
+
 export interface CodexParsedEvent {
-	agentMessageCompleted?: boolean;
-	agentMessageDelta?: boolean;
-	agentMessageItemId?: string;
-	assistantMessage?: string;
-	delta?: string;
+	command?: string;
+	commandExitCode?: number | null;
+	commandOutput?: string;
 	error?: string;
-	statusDelta?: boolean;
+	itemId?: string;
+	itemType?: AssistantStreamItemType;
+	text?: string;
 	threadId?: string;
-	turnCompleted?: boolean;
+	type: ParsedCodexEventType;
 }
 
 interface CodexSpawnedProcess {
@@ -52,13 +67,20 @@ interface CodexSpawnedProcess {
 }
 
 interface CodexRunnerState {
+	activeItemByType: Partial<Record<AssistantStreamItemType, string>>;
 	agentMessageDeltaText: string;
 	assistantMessage?: string;
+	commandByItemId: Map<string, string>;
+	currentTurnId?: string;
 	errorMessage?: string;
+	itemIdByRawId: Map<string, string>;
+	itemSequence: number;
 	lastStatusDelta?: string;
+	startedItemIds: Set<string>;
 	streamedAgentMessageItemIds: Set<string>;
 	threadId?: string;
 	turnCompleted: boolean;
+	turnCounter: number;
 }
 
 type SpawnCodexProcess = (input: {
@@ -152,18 +174,70 @@ const extractTextContent = (value: unknown): string | null => {
 	return textParts.join("\n");
 };
 
-const buildThinkingDelta = (text: unknown): string => {
+const extractCommandOutput = (value: unknown): string | null => {
+	if (typeof value === "string") {
+		return value;
+	}
+
+	return extractTextContent(value);
+};
+
+const buildThinkingSummary = (text: unknown): string => {
 	const raw = extractTextContent(text);
 	if (!raw) {
-		return "Thinking...\n";
+		return "Thinking...";
 	}
 
 	const normalized = sanitizeStatusLabel(raw);
 	if (!normalized) {
-		return "Thinking...\n";
+		return "Thinking...";
 	}
 
-	return `Thinking: ${truncate(normalized, 180)}\n`;
+	return `Thinking: ${truncate(normalized, 180)}`;
+};
+
+const buildPlanSummary = (text: unknown): string => {
+	const raw = extractTextContent(text);
+	if (!raw) {
+		return "Planning...";
+	}
+
+	const normalized = sanitizeStatusLabel(raw);
+	if (!normalized) {
+		return "Planning...";
+	}
+
+	return `Planning: ${truncate(normalized, 180)}`;
+};
+
+const buildCommandStartSummary = (command: string | undefined): string => {
+	if (!command) {
+		return "Running command...";
+	}
+
+	return `Running command: ${truncate(command, 140)}`;
+};
+
+const buildCommandCompletedSummary = (
+	command: string | undefined,
+	commandOutput: string | undefined,
+	commandExitCode: number | null | undefined,
+): string => {
+	const commandLabel = command ? truncate(command, 140) : "command";
+	const outputSummary = summarizeCommandOutput(commandOutput ?? "");
+
+	if (commandExitCode === 0) {
+		return outputSummary
+			? `Ran ${commandLabel} · ${outputSummary}`
+			: `Ran ${commandLabel}`;
+	}
+
+	const exitLabel = commandExitCode === null || commandExitCode === undefined
+		? "unknown"
+		: String(commandExitCode);
+	return outputSummary
+		? `Command failed (${exitLabel}) · ${outputSummary}`
+		: `Command failed (${exitLabel})`;
 };
 
 const extractAssistantText = (item: CodexEventItem | CodexCommandExecutionItem | undefined): string | null => {
@@ -196,6 +270,191 @@ const parseProcessErrorMessage = (event: CodexJsonEvent): string | null => {
 	return asString(event.message) || asString(event.error) || "provider failed";
 };
 
+const normalizeItemType = (value: unknown): AssistantStreamItemType | null => {
+	const rawType = asString(value);
+	if (!rawType) {
+		return null;
+	}
+
+	if (rawType === "command_execution") {
+		return "tool";
+	}
+
+	if (rawType === "reasoning") {
+		return "reasoning";
+	}
+
+	if (rawType === "plan") {
+		return "plan";
+	}
+
+	if (rawType === "agent_message") {
+		return "assistant_message";
+	}
+
+	return null;
+};
+
+const toNullableNumber = (value: unknown): number | null => {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+};
+
+const emitLegacyDelta = (
+	state: CodexRunnerState,
+	onDelta: (delta: string) => void,
+	delta: string,
+	isStatusDelta = false,
+): void => {
+	let shouldEmit = true;
+
+	if (isStatusDelta) {
+		const normalizedStatus = normalizeLine(delta);
+		if (normalizedStatus && state.lastStatusDelta === normalizedStatus) {
+			shouldEmit = false;
+		} else if (normalizedStatus) {
+			state.lastStatusDelta = normalizedStatus;
+		}
+	}
+
+	if (shouldEmit) {
+		onDelta(delta);
+	}
+};
+
+const emitStreamEvent = (
+	callback: ((event: AssistantStreamEvent) => void) | undefined,
+	event: AssistantStreamEvent,
+): void => {
+	if (!callback) {
+		return;
+	}
+
+	callback(event);
+};
+
+const startTurn = (
+	state: CodexRunnerState,
+	onEvent: ((event: AssistantStreamEvent) => void) | undefined,
+): string => {
+	state.turnCounter += 1;
+	const turnId = `turn-${state.turnCounter}`;
+	state.currentTurnId = turnId;
+	emitStreamEvent(onEvent, {
+		type: "turn_started",
+		turnId,
+	});
+	return turnId;
+};
+
+const ensureTurn = (
+	state: CodexRunnerState,
+	onEvent: ((event: AssistantStreamEvent) => void) | undefined,
+): string => {
+	if (state.currentTurnId) {
+		return state.currentTurnId;
+	}
+
+	return startTurn(state, onEvent);
+};
+
+const resolveItemId = (
+	state: CodexRunnerState,
+	itemType: AssistantStreamItemType,
+	rawItemId: string | undefined,
+): string => {
+	if (rawItemId) {
+		const existing = state.itemIdByRawId.get(rawItemId);
+		if (existing) {
+			return existing;
+		}
+
+		state.itemIdByRawId.set(rawItemId, rawItemId);
+		return rawItemId;
+	}
+
+	const active = state.activeItemByType[itemType];
+	if (active) {
+		return active;
+	}
+
+	state.itemSequence += 1;
+	return `${itemType}-${state.itemSequence}`;
+};
+
+const ensureItemStarted = (input: {
+	state: CodexRunnerState;
+	onEvent: ((event: AssistantStreamEvent) => void) | undefined;
+	turnId: string;
+	itemType: AssistantStreamItemType;
+	rawItemId?: string;
+	command?: string;
+}): string => {
+	const itemId = resolveItemId(input.state, input.itemType, input.rawItemId);
+
+	input.state.activeItemByType[input.itemType] = itemId;
+	if (input.rawItemId) {
+		input.state.itemIdByRawId.set(input.rawItemId, itemId);
+	}
+
+	if (input.command) {
+		input.state.commandByItemId.set(itemId, input.command);
+	}
+
+	if (input.state.startedItemIds.has(itemId)) {
+		return itemId;
+	}
+
+	let summary: string | undefined;
+	if (input.itemType === "reasoning") {
+		summary = "Thinking...";
+	}
+	if (input.itemType === "assistant_message") {
+		summary = "Writing response...";
+	}
+	if (input.itemType === "plan") {
+		summary = "Planning...";
+	}
+	if (input.itemType === "tool") {
+		summary = buildCommandStartSummary(input.command);
+	}
+
+	emitStreamEvent(input.onEvent, {
+		type: "item_started",
+		turnId: input.turnId,
+		itemId,
+		itemType: input.itemType,
+		state: "running",
+		...(summary ? { summary } : {}),
+	});
+	input.state.startedItemIds.add(itemId);
+
+	return itemId;
+};
+
+const completeItem = (input: {
+	state: CodexRunnerState;
+	onEvent: ((event: AssistantStreamEvent) => void) | undefined;
+	turnId: string;
+	itemId: string;
+	stateValue: AssistantStreamItemState;
+	summary?: string;
+}): void => {
+	emitStreamEvent(input.onEvent, {
+		type: "item_state",
+		turnId: input.turnId,
+		itemId: input.itemId,
+		state: input.stateValue,
+		...(input.summary ? { summary: input.summary } : {}),
+	});
+	emitStreamEvent(input.onEvent, {
+		type: "item_completed",
+		turnId: input.turnId,
+		itemId: input.itemId,
+		state: input.stateValue,
+		...(input.summary ? { summary: input.summary } : {}),
+	});
+};
+
 export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 	const payload = parseJsonLine(line);
 	if (!payload) {
@@ -209,80 +468,51 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 
 	if (type === "thread.started") {
 		const threadId = asString(payload.thread_id);
-		return threadId ? { threadId } : null;
+		return threadId
+			? {
+					type: "thread_started",
+					threadId,
+				}
+			: null;
 	}
 
 	if (type === "turn.started") {
 		return {
-			delta: "Thinking...\n",
-			statusDelta: true,
+			type: "turn_started",
 		};
 	}
 
 	if (type === "turn.completed") {
-		return { turnCompleted: true };
+		return {
+			type: "turn_completed",
+		};
 	}
 
-	if (type === "process.failed" || type === "turn.failed" || type === "item.failed" || type === "error") {
+	if (type === "process.failed" || type === "turn.failed" || type === "error") {
 		return {
+			type: "error",
 			error: parseProcessErrorMessage(payload) || "provider failed",
 		};
 	}
 
 	const item = payload.item;
-	const itemType = asString(item?.type);
+	const itemType = normalizeItemType(item?.type);
+	const itemId = asString((item as CodexEventItem | CodexCommandExecutionItem | undefined)?.id) ?? undefined;
 
-	if (type === "item.started" && itemType === "command_execution") {
+	if (!itemType) {
+		return null;
+	}
+
+	if (type === "item.started") {
 		return {
-			delta: buildCommandStartDelta((item as CodexCommandExecutionItem).command),
-			statusDelta: true,
+			type: "item_started",
+			itemId,
+			itemType,
+			command: asString((item as CodexCommandExecutionItem).command) ?? undefined,
 		};
 	}
 
-	if (type === "item.started" && itemType === "reasoning") {
-		return {
-			delta: "Thinking...\n",
-			statusDelta: true,
-		};
-	}
-
-	if (type === "item.started" && itemType === "agent_message") {
-		return {
-			delta: "Writing response...\n",
-			statusDelta: true,
-		};
-	}
-
-	if (type === "item.completed" && itemType === "command_execution") {
-		const commandItem = item as CodexCommandExecutionItem;
-		return {
-			delta: buildCommandCompletedDelta(commandItem.aggregated_output, commandItem.exit_code),
-			statusDelta: true,
-		};
-	}
-
-	if (type === "item.completed" && itemType === "reasoning") {
-		return {
-			delta: buildThinkingDelta((item as CodexEventItem).text ?? (item as CodexEventItem).content),
-			statusDelta: true,
-		};
-	}
-
-	if (type === "item.completed" && itemType === "agent_message") {
-		const assistantMessage = extractAssistantText(item);
-		if (!assistantMessage) {
-			return null;
-		}
-
-		return {
-			agentMessageCompleted: true,
-			agentMessageItemId: asString((item as CodexEventItem).id) ?? undefined,
-			assistantMessage,
-			delta: assistantMessage,
-		};
-	}
-
-	if (type === "item.delta" && itemType === "agent_message") {
+	if (type === "item.delta") {
 		const delta = extractTextContent(
 			(item as CodexEventItem).delta ??
 				(item as CodexEventItem).text ??
@@ -294,9 +524,52 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 		}
 
 		return {
-			agentMessageDelta: true,
-			agentMessageItemId: asString((item as CodexEventItem).id) ?? undefined,
-			delta,
+			type: "item_delta",
+			itemId,
+			itemType,
+			text: delta,
+		};
+	}
+
+	if (type === "item.failed") {
+		return {
+			type: "item_failed",
+			itemId,
+			itemType,
+			command: asString((item as CodexCommandExecutionItem).command) ?? undefined,
+			commandExitCode: toNullableNumber((item as CodexCommandExecutionItem).exit_code),
+			commandOutput: extractCommandOutput((item as CodexCommandExecutionItem).aggregated_output) ?? undefined,
+			error: parseProcessErrorMessage(payload) ?? "item failed",
+		};
+	}
+
+	if (type === "item.completed") {
+		if (itemType === "assistant_message") {
+			const assistantMessage = extractAssistantText(item);
+			return {
+				type: "item_completed",
+				itemId,
+				itemType,
+				text: assistantMessage ?? undefined,
+			};
+		}
+
+		if (itemType === "reasoning" || itemType === "plan") {
+			return {
+				type: "item_completed",
+				itemId,
+				itemType,
+				text: extractTextContent((item as CodexEventItem).text ?? (item as CodexEventItem).content) ?? undefined,
+			};
+		}
+
+		return {
+			type: "item_completed",
+			itemId,
+			itemType,
+			command: asString((item as CodexCommandExecutionItem).command) ?? undefined,
+			commandExitCode: toNullableNumber((item as CodexCommandExecutionItem).exit_code),
+			commandOutput: extractCommandOutput((item as CodexCommandExecutionItem).aggregated_output) ?? undefined,
 		};
 	}
 
@@ -306,56 +579,250 @@ export const parseCodexJsonLine = (line: string): CodexParsedEvent | null => {
 const applyParsedEvent = (
 	state: CodexRunnerState,
 	event: CodexParsedEvent,
-	onDelta: (delta: string) => void,
+	input: {
+		onDelta: (delta: string) => void;
+		onEvent?: (event: AssistantStreamEvent) => void;
+	},
 ): void => {
-	if (event.threadId) {
+	if (event.type === "thread_started" && event.threadId) {
 		state.threadId = event.threadId;
+		return;
 	}
 
-	if (event.agentMessageDelta && event.agentMessageItemId) {
-		state.streamedAgentMessageItemIds.add(event.agentMessageItemId);
+	if (event.type === "turn_started") {
+		startTurn(state, input.onEvent);
+		emitLegacyDelta(state, input.onDelta, "Thinking...\n", true);
+		return;
 	}
 
-	if (event.agentMessageDelta && event.delta) {
-		state.agentMessageDeltaText += event.delta;
-	}
-
-	if (event.delta) {
-		let shouldEmitDelta = true;
-
-		if (event.statusDelta) {
-			const normalizedStatus = normalizeLine(event.delta);
-			if (normalizedStatus && state.lastStatusDelta === normalizedStatus) {
-				shouldEmitDelta = false;
-			} else if (normalizedStatus) {
-				state.lastStatusDelta = normalizedStatus;
-			}
-		}
-
-		if (
-			event.agentMessageCompleted &&
-			event.agentMessageItemId &&
-			state.streamedAgentMessageItemIds.has(event.agentMessageItemId)
-		) {
-			shouldEmitDelta = false;
-		}
-
-		if (shouldEmitDelta) {
-			onDelta(event.delta);
-		}
-	}
-
-	if (event.assistantMessage) {
-		state.assistantMessage = event.assistantMessage;
-	}
-
-	if (event.turnCompleted) {
+	if (event.type === "turn_completed") {
+		const turnId = ensureTurn(state, input.onEvent);
+		emitStreamEvent(input.onEvent, {
+			type: "turn_completed",
+			turnId,
+		});
 		state.turnCompleted = true;
+		state.currentTurnId = undefined;
+		state.activeItemByType = {};
+		return;
 	}
 
-	if (event.error) {
-		state.errorMessage = event.error;
+	if (event.type === "error") {
+		state.errorMessage = event.error || "provider failed";
+		return;
 	}
+
+	if (!event.itemType) {
+		return;
+	}
+
+	const turnId = ensureTurn(state, input.onEvent);
+	const itemId = ensureItemStarted({
+		state,
+		onEvent: input.onEvent,
+		turnId,
+		itemType: event.itemType,
+		rawItemId: event.itemId,
+		command: event.command,
+	});
+
+	if (event.type === "item_started") {
+		if (event.itemType === "reasoning") {
+			emitLegacyDelta(state, input.onDelta, "Thinking...\n", true);
+		}
+		if (event.itemType === "assistant_message") {
+			emitLegacyDelta(state, input.onDelta, "Writing response...\n", true);
+		}
+		if (event.itemType === "tool") {
+			emitLegacyDelta(state, input.onDelta, buildCommandStartDelta(event.command), true);
+		}
+		if (event.itemType === "plan") {
+			emitLegacyDelta(state, input.onDelta, "Planning...\n", true);
+		}
+		return;
+	}
+
+	if (event.type === "item_delta") {
+		const deltaText = event.text ?? "";
+		if (!deltaText) {
+			return;
+		}
+
+		if (event.itemType === "assistant_message") {
+			state.streamedAgentMessageItemIds.add(itemId);
+			state.agentMessageDeltaText += deltaText;
+			emitStreamEvent(input.onEvent, {
+				type: "item_delta",
+				turnId,
+				itemId,
+				target: "body",
+				delta: deltaText,
+			});
+			emitLegacyDelta(state, input.onDelta, deltaText, false);
+			return;
+		}
+
+		if (event.itemType === "reasoning") {
+			emitStreamEvent(input.onEvent, {
+				type: "item_delta",
+				turnId,
+				itemId,
+				target: "summary",
+				delta: deltaText,
+			});
+			return;
+		}
+
+		if (event.itemType === "plan") {
+			emitStreamEvent(input.onEvent, {
+				type: "item_delta",
+				turnId,
+				itemId,
+				target: "body",
+				delta: deltaText,
+			});
+			return;
+		}
+
+		emitStreamEvent(input.onEvent, {
+			type: "item_delta",
+			turnId,
+			itemId,
+			target: "output",
+			delta: deltaText,
+		});
+		return;
+	}
+
+	if (event.type === "item_failed") {
+		const failedSummary =
+			event.itemType === "tool"
+				? buildCommandCompletedSummary(
+					event.command ?? state.commandByItemId.get(itemId),
+					event.commandOutput,
+					event.commandExitCode,
+				)
+				: event.error || "Step failed";
+		completeItem({
+			state,
+			onEvent: input.onEvent,
+			turnId,
+			itemId,
+			stateValue: "failed",
+			summary: failedSummary,
+		});
+		delete state.activeItemByType[event.itemType];
+		state.errorMessage = event.error || state.errorMessage;
+
+		if (event.itemType === "tool") {
+			emitLegacyDelta(
+				state,
+				input.onDelta,
+				buildCommandCompletedDelta(event.commandOutput ?? "", event.commandExitCode),
+				true,
+			);
+		}
+		return;
+	}
+
+	if (event.type !== "item_completed") {
+		return;
+	}
+
+	if (event.itemType === "tool") {
+		if (event.commandOutput) {
+			emitStreamEvent(input.onEvent, {
+				type: "item_delta",
+				turnId,
+				itemId,
+				target: "output",
+				delta: event.commandOutput,
+			});
+		}
+
+		const resolvedCommand = event.command ?? state.commandByItemId.get(itemId);
+		const status: AssistantStreamItemState = event.commandExitCode === 0 ? "completed" : "failed";
+		const summary = buildCommandCompletedSummary(
+			resolvedCommand,
+			event.commandOutput,
+			event.commandExitCode,
+		);
+
+		completeItem({
+			state,
+			onEvent: input.onEvent,
+			turnId,
+			itemId,
+			stateValue: status,
+			summary,
+		});
+		delete state.activeItemByType.tool;
+		emitLegacyDelta(
+			state,
+			input.onDelta,
+			buildCommandCompletedDelta(event.commandOutput ?? "", event.commandExitCode),
+			true,
+		);
+		return;
+	}
+
+	if (event.itemType === "reasoning") {
+		const summary = buildThinkingSummary(event.text);
+		completeItem({
+			state,
+			onEvent: input.onEvent,
+			turnId,
+			itemId,
+			stateValue: "completed",
+			summary,
+		});
+		delete state.activeItemByType.reasoning;
+		emitLegacyDelta(state, input.onDelta, `${summary}\n`, true);
+		return;
+	}
+
+	if (event.itemType === "plan") {
+		const summary = buildPlanSummary(event.text);
+		completeItem({
+			state,
+			onEvent: input.onEvent,
+			turnId,
+			itemId,
+			stateValue: "completed",
+			summary,
+		});
+		delete state.activeItemByType.plan;
+		emitLegacyDelta(state, input.onDelta, `${summary}\n`, true);
+		return;
+	}
+
+	const assistantMessage = event.text;
+	if (assistantMessage && assistantMessage.length > 0) {
+		state.assistantMessage = assistantMessage;
+	}
+
+	const hasStreamedDelta = state.streamedAgentMessageItemIds.has(itemId);
+	if (assistantMessage && assistantMessage.length > 0 && !hasStreamedDelta) {
+		state.agentMessageDeltaText += assistantMessage;
+		emitStreamEvent(input.onEvent, {
+			type: "item_delta",
+			turnId,
+			itemId,
+			target: "body",
+			delta: assistantMessage,
+		});
+		emitLegacyDelta(state, input.onDelta, assistantMessage, false);
+	}
+
+	completeItem({
+		state,
+		onEvent: input.onEvent,
+		turnId,
+		itemId,
+		stateValue: "completed",
+		summary: "Response completed",
+	});
+	delete state.activeItemByType.assistant_message;
 };
 
 const buildPermissionFlags = (permissionMode: CodexPermissionMode | undefined): string[] => {
@@ -449,10 +916,16 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 		}
 
 		const state: CodexRunnerState = {
+			activeItemByType: {},
 			agentMessageDeltaText: "",
+			commandByItemId: new Map<string, string>(),
+			itemIdByRawId: new Map<string, string>(),
+			itemSequence: 0,
+			startedItemIds: new Set<string>(),
 			streamedAgentMessageItemIds: new Set<string>(),
 			threadId: options.threadId,
 			turnCompleted: false,
+			turnCounter: 0,
 		};
 		const decoder = new TextDecoder();
 		let stdoutReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
@@ -485,40 +958,46 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 							continue;
 						}
 
-						applyParsedEvent(state, parsed, options.onDelta);
+						applyParsedEvent(state, parsed, {
+							onDelta: options.onDelta,
+							onEvent: options.onEvent,
+						});
 					}
 				}
 
 				if (pending.trim().length > 0) {
 					const parsed = parseCodexJsonLine(pending);
 					if (parsed) {
-						applyParsedEvent(state, parsed, options.onDelta);
+						applyParsedEvent(state, parsed, {
+							onDelta: options.onDelta,
+							onEvent: options.onEvent,
+						});
 					}
 				}
 			})();
 
-				const stderrTask = spawnedProcess.stderr
-					? new Response(spawnedProcess.stderr).text()
-					: Promise.resolve("");
+			const stderrTask = spawnedProcess.stderr
+				? new Response(spawnedProcess.stderr).text()
+				: Promise.resolve("");
 
-				const results = await Promise.all([
-					stdoutTask,
-					stderrTask,
-					spawnedProcess.exited,
-				]);
-				const stderrOutput = results[1];
-				const exitCode = results[2];
+			const results = await Promise.all([
+				stdoutTask,
+				stderrTask,
+				spawnedProcess.exited,
+			]);
+			const stderrOutput = results[1];
+			const exitCode = results[2];
 
-				resolvedExitCode = exitCode;
-				stderrText = stderrOutput.trim();
-			} finally {
-				if (stdoutReader) {
-					try {
-						(stdoutReader as ReadableStreamDefaultReader<Uint8Array>).releaseLock();
-					} catch {
-						// no-op on best effort cleanup
-					}
+			resolvedExitCode = exitCode;
+			stderrText = stderrOutput.trim();
+		} finally {
+			if (stdoutReader) {
+				try {
+					(stdoutReader as ReadableStreamDefaultReader<Uint8Array>).releaseLock();
+				} catch {
+					// no-op on best effort cleanup
 				}
+			}
 
 			if (spawnedProcess.stdout) {
 				try {

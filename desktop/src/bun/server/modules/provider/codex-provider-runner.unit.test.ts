@@ -21,6 +21,7 @@ test("parseCodexJsonLine captures thread id from thread.started", () => {
 	);
 
 	expect(parsed).toEqual({
+		type: "thread_started",
 		threadId: "thread-123",
 	});
 });
@@ -33,8 +34,7 @@ test("parseCodexJsonLine emits thinking status on turn.started", () => {
 	);
 
 	expect(parsed).toEqual({
-		delta: "Thinking...\n",
-		statusDelta: true,
+		type: "turn_started",
 	});
 });
 
@@ -59,11 +59,20 @@ test("parseCodexJsonLine emits friendly deltas for command start and completion"
 		}),
 	);
 
-	expect(started?.delta).toContain("Tool calling:");
-	expect(started?.statusDelta).toBe(true);
-	expect(completed?.delta).toContain("Tool output:");
-	expect(completed?.delta).toContain("file-1 file-2");
-	expect(completed?.statusDelta).toBe(true);
+	expect(started).toEqual({
+		type: "item_started",
+		itemId: undefined,
+		itemType: "tool",
+		command: "/bin/zsh -lc ls",
+	});
+	expect(completed).toEqual({
+		type: "item_completed",
+		itemId: undefined,
+		itemType: "tool",
+		command: undefined,
+		commandExitCode: 0,
+		commandOutput: "file-1\nfile-2\n",
+	});
 });
 
 test("parseCodexJsonLine extracts assistant final text from agent_message", () => {
@@ -79,10 +88,10 @@ test("parseCodexJsonLine extracts assistant final text from agent_message", () =
 	);
 
 	expect(parsed).toEqual({
-		agentMessageCompleted: true,
-		agentMessageItemId: "msg-1",
-		assistantMessage: "Final answer",
-		delta: "Final answer",
+		type: "item_completed",
+		itemId: "msg-1",
+		itemType: "assistant_message",
+		text: "Final answer",
 	});
 });
 
@@ -97,9 +106,12 @@ test("parseCodexJsonLine maps reasoning completion into concise thinking delta",
 		}),
 	);
 
-	expect(parsed?.statusDelta).toBe(true);
-	expect(parsed?.delta).toContain("Thinking:");
-	expect(parsed?.delta).toContain("Running shell command with update");
+	expect(parsed).toEqual({
+		type: "item_completed",
+		itemId: undefined,
+		itemType: "reasoning",
+		text: "**Running shell command with update**",
+	});
 });
 
 test("parseCodexJsonLine extracts agent_message token deltas from item.delta", () => {
@@ -115,9 +127,10 @@ test("parseCodexJsonLine extracts agent_message token deltas from item.delta", (
 	);
 
 	expect(parsed).toEqual({
-		agentMessageDelta: true,
-		agentMessageItemId: "msg-2",
-		delta: "Hello",
+		type: "item_delta",
+		itemId: "msg-2",
+		itemType: "assistant_message",
+		text: "Hello",
 	});
 });
 

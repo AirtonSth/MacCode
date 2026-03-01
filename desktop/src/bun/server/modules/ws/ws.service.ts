@@ -135,6 +135,15 @@ export class WsService implements WsServiceContract {
 						event: "assistant_delta",
 					});
 				},
+				onEvent: (event) => {
+					emit({
+						data: {
+							chatId,
+							event,
+						},
+						event: "assistant_event",
+					});
+				},
 				permissionMode,
 				reasoningEffort: input.reasoningEffort,
 				text,

@@ -1,5 +1,11 @@
 import type { CodexPermissionMode } from "../../../shared/codex-permission-mode";
 import type { CodexReasoningEffort } from "../../../shared/codex-model-config";
+import type {
+	AssistantStreamDeltaTarget,
+	AssistantStreamEvent,
+	AssistantStreamItemState,
+	AssistantStreamItemType,
+} from "../../../shared/assistant-stream-event";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
@@ -40,6 +46,14 @@ export interface AssistantDoneEvent {
 	event: "assistant_done";
 }
 
+export interface AssistantEvent {
+	data: {
+		chatId: string;
+		event: AssistantStreamEvent;
+	};
+	event: "assistant_event";
+}
+
 export interface ChatUpdatedEvent {
 	data: {
 		chatId: string;
@@ -60,7 +74,7 @@ export interface ErrorEvent {
 	event: "error";
 }
 
-export type ServerWsEvent = AssistantDeltaEvent | AssistantDoneEvent | ChatUpdatedEvent | ErrorEvent;
+export type ServerWsEvent = AssistantDeltaEvent | AssistantEvent | AssistantDoneEvent | ChatUpdatedEvent | ErrorEvent;
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null;
@@ -68,6 +82,105 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 const isString = (value: unknown): value is string => typeof value === "string";
 
 const isNumber = (value: unknown): value is number => typeof value === "number";
+
+const streamItemTypeValues = ["reasoning", "tool", "plan", "assistant_message"] as const;
+const streamItemStateValues = [
+	"running",
+	"preview",
+	"collapsed",
+	"completed",
+	"failed",
+	"cancelled",
+] as const;
+const streamDeltaTargetValues = ["summary", "body", "output"] as const;
+
+const isStreamItemType = (value: unknown): value is AssistantStreamItemType =>
+	isString(value) && streamItemTypeValues.includes(value as AssistantStreamItemType);
+
+const isStreamItemState = (value: unknown): value is AssistantStreamItemState =>
+	isString(value) && streamItemStateValues.includes(value as AssistantStreamItemState);
+
+const isStreamDeltaTarget = (value: unknown): value is AssistantStreamDeltaTarget =>
+	isString(value) && streamDeltaTargetValues.includes(value as AssistantStreamDeltaTarget);
+
+const parseAssistantStreamEvent = (value: unknown): AssistantStreamEvent | null => {
+	if (!isObject(value) || !isString(value.type)) {
+		return null;
+	}
+
+	if (value.type === "turn_started" && isString(value.turnId)) {
+		return {
+			type: "turn_started",
+			turnId: value.turnId,
+		};
+	}
+
+	if (
+		value.type === "item_started" &&
+		isString(value.turnId) &&
+		isString(value.itemId) &&
+		isStreamItemType(value.itemType)
+	) {
+		return {
+			type: "item_started",
+			turnId: value.turnId,
+			itemId: value.itemId,
+			itemType: value.itemType,
+			state: isStreamItemState(value.state) ? value.state : undefined,
+			summary: isString(value.summary) ? value.summary : undefined,
+		};
+	}
+
+	if (
+		value.type === "item_delta" &&
+		isString(value.turnId) &&
+		isString(value.itemId) &&
+		isStreamDeltaTarget(value.target) &&
+		isString(value.delta)
+	) {
+		return {
+			type: "item_delta",
+			turnId: value.turnId,
+			itemId: value.itemId,
+			target: value.target,
+			delta: value.delta,
+		};
+	}
+
+	if (
+		value.type === "item_state" &&
+		isString(value.turnId) &&
+		isString(value.itemId) &&
+		isStreamItemState(value.state)
+	) {
+		return {
+			type: "item_state",
+			turnId: value.turnId,
+			itemId: value.itemId,
+			state: value.state,
+			summary: isString(value.summary) ? value.summary : undefined,
+		};
+	}
+
+	if (value.type === "item_completed" && isString(value.turnId) && isString(value.itemId)) {
+		return {
+			type: "item_completed",
+			turnId: value.turnId,
+			itemId: value.itemId,
+			state: isStreamItemState(value.state) ? value.state : undefined,
+			summary: isString(value.summary) ? value.summary : undefined,
+		};
+	}
+
+	if (value.type === "turn_completed" && isString(value.turnId)) {
+		return {
+			type: "turn_completed",
+			turnId: value.turnId,
+		};
+	}
+
+	return null;
+};
 
 const parseJsonString = (raw: string): unknown => {
 	try {
@@ -136,6 +249,21 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				chatId,
 			},
 			event: "assistant_done",
+		};
+	}
+
+	if (event === "assistant_event" && isString(chatId)) {
+		const streamEvent = parseAssistantStreamEvent(data.event);
+		if (!streamEvent) {
+			return null;
+		}
+
+		return {
+			data: {
+				chatId,
+				event: streamEvent,
+			},
+			event: "assistant_event",
 		};
 	}
 

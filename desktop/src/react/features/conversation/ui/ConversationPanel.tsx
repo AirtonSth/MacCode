@@ -7,14 +7,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "../../../lib/utils";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
-import type { ChatDTO, MessageDTO } from "../../workspace/model/useWorkspaceStore";
+import type { AssistantStreamItemState } from "../../../../shared/assistant-stream-event";
+import type { ChatDTO, MessageDTO, StreamTurnState } from "../../workspace/model/useWorkspaceStore";
+import { StreamingTimeline } from "./StreamingTimeline";
 
 interface ConversationPanelProps {
 	chat: ChatDTO | null;
 	messages: MessageDTO[];
 	streamingText: string;
+	streamingTurn: StreamTurnState | null;
 	loading: boolean;
 	hasRestError: boolean;
+	onSetStreamItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void;
+	onSetStreamItemState: (itemId: string, state: AssistantStreamItemState) => void;
 	focusMode?: boolean;
 }
 
@@ -22,13 +27,18 @@ export const ConversationPanel = ({
 	chat,
 	messages,
 	streamingText,
+	streamingTurn,
 	loading,
 	hasRestError,
+	onSetStreamItemExpanded,
+	onSetStreamItemState,
 	focusMode = false,
 }: ConversationPanelProps): JSX.Element => {
-	const shouldReduceMotion = useReducedMotion();
+	const shouldReduceMotion = Boolean(useReducedMotion());
 	const hasMessages = messages.length > 0;
-	const hasStreaming = streamingText.trim().length > 0;
+	const hasStreamingTimeline = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
+	const hasStreamingText = streamingText.trim().length > 0;
+	const hasStreaming = hasStreamingTimeline || hasStreamingText;
 	const hasContent = hasMessages || hasStreaming;
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
@@ -267,7 +277,18 @@ export const ConversationPanel = ({
 										</motion.article>
 									))}
 
-									{streamingText ? (
+									{hasStreamingTimeline && streamingTurn ? (
+										<StreamingTimeline
+											focusMode={focusMode}
+											key={`stream-turn-${streamingTurn.turnId}`}
+											onSetItemExpanded={onSetStreamItemExpanded}
+											onSetItemState={onSetStreamItemState}
+											shouldReduceMotion={shouldReduceMotion}
+											turn={streamingTurn}
+										/>
+									) : null}
+
+									{streamingText && !hasStreamingTimeline ? (
 										<motion.article
 											className={cn(
 												focusMode

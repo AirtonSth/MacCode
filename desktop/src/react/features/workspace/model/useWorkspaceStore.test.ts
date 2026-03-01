@@ -45,6 +45,7 @@ const baseWorkspaceState = (): WorkspaceState => ({
 	messages: [],
 	streamingByChat: {},
 	streamingActiveByChat: {},
+	streamTurnsByChat: {},
 	isSendingMessage: false,
 	isCreatingProject: false,
 	isCreatingChat: false,
@@ -87,6 +88,16 @@ test("SET_SELECTED_PROJECT updates selection and clears dependent state", () => 
 		},
 		streamingActiveByChat: {
 			"chat-1": true,
+		},
+		streamTurnsByChat: {
+			"chat-1": {
+				turnId: "turn-1",
+				status: "running",
+				itemsById: {},
+				itemOrder: [],
+				startedAtMs: Date.now(),
+				finishedAtMs: null,
+			},
 		},
 	};
 
@@ -281,6 +292,7 @@ test("RESET_SELECTED_PROJECT and RESET_SELECTED_CHAT clear state slices", () => 
 	expect(projectReset.messages).toEqual([]);
 	expect(projectReset.streamingByChat).toEqual({});
 	expect(projectReset.streamingActiveByChat).toEqual({});
+	expect(projectReset.streamTurnsByChat).toEqual({});
 
 	const chatStateInput: WorkspaceState = {
 		...projectReset,
@@ -313,6 +325,16 @@ test("RESET_SELECTED_PROJECT and RESET_SELECTED_CHAT clear state slices", () => 
 		streamingActiveByChat: {
 			"chat-2": true,
 		},
+		streamTurnsByChat: {
+			"chat-2": {
+				turnId: "turn-2",
+				status: "running",
+				itemsById: {},
+				itemOrder: [],
+				startedAtMs: Date.now(),
+				finishedAtMs: null,
+			},
+		},
 	};
 
 	const chatReset = workspaceReducer(chatStateInput, { type: "RESET_SELECTED_CHAT" });
@@ -321,4 +343,69 @@ test("RESET_SELECTED_PROJECT and RESET_SELECTED_CHAT clear state slices", () => 
 	expect(chatReset.messages).toEqual([]);
 	expect(chatReset.streamingByChat).toEqual({});
 	expect(chatReset.streamingActiveByChat).toEqual({});
+	expect(chatReset.streamTurnsByChat).toEqual({});
+});
+
+test("assistant stream events append by target and keep item identity", () => {
+	const initial = baseWorkspaceState();
+	const withTurn = workspaceReducer(initial, {
+		type: "APPLY_ASSISTANT_EVENT",
+		payload: {
+			chatId: "chat-1",
+			event: {
+				type: "turn_started",
+				turnId: "turn-1",
+			},
+		},
+	});
+
+	const withStartedItem = workspaceReducer(withTurn, {
+		type: "APPLY_ASSISTANT_EVENT",
+		payload: {
+			chatId: "chat-1",
+			event: {
+				type: "item_started",
+				turnId: "turn-1",
+				itemId: "tool-1",
+				itemType: "tool",
+				state: "running",
+				summary: "Running command: pwd",
+			},
+		},
+	});
+
+	const withOutput = workspaceReducer(withStartedItem, {
+		type: "APPLY_ASSISTANT_EVENT",
+		payload: {
+			chatId: "chat-1",
+			event: {
+				type: "item_delta",
+				turnId: "turn-1",
+				itemId: "tool-1",
+				target: "output",
+				delta: "/tmp",
+			},
+		},
+	});
+
+	const withCompleted = workspaceReducer(withOutput, {
+		type: "APPLY_ASSISTANT_EVENT",
+		payload: {
+			chatId: "chat-1",
+			event: {
+				type: "item_completed",
+				turnId: "turn-1",
+				itemId: "tool-1",
+				state: "completed",
+				summary: "Ran pwd",
+			},
+		},
+	});
+
+	const turn = withCompleted.streamTurnsByChat["chat-1"];
+	expect(turn?.turnId).toBe("turn-1");
+	expect(turn?.itemOrder).toEqual(["tool-1"]);
+	expect(turn?.itemsById["tool-1"]?.output).toBe("/tmp");
+	expect(turn?.itemsById["tool-1"]?.state).toBe("completed");
+	expect(turn?.itemsById["tool-1"]?.summary).toBe("Ran pwd");
 });

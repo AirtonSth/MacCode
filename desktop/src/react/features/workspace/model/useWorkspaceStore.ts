@@ -1,4 +1,9 @@
 import { useReducer } from "react";
+import type {
+	AssistantStreamEvent,
+	AssistantStreamItemState,
+	AssistantStreamItemType,
+} from "../../../../shared/assistant-stream-event";
 
 export interface ProjectDTO {
 	id: string;
@@ -42,6 +47,28 @@ export type ConnectionState = "idle" | "connecting" | "connected" | "reconnectin
 
 export type LoadingState = boolean;
 
+export interface StreamItem {
+	id: string;
+	type: AssistantStreamItemType;
+	state: AssistantStreamItemState;
+	summary: string;
+	body: string;
+	output: string;
+	startedAtMs: number;
+	finishedAtMs: number | null;
+	expandedByUser: boolean;
+	isExpanded: boolean;
+}
+
+export interface StreamTurnState {
+	turnId: string;
+	status: "running" | "completed" | "failed";
+	itemsById: Record<string, StreamItem>;
+	itemOrder: string[];
+	startedAtMs: number;
+	finishedAtMs: number | null;
+}
+
 export interface WorkspaceState {
 	baseUrl: string;
 	token: string;
@@ -52,6 +79,7 @@ export interface WorkspaceState {
 	messages: MessageDTO[];
 	streamingByChat: Record<string, string>;
 	streamingActiveByChat: Record<string, boolean>;
+	streamTurnsByChat: Record<string, StreamTurnState | undefined>;
 	isSendingMessage: boolean;
 	isCreatingProject: boolean;
 	isCreatingChat: boolean;
@@ -85,6 +113,10 @@ export type WorkspaceAction =
 	| { type: "APPEND_STREAMING"; payload: { chatId: string; delta: string } }
 	| { type: "CLEAR_STREAMING"; payload: { chatId: string } }
 	| { type: "RESET_STREAMING"; payload?: { chatId: string | null } }
+	| { type: "APPLY_ASSISTANT_EVENT"; payload: { chatId: string; event: AssistantStreamEvent } }
+	| { type: "SET_STREAM_ITEM_EXPANDED"; payload: { chatId: string; itemId: string; expanded: boolean; byUser: boolean } }
+	| { type: "SET_STREAM_ITEM_STATE"; payload: { chatId: string; itemId: string; state: AssistantStreamItemState } }
+	| { type: "CLEAR_STREAM_TURN"; payload: { chatId: string } }
 	| { type: "SET_SENDING_MESSAGE"; payload: boolean }
 	| { type: "SET_CREATING_PROJECT"; payload: boolean }
 	| { type: "SET_CREATING_CHAT"; payload: boolean }
@@ -96,6 +128,64 @@ export type WorkspaceAction =
 	| { type: "CLEAR_ERRORS" };
 
 const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+const createStreamTurnState = (turnId: string): StreamTurnState => ({
+	turnId,
+	status: "running",
+	itemsById: {},
+	itemOrder: [],
+	startedAtMs: Date.now(),
+	finishedAtMs: null,
+});
+
+const createStreamItem = (itemId: string, itemType: AssistantStreamItemType): StreamItem => ({
+	id: itemId,
+	type: itemType,
+	state: "running",
+	summary: "",
+	body: "",
+	output: "",
+	startedAtMs: Date.now(),
+	finishedAtMs: null,
+	expandedByUser: false,
+	isExpanded: false,
+});
+
+const cloneTurn = (turn: StreamTurnState): StreamTurnState => ({
+	...turn,
+	itemsById: { ...turn.itemsById },
+	itemOrder: [...turn.itemOrder],
+});
+
+const ensureTurnForEvent = (
+	streamTurnsByChat: Record<string, StreamTurnState | undefined>,
+	chatId: string,
+	turnId: string,
+): StreamTurnState => {
+	const currentTurn = streamTurnsByChat[chatId];
+	if (currentTurn && currentTurn.turnId === turnId) {
+		return cloneTurn(currentTurn);
+	}
+
+	return createStreamTurnState(turnId);
+};
+
+const ensureItemForTurn = (
+	turn: StreamTurnState,
+	itemId: string,
+	defaultItemType: AssistantStreamItemType = "reasoning",
+): StreamItem => {
+	const existing = turn.itemsById[itemId];
+	if (existing) {
+		return {
+			...existing,
+		};
+	}
+
+	const created = createStreamItem(itemId, defaultItemType);
+	turn.itemOrder = turn.itemOrder.includes(itemId) ? turn.itemOrder : [...turn.itemOrder, itemId];
+	return created;
+};
 
 const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): WorkspaceState => {
 	switch (action.type) {
@@ -142,34 +232,8 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				),
 			};
 
-			case "SET_SELECTED_PROJECT":
-				if (action.payload === null) {
-					return {
-						...state,
-						selectedProjectId: null,
-						chats: [],
-						selectedChatId: null,
-						messages: [],
-						streamingByChat: {},
-						streamingActiveByChat: {},
-					};
-				}
-
-				if (state.selectedProjectId === action.payload) {
-					return state;
-				}
-
-				return {
-					...state,
-					selectedProjectId: action.payload,
-					chats: [],
-					selectedChatId: null,
-					messages: [],
-					streamingByChat: {},
-					streamingActiveByChat: {},
-				};
-
-			case "RESET_SELECTED_PROJECT":
+		case "SET_SELECTED_PROJECT":
+			if (action.payload === null) {
 				return {
 					...state,
 					selectedProjectId: null,
@@ -178,7 +242,36 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 					messages: [],
 					streamingByChat: {},
 					streamingActiveByChat: {},
+					streamTurnsByChat: {},
 				};
+			}
+
+			if (state.selectedProjectId === action.payload) {
+				return state;
+			}
+
+			return {
+				...state,
+				selectedProjectId: action.payload,
+				chats: [],
+				selectedChatId: null,
+				messages: [],
+				streamingByChat: {},
+				streamingActiveByChat: {},
+				streamTurnsByChat: {},
+			};
+
+		case "RESET_SELECTED_PROJECT":
+			return {
+				...state,
+				selectedProjectId: null,
+				chats: [],
+				selectedChatId: null,
+				messages: [],
+				streamingByChat: {},
+				streamingActiveByChat: {},
+				streamTurnsByChat: {},
+			};
 
 		case "SET_CHATS_LOADING":
 			return {
@@ -222,8 +315,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 		case "REMOVE_CHAT": {
 			const nextStreamingByChat = { ...state.streamingByChat };
 			const nextStreamingActiveByChat = { ...state.streamingActiveByChat };
+			const nextStreamTurnsByChat = { ...state.streamTurnsByChat };
 			delete nextStreamingByChat[action.payload.chatId];
 			delete nextStreamingActiveByChat[action.payload.chatId];
+			delete nextStreamTurnsByChat[action.payload.chatId];
 
 			return {
 				...state,
@@ -232,30 +327,32 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				messages: state.selectedChatId === action.payload.chatId ? [] : state.messages,
 				streamingByChat: nextStreamingByChat,
 				streamingActiveByChat: nextStreamingActiveByChat,
+				streamTurnsByChat: nextStreamTurnsByChat,
 			};
 		}
 
-			case "SET_SELECTED_CHAT":
-				return {
-					...state,
-					selectedChatId: action.payload,
-					messages: [],
-					streamingActiveByChat: {
-						...state.streamingActiveByChat,
-						...(!action.payload
-							? {}
-							: { [action.payload]: state.streamingActiveByChat[action.payload] ?? false }),
-					},
-				};
+		case "SET_SELECTED_CHAT":
+			return {
+				...state,
+				selectedChatId: action.payload,
+				messages: [],
+				streamingActiveByChat: {
+					...state.streamingActiveByChat,
+					...(!action.payload
+						? {}
+						: { [action.payload]: state.streamingActiveByChat[action.payload] ?? false }),
+				},
+			};
 
-			case "RESET_SELECTED_CHAT":
-				return {
-					...state,
-					selectedChatId: null,
-					messages: [],
-					streamingByChat: {},
-					streamingActiveByChat: {},
-				};
+		case "RESET_SELECTED_CHAT":
+			return {
+				...state,
+				selectedChatId: null,
+				messages: [],
+				streamingByChat: {},
+				streamingActiveByChat: {},
+				streamTurnsByChat: {},
+			};
 
 		case "SET_MESSAGES_LOADING":
 			return {
@@ -263,46 +360,60 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				messagesLoading: action.payload,
 			};
 
-			case "SET_MESSAGES":
-				return {
-					...state,
-					messages: action.payload,
-					messagesLoading: false,
-				};
+		case "SET_MESSAGES":
+			return {
+				...state,
+				messages: action.payload,
+				messagesLoading: false,
+			};
 
-			case "START_STREAMING":
-				return {
-					...state,
-					streamingByChat: {
-						...state.streamingByChat,
-						[action.payload.chatId]: state.streamingByChat[action.payload.chatId] ?? "",
-					},
-					streamingActiveByChat: {
-						...state.streamingActiveByChat,
-						[action.payload.chatId]: true,
-					},
-				};
+		case "START_STREAMING":
+			return {
+				...state,
+				streamingByChat: {
+					...state.streamingByChat,
+					[action.payload.chatId]: state.streamingByChat[action.payload.chatId] ?? "",
+				},
+				streamingActiveByChat: {
+					...state.streamingActiveByChat,
+					[action.payload.chatId]: true,
+				},
+			};
 
-			case "APPEND_MESSAGE":
-				return {
-					...state,
-					messages: [...state.messages, action.payload],
+		case "APPEND_MESSAGE":
+			return {
+				...state,
+				messages: [...state.messages, action.payload],
 			};
 
 		case "APPEND_STREAMING":
-				return {
-					...state,
-					streamingByChat: {
-						...state.streamingByChat,
-						[action.payload.chatId]: `${state.streamingByChat[action.payload.chatId] ?? ""}${action.payload.delta}`,
-					},
-					streamingActiveByChat: {
-						...state.streamingActiveByChat,
-						[action.payload.chatId]: true,
-					},
-				};
+			return {
+				...state,
+				streamingByChat: {
+					...state.streamingByChat,
+					[action.payload.chatId]: `${state.streamingByChat[action.payload.chatId] ?? ""}${action.payload.delta}`,
+				},
+				streamingActiveByChat: {
+					...state.streamingActiveByChat,
+					[action.payload.chatId]: true,
+				},
+			};
 
-			case "CLEAR_STREAMING":
+		case "CLEAR_STREAMING":
+			return {
+				...state,
+				streamingByChat: {
+					...state.streamingByChat,
+					[action.payload.chatId]: "",
+				},
+				streamingActiveByChat: {
+					...state.streamingActiveByChat,
+					[action.payload.chatId]: false,
+				},
+			};
+
+		case "RESET_STREAMING": {
+			if (action.payload?.chatId) {
 				return {
 					...state,
 					streamingByChat: {
@@ -313,22 +424,192 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 						...state.streamingActiveByChat,
 						[action.payload.chatId]: false,
 					},
+					streamTurnsByChat: {
+						...state.streamTurnsByChat,
+						[action.payload.chatId]: undefined,
+					},
 				};
+			}
 
-			case "RESET_STREAMING":
+			return {
+				...state,
+				streamingByChat: {},
+				streamingActiveByChat: {},
+				streamTurnsByChat: {},
+			};
+		}
+
+		case "APPLY_ASSISTANT_EVENT": {
+			const chatId = action.payload.chatId;
+			const streamEvent = action.payload.event;
+			const nextStreamTurnsByChat = { ...state.streamTurnsByChat };
+			const nextStreamingActiveByChat = { ...state.streamingActiveByChat };
+
+			if (streamEvent.type === "turn_started") {
+				nextStreamTurnsByChat[chatId] = createStreamTurnState(streamEvent.turnId);
+				nextStreamingActiveByChat[chatId] = true;
+
 				return {
 					...state,
-					streamingByChat: action.payload?.chatId ? {
-						...state.streamingByChat,
-						[action.payload.chatId]: "",
-					} : {},
-					streamingActiveByChat: action.payload?.chatId
-						? {
-							...state.streamingActiveByChat,
-							[action.payload.chatId]: false,
-						}
-						: {},
+					streamTurnsByChat: nextStreamTurnsByChat,
+					streamingActiveByChat: nextStreamingActiveByChat,
 				};
+			}
+
+			if (streamEvent.type === "turn_completed") {
+				const currentTurn = nextStreamTurnsByChat[chatId];
+				if (currentTurn && currentTurn.turnId === streamEvent.turnId) {
+					const turn = cloneTurn(currentTurn);
+					turn.status = turn.status === "failed" ? "failed" : "completed";
+					turn.finishedAtMs = Date.now();
+					nextStreamTurnsByChat[chatId] = turn;
+				}
+				nextStreamingActiveByChat[chatId] = false;
+
+				return {
+					...state,
+					streamTurnsByChat: nextStreamTurnsByChat,
+					streamingActiveByChat: nextStreamingActiveByChat,
+				};
+			}
+
+			const turn = ensureTurnForEvent(nextStreamTurnsByChat, chatId, streamEvent.turnId);
+			nextStreamingActiveByChat[chatId] = true;
+
+			if (streamEvent.type === "item_started") {
+				const item = ensureItemForTurn(turn, streamEvent.itemId, streamEvent.itemType);
+				item.type = streamEvent.itemType;
+				item.state = streamEvent.state ?? "running";
+				if (streamEvent.summary !== undefined) {
+					item.summary = streamEvent.summary;
+				}
+				turn.itemsById[streamEvent.itemId] = item;
+				nextStreamTurnsByChat[chatId] = turn;
+				return {
+					...state,
+					streamTurnsByChat: nextStreamTurnsByChat,
+					streamingActiveByChat: nextStreamingActiveByChat,
+				};
+			}
+
+			const existingDefaultType =
+				turn.itemsById[streamEvent.itemId]?.type ??
+				(streamEvent.type === "item_delta" && streamEvent.target === "output"
+					? "tool"
+					: "reasoning");
+			const item = ensureItemForTurn(turn, streamEvent.itemId, existingDefaultType);
+
+			if (streamEvent.type === "item_delta") {
+				if (streamEvent.target === "summary") {
+					item.summary = `${item.summary}${streamEvent.delta}`;
+				}
+				if (streamEvent.target === "body") {
+					item.body = `${item.body}${streamEvent.delta}`;
+				}
+				if (streamEvent.target === "output") {
+					item.output = `${item.output}${streamEvent.delta}`;
+				}
+			}
+
+			if (streamEvent.type === "item_state") {
+				item.state = streamEvent.state;
+				if (streamEvent.summary !== undefined) {
+					item.summary = streamEvent.summary;
+				}
+				if (streamEvent.state === "failed" || streamEvent.state === "cancelled") {
+					turn.status = "failed";
+				}
+			}
+
+			if (streamEvent.type === "item_completed") {
+				item.state =
+					streamEvent.state ?? (item.state === "failed" || item.state === "cancelled" ? item.state : "completed");
+				item.finishedAtMs = item.finishedAtMs ?? Date.now();
+				if (streamEvent.summary !== undefined) {
+					item.summary = streamEvent.summary;
+				}
+				if (item.state === "failed" || item.state === "cancelled") {
+					turn.status = "failed";
+				}
+			}
+
+			turn.itemsById[streamEvent.itemId] = item;
+			nextStreamTurnsByChat[chatId] = turn;
+
+			return {
+				...state,
+				streamTurnsByChat: nextStreamTurnsByChat,
+				streamingActiveByChat: nextStreamingActiveByChat,
+			};
+		}
+
+		case "SET_STREAM_ITEM_EXPANDED": {
+			const currentTurn = state.streamTurnsByChat[action.payload.chatId];
+			if (!currentTurn) {
+				return state;
+			}
+
+			const currentItem = currentTurn.itemsById[action.payload.itemId];
+			if (!currentItem) {
+				return state;
+			}
+
+			const turn = cloneTurn(currentTurn);
+			turn.itemsById[action.payload.itemId] = {
+				...currentItem,
+				isExpanded: action.payload.expanded,
+				expandedByUser: action.payload.byUser ? action.payload.expanded : currentItem.expandedByUser,
+			};
+
+			return {
+				...state,
+				streamTurnsByChat: {
+					...state.streamTurnsByChat,
+					[action.payload.chatId]: turn,
+				},
+			};
+		}
+
+		case "SET_STREAM_ITEM_STATE": {
+			const currentTurn = state.streamTurnsByChat[action.payload.chatId];
+			if (!currentTurn) {
+				return state;
+			}
+
+			const currentItem = currentTurn.itemsById[action.payload.itemId];
+			if (!currentItem) {
+				return state;
+			}
+
+			const turn = cloneTurn(currentTurn);
+			turn.itemsById[action.payload.itemId] = {
+				...currentItem,
+				state: action.payload.state,
+				finishedAtMs:
+					action.payload.state === "completed" ||
+					action.payload.state === "failed" ||
+					action.payload.state === "cancelled"
+						? currentItem.finishedAtMs ?? Date.now()
+						: currentItem.finishedAtMs,
+			};
+
+			return {
+				...state,
+				streamTurnsByChat: {
+					...state.streamTurnsByChat,
+					[action.payload.chatId]: turn,
+				},
+			};
+		}
+
+		case "CLEAR_STREAM_TURN":
+			return {
+				...state,
+				streamTurnsByChat: {
+					...state.streamTurnsByChat,
+					[action.payload.chatId]: undefined,
+				},
+			};
 
 		case "SET_SENDING_MESSAGE":
 			return {
@@ -348,36 +629,36 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				isCreatingChat: action.payload,
 			};
 
-			case "SET_CONNECTION_STATE":
-				return {
-					...state,
-					connectionState: action.payload,
-					connectionError: action.payload === "connected" ? null : state.connectionError,
-				};
+		case "SET_CONNECTION_STATE":
+			return {
+				...state,
+				connectionState: action.payload,
+				connectionError: action.payload === "connected" ? null : state.connectionError,
+			};
 
-			case "SET_CONNECTION_ERROR": {
-				if (action.payload === null) {
-					return {
-						...state,
-						connectionError: null,
-					};
-				}
-
-				return {
-					...state,
-					connectionError: {
-						...action.payload,
-						id: formatErrorId(),
-						timestamp: new Date().toISOString(),
-					},
-				};
-			}
-
-			case "CLEAR_CONNECTION_ERROR":
+		case "SET_CONNECTION_ERROR": {
+			if (action.payload === null) {
 				return {
 					...state,
 					connectionError: null,
 				};
+			}
+
+			return {
+				...state,
+				connectionError: {
+					...action.payload,
+					id: formatErrorId(),
+					timestamp: new Date().toISOString(),
+				},
+			};
+		}
+
+		case "CLEAR_CONNECTION_ERROR":
+			return {
+				...state,
+				connectionError: null,
+			};
 
 		case "ADD_ERROR":
 			return {
@@ -422,6 +703,7 @@ export const useWorkspaceStore = () => {
 		messages: [],
 		streamingByChat: {},
 		streamingActiveByChat: {},
+		streamTurnsByChat: {},
 		isSendingMessage: false,
 		isCreatingProject: false,
 		isCreatingChat: false,
@@ -435,6 +717,6 @@ export const useWorkspaceStore = () => {
 
 	return {
 		state,
-			dispatch,
+		dispatch,
 	};
 };

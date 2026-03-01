@@ -107,6 +107,31 @@
 		background-size: 3px 3px;
 	}
 
+	.loading-shimmer-pure-text {
+		background: linear-gradient(
+			110deg,
+			rgba(255, 255, 255, 0.62) 0%,
+			rgba(255, 255, 255, 0.95) 35%,
+			rgba(255, 255, 255, 0.62) 65%,
+			rgba(255, 255, 255, 0.62) 100%
+		);
+		background-size: 240% 100%;
+		background-clip: text;
+		-webkit-background-clip: text;
+		color: transparent;
+		animation: loading-shimmer 1.8s steps(48, end) infinite;
+	}
+
+}
+
+@keyframes loading-shimmer {
+	0% {
+		background-position: 140% 0;
+	}
+
+	100% {
+		background-position: -20% 0;
+	}
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -117,5 +142,12 @@
 		animation-iteration-count: 1 !important;
 		scroll-behavior: auto !important;
 		transition-duration: 0.001ms !important;
+	}
+
+	.loading-shimmer-pure-text {
+		animation: none !important;
+		color: inherit !important;
+		background: none !important;
+		-webkit-text-fill-color: currentColor;
 	}
 }

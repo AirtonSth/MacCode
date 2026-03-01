@@ -1,5 +1,6 @@
 import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import type { CodexReasoningEffort } from "../../../../shared/codex-model-config";
+import type { AssistantStreamEvent } from "../../../../shared/assistant-stream-event";
 
 export interface ChatDTO {
 	diffAdded: number;
@@ -67,6 +68,7 @@ export interface CodexProviderRunOptions {
 	chatId: string;
 	model?: string;
 	onDelta: (delta: string) => void;
+	onEvent?: (event: AssistantStreamEvent) => void;
 	permissionMode?: CodexPermissionMode;
 	reasoningEffort?: CodexReasoningEffort;
 	text: string;
@@ -129,6 +131,13 @@ export type ServerWsEvent =
 				delta: string;
 			};
 			event: "assistant_delta";
+	  }
+	| {
+			data: {
+				chatId: string;
+				event: AssistantStreamEvent;
+			};
+			event: "assistant_event";
 	  }
 	| {
 			data: {

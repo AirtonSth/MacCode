@@ -494,3 +494,93 @@ test("WsService.startUserMessage forwards intermediate assistant deltas in order
 		"final answer",
 	]);
 });
+
+test("WsService.startUserMessage forwards structured assistant_event payloads", async () => {
+	const chat = createChat();
+	let updateCallCount = 0;
+	const chatRepository = {
+		findChatById: () => {
+			updateCallCount += 1;
+
+			if (updateCallCount === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+			...chat,
+			status: "running",
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => ({
+			chatId: chat.id,
+			content: "",
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role: "assistant" as const,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({
+			createdAt: "",
+			id: "project-id",
+			isFavorite: false,
+			name: "p",
+			path: "/tmp",
+			updatedAt: "",
+		}),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({
+			onDelta,
+			onEvent,
+		}: {
+			onDelta: (delta: string) => void;
+			onEvent?: (event: { type: string; [key: string]: unknown }) => void;
+		}) => {
+			onEvent?.({
+				type: "turn_started",
+				turnId: "turn-1",
+			});
+			onEvent?.({
+				type: "item_started",
+				turnId: "turn-1",
+				itemId: "tool-1",
+				itemType: "tool",
+				state: "running",
+				summary: "Running command: pwd",
+			});
+			onDelta("final answer");
+			return {
+				assistantText: "final answer",
+				diffAdded: 12,
+				diffRemoved: 0,
+				status: "completed" as const,
+				threadId: "thread-stream-2",
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	const assistantEvents = collector.events
+		.filter((event) => event.event === "assistant_event")
+		.map((event) => event.data.event.type);
+
+	expect(assistantEvents).toEqual(["turn_started", "item_started"]);
+});

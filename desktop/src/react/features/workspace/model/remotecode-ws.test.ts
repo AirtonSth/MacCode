@@ -59,6 +59,38 @@ test("parseServerWsEvent parses assistant_done", () => {
 	});
 });
 
+test("parseServerWsEvent parses assistant_event", () => {
+	const parsed = parseServerWsEvent({
+		event: "assistant_event",
+		data: {
+			chatId: "chat-1",
+			event: {
+				type: "item_started",
+				turnId: "turn-1",
+				itemId: "tool-1",
+				itemType: "tool",
+				state: "running",
+				summary: "Running command: pwd",
+			},
+		},
+	});
+
+	expect(parsed).toEqual({
+		event: "assistant_event",
+		data: {
+			chatId: "chat-1",
+			event: {
+				type: "item_started",
+				turnId: "turn-1",
+				itemId: "tool-1",
+				itemType: "tool",
+				state: "running",
+				summary: "Running command: pwd",
+			},
+		},
+	});
+});
+
 test("parseServerWsEvent parses chat_updated with expected fields", () => {
 	const parsed = parseServerWsEvent(
 		JSON.stringify({

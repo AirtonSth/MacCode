@@ -215,6 +215,7 @@ const createInitialWorkspaceState = (): WorkspaceState => ({
 	messages: [],
 	streamingByChat: {},
 	streamingActiveByChat: {},
+	streamTurnsByChat: {},
 	isSendingMessage: false,
 	isCreatingProject: false,
 	isCreatingChat: false,

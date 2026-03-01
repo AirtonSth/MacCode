@@ -24,7 +24,7 @@ import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
 import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
 import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
-import { useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
+import { type StreamTurnState, useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
 import {
@@ -267,9 +267,13 @@ const App = (): JSX.Element => {
 		[state.chats, state.selectedChatId],
 	);
 
-	const streamingText = selectedChatIdRef.current
-		? state.streamingByChat[selectedChatIdRef.current] ?? ""
+	const selectedChatId = state.selectedChatId;
+	const streamingText = selectedChatId
+		? state.streamingByChat[selectedChatId] ?? ""
 		: "";
+	const streamingTurn: StreamTurnState | null = selectedChatId
+		? state.streamTurnsByChat[selectedChatId] ?? null
+		: null;
 
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
 	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
@@ -293,6 +297,7 @@ const App = (): JSX.Element => {
 		);
 	});
 	const [availableModels, setAvailableModels] = useState<CodexModelDescriptor[]>([]);
+	const [hasLoadedCodexModels, setHasLoadedCodexModels] = useState(false);
 	const [selectedModel, setSelectedModel] = useState<string | null>(() => {
 		if (typeof window === "undefined") {
 			return null;
@@ -369,6 +374,10 @@ const App = (): JSX.Element => {
 	}, [selectedReasoningEffort]);
 
 	useEffect(() => {
+		if (!hasLoadedCodexModels || availableModels.length === 0) {
+			return;
+		}
+
 		const resolvedModel = resolveSelectedModel(availableModels, selectedModel);
 		if (resolvedModel !== selectedModel) {
 			setSelectedModel(resolvedModel);
@@ -382,7 +391,7 @@ const App = (): JSX.Element => {
 		if (resolvedEffort !== selectedReasoningEffort) {
 			setSelectedReasoningEffort(resolvedEffort);
 		}
-	}, [availableModels, selectedModel, selectedReasoningEffort]);
+	}, [availableModels, hasLoadedCodexModels, selectedModel, selectedReasoningEffort]);
 
 	const persistSidebarWidth = useCallback((width: number) => {
 		if (typeof window === "undefined") {
@@ -618,12 +627,13 @@ const App = (): JSX.Element => {
 			const catalog = await api.listCodexModels();
 			setAvailableModels(catalog.models);
 		} catch (error) {
-			setAvailableModels([]);
 			addError(
 				formatApiErrorMessage(error, "Unable to load codex models"),
 				"rest",
 				formatApiErrorCode(error),
 			);
+		} finally {
+			setHasLoadedCodexModels(true);
 		}
 	}, [addError, api, formatApiErrorCode, formatApiErrorMessage]);
 
@@ -645,6 +655,21 @@ const App = (): JSX.Element => {
 						});
 					}
 					break;
+				case "assistant_event":
+					dispatch({
+						payload: {
+							chatId: event.data.chatId,
+							event: event.data.event,
+						},
+						type: "APPLY_ASSISTANT_EVENT",
+					});
+					if (selectedChatIdRef.current === event.data.chatId) {
+						dispatch({
+							payload: false,
+							type: "SET_SENDING_MESSAGE",
+						});
+					}
+					break;
 				case "assistant_done":
 					dispatch({
 						payload: { chatId: event.data.chatId },
@@ -653,6 +678,10 @@ const App = (): JSX.Element => {
 					if (selectedChatIdRef.current === event.data.chatId) {
 						await loadMessagesForChat(event.data.chatId);
 					}
+					dispatch({
+						payload: { chatId: event.data.chatId },
+						type: "CLEAR_STREAM_TURN",
+					});
 					dispatch({
 						payload: false,
 						type: "SET_SENDING_MESSAGE",
@@ -676,6 +705,10 @@ const App = (): JSX.Element => {
 						dispatch({
 							payload: { chatId: event.data.chatId },
 							type: "CLEAR_STREAMING",
+						});
+						dispatch({
+							payload: { chatId: event.data.chatId },
+							type: "CLEAR_STREAM_TURN",
 						});
 						if (selectedChatIdRef.current === event.data.chatId) {
 							dispatch({
@@ -833,8 +866,8 @@ const App = (): JSX.Element => {
 				},
 				onClearStreaming: (chatId) => {
 					dispatch({
-						payload: { chatId },
-						type: "CLEAR_STREAMING",
+						payload: { chatId: chatId ?? null },
+						type: "RESET_STREAMING",
 					});
 				},
 				onCreateMessageError: addError,
@@ -886,6 +919,45 @@ const App = (): JSX.Element => {
 	const handleReasoningEffortChange = useCallback((effort: CodexReasoningEffort) => {
 		setSelectedReasoningEffort(effort);
 	}, []);
+
+	const handleSetStreamItemExpanded = useCallback(
+		(itemId: string, expanded: boolean, byUser: boolean) => {
+			const chatId = selectedChatIdRef.current;
+			if (!chatId) {
+				return;
+			}
+
+			dispatch({
+				payload: {
+					chatId,
+					itemId,
+					expanded,
+					byUser,
+				},
+				type: "SET_STREAM_ITEM_EXPANDED",
+			});
+		},
+		[dispatch],
+	);
+
+	const handleSetStreamItemState = useCallback(
+		(itemId: string, stateValue: "running" | "preview" | "collapsed" | "completed" | "failed" | "cancelled") => {
+			const chatId = selectedChatIdRef.current;
+			if (!chatId) {
+				return;
+			}
+
+			dispatch({
+				payload: {
+					chatId,
+					itemId,
+					state: stateValue,
+				},
+				type: "SET_STREAM_ITEM_STATE",
+			});
+		},
+		[dispatch],
+	);
 
 	const handleSelectProject = useCallback(
 		async (projectId: string) => {
@@ -1394,6 +1466,9 @@ const App = (): JSX.Element => {
 												hasRestError={state.errors.some((error) => error.source === "rest")}
 												loading={state.messagesLoading}
 												messages={state.messages}
+												onSetStreamItemExpanded={handleSetStreamItemExpanded}
+												onSetStreamItemState={handleSetStreamItemState}
+												streamingTurn={streamingTurn}
 												streamingText={streamingText}
 											/>
 										</div>
@@ -1560,6 +1635,9 @@ const App = (): JSX.Element => {
 													hasRestError={state.errors.some((error) => error.source === "rest")}
 													loading={state.messagesLoading}
 													messages={state.messages}
+													onSetStreamItemExpanded={handleSetStreamItemExpanded}
+													onSetStreamItemState={handleSetStreamItemState}
+													streamingTurn={streamingTurn}
 													streamingText={streamingText}
 												/>
 											) : (
