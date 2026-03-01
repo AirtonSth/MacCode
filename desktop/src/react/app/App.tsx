@@ -1203,11 +1203,11 @@ const App = (): JSX.Element => {
 				<motion.div
 						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
 						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
-							className={cn(
-								"grid h-full w-full min-h-0 overflow-hidden rounded-b-[14px] border border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
-								isSidebarVisible
-									? "grid-cols-[var(--desktop-sidebar-width)_8px_minmax(0,1fr)] max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
-									: "grid-cols-[minmax(0,1fr)]",
+						className={cn(
+							"grid h-full w-full min-h-0 overflow-hidden rounded-b-[14px] border-x border-b border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
+							isSidebarVisible
+								? "grid-cols-[var(--desktop-sidebar-width)_8px_minmax(0,1fr)] max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
+								: "grid-cols-[minmax(0,1fr)]",
 							)}
 							initial={shouldReduceMotion ? undefined : { opacity: 0, y: 12 }}
 							transition={{ duration: 0.32, ease: "easeOut" }}
