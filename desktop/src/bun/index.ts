@@ -36,7 +36,7 @@ const appRPC = (BrowserView as unknown as {
 				});
 			},
 			showProjectInFinder: (projectPath: string) => {
-				return Utils.showItemInFolder(projectPath);
+				return Utils.showItemInFolder?.(projectPath);
 			},
 			closeWindow: () => {
 				mainWindowRef?.close();

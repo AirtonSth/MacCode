@@ -79,7 +79,11 @@ declare module "electrobun/bun" {
 			canChooseFiles?: boolean;
 			startingFolder?: string;
 		}) => Promise<string[]>;
+		showItemInFolder?: (path: string) => void;
 	}
 
 	export const Utils: UtilsNamespace;
+	export const ApplicationMenu: {
+		setApplicationMenu: (menu: unknown) => void;
+	};
 }

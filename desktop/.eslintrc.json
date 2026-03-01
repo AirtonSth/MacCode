@@ -57,6 +57,12 @@
       "rules": {
         "n/no-unsupported-features/node-builtins": "off"
       }
+    },
+    {
+      "files": ["src/bun/providers/fake-codex-provider.mjs"],
+      "rules": {
+        "functional/immutable-data": "off"
+      }
     }
   ]
 }

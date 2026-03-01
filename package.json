@@ -8,11 +8,11 @@
   ],
   "scripts": {
     "prepare": "husky",
-    "lint": "bun run lint:desktop",
+    "lint": "bun run lint:mobile && bun run lint:contracts",
     "lint:desktop": "bun run --cwd desktop lint:check",
     "lint:mobile": "bun run --cwd mobile lint",
     "lint:contracts": "bun run --cwd packages/contracts lint",
-    "typecheck": "bun run typecheck:desktop",
+    "typecheck": "bun run typecheck:desktop && bun run typecheck:mobile && bun run typecheck:contracts",
     "typecheck:desktop": "bun run --cwd desktop typecheck",
     "typecheck:mobile": "bun run --cwd mobile typecheck",
     "typecheck:contracts": "bun run --cwd packages/contracts typecheck",
@@ -29,7 +29,10 @@
     "typescript": "^5.9.3"
   },
   "lint-staged": {
-    "desktop/**/*.{ts,tsx,js,jsx}": [
+    "mobile/src/**/*.{ts,tsx,js,jsx}": [
+      "bunx eslint --fix --max-warnings=0"
+    ],
+    "packages/contracts/src/**/*.{ts,tsx,js,jsx}": [
       "bunx eslint --fix --max-warnings=0"
     ]
   }

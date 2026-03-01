@@ -7,7 +7,7 @@ import {
 	type ViewStyle,
 } from "react-native";
 
-import { theme } from "@/shared/theme/tokens";
+import { theme } from "../theme/tokens";
 
 interface GhostButtonProps extends PressableProps {
 	label: string;
@@ -21,9 +21,10 @@ export const GhostButton = ({
 	return (
 		<Pressable
 			{...rest}
-			style={({ pressed }: PressableStateCallbackType) => {
+			style={(state: PressableStateCallbackType) => {
+				const { pressed } = state;
 				const resolvedStyle: StyleProp<ViewStyle> = typeof style === "function"
-					? style({ pressed })
+					? style(state)
 					: style;
 
 				return [

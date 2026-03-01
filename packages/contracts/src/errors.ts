@@ -33,11 +33,13 @@ const toErrorMessage = (value: unknown, fallback: string): string => {
 	}
 
 	const error = value.error;
+
 	if (typeof error === "string" && error.trim().length > 0) {
 		return error;
 	}
 
 	const message = value.message;
+
 	if (typeof message === "string" && message.trim().length > 0) {
 		return message;
 	}

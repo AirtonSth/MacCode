@@ -61,10 +61,5 @@
     "wait-on": "^8.0.3",
     "typescript": "^5.7.2",
     "vite": "5.4.11"
-  },
-  "lint-staged": {
-    "*.{ts,tsx,js,jsx}": [
-      "bunx eslint --fix"
-    ]
   }
 }

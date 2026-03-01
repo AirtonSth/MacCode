@@ -1079,10 +1079,6 @@ const App = (): JSX.Element => {
 		],
 	);
 
-	const clearAllErrors = useCallback(() => {
-		dispatch({ type: "CLEAR_ERRORS" });
-	}, [dispatch]);
-
 	const handleShowMoreThreads = useCallback((projectId: string) => {
 		setExpandedProjectThreads((current) => ({
 			...current,
