@@ -26,6 +26,15 @@ const appRPC = (BrowserView as unknown as {
 					startingFolder: Utils.paths.home,
 				});
 			},
+			openContextPaths: async () => {
+				return Utils.openFileDialog({
+					allowedFileTypes: "*",
+					allowsMultipleSelection: true,
+					canChooseDirectory: true,
+					canChooseFiles: true,
+					startingFolder: Utils.paths.home,
+				});
+			},
 			showProjectInFinder: (projectPath: string) => {
 				return Utils.showItemInFolder(projectPath);
 			},

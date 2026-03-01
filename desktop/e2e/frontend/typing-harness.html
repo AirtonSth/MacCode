@@ -25,6 +25,11 @@
 				background: rgba(15, 23, 42, 0.7);
 			}
 
+			.panel.is-dragging {
+				border-color: rgba(125, 211, 252, 0.8);
+				box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.45) inset;
+			}
+
 			.controls {
 				display: flex;
 				gap: 8px;
@@ -62,13 +67,19 @@
 				background: rgba(15, 23, 42, 0.9);
 				color: #e2e8f0;
 			}
+
+			.hidden-input {
+				display: none;
+			}
 		</style>
 	</head>
 	<body>
 		<div class="container">
-			<section class="panel">
+			<section class="panel" data-testid="composer-dropzone">
 				<textarea aria-label="Message input" placeholder="Ask for follow-up changes"></textarea>
+				<input class="hidden-input" id="context-input" multiple type="file" />
 				<div class="controls">
+					<button aria-label="Attach context" type="button">+</button>
 					<select aria-label="Model">
 						<option>GPT-5.3-Codex-Spark</option>
 					</select>
@@ -85,5 +96,207 @@
 				<button style="margin-top: 8px;" type="button">Run</button>
 			</section>
 		</div>
+		<script>
+			(() => {
+				const absolutePathPattern = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
+				const composer = document.querySelector("textarea[aria-label='Message input']");
+				const attachButton = document.querySelector("button[aria-label='Attach context']");
+				const contextInput = document.querySelector("#context-input");
+				const dropzone = document.querySelector("[data-testid='composer-dropzone']");
+
+				if (!(composer instanceof HTMLTextAreaElement)) {
+					return;
+				}
+				if (!(attachButton instanceof HTMLButtonElement)) {
+					return;
+				}
+				if (!(contextInput instanceof HTMLInputElement)) {
+					return;
+				}
+				if (!(dropzone instanceof HTMLElement)) {
+					return;
+				}
+
+				const normalizePath = (candidate) => {
+					if (typeof candidate !== "string") {
+						return null;
+					}
+
+					const stripped = candidate.trim().replace(/^["']+|["']+$/g, "");
+					if (stripped.length === 0) {
+						return null;
+					}
+
+					let normalized = stripped;
+					if (stripped.toLowerCase().startsWith("file://")) {
+						try {
+							const parsed = new URL(stripped);
+							const decodedPath = decodeURIComponent(parsed.pathname);
+							if (/^\/[A-Za-z]:\//.test(decodedPath)) {
+								normalized = decodedPath.slice(1);
+							} else if (parsed.host.length > 0) {
+								normalized = `//${parsed.host}${decodedPath}`;
+							} else {
+								normalized = decodedPath;
+							}
+						} catch {
+							return null;
+						}
+					}
+
+					return absolutePathPattern.test(normalized) ? normalized : null;
+				};
+
+				const dedupe = (paths) => {
+					const unique = new Set();
+					const ordered = [];
+					for (const path of paths) {
+						if (unique.has(path)) {
+							continue;
+						}
+						unique.add(path);
+						ordered.push(path);
+					}
+					return ordered;
+				};
+
+				const appendPaths = (rawPaths) => {
+					const paths = dedupe(
+						rawPaths
+							.map((item) => normalizePath(item))
+							.filter((item) => typeof item === "string"),
+					);
+					if (paths.length === 0) {
+						return;
+					}
+
+					if (composer.value.length === 0) {
+						composer.value = paths.join(" ");
+						return;
+					}
+
+					const separator = /\s$/.test(composer.value) ? "" : " ";
+					composer.value = `${composer.value}${separator}${paths.join(" ")}`;
+				};
+
+				const extractDroppedPaths = (dataTransfer) => {
+					if (!dataTransfer) {
+						return [];
+					}
+
+					const paths = [];
+
+					if (dataTransfer.files) {
+						for (let index = 0; index < dataTransfer.files.length; index += 1) {
+							const file = dataTransfer.files[index];
+							if (typeof file?.path === "string") {
+								paths.push(file.path);
+							}
+						}
+					}
+
+					const collectFromPayload = (payload) => {
+						if (!payload) {
+							return;
+						}
+
+						const lines = payload
+							.split(/\r?\n/)
+							.map((line) => line.trim())
+							.filter(Boolean);
+
+						for (const line of lines) {
+							if (line.startsWith("#")) {
+								continue;
+							}
+							paths.push(line);
+						}
+					};
+
+					collectFromPayload(dataTransfer.getData("text/uri-list"));
+					collectFromPayload(dataTransfer.getData("text/plain"));
+
+					return dedupe(
+						paths
+							.map((item) => normalizePath(item))
+							.filter((item) => typeof item === "string"),
+					);
+				};
+
+				window.__E2E_PICKER_PATHS = [];
+				window.__E2E_INPUT_CLICK_COUNT = 0;
+				window.__e2eSetPickerPaths = (paths) => {
+					window.__E2E_PICKER_PATHS = Array.isArray(paths) ? paths : [];
+				};
+				window.__e2eGetInputClickCount = () => {
+					return Number(window.__E2E_INPUT_CLICK_COUNT || 0);
+				};
+
+				contextInput.addEventListener("click", () => {
+					window.__E2E_INPUT_CLICK_COUNT = Number(window.__E2E_INPUT_CLICK_COUNT || 0) + 1;
+				});
+
+				contextInput.addEventListener("change", () => {
+					const selectedPaths = Array.from(contextInput.files || []).map((file) => file.path || "");
+					appendPaths(selectedPaths);
+					contextInput.value = "";
+				});
+
+				attachButton.addEventListener("click", () => {
+					const scriptedPaths = Array.isArray(window.__E2E_PICKER_PATHS) ? window.__E2E_PICKER_PATHS : [];
+					if (scriptedPaths.length > 0) {
+						appendPaths(scriptedPaths);
+						window.__E2E_PICKER_PATHS = [];
+						return;
+					}
+
+					contextInput.click();
+				});
+
+				const clearDragState = () => {
+					dropzone.classList.remove("is-dragging");
+				};
+
+				dropzone.addEventListener("dragenter", (event) => {
+					const paths = extractDroppedPaths(event.dataTransfer);
+					if (paths.length === 0) {
+						return;
+					}
+
+					event.preventDefault();
+					dropzone.classList.add("is-dragging");
+				});
+
+				dropzone.addEventListener("dragover", (event) => {
+					const paths = extractDroppedPaths(event.dataTransfer);
+					if (paths.length === 0) {
+						return;
+					}
+
+					event.preventDefault();
+					event.dataTransfer.dropEffect = "copy";
+					dropzone.classList.add("is-dragging");
+				});
+
+				dropzone.addEventListener("dragleave", (event) => {
+					if (event.relatedTarget && dropzone.contains(event.relatedTarget)) {
+						return;
+					}
+
+					clearDragState();
+				});
+
+				dropzone.addEventListener("drop", (event) => {
+					clearDragState();
+					const paths = extractDroppedPaths(event.dataTransfer);
+					if (paths.length === 0) {
+						return;
+					}
+
+					event.preventDefault();
+					appendPaths(paths);
+				});
+			})();
+		</script>
 	</body>
 </html>

@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, KeyboardEvent, useLayoutEffect, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useLayoutEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
 import { ArrowUp, ChevronDown, Loader2, Plus } from "lucide-react";
 import { Button } from "../../../components/ui/button";
@@ -8,6 +8,12 @@ import { GitBranchControl } from "../../git/ui/GitBranchControl";
 import type { ChatStatus } from "../../workspace/model/useWorkspaceStore";
 import type { GitBranchDTO } from "../../../shared/api/remotecode-http";
 import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
+import {
+	appendAttachmentPathsToMessage,
+	extractAttachmentPathsFromDataTransfer,
+	extractAttachmentPathsFromPickerResult,
+	normalizeAttachmentPath,
+} from "../model/attachment-paths";
 import {
 	formatCodexReasoningEffortLabel,
 	type CodexModelDescriptor,
@@ -36,6 +42,7 @@ interface MessageComposerProps {
 	isGitRepository?: boolean | null;
 	onCheckoutBranch?: (branch: string) => Promise<void> | void;
 	onCreateBranch?: (name: string) => Promise<void> | void;
+	onPickContextPaths?: () => Promise<unknown> | unknown;
 	focusMode?: boolean;
 }
 
@@ -63,11 +70,14 @@ export const MessageComposer = ({
 	isGitRepository = null,
 	onCheckoutBranch,
 	onCreateBranch,
+	onPickContextPaths,
 	focusMode = false,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
+	const fileInputRef = useRef<HTMLInputElement>(null);
 	const [validationError, setValidationError] = useState<string | null>(null);
+	const [isDraggingPaths, setIsDraggingPaths] = useState(false);
 	const shouldReduceMotion = useReducedMotion();
 	const isRunning = chatStatus === "running";
 	const isLocked = disabled || sending || isRunning;
@@ -101,6 +111,112 @@ export const MessageComposer = ({
 		onSend(value.trim());
 		setValue("");
 		setValidationError(null);
+	};
+
+	const appendPathsToComposer = (paths: string[]) => {
+		setValue((currentValue) => appendAttachmentPathsToMessage(currentValue, paths));
+		if (validationError) {
+			setValidationError(null);
+		}
+	};
+
+	const handleAttachContextClick = async () => {
+		if (isLocked) {
+			return;
+		}
+
+		if (onPickContextPaths) {
+			try {
+				const pickerResult = await onPickContextPaths();
+				const pickedPaths = extractAttachmentPathsFromPickerResult(pickerResult);
+				if (pickedPaths.length > 0) {
+					appendPathsToComposer(pickedPaths);
+				}
+			} catch {
+				// native picker unavailable
+			}
+
+			return;
+		}
+
+		fileInputRef.current?.click();
+	};
+
+	const handleAttachInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+		const files = event.target.files;
+		if (!files || files.length === 0) {
+			return;
+		}
+
+		const pickedPaths: string[] = [];
+		for (let index = 0; index < files.length; index += 1) {
+			const fileWithPath = files[index] as File & { path?: string };
+			const maybePath = fileWithPath.path;
+			if (typeof maybePath !== "string") {
+				continue;
+			}
+
+			const normalized = normalizeAttachmentPath(maybePath);
+			if (normalized) {
+				pickedPaths.push(normalized);
+			}
+		}
+
+		appendPathsToComposer(pickedPaths);
+		event.target.value = "";
+	};
+
+	const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+		if (isLocked) {
+			return;
+		}
+
+		const draggedPaths = extractAttachmentPathsFromDataTransfer(event.dataTransfer);
+		if (draggedPaths.length === 0) {
+			return;
+		}
+
+		event.preventDefault();
+		setIsDraggingPaths(true);
+	};
+
+	const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+		if (isLocked) {
+			return;
+		}
+
+		const draggedPaths = extractAttachmentPathsFromDataTransfer(event.dataTransfer);
+		if (draggedPaths.length === 0) {
+			return;
+		}
+
+		event.preventDefault();
+		event.dataTransfer.dropEffect = "copy";
+		setIsDraggingPaths(true);
+	};
+
+	const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+		const relatedTarget = event.relatedTarget;
+		if (relatedTarget && event.currentTarget.contains(relatedTarget as Node)) {
+			return;
+		}
+
+		setIsDraggingPaths(false);
+	};
+
+	const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+		setIsDraggingPaths(false);
+		if (isLocked) {
+			return;
+		}
+
+		const droppedPaths = extractAttachmentPathsFromDataTransfer(event.dataTransfer);
+		if (droppedPaths.length === 0) {
+			return;
+		}
+
+		event.preventDefault();
+		appendPathsToComposer(droppedPaths);
 	};
 
 	const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -157,9 +273,24 @@ export const MessageComposer = ({
 				<div
 					className={cn(
 						`codex-sidebar rounded-2xl border border-[#2c3038] bg-[linear-gradient(180deg,#181a1f_0%,#15171b_100%)] px-4 pb-1 pt-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04),_0_16px_30px_rgba(0,0,0,0.35)] ${composerTextClass}`,
+						isDraggingPaths ? "border-sky-300/70 bg-[linear-gradient(180deg,#1b2029_0%,#171b24_100%)]" : "",
 						isLocked ? "opacity-85" : "",
 					)}
+					onDragEnter={handleDragEnter}
+					onDragLeave={handleDragLeave}
+					onDragOver={handleDragOver}
+					onDrop={handleDrop}
 				>
+					<input
+						aria-hidden={true}
+						className="hidden"
+						multiple
+						onChange={handleAttachInputChange}
+						ref={fileInputRef}
+						tabIndex={-1}
+						type="file"
+					/>
+
 					<Textarea
 						ref={textareaRef}
 						aria-label="Message input"
@@ -189,6 +320,9 @@ export const MessageComposer = ({
 								aria-label="Attach context"
 								className="h-6 w-6 shrink-0 rounded-full p-0 text-[#9a9da5] hover:bg-white/[0.04] hover:text-[#c8ccd6]"
 								disabled={isLocked}
+								onClick={() => {
+									void handleAttachContextClick();
+								}}
 								size="icon"
 								type="button"
 								variant="ghost"

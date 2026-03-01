@@ -1119,6 +1119,23 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, handleCreateProject]);
 
+	const handlePickComposerContextPaths = useCallback(async (): Promise<unknown> => {
+		if (!electrobunView) {
+			return [];
+		}
+
+		try {
+			return await electrobunView.rpc.request.openContextPaths();
+		} catch (error) {
+			addError(
+				error instanceof Error ? error.message : "Unable to open native context picker",
+				"rest",
+				"open_context_picker_error",
+			);
+			return [];
+		}
+	}, [addError]);
+
 	const handleOpenProjectInFinder = useCallback(async () => {
 		if (!selectedProject?.path) {
 			addError("No project selected", "rest", "missing_project_path");
@@ -1572,6 +1589,9 @@ const App = (): JSX.Element => {
 														onCheckoutBranch={checkoutBranch}
 														onCreateBranch={createBranch}
 														onModelChange={handleModelChange}
+														onPickContextPaths={
+															electrobunView ? handlePickComposerContextPaths : undefined
+														}
 														onPermissionModeChange={setPermissionMode}
 														onReasoningEffortChange={handleReasoningEffortChange}
 														onSend={handleSendMessage}
