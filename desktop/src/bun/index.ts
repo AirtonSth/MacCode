@@ -1,4 +1,4 @@
-import { BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
+import { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
 
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
@@ -63,6 +63,27 @@ const waitForBackendReady = async () => {
 	throw new Error(`Backend readiness timeout: ${serverConfig.port}`);
 };
 
+const installMacShortcutsMenu = () => {
+	ApplicationMenu.setApplicationMenu([
+		{
+			label: "Remotecode",
+			submenu: [{ role: "about" }, { type: "separator" }, { role: "quit" }],
+		},
+		{
+			label: "Edit",
+			submenu: [
+				{ role: "undo" },
+				{ role: "redo" },
+				{ type: "separator" },
+				{ role: "cut" },
+				{ role: "copy" },
+				{ role: "paste" },
+				{ role: "selectAll" },
+			],
+		},
+	]);
+};
+
 async function getMainViewUrl() {
 	const channel = await Updater.localInfo.channel();
 
@@ -82,6 +103,8 @@ async function getMainViewUrl() {
 
 await createBackendServer({ port: serverConfig.port });
 await waitForBackendReady();
+
+installMacShortcutsMenu();
 
 const url = await getMainViewUrl();
 
