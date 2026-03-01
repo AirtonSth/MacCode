@@ -1374,13 +1374,13 @@ const App = (): JSX.Element => {
 																			{visibleChats.map((chat) => (
 																				<motion.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
 																					<div
-																						className={cn(
-																							"group grid w-full min-h-[2rem] grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-[13px] transition duration-150",
+                                                                                        className={cn(
+                                                                                            "group relative grid w-full min-h-[2rem] grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-[13px] transition duration-150",
 																							state.selectedChatId === chat.id
 																								? "bg-white/[0.07] text-slate-100"
 																								: "text-slate-300 hover:bg-white/[0.03] hover:text-slate-100",
 																						)}
-																					>
+                                                                                        >
 																						<button
 																							aria-label={`Open ${chat.title}`}
 																							className={cn(
@@ -1394,28 +1394,30 @@ const App = (): JSX.Element => {
 																						>
 																							<span className="truncate leading-5">{chat.title}</span>
 																						</button>
-																						<span className="justify-self-end text-[11px] text-slate-500">
-																							{formatRelativeTime(chat.updatedAt)}
-																						</span>
-																						<Tooltip>
-																							<TooltipTrigger asChild>
-																								<Button
-																									aria-label={`Delete ${chat.title}`}
-																									className="h-6 w-6 shrink-0 text-rose-300/80 opacity-0 transition-opacity hover:text-rose-100 group-hover:opacity-100 focus-visible:opacity-100"
-																									onClick={(event) => {
-																										event.stopPropagation();
-																										void handleDeleteChat(chat.id);
-																									}}
-																									size="icon"
-																									type="button"
-																									variant="ghost"
-																								>
-																									<Trash2 className="h-4 w-4" />
-																								</Button>
-																							</TooltipTrigger>
-																							<TooltipContent>Delete thread</TooltipContent>
-																						</Tooltip>
-																					</div>
+                                                                                            <div className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end">
+                                                                                            <span className="pr-1.5 text-[11px] text-slate-500 transition-opacity duration-150 group-hover:opacity-0">
+																								{formatRelativeTime(chat.updatedAt)}
+																							</span>
+																							<Tooltip>
+                                                                                                <TooltipTrigger asChild>
+                                                                                                    <Button
+                                                                                                        aria-label={`Delete ${chat.title}`}
+                                                                                                        className="absolute right-0 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md border border-transparent text-rose-300/80 opacity-0 transition-opacity hover:border-rose-100/20 hover:text-rose-100 group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto pointer-events-none"
+                                                                                                        onClick={(event) => {
+                                                                                                            event.stopPropagation();
+                                                                                                            void handleDeleteChat(chat.id);
+                                                                                                        }}
+                                                                                                        size="icon"
+                                                                                                        type="button"
+                                                                                                        variant="ghost"
+                                                                                                    >
+                                                                                                        <Trash2 className="h-4 w-4" />
+                                                                                                    </Button>
+                                                                                                </TooltipTrigger>
+                                                                                                <TooltipContent>Delete thread</TooltipContent>
+                                                                                            </Tooltip>
+                                                                                        </div>
+                                                                                    </div>
 																				</motion.li>
 																			))}
 																			{hasMoreThreads ? (
