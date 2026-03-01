@@ -1,25 +1,19 @@
 import { type CSSProperties, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 import {
-	AlertTriangle,
 	Folder,
 	FolderSearch,
 	FolderOpen,
 	MessageSquareText,
 	PanelLeft,
-	RefreshCcw,
 	SquareTerminal,
-	Sparkles,
 	Star,
 	Trash2,
-	X,
 } from "lucide-react";
 
 import { Electroview } from "electrobun/view";
-import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { ScrollArea } from "../components/ui/scroll-area";
-import { Separator } from "../components/ui/separator";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
 import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
@@ -27,7 +21,7 @@ import { GitQuickControl } from "../features/git/ui/GitQuickControl";
 import { useProjectGit } from "../features/git/model/useProjectGit";
 import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
 import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
-import { type StreamTurnState, useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
+import { type ChatDTO, type StreamTurnState, useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
 import {
@@ -127,20 +121,6 @@ const getFolderFallbackName = (projectPath: string): string => {
 	return segments[segments.length - 1] ?? "Project";
 };
 
-const getConnectionPillClass = (connectionState: ConnectionState): string => {
-	switch (connectionState) {
-		case "connected":
-			return "border-emerald-300/30 bg-emerald-400/10 text-emerald-100";
-		case "connecting":
-		case "reconnecting":
-			return "border-amber-300/30 bg-amber-400/10 text-amber-100";
-		case "disconnected":
-			return "border-rose-300/30 bg-rose-400/10 text-rose-100";
-		default:
-			return "border-slate-300/20 bg-slate-400/10 text-slate-200";
-	}
-};
-
 const OPEN_PROJECT_RPC_TIMEOUT_MS = 120_000;
 const SIDEBAR_WIDTH_STORAGE_KEY = "remotecode-desktop-sidebar-width";
 const PERMISSION_MODE_STORAGE_KEY = "remotecode:permission-mode";
@@ -166,11 +146,16 @@ const electrobunView = (() => {
 	}
 })();
 
-const SUGGESTION_CARDS = [
-	"Build a classic Snake game in this repo.",
-	"Create a one-page PDF that summarizes this app.",
-	"Create a plan to improve the backend architecture.",
-];
+const createDraftThreadChat = (projectId: string): ChatDTO => ({
+	id: `draft-thread-${projectId}`,
+	projectId,
+	title: "New thread",
+	provider: "fake",
+	status: "pending",
+	diffAdded: 0,
+	diffRemoved: 0,
+	updatedAt: new Date().toISOString(),
+});
 const SIDEBAR_MAX_VISIBLE_THREADS = 3;
 
 const clampSidebarWidth = (width: number): number => {
@@ -269,6 +254,11 @@ const App = (): JSX.Element => {
 		() => state.chats.find((chat) => chat.id === state.selectedChatId) ?? null,
 		[state.chats, state.selectedChatId],
 	);
+	const draftThreadChat = useMemo(
+		() => (state.selectedProjectId ? createDraftThreadChat(state.selectedProjectId) : null),
+		[state.selectedProjectId],
+	);
+	const activeThreadChat = selectedChat ?? draftThreadChat;
 
 	const selectedChatId = state.selectedChatId;
 	const streamingText = selectedChatId
@@ -1174,22 +1164,7 @@ const App = (): JSX.Element => {
 		[runTerminalCommand, state.selectedChatId],
 	);
 
-	const connectionMessage = useMemo(() => {
-		switch (state.connectionState) {
-			case "connected":
-				return "Connected";
-			case "connecting":
-				return "Connecting...";
-			case "reconnecting":
-				return "Reconnecting...";
-			case "disconnected":
-				return "Disconnected";
-			default:
-				return "Idle";
-		}
-	}, [state.connectionState]);
-	const hasProjects = state.projects.length > 0;
-	const isThreadFocusMode = Boolean(state.selectedChatId);
+	const isThreadFocusMode = Boolean(activeThreadChat && state.selectedProjectId);
 	const selectedThreadTerminal = state.selectedChatId
 		? terminalState.chats[state.selectedChatId] ?? null
 		: null;
@@ -1463,41 +1438,40 @@ const App = (): JSX.Element => {
 							</>
 						) : null}
 
-								<main
-									className={cn(
-										"relative z-10 flex min-h-0 flex-col",
-										threadPanelBgClass,
-										isThreadFocusMode && isSidebarVisible ? "shadow-[-20px_0_38px_rgba(4,7,14,0.42)]" : "",
-									)}
-								>
-									{hasProjects ? (
-												isThreadFocusMode ? (
-													<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-														<header className="relative flex h-10 items-center justify-between gap-2 px-4">
-														<div className="relative z-10 flex min-w-0 items-center gap-2">
-															<Tooltip>
-																<TooltipTrigger asChild>
-																	<Button
-																	aria-label={sidebarToggleLabel}
-																	className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
-																	onClick={() => {
+									<main
+										className={cn(
+											"relative z-10 flex min-h-0 flex-col",
+											threadPanelBgClass,
+											isThreadFocusMode && isSidebarVisible ? "shadow-[-20px_0_38px_rgba(4,7,14,0.42)]" : "",
+										)}
+									>
+									{state.selectedProjectId ? (
+										<section className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
+											<header className="relative flex h-10 items-center justify-between gap-2 px-4">
+												<div className="relative z-10 flex min-w-0 items-center gap-2">
+													<Tooltip>
+														<TooltipTrigger asChild>
+															<Button
+																aria-label={sidebarToggleLabel}
+																className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
+																onClick={() => {
 																	setIsSidebarVisible((current) => !current);
 																}}
 																size="icon"
 																type="button"
 																variant="ghost"
-														>
-															<PanelLeft className="h-4 w-4" />
-														</Button>
+															>
+																<PanelLeft className="h-4 w-4" />
+															</Button>
 														</TooltipTrigger>
 														<TooltipContent>{sidebarToggleLabel}</TooltipContent>
-															</Tooltip>
-														<div className="min-w-0">
-															<h2 className="truncate text-sm font-semibold text-slate-100">
-																{selectedChat?.title ?? "No thread selected"}
-															</h2>
-														</div>
+													</Tooltip>
+													<div className="min-w-0">
+														<h2 className="truncate text-sm font-semibold text-slate-100">
+															{activeThreadChat?.title ?? "New thread"}
+														</h2>
 													</div>
+												</div>
 												<div className="relative z-10 flex items-center gap-1.5">
 													<Tooltip>
 														<TooltipTrigger asChild>
@@ -1556,203 +1530,10 @@ const App = (): JSX.Element => {
 												</div>
 											</header>
 
-										<div className="relative min-h-0 flex-1 overflow-hidden">
-											<ConversationPanel
-												chat={selectedChat}
-												focusMode
-												hasRestError={state.errors.some((error) => error.source === "rest")}
-												loading={state.messagesLoading}
-												messages={state.messages}
-												onSetStreamItemExpanded={handleSetStreamItemExpanded}
-												onSetStreamItemState={handleSetStreamItemState}
-												streamingTurn={streamingTurn}
-												streamingText={streamingText}
-											/>
-										</div>
-
-									<div className="shrink-0 px-3 pb-4 pt-3 sm:px-6">
-										<div className="mx-auto w-full max-w-3xl">
-											<MessageComposer
-												availableModels={availableModels}
-												availableReasoningEfforts={availableReasoningEfforts}
-												gitBranches={
-													projectGitState.status?.isRepo === true
-														? projectGitState.branches
-														: []
-												}
-												gitCurrentBranch={
-													projectGitState.status?.isRepo === true
-														? projectGitState.status.currentBranch
-														: null
-												}
-												gitChangedFiles={projectGitState.status?.changedFiles ?? 0}
-												gitAdded={projectGitState.status?.added ?? 0}
-												gitRemoved={projectGitState.status?.removed ?? 0}
-												chatStatus={selectedChat?.status ?? null}
-												disabled={!state.selectedProjectId}
-												focusMode
-												isGitLoading={projectGitState.loading}
-												isGitRepository={
-													selectedProject ? projectGitState.status?.isRepo ?? null : false
-												}
-												onCheckoutBranch={checkoutBranch}
-												onCreateBranch={createBranch}
-												onModelChange={handleModelChange}
-												onPermissionModeChange={setPermissionMode}
-												onReasoningEffortChange={handleReasoningEffortChange}
-												onSend={handleSendMessage}
-												permissionMode={permissionMode}
-												selectedModel={selectedModel}
-												selectedReasoningEffort={selectedReasoningEffort}
-												sending={state.isSendingMessage}
-											/>
-										</div>
-									</div>
-
-									{isTerminalOpen && state.selectedChatId ? (
-										<div className="shrink-0 border-t border-white/10">
-											<div className="h-[42vh] min-h-[220px]">
-												<ThreadTerminalPanel
-													chatId={state.selectedChatId}
-													className="h-full rounded-none border-0"
-													error={selectedThreadTerminal?.error ?? null}
-													isExecuting={Boolean(selectedThreadTerminal?.isExecuting)}
-													isLoading={Boolean(selectedThreadTerminal?.isLoading)}
-													items={selectedThreadTerminal?.items ?? []}
-													key={state.selectedChatId}
-													onRun={(command) => {
-														void handleTerminalRun(command);
-													}}
-												/>
-											</div>
-										</div>
-									) : null}
-								</section>
-												) : (
-													<>
-															<header className="relative flex h-10 items-center justify-between gap-2 px-4 lg:px-5">
-															<div className="relative z-10 flex min-w-0 items-center gap-2">
-																<Tooltip>
-																	<TooltipTrigger asChild>
-																		<Button
-																		aria-label={sidebarToggleLabel}
-																		className="h-7 w-7 shrink-0 text-slate-300 hover:bg-white/[0.06] hover:text-slate-100"
-																		onClick={() => {
-																		setIsSidebarVisible((current) => !current);
-																	}}
-																	size="icon"
-																	type="button"
-																	variant="ghost"
-																>
-																<PanelLeft className="h-4 w-4" />
-															</Button>
-														</TooltipTrigger>
-															<TooltipContent>{sidebarToggleLabel}</TooltipContent>
-														</Tooltip>
-														<div className="min-w-0">
-															<h1 className="truncate text-sm font-semibold text-slate-100">
-																{selectedChat ? selectedChat.title : "New thread"}
-															</h1>
-														</div>
-													</div>
-													<div className="flex shrink-0 items-center gap-2">
-														<Tooltip>
-															<TooltipTrigger asChild>
-																<Button
-																	className="h-7 w-7"
-																	disabled={isOpeningProject}
-																	onClick={() => {
-																	void handleOpenProject();
-																}}
-																	size="icon"
-																	type="button"
-																	variant="outline"
-															>
-															<FolderOpen className="h-3.5 w-3.5" />
-														</Button>
-														</TooltipTrigger>
-														<TooltipContent>Open folder</TooltipContent>
-													</Tooltip>
-														<Tooltip>
-															<TooltipTrigger asChild>
-																<Button
-																	className="h-7 w-7"
-																	onClick={() => {
-																	void Promise.all([loadProjects(), loadCodexModels()]);
-																}}
-																	size="icon"
-																	type="button"
-																	variant="outline"
-															>
-															<RefreshCcw className="h-3.5 w-3.5" />
-														</Button>
-														</TooltipTrigger>
-										<TooltipContent>Reload</TooltipContent>
-								</Tooltip>
-													{state.errors.length > 0 ? (
-										<Tooltip>
-																<TooltipTrigger asChild>
-																	<Button
-																		className="h-7 w-7"
-																		onClick={clearAllErrors}
-																		size="icon"
-																		type="button"
-																		variant="destructive"
-																	>
-																<AlertTriangle className="h-3.5 w-3.5" />
-															</Button>
-															</TooltipTrigger>
-															<TooltipContent>Clear {state.errors.length} errors</TooltipContent>
-														</Tooltip>
-														) : null}
-														<Badge className={getConnectionPillClass(state.connectionState)} variant="outline">
-															{connectionMessage}
-														</Badge>
-										</div>
-									</header>
-
-									<section className="flex min-h-0 flex-1 flex-col gap-3 p-3 lg:p-4">
-										<AnimatePresence initial={false}>
-											{state.errors.length > 0 ? (
-												<motion.div
-													animate={{ opacity: 1, y: 0 }}
-													className="space-y-2"
-													exit={{ opacity: 0, y: -8 }}
-													initial={{ opacity: 0, y: -8 }}
-												>
-													{state.errors.map((error) => (
-														<motion.article
-															className="flex items-start gap-3 rounded-2xl border border-rose-300/30 bg-rose-500/10 px-3 py-2.5 text-xs text-rose-100"
-															key={error.id}
-															layout={!shouldReduceMotion}
-														>
-															<AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-															<div className="min-w-0 flex-1">
-																<p className="truncate font-semibold">{error.code}</p>
-																<p className="truncate">{error.message}</p>
-															</div>
-															<Button
-																aria-label={`Dismiss ${error.message}`}
-																className="h-7 w-7 rounded-lg"
-																onClick={() => {
-																	dispatch({ payload: error.id, type: "REMOVE_ERROR" });
-																}}
-																size="icon"
-																type="button"
-																variant="ghost"
-															>
-																<X className="h-3.5 w-3.5" />
-															</Button>
-														</motion.article>
-													))}
-												</motion.div>
-											) : null}
-										</AnimatePresence>
-
-										<div className="relative min-h-0 flex-1">
-											{state.selectedChatId ? (
+											<div className="relative min-h-0 flex-1 overflow-hidden">
 												<ConversationPanel
-													chat={selectedChat}
+													chat={activeThreadChat}
+													focusMode
 													hasRestError={state.errors.some((error) => error.source === "rest")}
 													loading={state.messagesLoading}
 													messages={state.messages}
@@ -1761,102 +1542,67 @@ const App = (): JSX.Element => {
 													streamingTurn={streamingTurn}
 													streamingText={streamingText}
 												/>
-											) : (
-												<motion.div
-													animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
-													className="grid h-full place-items-center rounded-[28px] border border-white/10 bg-slate-950/45 p-6 text-center backdrop-blur-2xl"
-													initial={shouldReduceMotion ? undefined : { opacity: 0, y: 10 }}
-													transition={{ duration: 0.28 }}
-												>
-													<div>
-														<div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl border border-white/20 bg-white/[0.04]">
-															<Sparkles className="h-5 w-5 text-sky-200" />
-														</div>
-														<h2 className="text-[clamp(1.4rem,2.5vw,2.2rem)] font-bold text-slate-100">
-															Let&apos;s build
-														</h2>
-														<p className="mt-1 text-[clamp(1rem,1.9vw,1.3rem)] text-slate-400">
-															{selectedProject?.name ?? "remotecode.io"}
-														</p>
-													</div>
-												</motion.div>
-											)}
-										</div>
-
-										<div className="space-y-3">
-											<div className="grid gap-2 md:grid-cols-3">
-												{SUGGESTION_CARDS.map((card) => (
-													<button
-														className="group cursor-pointer rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-left text-sm text-slate-300 transition hover:border-white/20 hover:bg-white/[0.06]"
-														key={card}
-														type="button"
-													>
-														<span className="mb-2 inline-flex h-6 w-6 items-center justify-center rounded-lg border border-white/15 bg-white/[0.03]">
-															<Sparkles className="h-3.5 w-3.5 text-slate-300/80 group-hover:text-sky-200" />
-														</span>
-														<span className="block leading-5">{card}</span>
-													</button>
-												))}
 											</div>
 
-												<MessageComposer
-													availableModels={availableModels}
-													availableReasoningEfforts={availableReasoningEfforts}
-													gitBranches={
-														projectGitState.status?.isRepo === true
-															? projectGitState.branches
-															: []
-													}
-													gitCurrentBranch={
-														projectGitState.status?.isRepo === true
-															? projectGitState.status.currentBranch
-															: null
-													}
-													gitChangedFiles={projectGitState.status?.changedFiles ?? 0}
-													gitAdded={projectGitState.status?.added ?? 0}
-													gitRemoved={projectGitState.status?.removed ?? 0}
-													chatStatus={selectedChat?.status ?? null}
-													disabled={!state.selectedProjectId}
-													isGitLoading={projectGitState.loading}
-													isGitRepository={
-														selectedProject ? projectGitState.status?.isRepo ?? null : false
-													}
-													onCheckoutBranch={checkoutBranch}
-													onCreateBranch={createBranch}
-													onModelChange={handleModelChange}
-													onPermissionModeChange={setPermissionMode}
-													onReasoningEffortChange={handleReasoningEffortChange}
-													onSend={handleSendMessage}
-													permissionMode={permissionMode}
-													selectedModel={selectedModel}
-													selectedReasoningEffort={selectedReasoningEffort}
-													sending={state.isSendingMessage}
-												/>
-
-											<Separator />
-
-											<div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-												<span className="inline-flex items-center gap-1.5">
-													<span
-														className={cn(
-															"h-1.5 w-1.5 rounded-full",
-															state.connectionState === "connected"
-																? "bg-emerald-300"
-																: state.connectionState === "disconnected"
-																	? "bg-rose-300"
-																	: "bg-amber-300",
-														)}
+											<div className="shrink-0 px-3 pb-4 pt-3 sm:px-6">
+												<div className="mx-auto w-full max-w-3xl">
+													<MessageComposer
+														availableModels={availableModels}
+														availableReasoningEfforts={availableReasoningEfforts}
+														gitBranches={
+															projectGitState.status?.isRepo === true
+																? projectGitState.branches
+																: []
+														}
+														gitCurrentBranch={
+															projectGitState.status?.isRepo === true
+																? projectGitState.status.currentBranch
+																: null
+														}
+														gitChangedFiles={projectGitState.status?.changedFiles ?? 0}
+														gitAdded={projectGitState.status?.added ?? 0}
+														gitRemoved={projectGitState.status?.removed ?? 0}
+														chatStatus={activeThreadChat?.status ?? null}
+														disabled={!state.selectedProjectId}
+														focusMode
+														isGitLoading={projectGitState.loading}
+														isGitRepository={
+															selectedProject ? projectGitState.status?.isRepo ?? null : false
+														}
+														onCheckoutBranch={checkoutBranch}
+														onCreateBranch={createBranch}
+														onModelChange={handleModelChange}
+														onPermissionModeChange={setPermissionMode}
+														onReasoningEffortChange={handleReasoningEffortChange}
+														onSend={handleSendMessage}
+														permissionMode={permissionMode}
+														selectedModel={selectedModel}
+														selectedReasoningEffort={selectedReasoningEffort}
+														sending={state.isSendingMessage}
 													/>
-													Local
-												</span>
-												<span>{connectionMessage}</span>
-												<span>{selectedProject?.name ?? "No workspace selected"}</span>
+												</div>
 											</div>
-										</div>
-									</section>
-								</>
-							)
-						) : (
+
+											{isTerminalOpen && state.selectedChatId ? (
+												<div className="shrink-0 border-t border-white/10">
+													<div className="h-[42vh] min-h-[220px]">
+														<ThreadTerminalPanel
+															chatId={state.selectedChatId}
+															className="h-full rounded-none border-0"
+															error={selectedThreadTerminal?.error ?? null}
+															isExecuting={Boolean(selectedThreadTerminal?.isExecuting)}
+															isLoading={Boolean(selectedThreadTerminal?.isLoading)}
+															items={selectedThreadTerminal?.items ?? []}
+															key={state.selectedChatId}
+															onRun={(command) => {
+																void handleTerminalRun(command);
+															}}
+														/>
+													</div>
+												</div>
+											) : null}
+										</section>
+									) : (
 							<motion.div
 								animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
 								className="grid flex-1 place-items-center px-6 py-12"

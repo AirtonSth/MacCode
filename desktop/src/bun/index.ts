@@ -132,7 +132,7 @@ const url = await getMainViewUrl();
 
 const mainWindow = new BrowserWindow({
 	titleBarStyle: "default",
-	transparent: true,
+	transparent: false,
 	frame: {
 		height: 700,
 		width: 1200,
