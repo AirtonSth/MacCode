@@ -192,27 +192,6 @@ export const MessageComposer = ({
 				)}
 				<div className="grid gap-2 px-1 sm:grid-cols-3">
 					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
-						<label
-							className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
-							htmlFor={permissionSelectId}
-						>
-							Permissions
-						</label>
-						<select
-							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
-							disabled={isLocked}
-							id={permissionSelectId}
-							onChange={(event) => {
-								onPermissionModeChange(event.target.value as CodexPermissionMode);
-							}}
-							value={permissionMode}
-						>
-							<option value="plan">Plan mode</option>
-							<option value="default">Default mode</option>
-							<option value="full">Full access</option>
-						</select>
-					</div>
-					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
 						<label className="text-[11px] uppercase tracking-[0.16em] text-slate-400" htmlFor={modelSelectId}>
 							Model
 						</label>
@@ -255,6 +234,27 @@ export const MessageComposer = ({
 									{formatCodexReasoningEffortLabel(effort)}
 								</option>
 							))}
+						</select>
+					</div>
+					<div className="flex items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-1.5">
+						<label
+							className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
+							htmlFor={permissionSelectId}
+						>
+							Permissions
+						</label>
+						<select
+							className="h-8 w-full min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
+							disabled={isLocked}
+							id={permissionSelectId}
+							onChange={(event) => {
+								onPermissionModeChange(event.target.value as CodexPermissionMode);
+							}}
+							value={permissionMode}
+						>
+							<option value="plan">Plan mode</option>
+							<option value="default">Default mode</option>
+							<option value="full">Full access</option>
 						</select>
 					</div>
 				</div>
