@@ -699,7 +699,10 @@ const createWorkspaceFlowHarness = () => {
 		}
 	};
 
-	const sendMessage = async (text: string) => {
+	const sendMessage = async (
+		text: string,
+		permissionMode?: "plan" | "default" | "full",
+	) => {
 		if (!state.value.selectedProjectId) {
 			addError("Select a project before sending a message", "rest", "missing_project");
 			return;
@@ -721,7 +724,7 @@ const createWorkspaceFlowHarness = () => {
 			},
 			onCreateMessageError: addError,
 			onSendUserMessage: (chatId, messageText) => {
-				wsRef?.sendUserMessage(chatId, messageText);
+				wsRef?.sendUserMessage(chatId, messageText, permissionMode);
 			},
 			onSetSending: (sending) => {
 				dispatch({ type: "SET_SENDING_MESSAGE", payload: sending });
@@ -806,14 +809,18 @@ describe("workspace frontend flow coverage", () => {
 			harness.connectRealtime();
 			MockWebSocket.instances[0]?.triggerOpen();
 
-			await harness.sendMessage("Start my thread");
+			await harness.sendMessage("Start my thread", "default");
 
 			const state = harness.getState();
 			const sent = MockWebSocket.instances[0]?.sent ?? [];
 			const sendEvent = sent.find((payload) => {
 				try {
 					const parsed = JSON.parse(payload);
-					return parsed.event === "user_message" && parsed.data?.chatId === "chat-1";
+					return (
+						parsed.event === "user_message" &&
+						parsed.data?.chatId === "chat-1" &&
+						parsed.data?.permissionMode === "default"
+					);
 				} catch {
 					return false;
 				}

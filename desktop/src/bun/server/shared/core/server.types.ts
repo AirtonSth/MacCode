@@ -1,3 +1,5 @@
+import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
+
 export interface ChatDTO {
 	diffAdded: number;
 	diffRemoved: number;
@@ -23,6 +25,7 @@ export interface ClientJoinEvent {
 export interface ClientMessageEvent {
 	data: {
 		chatId: string;
+		permissionMode?: CodexPermissionMode;
 		text: string;
 	};
 	event: "user_message";
@@ -60,6 +63,7 @@ export interface CodexProviderResult {
 export interface CodexProviderRunOptions {
 	chatId: string;
 	onDelta: (delta: string) => void;
+	permissionMode?: CodexPermissionMode;
 	text: string;
 	threadId?: string;
 	workspacePath: string;

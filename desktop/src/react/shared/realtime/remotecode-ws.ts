@@ -1,3 +1,5 @@
+import type { CodexPermissionMode } from "../../../shared/codex-permission-mode";
+
 export type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
 export type WsConnectionEvent = (state: ConnectionState) => void;
@@ -13,6 +15,7 @@ export interface ClientMessageEvent {
 	data: {
 		chatId: string;
 		text: string;
+		permissionMode?: CodexPermissionMode;
 	};
 	event: "user_message";
 }
@@ -379,8 +382,15 @@ export const RemoteCodeRealtime = {
 				send({ data: { chatId }, event: "join_chat" });
 			},
 
-			sendUserMessage(chatId: string, text: string) {
-				send({ data: { chatId, text }, event: "user_message" });
+			sendUserMessage(chatId: string, text: string, permissionMode?: CodexPermissionMode) {
+				send({
+					data: {
+						chatId,
+						text,
+						...(permissionMode ? { permissionMode } : {}),
+					},
+					event: "user_message",
+				});
 			},
 
 			getIsConnected() {

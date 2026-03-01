@@ -268,3 +268,132 @@ test("CodexProviderRunner uses resolved process exit code when subprocess fails"
 	expect(result.status).toBe("failed");
 	expect(result.error).toContain("simulated stderr failure");
 });
+
+test("CodexProviderRunner builds plan mode command for fresh exec", async () => {
+	let capturedCommand: string[] = [];
+	const runner = new CodexProviderRunner((input) => {
+		capturedCommand = input.cmd;
+		return {
+			exitCode: 0,
+			exited: Promise.resolve(0),
+			stderr: toStream(""),
+			stdout: toStream(
+				[
+					JSON.stringify({ item: { id: "msg-1", text: "ok", type: "agent_message" }, type: "item.completed" }),
+					JSON.stringify({ type: "turn.completed" }),
+					"",
+				].join("\n"),
+			),
+		};
+	});
+
+	const result = await runner.run({
+		chatId: "chat-plan",
+		onDelta: () => {
+			// no-op
+		},
+		permissionMode: "plan",
+		text: "hello",
+		workspacePath: "/tmp/workspace",
+	});
+
+	expect(result.status).toBe("completed");
+	expect(capturedCommand).toEqual([
+		"codex",
+		"--sandbox",
+		"read-only",
+		"--ask-for-approval",
+		"never",
+		"exec",
+		"--json",
+		"--skip-git-repo-check",
+		"--cd",
+		"/tmp/workspace",
+		"hello",
+	]);
+});
+
+test("CodexProviderRunner defaults to workspace-write mode when permission mode is omitted", async () => {
+	let capturedCommand: string[] = [];
+	const runner = new CodexProviderRunner((input) => {
+		capturedCommand = input.cmd;
+		return {
+			exitCode: 0,
+			exited: Promise.resolve(0),
+			stderr: toStream(""),
+			stdout: toStream(
+				[
+					JSON.stringify({ item: { id: "msg-1", text: "ok", type: "agent_message" }, type: "item.completed" }),
+					JSON.stringify({ type: "turn.completed" }),
+					"",
+				].join("\n"),
+			),
+		};
+	});
+
+	const result = await runner.run({
+		chatId: "chat-default",
+		onDelta: () => {
+			// no-op
+		},
+		text: "hello",
+		workspacePath: "/tmp/workspace",
+	});
+
+	expect(result.status).toBe("completed");
+	expect(capturedCommand).toEqual([
+		"codex",
+		"--sandbox",
+		"workspace-write",
+		"--ask-for-approval",
+		"never",
+		"exec",
+		"--json",
+		"--skip-git-repo-check",
+		"--cd",
+		"/tmp/workspace",
+		"hello",
+	]);
+});
+
+test("CodexProviderRunner builds full access command for resume flow", async () => {
+	let capturedCommand: string[] = [];
+	const runner = new CodexProviderRunner((input) => {
+		capturedCommand = input.cmd;
+		return {
+			exitCode: 0,
+			exited: Promise.resolve(0),
+			stderr: toStream(""),
+			stdout: toStream(
+				[
+					JSON.stringify({ item: { id: "msg-1", text: "ok", type: "agent_message" }, type: "item.completed" }),
+					JSON.stringify({ type: "turn.completed" }),
+					"",
+				].join("\n"),
+			),
+		};
+	});
+
+	const result = await runner.run({
+		chatId: "chat-full",
+		onDelta: () => {
+			// no-op
+		},
+		permissionMode: "full",
+		text: "hello",
+		threadId: "thread-1",
+		workspacePath: "/tmp/workspace",
+	});
+
+	expect(result.status).toBe("completed");
+	expect(capturedCommand).toEqual([
+		"codex",
+		"--dangerously-bypass-approvals-and-sandbox",
+		"exec",
+		"resume",
+		"--json",
+		"--skip-git-repo-check",
+		"thread-1",
+		"hello",
+	]);
+});

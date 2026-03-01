@@ -2,6 +2,7 @@ import { Elysia, t } from "elysia";
 
 import { serverConfig } from "../../config";
 import { resolveWsToken } from "../../shared/auth/auth.service";
+import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import type { ClientWsEvent, ServerWsEvent } from "../../types";
 import type { WsService } from "./ws.model";
 
@@ -197,11 +198,25 @@ export class WsController {
 							});
 							return;
 						}
+						const rawPermissionMode = (payload.data as { permissionMode?: unknown }).permissionMode;
+						const permissionMode = parseCodexPermissionMode(rawPermissionMode);
+						if (rawPermissionMode !== undefined && permissionMode === null) {
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: invalid permission mode",
+								},
+								event: "error",
+							});
+							return;
+						}
 
 						this.joinChat(chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
 							chatId,
 							emit,
+							permissionMode: permissionMode ?? undefined,
 							text,
 						});
 						return;

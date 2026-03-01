@@ -112,6 +112,7 @@ codexTest(`WS emits intermediate thinking/tool deltas before assistant_done${ski
 		ws.send({
 			data: {
 				chatId,
+				permissionMode: "default",
 				text: "Run exactly one shell command: pwd. After that, reply with exactly: ws-codex-flow-ok",
 			},
 			event: "user_message",
@@ -281,10 +282,21 @@ test("WS emits validation error for invalid payload", async () => {
 
 		socket.send(JSON.stringify({ data: { bad: true }, event: "user_message" }));
 		socket.send(JSON.stringify({ data: { chatId: "missing" }, event: "unknown" }));
+		socket.send(
+			JSON.stringify({
+				data: {
+					chatId: "missing",
+					permissionMode: "invalid-mode",
+					text: "hello",
+				},
+				event: "user_message",
+			}),
+		);
 
 		await new Promise((resolve) => setTimeout(resolve, 80));
 
 		expect(events.some((event) => event.includes("validation"))).toBe(true);
+		expect(events.some((event) => event.includes("invalid permission mode"))).toBe(true);
 	} finally {
 		socket?.close();
 		await cleanup();

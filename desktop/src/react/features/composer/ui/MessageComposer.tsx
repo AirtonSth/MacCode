@@ -5,12 +5,15 @@ import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
 import type { ChatStatus } from "../../workspace/model/useWorkspaceStore";
+import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
 
 interface MessageComposerProps {
 	disabled: boolean;
 	sending: boolean;
 	chatStatus: ChatStatus | null;
 	onSend: (text: string) => void;
+	permissionMode: CodexPermissionMode;
+	onPermissionModeChange: (mode: CodexPermissionMode) => void;
 	focusMode?: boolean;
 }
 
@@ -21,6 +24,8 @@ export const MessageComposer = ({
 	sending,
 	chatStatus,
 	onSend,
+	permissionMode,
+	onPermissionModeChange,
 	focusMode = false,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
@@ -89,6 +94,7 @@ export const MessageComposer = ({
 			: sending
 				? "Sending message..."
 				: validationError ?? (hasText ? `${value.length}/${MAX_MESSAGE_LENGTH}` : "Type a message to send.");
+	const permissionSelectId = focusMode ? "permission-mode-focus" : "permission-mode";
 
 	const submitDisabled = isLocked || hasValidationError;
 	const buttonLabel = isRunning ? "Wait" : sending ? "Sending..." : "Send";
@@ -165,6 +171,27 @@ export const MessageComposer = ({
 						/>
 					</div>
 				)}
+				<div className="flex items-center justify-between gap-3 px-1">
+					<label
+						className="text-[11px] uppercase tracking-[0.16em] text-slate-400"
+						htmlFor={permissionSelectId}
+					>
+						Permissions
+					</label>
+					<select
+						className="h-8 min-w-[160px] rounded-lg border border-white/15 bg-slate-900/70 px-2 text-xs text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/35 disabled:cursor-not-allowed disabled:opacity-70"
+						disabled={isLocked}
+						id={permissionSelectId}
+						onChange={(event) => {
+							onPermissionModeChange(event.target.value as CodexPermissionMode);
+						}}
+						value={permissionMode}
+					>
+						<option value="plan">Plan mode</option>
+						<option value="default">Default mode</option>
+						<option value="full">Full access</option>
+					</select>
+				</div>
 				{!focusMode && (
 					<div aria-live="polite" className="flex flex-wrap items-center justify-between gap-3">
 						<span className={cn("text-xs", validationError ? "text-rose-300" : "text-slate-400")}>

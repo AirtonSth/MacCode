@@ -1,4 +1,8 @@
 import type { CodexProviderResult, CodexProviderRunOptions } from "../../types";
+import {
+	DEFAULT_CODEX_PERMISSION_MODE,
+	type CodexPermissionMode,
+} from "../../../../shared/codex-permission-mode";
 
 interface CodexCommandExecutionItem {
 	aggregated_output?: unknown;
@@ -354,10 +358,27 @@ const applyParsedEvent = (
 	}
 };
 
+const buildPermissionFlags = (permissionMode: CodexPermissionMode | undefined): string[] => {
+	const mode = permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
+
+	if (mode === "plan") {
+		return ["--sandbox", "read-only", "--ask-for-approval", "never"];
+	}
+
+	if (mode === "full") {
+		return ["--dangerously-bypass-approvals-and-sandbox"];
+	}
+
+	return ["--sandbox", "workspace-write", "--ask-for-approval", "never"];
+};
+
 const buildCommand = (options: CodexProviderRunOptions): string[] => {
+	const permissionFlags = buildPermissionFlags(options.permissionMode);
+
 	if (options.threadId) {
 		return [
 			"codex",
+			...permissionFlags,
 			"exec",
 			"resume",
 			"--json",
@@ -369,6 +390,7 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 
 	return [
 		"codex",
+		...permissionFlags,
 		"exec",
 		"--json",
 		"--skip-git-repo-check",

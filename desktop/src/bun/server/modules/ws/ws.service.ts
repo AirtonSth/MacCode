@@ -1,4 +1,5 @@
 import type { ChatDTO, ServerWsEvent } from "../../types";
+import { DEFAULT_CODEX_PERMISSION_MODE } from "../../../../shared/codex-permission-mode";
 import type { ChatRepository } from "../chat/chat.repository";
 import {
 	type CodexProviderRunnerContract,
@@ -69,7 +70,8 @@ export class WsService implements WsServiceContract {
 		return this.chatRepository.findChatById(chatId);
 	}
 
-	async startUserMessage({ chatId, emit, text }: WsServiceInput): Promise<void> {
+	async startUserMessage(input: WsServiceInput): Promise<void> {
+		const { chatId, emit, text } = input;
 		const chat = await this.chatRepository.findChatById(chatId);
 
 		if (!chat) {
@@ -120,6 +122,7 @@ export class WsService implements WsServiceContract {
 		this.runningChats.add(chatId);
 
 		try {
+			const permissionMode = input.permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
 			const providerResult = await this.codexProviderRunner.run({
 				chatId,
 				onDelta: (delta: string) => {
@@ -131,6 +134,7 @@ export class WsService implements WsServiceContract {
 						event: "assistant_delta",
 					});
 				},
+				permissionMode,
 				text,
 				threadId: this.chatRepository.findProviderThreadIdByChatId(chatId) ?? undefined,
 				workspacePath: project.path,

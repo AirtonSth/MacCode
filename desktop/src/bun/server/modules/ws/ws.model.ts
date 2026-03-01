@@ -1,4 +1,4 @@
-import type { ChatDTO, ClientWsEvent, ServerWsEvent } from "../../types";
+import type { ChatDTO, ClientMessageEvent, ClientWsEvent, ServerWsEvent } from "../../types";
 
 export type WsEventPayload = ClientWsEvent;
 
@@ -11,5 +11,6 @@ export interface WsService {
 export interface WsServiceInput {
 	chatId: string;
 	emit: (event: ServerWsEvent) => void;
+	permissionMode?: ClientMessageEvent["data"]["permissionMode"];
 	text: string;
 }

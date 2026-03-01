@@ -27,6 +27,11 @@ import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel
 import { useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
+import {
+	DEFAULT_CODEX_PERMISSION_MODE,
+	parseCodexPermissionMode,
+	type CodexPermissionMode,
+} from "../../shared/codex-permission-mode";
 import { RemoteCodeApi, RemoteCodeApiError } from "../shared/api/remotecode-http";
 import {
 	RemoteCodeRealtime,
@@ -130,6 +135,7 @@ const getConnectionPillClass = (connectionState: ConnectionState): string => {
 
 const OPEN_PROJECT_RPC_TIMEOUT_MS = 120_000;
 const SIDEBAR_WIDTH_STORAGE_KEY = "remotecode-desktop-sidebar-width";
+const PERMISSION_MODE_STORAGE_KEY = "remotecode:permission-mode";
 const DEFAULT_SIDEBAR_WIDTH = 272;
 const SIDEBAR_WIDTH_MIN = 208;
 const SIDEBAR_WIDTH_MAX = 560;
@@ -218,10 +224,32 @@ const App = (): JSX.Element => {
 		return parseSidebarWidth(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
 	});
 	const [isSidebarVisible, setIsSidebarVisible] = useState<boolean>(true);
+	const [permissionMode, setPermissionMode] = useState<CodexPermissionMode>(() => {
+		if (typeof window === "undefined") {
+			return DEFAULT_CODEX_PERMISSION_MODE;
+		}
+
+		return (
+			parseCodexPermissionMode(window.localStorage.getItem(PERMISSION_MODE_STORAGE_KEY)) ??
+			DEFAULT_CODEX_PERMISSION_MODE
+		);
+	});
 
 	useEffect(() => {
 		sidebarWidthRef.current = sidebarWidth;
 	}, [sidebarWidth]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		try {
+			window.localStorage.setItem(PERMISSION_MODE_STORAGE_KEY, permissionMode);
+		} catch {
+			// Ignore storage failures in restricted environments
+		}
+	}, [permissionMode]);
 
 	const persistSidebarWidth = useCallback((width: number) => {
 		if (typeof window === "undefined") {
@@ -664,7 +692,7 @@ const App = (): JSX.Element => {
 				},
 				onCreateMessageError: addError,
 				onSendUserMessage: (chatId, messageText) => {
-					wsRef.current?.sendUserMessage(chatId, messageText);
+					wsRef.current?.sendUserMessage(chatId, messageText, permissionMode);
 				},
 				onSetSending: (sending) => {
 					dispatch({
@@ -682,6 +710,7 @@ const App = (): JSX.Element => {
 			addError,
 			dispatch,
 			handleCreateChat,
+			permissionMode,
 			selectedChat?.provider,
 			state.selectedChatId,
 			state.selectedProjectId,
@@ -1205,7 +1234,9 @@ const App = (): JSX.Element => {
 												chatStatus={selectedChat?.status ?? null}
 												disabled={!state.selectedProjectId}
 												focusMode
+												onPermissionModeChange={setPermissionMode}
 												onSend={handleSendMessage}
+												permissionMode={permissionMode}
 												sending={state.isSendingMessage}
 											/>
 										</div>
@@ -1396,7 +1427,9 @@ const App = (): JSX.Element => {
 											<MessageComposer
 												chatStatus={selectedChat?.status ?? null}
 												disabled={!state.selectedProjectId}
+												onPermissionModeChange={setPermissionMode}
 												onSend={handleSendMessage}
+												permissionMode={permissionMode}
 												sending={state.isSendingMessage}
 											/>
 

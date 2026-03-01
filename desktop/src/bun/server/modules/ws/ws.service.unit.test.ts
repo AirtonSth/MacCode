@@ -192,6 +192,137 @@ test("WsService.startUserMessage emits project_not_found when project does not e
 	]);
 });
 
+test("WsService.startUserMessage forwards explicit permission mode to codex runner", async () => {
+	const chat = createChat();
+	let capturedPermissionMode: string | undefined;
+	let findChatCalls = 0;
+
+	const chatRepository = {
+		findChatById: () => {
+			findChatCalls += 1;
+			if (findChatCalls === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+			...chat,
+			...update,
+			updatedAt: new Date().toISOString(),
+		}),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => ({
+			chatId: chat.id,
+			content: "",
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role: "assistant" as const,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async (options: { onDelta: (delta: string) => void; permissionMode?: string }) => {
+			capturedPermissionMode = options.permissionMode;
+			options.onDelta("hello");
+			return {
+				assistantText: "hello",
+				diffAdded: 5,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({
+		chatId: "chat-id",
+		emit: collector.emit,
+		permissionMode: "plan",
+		text: "hi",
+	});
+
+	expect(capturedPermissionMode).toBe("plan");
+});
+
+test("WsService.startUserMessage defaults permission mode to default", async () => {
+	const chat = createChat();
+	let capturedPermissionMode: string | undefined;
+	let findChatCalls = 0;
+
+	const chatRepository = {
+		findChatById: () => {
+			findChatCalls += 1;
+			if (findChatCalls === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+			...chat,
+			...update,
+			updatedAt: new Date().toISOString(),
+		}),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => ({
+			chatId: chat.id,
+			content: "",
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role: "assistant" as const,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async (options: { onDelta: (delta: string) => void; permissionMode?: string }) => {
+			capturedPermissionMode = options.permissionMode;
+			options.onDelta("hello");
+			return {
+				assistantText: "hello",
+				diffAdded: 5,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({
+		chatId: "chat-id",
+		emit: collector.emit,
+		text: "hi",
+	});
+
+	expect(capturedPermissionMode).toBe("default");
+});
+
 test("WsService persists providerThreadId returned by codex runner", async () => {
 	const chat = createChat();
 	const updates: Array<{ chatId: string; providerThreadId: string | null }> = [];
