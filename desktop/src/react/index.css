@@ -42,18 +42,19 @@
 	#root {
 		height: 100%;
 		width: 100%;
+		background: transparent;
 	}
 
 	body {
-		@apply m-0 bg-background text-foreground antialiased;
-		background-image:
-			radial-gradient(circle at 8% -6%, rgba(247, 98, 169, 0.16), transparent 30%),
-			radial-gradient(circle at 96% 4%, rgba(95, 180, 255, 0.2), transparent 34%),
-			radial-gradient(circle at 50% 100%, rgba(118, 93, 255, 0.18), transparent 42%),
-			linear-gradient(160deg, #05070f 0%, #080b14 50%, #05070f 100%);
-		background-attachment: fixed;
+		@apply m-0 text-foreground antialiased;
+		background: transparent;
 		font-family: "Manrope", "Plus Jakarta Sans", "Avenir Next", "SF Pro Display", sans-serif;
 		-webkit-font-smoothing: antialiased;
+	}
+
+	#root {
+		overflow: hidden;
+		border-radius: 14px;
 	}
 
 	button,

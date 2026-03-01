@@ -3,6 +3,8 @@ import { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "ele
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
 
+let mainWindowRef: BrowserWindow | null = null;
+
 const appRPC = (BrowserView as unknown as {
 	defineRPC: <T>(config: {
 		maxRequestTime?: number;
@@ -23,6 +25,26 @@ const appRPC = (BrowserView as unknown as {
 					canChooseFiles: false,
 					startingFolder: Utils.paths.home,
 				});
+			},
+			showProjectInFinder: (projectPath: string) => {
+				return Utils.showItemInFolder(projectPath);
+			},
+			closeWindow: () => {
+				mainWindowRef?.close();
+			},
+			minimizeWindow: () => {
+				mainWindowRef?.minimize();
+			},
+			toggleMaximizeWindow: () => {
+				if (!mainWindowRef) {
+					return;
+				}
+
+				if (mainWindowRef.isMaximized()) {
+					mainWindowRef.unmaximize();
+				} else {
+					mainWindowRef.maximize();
+				}
 			},
 		},
 		messages: {},
@@ -109,6 +131,8 @@ installMacShortcutsMenu();
 const url = await getMainViewUrl();
 
 const mainWindow = new BrowserWindow({
+	titleBarStyle: "hidden",
+	transparent: true,
 	frame: {
 		height: 700,
 		width: 1200,
@@ -119,6 +143,7 @@ const mainWindow = new BrowserWindow({
 	url,
 	rpc: appRPC,
 });
+mainWindowRef = mainWindow;
 
 const webview = mainWindow.webview;
 webview.on("dom-ready", () => {

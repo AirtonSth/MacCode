@@ -1,4 +1,6 @@
 declare module "electrobun/bun" {
+	export type WindowTitleBarStyle = "hidden" | "hiddenInset" | "default";
+
 	export interface WebView {
 		openDevTools: () => void;
 		on: (event: string, listener: (...args: unknown[]) => void) => void;
@@ -11,14 +13,27 @@ declare module "electrobun/bun" {
 			x?: number;
 			y?: number;
 		};
+		titleBarStyle?: WindowTitleBarStyle;
 		title?: string;
+		transparent?: boolean;
 		url?: string;
 		rpc?: unknown;
+		navigationRules?: string | null;
+		sandbox?: boolean;
 	}
 
 	export class BrowserWindow {
 		constructor(options?: BrowserWindowConfig);
 		webview: WebView;
+		close(): void;
+		focus(): void;
+		show(): void;
+		minimize(): void;
+		unminimize(): void;
+		isMinimized(): boolean;
+		maximize(): void;
+		unmaximize(): void;
+		isMaximized(): boolean;
 	}
 
 	export interface BrowserViewConfig {

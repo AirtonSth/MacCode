@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
 	AlertTriangle,
 	Folder,
+	FolderSearch,
 	FolderOpen,
 	MessageSquareText,
 	PanelLeft,
@@ -1113,6 +1114,28 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, handleCreateProject]);
 
+	const handleOpenProjectInFinder = useCallback(async () => {
+		if (!selectedProject?.path) {
+			addError("No project selected", "rest", "missing_project_path");
+			return;
+		}
+
+		if (!electrobunView) {
+			addError("Native finder action is unavailable", "rest", "native_rpc_unavailable");
+			return;
+		}
+
+		try {
+			await electrobunView.rpc.request.showProjectInFinder(selectedProject.path);
+		} catch (error) {
+			addError(
+				error instanceof Error ? error.message : "Unable to open project in finder",
+				"rest",
+				"open_in_finder_error",
+			);
+		}
+	}, [addError, electrobunView, selectedProject?.path]);
+
 	const handleWindowControl = useCallback(
 		async (action: "closeWindow" | "minimizeWindow" | "toggleMaximizeWindow") => {
 			if (!electrobunView) {
@@ -1587,21 +1610,51 @@ const App = (): JSX.Element => {
 															</h2>
 														</div>
 													</div>
-							<Button
-														className={cn(
-															"rounded-lg h-8 w-8 gap-1.5 bg-transparent transition-colors hover:bg-sky-400/10 hover:text-sky-100 active:bg-sky-400/10 active:text-sky-100 focus-visible:bg-sky-400/10 focus-visible:text-sky-100",
-															isTerminalOpen
-																? "bg-sky-400/10 text-sky-100"
-																: "text-slate-200",
-														)}
-														size="icon"
-														onClick={handleToggleTerminal}
-														type="button"
-														variant="ghost"
-													>
-														<SquareTerminal className="h-4 w-4" />
-														<span className="sr-only">{isTerminalOpen ? "Hide terminal" : "Show terminal"}</span>
-													</Button>
+													<div className="relative z-10 flex items-center gap-1.5">
+													<Tooltip>
+														<TooltipTrigger asChild>
+															<Button
+																aria-label={isTerminalOpen ? "Hide terminal" : "Show terminal"}
+																className={cn(
+																	"rounded-lg h-8 w-8 gap-1.5 bg-transparent transition-colors hover:bg-sky-400/10 hover:text-sky-100 active:bg-sky-400/10 active:text-sky-100 focus-visible:bg-sky-400/10 focus-visible:text-sky-100",
+																	isTerminalOpen
+																		? "bg-sky-400/10 text-sky-100"
+																		: "text-slate-200",
+																)}
+																onClick={handleToggleTerminal}
+																size="icon"
+																type="button"
+																variant="ghost"
+															>
+																<SquareTerminal className="h-4 w-4" />
+																<span className="sr-only">
+																	{isTerminalOpen ? "Hide terminal" : "Show terminal"}
+																</span>
+															</Button>
+														</TooltipTrigger>
+														<TooltipContent>
+															{isTerminalOpen ? "Esconder terminal" : "Abrir terminal"}
+														</TooltipContent>
+													</Tooltip>
+													<Tooltip>
+														<TooltipTrigger asChild>
+															<Button
+																aria-label="Open project in Finder"
+																className="rounded-lg h-8 w-8 gap-1.5 bg-transparent text-slate-200 transition-colors hover:bg-sky-400/10 hover:text-sky-100 active:bg-sky-400/10 active:text-sky-100 focus-visible:bg-sky-400/10 focus-visible:text-sky-100 disabled:text-slate-500 disabled:hover:bg-transparent"
+																disabled={!selectedProject?.path || !electrobunView}
+																onClick={() => {
+																	void handleOpenProjectInFinder();
+																}}
+																size="icon"
+																type="button"
+																variant="ghost"
+															>
+																<FolderSearch className="h-4 w-4" />
+															</Button>
+														</TooltipTrigger>
+														<TooltipContent>Abrir no Finder</TooltipContent>
+													</Tooltip>
+												</div>
 											</header>
 
 										<div className="relative min-h-0 flex-1 overflow-hidden">
