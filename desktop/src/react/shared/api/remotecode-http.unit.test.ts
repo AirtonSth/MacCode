@@ -277,6 +277,215 @@ test("RemoteCodeApi executes terminal command via POST /v1/chats/:id/terminal/ex
 	}
 });
 
+test("RemoteCodeApi gets project git status from GET /v1/projects/:id/git/status", async () => {
+	let method = "";
+	let pathname = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		pathname = url.pathname;
+		return jsonResponse({
+			isRepo: true,
+			currentBranch: "main",
+			ahead: 2,
+			behind: 0,
+			changedFiles: 4,
+			stagedFiles: 0,
+			unstagedFiles: 1,
+			untrackedFiles: 3,
+			conflictedFiles: 0,
+			isDetachedHead: false,
+			added: 0,
+			removed: 0,
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+
+		const status = await client.getProjectGitStatus("project-1");
+
+		expect(method).toBe("GET");
+		expect(pathname).toBe("/v1/projects/project-1/git/status");
+		expect(status.currentBranch).toBe("main");
+		expect(status.stagedFiles).toBe(0);
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi lists project git branches from GET /v1/projects/:id/git/branches", async () => {
+	let method = "";
+	let pathname = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		pathname = url.pathname;
+		return jsonResponse({
+			currentBranch: "main",
+			branches: ["main", "feature/ci"],
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+
+		const branches = await client.getProjectGitBranches("project-1");
+
+		expect(method).toBe("GET");
+		expect(pathname).toBe("/v1/projects/project-1/git/branches");
+		expect(branches.branches).toHaveLength(2);
+		expect(branches.currentBranch).toBe("main");
+		expect(branches.branches[1]).toBe("feature/ci");
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi checks out a git branch via POST /v1/projects/:id/git/branches/checkout", async () => {
+	let method = "";
+	let pathname = "";
+	let body = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		pathname = url.pathname;
+		body = String(init?.body ?? "");
+
+		return jsonResponse({
+			branch: "feature/ci",
+			switched: true,
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+
+		const result = await client.checkoutProjectGitBranch("project-1", "feature/ci");
+
+		expect(method).toBe("POST");
+		expect(pathname).toBe("/v1/projects/project-1/git/branches/checkout");
+		expect(body).toBe(JSON.stringify({ branch: "feature/ci" }));
+		expect(result.switched).toBe(true);
+		expect(result.branch).toBe("feature/ci");
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi creates a git branch via POST /v1/projects/:id/git/branches/create", async () => {
+	let method = "";
+	let pathname = "";
+	let body = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		pathname = url.pathname;
+		body = String(init?.body ?? "");
+
+		return jsonResponse({
+			branch: "feature/new",
+			created: true,
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+
+		const result = await client.createProjectGitBranch("project-1", "feature/new");
+
+		expect(method).toBe("POST");
+		expect(pathname).toBe("/v1/projects/project-1/git/branches/create");
+		expect(body).toBe(JSON.stringify({ name: "feature/new" }));
+		expect(result.created).toBe(true);
+		expect(result.branch).toBe("feature/new");
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi creates a commit via POST /v1/projects/:id/git/commit", async () => {
+	let method = "";
+	let pathname = "";
+	let body = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		pathname = url.pathname;
+		body = String(init?.body ?? "");
+
+		return jsonResponse({
+			commit: {
+				branch: "main",
+				commitHash: "a1b2c3d",
+				commitMessage: "chore: commit all changes",
+				pushed: true,
+				pushedWithUpstream: false,
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+
+		const result = await client.commitProject("project-1", {
+			message: "chore: commit all changes",
+			includeUnstaged: true,
+			push: true,
+		});
+
+		expect(method).toBe("POST");
+		expect(pathname).toBe("/v1/projects/project-1/git/commit");
+		expect(body).toBe(
+			JSON.stringify({
+				message: "chore: commit all changes",
+				includeUnstaged: true,
+				push: true,
+			}),
+		);
+		expect(result.commit.branch).toBe("main");
+		expect(result.commit.pushed).toBe(true);
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi throws RemoteCodeApiError on git branch list failure", async () => {
+	let pathname = "";
+	const restore = createMockFetch((url) => {
+		pathname = url.pathname;
+		return jsonResponse({ error: "failed to list branches" }, 500);
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+
+		await expect(client.getProjectGitBranches("project-1")).rejects.toMatchObject({
+			status: 500,
+			code: "500",
+			payload: {
+				error: "failed to list branches",
+			},
+		});
+		expect(pathname).toBe("/v1/projects/project-1/git/branches");
+	} finally {
+		restore();
+	}
+});
+
 test("RemoteCodeApi throws RemoteCodeApiError when request fails", async () => {
 	const restore = createMockFetch(() => jsonResponse({ error: "forbidden" }, 403));
 

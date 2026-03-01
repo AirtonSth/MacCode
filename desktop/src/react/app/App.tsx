@@ -23,6 +23,8 @@ import { Separator } from "../components/ui/separator";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
 import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
+import { GitQuickControl } from "../features/git/ui/GitQuickControl";
+import { useProjectGit } from "../features/git/model/useProjectGit";
 import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
 import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
 import { type StreamTurnState, useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
@@ -478,6 +480,19 @@ const App = (): JSX.Element => {
 	const formatApiErrorMessage = useCallback((error: unknown, fallback: string) => {
 		return error instanceof Error ? error.message : fallback;
 	}, []);
+
+	const {
+		state: projectGitState,
+		checkoutBranch,
+		createBranch,
+		refresh: refreshProjectGit,
+	} = useProjectGit({
+		projectId: state.selectedProjectId,
+		api,
+		onError: (message) => {
+			addError(message, "rest", "git_error");
+		},
+	});
 
 	const {
 		state: terminalState,
@@ -1481,7 +1496,7 @@ const App = (): JSX.Element => {
 															</h2>
 														</div>
 													</div>
-													<div className="relative z-10 flex items-center gap-1.5">
+												<div className="relative z-10 flex items-center gap-1.5">
 													<Tooltip>
 														<TooltipTrigger asChild>
 															<Button
@@ -1525,6 +1540,17 @@ const App = (): JSX.Element => {
 														</TooltipTrigger>
 														<TooltipContent>Abrir no Finder</TooltipContent>
 													</Tooltip>
+													<GitQuickControl
+														className="relative"
+														client={api}
+														disabled={
+															!selectedProject?.id || projectGitState.status?.isRepo === false || projectGitState.loading
+														}
+														project={selectedProject}
+														onCommitted={() => {
+															void refreshProjectGit();
+														}}
+													/>
 												</div>
 											</header>
 
@@ -1547,9 +1573,28 @@ const App = (): JSX.Element => {
 											<MessageComposer
 												availableModels={availableModels}
 												availableReasoningEfforts={availableReasoningEfforts}
+												gitBranches={
+													projectGitState.status?.isRepo === true
+														? projectGitState.branches
+														: []
+												}
+												gitCurrentBranch={
+													projectGitState.status?.isRepo === true
+														? projectGitState.status.currentBranch
+														: null
+												}
+												gitChangedFiles={projectGitState.status?.changedFiles ?? 0}
+												gitAdded={projectGitState.status?.added ?? 0}
+												gitRemoved={projectGitState.status?.removed ?? 0}
 												chatStatus={selectedChat?.status ?? null}
 												disabled={!state.selectedProjectId}
 												focusMode
+												isGitLoading={projectGitState.loading}
+												isGitRepository={
+													selectedProject ? projectGitState.status?.isRepo ?? null : false
+												}
+												onCheckoutBranch={checkoutBranch}
+												onCreateBranch={createBranch}
 												onModelChange={handleModelChange}
 												onPermissionModeChange={setPermissionMode}
 												onReasoningEffortChange={handleReasoningEffortChange}
@@ -1640,10 +1685,10 @@ const App = (): JSX.Element => {
 															<RefreshCcw className="h-3.5 w-3.5" />
 														</Button>
 														</TooltipTrigger>
-														<TooltipContent>Reload</TooltipContent>
-														</Tooltip>
-														{state.errors.length > 0 ? (
-															<Tooltip>
+										<TooltipContent>Reload</TooltipContent>
+								</Tooltip>
+													{state.errors.length > 0 ? (
+										<Tooltip>
 																<TooltipTrigger asChild>
 																	<Button
 																		className="h-7 w-7"
@@ -1752,20 +1797,39 @@ const App = (): JSX.Element => {
 												))}
 											</div>
 
-											<MessageComposer
-												availableModels={availableModels}
-												availableReasoningEfforts={availableReasoningEfforts}
-												chatStatus={selectedChat?.status ?? null}
-												disabled={!state.selectedProjectId}
-												onModelChange={handleModelChange}
-												onPermissionModeChange={setPermissionMode}
-												onReasoningEffortChange={handleReasoningEffortChange}
-												onSend={handleSendMessage}
-												permissionMode={permissionMode}
-												selectedModel={selectedModel}
-												selectedReasoningEffort={selectedReasoningEffort}
-												sending={state.isSendingMessage}
-											/>
+												<MessageComposer
+													availableModels={availableModels}
+													availableReasoningEfforts={availableReasoningEfforts}
+													gitBranches={
+														projectGitState.status?.isRepo === true
+															? projectGitState.branches
+															: []
+													}
+													gitCurrentBranch={
+														projectGitState.status?.isRepo === true
+															? projectGitState.status.currentBranch
+															: null
+													}
+													gitChangedFiles={projectGitState.status?.changedFiles ?? 0}
+													gitAdded={projectGitState.status?.added ?? 0}
+													gitRemoved={projectGitState.status?.removed ?? 0}
+													chatStatus={selectedChat?.status ?? null}
+													disabled={!state.selectedProjectId}
+													isGitLoading={projectGitState.loading}
+													isGitRepository={
+														selectedProject ? projectGitState.status?.isRepo ?? null : false
+													}
+													onCheckoutBranch={checkoutBranch}
+													onCreateBranch={createBranch}
+													onModelChange={handleModelChange}
+													onPermissionModeChange={setPermissionMode}
+													onReasoningEffortChange={handleReasoningEffortChange}
+													onSend={handleSendMessage}
+													permissionMode={permissionMode}
+													selectedModel={selectedModel}
+													selectedReasoningEffort={selectedReasoningEffort}
+													sending={state.isSendingMessage}
+												/>
 
 											<Separator />
 

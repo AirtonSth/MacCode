@@ -10,6 +10,8 @@ import { MessageService } from "./modules/message/message.service";
 import { ProjectController } from "./modules/project/project.controller";
 import { ProjectRepository } from "./modules/project/project.repository";
 import { ProjectService } from "./modules/project/project.service";
+import { GitController } from "./modules/git/git.controller";
+import { GitService } from "./modules/git/git.service";
 import { ProviderController } from "./modules/provider/provider.controller";
 import { CodexModelsService } from "./modules/provider/codex-models.service";
 import { SelectionController } from "./modules/selection/selection.controller";
@@ -38,6 +40,7 @@ export const ServerBootstrap = {
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
 		const messageService = new MessageService(chatRepository, messageRepository);
+		const gitService = new GitService(projectService);
 		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
 		const terminalService = createTerminalService({
 			chat: chatRepository,
@@ -53,6 +56,7 @@ export const ServerBootstrap = {
 					.use(ProjectController.build(projectService))
 					.use(ChatController.build(chatService))
 					.use(MessageController.build(messageService))
+					.use(GitController.build(gitService))
 					.use(ProviderController.build(codexModelsService))
 					.use(SelectionController.build(workspaceSelectionService))
 					.use(TerminalController.build(terminalService)),

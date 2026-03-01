@@ -70,6 +70,62 @@ export interface TerminalExecDTO {
 	entries: TerminalEntryDTO[];
 }
 
+export interface GitStatusDTO {
+	isRepo: boolean;
+	currentBranch: string | null;
+	ahead: number;
+	behind: number;
+	changedFiles: number;
+	stagedFiles: number;
+	unstagedFiles: number;
+	untrackedFiles: number;
+	conflictedFiles: number;
+	isDetachedHead: boolean;
+	added: number;
+	removed: number;
+}
+
+export type GitBranchDTO = string;
+
+export interface GitBranchListDTO {
+	currentBranch: string | null;
+	branches: string[];
+}
+
+export interface CheckoutProjectGitBranchRequestDTO {
+	branch: string;
+}
+
+export interface CreateProjectGitBranchRequestDTO {
+	name: string;
+}
+
+export interface CommitProjectRequestDTO {
+	message: string;
+	includeUnstaged?: boolean;
+	push?: boolean;
+}
+
+interface RestProjectGitCheckoutResponse {
+	switched: boolean;
+	branch: GitBranchDTO;
+}
+
+interface RestProjectGitCreateBranchResponse {
+	created: boolean;
+	branch: GitBranchDTO;
+}
+
+interface RestProjectGitCommitResponse {
+	commit: {
+		branch: string | null;
+		commitHash: string | null;
+		commitMessage: string;
+		pushed: boolean;
+		pushedWithUpstream: boolean;
+	};
+}
+
 export class RemoteCodeApiError extends Error {
 	constructor(
 		public readonly status: number,
@@ -336,6 +392,47 @@ export const RemoteCodeApi = {
 					body: input,
 					method: "POST",
 					path: `/chats/${chatId}/terminal/exec`,
+				});
+			},
+
+			getProjectGitStatus: async (projectId: string): Promise<GitStatusDTO> => {
+				return await request<GitStatusDTO>({
+					method: "GET",
+					path: `/projects/${projectId}/git/status`,
+				});
+			},
+
+			getProjectGitBranches: async (projectId: string): Promise<GitBranchListDTO> => {
+				return await request<GitBranchListDTO>({
+					method: "GET",
+					path: `/projects/${projectId}/git/branches`,
+				});
+			},
+
+			checkoutProjectGitBranch: async (projectId: string, branch: string): Promise<RestProjectGitCheckoutResponse> => {
+				return await request<RestProjectGitCheckoutResponse>({
+					body: { branch },
+					method: "POST",
+					path: `/projects/${projectId}/git/branches/checkout`,
+				});
+			},
+
+			createProjectGitBranch: async (projectId: string, name: string): Promise<RestProjectGitCreateBranchResponse> => {
+				return await request<RestProjectGitCreateBranchResponse>({
+					body: { name },
+					method: "POST",
+					path: `/projects/${projectId}/git/branches/create`,
+				});
+			},
+
+			commitProject: async (
+				projectId: string,
+				input: CommitProjectRequestDTO,
+			): Promise<RestProjectGitCommitResponse> => {
+				return await request<RestProjectGitCommitResponse>({
+					body: input,
+					method: "POST",
+					path: `/projects/${projectId}/git/commit`,
 				});
 			},
 		};

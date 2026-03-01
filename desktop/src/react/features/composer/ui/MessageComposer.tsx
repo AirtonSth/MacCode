@@ -4,7 +4,9 @@ import { ArrowUp, ChevronDown, Loader2, Mic, Plus } from "lucide-react";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
+import { GitBranchControl } from "../../git/ui/GitBranchControl";
 import type { ChatStatus } from "../../workspace/model/useWorkspaceStore";
+import type { GitBranchDTO } from "../../../shared/api/remotecode-http";
 import type { CodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import {
 	formatCodexReasoningEffortLabel,
@@ -25,6 +27,15 @@ interface MessageComposerProps {
 	availableReasoningEfforts: CodexReasoningEffort[];
 	selectedReasoningEffort: CodexReasoningEffort | null;
 	onReasoningEffortChange: (effort: CodexReasoningEffort) => void;
+	gitBranches?: GitBranchDTO[];
+	gitCurrentBranch?: string | null;
+	gitChangedFiles?: number;
+	gitAdded?: number;
+	gitRemoved?: number;
+	isGitLoading?: boolean;
+	isGitRepository?: boolean | null;
+	onCheckoutBranch?: (branch: string) => Promise<void> | void;
+	onCreateBranch?: (name: string) => Promise<void> | void;
 	focusMode?: boolean;
 }
 
@@ -43,6 +54,15 @@ export const MessageComposer = ({
 	availableReasoningEfforts,
 	selectedReasoningEffort,
 	onReasoningEffortChange,
+	gitBranches = [],
+	gitCurrentBranch = null,
+	gitChangedFiles = 0,
+	gitAdded = 0,
+	gitRemoved = 0,
+	isGitLoading = false,
+	isGitRepository = null,
+	onCheckoutBranch,
+	onCreateBranch,
 	focusMode = false,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
@@ -164,7 +184,7 @@ export const MessageComposer = ({
 					/>
 
 					<div className={cn("mt-1 flex items-center justify-between gap-2 border-t border-[#2b3038] pt-1", composerTextClass)}>
-						<div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+						<div className="flex min-w-0 flex-1 items-center gap-1">
 							<Button
 								aria-label="Attach context"
 								className="h-6 w-6 shrink-0 rounded-full p-0 text-[#9a9da5] hover:bg-white/[0.04] hover:text-[#c8ccd6]"
@@ -235,6 +255,23 @@ export const MessageComposer = ({
 								</select>
 								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
+
+							{onCheckoutBranch && onCreateBranch ? (
+								<div className="shrink-0">
+									<GitBranchControl
+										branches={gitBranches}
+										currentBranch={gitCurrentBranch}
+										changedFiles={gitChangedFiles}
+										added={gitAdded}
+										removed={gitRemoved}
+										disabled={isLocked}
+										isLoading={isGitLoading}
+										isGitRepository={isGitRepository}
+										onCheckoutBranch={onCheckoutBranch}
+										onCreateBranch={onCreateBranch}
+									/>
+								</div>
+							) : null}
 						</div>
 
 						<div className="flex items-center gap-1">
