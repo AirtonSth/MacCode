@@ -1,8 +1,12 @@
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { AlertTriangle, Bot, Sparkles, User2 } from "lucide-react";
+import { AlertTriangle, Bot, ChevronDown, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
 import { ScrollArea } from "../../../components/ui/scroll-area";
+import ReactMarkdown from "react-markdown";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "../../../lib/utils";
+import remarkGfm from "remark-gfm";
+import type { Components } from "react-markdown";
 import type { ChatDTO, MessageDTO } from "../../workspace/model/useWorkspaceStore";
 
 interface ConversationPanelProps {
@@ -26,6 +30,8 @@ export const ConversationPanel = ({
 	const hasMessages = messages.length > 0;
 	const hasStreaming = streamingText.trim().length > 0;
 	const hasContent = hasMessages || hasStreaming;
+	const [isAtBottom, setIsAtBottom] = useState(true);
+	const scrollViewportRef = useRef<HTMLDivElement>(null);
 	const bubbleMotion = shouldReduceMotion
 		? {}
 		: {
@@ -34,6 +40,99 @@ export const ConversationPanel = ({
 				initial: { opacity: 0, y: 8 },
 				transition: { duration: 0.2, ease: "easeOut" as const },
 			};
+	const scrollToBottom = useCallback(
+		(behavior: ScrollBehavior = "smooth") => {
+			const viewport = scrollViewportRef.current;
+			if (!viewport) {
+				return;
+			}
+			viewport.scrollTo({
+				top: viewport.scrollHeight,
+				behavior: shouldReduceMotion ? "auto" : behavior,
+			});
+		},
+		[shouldReduceMotion],
+	);
+	const handleViewportScroll = useCallback(() => {
+		const viewport = scrollViewportRef.current;
+		if (!viewport) {
+			return;
+		}
+		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+		setIsAtBottom(distanceFromBottom <= 24);
+	}, []);
+	useEffect(() => {
+		setIsAtBottom(true);
+	}, [chat?.id]);
+
+	useEffect(() => {
+		if (!hasContent) {
+			return;
+		}
+		if (isAtBottom) {
+			scrollToBottom();
+		}
+	}, [hasContent, isAtBottom, messages, streamingText, scrollToBottom]);
+	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
+	const markdownComponents: Components = {
+		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,
+		h2: ({ children, ...props }) => <h2 className="mb-2 mt-3 text-base font-semibold" {...props}>{children}</h2>,
+		h3: ({ children, ...props }) => <h3 className="mb-1 mt-3 font-semibold" {...props}>{children}</h3>,
+		p: ({ children, ...props }) => (
+			<p className={cn(messageTextClass, "[&_code]:text-inherit [&:not(:first-child)]:mt-3")} {...props}>
+				{children}
+			</p>
+		),
+		ul: ({ children, ...props }) => <ul className="mb-2 mt-2 list-disc pl-5" {...props}>{children}</ul>,
+		ol: ({ children, ...props }) => <ol className="mb-2 mt-2 list-decimal pl-5" {...props}>{children}</ol>,
+		li: ({ children, ...props }) => <li className="mt-1" {...props}>{children}</li>,
+		a: ({ children, href, ...props }) => (
+			<a className="text-cyan-100 underline underline-offset-2 hover:text-white" href={href} rel="noreferrer noopener" target="_blank" {...props}>
+				{children}
+			</a>
+		),
+		code: ({ inline, children, ...props }) =>
+			inline ? (
+				<code
+					className={cn(
+						"rounded bg-white/10 px-1.5 py-0.5 font-mono text-[13px] leading-none tracking-tight",
+						focusMode ? "text-slate-100/95" : "text-cyan-100",
+					)}
+					{...props}
+				>
+					{children}
+				</code>
+			) : (
+				<code className="block" {...props}>
+					{children}
+				</code>
+			),
+		pre: ({ children, ...props }) => (
+			<pre
+				className={cn(
+					"mb-3 mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/75 p-3",
+					focusMode ? "text-[13px] leading-6" : "text-[12px] leading-5",
+				)}
+				{...props}
+			>
+				{children}
+			</pre>
+		),
+		blockquote: ({ children, ...props }) => (
+			<blockquote className="mt-2 border-l-2 border-white/30 pl-3 italic" {...props}>
+				{children}
+			</blockquote>
+		),
+		table: ({ children, ...props }) => (
+			<div className="my-2 overflow-x-auto">
+				<table className="w-full border-collapse text-left" {...props}>
+					{children}
+				</table>
+			</div>
+		),
+		th: ({ children, ...props }) => <th className="border-b border-white/20 px-2 py-1 text-left text-xs font-semibold" {...props}>{children}</th>,
+		td: ({ children, ...props }) => <td className="border-b border-white/10 px-2 py-1 align-top" {...props}>{children}</td>,
+	};
 
 	return (
 		<section
@@ -125,85 +224,93 @@ export const ConversationPanel = ({
 				) : null}
 
 				{hasContent ? (
-					<ScrollArea className="h-full">
-						<div
-							aria-live="polite"
-							className={cn(
-								"mx-auto w-full max-w-3xl",
-								focusMode ? "space-y-2 px-4 pb-8 pt-5 sm:px-6" : "space-y-3 px-5 pb-5 pt-4",
-							)}
-						>
-							<AnimatePresence initial={false}>
-								{messages.map((message) => (
-									<motion.article
-										className={cn(
-											focusMode
-												? message.role === "user"
-													? "ml-auto w-fit max-w-[min(86%,40rem)] rounded-[1.35rem] border border-white/10 bg-white/[0.06] px-4 py-3 text-[15px] leading-7 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.16)]"
-													: "w-full py-4 text-[15px] leading-7 text-slate-100"
-												: cn(
-														"max-w-[85ch] rounded-2xl border px-4 py-3 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
-														message.role === "user"
-															? "ml-auto border-cyan-300/25 bg-cyan-400/10 text-cyan-50"
-															: "mr-auto border-white/10 bg-slate-900/85 text-slate-100",
-													),
-										)}
-										key={message.id}
-										{...bubbleMotion}
-									>
-										{focusMode ? null : (
-											<div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-300/85">
-												{message.role === "user" ? (
-													<User2 className="h-3.5 w-3.5" />
-												) : (
-													<Bot className="h-3.5 w-3.5" />
-												)}
-												{message.role}
-											</div>
-										)}
-										<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>
-											{message.content}
-										</p>
-									</motion.article>
-								))}
-
-								{streamingText ? (
-									<motion.article
-										className={cn(
-											focusMode
-												? "w-full py-4 text-[15px] leading-7 text-slate-100"
-												: "mr-auto max-w-[85ch] rounded-2xl border border-sky-200/20 bg-sky-500/10 px-4 py-3 text-sky-50 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
-										)}
-										key="streaming"
-										{...bubbleMotion}
-									>
-										<div
+					<>
+						<ScrollArea className="relative h-full" onViewportScroll={handleViewportScroll} viewportRef={scrollViewportRef}>
+							<div
+								aria-live="polite"
+								className={cn(
+									"mx-auto w-full max-w-3xl",
+									focusMode ? "space-y-2 px-4 pb-8 pt-5 sm:px-6" : "space-y-3 px-5 pb-5 pt-4",
+								)}
+							>
+								<AnimatePresence initial={false}>
+									{messages.map((message) => (
+										<motion.article
 											className={cn(
-												"mb-2 flex items-center gap-2",
 												focusMode
-													? "text-xs tracking-[0.12em] text-slate-400"
-													: "text-[11px] uppercase tracking-[0.18em] text-sky-100/90",
+													? message.role === "user"
+														? "ml-auto w-fit max-w-[min(86%,40rem)] rounded-[1.35rem] border border-white/10 bg-white/[0.06] px-4 py-3 text-[15px] leading-7 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.16)]"
+														: "w-full py-4 text-[15px] leading-7 text-slate-100"
+													: cn(
+															"max-w-[85ch] rounded-2xl border px-4 py-3 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
+															message.role === "user"
+																? "ml-auto border-cyan-300/25 bg-cyan-400/10 text-cyan-50"
+																: "mr-auto border-white/10 bg-slate-900/85 text-slate-100",
+														),
 											)}
+											key={message.id}
+											{...bubbleMotion}
 										>
-											<Sparkles className="h-3.5 w-3.5" />
-											{focusMode ? "Assistant is writing" : "assistant · streaming"}
-											<motion.span
-												animate={shouldReduceMotion ? undefined : { opacity: [0.3, 1, 0.3] }}
+											{focusMode ? null : (
+												<div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-300/85">
+													{message.role === "user" ? <User2 className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}
+													{message.role}
+												</div>
+											)}
+											<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+												{message.content}
+											</ReactMarkdown>
+										</motion.article>
+									))}
+
+									{streamingText ? (
+										<motion.article
+											className={cn(
+												focusMode
+													? "w-full py-4 text-[15px] leading-7 text-slate-100"
+													: "mr-auto max-w-[85ch] rounded-2xl border border-sky-200/20 bg-sky-500/10 px-4 py-3 text-sky-50 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
+											)}
+											key="streaming"
+											{...bubbleMotion}
+										>
+											<div
 												className={cn(
-													"h-1.5 w-1.5 rounded-full",
-													focusMode ? "bg-slate-300" : "bg-sky-100",
+													"mb-2 flex items-center gap-2",
+													focusMode
+														? "text-xs tracking-[0.12em] text-slate-400"
+														: "text-[11px] uppercase tracking-[0.18em] text-sky-100/90",
 												)}
-												transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY }}
-											/>
-										</div>
-										<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>
-											{streamingText}
-										</p>
-									</motion.article>
-								) : null}
-							</AnimatePresence>
-						</div>
-					</ScrollArea>
+											>
+												<Sparkles className="h-3.5 w-3.5" />
+												{focusMode ? "Assistant is writing" : "assistant · streaming"}
+												<motion.span
+													animate={shouldReduceMotion ? undefined : { opacity: [0.3, 1, 0.3] }}
+													className={cn("h-1.5 w-1.5 rounded-full", focusMode ? "bg-slate-300" : "bg-sky-100")}
+													transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY }}
+												/>
+											</div>
+											<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>{streamingText}</p>
+										</motion.article>
+									) : null}
+								</AnimatePresence>
+							</div>
+						</ScrollArea>
+						{!isAtBottom ? (
+							<button
+								aria-label="Scroll to latest message"
+								className={cn(
+									"absolute bottom-4 right-4 z-20 rounded-full border border-white/20 bg-slate-900/90 p-2 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.45)] transition hover:bg-slate-800/95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950",
+									focusMode ? "bg-slate-950/80" : "",
+								)}
+								onClick={() => {
+									scrollToBottom();
+								}}
+								type="button"
+							>
+								<ChevronDown className="h-4 w-4" />
+							</button>
+						) : null}
+					</>
 				) : null}
 			</div>
 		</section>

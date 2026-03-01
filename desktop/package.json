@@ -2,17 +2,17 @@
   "name": "remotecode-electrobun",
   "version": "1.0.0",
   "description": "Electrobun app with React + Vite",
-	"scripts": {
-		"start": "vite build && electrobun dev",
+  "scripts": {
+    "start": "vite build && electrobun dev",
     "build:vite": "vite build",
-		"dev": "electrobun dev --watch",
-		"dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
-		"hmr": "bun run scripts/hmr.mjs",
-		"build:canary": "vite build && electrobun build --env=canary",
-		"test:backend": "bun test ./src/bun/server --pattern '.*\\.test\\.ts$'",
-		"typecheck": "bun run tsc --noEmit",
-		"lint": "bunx eslint --fix ."
-	},
+    "dev": "electrobun dev --watch",
+    "dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
+    "hmr": "bun run scripts/hmr.mjs",
+    "build:canary": "vite build && electrobun build --env=canary",
+    "test:backend": "bun test ./src/bun/server --pattern '.*\\.test\\.ts$'",
+    "typecheck": "bun run tsc --noEmit",
+    "lint": "bunx eslint --fix ."
+  },
   "dependencies": {
     "@elysiajs/eden": "^1.4.3",
     "@radix-ui/react-scroll-area": "^1.2.4",
@@ -29,6 +29,8 @@
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {
