@@ -1519,7 +1519,7 @@ const App = (): JSX.Element => {
 															</Button>
 														</TooltipTrigger>
 														<TooltipContent>
-															{isTerminalOpen ? "Esconder terminal" : "Abrir terminal"}
+															{isTerminalOpen ? "Hide terminal" : "Show terminal"}
 														</TooltipContent>
 													</Tooltip>
 													<Tooltip>
@@ -1538,7 +1538,7 @@ const App = (): JSX.Element => {
 																<FolderSearch className="h-4 w-4" />
 															</Button>
 														</TooltipTrigger>
-														<TooltipContent>Abrir no Finder</TooltipContent>
+														<TooltipContent>Open in Finder</TooltipContent>
 													</Tooltip>
 													<GitQuickControl
 														className="relative"
