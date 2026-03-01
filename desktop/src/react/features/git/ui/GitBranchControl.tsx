@@ -169,7 +169,7 @@ export const GitBranchControl = ({
 			</div>
 
 			{isOpen ? (
-				<div className="absolute bottom-[calc(100%+8px)] left-0 z-[70] w-[min(320px,calc(100vw-2.5rem))] rounded-2xl border border-white/12 bg-[linear-gradient(160deg,rgba(29,31,36,0.96),rgba(21,23,28,0.96))] p-2.5 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-lg">
+				<div className="absolute bottom-[calc(100%+8px)] right-0 z-[70] w-[min(320px,calc(100vw-2.5rem))] rounded-2xl border border-white/12 bg-[linear-gradient(160deg,rgba(29,31,36,0.96),rgba(21,23,28,0.96))] p-2.5 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-lg">
 					<div className="rounded-xl bg-white/[0.05] px-2.5 py-1.5">
 						<div className="flex items-center gap-2 text-[#9ca1ab]">
 							<Search className="h-3.5 w-3.5" />

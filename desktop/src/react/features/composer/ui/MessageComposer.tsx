@@ -1,6 +1,6 @@
 import { ChangeEvent, FormEvent, KeyboardEvent, useLayoutEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
-import { ArrowUp, ChevronDown, Loader2, Mic, Plus } from "lucide-react";
+import { ArrowUp, ChevronDown, Loader2, Plus } from "lucide-react";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
@@ -256,6 +256,9 @@ export const MessageComposer = ({
 								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
 
+						</div>
+
+						<div className="flex items-center gap-1">
 							{onCheckoutBranch && onCreateBranch ? (
 								<div className="shrink-0">
 									<GitBranchControl
@@ -272,19 +275,6 @@ export const MessageComposer = ({
 									/>
 								</div>
 							) : null}
-						</div>
-
-						<div className="flex items-center gap-1">
-							<Button
-								aria-label="Voice input"
-								className="h-6 w-6 shrink-0 rounded-full p-0 text-[#9a9da5] hover:bg-white/[0.04] hover:text-[#c8ccd6]"
-								disabled={isLocked}
-								size="icon"
-								type="button"
-								variant="ghost"
-							>
-								<Mic className="h-3 w-3" />
-							</Button>
 						</div>
 
 						<motion.div className="ml-1" whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
