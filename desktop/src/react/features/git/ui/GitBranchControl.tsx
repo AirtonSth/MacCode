@@ -138,7 +138,7 @@ export const GitBranchControl = ({
 					aria-expanded={isOpen}
 					aria-haspopup="dialog"
 					className={cn(
-						"inline-flex h-10 items-center gap-2 rounded-full border border-white/10 bg-white/[0.08] px-3.5 text-sm text-[#b7bcc6] transition hover:border-white/20 hover:bg-white/[0.12] hover:text-[#eceff4] disabled:cursor-not-allowed disabled:opacity-50",
+						"inline-flex h-8 items-center gap-1.5 rounded-full border border-white/12 bg-white/[0.06] px-2.5 text-[12px] text-[#c1c6d0] transition-colors hover:border-white/20 hover:bg-white/[0.1] hover:text-[#eceff4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 disabled:cursor-not-allowed disabled:opacity-50",
 						isOpen ? "border-white/25 bg-white/[0.14] text-[#eceff4]" : "",
 					)}
 					disabled={disabled || isSubmitting}
@@ -160,23 +160,23 @@ export const GitBranchControl = ({
 					}}
 					type="button"
 				>
-					<GitBranch className="h-4 w-4" />
-					<span className="max-w-[130px] truncate font-medium">{currentBranch ?? "Branches"}</span>
-					<ChevronDown className={cn("h-4 w-4 transition-transform", isOpen ? "rotate-180" : "")} />
+					<GitBranch className="h-3.5 w-3.5" />
+					<span className="max-w-[112px] truncate font-medium">{currentBranch ?? "Branches"}</span>
+					<ChevronDown className={cn("h-3.5 w-3.5 transition-transform", isOpen ? "rotate-180" : "")} />
 				</button>
 
 				{isLoading || isSubmitting ? <Loader2 className="h-5 w-5 animate-spin text-[#959ba6]" /> : null}
 			</div>
 
 			{isOpen ? (
-				<div className="absolute bottom-[calc(100%+12px)] left-0 z-[70] w-[380px] rounded-[22px] border border-white/10 bg-[linear-gradient(145deg,rgba(40,41,45,0.98),rgba(24,25,29,0.98))] p-3 shadow-[0_28px_80px_rgba(0,0,0,0.56)] backdrop-blur-xl">
-					<div className="rounded-2xl bg-white/[0.06] px-3 py-2">
+				<div className="absolute bottom-[calc(100%+8px)] left-0 z-[70] w-[min(320px,calc(100vw-2.5rem))] rounded-2xl border border-white/12 bg-[linear-gradient(160deg,rgba(29,31,36,0.96),rgba(21,23,28,0.96))] p-2.5 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-lg">
+					<div className="rounded-xl bg-white/[0.05] px-2.5 py-1.5">
 						<div className="flex items-center gap-2 text-[#9ca1ab]">
-							<Search className="h-4 w-4" />
+							<Search className="h-3.5 w-3.5" />
 							<input
 								aria-label="Search branches"
 								autoFocus
-								className="h-7 w-full bg-transparent text-[16px] font-medium text-[#d7dbe2] outline-none placeholder:text-[#989da7]"
+								className="h-6 w-full bg-transparent text-sm font-medium text-[#d7dbe2] outline-none placeholder:text-[#989da7]"
 								disabled={isActionDisabled}
 								onChange={(event) => {
 									setSearchTerm(event.target.value);
@@ -188,11 +188,11 @@ export const GitBranchControl = ({
 						</div>
 					</div>
 
-					<p className="px-2 pb-1 pt-4 text-sm font-medium text-[#9ca1aa]">Branches</p>
+					<p className="px-1.5 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-[#9ca1aa]">Branches</p>
 
-					<div className="max-h-[280px] space-y-0.5 overflow-y-auto px-1 pb-2">
+					<div className="max-h-[220px] space-y-0.5 overflow-y-auto px-0.5 pb-1 pr-1">
 						{filteredBranches.length === 0 ? (
-							<div className="px-3 py-3 text-sm text-[#8f959f]">
+							<div className="px-2 py-2 text-xs text-[#8f959f]">
 								{isLoading ? "Loading local branches..." : "No local branches match your search"}
 							</div>
 						) : (
@@ -201,7 +201,7 @@ export const GitBranchControl = ({
 								return (
 									<button
 										className={cn(
-											"w-full rounded-xl px-2 py-2 text-left transition",
+											"w-full rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60",
 											isCurrent ? "bg-white/[0.03]" : "hover:bg-white/[0.04]",
 										)}
 										key={branch}
@@ -213,20 +213,20 @@ export const GitBranchControl = ({
 										<div className="flex items-center justify-between gap-3">
 											<div className="min-w-0">
 												<div className="flex items-center gap-2">
-													<GitBranch className="h-4 w-4 text-[#d6d9e0]" />
-													<span className="truncate text-[16px] font-semibold text-[#edf0f4]">{branch}</span>
+													<GitBranch className="h-3.5 w-3.5 text-[#d6d9e0]" />
+													<span className="truncate text-sm font-semibold text-[#edf0f4]">{branch}</span>
 												</div>
 
 												{isCurrent ? (
-													<p className="pl-6 text-[14px] text-[#8f949d]">
-														Uncommited: {changedFiles} files{" "}
-														<span className="font-semibold text-emerald-400">+{added}</span>{" "}
+													<p className="pl-[22px] text-[11px] text-[#8f949d]">
+														Changes: {changedFiles} ·{" "}
+														<span className="font-semibold text-emerald-400">+{added}</span> /{" "}
 														<span className="font-semibold text-rose-400">-{removed}</span>
 													</p>
 												) : null}
 											</div>
 
-											{isCurrent ? <Check className="h-5 w-5 shrink-0 text-[#f5f7fb]" /> : null}
+											{isCurrent ? <Check className="h-4 w-4 shrink-0 text-[#f5f7fb]" /> : null}
 										</div>
 									</button>
 								);
@@ -234,13 +234,13 @@ export const GitBranchControl = ({
 						)}
 					</div>
 
-					<div className="mt-2 border-t border-white/10 pt-2">
+					<div className="mt-1.5 border-t border-white/10 pt-1.5">
 						{isCreateMode ? (
-							<div className="space-y-2 px-1">
+							<div className="space-y-1.5 px-0.5">
 								<input
 									aria-label="New branch name"
 									autoFocus
-									className="h-9 w-full rounded-xl border border-white/15 bg-white/[0.06] px-3 text-sm text-[#e4e8ef] outline-none placeholder:text-[#9197a2] focus-visible:border-white/30"
+									className="h-8 w-full rounded-lg border border-white/15 bg-white/[0.06] px-2.5 text-xs text-[#e4e8ef] outline-none placeholder:text-[#9197a2] focus-visible:border-white/30"
 									disabled={isActionDisabled}
 									onChange={(event) => {
 										setNewBranchName(event.target.value);
@@ -262,7 +262,7 @@ export const GitBranchControl = ({
 								/>
 								<div className="flex items-center justify-end gap-2">
 									<button
-										className="h-8 rounded-lg px-2.5 text-xs text-[#a8adb6] transition hover:bg-white/[0.06] hover:text-[#dfe3ea]"
+										className="h-7 rounded-lg px-2 text-[11px] text-[#a8adb6] transition hover:bg-white/[0.06] hover:text-[#dfe3ea]"
 										disabled={isActionDisabled}
 										onClick={() => {
 											setIsCreateMode(false);
@@ -273,7 +273,7 @@ export const GitBranchControl = ({
 										Cancel
 									</button>
 									<button
-										className="h-8 rounded-lg bg-white/[0.12] px-3 text-xs font-medium text-[#edf1f6] transition hover:bg-white/[0.18] disabled:cursor-not-allowed disabled:opacity-50"
+										className="h-7 rounded-lg bg-white/[0.12] px-2.5 text-[11px] font-medium text-[#edf1f6] transition hover:bg-white/[0.18] disabled:cursor-not-allowed disabled:opacity-50"
 										disabled={isActionDisabled || newBranchName.trim().length === 0}
 										onClick={() => {
 											void handleCreate();
@@ -286,7 +286,7 @@ export const GitBranchControl = ({
 							</div>
 						) : (
 							<button
-								className="flex h-10 w-full items-center gap-2 rounded-xl px-2 text-left text-base font-medium text-[#eceff4] transition hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-50"
+								className="flex h-8 w-full items-center gap-1.5 rounded-lg px-2 text-left text-sm font-medium text-[#eceff4] transition-colors hover:bg-white/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 disabled:cursor-not-allowed disabled:opacity-50"
 								disabled={isActionDisabled}
 								onClick={() => {
 									setIsCreateMode(true);
@@ -294,13 +294,13 @@ export const GitBranchControl = ({
 								}}
 								type="button"
 							>
-								<Plus className="h-5 w-5 shrink-0" />
+								<Plus className="h-4 w-4 shrink-0" />
 								<span className="truncate">Create and checkout new branch...</span>
 							</button>
 						)}
 					</div>
 
-					{errorMessage ? <p className="px-2 pt-2 text-xs text-rose-300">{errorMessage}</p> : null}
+					{errorMessage ? <p className="px-1.5 pt-1.5 text-[11px] text-rose-300">{errorMessage}</p> : null}
 				</div>
 			) : null}
 

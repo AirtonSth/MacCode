@@ -25,10 +25,14 @@ export interface ProjectGitDependencies {
 export interface ProjectGitController {
 	getState: () => ProjectGitState;
 	subscribe: (listener: () => void) => () => void;
-	refresh: () => Promise<void>;
+	refresh: (options?: ProjectGitRefreshOptions) => Promise<void>;
 	checkoutBranch: (branch: string) => Promise<void>;
 	createBranch: (name: string) => Promise<void>;
 	commit: (input: ProjectGitCommitInput) => Promise<void>;
+}
+
+interface ProjectGitRefreshOptions {
+	silent?: boolean;
 }
 
 const createEmptyProjectGitState = (): ProjectGitState => ({
@@ -37,6 +41,8 @@ const createEmptyProjectGitState = (): ProjectGitState => ({
 	loading: false,
 	error: null,
 });
+
+const GIT_STATUS_POLL_INTERVAL_MS = 2_000;
 
 const normalizeProjectId = (projectId: string | null): string | null => {
 	const trimmed = projectId?.trim() ?? "";
@@ -72,7 +78,10 @@ export const createProjectGitController = (
 		updateState(() => createEmptyProjectGitState());
 	};
 
-	const refreshProject = async (projectId: string): Promise<void> => {
+	const refreshProject = async (
+		projectId: string,
+		options: ProjectGitRefreshOptions = {},
+	): Promise<void> => {
 		const pending = loadingByProject.get(projectId);
 		if (pending) {
 			return pending;
@@ -84,11 +93,18 @@ export const createProjectGitController = (
 				return;
 			}
 
-			updateState((current) => ({
-				...current,
-				error: null,
-				loading: true,
-			}));
+			updateState((current) =>
+				options.silent && current.status !== null
+					? {
+							...current,
+							error: null,
+						}
+					: {
+							...current,
+							error: null,
+							loading: true,
+						},
+			);
 
 			try {
 				const [status, branches] = await Promise.all([
@@ -179,7 +195,7 @@ export const createProjectGitController = (
 				listeners.delete(listener);
 			};
 		},
-		refresh: async () => {
+		refresh: async (options = {}) => {
 			const dependencies = getDependencies();
 			const projectId = normalizeProjectId(dependencies.projectId);
 
@@ -194,7 +210,7 @@ export const createProjectGitController = (
 				setEmptyState();
 			}
 
-			await refreshProject(projectId);
+			await refreshProject(projectId, options);
 		},
 		checkoutBranch: async (branch: string) => {
 			const normalizedBranch = normalizeBranchOrName(branch);
@@ -259,6 +275,20 @@ export const useProjectGit = (dependencies: ProjectGitDependencies): UseProjectG
 
 	useEffect(() => {
 		void controllerRef.current?.refresh();
+	}, [dependencies.projectId]);
+
+	useEffect(() => {
+		if (normalizeProjectId(dependencies.projectId) === null) {
+			return;
+		}
+
+		const intervalHandle = globalThis.setInterval(() => {
+			void controllerRef.current?.refresh({ silent: true });
+		}, GIT_STATUS_POLL_INTERVAL_MS);
+
+		return () => {
+			globalThis.clearInterval(intervalHandle);
+		};
 	}, [dependencies.projectId]);
 
 	return {
