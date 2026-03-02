@@ -2,6 +2,7 @@ import * as Network from "expo-network";
 import * as SecureStore from "expo-secure-store";
 
 import type { DiscoveryInfoDTO } from "./types";
+import { ApiConfigStore } from "./api-config-store";
 
 export interface DiscoveredServer extends DiscoveryInfoDTO {
 	baseUrl: string;
@@ -12,14 +13,55 @@ interface DiscoveryCacheRecord {
 	items: DiscoveredServer[];
 }
 
+const normalizeToken = (value: string): string => {
+	const trimmed = value.trim();
+	const isEmpty = trimmed.length === 0;
+	const isLegacyDefault = trimmed === "local-dev-token";
+	return isEmpty || isLegacyDefault ? "remotecode.io-token" : trimmed;
+};
+
 const DISCOVERY_PORT = 8835;
 const DISCOVERY_PATH = "/v1/discovery";
 const CACHE_KEY = "remotecode.discovery.cache";
 const DEFAULT_TIMEOUT_MS = 500;
 const DEFAULT_CONCURRENCY = 24;
 const MAX_CACHE_ITEMS = 32;
+const LOG_PREFIX = "[LAN_DISCOVERY]";
+
+const log = (...args: unknown[]) => {
+	if (__DEV__) {
+		console.log(LOG_PREFIX, ...args);
+	}
+};
 
 const normalizeBaseUrl = (host: string): string => `http://${host}:${DISCOVERY_PORT}`;
+
+const parseHostFromBaseUrl = (baseUrl: string): string | null => {
+	const trimmed = baseUrl.trim();
+	if (trimmed.length === 0) {
+		return null;
+	}
+
+	const withoutProtocol = trimmed.includes("://") ? trimmed.split("://", 2)[1] : trimmed;
+	const withoutPath = withoutProtocol.split(/[/?#]/u, 1)[0] ?? "";
+	if (withoutPath.length === 0) {
+		return null;
+	}
+
+	const atIndex = withoutPath.lastIndexOf("@");
+	const hostPort = atIndex !== -1 ? withoutPath.slice(atIndex + 1) : withoutPath;
+	if (hostPort.startsWith("[")) {
+		const closingIndex = hostPort.indexOf("]");
+		if (closingIndex > 1) {
+			return hostPort.slice(1, closingIndex).trim();
+		}
+		return null;
+	}
+
+	const host = hostPort.split(":", 1)[0];
+	const normalized = host.trim();
+	return normalized.length > 0 ? normalized : null;
+};
 
 const parseJson = (input: string | null): unknown => {
 	if (!input) {
@@ -63,15 +105,10 @@ const toSubnetPrefix = (ipAddress: string): string | null => {
 	return `${numbers[0]}.${numbers[1]}.${numbers[2]}`;
 };
 
-const toScanHosts = (subnetPrefix: string, localHost?: string): string[] => {
+const toScanHosts = (subnetPrefix: string): string[] => {
 	const hosts: string[] = [];
 	for (let host = 1; host <= 254; host += 1) {
-		const candidate = `${subnetPrefix}.${host}`;
-		if (candidate === localHost) {
-			continue;
-		}
-
-		hosts.push(candidate);
+		hosts.push(`${subnetPrefix}.${host}`);
 	}
 
 	return hosts;
@@ -96,8 +133,13 @@ const dedupeServers = (input: DiscoveredServer[]): DiscoveredServer[] => {
 	);
 };
 
-const probeServer = async (host: string, timeoutMs: number): Promise<DiscoveredServer | null> => {
+const resolveDiscovery = async (host: string, timeoutMs: number, token?: string): Promise<Response | null> => {
 	const baseUrl = normalizeBaseUrl(host);
+	const headers: Record<string, string> = {};
+	if (token) {
+		headers.authorization = `Bearer ${token}`;
+	}
+
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => {
 		controller.abort();
@@ -106,27 +148,80 @@ const probeServer = async (host: string, timeoutMs: number): Promise<DiscoveredS
 	try {
 		const response = await fetch(`${baseUrl}${DISCOVERY_PATH}`, {
 			method: "GET",
+			headers,
 			signal: controller.signal,
 		});
 		if (!response.ok) {
-			return null;
+			return response;
 		}
 
-		const payload = (await response.json()) as unknown;
-		if (!isDiscoveryInfo(payload)) {
-			return null;
-		}
-
-		return {
-			...payload,
-			baseUrl,
-			lastSeenAt: new Date().toISOString(),
-		};
-	} catch {
+		return response;
+	} catch (error) {
+		log("probe request error", baseUrl, error instanceof Error ? error.message : "unknown");
 		return null;
 	} finally {
 		clearTimeout(timeoutId);
 	}
+};
+
+const readResponseText = async (response: Response): Promise<string> => {
+	try {
+		return await response.text();
+	} catch {
+		return "";
+	}
+};
+
+const parseDiscoveryResponse = async (baseUrl: string, response: Response): Promise<DiscoveredServer | null> => {
+	const payload = (await response.json()) as unknown;
+	if (!isDiscoveryInfo(payload)) {
+		log("probe invalid payload", baseUrl);
+		return null;
+	}
+
+	return {
+		...payload,
+		baseUrl,
+		lastSeenAt: new Date().toISOString(),
+	};
+};
+
+const probeServer = async (
+	host: string,
+	timeoutMs: number,
+	token?: string,
+): Promise<DiscoveredServer | null> => {
+	const baseUrl = normalizeBaseUrl(host);
+	log("probe start", baseUrl);
+
+	const firstAttempt = await resolveDiscovery(host, timeoutMs);
+	if (firstAttempt?.ok) {
+		log("probe success", baseUrl);
+		return await parseDiscoveryResponse(baseUrl, firstAttempt);
+	}
+
+	if (token && firstAttempt) {
+		log("probe non-ok", baseUrl, firstAttempt.status, "retrying with token");
+		const secondAttempt = await resolveDiscovery(host, timeoutMs, token);
+		if (!secondAttempt) {
+			return null;
+		}
+		if (!secondAttempt.ok) {
+			const body = await readResponseText(secondAttempt);
+			log("probe non-ok", baseUrl, secondAttempt.status, body || "no-body");
+			return null;
+		}
+
+		log("probe success", baseUrl);
+		return await parseDiscoveryResponse(baseUrl, secondAttempt);
+	}
+
+	if (firstAttempt) {
+		const body = await readResponseText(firstAttempt);
+		log("probe non-ok", baseUrl, firstAttempt.status, body || "no-body");
+	}
+
+	return null;
 };
 
 const runLimited = async <T>(
@@ -161,6 +256,11 @@ const runLimited = async <T>(
 	});
 
 	await Promise.all(runners);
+	log("scan workers done", {
+		totalItems: items.length,
+		completed: results.length,
+		runners: runnerCount,
+	});
 	return results;
 };
 
@@ -186,40 +286,87 @@ const writeCache = async (items: DiscoveredServer[]): Promise<void> => {
 	await SecureStore.setItemAsync(CACHE_KEY, JSON.stringify(payload));
 };
 
-const resolveCandidateHosts = async (): Promise<string[]> => {
+const pushUniqueHost = (hosts: string[], seen: Set<string>, host: string | null | undefined): void => {
+	const normalized = host?.trim();
+	if (!normalized || normalized.length === 0) {
+		return;
+	}
+
+	if (seen.has(normalized)) {
+		return;
+	}
+
+	seen.add(normalized);
+	hosts.push(normalized);
+};
+
+const resolveCandidateHosts = async (recent: DiscoveredServer[]): Promise<string[]> => {
 	let ip = "";
 	try {
 		ip = await Network.getIpAddressAsync();
+		log("getIpAddressAsync success", ip);
 	} catch {
 		ip = "";
+		log("getIpAddressAsync error");
 	}
+
+	const hosts: string[] = [];
+	const seen = new Set<string>();
+
+	for (const item of recent) {
+		pushUniqueHost(hosts, seen, parseHostFromBaseUrl(item.baseUrl));
+	}
+
+	pushUniqueHost(hosts, seen, ip);
+	pushUniqueHost(hosts, seen, "127.0.0.1");
+	pushUniqueHost(hosts, seen, "localhost");
 
 	const prefix = toSubnetPrefix(ip);
 	if (prefix) {
-		return toScanHosts(prefix, ip);
+		log("scan subnet prefix", prefix);
+		for (const host of toScanHosts(prefix)) {
+			pushUniqueHost(hosts, seen, host);
+		}
+	} else {
+		log("scan subnet prefix unavailable", ip);
 	}
 
-	return [];
+	log("scan candidates prepared", {
+		count: hosts.length,
+		recentCount: recent.length,
+	});
+	return hosts;
 };
 
 export const DiscoveryManager = {
 	async readRecent(): Promise<DiscoveredServer[]> {
-		return await readCache();
+		const recent = await readCache();
+		log("cache read", { count: recent.length });
+		return recent;
 	},
 
-	async scan(input?: { concurrency?: number; timeoutMs?: number }): Promise<DiscoveredServer[]> {
+	async scan(input?: { concurrency?: number; timeoutMs?: number; token?: string }): Promise<DiscoveredServer[]> {
 		const timeoutMs = input?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		const concurrency = input?.concurrency ?? DEFAULT_CONCURRENCY;
+		const config = await ApiConfigStore.read();
+		const token = normalizeToken(input?.token ?? config.token);
+		log("scan start", { timeoutMs, concurrency });
 		const recent = await readCache();
-		const candidateHosts = await resolveCandidateHosts();
+		const candidateHosts = await resolveCandidateHosts(recent);
+		log("scan start candidates", {
+			candidateCount: candidateHosts.length,
+			recentCount: recent.length,
+		});
 
 		const scanned = await runLimited(
 			candidateHosts,
-			async (host) => await probeServer(host, timeoutMs),
+			async (host) => await probeServer(host, timeoutMs, token),
 			concurrency,
 		);
+		log("scan results", { scannedCount: scanned.length });
 
 		const merged = dedupeServers([...scanned, ...recent]);
+		log("scan merged", { mergedCount: merged.length });
 		await writeCache(merged);
 		return merged;
 	},

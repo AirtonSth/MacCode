@@ -103,8 +103,9 @@ const normalizeBaseUrl = (baseUrl: string): string => {
 
 const normalizeToken = (token: string): string => {
 	const sanitized = token.trim();
+	const isLegacyDefault = sanitized === "local-dev-token";
 
-	return sanitized.length > 0 ? sanitized : "local-dev-token";
+	return sanitized.length > 0 && !isLegacyDefault ? sanitized : "remotecode.io-token";
 };
 
 export const createEdenClient = (config: EdenClientConfig) => {

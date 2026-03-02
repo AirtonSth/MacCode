@@ -695,7 +695,7 @@ export type PendingAssistantBuffer = Record<string, string>;
 export const useWorkspaceStore = () => {
 	const [state, dispatch] = useReducer(workspaceReducer, {
 		baseUrl: "http://127.0.0.1:8835",
-		token: "local-dev-token",
+		token: "remotecode.io-token",
 		projects: [],
 		selectedProjectId: null,
 		chats: [],

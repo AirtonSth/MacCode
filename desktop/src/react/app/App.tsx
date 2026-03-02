@@ -265,7 +265,7 @@ const App = (): JSX.Element => {
 	}, []);
 
 	const token = useMemo(() => {
-		return (import.meta.env.VITE_REMOTECODE_LOCAL_TOKEN || "local-dev-token").trim();
+		return (import.meta.env.VITE_REMOTECODE_LOCAL_TOKEN || "remotecode.io-token").trim();
 	}, []);
 
 	const api = useMemo(() => RemoteCodeApi.createClient({ baseUrl, token }), [baseUrl, token]);

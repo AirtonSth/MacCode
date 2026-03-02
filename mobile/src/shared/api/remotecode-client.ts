@@ -112,6 +112,29 @@ const toNormalizedBaseUrl = (input: string): string => {
 const toRequestId = (): string =>
 	`req-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 
+export class RemoteCodeRequestError extends Error {
+	public override name = "RemoteCodeRequestError";
+
+	public readonly status: number;
+
+	public constructor(status: number, message: string) {
+		super(message);
+		this.status = status;
+	}
+}
+
+export const isRemoteCodeUnauthorizedError = (error: unknown): boolean => {
+	if (error instanceof RemoteCodeRequestError) {
+		return error.status === 401;
+	}
+
+	if (error instanceof Error) {
+		return error.message.trim().toLowerCase() === "unauthorized";
+	}
+
+	return false;
+};
+
 export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 	const baseUrl = toNormalizedBaseUrl(config.baseUrl);
 	const token = config.token.trim();
@@ -137,19 +160,19 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			body: input.body === undefined ? undefined : JSON.stringify(input.body),
 		});
 
-			let payload: (Record<string, unknown> & { error?: unknown }) | null = null;
-			try {
-				payload = (await response.json()) as Record<string, unknown> & { error?: unknown };
-			} catch {
-				payload = null;
-			}
+		let payload: (Record<string, unknown> & { error?: unknown }) | null = null;
+		try {
+			payload = (await response.json()) as Record<string, unknown> & { error?: unknown };
+		} catch {
+			payload = null;
+		}
 
 		if (!response.ok) {
 			const message =
 				typeof payload?.error === "string" && payload.error.trim().length > 0
 					? payload.error
 					: response.statusText || "Request failed";
-			throw new Error(message);
+			throw new RemoteCodeRequestError(response.status, message);
 		}
 
 		return payload as T;

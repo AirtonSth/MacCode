@@ -306,7 +306,7 @@ export const RemoteCodeApi = {
 		const baseUrl = cleanBaseUrl(
 			config?.baseUrl?.trim() || (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim(),
 		);
-		const token = config?.token?.trim() || (import.meta.env.VITE_REMOTECODE_LOCAL_TOKEN || "local-dev-token").trim();
+		const token = config?.token?.trim() || (import.meta.env.VITE_REMOTECODE_LOCAL_TOKEN || "remotecode.io-token").trim();
 		const clientId = resolveHttpClientId();
 
 		const request = async <T>(input: RequestInput): Promise<T> => {

@@ -15,6 +15,7 @@ interface IosStackHeaderProps {
 	backLabel?: string;
 	left?: ReactNode;
 	right?: ReactNode;
+	shouldShowBack?: boolean;
 	subtitle?: string | null;
 	title: string;
 }
@@ -23,10 +24,11 @@ export const IosStackHeader = ({
 	onBack = undefined,
 	backLabel = "Back",
 	left = null,
-	right = null,
-	subtitle = null,
-	title,
-}: IosStackHeaderProps) => {
+	shouldShowBack = true,
+		right = null,
+		subtitle = null,
+		title,
+	}: IosStackHeaderProps) => {
 	const insets = useSafeAreaInsets();
 	const router = useRouter();
 	const canGoBack = router.canGoBack();
@@ -46,19 +48,23 @@ export const IosStackHeader = ({
 	return (
 		<View style={[styles.container, { paddingTop: insets.top + 6 }]}>
 			<View style={styles.row}>
-				<Pressable
-					disabled={!canGo}
-					hitSlop={10}
-					onPress={handleBack}
-					style={({ pressed }) => [
-						styles.backButton,
-						pressed ? styles.backButtonPressed : null,
-						!canGo ? styles.backButtonDisabled : null,
-					]}
-					testID="nav-back"
-				>
-					{left || <Text style={styles.backLabel}>{backLabel}</Text>}
-				</Pressable>
+			{shouldShowBack ? (
+					<Pressable
+						disabled={!canGo}
+						hitSlop={10}
+						onPress={handleBack}
+						style={({ pressed }) => [
+							styles.backButton,
+							pressed ? styles.backButtonPressed : null,
+							!canGo ? styles.backButtonDisabled : null,
+						]}
+						testID="nav-back"
+					>
+						{left || <Text style={styles.backLabel}>{backLabel}</Text>}
+					</Pressable>
+				) : (
+					<View style={styles.leftSpacer} />
+				)}
 
 				<View style={styles.center}>
 					<Text numberOfLines={1} style={styles.title}>
@@ -102,6 +108,9 @@ const styles = StyleSheet.create({
 		flex: 1,
 		gap: 2,
 		justifyContent: "center",
+	},
+	leftSpacer: {
+		minWidth: 58,
 	},
 	container: {
 		backgroundColor: palette.surface,

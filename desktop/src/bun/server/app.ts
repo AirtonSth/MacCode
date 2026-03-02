@@ -107,10 +107,16 @@ export const ServerBootstrap = {
 		let serverReference: unknown;
 
 		await new Promise<void>((resolve) => {
-			handle.app.listen(listenPort, (server) => {
+			handle.app.listen(
+				{
+					hostname: serverConfig.host,
+					port: listenPort,
+				},
+				(server) => {
 				serverReference = server;
 				resolve();
-			});
+				},
+			);
 		});
 
 		return {

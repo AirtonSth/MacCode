@@ -14,7 +14,10 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.remotecode-mobile"
+      "bundleIdentifier": "com.anonymous.remotecode-mobile",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Remotecode discovers and connects to your local desktop server."
+      }
     },
     "android": {
       "adaptiveIcon": {

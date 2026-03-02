@@ -29,6 +29,19 @@ export const AuthService = {
 		}
 	},
 
+	readPathname(request: Request): string {
+		try {
+			return new URL(request.url).pathname;
+		} catch {
+			return request.url.split("?")[0] ?? request.url;
+		}
+	},
+
+	isPublicRestRoute(request: Request): boolean {
+		const pathname = AuthService.readPathname(request);
+		return pathname === "/v1/discovery";
+	},
+
 	readHeaderToken(request: Request): string | null {
 		const rawToken = request.headers.get("authorization");
 
@@ -73,6 +86,10 @@ export const AuthService = {
 				set.status = 204;
 
 				return "";
+			}
+
+			if (AuthService.isPublicRestRoute(request)) {
+				return;
 			}
 
 			const token = AuthService.isWebSocketRoute(request)
