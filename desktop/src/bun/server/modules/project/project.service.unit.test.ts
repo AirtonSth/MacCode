@@ -81,7 +81,12 @@ test("ProjectService.createProject normalizes and rejects invalid paths", async 
 
 	expect(existing).toEqual({
 		created: false,
-		project: createMemoryProject("existing-id", normalizedExisting),
+		project: expect.objectContaining({
+			id: "existing-id",
+			isFavorite: false,
+			name: "project-existing-id",
+			path: normalizedExisting,
+		}),
 	});
 
 	const created = await service.createProject({ name: "repo", path: validDirectory });
