@@ -31,6 +31,11 @@ fill() {
 	ad fill "id=\"${test_id}\"" "${value}" >/dev/null
 }
 
+get_text() {
+	local test_id="$1"
+	ad get text "id=\"${test_id}\""
+}
+
 wait_for() {
 	local test_id="$1"
 	local timeout_ms="${2:-30000}"
@@ -87,8 +92,40 @@ ad wait 1200 >/dev/null
 
 ensure_chat
 
-echo "Opening terminal modal..."
+echo "Opening desktop file picker from chat composer..."
 fill "chat-input" "draft message stays here"
+click "chat-attach-button"
+wait_for "chat-file-picker-modal"
+wait_for "chat-file-picker-root-0"
+click "chat-file-picker-root-0"
+ad wait 600 >/dev/null
+
+if exists "chat-file-picker-directory-entry-0"; then
+	click "chat-file-picker-directory-entry-0"
+	ad wait 600 >/dev/null
+fi
+
+click "chat-file-picker-select-folder-button"
+click "chat-file-picker-add-button"
+ad wait 800 >/dev/null
+
+if exists "chat-file-picker-modal"; then
+	echo "File picker modal did not close after add action" >&2
+	exit 1
+fi
+
+composer_value="$(get_text "chat-input" | tr -d '\r' || true)"
+if [[ -z "${composer_value}" ]]; then
+	echo "Composer is empty after selecting desktop path" >&2
+	exit 1
+fi
+
+if [[ "${composer_value}" != *"/"* && "${composer_value}" != *"\\"* ]]; then
+	echo "Composer value does not contain an absolute path: ${composer_value}" >&2
+	exit 1
+fi
+
+echo "Opening terminal modal..."
 click "chat-terminal-open-button"
 wait_for "terminal-modal"
 

@@ -18,7 +18,9 @@ import {
 } from "react-native";
 
 import { useWorkspaceShell } from "../model/use-workspace-shell";
+import { appendAttachmentPathsToMessage } from "../model/attachment-paths";
 import { StreamingTimeline } from "./streamingTimeline";
+import { DesktopFilePickerModal } from "./desktop-file-picker-modal";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
@@ -131,6 +133,7 @@ export const ChatScreen = () => {
 	const [activePicker, setActivePicker] = useState<ActivePicker | null>(null);
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const [isTerminalOpen, setIsTerminalOpen] = useState<boolean>(false);
+	const [isFilePickerOpen, setIsFilePickerOpen] = useState<boolean>(false);
 	const [isKeyboardVisible, setIsKeyboardVisible] = useState<boolean>(false);
 	const [isBranchCheckoutPending, setIsBranchCheckoutPending] = useState<boolean>(false);
 	const selectorsScrollRef = useRef<ScrollView | null>(null);
@@ -360,6 +363,20 @@ export const ChatScreen = () => {
 		if (sent) {
 			setInput("");
 		}
+	};
+
+	const openFilePicker = () => {
+		Keyboard.dismiss();
+		setIsFilePickerOpen(true);
+	};
+
+	const closeFilePicker = () => {
+		setIsFilePickerOpen(false);
+	};
+
+	const handleAddAttachmentPaths = (paths: string[]) => {
+		setInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
+		setIsFilePickerOpen(false);
 	};
 
 	const openDrawer = () => {
@@ -753,6 +770,19 @@ export const ChatScreen = () => {
 				) : null}
 
 				<View style={styles.composerRow}>
+					<Pressable
+						disabled={isSending || !selectedProjectId}
+						onPress={openFilePicker}
+						style={({ pressed }) => [
+							styles.attachAction,
+							pressed ? styles.attachActionPressed : null,
+							isSending || !selectedProjectId ? styles.disabledButton : null,
+						]}
+						testID="chat-attach-button"
+					>
+						<MaterialIcons color={palette.text} name="add" size={22} />
+					</Pressable>
+
 					<TextInput
 						autoCapitalize="sentences"
 						multiline
@@ -911,6 +941,13 @@ export const ChatScreen = () => {
 						</Pressable>
 					</Pressable>
 			</Modal>
+
+			<DesktopFilePickerModal
+				client={api}
+				isVisible={isFilePickerOpen}
+				onAddPaths={handleAddAttachmentPaths}
+				onClose={closeFilePicker}
+			/>
 
 			<Modal animationType="none" onRequestClose={closeDrawer} transparent visible={isDrawerOpen}>
 				<View style={styles.drawerRoot}>
@@ -1091,6 +1128,19 @@ export const ChatScreen = () => {
 const styles = StyleSheet.create({
 	assistantBubble: {
 		backgroundColor: palette.soft,
+	},
+	attachAction: {
+		alignItems: "center",
+		backgroundColor: "rgba(255,255,255,0.04)",
+		borderColor: palette.border,
+		borderRadius: 11,
+		borderWidth: 1,
+		height: 42,
+		justifyContent: "center",
+		width: 42,
+	},
+	attachActionPressed: {
+		backgroundColor: "rgba(255,255,255,0.09)",
 	},
 	body: {
 		flex: 1,
