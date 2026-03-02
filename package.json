@@ -18,8 +18,9 @@
     "typecheck:contracts": "bun run --cwd packages/contracts typecheck",
     "test:quick": "bun run test:quick:desktop",
     "test:quick:desktop": "bun run --cwd desktop test:backend",
-    "dev:desktop": "bun run --cwd desktop dev",
-    "dev:mobile": "bun run --cwd mobile start"
+    "dev:desktop": "bun run --cwd desktop dev:hmr",
+    "dev:mobile": "bun run --cwd mobile start",
+    "dev:mobile:ios": "cd mobile && bunx expo run ios"
   },
   "devDependencies": {
     "eslint": "8.57.1",

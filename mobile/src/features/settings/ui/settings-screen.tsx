@@ -1,37 +1,58 @@
+import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
-import { useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { useEffect, useMemo, useState } from "react";
+import {
+	ActivityIndicator,
+	KeyboardAvoidingView,
+	Platform,
+	Pressable,
+	ScrollView,
+	StyleSheet,
+	Text,
+	TextInput,
+	View,
+} from "react-native";
 
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { ApiConfigStore } from "../../../shared/api/api-config-store";
-import { createRemoteCodeClient } from "../../../shared/api/remotecode-client";
 import { DiscoveryManager, type DiscoveredServer } from "../../../shared/api/discovery-manager";
-import { theme } from "../../../shared/theme/tokens";
-import { GlassPanel } from "../../../shared/ui/glass-panel";
+import { createRemoteCodeClient } from "../../../shared/api/remotecode-client";
+
+type StatusTone = "neutral" | "success" | "error";
+
+const palette = {
+	accent: "#6DE3C2",
+	accentPressed: "#53C9AB",
+	background: "#050A15",
+	card: "rgba(11, 24, 45, 0.86)",
+	cardSoft: "rgba(10, 18, 34, 0.7)",
+	line: "rgba(255, 255, 255, 0.12)",
+	muted: "#93A6C7",
+	text: "#F3F7FF",
+};
 
 export const SettingsScreen = () => {
 	const { config, update } = useApiConfig();
 	const router = useRouter();
+
 	const [baseUrl, setBaseUrl] = useState<string>(config.baseUrl);
 	const [token, setToken] = useState<string>(config.token);
-	const [isSaving, setIsSaving] = useState<boolean>(false);
-	const [saved, setSaved] = useState<boolean>(false);
 	const [discoveredServers, setDiscoveredServers] = useState<DiscoveredServer[]>([]);
 	const [tokenByServerId, setTokenByServerId] = useState<Record<string, string>>({});
 	const [isScanning, setIsScanning] = useState<boolean>(false);
+	const [isSaving, setIsSaving] = useState<boolean>(false);
 	const [isConnectingByServerId, setIsConnectingByServerId] = useState<Record<string, boolean>>({});
 	const [statusMessage, setStatusMessage] = useState<string | null>(null);
+	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
 
-	const save = async () => {
-		setIsSaving(true);
-		setSaved(false);
-		setStatusMessage(null);
-		await update({
-			baseUrl,
-			token,
-		});
-		setSaved(true);
-		setIsSaving(false);
+	const hasCurrentConnection = useMemo(
+		() => config.baseUrl.trim().length > 0 && config.token.trim().length > 0,
+		[config.baseUrl, config.token],
+	);
+
+	const setStatus = (message: string | null, tone: StatusTone = "neutral") => {
+		setStatusMessage(message);
+		setStatusTone(tone);
 	};
 
 	const loadRecent = async () => {
@@ -47,8 +68,8 @@ export const SettingsScreen = () => {
 
 		setTokenByServerId((current) => {
 			const next = { ...current };
-			for (const [serverId, serverToken] of tokenPairs) {
-				next[serverId] = serverToken;
+			for (const [serverId, savedToken] of tokenPairs) {
+				next[serverId] ||= savedToken;
 			}
 			return next;
 		});
@@ -60,7 +81,7 @@ export const SettingsScreen = () => {
 
 	const scanServers = async () => {
 		setIsScanning(true);
-		setStatusMessage(null);
+		setStatus(null);
 
 		try {
 			const found = await DiscoveryManager.scan();
@@ -72,24 +93,58 @@ export const SettingsScreen = () => {
 					return [server.serverId, storedToken ?? ""] as const;
 				}),
 			);
+
 			setTokenByServerId((current) => {
 				const next = { ...current };
-				for (const [serverId, serverToken] of tokenPairs) {
-					next[serverId] = current[serverId] ?? serverToken;
+				for (const [serverId, savedToken] of tokenPairs) {
+					next[serverId] ||= savedToken;
 				}
 				return next;
 			});
 		} catch (error) {
-			setStatusMessage(error instanceof Error ? error.message : "Unable to scan the local network.");
+			setStatus(error instanceof Error ? error.message : "Unable to scan the local network.", "error");
 		} finally {
 			setIsScanning(false);
+		}
+	};
+
+	const connectManual = async () => {
+		const trimmedBaseUrl = baseUrl.trim();
+		const trimmedToken = token.trim();
+
+		if (!trimmedBaseUrl || !trimmedToken) {
+			setStatus("Enter both server URL and token.", "error");
+			return;
+		}
+
+		setIsSaving(true);
+		setStatus(null);
+
+		try {
+			const verifyClient = createRemoteCodeClient({
+				baseUrl: trimmedBaseUrl,
+				token: trimmedToken,
+			});
+			await verifyClient.verifyToken(trimmedToken, trimmedBaseUrl);
+
+			await update({
+				baseUrl: trimmedBaseUrl,
+				token: trimmedToken,
+			});
+
+			setStatus(`Connected to ${trimmedBaseUrl}`, "success");
+			router.push("/workspaces");
+		} catch (error) {
+			setStatus(error instanceof Error ? error.message : "Unable to connect using manual settings.", "error");
+		} finally {
+			setIsSaving(false);
 		}
 	};
 
 	const connectServer = async (server: DiscoveredServer) => {
 		const selectedToken = (tokenByServerId[server.serverId] ?? "").trim() || token.trim();
 		if (!selectedToken) {
-			setStatusMessage("Token is required to connect to the selected server.");
+			setStatus("Token is required to connect to this server.", "error");
 			return;
 		}
 
@@ -97,7 +152,7 @@ export const SettingsScreen = () => {
 			...current,
 			[server.serverId]: true,
 		}));
-		setStatusMessage(null);
+		setStatus(null);
 
 		try {
 			const verifyClient = createRemoteCodeClient({
@@ -115,12 +170,13 @@ export const SettingsScreen = () => {
 				baseUrl: server.baseUrl,
 				token: selectedToken,
 			});
+
 			setBaseUrl(server.baseUrl);
 			setToken(selectedToken);
-			setSaved(true);
-			setStatusMessage(`Connected to ${server.hostname}:${String(server.port)}`);
+			setStatus(`Connected to ${server.hostname}:${String(server.port)}`, "success");
+			router.push("/workspaces");
 		} catch (error) {
-			setStatusMessage(error instanceof Error ? error.message : "Unable to connect to selected server.");
+			setStatus(error instanceof Error ? error.message : "Unable to connect to selected server.", "error");
 		} finally {
 			setIsConnectingByServerId((current) => ({
 				...current,
@@ -129,284 +185,349 @@ export const SettingsScreen = () => {
 		}
 	};
 
+	const continueWithCurrent = () => {
+		if (!hasCurrentConnection) {
+			setStatus("No saved connection found. Connect manually or choose a discovered server.", "error");
+			return;
+		}
+
+		setStatus(null);
+		router.push("/workspaces");
+	};
+
 	return (
-		<ScrollView
-			contentContainerStyle={{
-				flexGrow: 1,
-				gap: 14,
-				padding: 16,
-			}}
-			contentInsetAdjustmentBehavior="automatic"
-			style={{
-				backgroundColor: theme.colors.background,
-				flex: 1,
-			}}
+		<KeyboardAvoidingView
+			behavior={Platform.OS === "ios" ? "padding" : undefined}
+			style={styles.root}
 		>
-			<GlassPanel>
-				<View
-					style={{
-						alignItems: "center",
-						flexDirection: "row",
-						justifyContent: "space-between",
-					}}
-				>
-					<Text
-						style={{
-							color: theme.colors.textPrimary,
-							fontSize: 22,
-							fontWeight: "700",
-						}}
-					>
-						Servers
+			<LinearGradient
+				colors={["#1B2E57", "#0D1C36", palette.background]}
+				end={{ x: 0.9, y: 1 }}
+				start={{ x: 0.1, y: 0 }}
+				style={StyleSheet.absoluteFill}
+			/>
+
+			<ScrollView
+				contentContainerStyle={styles.content}
+				contentInsetAdjustmentBehavior="automatic"
+				showsVerticalScrollIndicator={false}
+			>
+				<View style={styles.headerRow}>
+					<Text style={styles.stepLabel}>STEP 1 OF 4</Text>
+				</View>
+
+				<View style={styles.progressRow}>
+					<View style={[styles.progressDot, styles.progressDotActive]} />
+					<View style={styles.progressDot} />
+					<View style={styles.progressDot} />
+					<View style={styles.progressDot} />
+				</View>
+
+				<Text style={styles.title}>Choose a server</Text>
+				<Text style={styles.subtitle}>
+					Connect to your desktop Codex server first. After that, we guide you through workspace, thread, and chat.
+				</Text>
+
+				<View style={styles.card}>
+					<Text style={styles.cardTitle}>Current connection</Text>
+					<Text style={styles.cardDescription}>
+						{hasCurrentConnection
+							? String(config.baseUrl)
+							: "No saved server yet."}
 					</Text>
 					<Pressable
-						onPress={() => {
-							void scanServers();
-						}}
-						style={({ pressed }) => ({
-							backgroundColor: pressed ? "rgba(99,200,255,0.3)" : "rgba(99,200,255,0.18)",
-							borderColor: "rgba(99,200,255,0.35)",
-							borderRadius: theme.borderRadius.chip,
-							borderWidth: 1,
-							paddingHorizontal: 14,
-							paddingVertical: 8,
-						})}
+						disabled={!hasCurrentConnection}
+						onPress={continueWithCurrent}
+						style={({ pressed }) => [
+							styles.primaryButton,
+							pressed ? styles.primaryButtonPressed : null,
+							!hasCurrentConnection ? styles.disabledButton : null,
+						]}
 					>
-						<Text
-							style={{
-								color: theme.colors.textPrimary,
-								fontSize: 13,
-								fontWeight: "700",
-							}}
-						>
-							{isScanning ? "Scanning..." : "Scan LAN"}
-						</Text>
+						<Text style={styles.primaryButtonLabel}>Continue with current server</Text>
 					</Pressable>
 				</View>
 
-				<Text
-					style={{
-						color: theme.colors.textSecondary,
-						fontSize: 13,
-						marginTop: 6,
-					}}
-				>
-					Discover local desktop servers on port 8835 and connect using token auth.
-				</Text>
-
-				{isScanning ? <ActivityIndicator color={theme.colors.accent} style={{ marginTop: 10 }} /> : null}
-
-				<View style={{ gap: 10, marginTop: 12 }}>
-					{discoveredServers.length === 0 ? (
-						<Text style={{ color: theme.colors.muted, fontSize: 13 }}>
-							No servers discovered yet. Tap Scan LAN.
-						</Text>
-					) : null}
-					{discoveredServers.map((server) => (
-						<View
-							key={server.serverId}
-							style={{
-								backgroundColor: "rgba(255,255,255,0.03)",
-								borderColor: theme.colors.borderSoft,
-								borderRadius: theme.borderRadius.card,
-								borderWidth: 1,
-								padding: 10,
+				<View style={styles.card}>
+					<View style={styles.cardHeaderRow}>
+						<Text style={styles.cardTitle}>Discovered servers</Text>
+						<Pressable
+							onPress={() => {
+								void scanServers();
 							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
 						>
-							<Text style={{ color: theme.colors.textPrimary, fontSize: 14, fontWeight: "700" }}>
-								{server.hostname}:{String(server.port)}
-							</Text>
-							<Text style={{ color: theme.colors.muted, fontSize: 12, marginTop: 4 }} selectable>
-								{server.baseUrl}
-							</Text>
-							<TextInput
-								autoCapitalize="none"
-								onChangeText={(value) => {
-									setTokenByServerId((current) => ({
-										...current,
-										[server.serverId]: value,
-									}));
-								}}
-								placeholder="Token"
-								placeholderTextColor={theme.colors.muted}
-								style={{
-									backgroundColor: "rgba(255,255,255,0.04)",
-									borderColor: theme.colors.borderSoft,
-									borderRadius: theme.borderRadius.chip,
-									borderWidth: 1,
-									color: theme.colors.textPrimary,
-									fontSize: 13,
-									marginTop: 8,
-									paddingHorizontal: 10,
-									paddingVertical: 8,
-								}}
-								value={tokenByServerId[server.serverId] ?? ""}
-							/>
-							<Pressable
-								onPress={() => {
-									void connectServer(server);
-								}}
-								style={({ pressed }) => ({
-									backgroundColor: pressed ? "rgba(99,200,255,0.3)" : "rgba(99,200,255,0.18)",
-									borderColor: "rgba(99,200,255,0.35)",
-									borderRadius: theme.borderRadius.chip,
-									borderWidth: 1,
-									marginTop: 8,
-									paddingHorizontal: 12,
-									paddingVertical: 8,
-								})}
-							>
-								<Text style={{ color: theme.colors.textPrimary, fontSize: 13, fontWeight: "700" }}>
-									{isConnectingByServerId[server.serverId] ? "Connecting..." : "Connect"}
-								</Text>
-							</Pressable>
-						</View>
-					))}
+							<Text style={styles.secondaryButtonLabel}>{isScanning ? "Scanning..." : "Scan LAN"}</Text>
+						</Pressable>
+					</View>
+
+					{isScanning ? <ActivityIndicator color={palette.accent} style={styles.loader} /> : null}
+
+					{discoveredServers.length === 0 ? (
+						<Text style={styles.emptyText}>No servers found yet. Tap Scan LAN.</Text>
+					) : (
+						discoveredServers.map((server) => (
+							<View key={server.serverId} style={styles.serverItem}>
+								<Text style={styles.serverName}>{server.hostname}:{String(server.port)}</Text>
+								<Text selectable style={styles.serverUrl}>{server.baseUrl}</Text>
+								<TextInput
+									autoCapitalize="none"
+									onChangeText={(value) => {
+										setTokenByServerId((current) => ({
+											...current,
+											[server.serverId]: value,
+										}));
+									}}
+									placeholder="Server token"
+									placeholderTextColor={palette.muted}
+									style={styles.input}
+									value={tokenByServerId[server.serverId] ?? ""}
+								/>
+								<Pressable
+									onPress={() => {
+										void connectServer(server);
+									}}
+									style={({ pressed }) => [
+										styles.primaryButton,
+										pressed ? styles.primaryButtonPressed : null,
+									]}
+								>
+									<Text style={styles.primaryButtonLabel}>
+										{isConnectingByServerId[server.serverId] ? "Connecting..." : "Connect and continue"}
+									</Text>
+								</Pressable>
+							</View>
+						))
+					)}
 				</View>
-			</GlassPanel>
 
-			<GlassPanel>
-				<Text
-					style={{
-						color: theme.colors.textPrimary,
-						fontSize: 22,
-						fontWeight: "700",
-					}}
-				>
-					Manual Connection
-				</Text>
-				<Text
-					style={{
-						color: theme.colors.textSecondary,
-						fontSize: 13,
-						marginTop: 6,
-					}}
-				>
-					Fallback: configure server URL and token manually.
-				</Text>
-
-				<View style={{ marginTop: 16 }}>
-					<Text
-						style={{
-							color: theme.colors.textSecondary,
-							fontSize: 12,
-							marginBottom: 6,
-							textTransform: "uppercase",
-						}}
-					>
-						Server URL
+				<View style={styles.card}>
+					<Text style={styles.cardTitle}>Manual connection</Text>
+					<Text style={styles.cardDescription}>
+						Use this when your server is outside your LAN or when discovery is disabled.
 					</Text>
+
+					<Text style={styles.inputLabel}>Server URL</Text>
 					<TextInput
 						autoCapitalize="none"
 						onChangeText={setBaseUrl}
 						placeholder="http://127.0.0.1:8835"
-						placeholderTextColor={theme.colors.muted}
-						style={{
-							backgroundColor: "rgba(255,255,255,0.04)",
-							borderColor: theme.colors.borderSoft,
-							borderRadius: theme.borderRadius.chip,
-							borderWidth: 1,
-							color: theme.colors.textPrimary,
-							fontSize: 14,
-							paddingHorizontal: 12,
-							paddingVertical: 10,
-						}}
+						placeholderTextColor={palette.muted}
+						style={styles.input}
 						value={baseUrl}
 					/>
-				</View>
 
-				<View style={{ marginTop: 14 }}>
-					<Text
-						style={{
-							color: theme.colors.textSecondary,
-							fontSize: 12,
-							marginBottom: 6,
-							textTransform: "uppercase",
-						}}
-					>
-						Token
-					</Text>
+					<Text style={styles.inputLabel}>Token</Text>
 					<TextInput
 						autoCapitalize="none"
 						onChangeText={setToken}
 						placeholder="local-dev-token"
-						placeholderTextColor={theme.colors.muted}
-						style={{
-							backgroundColor: "rgba(255,255,255,0.04)",
-							borderColor: theme.colors.borderSoft,
-							borderRadius: theme.borderRadius.chip,
-							borderWidth: 1,
-							color: theme.colors.textPrimary,
-							fontSize: 14,
-							paddingHorizontal: 12,
-							paddingVertical: 10,
-						}}
+						placeholderTextColor={palette.muted}
+						style={styles.input}
 						value={token}
 					/>
-				</View>
-
-				<View style={{ flexDirection: "row", gap: 10, marginTop: 18 }}>
-					<Pressable
-						onPress={() => {
-							void save();
-						}}
-						style={({ pressed }) => ({
-							backgroundColor: pressed ? "rgba(99,200,255,0.3)" : "rgba(99,200,255,0.18)",
-							borderColor: "rgba(99,200,255,0.35)",
-							borderRadius: theme.borderRadius.chip,
-							borderWidth: 1,
-							paddingHorizontal: 16,
-							paddingVertical: 10,
-						})}
-					>
-						<Text style={{ color: theme.colors.textPrimary, fontSize: 14, fontWeight: "700" }}>
-							{isSaving ? "Saving..." : "Save"}
-						</Text>
-					</Pressable>
 
 					<Pressable
+						disabled={isSaving}
 						onPress={() => {
-							router.back();
+							void connectManual();
 						}}
-						style={({ pressed }) => ({
-							backgroundColor: pressed ? "rgba(255,255,255,0.13)" : "rgba(255,255,255,0.06)",
-							borderColor: theme.colors.borderSoft,
-							borderRadius: theme.borderRadius.chip,
-							borderWidth: 1,
-							paddingHorizontal: 16,
-							paddingVertical: 10,
-						})}
+						style={({ pressed }) => [
+							styles.primaryButton,
+							pressed ? styles.primaryButtonPressed : null,
+							isSaving ? styles.disabledButton : null,
+						]}
 					>
-						<Text style={{ color: theme.colors.textPrimary, fontSize: 14, fontWeight: "600" }}>
-							Close
-						</Text>
+						<Text style={styles.primaryButtonLabel}>{isSaving ? "Connecting..." : "Connect and continue"}</Text>
 					</Pressable>
 				</View>
-
-				{saved ? (
-					<Text
-						style={{
-							color: theme.colors.accent,
-							fontSize: 12,
-							marginTop: 10,
-						}}
-					>
-						Saved. The app now reconnects using the new settings.
-					</Text>
-				) : null}
 
 				{statusMessage ? (
-					<Text
-						style={{
-							color: theme.colors.textSecondary,
-							fontSize: 12,
-							marginTop: 8,
-						}}
+					<View
+						style={[
+							styles.statusContainer,
+							statusTone === "success" ? styles.statusSuccess : null,
+							statusTone === "error" ? styles.statusError : null,
+						]}
 					>
-						{statusMessage}
-					</Text>
+						<Text style={styles.statusText}>{statusMessage}</Text>
+					</View>
 				) : null}
-			</GlassPanel>
-		</ScrollView>
+			</ScrollView>
+		</KeyboardAvoidingView>
 	);
 };
+
+const styles = StyleSheet.create({
+	card: {
+		backgroundColor: palette.card,
+		borderColor: palette.line,
+		borderRadius: 20,
+		borderWidth: 1,
+		padding: 16,
+	},
+	cardDescription: {
+		color: palette.muted,
+		fontSize: 14,
+		lineHeight: 20,
+		marginTop: 4,
+	},
+	cardHeaderRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		justifyContent: "space-between",
+	},
+	cardTitle: {
+		color: palette.text,
+		fontSize: 17,
+		fontWeight: "700",
+	},
+	content: {
+		gap: 16,
+		paddingBottom: 36,
+		paddingHorizontal: 18,
+		paddingTop: 20,
+	},
+	disabledButton: {
+		opacity: 0.45,
+	},
+	emptyText: {
+		color: palette.muted,
+		fontSize: 14,
+		marginTop: 12,
+	},
+	headerRow: {
+		alignItems: "center",
+		flexDirection: "row",
+	},
+	input: {
+		backgroundColor: palette.cardSoft,
+		borderColor: palette.line,
+		borderRadius: 14,
+		borderWidth: 1,
+		color: palette.text,
+		fontSize: 16,
+		minHeight: 46,
+		paddingHorizontal: 14,
+		paddingVertical: 10,
+	},
+	inputLabel: {
+		color: palette.muted,
+		fontSize: 12,
+		fontWeight: "700",
+		letterSpacing: 0.5,
+		marginBottom: 6,
+		marginTop: 12,
+		textTransform: "uppercase",
+	},
+	loader: {
+		marginTop: 12,
+	},
+	primaryButton: {
+		alignItems: "center",
+		backgroundColor: palette.accent,
+		borderRadius: 14,
+		justifyContent: "center",
+		marginTop: 12,
+		minHeight: 46,
+		paddingHorizontal: 14,
+	},
+	primaryButtonLabel: {
+		color: "#062016",
+		fontSize: 15,
+		fontWeight: "800",
+	},
+	primaryButtonPressed: {
+		backgroundColor: palette.accentPressed,
+	},
+	progressDot: {
+		backgroundColor: "rgba(255,255,255,0.18)",
+		borderRadius: 999,
+		flex: 1,
+		height: 6,
+	},
+	progressDotActive: {
+		backgroundColor: palette.accent,
+	},
+	progressRow: {
+		flexDirection: "row",
+		gap: 6,
+	},
+	root: {
+		backgroundColor: palette.background,
+		flex: 1,
+	},
+	secondaryButton: {
+		alignItems: "center",
+		borderColor: palette.line,
+		borderRadius: 12,
+		borderWidth: 1,
+		justifyContent: "center",
+		minHeight: 42,
+		paddingHorizontal: 14,
+	},
+	secondaryButtonLabel: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "700",
+	},
+	secondaryButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.1)",
+	},
+	serverItem: {
+		backgroundColor: palette.cardSoft,
+		borderColor: palette.line,
+		borderRadius: 16,
+		borderWidth: 1,
+		gap: 8,
+		marginTop: 12,
+		padding: 12,
+	},
+	serverName: {
+		color: palette.text,
+		fontSize: 15,
+		fontWeight: "700",
+	},
+	serverUrl: {
+		color: palette.muted,
+		fontSize: 12,
+	},
+	statusContainer: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+		borderColor: palette.line,
+		borderRadius: 14,
+		borderWidth: 1,
+		padding: 12,
+	},
+	statusError: {
+		borderColor: "rgba(255, 118, 133, 0.35)",
+	},
+	statusSuccess: {
+		borderColor: "rgba(109, 227, 194, 0.35)",
+	},
+	statusText: {
+		color: palette.text,
+		fontSize: 13,
+		lineHeight: 18,
+	},
+	stepLabel: {
+		color: palette.muted,
+		fontSize: 11,
+		fontWeight: "700",
+		letterSpacing: 1.2,
+	},
+	subtitle: {
+		color: palette.muted,
+		fontSize: 15,
+		lineHeight: 22,
+	},
+	title: {
+		color: palette.text,
+		fontSize: 30,
+		fontWeight: "800",
+		letterSpacing: 0.3,
+	},
+});
