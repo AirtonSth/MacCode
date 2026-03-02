@@ -187,7 +187,7 @@ export const ThreadSelectionScreen = () => {
 		]).start();
 	};
 
-	const closeDrawer = () => {
+	const closeDrawer = (onClosed?: () => void) => {
 		Animated.parallel([
 			Animated.timing(drawerOpacity, {
 				duration: 140,
@@ -201,6 +201,7 @@ export const ThreadSelectionScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
+			onClosed?.();
 		});
 	};
 
@@ -208,6 +209,12 @@ export const ThreadSelectionScreen = () => {
 		selectProject(project);
 		closeDrawer();
 		replace("/threads");
+	};
+
+	const openSettingsFromDrawer = () => {
+		closeDrawer(() => {
+			replace("/settings");
+		});
 	};
 
 	const openThread = (chat: (typeof chats)[number]) => {
@@ -426,6 +433,7 @@ export const ThreadSelectionScreen = () => {
 							/>
 
 							<ScrollView
+								style={styles.drawerListScroll}
 								contentContainerStyle={styles.drawerList}
 								contentInsetAdjustmentBehavior="automatic"
 								showsVerticalScrollIndicator={false}
@@ -434,7 +442,7 @@ export const ThreadSelectionScreen = () => {
 									<Text style={styles.drawerEmpty}>No workspace found.</Text>
 								) : null}
 
-								{visibleWorkspaces.map((project, index) => (
+							{visibleWorkspaces.map((project, index) => (
 									<Pressable
 										accessibilityLabel={`drawer-workspace-item-${String(index)}`}
 										accessibilityRole="button"
@@ -458,6 +466,27 @@ export const ThreadSelectionScreen = () => {
 									</Pressable>
 								))}
 							</ScrollView>
+								<View style={styles.drawerFooter}>
+									<Pressable
+										onPress={() => {
+											openSettingsFromDrawer();
+										}}
+										style={({ pressed }) => [
+											styles.drawerFooterButton,
+											pressed ? styles.drawerFooterButtonPressed : null,
+										]}
+										testID="drawer-settings-button"
+									>
+										<MaterialIcons
+											color={palette.text}
+											name="settings"
+											size={17}
+										/>
+										<Text numberOfLines={1} style={styles.drawerItemTitle}>
+											Settings
+										</Text>
+									</Pressable>
+								</View>
 						</LinearGradient>
 					</Animated.View>
 				</View>
@@ -613,6 +642,23 @@ const styles = StyleSheet.create({
 		color: palette.muted,
 		fontSize: 12,
 	},
+	drawerFooter: {
+		borderTopColor: "rgba(255,255,255,0.2)",
+		borderTopWidth: 1,
+		marginTop: 10,
+		paddingTop: 10,
+		paddingHorizontal: 2,
+		paddingBottom: Platform.OS === "ios" ? 34 : 16,
+	},
+	drawerFooterButton: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 10,
+		padding: 12,
+	},
+	drawerFooterButtonPressed: {
+		opacity: 0.75,
+	},
 	drawerItemPressed: {
 		backgroundColor: "rgba(255,255,255,0.08)",
 	},
@@ -625,6 +671,9 @@ const styles = StyleSheet.create({
 		gap: 8,
 		paddingBottom: 20,
 		paddingTop: 8,
+	},
+	drawerListScroll: {
+		flex: 1,
 	},
 	drawerPanel: {
 		elevation: 34,

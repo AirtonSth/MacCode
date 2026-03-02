@@ -1,5 +1,5 @@
 import { useRouter } from "expo-router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
 	ActivityIndicator,
 	KeyboardAvoidingView,
@@ -35,7 +35,6 @@ export const SettingsScreen = () => {
 	const { config, update } = useApiConfig();
 	const [baseUrl, setBaseUrl] = useState<string>(config.baseUrl);
 	const [token, setToken] = useState<string>(config.token);
-	const [isManualExpanded, setIsManualExpanded] = useState<boolean>(false);
 	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
 	const [statusMessage, setStatusMessage] = useState<string>("");
 	const [isScanning, setIsScanning] = useState<boolean>(false);
@@ -59,7 +58,7 @@ export const SettingsScreen = () => {
 		router.push("/workspaces");
 	};
 
-	const hydrateRecentServers = async () => {
+	const hydrateRecentServers = useCallback(async () => {
 		const recent = await DiscoveryManager.readRecent();
 		setDiscoveredServers(recent);
 
@@ -77,13 +76,14 @@ export const SettingsScreen = () => {
 			}
 			return next;
 		});
-	};
+	}, []);
 
 	useEffect(() => {
 		void hydrateRecentServers();
-	}, []);
+		void scanLan();
+	}, [hydrateRecentServers, scanLan]);
 
-	const scanLan = async () => {
+	const scanLan = useCallback(async () => {
 		setIsScanning(true);
 		setStatusMessage("");
 		try {
@@ -95,7 +95,7 @@ export const SettingsScreen = () => {
 		} finally {
 			setIsScanning(false);
 		}
-	};
+	}, []);
 
 	const connectAndPersist = async (input: { baseUrl: string; token: string; serverId?: string }) => {
 		const normalizedBaseUrl = input.baseUrl.trim();
@@ -285,56 +285,44 @@ export const SettingsScreen = () => {
 				</View>
 
 				<View style={styles.section}>
-					<Pressable
-						onPress={() => {
-							setIsManualExpanded((current) => !current);
-						}}
-						style={({ pressed }) => [
-							styles.sectionHeader,
-							pressed ? styles.secondaryButtonPressed : null,
-						]}
-						testID="server-manual-toggle"
-					>
+					<View style={styles.sectionHeader}>
 						<Text style={styles.sectionTitle}>Manual Connection</Text>
-						<Text style={styles.secondaryLabel}>{isManualExpanded ? "Hide" : "Show"}</Text>
-					</Pressable>
+					</View>
 
-					{isManualExpanded ? (
-						<View style={styles.formBody}>
-							<TextInput
-								autoCapitalize="none"
-								onChangeText={setBaseUrl}
-								placeholder="http://127.0.0.1:8835"
-								placeholderTextColor={palette.muted}
-								style={styles.input}
-								testID="server-manual-base-url"
-								value={baseUrl}
-							/>
-							<TextInput
-								autoCapitalize="none"
-								onChangeText={setToken}
-								placeholder="Token"
-								placeholderTextColor={palette.muted}
-								style={styles.input}
-								testID="server-manual-token"
-								value={token}
-							/>
-							<Pressable
-								disabled={isConnectingManual}
-								onPress={() => {
-									void connectManual();
-								}}
-								style={({ pressed }) => [
-									styles.primaryButton,
-									pressed ? styles.primaryButtonPressed : null,
-									isConnectingManual ? styles.disabledButton : null,
-								]}
-								testID="server-manual-connect"
-							>
-								<Text style={styles.primaryLabel}>{isConnectingManual ? "Connecting..." : "Connect"}</Text>
-							</Pressable>
-						</View>
-					) : null}
+					<View style={styles.formBody}>
+						<TextInput
+							autoCapitalize="none"
+							onChangeText={setBaseUrl}
+							placeholder="http://127.0.0.1:8835"
+							placeholderTextColor={palette.muted}
+							style={styles.input}
+							testID="server-manual-base-url"
+							value={baseUrl}
+						/>
+						<TextInput
+							autoCapitalize="none"
+							onChangeText={setToken}
+							placeholder="Token"
+							placeholderTextColor={palette.muted}
+							style={styles.input}
+							testID="server-manual-token"
+							value={token}
+						/>
+						<Pressable
+							disabled={isConnectingManual}
+							onPress={() => {
+								void connectManual();
+							}}
+							style={({ pressed }) => [
+								styles.primaryButton,
+								pressed ? styles.primaryButtonPressed : null,
+								isConnectingManual ? styles.disabledButton : null,
+							]}
+							testID="server-manual-connect"
+						>
+							<Text style={styles.primaryLabel}>{isConnectingManual ? "Connecting..." : "Connect"}</Text>
+						</Pressable>
+					</View>
 				</View>
 
 				{statusMessage.length > 0 ? (
