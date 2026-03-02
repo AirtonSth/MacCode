@@ -1,4 +1,3 @@
-import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -17,49 +16,54 @@ import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { ApiConfigStore } from "../../../shared/api/api-config-store";
 import { DiscoveryManager, type DiscoveredServer } from "../../../shared/api/discovery-manager";
 import { createRemoteCodeClient } from "../../../shared/api/remotecode-client";
+import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 
-type StatusTone = "neutral" | "success" | "error";
+type StatusTone = "error" | "neutral" | "success";
 
 const palette = {
-	accent: "#6DE3C2",
-	accentPressed: "#53C9AB",
-	background: "#050A15",
-	card: "rgba(11, 24, 45, 0.86)",
-	cardSoft: "rgba(10, 18, 34, 0.7)",
-	line: "rgba(255, 255, 255, 0.12)",
-	muted: "#93A6C7",
-	text: "#F3F7FF",
+	accent: "#63C8FF",
+	accentPressed: "#4EAAD9",
+	background: "#0D0F14",
+	border: "rgba(255,255,255,0.11)",
+	muted: "#98A0AF",
+	soft: "rgba(255,255,255,0.05)",
+	text: "#F1F4FA",
 };
 
 export const SettingsScreen = () => {
-	const { config, update } = useApiConfig();
 	const router = useRouter();
-
+	const { config, update } = useApiConfig();
 	const [baseUrl, setBaseUrl] = useState<string>(config.baseUrl);
 	const [token, setToken] = useState<string>(config.token);
+	const [isManualExpanded, setIsManualExpanded] = useState<boolean>(false);
+	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
+	const [statusMessage, setStatusMessage] = useState<string>("");
+	const [isScanning, setIsScanning] = useState<boolean>(false);
+	const [isConnectingManual, setIsConnectingManual] = useState<boolean>(false);
+	const [isContinuing, setIsContinuing] = useState<boolean>(false);
+	const [isConnectingByServerId, setIsConnectingByServerId] = useState<Record<string, boolean>>({});
 	const [discoveredServers, setDiscoveredServers] = useState<DiscoveredServer[]>([]);
 	const [tokenByServerId, setTokenByServerId] = useState<Record<string, string>>({});
-	const [isScanning, setIsScanning] = useState<boolean>(false);
-	const [isSaving, setIsSaving] = useState<boolean>(false);
-	const [isConnectingByServerId, setIsConnectingByServerId] = useState<Record<string, boolean>>({});
-	const [statusMessage, setStatusMessage] = useState<string | null>(null);
-	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
 
-	const hasCurrentConnection = useMemo(
+	const hasSavedServer = useMemo(
 		() => config.baseUrl.trim().length > 0 && config.token.trim().length > 0,
 		[config.baseUrl, config.token],
 	);
 
-	const setStatus = (message: string | null, tone: StatusTone = "neutral") => {
+	const setStatus = (message: string, tone: StatusTone = "neutral") => {
 		setStatusMessage(message);
 		setStatusTone(tone);
 	};
 
-	const loadRecent = async () => {
+	const goNext = () => {
+		router.push("/workspaces");
+	};
+
+	const hydrateRecentServers = async () => {
 		const recent = await DiscoveryManager.readRecent();
 		setDiscoveredServers(recent);
 
-		const tokenPairs = await Promise.all(
+		const pairs = await Promise.all(
 			recent.map(async (server) => {
 				const storedToken = await ApiConfigStore.readTokenForServer(server.serverId);
 				return [server.serverId, storedToken ?? ""] as const;
@@ -68,292 +72,282 @@ export const SettingsScreen = () => {
 
 		setTokenByServerId((current) => {
 			const next = { ...current };
-			for (const [serverId, savedToken] of tokenPairs) {
-				next[serverId] ||= savedToken;
+			for (const [serverId, storedToken] of pairs) {
+				next[serverId] ||= storedToken;
 			}
 			return next;
 		});
 	};
 
 	useEffect(() => {
-		void loadRecent();
+		void hydrateRecentServers();
 	}, []);
 
-	const scanServers = async () => {
+	const scanLan = async () => {
 		setIsScanning(true);
-		setStatus(null);
-
+		setStatusMessage("");
 		try {
 			const found = await DiscoveryManager.scan();
 			setDiscoveredServers(found);
-
-			const tokenPairs = await Promise.all(
-				found.map(async (server) => {
-					const storedToken = await ApiConfigStore.readTokenForServer(server.serverId);
-					return [server.serverId, storedToken ?? ""] as const;
-				}),
-			);
-
-			setTokenByServerId((current) => {
-				const next = { ...current };
-				for (const [serverId, savedToken] of tokenPairs) {
-					next[serverId] ||= savedToken;
-				}
-				return next;
-			});
-		} catch (error) {
-			setStatus(error instanceof Error ? error.message : "Unable to scan the local network.", "error");
+			setStatus(found.length === 0 ? "No server found on local network." : `Found ${String(found.length)} server(s).`);
+		} catch (error: unknown) {
+			setStatus(error instanceof Error ? error.message : "Failed to scan local network.", "error");
 		} finally {
 			setIsScanning(false);
 		}
 	};
 
+	const connectAndPersist = async (input: { baseUrl: string; token: string; serverId?: string }) => {
+		const normalizedBaseUrl = input.baseUrl.trim();
+		const normalizedToken = input.token.trim();
+
+		if (!normalizedBaseUrl || !normalizedToken) {
+			setStatus("Server URL and token are required.", "error");
+			return false;
+		}
+
+		try {
+			const verifyClient = createRemoteCodeClient({
+				baseUrl: normalizedBaseUrl,
+				token: normalizedToken,
+			});
+			await verifyClient.verifyToken(normalizedToken, normalizedBaseUrl);
+
+			if (input.serverId) {
+				await ApiConfigStore.saveServerConnection({
+					baseUrl: normalizedBaseUrl,
+					serverId: input.serverId,
+					token: normalizedToken,
+				});
+			}
+
+			await update({
+				baseUrl: normalizedBaseUrl,
+				token: normalizedToken,
+			});
+			setBaseUrl(normalizedBaseUrl);
+			setToken(normalizedToken);
+			setStatus("Server connected.", "success");
+			return true;
+		} catch (error: unknown) {
+			setStatus(error instanceof Error ? error.message : "Unable to connect to server.", "error");
+			return false;
+		}
+	};
+
+	const continueWithSaved = async () => {
+		if (!hasSavedServer) {
+			setStatus("No saved server connection found.", "error");
+			return;
+		}
+
+		setIsContinuing(true);
+		setStatusMessage("");
+		const connected = await connectAndPersist({
+			baseUrl: config.baseUrl,
+			token: config.token,
+		});
+		setIsContinuing(false);
+		if (connected) {
+			goNext();
+		}
+	};
+
 	const connectManual = async () => {
-		const trimmedBaseUrl = baseUrl.trim();
-		const trimmedToken = token.trim();
-
-		if (!trimmedBaseUrl || !trimmedToken) {
-			setStatus("Enter both server URL and token.", "error");
-			return;
-		}
-
-		setIsSaving(true);
-		setStatus(null);
-
-		try {
-			const verifyClient = createRemoteCodeClient({
-				baseUrl: trimmedBaseUrl,
-				token: trimmedToken,
-			});
-			await verifyClient.verifyToken(trimmedToken, trimmedBaseUrl);
-
-			await update({
-				baseUrl: trimmedBaseUrl,
-				token: trimmedToken,
-			});
-
-			setStatus(`Connected to ${trimmedBaseUrl}`, "success");
-			router.push("/workspaces");
-		} catch (error) {
-			setStatus(error instanceof Error ? error.message : "Unable to connect using manual settings.", "error");
-		} finally {
-			setIsSaving(false);
+		setIsConnectingManual(true);
+		setStatusMessage("");
+		const connected = await connectAndPersist({
+			baseUrl,
+			token,
+		});
+		setIsConnectingManual(false);
+		if (connected) {
+			goNext();
 		}
 	};
 
-	const connectServer = async (server: DiscoveredServer) => {
-		const selectedToken = (tokenByServerId[server.serverId] ?? "").trim() || token.trim();
-		if (!selectedToken) {
-			setStatus("Token is required to connect to this server.", "error");
-			return;
+	const connectDiscoveredServer = async (server: DiscoveredServer) => {
+		const selectedToken = (tokenByServerId[server.serverId] ?? token).trim();
+		setIsConnectingByServerId((current) => ({ ...current, [server.serverId]: true }));
+		setStatusMessage("");
+
+		const connected = await connectAndPersist({
+			baseUrl: server.baseUrl,
+			serverId: server.serverId,
+			token: selectedToken,
+		});
+
+		setIsConnectingByServerId((current) => ({ ...current, [server.serverId]: false }));
+		if (connected) {
+			goNext();
 		}
-
-		setIsConnectingByServerId((current) => ({
-			...current,
-			[server.serverId]: true,
-		}));
-		setStatus(null);
-
-		try {
-			const verifyClient = createRemoteCodeClient({
-				baseUrl: server.baseUrl,
-				token: selectedToken,
-			});
-			await verifyClient.verifyToken(selectedToken, server.baseUrl);
-
-			await ApiConfigStore.saveServerConnection({
-				serverId: server.serverId,
-				baseUrl: server.baseUrl,
-				token: selectedToken,
-			});
-			await update({
-				baseUrl: server.baseUrl,
-				token: selectedToken,
-			});
-
-			setBaseUrl(server.baseUrl);
-			setToken(selectedToken);
-			setStatus(`Connected to ${server.hostname}:${String(server.port)}`, "success");
-			router.push("/workspaces");
-		} catch (error) {
-			setStatus(error instanceof Error ? error.message : "Unable to connect to selected server.", "error");
-		} finally {
-			setIsConnectingByServerId((current) => ({
-				...current,
-				[server.serverId]: false,
-			}));
-		}
-	};
-
-	const continueWithCurrent = () => {
-		if (!hasCurrentConnection) {
-			setStatus("No saved connection found. Connect manually or choose a discovered server.", "error");
-			return;
-		}
-
-		setStatus(null);
-		router.push("/workspaces");
 	};
 
 	return (
 		<KeyboardAvoidingView
 			behavior={Platform.OS === "ios" ? "padding" : undefined}
 			style={styles.root}
+			testID="screen-settings"
 		>
-			<LinearGradient
-				colors={["#1B2E57", "#0D1C36", palette.background]}
-				end={{ x: 0.9, y: 1 }}
-				start={{ x: 0.1, y: 0 }}
-				style={StyleSheet.absoluteFill}
-			/>
+			<IosStackHeader subtitle="Select server connection" title="Server" />
 
 			<ScrollView
 				contentContainerStyle={styles.content}
 				contentInsetAdjustmentBehavior="automatic"
+				keyboardShouldPersistTaps="handled"
 				showsVerticalScrollIndicator={false}
 			>
-				<View style={styles.headerRow}>
-					<Text style={styles.stepLabel}>STEP 1 OF 4</Text>
-				</View>
-
-				<View style={styles.progressRow}>
-					<View style={[styles.progressDot, styles.progressDotActive]} />
-					<View style={styles.progressDot} />
-					<View style={styles.progressDot} />
-					<View style={styles.progressDot} />
-				</View>
-
-				<Text style={styles.title}>Choose a server</Text>
-				<Text style={styles.subtitle}>
-					Connect to your desktop Codex server first. After that, we guide you through workspace, thread, and chat.
-				</Text>
-
-				<View style={styles.card}>
-					<Text style={styles.cardTitle}>Current connection</Text>
-					<Text style={styles.cardDescription}>
-						{hasCurrentConnection
-							? String(config.baseUrl)
-							: "No saved server yet."}
+				<View style={styles.section}>
+					<View style={styles.sectionHeader}>
+						<Text style={styles.sectionTitle}>Saved Connection</Text>
+						<Pressable
+							disabled={!hasSavedServer || isContinuing}
+							onPress={() => {
+								void continueWithSaved();
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								pressed ? styles.secondaryButtonPressed : null,
+								!hasSavedServer || isContinuing ? styles.disabledButton : null,
+							]}
+							testID="server-continue-button"
+						>
+							<Text style={styles.secondaryLabel}>{isContinuing ? "Checking..." : "Continue"}</Text>
+						</Pressable>
+					</View>
+					<Text selectable style={styles.supportText}>
+						{hasSavedServer ? config.baseUrl : "No active server yet."}
 					</Text>
-					<Pressable
-						disabled={!hasCurrentConnection}
-						onPress={continueWithCurrent}
-						style={({ pressed }) => [
-							styles.primaryButton,
-							pressed ? styles.primaryButtonPressed : null,
-							!hasCurrentConnection ? styles.disabledButton : null,
-						]}
-					>
-						<Text style={styles.primaryButtonLabel}>Continue with current server</Text>
-					</Pressable>
 				</View>
 
-				<View style={styles.card}>
-					<View style={styles.cardHeaderRow}>
-						<Text style={styles.cardTitle}>Discovered servers</Text>
+				<View style={styles.section}>
+					<View style={styles.sectionHeader}>
+						<Text style={styles.sectionTitle}>LAN Discovery</Text>
 						<Pressable
 							onPress={() => {
-								void scanServers();
+								void scanLan();
 							}}
 							style={({ pressed }) => [
 								styles.secondaryButton,
 								pressed ? styles.secondaryButtonPressed : null,
 							]}
+							testID="server-scan-button"
 						>
-							<Text style={styles.secondaryButtonLabel}>{isScanning ? "Scanning..." : "Scan LAN"}</Text>
+							<Text style={styles.secondaryLabel}>{isScanning ? "Scanning..." : "Scan"}</Text>
 						</Pressable>
 					</View>
 
-					{isScanning ? <ActivityIndicator color={palette.accent} style={styles.loader} /> : null}
+					{isScanning ? <ActivityIndicator color={palette.accent} /> : null}
 
 					{discoveredServers.length === 0 ? (
-						<Text style={styles.emptyText}>No servers found yet. Tap Scan LAN.</Text>
+						<Text style={styles.supportText}>No discovered server.</Text>
 					) : (
-						discoveredServers.map((server) => (
-							<View key={server.serverId} style={styles.serverItem}>
-								<Text style={styles.serverName}>{server.hostname}:{String(server.port)}</Text>
-								<Text selectable style={styles.serverUrl}>{server.baseUrl}</Text>
-								<TextInput
-									autoCapitalize="none"
-									onChangeText={(value) => {
-										setTokenByServerId((current) => ({
-											...current,
-											[server.serverId]: value,
-										}));
-									}}
-									placeholder="Server token"
-									placeholderTextColor={palette.muted}
-									style={styles.input}
-									value={tokenByServerId[server.serverId] ?? ""}
-								/>
-								<Pressable
-									onPress={() => {
-										void connectServer(server);
-									}}
-									style={({ pressed }) => [
-										styles.primaryButton,
-										pressed ? styles.primaryButtonPressed : null,
-									]}
-								>
-									<Text style={styles.primaryButtonLabel}>
-										{isConnectingByServerId[server.serverId] ? "Connecting..." : "Connect and continue"}
+						discoveredServers.map((server, index) => {
+							const isConnecting = Boolean(isConnectingByServerId[server.serverId]);
+							return (
+								<View key={server.serverId} style={styles.listRow} testID={`server-item-${String(index)}`}>
+									<Text numberOfLines={1} style={styles.rowTitle}>
+										{server.hostname}:{String(server.port)}
 									</Text>
-								</Pressable>
-							</View>
-						))
+									<Text selectable style={styles.rowMeta}>
+										{server.baseUrl}
+									</Text>
+									<TextInput
+										autoCapitalize="none"
+										onChangeText={(value) => {
+											setTokenByServerId((current) => ({
+												...current,
+												[server.serverId]: value,
+											}));
+										}}
+										placeholder="Server token"
+										placeholderTextColor={palette.muted}
+										style={styles.input}
+										testID={`server-token-${String(index)}`}
+										value={tokenByServerId[server.serverId] ?? ""}
+									/>
+									<Pressable
+										onPress={() => {
+											void connectDiscoveredServer(server);
+										}}
+										style={({ pressed }) => [
+											styles.primaryButton,
+											pressed ? styles.primaryButtonPressed : null,
+										]}
+										testID={`server-connect-${String(index)}`}
+									>
+										<Text style={styles.primaryLabel}>{isConnecting ? "Connecting..." : "Connect"}</Text>
+									</Pressable>
+								</View>
+							);
+						})
 					)}
 				</View>
 
-				<View style={styles.card}>
-					<Text style={styles.cardTitle}>Manual connection</Text>
-					<Text style={styles.cardDescription}>
-						Use this when your server is outside your LAN or when discovery is disabled.
-					</Text>
-
-					<Text style={styles.inputLabel}>Server URL</Text>
-					<TextInput
-						autoCapitalize="none"
-						onChangeText={setBaseUrl}
-						placeholder="http://127.0.0.1:8835"
-						placeholderTextColor={palette.muted}
-						style={styles.input}
-						value={baseUrl}
-					/>
-
-					<Text style={styles.inputLabel}>Token</Text>
-					<TextInput
-						autoCapitalize="none"
-						onChangeText={setToken}
-						placeholder="local-dev-token"
-						placeholderTextColor={palette.muted}
-						style={styles.input}
-						value={token}
-					/>
-
+				<View style={styles.section}>
 					<Pressable
-						disabled={isSaving}
 						onPress={() => {
-							void connectManual();
+							setIsManualExpanded((current) => !current);
 						}}
 						style={({ pressed }) => [
-							styles.primaryButton,
-							pressed ? styles.primaryButtonPressed : null,
-							isSaving ? styles.disabledButton : null,
+							styles.sectionHeader,
+							pressed ? styles.secondaryButtonPressed : null,
 						]}
+						testID="server-manual-toggle"
 					>
-						<Text style={styles.primaryButtonLabel}>{isSaving ? "Connecting..." : "Connect and continue"}</Text>
+						<Text style={styles.sectionTitle}>Manual Connection</Text>
+						<Text style={styles.secondaryLabel}>{isManualExpanded ? "Hide" : "Show"}</Text>
 					</Pressable>
+
+					{isManualExpanded ? (
+						<View style={styles.formBody}>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setBaseUrl}
+								placeholder="http://127.0.0.1:8835"
+								placeholderTextColor={palette.muted}
+								style={styles.input}
+								testID="server-manual-base-url"
+								value={baseUrl}
+							/>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setToken}
+								placeholder="Token"
+								placeholderTextColor={palette.muted}
+								style={styles.input}
+								testID="server-manual-token"
+								value={token}
+							/>
+							<Pressable
+								disabled={isConnectingManual}
+								onPress={() => {
+									void connectManual();
+								}}
+								style={({ pressed }) => [
+									styles.primaryButton,
+									pressed ? styles.primaryButtonPressed : null,
+									isConnectingManual ? styles.disabledButton : null,
+								]}
+								testID="server-manual-connect"
+							>
+								<Text style={styles.primaryLabel}>{isConnectingManual ? "Connecting..." : "Connect"}</Text>
+							</Pressable>
+						</View>
+					) : null}
 				</View>
 
-				{statusMessage ? (
+				{statusMessage.length > 0 ? (
 					<View
 						style={[
-							styles.statusContainer,
-							statusTone === "success" ? styles.statusSuccess : null,
+							styles.statusBox,
 							statusTone === "error" ? styles.statusError : null,
+							statusTone === "success" ? styles.statusSuccess : null,
 						]}
 					>
-						<Text style={styles.statusText}>{statusMessage}</Text>
+						<Text selectable style={styles.statusText}>
+							{statusMessage}
+						</Text>
 					</View>
 				) : null}
 			</ScrollView>
@@ -362,172 +356,123 @@ export const SettingsScreen = () => {
 };
 
 const styles = StyleSheet.create({
-	card: {
-		backgroundColor: palette.card,
-		borderColor: palette.line,
-		borderRadius: 20,
-		borderWidth: 1,
-		padding: 16,
-	},
-	cardDescription: {
-		color: palette.muted,
-		fontSize: 14,
-		lineHeight: 20,
-		marginTop: 4,
-	},
-	cardHeaderRow: {
-		alignItems: "center",
-		flexDirection: "row",
-		justifyContent: "space-between",
-	},
-	cardTitle: {
-		color: palette.text,
-		fontSize: 17,
-		fontWeight: "700",
-	},
 	content: {
-		gap: 16,
+		gap: 12,
 		paddingBottom: 36,
-		paddingHorizontal: 18,
-		paddingTop: 20,
+		paddingHorizontal: 16,
+		paddingTop: 14,
 	},
 	disabledButton: {
 		opacity: 0.45,
 	},
-	emptyText: {
-		color: palette.muted,
-		fontSize: 14,
-		marginTop: 12,
-	},
-	headerRow: {
-		alignItems: "center",
-		flexDirection: "row",
+	formBody: {
+		gap: 10,
 	},
 	input: {
-		backgroundColor: palette.cardSoft,
-		borderColor: palette.line,
-		borderRadius: 14,
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 12,
 		borderWidth: 1,
 		color: palette.text,
-		fontSize: 16,
-		minHeight: 46,
-		paddingHorizontal: 14,
-		paddingVertical: 10,
+		fontSize: 15,
+		minHeight: 42,
+		paddingHorizontal: 12,
+		paddingVertical: 8,
 	},
-	inputLabel: {
-		color: palette.muted,
-		fontSize: 12,
-		fontWeight: "700",
-		letterSpacing: 0.5,
-		marginBottom: 6,
-		marginTop: 12,
-		textTransform: "uppercase",
-	},
-	loader: {
-		marginTop: 12,
+	listRow: {
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		gap: 8,
+		padding: 12,
 	},
 	primaryButton: {
 		alignItems: "center",
 		backgroundColor: palette.accent,
-		borderRadius: 14,
+		borderRadius: 11,
+		height: 38,
 		justifyContent: "center",
-		marginTop: 12,
-		minHeight: 46,
-		paddingHorizontal: 14,
-	},
-	primaryButtonLabel: {
-		color: "#062016",
-		fontSize: 15,
-		fontWeight: "800",
+		paddingHorizontal: 12,
 	},
 	primaryButtonPressed: {
 		backgroundColor: palette.accentPressed,
 	},
-	progressDot: {
-		backgroundColor: "rgba(255,255,255,0.18)",
-		borderRadius: 999,
-		flex: 1,
-		height: 6,
-	},
-	progressDotActive: {
-		backgroundColor: palette.accent,
-	},
-	progressRow: {
-		flexDirection: "row",
-		gap: 6,
+	primaryLabel: {
+		color: "#0A1D2B",
+		fontSize: 13,
+		fontWeight: "700",
 	},
 	root: {
 		backgroundColor: palette.background,
 		flex: 1,
 	},
+	rowMeta: {
+		color: palette.muted,
+		fontSize: 12,
+	},
+	rowTitle: {
+		color: palette.text,
+		fontSize: 15,
+		fontWeight: "600",
+	},
 	secondaryButton: {
 		alignItems: "center",
-		borderColor: palette.line,
-		borderRadius: 12,
+		borderColor: palette.border,
+		borderRadius: 10,
 		borderWidth: 1,
+		height: 34,
 		justifyContent: "center",
-		minHeight: 42,
-		paddingHorizontal: 14,
-	},
-	secondaryButtonLabel: {
-		color: palette.text,
-		fontSize: 13,
-		fontWeight: "700",
+		paddingHorizontal: 12,
 	},
 	secondaryButtonPressed: {
-		backgroundColor: "rgba(255,255,255,0.1)",
+		backgroundColor: "rgba(255,255,255,0.08)",
 	},
-	serverItem: {
-		backgroundColor: palette.cardSoft,
-		borderColor: palette.line,
-		borderRadius: 16,
+	secondaryLabel: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "600",
+	},
+	section: {
+		backgroundColor: "#12161E",
+		borderColor: palette.border,
+		borderRadius: 14,
 		borderWidth: 1,
-		gap: 8,
-		marginTop: 12,
+		gap: 10,
 		padding: 12,
 	},
-	serverName: {
+	sectionHeader: {
+		alignItems: "center",
+		flexDirection: "row",
+		justifyContent: "space-between",
+	},
+	sectionTitle: {
 		color: palette.text,
 		fontSize: 15,
 		fontWeight: "700",
 	},
-	serverUrl: {
-		color: palette.muted,
-		fontSize: 12,
-	},
-	statusContainer: {
-		backgroundColor: "rgba(255,255,255,0.08)",
-		borderColor: palette.line,
-		borderRadius: 14,
+	statusBox: {
+		backgroundColor: "rgba(255,255,255,0.06)",
+		borderColor: palette.border,
+		borderRadius: 12,
 		borderWidth: 1,
 		padding: 12,
 	},
 	statusError: {
-		borderColor: "rgba(255, 118, 133, 0.35)",
+		backgroundColor: "rgba(255,107,133,0.16)",
+		borderColor: "rgba(255,107,133,0.38)",
 	},
 	statusSuccess: {
-		borderColor: "rgba(109, 227, 194, 0.35)",
+		backgroundColor: "rgba(99,200,255,0.14)",
+		borderColor: "rgba(99,200,255,0.36)",
 	},
 	statusText: {
 		color: palette.text,
 		fontSize: 13,
+		lineHeight: 19,
+	},
+	supportText: {
+		color: palette.muted,
+		fontSize: 13,
 		lineHeight: 18,
-	},
-	stepLabel: {
-		color: palette.muted,
-		fontSize: 11,
-		fontWeight: "700",
-		letterSpacing: 1.2,
-	},
-	subtitle: {
-		color: palette.muted,
-		fontSize: 15,
-		lineHeight: 22,
-	},
-	title: {
-		color: palette.text,
-		fontSize: 30,
-		fontWeight: "800",
-		letterSpacing: 0.3,
 	},
 });

@@ -9,7 +9,10 @@
     "web": "expo start --web",
     "lint": "bunx eslint .",
     "typecheck": "bun run tsc --noEmit",
-    "test": "echo \"No mobile tests configured yet\""
+    "test": "echo \"No mobile tests configured yet\"",
+    "test:e2e:ios": "bash ./e2e/run-ios-e2e.sh",
+    "test:e2e:ios:navigation": "bash ./e2e/ios-navigation-flow.sh",
+    "test:e2e:ios:terminal": "bash ./e2e/ios-terminal-flow.sh"
   },
   "dependencies": {
     "@react-navigation/native": "^7.1.28",

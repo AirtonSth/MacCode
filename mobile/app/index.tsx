@@ -1,5 +1,5 @@
-import { SettingsScreen } from "@/features/settings/ui/settings-screen";
+import { Redirect } from "expo-router";
 
 export default function HomeRoute() {
-	return <SettingsScreen />;
+	return <Redirect href="/chat" />;
 }

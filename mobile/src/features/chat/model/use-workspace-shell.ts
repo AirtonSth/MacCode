@@ -60,6 +60,9 @@ const upsertUpdatedChat = (chats: ChatDTO[], update: ServerWsEvent & { event: "c
 const toRequestId = (): string =>
 	`req-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 
+let inMemorySelectedProjectId: string | null = null;
+let inMemorySelectedChatId: string | null = null;
+
 export const useWorkspaceShell = () => {
 	const queryClient = useQueryClient();
 	const { config } = useApiConfig();
@@ -68,8 +71,8 @@ export const useWorkspaceShell = () => {
 	const [lastError, setLastError] = useState<string | null>(null);
 	const [isSending, setIsSending] = useState<boolean>(false);
 	const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
-	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-	const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(inMemorySelectedProjectId);
+	const [selectedChatId, setSelectedChatId] = useState<string | null>(inMemorySelectedChatId);
 	const [permissionMode, setPermissionMode] = useState<string>("default");
 	const [selectedModel, setSelectedModel] = useState<string | null>(null);
 	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(null);
@@ -123,41 +126,12 @@ export const useWorkspaceShell = () => {
 			return;
 		}
 
-		setSelectedProjectId(selectionQuery.data.selectedProjectId);
-		setSelectedChatId(selectionQuery.data.selectedChatId);
+		inMemorySelectedProjectId = selectionQuery.data.selectedProjectId;
+		inMemorySelectedChatId = selectionQuery.data.selectedChatId;
+		setSelectedProjectId(inMemorySelectedProjectId);
+		setSelectedChatId(inMemorySelectedChatId);
 		hasBootstrappedSelectionRef.current = true;
 	}, [selectionQuery.data]);
-
-	useEffect(() => {
-		if (!hasBootstrappedSelectionRef.current) {
-			return;
-		}
-
-		if (selectedProjectId || !projectsQuery.data || projectsQuery.data.length === 0) {
-			return;
-		}
-
-		const fallbackProject = projectsQuery.data[0];
-		setSelectedProjectId(fallbackProject.id);
-		setSelectedChatId(null);
-		updateSelectionMutation.mutate({
-			selectedChatId: null,
-			selectedProjectId: fallbackProject.id,
-		});
-	}, [projectsQuery.data, selectedProjectId, updateSelectionMutation]);
-
-	useEffect(() => {
-		if (!selectedProjectId || !chatsQuery.data || chatsQuery.data.length === 0 || selectedChatId) {
-			return;
-		}
-
-		const fallbackChat = chatsQuery.data[0];
-		setSelectedChatId(fallbackChat.id);
-		updateSelectionMutation.mutate({
-			selectedChatId: fallbackChat.id,
-			selectedProjectId,
-		});
-	}, [chatsQuery.data, selectedChatId, selectedProjectId, updateSelectionMutation]);
 
 	const handleServerEvent = useCallback(
 		(event: ServerWsEvent) => {
@@ -285,6 +259,8 @@ export const useWorkspaceShell = () => {
 
 	const selectProject = useCallback(
 		(project: ProjectDTO) => {
+			inMemorySelectedProjectId = project.id;
+			inMemorySelectedChatId = null;
 			setSelectedProjectId(project.id);
 			setSelectedChatId(null);
 			setLastError(null);
@@ -299,6 +275,8 @@ export const useWorkspaceShell = () => {
 
 	const selectChat = useCallback(
 		(chat: ChatDTO) => {
+			inMemorySelectedProjectId = chat.projectId;
+			inMemorySelectedChatId = chat.id;
 			setSelectedProjectId(chat.projectId);
 			setSelectedChatId(chat.id);
 			setLastError(null);
@@ -328,6 +306,7 @@ export const useWorkspaceShell = () => {
 			await deleteChatMutation.mutateAsync(chatId);
 
 			if (selectedChatId === chatId) {
+				inMemorySelectedChatId = null;
 				setSelectedChatId(null);
 				updateSelectionMutation.mutate({
 					selectedChatId: null,
@@ -349,6 +328,8 @@ export const useWorkspaceShell = () => {
 				title,
 			});
 
+			inMemorySelectedProjectId = selectedProjectId;
+			inMemorySelectedChatId = chat.id;
 			setSelectedChatId(chat.id);
 			updateSelectionMutation.mutate({
 				selectedChatId: chat.id,
@@ -366,6 +347,8 @@ export const useWorkspaceShell = () => {
 			const project = await client.createProject(input);
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 
+			inMemorySelectedProjectId = project.id;
+			inMemorySelectedChatId = null;
 			setSelectedProjectId(project.id);
 			setSelectedChatId(null);
 			updateSelectionMutation.mutate({
@@ -384,6 +367,8 @@ export const useWorkspaceShell = () => {
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 
 			if (selectedProjectId === projectId) {
+				inMemorySelectedProjectId = null;
+				inMemorySelectedChatId = null;
 				setSelectedProjectId(null);
 				setSelectedChatId(null);
 				updateSelectionMutation.mutate({

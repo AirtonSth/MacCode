@@ -1,8 +1,10 @@
-import { LinearGradient } from "expo-linear-gradient";
+import { useQuery } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+	Animated,
 	KeyboardAvoidingView,
+	Modal,
 	Platform,
 	Pressable,
 	ScrollView,
@@ -13,34 +15,68 @@ import {
 } from "react-native";
 
 import { useWorkspaceShell } from "../model/use-workspace-shell";
+import { useApiConfig } from "../../../shared/api/api-config-provider";
+import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
+import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 
-const suggestionPrompts = [
-	"Summarize the latest code changes in this workspace.",
-	"Create a quick implementation plan for my next task.",
-	"Find potential bugs and suggest focused fixes.",
-	"Draft a clean commit message for my current edits.",
-];
+const drawerWidth = 308;
 
 const palette = {
-	accent: "#6DE3C2",
-	accentPressed: "#53C9AB",
-	background: "#050A15",
-	card: "rgba(11, 24, 45, 0.86)",
-	cardSoft: "rgba(10, 18, 34, 0.7)",
-	line: "rgba(255, 255, 255, 0.12)",
-	muted: "#93A6C7",
-	text: "#F3F7FF",
-	userBubble: "rgba(109, 227, 194, 0.22)",
+	accent: "#63C8FF",
+	accentPressed: "#4EAAD9",
+	background: "#0D0F14",
+	border: "rgba(255,255,255,0.11)",
+	muted: "#98A0AF",
+	soft: "rgba(255,255,255,0.05)",
+	text: "#F1F4FA",
+	userBubble: "rgba(99,200,255,0.19)",
+};
+
+const toTerminalTranscript = (
+	commands: TerminalCommandDTO[],
+	entries: TerminalEntryDTO[],
+): string => {
+	const byCommandId = new Map<string, TerminalEntryDTO[]>();
+	for (const entry of entries) {
+		const list = byCommandId.get(entry.commandId) ?? [];
+		list.push(entry);
+		byCommandId.set(entry.commandId, list);
+	}
+
+	const sortedCommands = Array.from(commands);
+	sortedCommands.sort(
+		(left, right) => new Date(left.startedAt).getTime() - new Date(right.startedAt).getTime(),
+	);
+
+	const chunks: string[] = [];
+	for (const command of sortedCommands) {
+		const commandEntries = Array.from(byCommandId.get(command.id) ?? []);
+		commandEntries.sort((left, right) => left.id - right.id);
+		const output = commandEntries.map((item) => item.data).join("").trimEnd();
+		const header = `$ ${command.command}`;
+		chunks.push(output.length > 0 ? `${header}\n${output}` : header);
+	}
+
+	if (chunks.length === 0) {
+		return "No terminal output yet.";
+	}
+
+	return chunks.join("\n\n");
 };
 
 export const ChatScreen = () => {
 	const router = useRouter();
+	const api = useRemoteCodeClient();
+	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
-		connectionState,
+		createChat,
 		isLoaded,
 		isSending,
 		lastError,
 		messages,
+		projects,
+		selectProject,
 		selectedChat,
 		selectedChatId,
 		selectedProject,
@@ -49,19 +85,124 @@ export const ChatScreen = () => {
 		streamingText,
 	} = useWorkspaceShell();
 	const [input, setInput] = useState<string>("");
-	const scrollRef = useRef<ScrollView | null>(null);
+	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
+	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
+	const [isTerminalOpen, setIsTerminalOpen] = useState<boolean>(false);
+	const [terminalInput, setTerminalInput] = useState<string>("");
+	const [terminalOutput, setTerminalOutput] = useState<string>("");
+	const [terminalError, setTerminalError] = useState<string>("");
+	const [isTerminalLoading, setIsTerminalLoading] = useState<boolean>(false);
+	const [isTerminalRunning, setIsTerminalRunning] = useState<boolean>(false);
+	const messageScrollRef = useRef<ScrollView | null>(null);
+	const terminalScrollRef = useRef<ScrollView | null>(null);
+	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
+	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
+
+	const serverHealthQuery = useQuery({
+		enabled: isConfigLoaded,
+		queryKey: ["mobile-server-health-chat", config.baseUrl, config.token],
+		queryFn: async () => await api.verifyToken(config.token, config.baseUrl),
+		retry: 1,
+		staleTime: 30_000,
+	});
+
+	const visibleWorkspaces = useMemo(() => {
+		const query = drawerSearchValue.trim().toLowerCase();
+		const sorted = Array.from(projects);
+		sorted.sort((left, right) => {
+			if (left.isFavorite !== right.isFavorite) {
+				return left.isFavorite ? -1 : 1;
+			}
+			return left.name.localeCompare(right.name);
+		});
+
+		if (!query) {
+			return sorted;
+		}
+
+		return sorted.filter((project) =>
+			project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
+		);
+	}, [projects, drawerSearchValue]);
 
 	useEffect(() => {
-		scrollRef.current?.scrollToEnd({ animated: true });
+		messageScrollRef.current?.scrollToEnd({ animated: true });
 	}, [messages.length, streamingText]);
 
-	const showSuggestions = useMemo(
-		() => isLoaded && messages.length === 0 && streamingText.trim().length === 0,
-		[isLoaded, messages.length, streamingText],
-	);
+	useEffect(() => {
+		let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-	const submit = async (rawText: string) => {
-		const text = rawText.trim();
+		if (isConfigLoaded && isLoaded && !serverHealthQuery.isPending) {
+			if (serverHealthQuery.isError) {
+				router.replace("/settings");
+			} else {
+				timeoutId = setTimeout(() => {
+					if (!selectedProjectId) {
+						router.replace("/workspaces");
+						return;
+					}
+
+					if (!selectedChatId) {
+						router.replace("/threads");
+					}
+				}, 650);
+			}
+		}
+
+		return () => {
+			if (timeoutId !== null) {
+				clearTimeout(timeoutId);
+			}
+		};
+	}, [
+		isConfigLoaded,
+		isLoaded,
+		router,
+		selectedChatId,
+		selectedProjectId,
+		serverHealthQuery.isError,
+		serverHealthQuery.isPending,
+	]);
+
+	useEffect(() => {
+		let active = true;
+		const loadHistory = async () => {
+			if (!isTerminalOpen || !selectedChatId) {
+				return;
+			}
+
+			setIsTerminalLoading(true);
+			setTerminalError("");
+			try {
+				const history = await api.getTerminalHistory(selectedChatId, { limit: 200 });
+				if (!active) {
+					return;
+				}
+				setTerminalOutput(toTerminalTranscript(history.commands, history.entries));
+				setTimeout(() => {
+					terminalScrollRef.current?.scrollToEnd({ animated: false });
+				}, 0);
+			} catch (error: unknown) {
+				if (!active) {
+					return;
+				}
+				setTerminalError(error instanceof Error ? error.message : "Unable to load terminal history.");
+			} finally {
+				if (active) {
+					setIsTerminalLoading(false);
+				}
+			}
+		};
+
+		void loadHistory();
+
+		return () => {
+			active = false;
+		};
+	}, [api, isTerminalOpen, selectedChatId]);
+
+	const submit = async () => {
+		const text = input.trim();
 		if (!text) {
 			return;
 		}
@@ -72,403 +213,568 @@ export const ChatScreen = () => {
 		}
 	};
 
+	const openDrawer = () => {
+		setIsDrawerOpen(true);
+		Animated.parallel([
+			Animated.timing(drawerOpacity, {
+				duration: 150,
+				toValue: 1,
+				useNativeDriver: true,
+			}),
+			Animated.timing(drawerTranslate, {
+				duration: 190,
+				toValue: 0,
+				useNativeDriver: true,
+			}),
+		]).start();
+	};
+
+	const closeDrawer = () => {
+		Animated.parallel([
+			Animated.timing(drawerOpacity, {
+				duration: 140,
+				toValue: 0,
+				useNativeDriver: true,
+			}),
+			Animated.timing(drawerTranslate, {
+				duration: 170,
+				toValue: -drawerWidth,
+				useNativeDriver: true,
+			}),
+		]).start(() => {
+			setIsDrawerOpen(false);
+		});
+	};
+
+	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
+		selectProject(project);
+		closeDrawer();
+		router.push("/threads");
+	};
+
+	const createQuickChat = async () => {
+		const chat = await createChat("New chat");
+		if (chat) {
+			router.push("/chat");
+		}
+	};
+
+	const runTerminalCommand = async () => {
+		const command = terminalInput.trim();
+		if (!selectedChatId || command.length === 0) {
+			return;
+		}
+
+		setIsTerminalRunning(true);
+		setTerminalError("");
+		try {
+			const result = await api.execTerminalCommand(selectedChatId, { command });
+			const output = result.entries.map((entry) => entry.data).join("").trimEnd();
+			const nextBlock = output.length > 0 ? `$ ${command}\n${output}` : `$ ${command}`;
+			setTerminalOutput((current) => {
+				const previous = current.trim() === "No terminal output yet." ? "" : current.trim();
+				return previous.length > 0 ? `${previous}\n\n${nextBlock}` : nextBlock;
+			});
+			setTerminalInput("");
+			setTimeout(() => {
+				terminalScrollRef.current?.scrollToEnd({ animated: true });
+			}, 0);
+		} catch (error: unknown) {
+			setTerminalError(error instanceof Error ? error.message : "Unable to run terminal command.");
+		} finally {
+			setIsTerminalRunning(false);
+		}
+	};
+
 	return (
 		<KeyboardAvoidingView
 			behavior={Platform.OS === "ios" ? "padding" : "height"}
 			style={styles.root}
+			testID="screen-chat"
 		>
-			<LinearGradient
-				colors={["#1A2B50", "#0E1A35", palette.background]}
-				end={{ x: 0.9, y: 1 }}
-				start={{ x: 0.1, y: 0 }}
-				style={StyleSheet.absoluteFill}
+			<IosStackHeader
+				right={(
+					<Pressable
+						accessibilityLabel="chat-drawer-button"
+						accessibilityRole="button"
+						onPress={openDrawer}
+						style={({ pressed }) => [styles.ghostButton, pressed ? styles.ghostButtonPressed : null]}
+						testID="chat-drawer-button"
+					>
+						<Text style={styles.ghostLabel}>Menu</Text>
+					</Pressable>
+				)}
+				subtitle={selectedProject?.name ?? "No workspace selected"}
+				title={selectedChat?.title ?? "Chat"}
 			/>
 
-			<View style={styles.screen}>
-				<Text style={styles.stepLabel}>STEP 4 OF 4</Text>
-				<View style={styles.progressRow}>
-					<View style={[styles.progressDot, styles.progressDotActive]} />
-					<View style={[styles.progressDot, styles.progressDotActive]} />
-					<View style={[styles.progressDot, styles.progressDotActive]} />
-					<View style={[styles.progressDot, styles.progressDotActive]} />
-				</View>
+			<View style={styles.body}>
+				<ScrollView
+					contentContainerStyle={styles.messagesContent}
+					contentInsetAdjustmentBehavior="automatic"
+					ref={messageScrollRef}
+					showsVerticalScrollIndicator={false}
+					style={styles.messages}
+					testID="chat-message-list"
+				>
+					{messages.length === 0 && streamingText.trim().length === 0 ? (
+						<Text style={styles.emptyState}>Start a conversation.</Text>
+					) : null}
 
-				<View style={styles.topActions}>
-					<Pressable
-						onPress={() => {
-							router.push("/threads");
-						}}
-						style={({ pressed }) => [
-							styles.secondaryButton,
-							pressed ? styles.secondaryButtonPressed : null,
-						]}
-					>
-						<Text style={styles.secondaryButtonLabel}>Threads</Text>
-					</Pressable>
-					<Pressable
-						onPress={() => {
-							router.push("/workspaces");
-						}}
-						style={({ pressed }) => [
-							styles.secondaryButton,
-							pressed ? styles.secondaryButtonPressed : null,
-						]}
-					>
-						<Text style={styles.secondaryButtonLabel}>Workspaces</Text>
-					</Pressable>
-					<Pressable
-						onPress={() => {
-							router.replace("/");
-						}}
-						style={({ pressed }) => [
-							styles.secondaryButton,
-							pressed ? styles.secondaryButtonPressed : null,
-						]}
-					>
-						<Text style={styles.secondaryButtonLabel}>Server</Text>
-					</Pressable>
-				</View>
-
-				<View style={styles.chatHeader}>
-					<Text numberOfLines={1} style={styles.chatTitle}>
-						{selectedChat?.title ?? "Select a thread"}
-					</Text>
-					<Text numberOfLines={1} style={styles.chatSubtitle}>
-						{selectedProject ? `${selectedProject.name} · ${connectionState}` : connectionState}
-					</Text>
-				</View>
-
-				<View style={styles.chatCard}>
-					<ScrollView
-						contentContainerStyle={styles.messagesContent}
-						contentInsetAdjustmentBehavior="automatic"
-						ref={scrollRef}
-						showsVerticalScrollIndicator={false}
-						style={styles.messagesContainer}
-					>
-						{!selectedProjectId || !selectedChatId ? (
-							<View style={styles.placeholderBox}>
-								<Text style={styles.placeholderTitle}>Thread required</Text>
-								<Text style={styles.placeholderText}>
-									Choose or create a thread to start chatting with Codex.
-								</Text>
-								<Pressable
-									onPress={() => {
-										router.push("/threads");
-									}}
-									style={({ pressed }) => [
-										styles.primaryButton,
-										pressed ? styles.primaryButtonPressed : null,
-									]}
-								>
-									<Text style={styles.primaryButtonLabel}>Go to threads</Text>
-								</Pressable>
-							</View>
-						) : null}
-
-						{messages.map((message) => {
-							const isUser = message.role === "user";
-							return (
-								<View
-									key={message.id}
-									style={[
-										styles.messageRow,
-										isUser ? styles.messageRowUser : styles.messageRowAssistant,
-									]}
-								>
-									<View
-										style={[
-											styles.messageBubble,
-											isUser ? styles.userBubble : styles.assistantBubble,
-										]}
-									>
-										<Text selectable style={styles.messageText}>
-											{message.content}
-										</Text>
-									</View>
-								</View>
-							);
-						})}
-
-						{streamingText.length > 0 ? (
-							<View style={[styles.messageRow, styles.messageRowAssistant]}>
-								<View style={[styles.messageBubble, styles.assistantBubble]}>
+					{messages.map((message) => {
+						const isUser = message.role === "user";
+						return (
+							<View key={message.id} style={[styles.messageRow, isUser ? styles.messageRowUser : null]}>
+								<View style={[styles.messageBubble, isUser ? styles.userBubble : styles.assistantBubble]}>
 									<Text selectable style={styles.messageText}>
-										{streamingText}
+										{message.content}
 									</Text>
 								</View>
 							</View>
-						) : null}
+						);
+					})}
 
-						{isSending && streamingText.length === 0 ? (
-							<View style={[styles.messageRow, styles.messageRowAssistant]}>
-								<View style={[styles.messageBubble, styles.assistantBubble]}>
-									<Text style={styles.typingText}>Codex is thinking...</Text>
-								</View>
+					{streamingText.trim().length > 0 ? (
+						<View style={styles.messageRow}>
+							<View style={[styles.messageBubble, styles.assistantBubble]}>
+								<Text selectable style={styles.messageText}>
+									{streamingText}
+								</Text>
 							</View>
-						) : null}
+						</View>
+					) : null}
 
-						{showSuggestions ? (
-							<View style={styles.suggestionsSection}>
-								<Text style={styles.suggestionsTitle}>Try one of these</Text>
-								{suggestionPrompts.map((prompt) => (
-									<Pressable
-										key={prompt}
-										onPress={() => {
-											void submit(prompt);
-										}}
-										style={({ pressed }) => [
-											styles.suggestionCard,
-											pressed ? styles.suggestionCardPressed : null,
-										]}
-									>
-										<Text style={styles.suggestionText}>{prompt}</Text>
-									</Pressable>
-								))}
-							</View>
-						) : null}
-					</ScrollView>
+					{isSending && streamingText.trim().length === 0 ? (
+						<Text style={styles.typingLabel}>Thinking...</Text>
+					) : null}
+				</ScrollView>
 
-					{lastError ? <Text style={styles.errorText}>{lastError}</Text> : null}
+				{lastError ? (
+					<Text selectable style={styles.errorText}>
+						{lastError}
+					</Text>
+				) : null}
 
-					<View style={styles.composer}>
-						<TextInput
-							autoCapitalize="sentences"
-							multiline
-							onChangeText={setInput}
-							onSubmitEditing={() => {
-								void submit(input);
-							}}
-							placeholder="Ask Codex anything..."
-							placeholderTextColor={palette.muted}
-							style={styles.composerInput}
-							value={input}
-						/>
-						<Pressable
-							disabled={isSending || !selectedProjectId}
-							onPress={() => {
-								void submit(input);
-							}}
-							style={({ pressed }) => [
-								styles.primaryButton,
-								styles.sendButton,
-								pressed ? styles.primaryButtonPressed : null,
-								isSending || !selectedProjectId ? styles.disabledButton : null,
-							]}
-						>
-							<Text style={styles.primaryButtonLabel}>{isSending ? "Sending..." : "Send"}</Text>
-						</Pressable>
-					</View>
+				<View style={styles.composerRow}>
+					<Pressable
+						accessibilityLabel="chat-terminal-open-button"
+						accessibilityRole="button"
+						onPress={() => {
+							setIsTerminalOpen(true);
+						}}
+						style={({ pressed }) => [
+							styles.secondaryAction,
+							pressed ? styles.secondaryActionPressed : null,
+						]}
+						testID="chat-terminal-open-button"
+					>
+						<Text style={styles.secondaryActionLabel}>Terminal</Text>
+					</Pressable>
+
+					<TextInput
+						autoCapitalize="sentences"
+						multiline
+						onChangeText={setInput}
+						onSubmitEditing={() => {
+							void submit();
+						}}
+						placeholder="Message"
+						placeholderTextColor={palette.muted}
+						style={styles.composerInput}
+						testID="chat-input"
+						value={input}
+					/>
+
+					<Pressable
+						disabled={isSending || !selectedProjectId}
+						onPress={() => {
+							void submit();
+						}}
+						style={({ pressed }) => [
+							styles.primaryAction,
+							pressed ? styles.primaryActionPressed : null,
+							isSending || !selectedProjectId ? styles.disabledButton : null,
+						]}
+						testID="chat-send-button"
+					>
+						<Text style={styles.primaryActionLabel}>{isSending ? "..." : "Send"}</Text>
+					</Pressable>
 				</View>
 			</View>
+
+			<Modal animationType="none" onRequestClose={closeDrawer} transparent visible={isDrawerOpen}>
+				<View style={styles.drawerRoot}>
+					<Pressable onPress={closeDrawer} style={StyleSheet.absoluteFill}>
+						<Animated.View style={[styles.drawerBackdrop, { opacity: drawerOpacity }]} />
+					</Pressable>
+					<Animated.View style={[styles.drawerPanel, { transform: [{ translateX: drawerTranslate }] }]}>
+						<Text style={styles.drawerTitle}>Workspaces</Text>
+						<TextInput
+							autoCapitalize="none"
+							onChangeText={setDrawerSearchValue}
+							placeholder="Search"
+							placeholderTextColor={palette.muted}
+							style={styles.drawerSearch}
+							testID="drawer-workspaces-search-input"
+							value={drawerSearchValue}
+						/>
+
+						<ScrollView
+							contentContainerStyle={styles.drawerList}
+							contentInsetAdjustmentBehavior="automatic"
+							showsVerticalScrollIndicator={false}
+						>
+							{visibleWorkspaces.length === 0 ? (
+								<Text style={styles.drawerEmpty}>No workspace found.</Text>
+							) : null}
+
+							{visibleWorkspaces.map((project, index) => (
+								<Pressable
+									accessibilityLabel={`drawer-workspace-item-${String(index)}`}
+									accessibilityRole="button"
+									key={project.id}
+									onPress={() => {
+										openWorkspaceFromDrawer(project);
+									}}
+									style={({ pressed }) => [
+										styles.drawerItem,
+										project.id === selectedProjectId ? styles.drawerItemActive : null,
+										pressed ? styles.drawerItemPressed : null,
+									]}
+									testID={`drawer-workspace-item-${String(index)}`}
+								>
+									<Text numberOfLines={1} style={styles.drawerItemTitle}>
+										{project.name}
+									</Text>
+									<Text numberOfLines={1} style={styles.drawerItemMeta}>
+										{project.path}
+									</Text>
+								</Pressable>
+							))}
+						</ScrollView>
+					</Animated.View>
+				</View>
+			</Modal>
+
+			<Modal
+				animationType="slide"
+				onRequestClose={() => {
+					setIsTerminalOpen(false);
+				}}
+				presentationStyle="fullScreen"
+				visible={isTerminalOpen}
+			>
+				<KeyboardAvoidingView
+					behavior={Platform.OS === "ios" ? "padding" : "height"}
+					style={styles.terminalRoot}
+					testID="terminal-modal"
+				>
+					<IosStackHeader
+						onBack={() => {
+							setIsTerminalOpen(false);
+						}}
+						right={(
+							<Pressable
+								onPress={() => {
+									void createQuickChat();
+								}}
+								style={({ pressed }) => [styles.ghostButton, pressed ? styles.ghostButtonPressed : null]}
+								testID="terminal-new-chat-button"
+							>
+								<Text style={styles.ghostLabel}>New Chat</Text>
+							</Pressable>
+						)}
+						subtitle={selectedChat?.title ?? "No thread selected"}
+						title="Terminal"
+					/>
+
+					<View style={styles.terminalBody}>
+						<ScrollView
+							contentContainerStyle={styles.terminalOutputContent}
+							contentInsetAdjustmentBehavior="automatic"
+							ref={terminalScrollRef}
+							showsVerticalScrollIndicator={false}
+							style={styles.terminalOutput}
+						>
+							{isTerminalLoading ? <Text style={styles.terminalMeta}>Loading history...</Text> : null}
+							<Text selectable style={styles.terminalText}>
+								{terminalOutput || "No terminal output yet."}
+							</Text>
+						</ScrollView>
+
+						{terminalError.length > 0 ? (
+							<Text selectable style={styles.errorText}>
+								{terminalError}
+							</Text>
+						) : null}
+
+						<View style={styles.terminalComposer}>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setTerminalInput}
+								onSubmitEditing={() => {
+									void runTerminalCommand();
+								}}
+								placeholder="Run command"
+								placeholderTextColor={palette.muted}
+								style={styles.composerInput}
+								testID="terminal-command-input"
+								value={terminalInput}
+							/>
+							<Pressable
+								disabled={isTerminalRunning || !selectedChatId}
+								onPress={() => {
+									void runTerminalCommand();
+								}}
+								style={({ pressed }) => [
+									styles.primaryAction,
+									pressed ? styles.primaryActionPressed : null,
+									isTerminalRunning || !selectedChatId ? styles.disabledButton : null,
+								]}
+								testID="terminal-run-button"
+							>
+								<Text style={styles.primaryActionLabel}>{isTerminalRunning ? "..." : "Run"}</Text>
+							</Pressable>
+						</View>
+					</View>
+				</KeyboardAvoidingView>
+			</Modal>
 		</KeyboardAvoidingView>
 	);
 };
 
 const styles = StyleSheet.create({
 	assistantBubble: {
-		backgroundColor: palette.cardSoft,
+		backgroundColor: palette.soft,
 	},
-	chatCard: {
-		backgroundColor: palette.card,
-		borderColor: palette.line,
-		borderRadius: 20,
-		borderWidth: 1,
+	body: {
 		flex: 1,
-		padding: 12,
-	},
-	chatHeader: {
-		gap: 4,
-	},
-	chatSubtitle: {
-		color: palette.muted,
-		fontSize: 13,
-	},
-	chatTitle: {
-		color: palette.text,
-		fontSize: 26,
-		fontWeight: "800",
-	},
-	composer: {
-		alignItems: "flex-end",
-		borderColor: palette.line,
-		borderRadius: 16,
-		borderWidth: 1,
-		flexDirection: "row",
-		gap: 10,
-		marginTop: 10,
-		padding: 8,
+		paddingHorizontal: 12,
+		paddingTop: 10,
 	},
 	composerInput: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 11,
+		borderWidth: 1,
 		color: palette.text,
 		flex: 1,
 		fontSize: 15,
-		maxHeight: 130,
-		minHeight: 44,
-		paddingHorizontal: 10,
+		maxHeight: 120,
+		minHeight: 42,
+		paddingHorizontal: 12,
 		paddingVertical: 8,
+	},
+	composerRow: {
+		alignItems: "flex-end",
+		flexDirection: "row",
+		gap: 8,
+		paddingBottom: 12,
+		paddingTop: 8,
 	},
 	disabledButton: {
 		opacity: 0.45,
 	},
-	errorText: {
-		color: "#FF7685",
+	drawerBackdrop: {
+		backgroundColor: "rgba(0,0,0,0.45)",
+		flex: 1,
+	},
+	drawerEmpty: {
+		color: palette.muted,
+		fontSize: 13,
+		paddingTop: 12,
+	},
+	drawerItem: {
+		borderColor: palette.border,
+		borderRadius: 11,
+		borderWidth: 1,
+		gap: 4,
+		padding: 12,
+	},
+	drawerItemActive: {
+		borderColor: "rgba(99,200,255,0.45)",
+	},
+	drawerItemMeta: {
+		color: palette.muted,
 		fontSize: 12,
-		marginTop: 8,
+	},
+	drawerItemPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	drawerItemTitle: {
+		color: palette.text,
+		fontSize: 15,
+		fontWeight: "600",
+	},
+	drawerList: {
+		gap: 8,
+		paddingBottom: 20,
+		paddingTop: 8,
+	},
+	drawerPanel: {
+		backgroundColor: "#0F131A",
+		borderRightColor: palette.border,
+		borderRightWidth: 1,
+		bottom: 0,
+		left: 0,
+		paddingHorizontal: 12,
+		paddingTop: 58,
+		position: "absolute",
+		top: 0,
+		width: drawerWidth,
+	},
+	drawerRoot: {
+		flex: 1,
+	},
+	drawerSearch: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 11,
+		borderWidth: 1,
+		color: palette.text,
+		fontSize: 14,
+		minHeight: 40,
+		paddingHorizontal: 12,
+		paddingVertical: 8,
+	},
+	drawerTitle: {
+		color: palette.text,
+		fontSize: 18,
+		fontWeight: "700",
+		marginBottom: 10,
+	},
+	emptyState: {
+		color: palette.muted,
+		fontSize: 14,
+		paddingVertical: 20,
+		textAlign: "center",
+	},
+	errorText: {
+		color: "#FF8CA2",
+		fontSize: 12,
+		paddingBottom: 6,
+	},
+	ghostButton: {
+		alignItems: "center",
+		borderRadius: 10,
+		height: 32,
+		justifyContent: "center",
+		paddingHorizontal: 10,
+	},
+	ghostButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	ghostLabel: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "600",
 	},
 	messageBubble: {
-		borderColor: palette.line,
-		borderRadius: 16,
+		borderColor: palette.border,
+		borderRadius: 14,
 		borderWidth: 1,
-		maxWidth: "88%",
+		maxWidth: "92%",
 		paddingHorizontal: 12,
 		paddingVertical: 10,
 	},
 	messageRow: {
-		marginBottom: 10,
-	},
-	messageRowAssistant: {
-		alignItems: "flex-start",
+		flexDirection: "row",
+		justifyContent: "flex-start",
 	},
 	messageRowUser: {
-		alignItems: "flex-end",
+		justifyContent: "flex-end",
 	},
 	messageText: {
 		color: palette.text,
 		fontSize: 15,
-		lineHeight: 22,
+		lineHeight: 21,
 	},
-	messagesContainer: {
+	messages: {
 		flex: 1,
 	},
 	messagesContent: {
-		paddingBottom: 6,
-	},
-	placeholderBox: {
-		alignItems: "center",
-		backgroundColor: palette.cardSoft,
-		borderColor: palette.line,
-		borderRadius: 16,
-		borderWidth: 1,
 		gap: 8,
-		marginBottom: 14,
-		padding: 16,
+		paddingBottom: 10,
 	},
-	placeholderText: {
-		color: palette.muted,
-		fontSize: 14,
-		lineHeight: 20,
-		textAlign: "center",
+	primaryAction: {
+		alignItems: "center",
+		backgroundColor: palette.accent,
+		borderRadius: 11,
+		height: 42,
+		justifyContent: "center",
+		minWidth: 62,
+		paddingHorizontal: 12,
 	},
-	placeholderTitle: {
-		color: palette.text,
-		fontSize: 16,
+	primaryActionLabel: {
+		color: "#0A1D2B",
+		fontSize: 13,
 		fontWeight: "700",
 	},
-	primaryButton: {
-		alignItems: "center",
-		backgroundColor: palette.accent,
-		borderRadius: 14,
-		justifyContent: "center",
-		minHeight: 44,
-		paddingHorizontal: 14,
-	},
-	primaryButtonLabel: {
-		color: "#062016",
-		fontSize: 14,
-		fontWeight: "800",
-	},
-	primaryButtonPressed: {
+	primaryActionPressed: {
 		backgroundColor: palette.accentPressed,
-	},
-	progressDot: {
-		backgroundColor: "rgba(255,255,255,0.18)",
-		borderRadius: 999,
-		flex: 1,
-		height: 6,
-	},
-	progressDotActive: {
-		backgroundColor: palette.accent,
-	},
-	progressRow: {
-		flexDirection: "row",
-		gap: 6,
 	},
 	root: {
 		backgroundColor: palette.background,
 		flex: 1,
 	},
-	screen: {
-		flex: 1,
-		gap: 12,
-		paddingBottom: 12,
-		paddingHorizontal: 14,
-		paddingTop: 54,
-	},
-	secondaryButton: {
+	secondaryAction: {
 		alignItems: "center",
-		borderColor: palette.line,
-		borderRadius: 12,
+		borderColor: palette.border,
+		borderRadius: 11,
 		borderWidth: 1,
-		flex: 1,
+		height: 42,
 		justifyContent: "center",
-		minHeight: 40,
-		paddingHorizontal: 10,
+		paddingHorizontal: 12,
 	},
-	secondaryButtonLabel: {
+	secondaryActionLabel: {
 		color: palette.text,
 		fontSize: 13,
 		fontWeight: "600",
 	},
-	secondaryButtonPressed: {
+	secondaryActionPressed: {
 		backgroundColor: "rgba(255,255,255,0.08)",
 	},
-	sendButton: {
-		minWidth: 88,
-	},
-	stepLabel: {
-		color: palette.muted,
-		fontSize: 11,
-		fontWeight: "700",
-		letterSpacing: 1.2,
-	},
-	suggestionCard: {
-		backgroundColor: palette.cardSoft,
-		borderColor: palette.line,
-		borderRadius: 14,
-		borderWidth: 1,
-		marginTop: 8,
-		minHeight: 52,
+	terminalBody: {
+		flex: 1,
 		paddingHorizontal: 12,
-		paddingVertical: 10,
+		paddingTop: 12,
 	},
-	suggestionCardPressed: {
-		backgroundColor: "rgba(255,255,255,0.12)",
-	},
-	suggestionText: {
-		color: palette.text,
-		fontSize: 14,
-		lineHeight: 19,
-	},
-	suggestionsSection: {
-		marginBottom: 8,
-		marginTop: 4,
-	},
-	suggestionsTitle: {
-		color: palette.muted,
-		fontSize: 12,
-		fontWeight: "700",
-		letterSpacing: 0.4,
-		textTransform: "uppercase",
-	},
-	topActions: {
+	terminalComposer: {
+		alignItems: "flex-end",
 		flexDirection: "row",
 		gap: 8,
+		paddingBottom: 12,
+		paddingTop: 8,
 	},
-	typingText: {
+	terminalMeta: {
 		color: palette.muted,
-		fontSize: 14,
-		fontStyle: "italic",
+		fontSize: 12,
+		marginBottom: 8,
+	},
+	terminalOutput: {
+		backgroundColor: "#0A0C10",
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		flex: 1,
+	},
+	terminalOutputContent: {
+		padding: 12,
+	},
+	terminalRoot: {
+		backgroundColor: palette.background,
+		flex: 1,
+	},
+	terminalText: {
+		color: palette.text,
+		fontFamily: Platform.select({ ios: "Menlo", default: "monospace" }),
+		fontSize: 13,
+		lineHeight: 20,
+	},
+	typingLabel: {
+		color: palette.muted,
+		fontSize: 13,
+		paddingTop: 4,
 	},
 	userBubble: {
 		backgroundColor: palette.userBubble,
