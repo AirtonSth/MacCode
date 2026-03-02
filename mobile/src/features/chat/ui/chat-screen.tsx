@@ -21,6 +21,7 @@ import { useWorkspaceShell } from "../model/use-workspace-shell";
 import { appendAttachmentPathsToMessage } from "../model/attachment-paths";
 import { StreamingTimeline } from "./streamingTimeline";
 import { DesktopFilePickerModal } from "./desktop-file-picker-modal";
+import { BranchPickerModal } from "./branch-picker-modal";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
@@ -42,19 +43,13 @@ const palette = {
 	userBubble: "rgba(99,200,255,0.19)",
 };
 
-type ActivePicker = "branch" | "model" | "permission" | "reasoning";
+type ActivePicker = "model" | "permission" | "reasoning";
 type FilePickerTarget = "chat" | "terminal";
 
 const getSelectModalTitle = (activePicker: ActivePicker | null): string => {
 	switch (activePicker) {
-		case "branch": {
-			return "Select branch";
-		}
 		case "model": {
 			return "Select model";
-		}
-		case null: {
-			return "Select branch";
 		}
 		case "permission": {
 			return "Select permission";
@@ -63,10 +58,9 @@ const getSelectModalTitle = (activePicker: ActivePicker | null): string => {
 			return "Select reasoning";
 		}
 		default: {
-			return "Select branch";
+			return "Select option";
 		}
 	}
-	return "Select branch";
 };
 
 const toTerminalTranscript = (
@@ -138,6 +132,8 @@ export const ChatScreen = () => {
 	const [filePickerTarget, setFilePickerTarget] = useState<FilePickerTarget>("chat");
 	const [isKeyboardVisible, setIsKeyboardVisible] = useState<boolean>(false);
 	const [isBranchCheckoutPending, setIsBranchCheckoutPending] = useState<boolean>(false);
+	const [isBranchCreatePending, setIsBranchCreatePending] = useState<boolean>(false);
+	const [isBranchModalOpen, setIsBranchModalOpen] = useState<boolean>(false);
 	const selectorsScrollRef = useRef<ScrollView | null>(null);
 	const [terminalInput, setTerminalInput] = useState<string>("");
 	const [terminalOutput, setTerminalOutput] = useState<string>("");
@@ -259,6 +255,7 @@ export const ChatScreen = () => {
 		const onShow = () => {
 			setIsKeyboardVisible(true);
 			setActivePicker(null);
+			setIsBranchModalOpen(false);
 		};
 		const onHide = () => {
 			setIsKeyboardVisible(false);
@@ -479,37 +476,76 @@ export const ChatScreen = () => {
 		}
 	};
 
-	const isBranchPickerDisabled = !selectedProjectId || !isGitRepository || gitBranchesQuery.isLoading || isBranchCheckoutPending;
+	const isBranchActionPending = isBranchCheckoutPending || isBranchCreatePending;
+	const isBranchPickerDisabled = !selectedProjectId || isBranchActionPending;
+
+	const refreshGitBranchQueries = useCallback(
+		async (projectId: string) => {
+			await Promise.all([
+				queryClient.invalidateQueries({
+					queryKey: ["project-git-status", projectId],
+				}),
+				queryClient.invalidateQueries({
+					queryKey: ["project-git-branches", projectId],
+				}),
+			]);
+		},
+		[queryClient],
+	);
+
+	const handleBranchCheckout = useCallback(
+		async (branch: string) => {
+			if (
+				!selectedProjectId ||
+				!isGitRepository ||
+				branch === gitCurrentBranch ||
+				isBranchActionPending
+			) {
+				return;
+			}
+
+			setIsBranchCheckoutPending(true);
+			try {
+				await api.checkoutProjectGitBranch(selectedProjectId, branch);
+				await refreshGitBranchQueries(selectedProjectId);
+			} finally {
+				setIsBranchCheckoutPending(false);
+			}
+		},
+		[
+			api,
+			gitCurrentBranch,
+			isBranchActionPending,
+			isGitRepository,
+			refreshGitBranchQueries,
+			selectedProjectId,
+		],
+	);
+
+	const handleBranchCreate = useCallback(
+		async (name: string) => {
+			if (!selectedProjectId || !isGitRepository || isBranchActionPending) {
+				return;
+			}
+
+			setIsBranchCreatePending(true);
+			try {
+				await api.createProjectGitBranch(selectedProjectId, name);
+				await refreshGitBranchQueries(selectedProjectId);
+			} finally {
+				setIsBranchCreatePending(false);
+			}
+		},
+		[api, isBranchActionPending, isGitRepository, refreshGitBranchQueries, selectedProjectId],
+	);
 
 	const setPicker = useCallback(
-		async (value: string) => {
+		(value: string) => {
 			if (activePicker === null) {
 				return;
 			}
 
 			switch (activePicker) {
-				case "branch": {
-					if (!selectedProjectId || !isGitRepository || value === selectedBranch || isBranchCheckoutPending) {
-						setActivePicker(null);
-						return;
-					}
-
-					setIsBranchCheckoutPending(true);
-					try {
-						await api.checkoutProjectGitBranch(selectedProjectId, value);
-						await Promise.all([
-							queryClient.invalidateQueries({
-								queryKey: ["project-git-status", selectedProjectId],
-							}),
-							queryClient.invalidateQueries({
-								queryKey: ["project-git-branches", selectedProjectId],
-							}),
-						]);
-					} finally {
-						setIsBranchCheckoutPending(false);
-					}
-					break;
-				}
 				case "model": {
 					if (value !== selectedModel) {
 						setSelectedModel(value);
@@ -532,17 +568,10 @@ export const ChatScreen = () => {
 		},
 		[
 			activePicker,
-			selectedBranch,
 			selectedModel,
-			selectedProjectId,
-			isBranchCheckoutPending,
-			isGitRepository,
-			queryClient,
-			api,
 			setPermissionMode,
 			setSelectedModel,
 			setSelectedReasoningEffort,
-			setIsBranchCheckoutPending,
 		],
 	);
 
@@ -550,42 +579,6 @@ export const ChatScreen = () => {
 		const options: JSX.Element[] = [];
 
 		switch (activePicker) {
-			case "branch": {
-				if (branchOptions.length === 0) {
-					options.push(
-						<Text key="no-branches" style={styles.selectModalEmpty}>
-							No branches available.
-						</Text>,
-					);
-					break;
-				}
-
-				options.push(
-					...branchOptions.map((branch) => {
-						const isCurrent = branch === gitCurrentBranch;
-						return (
-							<Pressable
-								key={branch}
-								onPress={() => {
-									void setPicker(branch);
-								}}
-								style={({ pressed }) => [
-									styles.selectModalItem,
-									isCurrent ? styles.selectModalItemActive : null,
-									pressed ? styles.selectModalItemPressed : null,
-								]}
-								disabled={isBranchPickerDisabled}
-								testID={`chat-branch-option-${branch}`}
-							>
-								<Text numberOfLines={1} style={styles.selectModalItemLabel}>
-									{branch}
-								</Text>
-							</Pressable>
-						);
-					}),
-				);
-				break;
-			}
 			case "model": {
 				options.push(
 					...availableModels.map((model) => {
@@ -594,7 +587,7 @@ export const ChatScreen = () => {
 							<Pressable
 								key={model.id}
 								onPress={() => {
-									void setPicker(model.model);
+									setPicker(model.model);
 								}}
 								style={({ pressed }) => [
 									styles.selectModalItem,
@@ -620,7 +613,7 @@ export const ChatScreen = () => {
 							<Pressable
 								key={permission}
 								onPress={() => {
-									void setPicker(permission);
+									setPicker(permission);
 								}}
 								style={({ pressed }) => [
 									styles.selectModalItem,
@@ -646,7 +639,7 @@ export const ChatScreen = () => {
 							<Pressable
 								key={effort}
 								onPress={() => {
-									void setPicker(effort);
+									setPicker(effort);
 								}}
 								style={({ pressed }) => [
 									styles.selectModalItem,
@@ -675,11 +668,8 @@ export const ChatScreen = () => {
 		availableModels,
 		availableReasoningEfforts,
 		permissionMode,
-		branchOptions,
-		gitCurrentBranch,
 		selectedModel,
 		selectedReasoningEffort,
-		isBranchPickerDisabled,
 		permissionOptions,
 		setPicker,
 	]);
@@ -903,7 +893,10 @@ export const ChatScreen = () => {
 						<Pressable
 							disabled={isBranchPickerDisabled}
 							onPress={() => {
-								setActivePicker("branch");
+								if (!selectedProjectId || isBranchActionPending) {
+									return;
+								}
+								setIsBranchModalOpen(true);
 							}}
 							style={({ pressed }) => [
 								styles.selectorButton,
@@ -924,6 +917,23 @@ export const ChatScreen = () => {
 					</ScrollView>
 				) : null}
 			</View>
+
+			<BranchPickerModal
+				added={gitStatusQuery.data?.added ?? 0}
+				branches={branchOptions}
+				changedFiles={gitStatusQuery.data?.changedFiles ?? 0}
+				currentBranch={gitCurrentBranch}
+				isDisabled={!selectedProjectId || isBranchActionPending}
+				isGitRepository={isGitRepository}
+				isLoading={gitBranchesQuery.isLoading || gitStatusQuery.isLoading}
+				onCheckoutBranch={handleBranchCheckout}
+				onClose={() => {
+					setIsBranchModalOpen(false);
+				}}
+				onCreateBranch={handleBranchCreate}
+				removed={gitStatusQuery.data?.removed ?? 0}
+				isVisible={isBranchModalOpen}
+			/>
 
 			<Modal
 				animationType="fade"
