@@ -234,7 +234,7 @@ export const ChatScreen = () => {
 		]).start();
 	};
 
-	const closeDrawer = (onClosed?: () => void) => {
+	const closeDrawer = () => {
 		Animated.parallel([
 			Animated.timing(drawerOpacity, {
 				duration: 140,
@@ -248,7 +248,24 @@ export const ChatScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
-			onClosed?.();
+		});
+	};
+
+	const closeDrawerThen = (onClosed: () => void) => {
+		Animated.parallel([
+			Animated.timing(drawerOpacity, {
+				duration: 140,
+				toValue: 0,
+				useNativeDriver: true,
+			}),
+			Animated.timing(drawerTranslate, {
+				duration: 170,
+				toValue: -drawerWidth,
+				useNativeDriver: true,
+			}),
+		]).start(() => {
+			setIsDrawerOpen(false);
+			onClosed();
 		});
 	};
 
@@ -259,7 +276,7 @@ export const ChatScreen = () => {
 	};
 
 	const openSettingsFromDrawer = () => {
-		closeDrawer(() => {
+		closeDrawerThen(() => {
 			replace("/settings");
 		});
 	};

@@ -187,7 +187,7 @@ export const ThreadSelectionScreen = () => {
 		]).start();
 	};
 
-	const closeDrawer = (onClosed?: () => void) => {
+	const closeDrawer = () => {
 		Animated.parallel([
 			Animated.timing(drawerOpacity, {
 				duration: 140,
@@ -201,7 +201,24 @@ export const ThreadSelectionScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
-			onClosed?.();
+		});
+	};
+
+	const closeDrawerThen = (onClosed: () => void) => {
+		Animated.parallel([
+			Animated.timing(drawerOpacity, {
+				duration: 140,
+				toValue: 0,
+				useNativeDriver: true,
+			}),
+			Animated.timing(drawerTranslate, {
+				duration: 170,
+				toValue: -drawerWidth,
+				useNativeDriver: true,
+			}),
+		]).start(() => {
+			setIsDrawerOpen(false);
+			onClosed();
 		});
 	};
 
@@ -212,7 +229,7 @@ export const ThreadSelectionScreen = () => {
 	};
 
 	const openSettingsFromDrawer = () => {
-		closeDrawer(() => {
+		closeDrawerThen(() => {
 			replace("/settings");
 		});
 	};

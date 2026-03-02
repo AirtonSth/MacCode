@@ -58,6 +58,20 @@ export const SettingsScreen = () => {
 		router.push("/workspaces");
 	};
 
+	const scanLan = useCallback(async () => {
+		setIsScanning(true);
+		setStatusMessage("");
+		try {
+			const found = await DiscoveryManager.scan();
+			setDiscoveredServers(found);
+			setStatus(found.length === 0 ? "No server found on local network." : `Found ${String(found.length)} server(s).`);
+		} catch (error: unknown) {
+			setStatus(error instanceof Error ? error.message : "Failed to scan local network.", "error");
+		} finally {
+			setIsScanning(false);
+		}
+	}, []);
+
 	const hydrateRecentServers = useCallback(async () => {
 		const recent = await DiscoveryManager.readRecent();
 		setDiscoveredServers(recent);
@@ -82,20 +96,6 @@ export const SettingsScreen = () => {
 		void hydrateRecentServers();
 		void scanLan();
 	}, [hydrateRecentServers, scanLan]);
-
-	const scanLan = useCallback(async () => {
-		setIsScanning(true);
-		setStatusMessage("");
-		try {
-			const found = await DiscoveryManager.scan();
-			setDiscoveredServers(found);
-			setStatus(found.length === 0 ? "No server found on local network." : `Found ${String(found.length)} server(s).`);
-		} catch (error: unknown) {
-			setStatus(error instanceof Error ? error.message : "Failed to scan local network.", "error");
-		} finally {
-			setIsScanning(false);
-		}
-	}, []);
 
 	const connectAndPersist = async (input: { baseUrl: string; token: string; serverId?: string }) => {
 		const normalizedBaseUrl = input.baseUrl.trim();
