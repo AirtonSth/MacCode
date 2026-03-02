@@ -126,6 +126,7 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "remotecode-desktop-sidebar-width";
 const PERMISSION_MODE_STORAGE_KEY = "remotecode:permission-mode";
 const MODEL_STORAGE_KEY = "remotecode:model";
 const REASONING_EFFORT_STORAGE_KEY = "remotecode:reasoning-effort";
+const WS_CLIENT_ID_STORAGE_KEY = "remotecode:ws-client-id";
 const DEFAULT_SIDEBAR_WIDTH = 272;
 const SIDEBAR_WIDTH_MIN = 208;
 const SIDEBAR_WIDTH_MAX = 560;
@@ -223,20 +224,44 @@ const resolveSelectedReasoningEffort = (
 	return supported[0] ?? null;
 };
 
+const resolveWebSocketClientId = (): string => {
+	if (typeof window === "undefined") {
+		return `desktop-${Date.now()}`;
+	}
+
+	try {
+		const stored = window.localStorage.getItem(WS_CLIENT_ID_STORAGE_KEY)?.trim();
+		if (stored) {
+			return stored;
+		}
+
+		const created = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+			? crypto.randomUUID()
+			: `desktop-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+		window.localStorage.setItem(WS_CLIENT_ID_STORAGE_KEY, created);
+		return created;
+	} catch {
+		return `desktop-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+	}
+};
+
 const App = (): JSX.Element => {
 	const { dispatch, state } = useWorkspaceStore();
 	const shouldReduceMotion = useReducedMotion();
 	const wsRef = useRef<ReturnType<(typeof RemoteCodeRealtime)["createClient"]> | null>(null);
 	const selectedChatIdRef = useRef<string | null>(null);
+	const selectedProjectIdRef = useRef<string | null>(null);
 	const persistedSelectedChatIdRef = useRef<string | null>(null);
 	const sidebarWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
 	const isSidebarResizingRef = useRef<boolean>(false);
 	const sidebarResizeStartXRef = useRef<number>(0);
 	const sidebarResizeStartWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
 	const terminalOpenByChatRef = useRef<Record<string, boolean>>({});
+	const workspaceClientIdRef = useRef<string>(resolveWebSocketClientId());
+	const lastWorkspaceSeqRef = useRef<number>(0);
 
 	const baseUrl = useMemo(() => {
-		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:3001").trim();
+		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim();
 	}, []);
 
 	const token = useMemo(() => {
@@ -452,6 +477,10 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		selectedChatIdRef.current = state.selectedChatId;
 	}, [state.selectedChatId]);
+
+	useEffect(() => {
+		selectedProjectIdRef.current = state.selectedProjectId;
+	}, [state.selectedProjectId]);
 
 	const addError = useCallback(
 		(message: string, source: "rest" | "ws", code = "unknown") => {
@@ -724,20 +753,108 @@ const App = (): JSX.Element => {
 						}
 					}
 					break;
+				case "workspace_event": {
+					const envelope = event.data;
+					lastWorkspaceSeqRef.current = Math.max(lastWorkspaceSeqRef.current, envelope.seq);
+
+					const payload =
+						envelope.payload && typeof envelope.payload === "object" && !Array.isArray(envelope.payload)
+							? (envelope.payload as Record<string, unknown>)
+							: null;
+					const payloadChat = payload?.chat;
+					const payloadMessage = payload?.message;
+					const payloadCommand = payload?.command;
+					const chatId =
+						typeof payload?.chatId === "string"
+							? payload.chatId
+							: typeof payloadChat === "object" && payloadChat && typeof (payloadChat as { id?: unknown }).id === "string"
+								? ((payloadChat as { id: string }).id)
+								: typeof payloadMessage === "object" &&
+									  payloadMessage &&
+									  typeof (payloadMessage as { chatId?: unknown }).chatId === "string"
+									? ((payloadMessage as { chatId: string }).chatId)
+									: typeof payloadCommand === "object" &&
+										  payloadCommand &&
+										  typeof (payloadCommand as { chatId?: unknown }).chatId === "string"
+										? ((payloadCommand as { chatId: string }).chatId)
+										: null;
+					const projectId =
+						typeof payload?.projectId === "string"
+							? payload.projectId
+							: typeof payloadChat === "object" &&
+								  payloadChat &&
+								  typeof (payloadChat as { projectId?: unknown }).projectId === "string"
+								? ((payloadChat as { projectId: string }).projectId)
+								: null;
+
+					switch (envelope.type) {
+						case "project_created":
+						case "project_updated":
+						case "project_deleted":
+							await loadProjects();
+							break;
+						case "chat_created":
+						case "chat_updated":
+						case "chat_deleted":
+							if (projectId && projectId === selectedProjectIdRef.current) {
+								await loadChatsForProject(projectId, selectedChatIdRef.current);
+							} else if (selectedProjectIdRef.current) {
+								await loadChatsForProject(selectedProjectIdRef.current, selectedChatIdRef.current);
+							}
+							break;
+						case "message_created":
+							if (chatId && chatId === selectedChatIdRef.current) {
+								await loadMessagesForChat(chatId);
+							}
+							break;
+						case "selection_updated":
+							await loadProjects();
+							break;
+						case "git_updated":
+							if (projectId && projectId === selectedProjectIdRef.current) {
+								void refreshProjectGit();
+							}
+							break;
+						case "terminal_command_started":
+						case "terminal_entry_appended":
+						case "terminal_command_finished":
+							if (
+								chatId &&
+								chatId === selectedChatIdRef.current &&
+								terminalOpenByChatRef.current[chatId]
+							) {
+								await syncTerminalHistory(chatId);
+							}
+							break;
+					}
+
+					break;
+				}
 			}
 		},
-		[addError, dispatch, loadMessagesForChat],
+		[
+			addError,
+			dispatch,
+			loadChatsForProject,
+			loadMessagesForChat,
+			loadProjects,
+			refreshProjectGit,
+			syncTerminalHistory,
+		],
 	);
 
 	const handleWsState = useCallback(
-		(connectionState: ConnectionState) => {
-			dispatch({ payload: connectionState, type: "SET_CONNECTION_STATE" });
-			if (connectionState === "connected" && selectedChatIdRef.current) {
-				wsRef.current?.sendJoinChat(selectedChatIdRef.current);
-				void loadMessagesForChat(selectedChatIdRef.current);
-			}
-		},
-		[dispatch, loadMessagesForChat],
+			(connectionState: ConnectionState) => {
+				dispatch({ payload: connectionState, type: "SET_CONNECTION_STATE" });
+				if (connectionState === "connected") {
+					wsRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, workspaceClientIdRef.current);
+					if (selectedChatIdRef.current) {
+						wsRef.current?.sendJoinChat(selectedChatIdRef.current);
+						void loadMessagesForChat(selectedChatIdRef.current);
+					}
+				}
+			},
+			[dispatch, loadMessagesForChat],
 	);
 
 	const handleBootstrap = useCallback(() => {
@@ -876,16 +993,22 @@ const App = (): JSX.Element => {
 						type: "RESET_STREAMING",
 					});
 				},
-				onCreateMessageError: addError,
-				onSendUserMessage: (chatId, messageText) => {
-					wsRef.current?.sendUserMessage(
-						chatId,
-						messageText,
-						permissionMode,
-						selectedModel ?? undefined,
-						selectedReasoningEffort ?? undefined,
-					);
-				},
+					onCreateMessageError: addError,
+					onSendUserMessage: (chatId, messageText) => {
+						const requestId =
+							typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+								? crypto.randomUUID()
+								: `ws-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+						wsRef.current?.sendUserMessage(
+							chatId,
+							messageText,
+							permissionMode,
+							selectedModel ?? undefined,
+							selectedReasoningEffort ?? undefined,
+							workspaceClientIdRef.current,
+							requestId,
+						);
+					},
 				onSetSending: (sending) => {
 					dispatch({
 						payload: sending,

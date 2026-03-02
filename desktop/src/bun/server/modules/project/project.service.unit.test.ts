@@ -8,23 +8,29 @@ import type { ProjectDTO } from "../../types";
 import type { ProjectRepository } from "./project.repository";
 import { ProjectService } from "./project.service";
 
-const createMemoryProject = (id: string, path: string): ProjectDTO => ({
-	createdAt: new Date().toISOString(),
-	id,
-	isFavorite: false,
-	name: `project-${id}`,
-	path,
-	updatedAt: new Date().toISOString(),
-});
+const createMemoryProject = (id: string, path: string): ProjectDTO => {
+	const now = new Date().toISOString();
+	return {
+		createdAt: now,
+		id,
+		isFavorite: false,
+		name: `project-${id}`,
+		path,
+		updatedAt: now,
+	};
+};
 
-const createProject = (id: string, path: string, name = `project-${id}`): ProjectDTO => ({
-	createdAt: new Date().toISOString(),
-	id,
-	isFavorite: false,
-	name,
-	path,
-	updatedAt: new Date().toISOString(),
-});
+const createProject = (id: string, path: string, name = `project-${id}`): ProjectDTO => {
+	const now = new Date().toISOString();
+	return {
+		createdAt: now,
+		id,
+		isFavorite: false,
+		name,
+		path,
+		updatedAt: now,
+	};
+};
 
 test("ProjectService.createProject normalizes and rejects invalid paths", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-project-service-unit-"));

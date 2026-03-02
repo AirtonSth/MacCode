@@ -1,14 +1,19 @@
 import { Elysia, t } from "elysia";
 
 import { withRestAuth } from "../../shared/auth/auth.service";
+import { readMutationRequestMetadata } from "../../shared/core/request-context";
+import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { ProjectService } from "./project.service";
 
 export class ProjectController {
-	static build(service: ProjectService) {
-		return new ProjectController(service).build();
+	static build(service: ProjectService, workspaceEvents?: WorkspaceEventsServiceContract) {
+		return new ProjectController(service, workspaceEvents).build();
 	}
 
-constructor(private readonly service: ProjectService) {}
+constructor(
+		private readonly service: ProjectService,
+		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+	) {}
 
 	
 
@@ -22,7 +27,7 @@ constructor(private readonly service: ProjectService) {}
 			})
 			.post(
 				"/projects",
-				async ({ body, set }) => {
+				async ({ body, request, set }) => {
 					const result = await this.service.createProject(body);
 
 					if ("type" in result) {
@@ -39,6 +44,16 @@ constructor(private readonly service: ProjectService) {}
 						set.status = 201;
 					}
 
+					const metadata = readMutationRequestMetadata(request);
+					this.workspaceEvents?.append({
+						type: result.created ? "project_created" : "project_updated",
+						payload: {
+							project: result.project,
+						},
+						originClientId: metadata.clientId,
+						requestId: metadata.requestId,
+					});
+
 					return {
 						created: result.created,
 						project: result.project,
@@ -53,7 +68,7 @@ constructor(private readonly service: ProjectService) {}
 			)
 			.patch(
 				"/projects/:id",
-				async ({ body, params: parameters, set }) => {
+				async ({ body, params: parameters, request, set }) => {
 					const project = await this.service.setFavorite(parameters.id, body.isFavorite);
 
 					if (!project) {
@@ -61,6 +76,16 @@ constructor(private readonly service: ProjectService) {}
 
 						return { error: "project not found" };
 					}
+
+					const metadata = readMutationRequestMetadata(request);
+					this.workspaceEvents?.append({
+						type: "project_updated",
+						payload: {
+							project,
+						},
+						originClientId: metadata.clientId,
+						requestId: metadata.requestId,
+					});
 
 					return { project };
 				},
@@ -70,7 +95,7 @@ constructor(private readonly service: ProjectService) {}
 					}),
 				},
 			)
-			.delete("/projects/:id", async ({ params: parameters, set }) => {
+			.delete("/projects/:id", async ({ params: parameters, request, set }) => {
 				const deleted = await this.service.deleteProject(parameters.id);
 
 				if (!deleted) {
@@ -79,9 +104,20 @@ constructor(private readonly service: ProjectService) {}
 					return { error: "project not found" };
 				}
 
+				const metadata = readMutationRequestMetadata(request);
+				this.workspaceEvents?.append({
+					type: "project_deleted",
+					payload: {
+						projectId: parameters.id,
+					},
+					originClientId: metadata.clientId,
+					requestId: metadata.requestId,
+				});
+
 				return { deleted: true };
 			});
 	}
 }
 
-export const createProjectController = (service: ProjectService) => ProjectController.build(service);
+export const createProjectController = (service: ProjectService, workspaceEvents?: WorkspaceEventsServiceContract) =>
+	ProjectController.build(service, workspaceEvents);

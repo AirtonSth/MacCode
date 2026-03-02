@@ -24,18 +24,29 @@ export interface ClientJoinEvent {
 	event: "join_chat";
 }
 
+export interface ClientJoinWorkspaceEvent {
+	data: {
+		clientId?: string;
+		lastSeq?: number;
+		requestId?: string;
+	};
+	event: "join_workspace";
+}
+
 export interface ClientMessageEvent {
 	data: {
 		chatId: string;
+		clientId?: string;
 		model?: string;
 		permissionMode?: CodexPermissionMode;
+		requestId?: string;
 		reasoningEffort?: CodexReasoningEffort;
 		text: string;
 	};
 	event: "user_message";
 }
 
-export type ClientWsEvent = ClientJoinEvent | ClientMessageEvent;
+export type ClientWsEvent = ClientJoinEvent | ClientJoinWorkspaceEvent | ClientMessageEvent;
 
 export interface ErrorPayload {
 	error: string;
@@ -87,6 +98,61 @@ export interface MessageDTO {
 export interface WorkspaceSelectionDTO {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+}
+
+export interface DiscoveryInfoDTO {
+	serverId: string;
+	hostname: string;
+	port: number;
+	version: string;
+	authMode: "token_lan";
+	capabilitiesVersion: string;
+}
+
+export interface AuthVerifyResponseDTO {
+	ok: true;
+	server: DiscoveryInfoDTO;
+}
+
+export interface FsRootEntryDTO {
+	id: string;
+	label: string;
+	path: string;
+}
+
+export interface FsEntryDTO {
+	type: "directory" | "file";
+	name: string;
+	path: string;
+}
+
+export interface FsListResponseDTO {
+	parentPath: string | null;
+	path: string;
+	entries: FsEntryDTO[];
+}
+
+export type WorkspaceEventType =
+	| "project_created"
+	| "project_updated"
+	| "project_deleted"
+	| "chat_created"
+	| "chat_updated"
+	| "chat_deleted"
+	| "message_created"
+	| "selection_updated"
+	| "git_updated"
+	| "terminal_command_started"
+	| "terminal_entry_appended"
+	| "terminal_command_finished";
+
+export interface WorkspaceEventEnvelope {
+	seq: number;
+	ts: string;
+	type: WorkspaceEventType;
+	payload: unknown;
+	originClientId: string | null;
+	requestId: string | null;
 }
 
 export interface ProjectDTO {
@@ -154,6 +220,10 @@ export type ServerWsEvent =
 				updatedAt: string;
 			};
 			event: "chat_updated";
+	  }
+	| {
+			data: WorkspaceEventEnvelope;
+			event: "workspace_event";
 	  }
 	| {
 			data: {

@@ -68,7 +68,9 @@ static async create(pathOverride?: string): Promise<DrizzleDatabaseClient> {
 				projects: DatabaseSchema.projects,
 				terminalCommands: DatabaseSchema.terminalCommands,
 				terminalEntries: DatabaseSchema.terminalEntries,
+				serverMetadata: DatabaseSchema.serverMetadata,
 				workspaceSelection: DatabaseSchema.workspaceSelection,
+				workspaceEvents: DatabaseSchema.workspaceEvents,
 			},
 		});
 

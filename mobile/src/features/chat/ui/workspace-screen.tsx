@@ -13,11 +13,12 @@ import {
 	View,
 } from "react-native";
 
-import { useWorkspaceShell } from "@/features/chat/model/use-workspace-shell";
-import { formatRelativeTime } from "@/shared/lib/time";
-import { theme } from "@/shared/theme/tokens";
-import { GhostButton } from "@/shared/ui/ghost-button";
-import { GlassPanel } from "@/shared/ui/glass-panel";
+import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import { formatRelativeTime } from "../../../shared/lib/time";
+import { theme } from "../../../shared/theme/tokens";
+import { GhostButton } from "../../../shared/ui/ghost-button";
+import { GlassPanel } from "../../../shared/ui/glass-panel";
+import { useWorkspaceShell } from "../model/use-workspace-shell";
 
 const styles = StyleSheet.create({
 	composerInput: {
@@ -31,17 +32,26 @@ const styles = StyleSheet.create({
 
 export const WorkspaceScreen = () => {
 	const {
+		availableModels,
 		chats,
 		connectionState,
 		createChat,
+		createProject,
+		deleteProject,
 		deleteChat,
 		isLoaded,
 		isSending,
 		lastError,
 		messages,
+		permissionMode,
 		projects,
+		selectedModel,
+		selectedReasoningEffort,
 		selectChat,
 		selectProject,
+		setPermissionMode,
+		setSelectedModel,
+		setSelectedReasoningEffort,
 		selectedChat,
 		selectedChatId,
 		selectedProjectId,
@@ -50,6 +60,23 @@ export const WorkspaceScreen = () => {
 		toggleFavorite,
 	} = useWorkspaceShell();
 	const [input, setInput] = useState<string>("");
+	const [newProjectPath, setNewProjectPath] = useState<string>("");
+	const [newProjectName, setNewProjectName] = useState<string>("");
+	const [browserPath, setBrowserPath] = useState<string | null>(null);
+	const [browserEntries, setBrowserEntries] = useState<
+		{ name: string; path: string; type: "directory" | "file" }[]
+	>([]);
+	const [browserRoots, setBrowserRoots] = useState<{ id: string; label: string; path: string }[]>([]);
+	const activeModel = useMemo(
+		() => availableModels.find((item) => item.model === selectedModel) ?? null,
+		[availableModels, selectedModel],
+	);
+	const api = useRemoteCodeClient();
+	const [gitSummary, setGitSummary] = useState<string>("Git status unavailable");
+	const [gitBranchInput, setGitBranchInput] = useState<string>("");
+	const [gitCommitMessage, setGitCommitMessage] = useState<string>("");
+	const [terminalInput, setTerminalInput] = useState<string>("");
+	const [terminalOutput, setTerminalOutput] = useState<string>("");
 	const dimensions = useWindowDimensions();
 	const isWide = dimensions.width >= 960;
 	const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(isWide);
@@ -78,6 +105,89 @@ export const WorkspaceScreen = () => {
 		if (sent) {
 			setInput("");
 		}
+	};
+
+	const handleCreateProject = async () => {
+		const path = newProjectPath.trim();
+		if (!path) {
+			return;
+		}
+
+		await createProject({
+			name: newProjectName.trim() || undefined,
+			path,
+		});
+		setNewProjectName("");
+		setNewProjectPath("");
+	};
+
+	const loadRoots = async () => {
+		const roots = await api.listFsRoots();
+		setBrowserRoots(roots);
+	};
+
+	const loadDirectory = async (path: string) => {
+		const listed = await api.listFsEntries(path);
+		setBrowserPath(listed.path);
+		setBrowserEntries(listed.entries);
+	};
+
+	const handleRefreshGit = async () => {
+		if (!selectedProjectId) {
+			return;
+		}
+
+		const status = await api.getProjectGitStatus(selectedProjectId);
+		setGitSummary(
+			status.isRepo
+				? `branch=${status.currentBranch ?? "detached"} · +${String(status.added)} / -${String(status.removed)} · changed=${String(status.changedFiles)}`
+				: "Project is not a git repository",
+		);
+	};
+
+	const handleCreateBranch = async () => {
+		if (!selectedProjectId || gitBranchInput.trim().length === 0) {
+			return;
+		}
+
+		await api.createProjectGitBranch(selectedProjectId, gitBranchInput.trim());
+		setGitBranchInput("");
+		await handleRefreshGit();
+	};
+
+	const handleCheckoutBranch = async () => {
+		if (!selectedProjectId || gitBranchInput.trim().length === 0) {
+			return;
+		}
+
+		await api.checkoutProjectGitBranch(selectedProjectId, gitBranchInput.trim());
+		setGitBranchInput("");
+		await handleRefreshGit();
+	};
+
+	const handleCommit = async () => {
+		if (!selectedProjectId) {
+			return;
+		}
+
+		await api.commitProject(selectedProjectId, {
+			message: gitCommitMessage,
+			includeUnstaged: true,
+			push: false,
+		});
+		await handleRefreshGit();
+	};
+
+	const handleTerminalRun = async () => {
+		const command = terminalInput.trim();
+		if (!selectedChatId || command.length === 0) {
+			return;
+		}
+
+		const result = await api.execTerminalCommand(selectedChatId, { command });
+		const transcript = result.entries.map((entry) => `[${entry.stream}] ${entry.data}`).join("");
+		setTerminalOutput((current) => `${current}\\n$ ${command}\\n${transcript}`.trim());
+		setTerminalInput("");
 	};
 
 	return (
@@ -260,6 +370,93 @@ export const WorkspaceScreen = () => {
 										>
 											Projects
 										</Text>
+										<View style={{ gap: 6, marginBottom: 10 }}>
+											<TextInput
+												autoCapitalize="none"
+												onChangeText={setNewProjectPath}
+												placeholder="Add project path (absolute)"
+												placeholderTextColor={theme.colors.muted}
+												style={{
+													backgroundColor: "rgba(255,255,255,0.04)",
+													borderColor: theme.colors.borderSoft,
+													borderRadius: theme.borderRadius.chip,
+													borderWidth: 1,
+													color: theme.colors.textPrimary,
+													fontSize: 12,
+													paddingHorizontal: 10,
+													paddingVertical: 7,
+												}}
+												value={newProjectPath}
+											/>
+											<TextInput
+												autoCapitalize="none"
+												onChangeText={setNewProjectName}
+												placeholder="Optional project name"
+												placeholderTextColor={theme.colors.muted}
+												style={{
+													backgroundColor: "rgba(255,255,255,0.04)",
+													borderColor: theme.colors.borderSoft,
+													borderRadius: theme.borderRadius.chip,
+													borderWidth: 1,
+													color: theme.colors.textPrimary,
+													fontSize: 12,
+													paddingHorizontal: 10,
+													paddingVertical: 7,
+												}}
+												value={newProjectName}
+											/>
+											<GhostButton
+												label="Create Project"
+												onPress={() => {
+													void handleCreateProject();
+												}}
+											/>
+											<GhostButton
+												label="Browse Remote FS"
+												onPress={() => {
+													void loadRoots();
+												}}
+											/>
+											{browserRoots.length > 0 ? (
+												<View style={{ gap: 4 }}>
+													<Text style={{ color: theme.colors.muted, fontSize: 12 }}>Roots</Text>
+													{browserRoots.map((root) => (
+														<Pressable
+															key={root.id}
+															onPress={() => {
+																void loadDirectory(root.path);
+															}}
+														>
+															<Text style={{ color: theme.colors.textSecondary, fontSize: 12 }}>{root.label}</Text>
+														</Pressable>
+													))}
+												</View>
+											) : null}
+											{browserPath ? (
+												<View style={{ gap: 4 }}>
+													<Text style={{ color: theme.colors.muted, fontSize: 12 }}>
+														{`Path: ${browserPath}`}
+													</Text>
+													{browserEntries.slice(0, 24).map((entry) => (
+														<Pressable
+															key={entry.path}
+															onPress={() => {
+																if (entry.type === "directory") {
+																	setNewProjectPath(entry.path);
+																	void loadDirectory(entry.path);
+																} else {
+																	setNewProjectPath(entry.path);
+																}
+															}}
+														>
+															<Text style={{ color: theme.colors.textSecondary, fontSize: 12 }}>
+																{entry.type === "directory" ? "[DIR]" : "[FILE]"} {entry.name}
+															</Text>
+														</Pressable>
+													))}
+												</View>
+											) : null}
+										</View>
 										{projects.map((project) => (
 											<Pressable
 												key={project.id}
@@ -306,6 +503,14 @@ export const WorkspaceScreen = () => {
 														>
 															★
 														</Text>
+													</Pressable>
+													<Pressable
+														onPress={() => {
+															void deleteProject(project.id);
+														}}
+														style={{ marginLeft: 8 }}
+													>
+														<Text style={{ color: theme.colors.danger }}>×</Text>
 													</Pressable>
 												</View>
 											</Pressable>
@@ -429,6 +634,94 @@ export const WorkspaceScreen = () => {
 							>
 								{selectedChat ? `${selectedChat.provider} · ${selectedChat.status}` : "Waiting for a chat selection"}
 							</Text>
+							<View style={{ gap: 8, marginTop: 10 }}>
+								<View
+									style={{
+										alignItems: "center",
+										flexDirection: "row",
+										gap: 8,
+									}}
+								>
+									<Text style={{ color: theme.colors.textSecondary, fontSize: 12, width: 84 }}>Model</Text>
+									<TextInput
+										autoCapitalize="none"
+										onChangeText={setSelectedModel}
+										placeholder="codex model"
+										placeholderTextColor={theme.colors.muted}
+										style={{
+											backgroundColor: "rgba(255,255,255,0.04)",
+											borderColor: theme.colors.borderSoft,
+											borderRadius: theme.borderRadius.chip,
+											borderWidth: 1,
+											color: theme.colors.textPrimary,
+											flex: 1,
+											fontSize: 12,
+											paddingHorizontal: 10,
+											paddingVertical: 7,
+										}}
+										value={selectedModel ?? ""}
+									/>
+								</View>
+								<View
+									style={{
+										alignItems: "center",
+										flexDirection: "row",
+										gap: 8,
+									}}
+								>
+									<Text style={{ color: theme.colors.textSecondary, fontSize: 12, width: 84 }}>Permission</Text>
+									<TextInput
+										autoCapitalize="none"
+										onChangeText={setPermissionMode}
+										placeholder="plan | default | full"
+										placeholderTextColor={theme.colors.muted}
+										style={{
+											backgroundColor: "rgba(255,255,255,0.04)",
+											borderColor: theme.colors.borderSoft,
+											borderRadius: theme.borderRadius.chip,
+											borderWidth: 1,
+											color: theme.colors.textPrimary,
+											flex: 1,
+											fontSize: 12,
+											paddingHorizontal: 10,
+											paddingVertical: 7,
+										}}
+										value={permissionMode}
+									/>
+								</View>
+								<View
+									style={{
+										alignItems: "center",
+										flexDirection: "row",
+										gap: 8,
+									}}
+								>
+									<Text style={{ color: theme.colors.textSecondary, fontSize: 12, width: 84 }}>Reasoning</Text>
+									<TextInput
+										autoCapitalize="none"
+										onChangeText={setSelectedReasoningEffort}
+										placeholder="minimal | medium | high"
+										placeholderTextColor={theme.colors.muted}
+										style={{
+											backgroundColor: "rgba(255,255,255,0.04)",
+											borderColor: theme.colors.borderSoft,
+											borderRadius: theme.borderRadius.chip,
+											borderWidth: 1,
+											color: theme.colors.textPrimary,
+											flex: 1,
+											fontSize: 12,
+											paddingHorizontal: 10,
+											paddingVertical: 7,
+										}}
+										value={selectedReasoningEffort ?? ""}
+									/>
+								</View>
+								{activeModel ? (
+									<Text style={{ color: theme.colors.muted, fontSize: 11 }}>
+										Available reasoning: {activeModel.supportedReasoningEfforts.map((item) => item.reasoningEffort).join(", ")}
+									</Text>
+								) : null}
+							</View>
 						</View>
 
 						<ScrollView
@@ -567,6 +860,126 @@ export const WorkspaceScreen = () => {
 									{isSending ? "Sending" : "Send"}
 								</Text>
 							</Pressable>
+						</View>
+
+						<View
+							style={{
+								borderColor: theme.colors.borderSoft,
+								borderRadius: theme.borderRadius.card,
+								borderWidth: 1,
+								gap: 8,
+								marginTop: 10,
+								padding: 10,
+							}}
+						>
+							<Text style={{ color: theme.colors.textPrimary, fontSize: 14, fontWeight: "700" }}>
+								Git Controls
+							</Text>
+							<Text selectable style={{ color: theme.colors.muted, fontSize: 12 }}>
+								{gitSummary}
+							</Text>
+							<View style={{ flexDirection: "row", gap: 8 }}>
+								<GhostButton
+									label="Refresh Git"
+									onPress={() => {
+										void handleRefreshGit();
+									}}
+								/>
+							</View>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setGitBranchInput}
+								placeholder="Branch name"
+								placeholderTextColor={theme.colors.muted}
+								style={{
+									backgroundColor: "rgba(255,255,255,0.04)",
+									borderColor: theme.colors.borderSoft,
+									borderRadius: theme.borderRadius.chip,
+									borderWidth: 1,
+									color: theme.colors.textPrimary,
+									fontSize: 12,
+									paddingHorizontal: 10,
+									paddingVertical: 8,
+								}}
+								value={gitBranchInput}
+							/>
+							<View style={{ flexDirection: "row", gap: 8 }}>
+								<GhostButton
+									label="Create Branch"
+									onPress={() => {
+										void handleCreateBranch();
+									}}
+								/>
+								<GhostButton
+									label="Checkout"
+									onPress={() => {
+										void handleCheckoutBranch();
+									}}
+								/>
+							</View>
+							<TextInput
+								onChangeText={setGitCommitMessage}
+								placeholder="Commit message"
+								placeholderTextColor={theme.colors.muted}
+								style={{
+									backgroundColor: "rgba(255,255,255,0.04)",
+									borderColor: theme.colors.borderSoft,
+									borderRadius: theme.borderRadius.chip,
+									borderWidth: 1,
+									color: theme.colors.textPrimary,
+									fontSize: 12,
+									paddingHorizontal: 10,
+									paddingVertical: 8,
+								}}
+								value={gitCommitMessage}
+							/>
+							<GhostButton
+								label="Commit"
+								onPress={() => {
+									void handleCommit();
+								}}
+							/>
+						</View>
+
+						<View
+							style={{
+								borderColor: theme.colors.borderSoft,
+								borderRadius: theme.borderRadius.card,
+								borderWidth: 1,
+								gap: 8,
+								marginTop: 10,
+								padding: 10,
+							}}
+						>
+							<Text style={{ color: theme.colors.textPrimary, fontSize: 14, fontWeight: "700" }}>
+								Terminal
+							</Text>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setTerminalInput}
+								placeholder="Run command"
+								placeholderTextColor={theme.colors.muted}
+								style={{
+									backgroundColor: "rgba(255,255,255,0.04)",
+									borderColor: theme.colors.borderSoft,
+									borderRadius: theme.borderRadius.chip,
+									borderWidth: 1,
+									color: theme.colors.textPrimary,
+									fontSize: 12,
+									paddingHorizontal: 10,
+									paddingVertical: 8,
+								}}
+								value={terminalInput}
+							/>
+							<GhostButton
+								label="Run Command"
+								onPress={() => {
+									void handleTerminalRun();
+								}}
+							/>
+							<Text selectable style={{ color: theme.colors.muted, fontSize: 12 }}>
+								{terminalOutput.length > 0 ? terminalOutput : "No terminal output yet."}
+							</Text>
 						</View>
 					</GlassPanel>
 				</View>

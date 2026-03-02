@@ -1,9 +1,13 @@
 import { Elysia } from "elysia";
 
 import { serverConfig } from "./config";
+import { AuthController } from "./modules/auth/auth.controller";
 import { ChatController } from "./modules/chat/chat.controller";
 import { ChatRepository } from "./modules/chat/chat.repository";
 import { ChatService } from "./modules/chat/chat.service";
+import { DiscoveryController } from "./modules/discovery/discovery.controller";
+import { FsController } from "./modules/fs/fs.controller";
+import { createFsService } from "./modules/fs/fs.service";
 import { MessageController } from "./modules/message/message.controller";
 import { MessageRepository } from "./modules/message/message.repository";
 import { MessageService } from "./modules/message/message.service";
@@ -14,20 +18,25 @@ import { GitController } from "./modules/git/git.controller";
 import { GitService } from "./modules/git/git.service";
 import { ProviderController } from "./modules/provider/provider.controller";
 import { CodexModelsService } from "./modules/provider/codex-models.service";
+import { createServerMetadataRepository } from "./modules/server-metadata/server-metadata.repository";
+import { createServerMetadataService } from "./modules/server-metadata/server-metadata.service";
 import { SelectionController } from "./modules/selection/selection.controller";
 import { createSelectionRepository } from "./modules/selection/selection.repository";
 import { createSelectionService } from "./modules/selection/selection.service";
 import { TerminalController } from "./modules/terminal/terminal.controller";
 import { createTerminalRepository } from "./modules/terminal/terminal.repository";
 import { createTerminalService } from "./modules/terminal/terminal.service";
+import { createWorkspaceEventsRepository } from "./modules/workspace-events/workspace-events.repository";
+import { createWorkspaceEventsService } from "./modules/workspace-events/workspace-events.service";
 import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
 import { DatabaseClientFactory } from "./shared/db/db.client";
 
 export const ServerBootstrap = {
-	async buildServerApp(databasePath?: string) {
-		const databaseClient = await DatabaseClientFactory.create(databasePath);
+	async buildServerApp(options?: { databasePath?: string; port?: number }) {
+		const listenPort = options?.port ?? serverConfig.port;
+		const databaseClient = await DatabaseClientFactory.create(options?.databasePath);
 
 		DatabaseBootstrap.initialize(databaseClient.sqlite);
 
@@ -36,32 +45,46 @@ export const ServerBootstrap = {
 		const messageRepository = new MessageRepository(databaseClient.orm);
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 		const terminalRepository = createTerminalRepository(databaseClient.orm);
+		const workspaceEventsRepository = createWorkspaceEventsRepository(databaseClient.orm);
+		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
 		const messageService = new MessageService(chatRepository, messageRepository);
 		const gitService = new GitService(projectService);
+		const fsService = createFsService();
 		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
 		const terminalService = createTerminalService({
 			chat: chatRepository,
 			project: projectRepository,
 			terminal: terminalRepository,
 		});
-		const wsService = new WsService(chatRepository, messageRepository, projectRepository);
+		const workspaceEventsService = createWorkspaceEventsService(workspaceEventsRepository);
+		const serverMetadataService = createServerMetadataService(serverMetadataRepository, listenPort);
+		const wsService = new WsService(
+			chatRepository,
+			messageRepository,
+			projectRepository,
+			undefined,
+			workspaceEventsService,
+		);
 		const codexModelsService = new CodexModelsService();
 
 		const app = new Elysia()
 			.group("/v1", (group) =>
 				group
-					.use(ProjectController.build(projectService))
-					.use(ChatController.build(chatService))
+					.use(DiscoveryController.build(serverMetadataService))
+					.use(AuthController.build(serverMetadataService))
+					.use(ProjectController.build(projectService, workspaceEventsService))
+					.use(ChatController.build(chatService, workspaceEventsService))
 					.use(MessageController.build(messageService))
-					.use(GitController.build(gitService))
+					.use(GitController.build(gitService, workspaceEventsService))
 					.use(ProviderController.build(codexModelsService))
-					.use(SelectionController.build(workspaceSelectionService))
-					.use(TerminalController.build(terminalService)),
+					.use(SelectionController.build(workspaceSelectionService, workspaceEventsService))
+					.use(TerminalController.build(terminalService, workspaceEventsService))
+					.use(FsController.build(fsService)),
 			)
-			.use(WsController.build(wsService));
+			.use(WsController.build(wsService, workspaceEventsService));
 
 		return {
 			app,
@@ -75,12 +98,13 @@ export const ServerBootstrap = {
 	},
 
 	async createBackendServer(options?: { databasePath?: string; port?: number }): Promise<BackendHandle> {
-		const port = options?.port;
-		const handle = await ServerBootstrap.buildServerApp(options?.databasePath);
+		const listenPort = options?.port ?? serverConfig.port;
+		const handle = await ServerBootstrap.buildServerApp({
+			databasePath: options?.databasePath,
+			port: listenPort,
+		});
 
 		let serverReference: unknown;
-
-		const listenPort = port ?? serverConfig.port;
 
 		await new Promise<void>((resolve) => {
 			handle.app.listen(listenPort, (server) => {
@@ -96,7 +120,8 @@ export const ServerBootstrap = {
 	},
 };
 
-export const buildServerApp = async (databasePath?: string) => await ServerBootstrap.buildServerApp(databasePath);
+export const buildServerApp = async (databasePath?: string) =>
+	await ServerBootstrap.buildServerApp({ databasePath });
 
 export interface BackendHandle {
 	app: Awaited<ReturnType<typeof buildServerApp>>["app"];

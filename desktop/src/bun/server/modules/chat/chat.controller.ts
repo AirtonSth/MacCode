@@ -1,14 +1,19 @@
 import { Elysia, t } from "elysia";
 
 import { withRestAuth } from "../../shared/auth/auth.service";
+import { readMutationRequestMetadata } from "../../shared/core/request-context";
+import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { ChatService } from "./chat.service";
 
 export class ChatController {
-	static build(service: ChatService) {
-		return new ChatController(service).build();
+	static build(service: ChatService, workspaceEvents?: WorkspaceEventsServiceContract) {
+		return new ChatController(service, workspaceEvents).build();
 	}
 
-constructor(private readonly service: ChatService) {}
+constructor(
+		private readonly service: ChatService,
+		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+	) {}
 
 	
 
@@ -28,8 +33,8 @@ constructor(private readonly service: ChatService) {}
 			})
 			.post(
 				"/projects/:id/chats",
-				async ({ body, params: parameters, set }) => {
-					const title = body.title?.trim() || "Novo chat";
+				async ({ body, params: parameters, request, set }) => {
+					const title = body.title?.trim() || "New chat";
 					const chat = await this.service.createChat(parameters.id, title);
 
 					if (!chat) {
@@ -37,6 +42,16 @@ constructor(private readonly service: ChatService) {}
 
 						return { error: "project not found" };
 					}
+
+					const metadata = readMutationRequestMetadata(request);
+					this.workspaceEvents?.append({
+						type: "chat_created",
+						payload: {
+							chat,
+						},
+						originClientId: metadata.clientId,
+						requestId: metadata.requestId,
+					});
 
 					set.status = 201;
 
@@ -48,7 +63,7 @@ constructor(private readonly service: ChatService) {}
 					}),
 				},
 			)
-			.delete("/chats/:id", async ({ params: parameters, set }) => {
+			.delete("/chats/:id", async ({ params: parameters, request, set }) => {
 				const deleted = await this.service.deleteChat(parameters.id);
 
 				if (!deleted) {
@@ -57,9 +72,20 @@ constructor(private readonly service: ChatService) {}
 					return { error: "chat not found" };
 				}
 
+				const metadata = readMutationRequestMetadata(request);
+				this.workspaceEvents?.append({
+					type: "chat_deleted",
+					payload: {
+						chatId: parameters.id,
+					},
+					originClientId: metadata.clientId,
+					requestId: metadata.requestId,
+				});
+
 				return { deleted: true };
 			});
 	}
 }
 
-export const createChatController = (service: ChatService) => ChatController.build(service);
+export const createChatController = (service: ChatService, workspaceEvents?: WorkspaceEventsServiceContract) =>
+	ChatController.build(service, workspaceEvents);

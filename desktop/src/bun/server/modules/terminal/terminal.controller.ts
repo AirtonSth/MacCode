@@ -1,6 +1,8 @@
 import { Elysia, t } from "elysia";
 
 import { withRestAuth } from "../../shared/auth/auth.service";
+import { readMutationRequestMetadata } from "../../shared/core/request-context";
+import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { TerminalService } from "./terminal.service";
 
 const DEFAULT_LIMIT = 200;
@@ -23,11 +25,14 @@ const normalizeLimit = (limit: unknown): number => {
 };
 
 export class TerminalController {
-	static build(service: TerminalService) {
-		return new TerminalController(service).build();
+	static build(service: TerminalService, workspaceEvents?: WorkspaceEventsServiceContract) {
+		return new TerminalController(service, workspaceEvents).build();
 	}
 
-	constructor(private readonly service: TerminalService) {}
+	constructor(
+		private readonly service: TerminalService,
+		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+	) {}
 
 	build() {
 		return new Elysia({ name: "terminal-controller" })
@@ -59,7 +64,7 @@ export class TerminalController {
 			)
 			.post(
 				"/chats/:id/terminal/exec",
-				async ({ body, params: parameters, set }) => {
+				async ({ body, params: parameters, request, set }) => {
 					const normalizedCommand = body.command.trim();
 					if (!normalizedCommand) {
 						set.status = 400;
@@ -87,6 +92,39 @@ export class TerminalController {
 						return { error: "terminal command not available" };
 					}
 
+					const metadata = readMutationRequestMetadata(request);
+					this.workspaceEvents?.append({
+						type: "terminal_command_started",
+						payload: {
+							command: {
+								...result.command,
+								status: "running",
+							},
+						},
+						originClientId: metadata.clientId,
+						requestId: metadata.requestId,
+					});
+
+					for (const entry of result.entries) {
+						this.workspaceEvents?.append({
+							type: "terminal_entry_appended",
+							payload: {
+								entry,
+							},
+							originClientId: metadata.clientId,
+							requestId: metadata.requestId,
+						});
+					}
+
+					this.workspaceEvents?.append({
+						type: "terminal_command_finished",
+						payload: {
+							command: result.command,
+						},
+						originClientId: metadata.clientId,
+						requestId: metadata.requestId,
+					});
+
 					return {
 						command: result.command,
 						entries: result.entries,
@@ -102,4 +140,7 @@ export class TerminalController {
 	}
 }
 
-export const createTerminalController = (service: TerminalService) => TerminalController.build(service);
+export const createTerminalController = (
+	service: TerminalService,
+	workspaceEvents?: WorkspaceEventsServiceContract,
+) => TerminalController.build(service, workspaceEvents);

@@ -18,18 +18,28 @@ export interface ClientJoinEvent {
 	event: "join_chat";
 }
 
+export interface ClientJoinWorkspaceEvent {
+	data: {
+		clientId?: string;
+		lastSeq?: number;
+	};
+	event: "join_workspace";
+}
+
 export interface ClientMessageEvent {
 	data: {
 		chatId: string;
+		clientId?: string;
 		model?: string;
-		text: string;
 		permissionMode?: CodexPermissionMode;
+		requestId?: string;
 		reasoningEffort?: CodexReasoningEffort;
+		text: string;
 	};
 	event: "user_message";
 }
 
-export type ClientWsEvent = ClientJoinEvent | ClientMessageEvent;
+export type ClientWsEvent = ClientJoinEvent | ClientJoinWorkspaceEvent | ClientMessageEvent;
 
 export interface AssistantDeltaEvent {
 	data: {
@@ -74,7 +84,27 @@ export interface ErrorEvent {
 	event: "error";
 }
 
-export type ServerWsEvent = AssistantDeltaEvent | AssistantEvent | AssistantDoneEvent | ChatUpdatedEvent | ErrorEvent;
+export interface WorkspaceEventEnvelope {
+	seq: number;
+	ts: string;
+	type: string;
+	payload: unknown;
+	originClientId: string | null;
+	requestId: string | null;
+}
+
+export interface WorkspaceEvent {
+	data: WorkspaceEventEnvelope;
+	event: "workspace_event";
+}
+
+export type ServerWsEvent =
+	| AssistantDeltaEvent
+	| AssistantEvent
+	| AssistantDoneEvent
+	| ChatUpdatedEvent
+	| WorkspaceEvent
+	| ErrorEvent;
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null;
@@ -298,6 +328,28 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 		};
 	}
 
+	if (
+		event === "workspace_event" &&
+		isNumber(data.seq) &&
+		isString(data.ts) &&
+		isString(data.type) &&
+		("payload" in data) &&
+		(isString(data.originClientId) || data.originClientId === null || data.originClientId === undefined) &&
+		(isString(data.requestId) || data.requestId === null || data.requestId === undefined)
+	) {
+		return {
+			data: {
+				seq: data.seq,
+				ts: data.ts,
+				type: data.type,
+				payload: data.payload ?? null,
+				originClientId: isString(data.originClientId) ? data.originClientId : null,
+				requestId: isString(data.requestId) ? data.requestId : null,
+			},
+			event: "workspace_event",
+		};
+	}
+
 	return null;
 };
 
@@ -513,20 +565,34 @@ export const RemoteCodeRealtime = {
 				send({ data: { chatId }, event: "join_chat" });
 			},
 
+			sendJoinWorkspace(lastSeq = 0, clientId?: string) {
+				send({
+					data: {
+						lastSeq,
+						...(clientId ? { clientId } : {}),
+					},
+					event: "join_workspace",
+				});
+			},
+
 			sendUserMessage(
 				chatId: string,
 				text: string,
 				permissionMode?: CodexPermissionMode,
 				model?: string,
 				reasoningEffort?: CodexReasoningEffort,
+				clientId?: string,
+				requestId?: string,
 			) {
 				send({
 					data: {
 						chatId,
+						...(clientId ? { clientId } : {}),
 						...(model ? { model } : {}),
-						text,
 						...(permissionMode ? { permissionMode } : {}),
+						...(requestId ? { requestId } : {}),
 						...(reasoningEffort ? { reasoningEffort } : {}),
+						text,
 					},
 					event: "user_message",
 				});

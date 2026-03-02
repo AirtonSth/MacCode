@@ -1,4 +1,4 @@
-const DEFAULT_PORT = 3001;
+const DEFAULT_PORT = 8835;
 const DEFAULT_TOKEN = "local-dev-token";
 
 export interface ServerConfigValues {

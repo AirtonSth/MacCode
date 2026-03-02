@@ -1,6 +1,8 @@
 import { Elysia, t } from "elysia";
 
 import { withRestAuth } from "../../shared/auth/auth.service";
+import { readMutationRequestMetadata } from "../../shared/core/request-context";
+import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { GitError } from "./git.model";
 import type { GitService } from "./git.service";
 
@@ -14,11 +16,14 @@ export class GitController {
 		);
 	}
 
-	static build(service: GitService) {
-		return new GitController(service).build();
+	static build(service: GitService, workspaceEvents?: WorkspaceEventsServiceContract) {
+		return new GitController(service, workspaceEvents).build();
 	}
 
-	constructor(private readonly service: GitService) {}
+	constructor(
+		private readonly service: GitService,
+		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+	) {}
 
 	private static errorStatusCode(error: GitError): number {
 		switch (error.type) {
@@ -70,11 +75,25 @@ export class GitController {
 			})
 			.post(
 				"/projects/:id/git/branches/checkout",
-				async ({ body, params: parameters, set }) => {
+				async ({ body, params: parameters, request, set }) => {
 					const result = await this.service.checkoutBranch(parameters.id, body);
 					if (GitController.isGitError(result)) {
 						set.status = GitController.errorStatusCode(result);
 						return { error: GitController.errorMessage(result) };
+					}
+
+					const status = await this.service.getStatus(parameters.id);
+					if (!GitController.isGitError(status)) {
+						const metadata = readMutationRequestMetadata(request);
+						this.workspaceEvents?.append({
+							type: "git_updated",
+							payload: {
+								projectId: parameters.id,
+								status,
+							},
+							originClientId: metadata.clientId,
+							requestId: metadata.requestId,
+						});
 					}
 
 					return {
@@ -90,13 +109,27 @@ export class GitController {
 			)
 			.post(
 				"/projects/:id/git/branches/create",
-				async ({ body, params: parameters, set }) => {
+				async ({ body, params: parameters, request, set }) => {
 					const result = await this.service.createBranch(parameters.id, {
 						name: body.name.trim(),
 					});
 					if (GitController.isGitError(result)) {
 						set.status = GitController.errorStatusCode(result);
 						return { error: GitController.errorMessage(result) };
+					}
+
+					const status = await this.service.getStatus(parameters.id);
+					if (!GitController.isGitError(status)) {
+						const metadata = readMutationRequestMetadata(request);
+						this.workspaceEvents?.append({
+							type: "git_updated",
+							payload: {
+								projectId: parameters.id,
+								status,
+							},
+							originClientId: metadata.clientId,
+							requestId: metadata.requestId,
+						});
 					}
 
 					return {
@@ -112,7 +145,7 @@ export class GitController {
 			)
 			.post(
 				"/projects/:id/git/commit",
-				async ({ body, params: parameters, set }) => {
+				async ({ body, params: parameters, request, set }) => {
 					const result = await this.service.commit(parameters.id, {
 						message: body.message ?? "",
 						includeUnstaged: body.includeUnstaged ?? false,
@@ -121,6 +154,21 @@ export class GitController {
 					if (GitController.isGitError(result)) {
 						set.status = GitController.errorStatusCode(result);
 						return { error: GitController.errorMessage(result) };
+					}
+
+					const status = await this.service.getStatus(parameters.id);
+					if (!GitController.isGitError(status)) {
+						const metadata = readMutationRequestMetadata(request);
+						this.workspaceEvents?.append({
+							type: "git_updated",
+							payload: {
+								projectId: parameters.id,
+								status,
+								commit: result,
+							},
+							originClientId: metadata.clientId,
+							requestId: metadata.requestId,
+						});
 					}
 
 					return { commit: result };
@@ -136,4 +184,5 @@ export class GitController {
 		}
 	}
 
-export const createGitController = (service: GitService) => GitController.build(service);
+export const createGitController = (service: GitService, workspaceEvents?: WorkspaceEventsServiceContract) =>
+	GitController.build(service, workspaceEvents);

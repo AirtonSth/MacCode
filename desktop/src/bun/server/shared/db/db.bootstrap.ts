@@ -40,6 +40,25 @@ const terminalEntriesCreateSql = `
 	)
 `;
 
+const workspaceEventsCreateSql = `
+	CREATE TABLE IF NOT EXISTS workspace_events (
+		seq INTEGER PRIMARY KEY AUTOINCREMENT,
+		type TEXT NOT NULL,
+		payload TEXT NOT NULL,
+		originClientId TEXT,
+		requestId TEXT,
+		createdAt TEXT NOT NULL
+	)
+`;
+
+const serverMetadataCreateSql = `
+	CREATE TABLE IF NOT EXISTS server_metadata (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL,
+		updatedAt TEXT NOT NULL
+	)
+`;
+
 export class DatabaseBootstrap {
 	static initialize(database: Database): void {
 		this.enableForeignKeys(database);
@@ -50,6 +69,8 @@ export class DatabaseBootstrap {
 		this.createWorkspaceSelectionTable(database);
 		this.createTerminalCommandsTable(database);
 		this.createOrMigrateTerminalEntriesTable(database);
+		this.createWorkspaceEventsTable(database);
+		this.createServerMetadataTable(database);
 		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
 	}
@@ -248,6 +269,14 @@ export class DatabaseBootstrap {
 		}
 	}
 
+	private static createWorkspaceEventsTable(database: Database): void {
+		database.exec(workspaceEventsCreateSql);
+	}
+
+	private static createServerMetadataTable(database: Database): void {
+		database.exec(serverMetadataCreateSql);
+	}
+
 	private static dropLegacyTerminalSessionsTable(database: Database): void {
 		if (!this.hasTable(database, "terminal_sessions")) {
 			return;
@@ -274,6 +303,9 @@ export class DatabaseBootstrap {
 		database.exec(
 			"CREATE INDEX IF NOT EXISTS idx_terminal_entries_command_id ON terminal_entries(commandId, id ASC)",
 		);
+		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_events_seq ON workspace_events(seq ASC)");
+		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_events_created_at ON workspace_events(createdAt ASC)");
+		database.exec("CREATE INDEX IF NOT EXISTS idx_server_metadata_updated_at ON server_metadata(updatedAt DESC)");
 	}
 }
 

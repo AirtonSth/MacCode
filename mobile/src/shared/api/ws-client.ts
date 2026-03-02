@@ -226,6 +226,28 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 		};
 	}
 
+	if (
+		event === "workspace_event" &&
+		isNumber(data.seq) &&
+		isString(data.ts) &&
+		isString(data.type) &&
+		("payload" in data) &&
+		(isString(data.originClientId) || data.originClientId === null || data.originClientId === undefined) &&
+		(isString(data.requestId) || data.requestId === null || data.requestId === undefined)
+	) {
+		return {
+			data: {
+				seq: data.seq,
+				ts: data.ts,
+				type: data.type,
+				payload: data.payload ?? null,
+				originClientId: isString(data.originClientId) ? data.originClientId : null,
+				requestId: isString(data.requestId) ? data.requestId : null,
+			},
+			event: "workspace_event",
+		};
+	}
+
 	return null;
 };
 
@@ -443,18 +465,35 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				event: "join_chat",
 			});
 		},
+		sendJoinWorkspace: (lastSeq = 0, clientId?: string) => {
+			send({
+				data: {
+					lastSeq,
+					...(clientId ? { clientId } : {}),
+				},
+				event: "join_workspace",
+			});
+		},
 		sendUserMessage: (
 			chatId: string,
 			text: string,
-			options?: { model?: string; permissionMode?: string; reasoningEffort?: string },
+			options?: {
+				clientId?: string;
+				model?: string;
+				permissionMode?: string;
+				reasoningEffort?: string;
+				requestId?: string;
+			},
 		) => {
 			send({
 				data: {
 					chatId,
 					text,
+					...(options?.clientId ? { clientId: options.clientId } : {}),
 					...(options?.model ? { model: options.model } : {}),
 					...(options?.permissionMode ? { permissionMode: options.permissionMode } : {}),
 					...(options?.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+					...(options?.requestId ? { requestId: options.requestId } : {}),
 				},
 				event: "user_message",
 			});

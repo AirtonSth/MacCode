@@ -2,6 +2,7 @@ import { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "ele
 
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
+import { startMdnsBroadcast } from "./network/mdns";
 
 let mainWindowRef: BrowserWindow | null = null;
 
@@ -94,6 +95,15 @@ const waitForBackendReady = async () => {
 	throw new Error(`Backend readiness timeout: ${serverConfig.port}`);
 };
 
+interface DiscoveryMetadata {
+	authMode: string;
+	capabilitiesVersion: string;
+	hostname: string;
+	port: number;
+	serverId: string;
+	version: string;
+}
+
 const installMacShortcutsMenu = () => {
 	ApplicationMenu.setApplicationMenu([
 		{
@@ -134,6 +144,30 @@ async function getMainViewUrl() {
 
 await createBackendServer({ port: serverConfig.port });
 await waitForBackendReady();
+
+let stopMdns = () => {
+	// no-op
+};
+try {
+	const discoveryResponse = await fetch(`http://127.0.0.1:${serverConfig.port}/v1/discovery`, {
+		method: "GET",
+	});
+	if (discoveryResponse.ok) {
+		const discoveryMetadata = (await discoveryResponse.json()) as DiscoveryMetadata;
+		stopMdns = await startMdnsBroadcast({
+			capabilitiesVersion: discoveryMetadata.capabilitiesVersion,
+			port: discoveryMetadata.port,
+			serverId: discoveryMetadata.serverId,
+			version: discoveryMetadata.version,
+		});
+	}
+} catch {
+	// mDNS remains optional; keep app startup resilient
+}
+
+process.on("exit", () => {
+	stopMdns();
+});
 
 installMacShortcutsMenu();
 

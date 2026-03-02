@@ -5,6 +5,8 @@ import { resolveWsToken } from "../../shared/auth/auth.service";
 import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
 import type { ClientWsEvent, ServerWsEvent } from "../../types";
+import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
+import type { WorkspaceEventEnvelope } from "../workspace-events/workspace-events.model";
 import type { WsService } from "./ws.model";
 
 interface BroadcastSocket extends WsLike {
@@ -18,8 +20,8 @@ interface WsLike {
 }
 
 export class WsController {
-	static build(service: WsService) {
-		return new WsController(service).build();
+	static build(service: WsService, workspaceEvents?: WorkspaceEventsServiceContract) {
+		return new WsController(service, workspaceEvents).build();
 	}
 
 	private static parseEventPayload(message: unknown): ClientWsEvent | null {
@@ -78,8 +80,19 @@ export class WsController {
 	}
 
 	private readonly subscriptions = new Map<string, Set<BroadcastSocket>>();
+	private readonly workspaceSubscriptions = new Set<BroadcastSocket>();
 
-	constructor(private readonly service: WsService) {}
+	constructor(
+		private readonly service: WsService,
+		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+	) {
+		this.workspaceEvents?.subscribe((event: WorkspaceEventEnvelope) => {
+			this.broadcastWorkspaceEvent({
+				data: event,
+				event: "workspace_event",
+			});
+		});
+	}
 
 	private joinChat(chatId: string, socket: BroadcastSocket) {
 		const previous = this.subscriptions.get(chatId);
@@ -107,6 +120,8 @@ export class WsController {
 				this.subscriptions.delete(chatId);
 			}
 		}
+
+		this.workspaceSubscriptions.delete(socket);
 	}
 
 	private broadcastToChat(chatId: string, event: ServerWsEvent) {
@@ -124,12 +139,26 @@ export class WsController {
 		}
 	}
 
-	private sendValidationError(socket: BroadcastSocket, chatId: string, message: string) {
+	private joinWorkspace(socket: BroadcastSocket) {
+		this.workspaceSubscriptions.add(socket);
+	}
+
+	private broadcastWorkspaceEvent(event: ServerWsEvent & { event: "workspace_event" }) {
+		for (const socket of this.workspaceSubscriptions) {
+			try {
+				socket.send(event);
+			} catch {
+				// keep resilient and continue
+			}
+		}
+	}
+
+	private sendValidationError(socket: BroadcastSocket, chatId: string | undefined, message: string) {
 		socket.send({
 			data: {
-				chatId,
 				code: "validation_error",
 				message: `validation error: ${message}`,
+				...(chatId ? { chatId } : {}),
 			},
 			event: "error",
 		});
@@ -153,7 +182,7 @@ export class WsController {
 				void (async () => {
 					const payload = WsController.parseEventPayload(message as unknown);
 
-					if (!payload?.data.chatId) {
+					if (!payload?.event || !payload.data) {
 						(ws as BroadcastSocket).send({
 							data: {
 								code: "validation_error",
@@ -164,10 +193,19 @@ export class WsController {
 						return;
 					}
 
-					const chatId = payload.data.chatId;
-					const emit = this.createChatEmitter(chatId);
-
 					if (payload.event === "join_chat") {
+						const chatId = payload.data.chatId;
+						if (!chatId) {
+							(ws as BroadcastSocket).send({
+								data: {
+									code: "validation_error",
+									message: "validation error: chatId is required",
+								},
+								event: "error",
+							});
+							return;
+						}
+
 						const chat = await this.service.getChatById(chatId);
 
 						if (!chat) {
@@ -186,7 +224,40 @@ export class WsController {
 						return;
 					}
 
+					if (payload.event === "join_workspace") {
+						this.joinWorkspace(ws as BroadcastSocket);
+
+						const rawLastSeq = (payload.data as { lastSeq?: unknown }).lastSeq;
+						const lastSeq =
+							typeof rawLastSeq === "number" && Number.isFinite(rawLastSeq) && rawLastSeq > 0
+								? Math.floor(rawLastSeq)
+								: 0;
+						const replayEvents = this.service.listWorkspaceEventsAfter(lastSeq, { limit: 2_000 });
+
+						for (const event of replayEvents) {
+							(ws as BroadcastSocket).send({
+								data: event,
+								event: "workspace_event",
+							});
+						}
+
+						return;
+					}
+
 					if (payload.event === "user_message") {
+						const chatId = payload.data.chatId;
+						if (!chatId) {
+							(ws as BroadcastSocket).send({
+								data: {
+									code: "validation_error",
+									message: "validation error: chatId is required",
+								},
+								event: "error",
+							});
+							return;
+						}
+
+						const emit = this.createChatEmitter(chatId);
 						const text = typeof payload.data.text === "string" ? payload.data.text.trim() : "";
 						if (!text) {
 							(ws as BroadcastSocket).send({
@@ -245,16 +316,25 @@ export class WsController {
 						this.joinChat(chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
 							chatId,
+							clientId: typeof payload.data.clientId === "string" ? payload.data.clientId.trim() || undefined : undefined,
 							emit,
 							model: model ?? undefined,
 							permissionMode: permissionMode ?? undefined,
+							requestId:
+								typeof payload.data.requestId === "string"
+									? payload.data.requestId.trim() || undefined
+									: undefined,
 							reasoningEffort: reasoningEffort ?? undefined,
 							text,
 						});
 						return;
 					}
 
-					this.sendValidationError(ws as BroadcastSocket, chatId, "unsupported event");
+					this.sendValidationError(
+						ws as BroadcastSocket,
+						undefined,
+						"unsupported event",
+					);
 				})();
 			},
 
@@ -268,4 +348,5 @@ export class WsController {
 	}
 }
 
-export const createWsController = (service: WsService) => WsController.build(service);
+export const createWsController = (service: WsService, workspaceEvents?: WorkspaceEventsServiceContract) =>
+	WsController.build(service, workspaceEvents);

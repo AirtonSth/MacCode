@@ -38,6 +38,38 @@ export interface WorkspaceSelection {
 	selectedChatId: string | null;
 }
 
+export interface DiscoveryInfoDTO {
+	serverId: string;
+	hostname: string;
+	port: number;
+	version: string;
+	authMode: "token_lan";
+	capabilitiesVersion: string;
+}
+
+export interface AuthVerifyResponseDTO {
+	ok: boolean;
+	server: DiscoveryInfoDTO;
+}
+
+export interface FsRootEntryDTO {
+	id: string;
+	label: string;
+	path: string;
+}
+
+export interface FsEntryDTO {
+	name: string;
+	path: string;
+	type: "directory" | "file";
+}
+
+export interface FsListResponseDTO {
+	path: string;
+	parentPath: string | null;
+	entries: FsEntryDTO[];
+}
+
 export interface TerminalCommandDTO {
 	id: string;
 	chatId: string;
@@ -172,6 +204,10 @@ interface RestDeleteResponse {
 	deleted: boolean;
 }
 
+interface RestFsRootsResponse {
+	roots: FsRootEntryDTO[];
+}
+
 interface RestTerminalHistoryResponse {
 	commands: TerminalCommandDTO[];
 	entries: TerminalEntryDTO[];
@@ -210,8 +246,34 @@ const parsePath = (path: string): string => (path.startsWith("/") ? path : `/${p
 
 const cleanBaseUrl = (rawUrl: string): string => {
 	const withoutTrailingSlash = rawUrl.replace(/\/+$/, "");
-	return withoutTrailingSlash || "http://127.0.0.1:3001";
+	return withoutTrailingSlash || "http://127.0.0.1:8835";
 };
+
+const CLIENT_ID_STORAGE_KEY = "remotecode:http-client-id";
+
+const resolveHttpClientId = (): string => {
+	if (typeof window === "undefined") {
+		return `desktop-http-${Date.now()}`;
+	}
+
+	try {
+		const stored = window.localStorage.getItem(CLIENT_ID_STORAGE_KEY)?.trim();
+		if (stored) {
+			return stored;
+		}
+
+		const created = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+			? crypto.randomUUID()
+			: `desktop-http-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+		window.localStorage.setItem(CLIENT_ID_STORAGE_KEY, created);
+		return created;
+	} catch {
+		return `desktop-http-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+	}
+};
+
+const isMutatingMethod = (method: RequestInput["method"]): boolean =>
+	method === "POST" || method === "PATCH" || method === "DELETE";
 
 const readBody = async (response: Response): Promise<unknown> => {
 	try {
@@ -242,17 +304,26 @@ const createRequestError = async (response: Response): Promise<RemoteCodeApiErro
 export const RemoteCodeApi = {
 	createClient(config?: Partial<ApiConfig>) {
 		const baseUrl = cleanBaseUrl(
-			config?.baseUrl?.trim() || (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:3001").trim(),
+			config?.baseUrl?.trim() || (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim(),
 		);
 		const token = config?.token?.trim() || (import.meta.env.VITE_REMOTECODE_LOCAL_TOKEN || "local-dev-token").trim();
+		const clientId = resolveHttpClientId();
 
 		const request = async <T>(input: RequestInput): Promise<T> => {
 			const url = `${baseUrl}/v1${parsePath(input.path)}`;
+			const requestId = isMutatingMethod(input.method)
+				? (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+						? crypto.randomUUID()
+						: `req-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`)
+				: null;
+
 			const response = await fetch(url, {
 				body: input.body === undefined ? undefined : JSON.stringify(input.body),
 				headers: {
 					authorization: `Bearer ${token}`,
 					"content-type": "application/json",
+					"x-remotecode-client-id": clientId,
+					...(requestId ? { "x-remotecode-request-id": requestId } : {}),
 				},
 				method: input.method,
 			});
@@ -347,6 +418,38 @@ export const RemoteCodeApi = {
 				});
 
 				return payload;
+			},
+
+			getDiscoveryInfo: async (): Promise<DiscoveryInfoDTO> => {
+				return await request<DiscoveryInfoDTO>({
+					method: "GET",
+					path: "/discovery",
+				});
+			},
+
+			verifyToken: async (tokenInput: string): Promise<AuthVerifyResponseDTO> => {
+				return await request<AuthVerifyResponseDTO>({
+					body: { token: tokenInput.trim() },
+					method: "POST",
+					path: "/auth/verify",
+				});
+			},
+
+			listFsRoots: async (): Promise<FsRootEntryDTO[]> => {
+				const payload = await request<RestFsRootsResponse>({
+					method: "GET",
+					path: "/fs/roots",
+				});
+
+				return payload.roots;
+			},
+
+			listFsEntries: async (path: string): Promise<FsListResponseDTO> => {
+				const encodedPath = encodeURIComponent(path);
+				return await request<FsListResponseDTO>({
+					method: "GET",
+					path: `/fs/list?path=${encodedPath}`,
+				});
 			},
 
 			deleteProject: async (id: string): Promise<RestDeleteResponse> => {

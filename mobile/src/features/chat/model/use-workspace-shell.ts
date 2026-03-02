@@ -1,18 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { useChatsQuery } from "@/features/chat/api/use-chats-query";
-import { useCreateChatMutation } from "@/features/chat/api/use-create-chat-mutation";
-import { useDeleteChatMutation } from "@/features/chat/api/use-delete-chat-mutation";
-import { useMessagesQuery } from "@/features/chat/api/use-messages-query";
-import { useUpdateWorkspaceSelectionMutation } from "@/features/settings/api/use-update-workspace-selection-mutation";
-import { useWorkspaceSelectionQuery } from "@/features/settings/api/use-workspace-selection-query";
-import { useProjectsQuery } from "@/features/threads/api/use-projects-query";
-import { useToggleFavoriteMutation } from "@/features/threads/api/use-toggle-favorite-mutation";
-import { useApiConfig } from "@/shared/api/api-config-provider";
-import { queryKeys } from "@/shared/api/query-keys";
-import type { ChatDTO, MessageDTO, ProjectDTO, ServerWsEvent } from "@/shared/api/types";
-import { createRealtimeClient, type ConnectionState } from "@/shared/api/ws-client";
+import { useChatsQuery } from "../api/use-chats-query";
+import { useCreateChatMutation } from "../api/use-create-chat-mutation";
+import { useDeleteChatMutation } from "../api/use-delete-chat-mutation";
+import { useMessagesQuery } from "../api/use-messages-query";
+import { useUpdateWorkspaceSelectionMutation } from "../../settings/api/use-update-workspace-selection-mutation";
+import { useWorkspaceSelectionQuery } from "../../settings/api/use-workspace-selection-query";
+import { useProjectsQuery } from "../../threads/api/use-projects-query";
+import { useToggleFavoriteMutation } from "../../threads/api/use-toggle-favorite-mutation";
+import { useApiConfig } from "../../../shared/api/api-config-provider";
+import { queryKeys } from "../../../shared/api/query-keys";
+import { createRealtimeClient, type ConnectionState } from "../../../shared/api/ws-client";
+import type { ChatDTO, MessageDTO, ProjectDTO, ServerWsEvent } from "../../../shared/api/types";
+import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 
 const appendAssistantMessage = (
 	messages: MessageDTO[],
@@ -56,6 +57,9 @@ const upsertUpdatedChat = (chats: ChatDTO[], update: ServerWsEvent & { event: "c
 	);
 };
 
+const toRequestId = (): string =>
+	`req-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+
 export const useWorkspaceShell = () => {
 	const queryClient = useQueryClient();
 	const { config } = useApiConfig();
@@ -66,14 +70,37 @@ export const useWorkspaceShell = () => {
 	const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
 	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 	const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
+	const [permissionMode, setPermissionMode] = useState<string>("default");
+	const [selectedModel, setSelectedModel] = useState<string | null>(null);
+	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(null);
 	const realtimeRef = useRef<ReturnType<typeof createRealtimeClient> | null>(null);
+	const lastWorkspaceSeqRef = useRef<number>(0);
+	const clientIdRef = useRef<string>(`mobile-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`);
 	const hasBootstrappedSelectionRef = useRef<boolean>(false);
+	const client = useRemoteCodeClient();
 	const projectsQuery = useProjectsQuery();
 	const chatsQuery = useChatsQuery(selectedProjectId);
 	const messagesQuery = useMessagesQuery(selectedChatId);
 	const selectionQuery = useWorkspaceSelectionQuery();
 	const toggleFavoriteMutation = useToggleFavoriteMutation();
 	const deleteChatMutation = useDeleteChatMutation(selectedProjectId);
+	const modelsQuery = useQuery({
+		queryKey: ["codex-models"],
+		queryFn: async () => await client.listCodexModels(),
+		staleTime: 5 * 60_000,
+	});
+
+	useEffect(() => {
+		const models = modelsQuery.data?.models ?? [];
+		if (models.length === 0) {
+			return;
+		}
+
+		const defaultModel = models.find((item) => item.isDefault)?.model ?? models[0]?.model ?? null;
+		if (defaultModel && !selectedModel) {
+			setSelectedModel(defaultModel);
+		}
+	}, [modelsQuery.data?.models, selectedModel]);
 
 	useQuery({
 		gcTime: Number.POSITIVE_INFINITY,
@@ -185,9 +212,42 @@ export const useWorkspaceShell = () => {
 			if (event.event === "error") {
 				setLastError(event.data.message);
 				setIsSending(false);
+				return;
 			}
-		},
-		[queryClient, selectedProjectId],
+
+				if (event.event === "workspace_event") {
+					lastWorkspaceSeqRef.current = Math.max(lastWorkspaceSeqRef.current, event.data.seq);
+					switch (event.data.type) {
+						case "chat_created":
+						case "chat_deleted":
+						case "chat_updated": {
+							void queryClient.invalidateQueries({ queryKey: queryKeys.chats(selectedProjectId) });
+							break;
+						}
+						case "message_created":
+						case "terminal_command_finished":
+						case "terminal_command_started":
+						case "terminal_entry_appended": {
+							void queryClient.invalidateQueries({ queryKey: queryKeys.messages(selectedChatId) });
+							break;
+						}
+						case "project_created":
+						case "project_deleted":
+						case "project_updated": {
+							void queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+							break;
+						}
+						case "selection_updated": {
+							void queryClient.invalidateQueries({ queryKey: queryKeys.selection });
+							break;
+						}
+						default: {
+							break;
+						}
+					}
+				}
+			},
+		[queryClient, selectedChatId, selectedProjectId],
 	);
 
 	useEffect(() => {
@@ -214,6 +274,14 @@ export const useWorkspaceShell = () => {
 
 		realtimeRef.current.sendJoinChat(selectedChatId);
 	}, [selectedChatId]);
+
+	useEffect(() => {
+		if (!realtimeRef.current) {
+			return;
+		}
+
+		realtimeRef.current.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
+	}, [config.baseUrl, config.token]);
 
 	const selectProject = useCallback(
 		(project: ProjectDTO) => {
@@ -293,6 +361,40 @@ export const useWorkspaceShell = () => {
 		[createChatMutation, selectedProjectId, updateSelectionMutation],
 	);
 
+	const createProject = useCallback(
+		async (input: { name?: string; path: string }) => {
+			const project = await client.createProject(input);
+			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+
+			setSelectedProjectId(project.id);
+			setSelectedChatId(null);
+			updateSelectionMutation.mutate({
+				selectedChatId: null,
+				selectedProjectId: project.id,
+			});
+
+			return project;
+		},
+		[client, queryClient, updateSelectionMutation],
+	);
+
+	const deleteProject = useCallback(
+		async (projectId: string) => {
+			await client.deleteProject(projectId);
+			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+
+			if (selectedProjectId === projectId) {
+				setSelectedProjectId(null);
+				setSelectedChatId(null);
+				updateSelectionMutation.mutate({
+					selectedChatId: null,
+					selectedProjectId: null,
+				});
+			}
+		},
+		[client, queryClient, selectedProjectId, updateSelectionMutation],
+	);
+
 	const sendMessage = useMutation({
 		mutationFn: async (rawText: string) => {
 			const text = rawText.trim();
@@ -329,8 +431,14 @@ export const useWorkspaceShell = () => {
 			setLastError(null);
 			setIsSending(true);
 
-			realtimeRef.current?.sendJoinChat(activeChatId);
-			realtimeRef.current?.sendUserMessage(activeChatId, text);
+				realtimeRef.current?.sendJoinChat(activeChatId);
+				realtimeRef.current?.sendUserMessage(activeChatId, text, {
+					clientId: clientIdRef.current,
+					model: selectedModel ?? undefined,
+					permissionMode,
+					reasoningEffort: selectedReasoningEffort ?? undefined,
+					requestId: toRequestId(),
+				});
 
 			return true;
 		},
@@ -351,17 +459,26 @@ export const useWorkspaceShell = () => {
 	);
 
 	return {
+		availableModels: modelsQuery.data?.models ?? [],
 		chats: chatsQuery.data ?? [],
 		connectionState,
 		createChat,
+		createProject,
+		deleteProject,
 		deleteChat,
 		isLoaded: !projectsQuery.isLoading && selectionQuery.isFetched,
 		isSending,
 		lastError,
 		messages: messagesQuery.data ?? [],
+		permissionMode,
 		projects: projectsQuery.data ?? [],
+		selectedModel,
+		selectedReasoningEffort,
 		selectChat,
 		selectProject,
+		setPermissionMode,
+		setSelectedModel,
+		setSelectedReasoningEffort,
 		selectedChat,
 		selectedChatId,
 		selectedProject,

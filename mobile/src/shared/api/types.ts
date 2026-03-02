@@ -33,6 +33,106 @@ export interface WorkspaceSelectionDTO {
 	selectedChatId: string | null;
 }
 
+export interface DiscoveryInfoDTO {
+	serverId: string;
+	hostname: string;
+	port: number;
+	version: string;
+	authMode: "token_lan";
+	capabilitiesVersion: string;
+}
+
+export interface AuthVerifyResponseDTO {
+	ok: boolean;
+	server: DiscoveryInfoDTO;
+}
+
+export interface FsRootEntryDTO {
+	id: string;
+	label: string;
+	path: string;
+}
+
+export interface FsEntryDTO {
+	name: string;
+	path: string;
+	type: "directory" | "file";
+}
+
+export interface FsListResponseDTO {
+	path: string;
+	parentPath: string | null;
+	entries: FsEntryDTO[];
+}
+
+export interface CodexModelReasoningEffortDTO {
+	reasoningEffort: string;
+}
+
+export interface CodexModelDescriptorDTO {
+	id: string;
+	model: string;
+	displayName: string;
+	isDefault: boolean;
+	defaultReasoningEffort: string;
+	supportedReasoningEfforts: CodexModelReasoningEffortDTO[];
+}
+
+export interface CodexModelsCatalogDTO {
+	models: CodexModelDescriptorDTO[];
+	nextCursor: string | null;
+}
+
+export interface GitStatusDTO {
+	isRepo: boolean;
+	currentBranch: string | null;
+	ahead: number;
+	behind: number;
+	changedFiles: number;
+	stagedFiles: number;
+	unstagedFiles: number;
+	untrackedFiles: number;
+	conflictedFiles: number;
+	isDetachedHead: boolean;
+	added: number;
+	removed: number;
+}
+
+export interface GitBranchListDTO {
+	currentBranch: string | null;
+	branches: string[];
+}
+
+export interface GitCommitResultDTO {
+	branch: string | null;
+	commitHash: string | null;
+	commitMessage: string;
+	pushed: boolean;
+	pushedWithUpstream: boolean;
+}
+
+export interface TerminalCommandDTO {
+	id: string;
+	chatId: string;
+	command: string;
+	cwd: string;
+	shell: string;
+	status: "running" | "completed" | "failed" | "timeout";
+	exitCode: number | null;
+	durationMs: number | null;
+	startedAt: string;
+	finishedAt: string | null;
+}
+
+export interface TerminalEntryDTO {
+	id: number;
+	commandId: string;
+	chatId: string;
+	stream: "stdout" | "stderr";
+	data: string;
+	createdAt: string;
+}
+
 export interface AssistantDeltaEvent {
 	data: {
 		chatId: string;
@@ -67,6 +167,20 @@ export interface ChatUpdatedEvent {
 	event: "chat_updated";
 }
 
+export interface WorkspaceEventEnvelope {
+	seq: number;
+	ts: string;
+	type: string;
+	payload: unknown;
+	originClientId: string | null;
+	requestId: string | null;
+}
+
+export interface WorkspaceEvent {
+	data: WorkspaceEventEnvelope;
+	event: "workspace_event";
+}
+
 export interface WsErrorEvent {
 	data: {
 		chatId?: string;
@@ -81,6 +195,7 @@ export type ServerWsEvent =
 	| AssistantDoneEvent
 	| AssistantEvent
 	| ChatUpdatedEvent
+	| WorkspaceEvent
 	| WsErrorEvent;
 
 export interface ClientJoinEvent {
@@ -93,15 +208,25 @@ export interface ClientJoinEvent {
 export interface ClientMessageEvent {
 	data: {
 		chatId: string;
+		clientId?: string;
 		text: string;
 		model?: string;
 		permissionMode?: string;
+		requestId?: string;
 		reasoningEffort?: string;
 	};
 	event: "user_message";
 }
 
-export type ClientWsEvent = ClientJoinEvent | ClientMessageEvent;
+export interface ClientJoinWorkspaceEvent {
+	data: {
+		clientId?: string;
+		lastSeq?: number;
+	};
+	event: "join_workspace";
+}
+
+export type ClientWsEvent = ClientJoinEvent | ClientJoinWorkspaceEvent | ClientMessageEvent;
 
 export type AssistantStreamItemType = "reasoning" | "tool" | "plan" | "assistant_message";
 export type AssistantStreamItemState = "running" | "preview" | "collapsed" | "completed" | "failed" | "cancelled";

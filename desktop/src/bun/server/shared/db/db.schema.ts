@@ -71,6 +71,21 @@ export const terminalEntries = sqliteTable("terminal_entries", {
 	createdAt: text("createdAt").notNull(),
 });
 
+export const workspaceEvents = sqliteTable("workspace_events", {
+	seq: integer("seq").primaryKey({ autoIncrement: true }),
+	type: text("type").notNull(),
+	payload: text("payload").notNull(),
+	originClientId: text("originClientId"),
+	requestId: text("requestId"),
+	createdAt: text("createdAt").notNull(),
+});
+
+export const serverMetadata = sqliteTable("server_metadata", {
+	key: text("key").primaryKey(),
+	value: text("value").notNull(),
+	updatedAt: text("updatedAt").notNull(),
+});
+
 export type ChatRow = typeof chats.$inferSelect;
 
 export type MessageRow = typeof messages.$inferSelect;
@@ -78,6 +93,8 @@ export type ProjectRow = typeof projects.$inferSelect;
 export type WorkspaceSelectionRow = typeof workspaceSelection.$inferSelect;
 export type TerminalCommandRow = typeof terminalCommands.$inferSelect;
 export type TerminalEntryRow = typeof terminalEntries.$inferSelect;
+export type WorkspaceEventRow = typeof workspaceEvents.$inferSelect;
+export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
 
 export class DatabaseSchema {
 	static readonly projects = projects;
@@ -91,4 +108,8 @@ export class DatabaseSchema {
 	static readonly terminalCommands = terminalCommands;
 
 	static readonly terminalEntries = terminalEntries;
+
+	static readonly workspaceEvents = workspaceEvents;
+
+	static readonly serverMetadata = serverMetadata;
 }
