@@ -1,5 +1,5 @@
-import { serverConfig } from "../../config";
 import { getServerDiscoveryInfo, getServerId } from "../../shared/core/server-identity";
+import { isValidToken } from "../../shared/auth/auth.service";
 import type { ServerMetadataRepository } from "./server-metadata.repository";
 
 export interface DiscoveryMetadata {
@@ -44,8 +44,7 @@ export class ServerMetadataService implements ServerMetadataServiceContract {
 	}
 
 	verifyToken(token: string | null | undefined): boolean {
-		const normalized = token?.trim();
-		return Boolean(normalized && normalized === serverConfig.token);
+		return isValidToken(token);
 	}
 
 	getDiscoveryMetadata(): DiscoveryMetadata {

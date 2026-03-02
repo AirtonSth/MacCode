@@ -1,7 +1,6 @@
 import { Elysia, t } from "elysia";
 
-import { serverConfig } from "../../config";
-import { resolveWsToken } from "../../shared/auth/auth.service";
+import { isValidToken, resolveWsToken } from "../../shared/auth/auth.service";
 import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
 import type { ClientWsEvent, ServerWsEvent } from "../../types";
@@ -340,7 +339,7 @@ export class WsController {
 
 			open: (ws) => {
 				const token = resolveWsToken(ws.data.request);
-				if (!token || token !== serverConfig.token) {
+				if (!isValidToken(token)) {
 					ws.close(4401, "unauthorized");
 				}
 			},

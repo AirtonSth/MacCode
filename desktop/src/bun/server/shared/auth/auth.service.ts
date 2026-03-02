@@ -2,6 +2,9 @@ import { Elysia } from "elysia";
 
 import { serverConfig } from "../../config";
 
+const DEFAULT_SERVER_TOKEN = "remotecode.io-token";
+const LEGACY_LOCAL_TOKEN = "local-dev-token";
+
 const setCorsHeaders = (request: Request, headers: Record<string, string | number>) => {
 	const origin = request.headers.get("origin");
 
@@ -12,13 +15,25 @@ const setCorsHeaders = (request: Request, headers: Record<string, string | numbe
 	headers["access-control-max-age"] = "86400";
 };
 
+const isTokenAuthorized = (token: string | null | undefined): boolean => {
+	const normalized = token?.trim();
+	if (!normalized) {
+		return false;
+	}
+
+	const isPrimary = normalized === serverConfig.token;
+	const isLegacyFallback = normalized === LEGACY_LOCAL_TOKEN && serverConfig.token === DEFAULT_SERVER_TOKEN;
+
+	return isPrimary || isLegacyFallback;
+};
+
 export const AuthService = {
 	isAuthorized(request: Request): boolean {
 		const token = AuthService.isWebSocketRoute(request)
 			? AuthService.resolveWsToken(request)
 			: AuthService.readHeaderToken(request);
 
-		return Boolean(token && token === serverConfig.token);
+		return isTokenAuthorized(token);
 	},
 
 	isWebSocketRoute(request: Request): boolean {
@@ -96,7 +111,7 @@ export const AuthService = {
 				? AuthService.resolveWsToken(request)
 				: AuthService.readHeaderToken(request);
 
-			if (!token || token !== serverConfig.token) {
+			if (!isTokenAuthorized(token)) {
 				set.status = 401;
 				set.headers["content-type"] = "application/json";
 
@@ -112,3 +127,4 @@ export const {isWebSocketRoute} = AuthService;
 export const {resolveWsToken} = AuthService;
 export const {isAuthorized} = AuthService;
 export const {withRestAuth} = AuthService;
+export const isValidToken = isTokenAuthorized;
