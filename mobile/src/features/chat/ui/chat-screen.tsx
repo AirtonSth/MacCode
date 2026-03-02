@@ -730,21 +730,34 @@ export const ChatScreen = () => {
 					{messages.map((message) => {
 						const isUser = message.role === "user";
 						return (
-							<View key={message.id} style={[styles.messageRow, isUser ? styles.messageRowUser : null]}>
-								<View style={[styles.messageBubble, isUser ? styles.userBubble : styles.assistantBubble]}>
-									<MessageMarkdown
-										content={message.content}
-										textColor={palette.text}
-										linkColor={palette.accent}
-									/>
-								</View>
+							<View
+								key={message.id}
+								style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAssistant]}
+							>
+								{isUser ? (
+									<View style={[styles.messageBubble, styles.userBubble]}>
+										<MessageMarkdown
+											content={message.content}
+											linkColor={palette.accent}
+											textColor={palette.text}
+										/>
+									</View>
+								) : (
+									<View style={styles.assistantMessageContent}>
+										<MessageMarkdown
+											content={message.content}
+											linkColor={palette.accent}
+											textColor={palette.text}
+										/>
+									</View>
+								)}
 							</View>
 						);
 					})}
 
 					{hasStreamingItems && streamingTurn ? (
-						<View style={styles.messageRow}>
-							<View style={[styles.messageBubble, styles.assistantBubble]}>
+						<View style={[styles.messageRow, styles.messageRowAssistant]}>
+							<View style={styles.assistantMessageContent}>
 								<StreamingTimeline
 									onSetItemExpanded={(itemId, expanded, byUser) => {
 										setStreamItemExpanded(itemId, expanded, byUser);
@@ -1126,8 +1139,8 @@ export const ChatScreen = () => {
 };
 
 const styles = StyleSheet.create({
-	assistantBubble: {
-		backgroundColor: palette.soft,
+	assistantMessageContent: {
+		width: "100%",
 	},
 	attachAction: {
 		alignItems: "center",
@@ -1413,6 +1426,10 @@ const styles = StyleSheet.create({
 	},
 	messageRow: {
 		flexDirection: "row",
+		justifyContent: "flex-start",
+		width: "100%",
+	},
+	messageRowAssistant: {
 		justifyContent: "flex-start",
 	},
 	messageRowUser: {
