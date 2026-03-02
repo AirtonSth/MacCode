@@ -12,36 +12,20 @@ import { useToggleFavoriteMutation } from "../../threads/api/use-toggle-favorite
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { queryKeys } from "../../../shared/api/query-keys";
 import { createRealtimeClient, type ConnectionState } from "../../../shared/api/ws-client";
-import type { ChatDTO, MessageDTO, ProjectDTO, ServerWsEvent } from "../../../shared/api/types";
+import type {
+	AssistantStreamItemState,
+	ChatDTO,
+	MessageDTO,
+	ProjectDTO,
+	ServerWsEvent,
+} from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
-
-const appendAssistantMessage = (
-	messages: MessageDTO[],
-	chatId: string,
-	content: string,
-): MessageDTO[] => {
-	const trimmed = content.trim();
-
-	if (trimmed.length === 0) {
-		return messages;
-	}
-
-	const lastMessage = messages[messages.length - 1];
-	if (lastMessage && lastMessage.role === "assistant" && lastMessage.content === trimmed) {
-		return messages;
-	}
-
-	return [
-		...messages,
-		{
-			chatId,
-			content: trimmed,
-			createdAt: new Date().toISOString(),
-			id: `assistant-${Date.now()}`,
-			role: "assistant",
-		},
-	];
-};
+import {
+	applyAssistantEventToTurn,
+	setStreamItemExpanded as updateStreamItemExpanded,
+	setStreamItemState as updateStreamItemState,
+	type StreamTurnState,
+} from "./stream-turn-state";
 
 const upsertUpdatedChat = (chats: ChatDTO[], update: ServerWsEvent & { event: "chat_updated" }): ChatDTO[] => {
 	return chats.map((chat) =>
@@ -55,6 +39,11 @@ const upsertUpdatedChat = (chats: ChatDTO[], update: ServerWsEvent & { event: "c
 			}
 			: chat,
 	);
+};
+
+const isPlaceholderThreadTitle = (title: string): boolean => {
+	const normalized = title.trim().toLowerCase();
+	return normalized === "new thread" || normalized === "new chat";
 };
 
 const toRequestId = (): string =>
@@ -105,19 +94,11 @@ export const useWorkspaceShell = () => {
 		}
 	}, [modelsQuery.data?.models, selectedModel]);
 
-	useQuery({
+	const streamTurnQuery = useQuery<StreamTurnState | null>({
 		gcTime: Number.POSITIVE_INFINITY,
-		initialData: [],
-		queryFn: async () => [],
-		queryKey: queryKeys.streamEvents(selectedChatId),
-		staleTime: Number.POSITIVE_INFINITY,
-	});
-
-	const streamingTextQuery = useQuery({
-		gcTime: Number.POSITIVE_INFINITY,
-		initialData: "",
-		queryFn: async () => "",
-		queryKey: queryKeys.streamingText(selectedChatId),
+		initialData: null,
+		queryFn: async () => null,
+		queryKey: queryKeys.streamTurn(selectedChatId),
 		staleTime: Number.POSITIVE_INFINITY,
 	});
 
@@ -126,8 +107,8 @@ export const useWorkspaceShell = () => {
 			return;
 		}
 
-		inMemorySelectedProjectId = selectionQuery.data.selectedProjectId;
-		inMemorySelectedChatId = selectionQuery.data.selectedChatId;
+		inMemorySelectedProjectId ??= selectionQuery.data.selectedProjectId;
+		inMemorySelectedChatId ??= selectionQuery.data.selectedChatId;
 		setSelectedProjectId(inMemorySelectedProjectId);
 		setSelectedChatId(inMemorySelectedChatId);
 		hasBootstrappedSelectionRef.current = true;
@@ -136,41 +117,21 @@ export const useWorkspaceShell = () => {
 	const handleServerEvent = useCallback(
 		(event: ServerWsEvent) => {
 			if (event.event === "assistant_delta") {
-				queryClient.setQueryData<string>(
-					queryKeys.streamingText(event.data.chatId),
-					(current) => `${current ?? ""}${event.data.delta}`,
-				);
 				return;
 			}
 
-				if (event.event === "assistant_event") {
-					const assistantEvent = event.data.event;
-
-					queryClient.setQueryData(
-						queryKeys.streamEvents(event.data.chatId),
-						(current: unknown) => {
-							const list = Array.isArray(current) ? current : [];
-							return [...list, assistantEvent];
-						},
-					);
-
-					if (assistantEvent.type === "item_delta" && assistantEvent.target === "body") {
-						queryClient.setQueryData<string>(
-							queryKeys.streamingText(event.data.chatId),
-							(current) => `${current ?? ""}${assistantEvent.delta}`,
-						);
-					}
-
+			if (event.event === "assistant_event") {
+				const assistantEvent = event.data.event;
+				queryClient.setQueryData<StreamTurnState | null>(
+					queryKeys.streamTurn(event.data.chatId),
+					(current) => applyAssistantEventToTurn(current ?? null, assistantEvent),
+				);
 				return;
 			}
 
 			if (event.event === "assistant_done") {
-				const streamingText = queryClient.getQueryData<string>(queryKeys.streamingText(event.data.chatId)) ?? "";
-				queryClient.setQueryData<MessageDTO[]>(
-					queryKeys.messages(event.data.chatId),
-					(current) => appendAssistantMessage(current ?? [], event.data.chatId, streamingText),
-				);
-				queryClient.setQueryData(queryKeys.streamingText(event.data.chatId), "");
+				queryClient.setQueryData(queryKeys.streamTurn(event.data.chatId), null);
+				void queryClient.invalidateQueries({ queryKey: queryKeys.messages(event.data.chatId) });
 				setIsSending(false);
 				return;
 			}
@@ -185,6 +146,9 @@ export const useWorkspaceShell = () => {
 
 			if (event.event === "error") {
 				setLastError(event.data.message);
+				if (event.data.chatId) {
+					queryClient.setQueryData(queryKeys.streamTurn(event.data.chatId), null);
+				}
 				setIsSending(false);
 				return;
 			}
@@ -389,9 +353,25 @@ export const useWorkspaceShell = () => {
 			}
 
 			let activeChatId = selectedChatId;
+			let placeholderChatIdToDelete: string | null = null;
+
+			const selectedChat = chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null;
+			const selectedChatHasNoMessages = (messagesQuery.data ?? []).length === 0;
+
+			if (
+				selectedChat &&
+				selectedChatHasNoMessages &&
+				isPlaceholderThreadTitle(selectedChat.title)
+			) {
+				const replacementChat = await createChat(text);
+				if (replacementChat) {
+					placeholderChatIdToDelete = selectedChat.id;
+					activeChatId = replacementChat.id;
+				}
+			}
 
 			if (!activeChatId) {
-				const chat = await createChat("New thread");
+				const chat = await createChat(text);
 				activeChatId = chat?.id ?? null;
 			}
 
@@ -411,19 +391,25 @@ export const useWorkspaceShell = () => {
 				queryKeys.messages(activeChatId),
 				(current) => [...(current ?? []), nextMessage],
 			);
-			queryClient.setQueryData(queryKeys.streamingText(activeChatId), "");
-			queryClient.setQueryData(queryKeys.streamEvents(activeChatId), []);
+			queryClient.setQueryData(queryKeys.streamTurn(activeChatId), null);
 			setLastError(null);
 			setIsSending(true);
 
 				realtimeRef.current?.sendJoinChat(activeChatId);
-				realtimeRef.current?.sendUserMessage(activeChatId, text, {
-					clientId: clientIdRef.current,
-					model: selectedModel ?? undefined,
-					permissionMode,
-					reasoningEffort: selectedReasoningEffort ?? undefined,
-					requestId: toRequestId(),
-				});
+			realtimeRef.current?.sendUserMessage(activeChatId, text, {
+				clientId: clientIdRef.current,
+				model: selectedModel ?? undefined,
+				permissionMode,
+				reasoningEffort: selectedReasoningEffort ?? undefined,
+				requestId: toRequestId(),
+			});
+			if (placeholderChatIdToDelete) {
+				try {
+					await deleteChatMutation.mutateAsync(placeholderChatIdToDelete);
+				} catch {
+					// Ignore placeholder cleanup failure.
+				}
+			}
 
 			return true;
 		},
@@ -432,6 +418,40 @@ export const useWorkspaceShell = () => {
 			setLastError(error instanceof Error ? error.message : "Failed to send message");
 		},
 	});
+
+	const setStreamItemExpanded = useCallback(
+		(itemId: string, expanded: boolean, byUser: boolean) => {
+			if (!selectedChatId) {
+				return;
+			}
+
+		queryClient.setQueryData<StreamTurnState | null>(
+			queryKeys.streamTurn(selectedChatId),
+			(current) =>
+				current
+					? updateStreamItemExpanded(current, itemId, {
+						expanded,
+						byUser,
+					})
+					: current ?? null,
+			);
+		},
+		[queryClient, selectedChatId],
+	);
+
+	const setStreamItemState = useCallback(
+		(itemId: string, state: AssistantStreamItemState) => {
+			if (!selectedChatId) {
+				return;
+			}
+
+			queryClient.setQueryData<StreamTurnState | null>(
+				queryKeys.streamTurn(selectedChatId),
+				(current) => (current ? updateStreamItemState(current, itemId, state) : current ?? null),
+			);
+		},
+		[queryClient, selectedChatId],
+	);
 
 	const selectedProject = useMemo(
 		() => projectsQuery.data?.find((project) => project.id === selectedProjectId) ?? null,
@@ -464,12 +484,14 @@ export const useWorkspaceShell = () => {
 		setPermissionMode,
 		setSelectedModel,
 		setSelectedReasoningEffort,
+		setStreamItemExpanded,
+		setStreamItemState,
 		selectedChat,
 		selectedChatId,
 		selectedProject,
 		selectedProjectId,
 		sendMessage: sendMessage.mutateAsync,
-		streamingText: streamingTextQuery.data ?? "",
+		streamingTurn: streamTurnQuery.data ?? null,
 		toggleFavorite,
 	};
 };

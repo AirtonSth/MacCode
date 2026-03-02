@@ -1,10 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MaterialIcons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocalSearchParams } from "expo-router";
 import {
 	Animated,
+	Keyboard,
 	KeyboardAvoidingView,
 	Modal,
 	Platform,
@@ -17,6 +18,7 @@ import {
 } from "react-native";
 
 import { useWorkspaceShell } from "../model/use-workspace-shell";
+import { StreamingTimeline } from "./streaming-timeline";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
@@ -35,6 +37,32 @@ const palette = {
 	soft: "rgba(255,255,255,0.05)",
 	text: "#F1F4FA",
 	userBubble: "rgba(99,200,255,0.19)",
+};
+
+type ActivePicker = "branch" | "model" | "permission" | "reasoning";
+
+const getSelectModalTitle = (activePicker: ActivePicker | null): string => {
+	switch (activePicker) {
+		case "branch": {
+			return "Select branch";
+		}
+		case "model": {
+			return "Select model";
+		}
+		case null: {
+			return "Select branch";
+		}
+		case "permission": {
+			return "Select permission";
+		}
+		case "reasoning": {
+			return "Select reasoning";
+		}
+		default: {
+			return "Select branch";
+		}
+	}
+	return "Select branch";
 };
 
 const toTerminalTranscript = (
@@ -76,32 +104,103 @@ export const ChatScreen = () => {
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		createChat,
+		availableModels,
 		isLoaded,
 		isSending,
 		lastError,
+		selectedModel,
 		messages,
 		projects,
+		permissionMode,
+		setStreamItemExpanded,
+		setStreamItemState,
+		setSelectedModel,
+		setSelectedReasoningEffort,
+		setPermissionMode,
 		selectProject,
 		selectedChat,
 		selectedChatId,
 		selectedProject,
 		selectedProjectId,
 		sendMessage,
-		streamingText,
+		selectedReasoningEffort,
+		streamingTurn,
 	} = useWorkspaceShell();
 	const [input, setInput] = useState<string>("");
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
+	const [activePicker, setActivePicker] = useState<ActivePicker | null>(null);
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const [isTerminalOpen, setIsTerminalOpen] = useState<boolean>(false);
+	const [isKeyboardVisible, setIsKeyboardVisible] = useState<boolean>(false);
+	const [isBranchCheckoutPending, setIsBranchCheckoutPending] = useState<boolean>(false);
+	const selectorsScrollRef = useRef<ScrollView | null>(null);
 	const [terminalInput, setTerminalInput] = useState<string>("");
 	const [terminalOutput, setTerminalOutput] = useState<string>("");
 	const [terminalError, setTerminalError] = useState<string>("");
 	const [isTerminalLoading, setIsTerminalLoading] = useState<boolean>(false);
 	const [isTerminalRunning, setIsTerminalRunning] = useState<boolean>(false);
+	const queryClient = useQueryClient();
 	const messageScrollRef = useRef<ScrollView | null>(null);
 	const terminalScrollRef = useRef<ScrollView | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
+	const gitStatusQuery = useQuery({
+		enabled: Boolean(selectedProjectId),
+		queryKey: ["project-git-status", selectedProjectId],
+		queryFn: async () => {
+			if (!selectedProjectId) {
+				return null;
+			}
+
+			return await api.getProjectGitStatus(selectedProjectId);
+		},
+		staleTime: 30_000,
+	});
+	const gitBranchesQuery = useQuery({
+		enabled: Boolean(selectedProjectId),
+		queryKey: ["project-git-branches", selectedProjectId],
+		queryFn: async () => {
+			if (!selectedProjectId) {
+				return null;
+			}
+
+			return await api.getProjectGitBranches(selectedProjectId);
+		},
+		staleTime: 30_000,
+	});
+	const activeModel = useMemo(
+		() => availableModels.find((item) => item.model === selectedModel) ?? null,
+		[availableModels, selectedModel],
+	);
+	const availableReasoningEfforts = useMemo(
+		() => activeModel?.supportedReasoningEfforts.map((item) => item.reasoningEffort) ?? [],
+		[activeModel],
+	);
+	const gitCurrentBranch = gitStatusQuery.data?.currentBranch ?? null;
+	const permissionOptions = useMemo(
+		() => ["plan", "default", "full"] as const,
+		[],
+	);
+	const permissionLabel = permissionMode?.trim().length ? permissionMode : "default";
+	const selectedModelName = activeModel?.displayName ?? selectedModel ?? "No model";
+	const selectedReasoningLabel = selectedReasoningEffort ?? activeModel?.defaultReasoningEffort ?? "No reasoning";
+	const selectedBranch = gitCurrentBranch ?? "No branch";
+	const isGitRepository = gitStatusQuery.data?.isRepo ?? false;
+	const availableBranches = useMemo(
+		() => gitBranchesQuery.data?.branches ?? [],
+		[gitBranchesQuery.data?.branches],
+	);
+	const branchOptions = useMemo(() => {
+		if (!isGitRepository || !gitCurrentBranch) {
+			return availableBranches;
+		}
+
+		if (availableBranches.includes(gitCurrentBranch)) {
+			return availableBranches;
+		}
+
+		return [gitCurrentBranch, ...availableBranches];
+	}, [availableBranches, gitCurrentBranch, isGitRepository]);
 
 	const serverHealthQuery = useQuery({
 		enabled: isConfigLoaded,
@@ -130,9 +229,54 @@ export const ChatScreen = () => {
 		);
 	}, [projects, drawerSearchValue]);
 
+	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
+
+	useEffect(() => {
+		let timer: ReturnType<typeof setTimeout> | null = null;
+
+		if (!isKeyboardVisible) {
+			timer = setTimeout(() => {
+				selectorsScrollRef.current?.scrollToEnd({ animated: false });
+			}, 0);
+		}
+
+		return () => {
+			if (timer !== null) {
+				clearTimeout(timer);
+			}
+		};
+	}, [isKeyboardVisible, availableModels.length, availableReasoningEfforts.length, availableBranches.length, permissionMode, selectedBranch]);
+
+	useEffect(() => {
+		const onShow = () => {
+			setIsKeyboardVisible(true);
+			setActivePicker(null);
+		};
+		const onHide = () => {
+			setIsKeyboardVisible(false);
+		};
+		const showSubscription = Keyboard.addListener("keyboardDidShow", onShow);
+		const hideSubscription = Keyboard.addListener("keyboardDidHide", onHide);
+
+		return () => {
+			showSubscription.remove();
+			hideSubscription.remove();
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!activeModel || availableReasoningEfforts.length === 0) {
+			return;
+		}
+
+		if (!selectedReasoningEffort || !availableReasoningEfforts.includes(selectedReasoningEffort)) {
+			setSelectedReasoningEffort(activeModel.defaultReasoningEffort);
+		}
+	}, [activeModel, availableReasoningEfforts, selectedReasoningEffort, setSelectedReasoningEffort]);
+
 	useEffect(() => {
 		messageScrollRef.current?.scrollToEnd({ animated: true });
-	}, [messages.length, streamingText]);
+	}, [messages.length, streamingTurn]);
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -321,6 +465,211 @@ export const ChatScreen = () => {
 		}
 	};
 
+	const isBranchPickerDisabled = !selectedProjectId || !isGitRepository || gitBranchesQuery.isLoading || isBranchCheckoutPending;
+
+	const setPicker = useCallback(
+		async (value: string) => {
+			if (activePicker === null) {
+				return;
+			}
+
+			switch (activePicker) {
+				case "branch": {
+					if (!selectedProjectId || !isGitRepository || value === selectedBranch || isBranchCheckoutPending) {
+						setActivePicker(null);
+						return;
+					}
+
+					setIsBranchCheckoutPending(true);
+					try {
+						await api.checkoutProjectGitBranch(selectedProjectId, value);
+						await Promise.all([
+							queryClient.invalidateQueries({
+								queryKey: ["project-git-status", selectedProjectId],
+							}),
+							queryClient.invalidateQueries({
+								queryKey: ["project-git-branches", selectedProjectId],
+							}),
+						]);
+					} finally {
+						setIsBranchCheckoutPending(false);
+					}
+					break;
+				}
+				case "model": {
+					if (value !== selectedModel) {
+						setSelectedModel(value);
+					}
+					break;
+				}
+				case "permission": {
+					setPermissionMode(value);
+					break;
+				}
+				case "reasoning": {
+					setSelectedReasoningEffort(value);
+					break;
+				}
+				default: {
+					break;
+				}
+			}
+			setActivePicker(null);
+		},
+		[
+			activePicker,
+			selectedBranch,
+			selectedModel,
+			selectedProjectId,
+			isBranchCheckoutPending,
+			isGitRepository,
+			queryClient,
+			api,
+			setPermissionMode,
+			setSelectedModel,
+			setSelectedReasoningEffort,
+			setIsBranchCheckoutPending,
+		],
+	);
+
+	const activePickerOptions = useMemo((): JSX.Element[] => {
+		const options: JSX.Element[] = [];
+
+		switch (activePicker) {
+			case "branch": {
+				if (branchOptions.length === 0) {
+					options.push(
+						<Text key="no-branches" style={styles.selectModalEmpty}>
+							No branches available.
+						</Text>,
+					);
+					break;
+				}
+
+				options.push(
+					...branchOptions.map((branch) => {
+						const isCurrent = branch === gitCurrentBranch;
+						return (
+							<Pressable
+								key={branch}
+								onPress={() => {
+									void setPicker(branch);
+								}}
+								style={({ pressed }) => [
+									styles.selectModalItem,
+									isCurrent ? styles.selectModalItemActive : null,
+									pressed ? styles.selectModalItemPressed : null,
+								]}
+								disabled={isBranchPickerDisabled}
+								testID={`chat-branch-option-${branch}`}
+							>
+								<Text numberOfLines={1} style={styles.selectModalItemLabel}>
+									{branch}
+								</Text>
+							</Pressable>
+						);
+					}),
+				);
+				break;
+			}
+			case "model": {
+				options.push(
+					...availableModels.map((model) => {
+						const isCurrent = model.model === selectedModel;
+						return (
+							<Pressable
+								key={model.id}
+								onPress={() => {
+									void setPicker(model.model);
+								}}
+								style={({ pressed }) => [
+									styles.selectModalItem,
+									isCurrent ? styles.selectModalItemActive : null,
+									pressed ? styles.selectModalItemPressed : null,
+								]}
+								testID={`chat-model-option-${model.id}`}
+							>
+								<Text numberOfLines={1} style={styles.selectModalItemLabel}>
+									{model.displayName}
+								</Text>
+							</Pressable>
+						);
+					}),
+				);
+				break;
+			}
+			case "permission": {
+				options.push(
+					...permissionOptions.map((permission) => {
+						const isCurrent = permission === permissionMode;
+						return (
+							<Pressable
+								key={permission}
+								onPress={() => {
+									void setPicker(permission);
+								}}
+								style={({ pressed }) => [
+									styles.selectModalItem,
+									isCurrent ? styles.selectModalItemActive : null,
+									pressed ? styles.selectModalItemPressed : null,
+								]}
+								testID={`chat-permission-option-${permission}`}
+							>
+								<Text numberOfLines={1} style={styles.selectModalItemLabel}>
+									{permission}
+								</Text>
+							</Pressable>
+						);
+					}),
+				);
+				break;
+			}
+			case "reasoning": {
+				options.push(
+					...availableReasoningEfforts.map((effort) => {
+						const isCurrent = effort === selectedReasoningEffort;
+						return (
+							<Pressable
+								key={effort}
+								onPress={() => {
+									void setPicker(effort);
+								}}
+								style={({ pressed }) => [
+									styles.selectModalItem,
+									isCurrent ? styles.selectModalItemActive : null,
+									pressed ? styles.selectModalItemPressed : null,
+								]}
+								testID={`chat-reasoning-option-${effort}`}
+							>
+								<Text numberOfLines={1} style={styles.selectModalItemLabel}>
+									{effort}
+								</Text>
+							</Pressable>
+						);
+					}),
+				);
+				break;
+			}
+			default: {
+				break;
+			}
+		}
+
+		return options;
+	}, [
+		activePicker,
+		availableModels,
+		availableReasoningEfforts,
+		permissionMode,
+		branchOptions,
+		gitCurrentBranch,
+		selectedModel,
+		selectedReasoningEffort,
+		isBranchPickerDisabled,
+		permissionOptions,
+		setPicker,
+	]);
+
 	return (
 		<KeyboardAvoidingView
 			behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -357,7 +706,7 @@ export const ChatScreen = () => {
 					style={styles.messages}
 					testID="chat-message-list"
 				>
-					{messages.length === 0 && streamingText.trim().length === 0 ? (
+					{messages.length === 0 && !hasStreamingItems ? (
 						<Text style={styles.emptyState}>Start a conversation.</Text>
 					) : null}
 
@@ -376,15 +725,23 @@ export const ChatScreen = () => {
 						);
 					})}
 
-					{streamingText.trim().length > 0 ? (
+					{hasStreamingItems && streamingTurn ? (
 						<View style={styles.messageRow}>
 							<View style={[styles.messageBubble, styles.assistantBubble]}>
-								<MessageMarkdown content={streamingText} textColor={palette.text} linkColor={palette.accent} />
+								<StreamingTimeline
+									onSetItemExpanded={(itemId, expanded, byUser) => {
+										setStreamItemExpanded(itemId, expanded, byUser);
+									}}
+									onSetItemState={(itemId, state) => {
+										setStreamItemState(itemId, state);
+									}}
+									turn={streamingTurn}
+								/>
 							</View>
 						</View>
 					) : null}
 
-					{isSending && streamingText.trim().length === 0 ? (
+					{isSending && !hasStreamingItems ? (
 						<Text style={styles.typingLabel}>Thinking...</Text>
 					) : null}
 				</ScrollView>
@@ -429,7 +786,131 @@ export const ChatScreen = () => {
 						/>
 					</Pressable>
 				</View>
+
+				{!isKeyboardVisible ? (
+					<ScrollView
+						ref={selectorsScrollRef}
+						contentContainerStyle={styles.selectorsScroller}
+						horizontal
+						showsHorizontalScrollIndicator={false}
+						style={styles.selectorsRow}
+					>
+						<Pressable
+							disabled={availableModels.length === 0}
+							onPress={() => {
+								setActivePicker("model");
+							}}
+							style={({ pressed }) => [
+								styles.selectorButton,
+								availableModels.length === 0 ? styles.selectorButtonDisabled : null,
+								pressed && availableModels.length > 0 ? styles.selectorButtonPressed : null,
+							]}
+							testID="chat-model-picker-button"
+						>
+							<View style={styles.selectorButtonContent}>
+								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+									Model
+								</Text>
+								<Text numberOfLines={1} style={styles.selectorButtonValue}>
+									{selectedModelName}
+								</Text>
+							</View>
+							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+						</Pressable>
+						<Pressable
+							disabled={availableReasoningEfforts.length === 0}
+							onPress={() => {
+								setActivePicker("reasoning");
+							}}
+							style={({ pressed }) => [
+								styles.selectorButton,
+								availableReasoningEfforts.length === 0 ? styles.selectorButtonDisabled : null,
+								pressed && availableReasoningEfforts.length > 0 ? styles.selectorButtonPressed : null,
+							]}
+							testID="chat-reasoning-picker-button"
+						>
+							<View style={styles.selectorButtonContent}>
+								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+									Reasoning
+								</Text>
+								<Text numberOfLines={1} style={styles.selectorButtonValue}>
+									{selectedReasoningLabel}
+								</Text>
+							</View>
+							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+						</Pressable>
+						<Pressable
+							onPress={() => {
+								setActivePicker("permission");
+							}}
+							style={({ pressed }) => [
+								styles.selectorButton,
+								pressed ? styles.selectorButtonPressed : null,
+							]}
+						>
+							<View style={styles.selectorButtonContent}>
+								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+									Permission
+								</Text>
+								<Text numberOfLines={1} style={styles.selectorButtonValue}>
+									{permissionLabel}
+								</Text>
+							</View>
+							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+						</Pressable>
+						<Pressable
+							disabled={isBranchPickerDisabled}
+							onPress={() => {
+								setActivePicker("branch");
+							}}
+							style={({ pressed }) => [
+								styles.selectorButton,
+								isBranchPickerDisabled ? styles.selectorButtonDisabled : null,
+								pressed && !isBranchPickerDisabled ? styles.selectorButtonPressed : null,
+							]}
+						>
+							<View style={styles.selectorButtonContent}>
+								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+									Branch
+								</Text>
+								<Text numberOfLines={1} style={styles.selectorButtonValue}>
+									{selectedBranch}
+								</Text>
+							</View>
+							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+						</Pressable>
+					</ScrollView>
+				) : null}
 			</View>
+
+			<Modal
+				animationType="fade"
+				onRequestClose={() => {
+					setActivePicker(null);
+				}}
+				transparent
+				visible={activePicker !== null}
+			>
+				<Pressable
+					onPress={() => {
+						setActivePicker(null);
+					}}
+					style={styles.selectModalBackdrop}
+					testID="chat-select-modal-backdrop"
+				>
+					<Pressable
+						onPress={() => {
+							// no-op
+						}}
+						style={styles.selectModalPanel}
+					>
+							<Text style={styles.selectModalTitle}>{getSelectModalTitle(activePicker)}</Text>
+							<ScrollView contentContainerStyle={styles.selectModalList} showsVerticalScrollIndicator={false}>
+								{activePickerOptions}
+							</ScrollView>
+						</Pressable>
+					</Pressable>
+			</Modal>
 
 			<Modal animationType="none" onRequestClose={closeDrawer} transparent visible={isDrawerOpen}>
 				<View style={styles.drawerRoot}>
@@ -633,8 +1114,113 @@ const styles = StyleSheet.create({
 		alignItems: "flex-end",
 		flexDirection: "row",
 		gap: 8,
-		paddingBottom: 12,
+		paddingBottom: 6,
 		paddingTop: 8,
+	},
+	selectorButton: {
+		alignItems: "center",
+		backgroundColor: "rgba(255,255,255,0.05)",
+		borderColor: palette.border,
+		borderRadius: 11,
+		borderWidth: 1,
+		flexDirection: "row",
+		flexShrink: 0,
+		minWidth: 136,
+		height: 44,
+		maxHeight: 44,
+		gap: 6,
+		justifyContent: "space-between",
+		overflow: "hidden",
+		paddingHorizontal: 9,
+		paddingVertical: 8,
+	},
+	selectorButtonContent: {
+		flex: 1,
+		minWidth: 0,
+		justifyContent: "center",
+	},
+	selectorButtonDisabled: {
+		opacity: 0.55,
+	},
+	selectorButtonLabel: {
+		color: palette.muted,
+		fontSize: 10.5,
+		fontWeight: "600",
+		letterSpacing: 0.15,
+		lineHeight: 12.5,
+		textTransform: "uppercase",
+	},
+	selectorButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	selectorButtonValue: {
+		color: palette.text,
+		fontSize: 12,
+		lineHeight: 14,
+		marginTop: 0,
+	},
+	selectorsRow: {
+		flexDirection: "row",
+		flexGrow: 0,
+		flexShrink: 0,
+	},
+	selectorsScroller: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
+		marginBottom: 8,
+		marginTop: 8,
+	},
+	selectModalBackdrop: {
+		backgroundColor: "rgba(2,5,10,0.62)",
+		flex: 1,
+		justifyContent: "flex-end",
+	},
+	selectModalItem: {
+		backgroundColor: "rgba(255,255,255,0.02)",
+		borderColor: "rgba(255,255,255,0.15)",
+		borderRadius: 10,
+		borderWidth: 1,
+		marginBottom: 8,
+		paddingHorizontal: 12,
+		paddingVertical: 10,
+	},
+	selectModalItemActive: {
+		backgroundColor: "rgba(99,200,255,0.14)",
+		borderColor: "rgba(99,200,255,0.74)",
+	},
+	selectModalItemLabel: {
+		color: palette.text,
+		fontSize: 14,
+	},
+	selectModalItemPressed: {
+		opacity: 0.8,
+	},
+	selectModalList: {
+		gap: 8,
+		paddingTop: 8,
+	},
+	selectModalEmpty: {
+		color: palette.muted,
+		fontSize: 13,
+		paddingBottom: 4,
+	},
+	selectModalPanel: {
+		backgroundColor: palette.background,
+		borderTopLeftRadius: 18,
+		borderTopRightRadius: 18,
+		maxHeight: 360,
+		paddingHorizontal: 14,
+		paddingBottom: 20,
+		paddingTop: 10,
+	},
+	selectModalTitle: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "700",
+		letterSpacing: 0.2,
+		textAlign: "center",
+		textTransform: "uppercase",
 	},
 	disabledButton: {
 		opacity: 0.45,

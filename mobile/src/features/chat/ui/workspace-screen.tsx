@@ -21,6 +21,7 @@ import { GhostButton } from "../../../shared/ui/ghost-button";
 import { GlassPanel } from "../../../shared/ui/glass-panel";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { useWorkspaceShell } from "../model/use-workspace-shell";
+import { StreamingTimeline } from "./streaming-timeline";
 
 const styles = StyleSheet.create({
 	composerInput: {
@@ -54,11 +55,13 @@ export const WorkspaceScreen = () => {
 		setPermissionMode,
 		setSelectedModel,
 		setSelectedReasoningEffort,
+		setStreamItemExpanded,
+		setStreamItemState,
 		selectedChat,
 		selectedChatId,
 		selectedProjectId,
 		sendMessage,
-		streamingText,
+		streamingTurn,
 		toggleFavorite,
 	} = useWorkspaceShell();
 	const [input, setInput] = useState<string>("");
@@ -87,6 +90,7 @@ export const WorkspaceScreen = () => {
 		() => projects.filter((project) => project.isFavorite),
 		[projects],
 	);
+	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 
 	useEffect(() => {
 		setIsSidebarOpen(isWide);
@@ -94,7 +98,7 @@ export const WorkspaceScreen = () => {
 
 	useEffect(() => {
 		messagesScrollRef.current?.scrollToEnd({ animated: true });
-	}, [messages.length, streamingText]);
+	}, [messages.length, streamingTurn]);
 
 	const handleSend = async () => {
 		const text = input.trim();
@@ -763,7 +767,7 @@ export const WorkspaceScreen = () => {
 									</View>
 								</View>
 							))}
-							{streamingText.length > 0 ? (
+							{hasStreamingItems && streamingTurn ? (
 								<View
 									style={{
 										alignItems: "flex-start",
@@ -780,13 +784,22 @@ export const WorkspaceScreen = () => {
 											paddingVertical: 10,
 										}}
 									>
-										<MessageMarkdown
-											content={streamingText}
-											linkColor={theme.colors.accent}
-											textColor={theme.colors.textPrimary}
+										<StreamingTimeline
+											onSetItemExpanded={(itemId, expanded, byUser) => {
+												setStreamItemExpanded(itemId, expanded, byUser);
+											}}
+											onSetItemState={(itemId, state) => {
+												setStreamItemState(itemId, state);
+											}}
+											turn={streamingTurn}
 										/>
 									</View>
 								</View>
+							) : null}
+							{isSending && !hasStreamingItems ? (
+								<Text style={{ color: theme.colors.muted, fontSize: 12, marginBottom: 12 }}>
+									Thinking...
+								</Text>
 							) : null}
 						</ScrollView>
 
