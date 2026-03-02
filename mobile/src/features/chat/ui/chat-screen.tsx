@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { MaterialIcons } from "@expo/vector-icons";
+import { LinearGradient } from "expo-linear-gradient";
 import { useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -404,50 +405,63 @@ export const ChatScreen = () => {
 						<Animated.View style={[styles.drawerBackdrop, { opacity: drawerOpacity }]} />
 					</Pressable>
 					<Animated.View style={[styles.drawerPanel, { transform: [{ translateX: drawerTranslate }] }]}>
-						<Text style={styles.drawerTitle}>Workspaces</Text>
-						<TextInput
-							autoCapitalize="none"
-							onChangeText={setDrawerSearchValue}
-							placeholder="Search"
-							placeholderTextColor={palette.muted}
-							style={styles.drawerSearch}
-							testID="drawer-workspaces-search-input"
-							value={drawerSearchValue}
-						/>
-
-						<ScrollView
-							contentContainerStyle={styles.drawerList}
-							contentInsetAdjustmentBehavior="automatic"
-							showsVerticalScrollIndicator={false}
+						<LinearGradient
+							colors={["#1b2a40", "#29405d", "#3f4372", "#5b3b66"]}
+							end={{
+								x: 0,
+								y: 1,
+							}}
+							style={styles.drawerPanelGradient}
+							start={{
+								x: 0,
+								y: 0,
+							}}
 						>
-							{visibleWorkspaces.length === 0 ? (
-								<Text style={styles.drawerEmpty}>No workspace found.</Text>
-							) : null}
+							<Text style={styles.drawerTitle}>Workspaces</Text>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setDrawerSearchValue}
+								placeholder="Search"
+								placeholderTextColor={palette.muted}
+								style={styles.drawerSearch}
+								testID="drawer-workspaces-search-input"
+								value={drawerSearchValue}
+							/>
 
-							{visibleWorkspaces.map((project, index) => (
-								<Pressable
-									accessibilityLabel={`drawer-workspace-item-${String(index)}`}
-									accessibilityRole="button"
-									key={project.id}
-									onPress={() => {
-										openWorkspaceFromDrawer(project);
-									}}
-									style={({ pressed }) => [
-										styles.drawerItem,
-										project.id === selectedProjectId ? styles.drawerItemActive : null,
-										pressed ? styles.drawerItemPressed : null,
-									]}
-									testID={`drawer-workspace-item-${String(index)}`}
-								>
-									<Text numberOfLines={1} style={styles.drawerItemTitle}>
-										{project.name}
-									</Text>
-									<Text numberOfLines={1} style={styles.drawerItemMeta}>
-										{project.path}
-									</Text>
-								</Pressable>
-							))}
-						</ScrollView>
+							<ScrollView
+								contentContainerStyle={styles.drawerList}
+								contentInsetAdjustmentBehavior="automatic"
+								showsVerticalScrollIndicator={false}
+							>
+								{visibleWorkspaces.length === 0 ? (
+									<Text style={styles.drawerEmpty}>No workspace found.</Text>
+								) : null}
+
+								{visibleWorkspaces.map((project, index) => (
+									<Pressable
+										accessibilityLabel={`drawer-workspace-item-${String(index)}`}
+										accessibilityRole="button"
+										key={project.id}
+										onPress={() => {
+											openWorkspaceFromDrawer(project);
+										}}
+										style={({ pressed }) => [
+											styles.drawerItem,
+											project.id === selectedProjectId ? styles.drawerItemActive : null,
+											pressed ? styles.drawerItemPressed : null,
+										]}
+										testID={`drawer-workspace-item-${String(index)}`}
+									>
+										<Text numberOfLines={1} style={styles.drawerItemTitle}>
+											{project.name}
+										</Text>
+										<Text numberOfLines={1} style={styles.drawerItemMeta}>
+											{project.path}
+										</Text>
+									</Pressable>
+								))}
+							</ScrollView>
+						</LinearGradient>
 					</Animated.View>
 				</View>
 			</Modal>
@@ -581,14 +595,16 @@ const styles = StyleSheet.create({
 		paddingTop: 12,
 	},
 	drawerItem: {
-		borderColor: palette.border,
+		backgroundColor: "rgba(255,255,255,0.04)",
+		borderColor: "rgba(255,255,255,0.2)",
 		borderRadius: 11,
 		borderWidth: 1,
 		gap: 4,
 		padding: 12,
 	},
 	drawerItemActive: {
-		borderColor: "rgba(99,200,255,0.45)",
+		backgroundColor: "rgba(99,200,255,0.16)",
+		borderColor: "rgba(99,200,255,0.75)",
 	},
 	drawerItemMeta: {
 		color: palette.muted,
@@ -608,26 +624,38 @@ const styles = StyleSheet.create({
 		paddingTop: 8,
 	},
 	drawerPanel: {
-		backgroundColor: "#0F131A",
+		elevation: 34,
+		shadowColor: "#000",
+		shadowOffset: {
+			height: 14,
+			width: 0,
+		},
+		shadowOpacity: 0.45,
+		shadowRadius: 36,
 		borderRightColor: palette.border,
-		borderRightWidth: 1,
+		borderRightWidth: 1.2,
 		bottom: 0,
 		left: 0,
-		paddingHorizontal: 12,
-		paddingTop: 58,
 		position: "absolute",
 		top: 0,
 		width: drawerWidth,
+	},
+	drawerPanelGradient: {
+		borderTopColor: "rgba(255,255,255,0.06)",
+		borderTopWidth: StyleSheet.hairlineWidth,
+		flex: 1,
+		paddingHorizontal: 12,
+		paddingTop: 58,
 	},
 	drawerRoot: {
 		flex: 1,
 	},
 	drawerSearch: {
-		backgroundColor: palette.soft,
-		borderColor: palette.border,
+		backgroundColor: "rgba(255,255,255,0.10)",
+		borderColor: "rgba(255,255,255,0.2)",
 		borderRadius: 11,
 		borderWidth: 1,
-		color: palette.text,
+		color: "#F9FCFF",
 		fontSize: 14,
 		minHeight: 40,
 		paddingHorizontal: 12,
