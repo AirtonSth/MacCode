@@ -108,6 +108,7 @@ export const MessageMarkdown = memo(({ content, linkColor, textColor }: MessageM
 		<MarkdownDisplay
 			onLinkPress={(url: string) => {
 				void Linking.openURL(url);
+				return false;
 			}}
 			style={styles}
 		>
