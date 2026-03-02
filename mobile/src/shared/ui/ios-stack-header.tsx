@@ -12,6 +12,8 @@ const palette = {
 
 interface IosStackHeaderProps {
 	onBack?: () => void;
+	backLabel?: string;
+	left?: ReactNode;
 	right?: ReactNode;
 	subtitle?: string | null;
 	title: string;
@@ -19,6 +21,8 @@ interface IosStackHeaderProps {
 
 export const IosStackHeader = ({
 	onBack = undefined,
+	backLabel = "Back",
+	left = null,
 	right = null,
 	subtitle = null,
 	title,
@@ -53,7 +57,7 @@ export const IosStackHeader = ({
 					]}
 					testID="nav-back"
 				>
-					<Text style={styles.backLabel}>Back</Text>
+					{left || <Text style={styles.backLabel}>{backLabel}</Text>}
 				</Pressable>
 
 				<View style={styles.center}>

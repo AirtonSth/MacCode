@@ -1,4 +1,5 @@
 import { LinearGradient } from "expo-linear-gradient";
+import { MaterialIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -18,6 +19,7 @@ import { formatRelativeTime } from "../../../shared/lib/time";
 import { theme } from "../../../shared/theme/tokens";
 import { GhostButton } from "../../../shared/ui/ghost-button";
 import { GlassPanel } from "../../../shared/ui/glass-panel";
+import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { useWorkspaceShell } from "../model/use-workspace-shell";
 
 const styles = StyleSheet.create({
@@ -753,16 +755,11 @@ export const WorkspaceScreen = () => {
 											paddingVertical: 10,
 										}}
 									>
-										<Text
-											selectable
-											style={{
-												color: theme.colors.textPrimary,
-												fontSize: 14,
-												lineHeight: 21,
-											}}
-										>
-											{message.content}
-										</Text>
+										<MessageMarkdown
+											content={message.content}
+											linkColor={theme.colors.accent}
+											textColor={theme.colors.textPrimary}
+										/>
 									</View>
 								</View>
 							))}
@@ -783,16 +780,11 @@ export const WorkspaceScreen = () => {
 											paddingVertical: 10,
 										}}
 									>
-										<Text
-											selectable
-											style={{
-												color: theme.colors.textPrimary,
-												fontSize: 14,
-												lineHeight: 21,
-											}}
-										>
-											{streamingText}
-										</Text>
+										<MessageMarkdown
+											content={streamingText}
+											linkColor={theme.colors.accent}
+											textColor={theme.colors.textPrimary}
+										/>
 									</View>
 								</View>
 							) : null}
@@ -845,20 +837,12 @@ export const WorkspaceScreen = () => {
 									borderColor: "rgba(99,200,255,0.35)",
 									borderRadius: theme.borderRadius.chip,
 									borderWidth: 1,
-									opacity: isSending ? 0.65 : 1,
+								opacity: isSending ? 0.65 : 1,
 									paddingHorizontal: 14,
 									paddingVertical: 10,
 								})}
 							>
-								<Text
-									style={{
-										color: theme.colors.textPrimary,
-										fontSize: 13,
-										fontWeight: "700",
-									}}
-								>
-									{isSending ? "Sending" : "Send"}
-								</Text>
+								<MaterialIcons color={theme.colors.textPrimary} name="send" size={18} />
 							</Pressable>
 						</View>
 

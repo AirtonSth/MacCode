@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { MaterialIcons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -19,6 +20,7 @@ import { useApiConfig } from "../../../shared/api/api-config-provider";
 import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
+import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 
 const drawerWidth = 308;
 
@@ -293,15 +295,20 @@ export const ChatScreen = () => {
 			testID="screen-chat"
 		>
 			<IosStackHeader
+				backLabel="Menu"
+				left={<MaterialIcons color={palette.text} name="menu" size={20} />}
+				onBack={openDrawer}
 				right={(
 					<Pressable
-						accessibilityLabel="chat-drawer-button"
+						accessibilityLabel="chat-terminal-open-button"
 						accessibilityRole="button"
-						onPress={openDrawer}
+						onPress={() => {
+							setIsTerminalOpen(true);
+						}}
 						style={({ pressed }) => [styles.ghostButton, pressed ? styles.ghostButtonPressed : null]}
-						testID="chat-drawer-button"
+						testID="chat-terminal-open-button"
 					>
-						<Text style={styles.ghostLabel}>Menu</Text>
+						<MaterialIcons color={palette.text} name="terminal" size={20} />
 					</Pressable>
 				)}
 				subtitle={selectedProject?.name ?? "No workspace selected"}
@@ -326,9 +333,11 @@ export const ChatScreen = () => {
 						return (
 							<View key={message.id} style={[styles.messageRow, isUser ? styles.messageRowUser : null]}>
 								<View style={[styles.messageBubble, isUser ? styles.userBubble : styles.assistantBubble]}>
-									<Text selectable style={styles.messageText}>
-										{message.content}
-									</Text>
+									<MessageMarkdown
+										content={message.content}
+										textColor={palette.text}
+										linkColor={palette.accent}
+									/>
 								</View>
 							</View>
 						);
@@ -337,9 +346,7 @@ export const ChatScreen = () => {
 					{streamingText.trim().length > 0 ? (
 						<View style={styles.messageRow}>
 							<View style={[styles.messageBubble, styles.assistantBubble]}>
-								<Text selectable style={styles.messageText}>
-									{streamingText}
-								</Text>
+								<MessageMarkdown content={streamingText} textColor={palette.text} linkColor={palette.accent} />
 							</View>
 						</View>
 					) : null}
@@ -356,21 +363,6 @@ export const ChatScreen = () => {
 				) : null}
 
 				<View style={styles.composerRow}>
-					<Pressable
-						accessibilityLabel="chat-terminal-open-button"
-						accessibilityRole="button"
-						onPress={() => {
-							setIsTerminalOpen(true);
-						}}
-						style={({ pressed }) => [
-							styles.secondaryAction,
-							pressed ? styles.secondaryActionPressed : null,
-						]}
-						testID="chat-terminal-open-button"
-					>
-						<Text style={styles.secondaryActionLabel}>Terminal</Text>
-					</Pressable>
-
 					<TextInput
 						autoCapitalize="sentences"
 						multiline
@@ -397,7 +389,11 @@ export const ChatScreen = () => {
 						]}
 						testID="chat-send-button"
 					>
-						<Text style={styles.primaryActionLabel}>{isSending ? "..." : "Send"}</Text>
+						<MaterialIcons
+							color={styles.primaryActionLabel.color}
+							name="send"
+							size={20}
+						/>
 					</Pressable>
 				</View>
 			</View>
