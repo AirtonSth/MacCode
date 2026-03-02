@@ -21,7 +21,7 @@ import { GhostButton } from "../../../shared/ui/ghost-button";
 import { GlassPanel } from "../../../shared/ui/glass-panel";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { useWorkspaceShell } from "../model/use-workspace-shell";
-import { StreamingTimeline } from "./streaming-timeline";
+import { StreamingTimeline } from "./streamingTimeline";
 
 const styles = StyleSheet.create({
 	composerInput: {

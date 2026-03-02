@@ -18,7 +18,7 @@ import {
 } from "react-native";
 
 import { useWorkspaceShell } from "../model/use-workspace-shell";
-import { StreamingTimeline } from "./streaming-timeline";
+import { StreamingTimeline } from "./streamingTimeline";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
