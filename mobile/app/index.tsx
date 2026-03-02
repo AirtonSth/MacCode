@@ -1,5 +1,5 @@
 import { Redirect } from "expo-router";
 
 export default function HomeRoute() {
-	return <Redirect href="/chat" />;
+	return <Redirect href="/workspaces" />;
 }

@@ -1,5 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
 import {
 	ActivityIndicator,
@@ -16,6 +15,7 @@ import {
 import { useWorkspaceShell } from "../../chat/model/use-workspace-shell";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 
 const palette = {
@@ -29,8 +29,8 @@ const palette = {
 };
 
 export const WorkspaceSelectionScreen = () => {
-	const router = useRouter();
 	const api = useRemoteCodeClient();
+	const { replace } = useFlowNavigator();
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const { createProject, isLoaded, projects, selectProject, selectedProjectId } = useWorkspaceShell();
 	const [searchValue, setSearchValue] = useState<string>("");
@@ -53,9 +53,15 @@ export const WorkspaceSelectionScreen = () => {
 		}
 
 		if (serverHealthQuery.isError) {
-			router.replace("/settings");
+			replace("/settings");
 		}
-	}, [isConfigLoaded, isLoaded, router, serverHealthQuery.isError, serverHealthQuery.isPending]);
+	}, [
+		isConfigLoaded,
+		isLoaded,
+		replace,
+		serverHealthQuery.isError,
+		serverHealthQuery.isPending,
+	]);
 
 	const visibleProjects = useMemo(() => {
 		const query = searchValue.trim().toLowerCase();
@@ -77,7 +83,7 @@ export const WorkspaceSelectionScreen = () => {
 
 	const openWorkspace = (project: (typeof projects)[number]) => {
 		selectProject(project);
-		router.push("/threads");
+		replace("/threads");
 	};
 
 	const createWorkspace = async () => {
@@ -96,7 +102,7 @@ export const WorkspaceSelectionScreen = () => {
 			});
 			setNewWorkspaceName("");
 			setNewWorkspacePath("");
-			router.push("/threads");
+			replace("/threads");
 		} catch (error: unknown) {
 			setErrorMessage(error instanceof Error ? error.message : "Failed to create workspace.");
 		} finally {

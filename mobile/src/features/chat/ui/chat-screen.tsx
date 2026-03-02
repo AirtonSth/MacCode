@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { MaterialIcons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
-import { useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocalSearchParams } from "expo-router";
 import {
 	Animated,
 	KeyboardAvoidingView,
@@ -18,6 +18,7 @@ import {
 
 import { useWorkspaceShell } from "../model/use-workspace-shell";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
+import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
@@ -69,8 +70,9 @@ const toTerminalTranscript = (
 };
 
 export const ChatScreen = () => {
-	const router = useRouter();
+	const { source } = useLocalSearchParams<{ source?: string }>();
 	const api = useRemoteCodeClient();
+	const { replace } = useFlowNavigator();
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		createChat,
@@ -133,35 +135,35 @@ export const ChatScreen = () => {
 	}, [messages.length, streamingText]);
 
 	useEffect(() => {
-		let timeoutId: ReturnType<typeof setTimeout> | null = null;
+		let timer: ReturnType<typeof setTimeout> | null = null;
 
 		if (isConfigLoaded && isLoaded && !serverHealthQuery.isPending) {
 			if (serverHealthQuery.isError) {
-				router.replace("/settings");
-			} else {
-				timeoutId = setTimeout(() => {
-					if (!selectedProjectId) {
-						router.replace("/workspaces");
-						return;
-					}
-
+				replace("/settings");
+			} else if (!selectedProjectId) {
+				replace("/workspaces");
+			} else if (!selectedChatId && source !== "thread-list" && source !== "terminal") {
+				timer = setTimeout(() => {
 					if (!selectedChatId) {
-						router.replace("/threads");
+						replace("/threads");
 					}
-				}, 650);
+				}, 180);
+			} else {
+				timer = null;
 			}
 		}
 
 		return () => {
-			if (timeoutId !== null) {
-				clearTimeout(timeoutId);
+			if (timer !== null) {
+				clearTimeout(timer);
 			}
 		};
 	}, [
 		isConfigLoaded,
 		isLoaded,
-		router,
+		replace,
 		selectedChatId,
+		source,
 		selectedProjectId,
 		serverHealthQuery.isError,
 		serverHealthQuery.isPending,
@@ -252,13 +254,19 @@ export const ChatScreen = () => {
 	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
 		selectProject(project);
 		closeDrawer();
-		router.push("/threads");
+		replace("/threads");
 	};
 
 	const createQuickChat = async () => {
 		const chat = await createChat("New chat");
 		if (chat) {
-			router.push("/chat");
+			setIsTerminalOpen(false);
+			replace({
+				params: {
+					source: "terminal",
+				},
+				pathname: "/chat",
+			});
 		}
 	};
 
