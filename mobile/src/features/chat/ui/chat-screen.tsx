@@ -21,6 +21,7 @@ import { useWorkspaceShell } from "../model/use-workspace-shell";
 import { appendAttachmentPathsToMessage } from "../model/attachment-paths";
 import { StreamingTimeline } from "./streamingTimeline";
 import { DesktopFilePickerModal } from "./desktop-file-picker-modal";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
@@ -42,6 +43,7 @@ const palette = {
 };
 
 type ActivePicker = "branch" | "model" | "permission" | "reasoning";
+type FilePickerTarget = "chat" | "terminal";
 
 const getSelectModalTitle = (activePicker: ActivePicker | null): string => {
 	switch (activePicker) {
@@ -105,7 +107,6 @@ export const ChatScreen = () => {
 	const { replace } = useFlowNavigator();
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
-		createChat,
 		availableModels,
 		isLoaded,
 		isSending,
@@ -134,6 +135,7 @@ export const ChatScreen = () => {
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const [isTerminalOpen, setIsTerminalOpen] = useState<boolean>(false);
 	const [isFilePickerOpen, setIsFilePickerOpen] = useState<boolean>(false);
+	const [filePickerTarget, setFilePickerTarget] = useState<FilePickerTarget>("chat");
 	const [isKeyboardVisible, setIsKeyboardVisible] = useState<boolean>(false);
 	const [isBranchCheckoutPending, setIsBranchCheckoutPending] = useState<boolean>(false);
 	const selectorsScrollRef = useRef<ScrollView | null>(null);
@@ -142,6 +144,7 @@ export const ChatScreen = () => {
 	const [terminalError, setTerminalError] = useState<string>("");
 	const [isTerminalLoading, setIsTerminalLoading] = useState<boolean>(false);
 	const [isTerminalRunning, setIsTerminalRunning] = useState<boolean>(false);
+	const terminalInsets = useSafeAreaInsets();
 	const queryClient = useQueryClient();
 	const messageScrollRef = useRef<ScrollView | null>(null);
 	const terminalScrollRef = useRef<ScrollView | null>(null);
@@ -189,6 +192,8 @@ export const ChatScreen = () => {
 	const selectedReasoningLabel = selectedReasoningEffort ?? activeModel?.defaultReasoningEffort ?? "No reasoning";
 	const selectedBranch = gitCurrentBranch ?? "No branch";
 	const isGitRepository = gitStatusQuery.data?.isRepo ?? false;
+	const isChatFilePickerVisible = isFilePickerOpen && filePickerTarget === "chat";
+	const isTerminalFilePickerVisible = isFilePickerOpen && filePickerTarget === "terminal" && isTerminalOpen;
 	const availableBranches = useMemo(
 		() => gitBranchesQuery.data?.branches ?? [],
 		[gitBranchesQuery.data?.branches],
@@ -365,8 +370,9 @@ export const ChatScreen = () => {
 		}
 	};
 
-	const openFilePicker = () => {
+	const openFilePicker = (target: FilePickerTarget) => {
 		Keyboard.dismiss();
+		setFilePickerTarget(target);
 		setIsFilePickerOpen(true);
 	};
 
@@ -375,7 +381,11 @@ export const ChatScreen = () => {
 	};
 
 	const handleAddAttachmentPaths = (paths: string[]) => {
-		setInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
+		if (filePickerTarget === "terminal") {
+			setTerminalInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
+		} else {
+			setInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
+		}
 		setIsFilePickerOpen(false);
 	};
 
@@ -440,19 +450,6 @@ export const ChatScreen = () => {
 		closeDrawerThen(() => {
 			replace("/settings");
 		});
-	};
-
-	const createQuickChat = async () => {
-		const chat = await createChat("New chat");
-		if (chat) {
-			setIsTerminalOpen(false);
-			replace({
-				params: {
-					source: "terminal",
-				},
-				pathname: "/chat",
-			});
-		}
 	};
 
 	const runTerminalCommand = async () => {
@@ -785,7 +782,9 @@ export const ChatScreen = () => {
 				<View style={styles.composerRow}>
 					<Pressable
 						disabled={isSending || !selectedProjectId}
-						onPress={openFilePicker}
+						onPress={() => {
+							openFilePicker("chat");
+						}}
 						style={({ pressed }) => [
 							styles.attachAction,
 							pressed ? styles.attachActionPressed : null,
@@ -957,7 +956,7 @@ export const ChatScreen = () => {
 
 			<DesktopFilePickerModal
 				client={api}
-				isVisible={isFilePickerOpen}
+				isVisible={isChatFilePickerVisible}
 				onAddPaths={handleAddAttachmentPaths}
 				onClose={closeFilePicker}
 			/>
@@ -1068,22 +1067,20 @@ export const ChatScreen = () => {
 						onBack={() => {
 							setIsTerminalOpen(false);
 						}}
-						right={(
-							<Pressable
-								onPress={() => {
-									void createQuickChat();
-								}}
-								style={({ pressed }) => [styles.ghostButton, pressed ? styles.ghostButtonPressed : null]}
-								testID="terminal-new-chat-button"
-							>
-								<Text style={styles.ghostLabel}>New Chat</Text>
-							</Pressable>
-						)}
 						subtitle={selectedChat?.title ?? "No thread selected"}
 						title="Terminal"
 					/>
 
-					<View style={styles.terminalBody}>
+					<View
+						style={[
+							styles.terminalBody,
+							{
+								paddingLeft: Math.max(12, terminalInsets.left),
+								paddingRight: Math.max(12, terminalInsets.right),
+								paddingBottom: Math.max(16, terminalInsets.bottom),
+							},
+						]}
+					>
 						<ScrollView
 							contentContainerStyle={styles.terminalOutputContent}
 							contentInsetAdjustmentBehavior="automatic"
@@ -1104,6 +1101,20 @@ export const ChatScreen = () => {
 						) : null}
 
 						<View style={styles.terminalComposer}>
+							<Pressable
+								disabled={isTerminalRunning || !selectedChatId}
+								onPress={() => {
+									openFilePicker("terminal");
+								}}
+								style={({ pressed }) => [
+									styles.attachAction,
+									pressed ? styles.attachActionPressed : null,
+									isTerminalRunning || !selectedChatId ? styles.disabledButton : null,
+								]}
+								testID="terminal-attach-button"
+							>
+								<MaterialIcons color={palette.text} name="add" size={22} />
+							</Pressable>
 							<TextInput
 								autoCapitalize="none"
 								onChangeText={setTerminalInput}
@@ -1132,6 +1143,13 @@ export const ChatScreen = () => {
 							</Pressable>
 						</View>
 					</View>
+
+					<DesktopFilePickerModal
+						client={api}
+						isVisible={isTerminalFilePickerVisible}
+						onAddPaths={handleAddAttachmentPaths}
+						onClose={closeFilePicker}
+					/>
 				</KeyboardAvoidingView>
 			</Modal>
 		</KeyboardAvoidingView>
@@ -1487,7 +1505,6 @@ const styles = StyleSheet.create({
 	},
 	terminalBody: {
 		flex: 1,
-		paddingHorizontal: 12,
 		paddingTop: 12,
 	},
 	terminalComposer: {
@@ -1503,14 +1520,14 @@ const styles = StyleSheet.create({
 		marginBottom: 8,
 	},
 	terminalOutput: {
-		backgroundColor: "#0A0C10",
-		borderColor: palette.border,
-		borderRadius: 12,
-		borderWidth: 1,
+		backgroundColor: "transparent",
+		borderColor: "transparent",
+		borderRadius: 0,
+		borderWidth: 0,
 		flex: 1,
 	},
 	terminalOutputContent: {
-		padding: 12,
+		padding: 8,
 	},
 	terminalRoot: {
 		backgroundColor: palette.background,
