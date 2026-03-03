@@ -142,6 +142,7 @@ export const ChatScreen = () => {
 		selectedProjectId,
 		sendMessage,
 		selectedReasoningEffort,
+		streamingText,
 		streamingTurn,
 	} = useWorkspaceShell();
 	const [input, setInput] = useState<string>("");
@@ -267,6 +268,7 @@ export const ChatScreen = () => {
 	}, [drawerSearchValue, optimisticDeletedWorkspaceIds, projects]);
 
 	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
+	const hasStreamingText = streamingText.trim().length > 0;
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -315,7 +317,7 @@ export const ChatScreen = () => {
 
 	useEffect(() => {
 		messageScrollRef.current?.scrollToEnd({ animated: true });
-	}, [messages.length, streamingTurn]);
+	}, [messages.length, streamingText, streamingTurn]);
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -887,6 +889,18 @@ export const ChatScreen = () => {
 							</View>
 						);
 					})}
+
+					{hasStreamingText && !hasStreamingItems ? (
+						<View style={[styles.messageRow, styles.messageRowAssistant]}>
+							<View style={styles.assistantMessageContent}>
+								<MessageMarkdown
+									content={streamingText}
+									linkColor={palette.accent}
+									textColor={palette.text}
+								/>
+							</View>
+						</View>
+					) : null}
 
 					{hasStreamingItems && streamingTurn ? (
 						<View style={[styles.messageRow, styles.messageRowAssistant]}>

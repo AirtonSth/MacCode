@@ -5,6 +5,7 @@ import type { ChatRepository } from "../chat/chat.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
 import type { ProjectRepository } from "../project/project.repository";
+import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
 import { WsService } from "./ws.service";
 
 const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
@@ -583,4 +584,111 @@ test("WsService.startUserMessage forwards structured assistant_event payloads", 
 		.map((event) => event.data.event.type);
 
 	expect(assistantEvents).toEqual(["turn_started", "item_started"]);
+});
+
+test("WsService.startUserMessage updates and clears persisted stream snapshots", async () => {
+	const chat = createChat();
+	let findChatCalls = 0;
+	const chatRepository = {
+		findChatById: () => {
+			findChatCalls += 1;
+			if (findChatCalls === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+			...chat,
+			...update,
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (_chatId: string, role: "user" | "assistant", content: string) => ({
+			chatId: chat.id,
+			content,
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({
+			createdAt: "",
+			id: "project-id",
+			isFavorite: false,
+			name: "p",
+			path: "/tmp",
+			updatedAt: "",
+		}),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({ onDelta }: { onDelta: (delta: string) => void }) => {
+			onDelta("partial-1 ");
+			onDelta("partial-2");
+			return {
+				assistantText: "done",
+				diffAdded: 0,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const snapshotCalls = {
+		append: [] as Array<{ chatId: string; delta: string }>,
+		clear: [] as string[],
+		reset: [] as string[],
+	};
+	const snapshots: ChatStreamSnapshotRepositoryContract = {
+		appendDelta: (chatId: string, delta: string) => {
+			snapshotCalls.append.push({ chatId, delta });
+			return {
+				chatId,
+				partialText: snapshotCalls.append.filter((item) => item.chatId === chatId).map((item) => item.delta).join(""),
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		clear: (chatId: string) => {
+			snapshotCalls.clear.push(chatId);
+		},
+		getByChatId: () => null,
+		reset: (chatId: string) => {
+			snapshotCalls.reset.push(chatId);
+			return {
+				chatId,
+				partialText: "",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+	};
+
+	const service = new WsService(
+		chatRepository,
+		messageRepository,
+		projectRepository,
+		runner,
+		undefined,
+		snapshots,
+	);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(snapshotCalls.reset).toEqual(["chat-id"]);
+	expect(snapshotCalls.append).toEqual([
+		{ chatId: "chat-id", delta: "partial-1 " },
+		{ chatId: "chat-id", delta: "partial-2" },
+	]);
+	expect(snapshotCalls.clear).toEqual(["chat-id"]);
 });

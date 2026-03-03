@@ -1,4 +1,4 @@
-import type { ChatDTO, ServerWsEvent } from "../../types";
+import type { ChatDTO, ChatStreamSnapshotDTO, ServerWsEvent } from "../../types";
 import type { WorkspaceEventEnvelope } from "../../types";
 import { DEFAULT_CODEX_PERMISSION_MODE } from "../../../../shared/codex-permission-mode";
 import type { ChatRepository } from "../chat/chat.repository";
@@ -9,7 +9,25 @@ import {
 import type { ProjectRepository } from "../project/project.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
+import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
 import type { WsService as WsServiceContract, WsServiceInput } from "./ws.model";
+
+const noopChatStreamSnapshotRepository: ChatStreamSnapshotRepositoryContract = {
+	appendDelta: (chatId: string, delta: string) => ({
+		chatId,
+		partialText: delta,
+		updatedAt: new Date().toISOString(),
+	}),
+	clear: () => {
+		// no-op
+	},
+	getByChatId: () => null,
+	reset: (chatId: string) => ({
+		chatId,
+		partialText: "",
+		updatedAt: new Date().toISOString(),
+	}),
+};
 
 export class WsService implements WsServiceContract {
 	private readonly runningChats = new Set<string>();
@@ -20,6 +38,7 @@ export class WsService implements WsServiceContract {
 		private readonly projectRepository: ProjectRepository,
 		private readonly codexProviderRunner: CodexProviderRunnerContract = new CodexProviderRunner(),
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+		private readonly chatStreamSnapshots: ChatStreamSnapshotRepositoryContract = noopChatStreamSnapshotRepository,
 	) {}
 
 	private static buildClientErrorEvent(
@@ -97,6 +116,10 @@ export class WsService implements WsServiceContract {
 		return this.chatRepository.findChatById(chatId);
 	}
 
+	async getChatStreamSnapshot(chatId: string): Promise<ChatStreamSnapshotDTO | null> {
+		return this.chatStreamSnapshots.getByChatId(chatId);
+	}
+
 	async startUserMessage(input: WsServiceInput): Promise<void> {
 		const { chatId, clientId, emit, requestId, text } = input;
 		const chat = await this.chatRepository.findChatById(chatId);
@@ -166,6 +189,7 @@ export class WsService implements WsServiceContract {
 			},
 			event: "chat_updated",
 		});
+		this.chatStreamSnapshots.reset(chatId);
 
 		this.runningChats.add(chatId);
 
@@ -175,6 +199,7 @@ export class WsService implements WsServiceContract {
 				chatId,
 				model: input.model,
 				onDelta: (delta: string) => {
+					this.chatStreamSnapshots.appendDelta(chatId, delta);
 					emit({
 						data: {
 							chatId,
@@ -249,6 +274,7 @@ export class WsService implements WsServiceContract {
 			});
 		} finally {
 			this.runningChats.delete(chatId);
+			this.chatStreamSnapshots.clear(chatId);
 		}
 	}
 }
@@ -257,7 +283,14 @@ export const createWsService = (repositories: {
 	chat: ChatRepository;
 	message: MessageRepository;
 	project: ProjectRepository;
-}, workspaceEvents?: WorkspaceEventsServiceContract) =>
-	new WsService(repositories.chat, repositories.message, repositories.project, undefined, workspaceEvents);
+}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract) =>
+	new WsService(
+		repositories.chat,
+		repositories.message,
+		repositories.project,
+		undefined,
+		workspaceEvents,
+		chatStreamSnapshots,
+	);
 
 export const { createClientErrorEvent } = WsService;

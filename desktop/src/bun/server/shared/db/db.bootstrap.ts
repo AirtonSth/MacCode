@@ -51,6 +51,14 @@ const workspaceEventsCreateSql = `
 	)
 `;
 
+const chatStreamSnapshotsCreateSql = `
+	CREATE TABLE IF NOT EXISTS chat_stream_snapshots (
+		chatId TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+		partialText TEXT NOT NULL DEFAULT '',
+		updatedAt TEXT NOT NULL
+	)
+`;
+
 const serverMetadataCreateSql = `
 	CREATE TABLE IF NOT EXISTS server_metadata (
 		key TEXT PRIMARY KEY,
@@ -70,6 +78,7 @@ export class DatabaseBootstrap {
 		this.createTerminalCommandsTable(database);
 		this.createOrMigrateTerminalEntriesTable(database);
 		this.createWorkspaceEventsTable(database);
+		this.createChatStreamSnapshotsTable(database);
 		this.createServerMetadataTable(database);
 		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
@@ -291,6 +300,10 @@ export class DatabaseBootstrap {
 		database.exec(workspaceEventsCreateSql);
 	}
 
+	private static createChatStreamSnapshotsTable(database: Database): void {
+		database.exec(chatStreamSnapshotsCreateSql);
+	}
+
 	private static createServerMetadataTable(database: Database): void {
 		database.exec(serverMetadataCreateSql);
 	}
@@ -323,6 +336,9 @@ export class DatabaseBootstrap {
 		);
 		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_events_seq ON workspace_events(seq ASC)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_events_created_at ON workspace_events(createdAt ASC)");
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_chat_stream_snapshots_updated_at ON chat_stream_snapshots(updatedAt ASC)",
+		);
 		database.exec("CREATE INDEX IF NOT EXISTS idx_server_metadata_updated_at ON server_metadata(updatedAt DESC)");
 	}
 }

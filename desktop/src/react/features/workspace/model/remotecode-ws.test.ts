@@ -59,6 +59,26 @@ test("parseServerWsEvent parses assistant_done", () => {
 	});
 });
 
+test("parseServerWsEvent parses assistant_snapshot", () => {
+	const parsed = parseServerWsEvent({
+		event: "assistant_snapshot",
+		data: {
+			chatId: "chat-1",
+			partialText: "partial text",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+		},
+	});
+
+	expect(parsed).toEqual({
+		event: "assistant_snapshot",
+		data: {
+			chatId: "chat-1",
+			partialText: "partial text",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+		},
+	});
+});
+
 test("parseServerWsEvent parses assistant_event", () => {
 	const parsed = parseServerWsEvent({
 		event: "assistant_event",

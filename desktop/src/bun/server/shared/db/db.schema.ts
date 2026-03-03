@@ -83,6 +83,14 @@ export const workspaceEvents = sqliteTable("workspace_events", {
 	createdAt: text("createdAt").notNull(),
 });
 
+export const chatStreamSnapshots = sqliteTable("chat_stream_snapshots", {
+	chatId: text("chatId")
+		.primaryKey()
+		.references(() => chats.id, { onDelete: "cascade" }),
+	partialText: text("partialText").notNull().default(""),
+	updatedAt: text("updatedAt").notNull(),
+});
+
 export const serverMetadata = sqliteTable("server_metadata", {
 	key: text("key").primaryKey(),
 	value: text("value").notNull(),
@@ -97,6 +105,7 @@ export type WorkspaceSelectionRow = typeof workspaceSelection.$inferSelect;
 export type TerminalCommandRow = typeof terminalCommands.$inferSelect;
 export type TerminalEntryRow = typeof terminalEntries.$inferSelect;
 export type WorkspaceEventRow = typeof workspaceEvents.$inferSelect;
+export type ChatStreamSnapshotRow = typeof chatStreamSnapshots.$inferSelect;
 export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
 
 export class DatabaseSchema {
@@ -113,6 +122,8 @@ export class DatabaseSchema {
 	static readonly terminalEntries = terminalEntries;
 
 	static readonly workspaceEvents = workspaceEvents;
+
+	static readonly chatStreamSnapshots = chatStreamSnapshots;
 
 	static readonly serverMetadata = serverMetadata;
 }

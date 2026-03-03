@@ -5,6 +5,7 @@ export { toEdenApiResult, unwrapEdenData } from "./errors";
 export type {
 	AssistantDeltaServerEvent,
 	AssistantDoneServerEvent,
+	AssistantSnapshotServerEvent,
 	AssistantStructuredServerEvent,
 	AuthVerifyRequestDto,
 	AuthVerifyResponseDto,

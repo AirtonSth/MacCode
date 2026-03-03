@@ -56,6 +56,15 @@ export interface AssistantDoneEvent {
 	event: "assistant_done";
 }
 
+export interface AssistantSnapshotEvent {
+	data: {
+		chatId: string;
+		partialText: string;
+		updatedAt: string;
+	};
+	event: "assistant_snapshot";
+}
+
 export interface AssistantEvent {
 	data: {
 		chatId: string;
@@ -102,6 +111,7 @@ export type ServerWsEvent =
 	| AssistantDeltaEvent
 	| AssistantEvent
 	| AssistantDoneEvent
+	| AssistantSnapshotEvent
 	| ChatUpdatedEvent
 	| WorkspaceEvent
 	| ErrorEvent;
@@ -279,6 +289,22 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				chatId,
 			},
 			event: "assistant_done",
+		};
+	}
+
+	if (
+		event === "assistant_snapshot" &&
+		isString(chatId) &&
+		isString(data.partialText) &&
+		isString(data.updatedAt)
+	) {
+		return {
+			data: {
+				chatId,
+				partialText: data.partialText,
+				updatedAt: data.updatedAt,
+			},
+			event: "assistant_snapshot",
 		};
 	}
 

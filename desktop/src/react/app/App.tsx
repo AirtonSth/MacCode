@@ -259,6 +259,7 @@ const App = (): JSX.Element => {
 	const terminalOpenByChatRef = useRef<Record<string, boolean>>({});
 	const workspaceClientIdRef = useRef<string>(resolveWebSocketClientId());
 	const lastWorkspaceSeqRef = useRef<number>(0);
+	const pendingSendChatIdRef = useRef<string | null>(null);
 
 	const baseUrl = useMemo(() => {
 		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim();
@@ -734,12 +735,21 @@ const App = (): JSX.Element => {
 						},
 						type: "APPEND_STREAMING",
 					});
-					if (selectedChatIdRef.current === event.data.chatId) {
+					if (pendingSendChatIdRef.current === event.data.chatId) {
 						dispatch({
 							payload: false,
 							type: "SET_SENDING_MESSAGE",
 						});
 					}
+					break;
+				case "assistant_snapshot":
+					dispatch({
+						payload: {
+							chatId: event.data.chatId,
+							text: event.data.partialText,
+						},
+						type: "SET_STREAMING_SNAPSHOT",
+					});
 					break;
 				case "assistant_event":
 					dispatch({
@@ -749,7 +759,7 @@ const App = (): JSX.Element => {
 						},
 						type: "APPLY_ASSISTANT_EVENT",
 					});
-					if (selectedChatIdRef.current === event.data.chatId) {
+					if (pendingSendChatIdRef.current === event.data.chatId) {
 						dispatch({
 							payload: false,
 							type: "SET_SENDING_MESSAGE",
@@ -768,10 +778,13 @@ const App = (): JSX.Element => {
 						payload: { chatId: event.data.chatId },
 						type: "CLEAR_STREAM_TURN",
 					});
-					dispatch({
-						payload: false,
-						type: "SET_SENDING_MESSAGE",
-					});
+					if (pendingSendChatIdRef.current === event.data.chatId) {
+						pendingSendChatIdRef.current = null;
+						dispatch({
+							payload: false,
+							type: "SET_SENDING_MESSAGE",
+						});
+					}
 					break;
 				case "chat_updated":
 					dispatch({
@@ -796,7 +809,8 @@ const App = (): JSX.Element => {
 							payload: { chatId: event.data.chatId },
 							type: "CLEAR_STREAM_TURN",
 						});
-						if (selectedChatIdRef.current === event.data.chatId) {
+						if (pendingSendChatIdRef.current === event.data.chatId) {
+							pendingSendChatIdRef.current = null;
 							dispatch({
 								payload: false,
 								type: "SET_SENDING_MESSAGE",
@@ -1024,7 +1038,7 @@ const App = (): JSX.Element => {
 
 	const handleSendMessage = useCallback(
 		async (text: string) => {
-			await sendWorkspaceMessage({
+			const result = await sendWorkspaceMessage({
 				createChatId: async () => {
 					const chat = await handleCreateChat("New thread");
 					return chat?.id ?? null;
@@ -1071,6 +1085,13 @@ const App = (): JSX.Element => {
 				selectedProjectId: state.selectedProjectId,
 				text,
 			});
+
+			if (result.sent && result.chatId) {
+				pendingSendChatIdRef.current = result.chatId;
+				return;
+			}
+
+			pendingSendChatIdRef.current = null;
 		},
 		[
 			addError,

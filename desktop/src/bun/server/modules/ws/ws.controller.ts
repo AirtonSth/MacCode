@@ -23,6 +23,17 @@ export class WsController {
 		return new WsController(service, workspaceEvents).build();
 	}
 
+	private static isAssistantBroadcastEvent(
+		event: ServerWsEvent,
+	): event is ServerWsEvent & { event: "assistant_delta" | "assistant_done" | "assistant_event" | "assistant_snapshot" } {
+		return (
+			event.event === "assistant_delta" ||
+			event.event === "assistant_done" ||
+			event.event === "assistant_event" ||
+			event.event === "assistant_snapshot"
+		);
+	}
+
 	private static parseEventPayload(message: unknown): ClientWsEvent | null {
 		if (message === null) {
 			return null;
@@ -138,6 +149,27 @@ export class WsController {
 		}
 	}
 
+	private broadcastToChatAndWorkspace(chatId: string, event: ServerWsEvent) {
+		const targets = new Set<BroadcastSocket>();
+		const chatTargets = this.subscriptions.get(chatId);
+		if (chatTargets) {
+			for (const socket of chatTargets) {
+				targets.add(socket);
+			}
+		}
+		for (const socket of this.workspaceSubscriptions) {
+			targets.add(socket);
+		}
+
+		for (const socket of targets) {
+			try {
+				socket.send(event);
+			} catch {
+				// keep resilient and continue
+			}
+		}
+	}
+
 	private joinWorkspace(socket: BroadcastSocket) {
 		this.workspaceSubscriptions.add(socket);
 	}
@@ -165,6 +197,11 @@ export class WsController {
 
 	private createChatEmitter(chatId: string) {
 		return (event: ServerWsEvent) => {
+			if (WsController.isAssistantBroadcastEvent(event)) {
+				this.broadcastToChatAndWorkspace(chatId, event);
+				return;
+			}
+
 			this.broadcastToChat(chatId, event);
 		};
 	}
@@ -220,6 +257,19 @@ export class WsController {
 						}
 
 						this.joinChat(chatId, ws as BroadcastSocket);
+						if (chat.status === "running") {
+							const snapshot = await this.service.getChatStreamSnapshot(chatId);
+							if (snapshot && snapshot.partialText.length > 0) {
+								(ws as BroadcastSocket).send({
+									data: {
+										chatId: snapshot.chatId,
+										partialText: snapshot.partialText,
+										updatedAt: snapshot.updatedAt,
+									},
+									event: "assistant_snapshot",
+								});
+							}
+						}
 						return;
 					}
 

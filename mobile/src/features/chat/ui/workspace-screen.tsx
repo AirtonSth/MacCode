@@ -61,6 +61,7 @@ export const WorkspaceScreen = () => {
 		selectedChatId,
 		selectedProjectId,
 		sendMessage,
+		streamingText,
 		streamingTurn,
 		toggleFavorite,
 	} = useWorkspaceShell();
@@ -91,6 +92,7 @@ export const WorkspaceScreen = () => {
 		[projects],
 	);
 	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
+	const hasStreamingText = streamingText.trim().length > 0;
 
 	useEffect(() => {
 		setIsSidebarOpen(isWide);
@@ -98,7 +100,7 @@ export const WorkspaceScreen = () => {
 
 	useEffect(() => {
 		messagesScrollRef.current?.scrollToEnd({ animated: true });
-	}, [messages.length, streamingTurn]);
+	}, [messages.length, streamingText, streamingTurn]);
 
 	const handleSend = async () => {
 		const text = input.trim();
@@ -767,6 +769,32 @@ export const WorkspaceScreen = () => {
 									</View>
 								</View>
 							))}
+							{hasStreamingText && !hasStreamingItems ? (
+								<View
+									style={{
+										alignItems: "flex-start",
+										marginBottom: 10,
+									}}
+								>
+									<View
+										style={{
+											backgroundColor: theme.colors.chatBubbleAssistant,
+											borderColor: theme.colors.borderSoft,
+											borderRadius: theme.borderRadius.card,
+											borderWidth: 1,
+											maxWidth: "92%",
+											paddingHorizontal: 12,
+											paddingVertical: 10,
+										}}
+									>
+										<MessageMarkdown
+											content={streamingText}
+											linkColor={theme.colors.accent}
+											textColor={theme.colors.textPrimary}
+										/>
+									</View>
+								</View>
+							) : null}
 							{hasStreamingItems && streamingTurn ? (
 								<View
 									style={{

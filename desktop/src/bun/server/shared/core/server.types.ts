@@ -13,6 +13,12 @@ export interface ChatDTO {
 	updatedAt: string;
 }
 
+export interface ChatStreamSnapshotDTO {
+	chatId: string;
+	partialText: string;
+	updatedAt: string;
+}
+
 export type ChatProvider = "fake" | "codex";
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
@@ -213,6 +219,14 @@ export type ServerWsEvent =
 				chatId: string;
 			};
 			event: "assistant_done";
+	  }
+	| {
+			data: {
+				chatId: string;
+				partialText: string;
+				updatedAt: string;
+			};
+			event: "assistant_snapshot";
 	  }
 	| {
 			data: {

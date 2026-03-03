@@ -28,6 +28,7 @@ import { createTerminalRepository } from "./modules/terminal/terminal.repository
 import { createTerminalService } from "./modules/terminal/terminal.service";
 import { createWorkspaceEventsRepository } from "./modules/workspace-events/workspace-events.repository";
 import { createWorkspaceEventsService } from "./modules/workspace-events/workspace-events.service";
+import { createChatStreamSnapshotRepository } from "./modules/ws/chat-stream-snapshot.repository";
 import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
@@ -46,6 +47,7 @@ export const ServerBootstrap = {
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 		const terminalRepository = createTerminalRepository(databaseClient.orm);
 		const workspaceEventsRepository = createWorkspaceEventsRepository(databaseClient.orm);
+		const chatStreamSnapshotRepository = createChatStreamSnapshotRepository(databaseClient.orm);
 		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
@@ -67,6 +69,7 @@ export const ServerBootstrap = {
 			projectRepository,
 			undefined,
 			workspaceEventsService,
+			chatStreamSnapshotRepository,
 		);
 		const codexModelsService = new CodexModelsService();
 

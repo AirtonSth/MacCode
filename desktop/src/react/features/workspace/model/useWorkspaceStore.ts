@@ -111,6 +111,7 @@ export type WorkspaceAction =
 	| { type: "APPEND_MESSAGE"; payload: MessageDTO }
 	| { type: "START_STREAMING"; payload: { chatId: string } }
 	| { type: "APPEND_STREAMING"; payload: { chatId: string; delta: string } }
+	| { type: "SET_STREAMING_SNAPSHOT"; payload: { chatId: string; text: string } }
 	| { type: "CLEAR_STREAMING"; payload: { chatId: string } }
 	| { type: "RESET_STREAMING"; payload?: { chatId: string | null } }
 	| { type: "APPLY_ASSISTANT_EVENT"; payload: { chatId: string; event: AssistantStreamEvent } }
@@ -396,6 +397,19 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				streamingActiveByChat: {
 					...state.streamingActiveByChat,
 					[action.payload.chatId]: true,
+				},
+			};
+
+		case "SET_STREAMING_SNAPSHOT":
+			return {
+				...state,
+				streamingByChat: {
+					...state.streamingByChat,
+					[action.payload.chatId]: action.payload.text,
+				},
+				streamingActiveByChat: {
+					...state.streamingActiveByChat,
+					[action.payload.chatId]: action.payload.text.trim().length > 0,
 				},
 			};
 

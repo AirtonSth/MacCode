@@ -119,6 +119,15 @@ export interface AssistantDoneServerEvent {
 	event: "assistant_done";
 }
 
+export interface AssistantSnapshotServerEvent {
+	data: {
+		chatId: string;
+		partialText: string;
+		updatedAt: string;
+	};
+	event: "assistant_snapshot";
+}
+
 export interface AssistantStructuredServerEvent {
 	data: {
 		chatId: string;
@@ -150,6 +159,7 @@ export interface WsErrorServerEvent {
 export type ServerWsEvent =
 	| AssistantDeltaServerEvent
 	| AssistantDoneServerEvent
+	| AssistantSnapshotServerEvent
 	| AssistantStructuredServerEvent
 	| ChatUpdatedServerEvent
 	| WsErrorServerEvent

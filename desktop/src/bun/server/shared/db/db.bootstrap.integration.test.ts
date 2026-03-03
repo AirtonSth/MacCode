@@ -61,6 +61,15 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 				]),
 			);
 
+		const chatStreamSnapshotColumns = client.sqlite
+			.prepare("PRAGMA table_info(chat_stream_snapshots)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+
+		expect(chatStreamSnapshotColumns).toEqual(
+			expect.arrayContaining(["chatId", "partialText", "updatedAt"]),
+		);
+
 		const commandIndexes = client.sqlite
 			.prepare("PRAGMA index_list(terminal_commands)")
 			.all()
@@ -73,6 +82,12 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 			.map((row) => (row as { name: string }).name);
 		expect(entryIndexes).toContain("idx_terminal_entries_chat_id");
 		expect(entryIndexes).toContain("idx_terminal_entries_command_id");
+
+		const chatSnapshotIndexes = client.sqlite
+			.prepare("PRAGMA index_list(chat_stream_snapshots)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+		expect(chatSnapshotIndexes).toContain("idx_chat_stream_snapshots_updated_at");
 
 		expect(
 			(client.sqlite.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys,
@@ -350,6 +365,9 @@ test("terminal command and entries cascade on chat delete", async () => {
 		client.sqlite
 			.prepare("INSERT INTO terminal_entries (commandId, chatId, stream, data, createdAt) VALUES (?, ?, ?, ?, ?)")
 			.run("cmd-1", "chat-1", "stdout", "ok\n", "2026-01-01T00:00:00.101Z");
+		client.sqlite
+			.prepare("INSERT INTO chat_stream_snapshots (chatId, partialText, updatedAt) VALUES (?, ?, ?)")
+			.run("chat-1", "in-progress", "2026-01-01T00:00:00.100Z");
 
 		client.sqlite.prepare("DELETE FROM chats WHERE id = ?").run("chat-1");
 
@@ -359,9 +377,13 @@ test("terminal command and entries cascade on chat delete", async () => {
 		const entryCount = client.sqlite
 			.prepare("SELECT COUNT(1) AS count FROM terminal_entries WHERE chatId = ?")
 			.get("chat-1") as { count: number };
+		const snapshotCount = client.sqlite
+			.prepare("SELECT COUNT(1) AS count FROM chat_stream_snapshots WHERE chatId = ?")
+			.get("chat-1") as { count: number };
 
 		expect(commandCount.count).toBe(0);
 		expect(entryCount.count).toBe(0);
+		expect(snapshotCount.count).toBe(0);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

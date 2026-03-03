@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 
 import { expect, test } from "bun:test";
 
@@ -15,12 +16,13 @@ type ServerEvent =
 				delta?: string;
 				diffAdded?: number;
 				diffRemoved?: number;
+				partialText?: string;
 				status?: "pending" | "running" | "completed" | "failed";
 				updatedAt?: string;
 				code?: string;
 				message?: string;
 			};
-			event: "assistant_delta" | "assistant_done" | "chat_updated" | "error";
+			event: "assistant_delta" | "assistant_done" | "assistant_snapshot" | "chat_updated" | "error";
 	  };
 
 const parseEvent = (raw: unknown): ServerEvent | null => {
@@ -321,6 +323,78 @@ test("WS emits validation error for invalid payload", async () => {
 		expect(events.some((event) => event.includes("invalid reasoning effort"))).toBe(true);
 	} finally {
 		socket?.close();
+		await cleanup();
+	}
+});
+
+test("WS join_chat emits assistant_snapshot for running chats with persisted partial text", async () => {
+	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-snapshot-"));
+	let socket: WebSocket | undefined;
+	const database = new Database(databasePath);
+	const events: ServerEvent[] = [];
+
+	try {
+		const project = await client.v1.projects.post({ path: workspaceRoot });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: projectId }).chats.post({ title: "snapshot-chat" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		database
+			.prepare("UPDATE chats SET status = ?, updatedAt = ? WHERE id = ?")
+			.run("running", "2026-01-01T00:00:01.000Z", chatId);
+		database
+			.prepare(
+				"INSERT INTO chat_stream_snapshots (chatId, partialText, updatedAt) VALUES (?, ?, ?) ON CONFLICT(chatId) DO UPDATE SET partialText = excluded.partialText, updatedAt = excluded.updatedAt",
+			)
+			.run(chatId, "Recovered partial output", "2026-01-01T00:00:02.000Z");
+
+		socket = new WebSocket(`${baseUrl}/v1/ws?token=local-dev-token`);
+		await new Promise<void>((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				reject(new Error("timed out waiting websocket open"));
+			}, 2_000);
+			socket?.addEventListener("open", () => {
+				clearTimeout(timeout);
+				resolve();
+			});
+		});
+
+		socket.addEventListener("message", (rawEvent) => {
+			const parsed = parseEvent(rawEvent.data);
+			if (!parsed) {
+				return;
+			}
+
+			events.push(parsed);
+		});
+
+		socket.send(
+			JSON.stringify({
+				data: { chatId },
+				event: "join_chat",
+			}),
+		);
+
+		await waitForCondition(
+			() => events.some((event) => event.event === "assistant_snapshot"),
+			5_000,
+			"assistant_snapshot event",
+		);
+
+		const snapshotEvent = events.find((event) => event.event === "assistant_snapshot");
+		expect(snapshotEvent).toEqual({
+			data: {
+				chatId,
+				partialText: "Recovered partial output",
+				updatedAt: "2026-01-01T00:00:02.000Z",
+			},
+			event: "assistant_snapshot",
+		});
+	} finally {
+		socket?.close();
+		database.close();
+		rmSync(workspaceRoot, { force: true, recursive: true });
 		await cleanup();
 	}
 });

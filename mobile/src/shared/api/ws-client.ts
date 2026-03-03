@@ -180,6 +180,22 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 		};
 	}
 
+	if (
+		event === "assistant_snapshot" &&
+		isString(chatId) &&
+		isString(data.partialText) &&
+		isString(data.updatedAt)
+	) {
+		return {
+			data: {
+				chatId,
+				partialText: data.partialText,
+				updatedAt: data.updatedAt,
+			},
+			event: "assistant_snapshot",
+		};
+	}
+
 	if (event === "assistant_event" && isString(chatId)) {
 		const streamEvent = parseAssistantStreamEvent(data.event);
 		if (!streamEvent) {
@@ -273,6 +289,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 	let reconnectScheduled = false;
 	let isConnected = false;
 	const activeChats = new Set<string>();
+	let activeWorkspaceSubscription: { clientId?: string; lastSeq: number } | null = null;
 	const sendQueue: ClientWsEvent[] = [];
 
 	const notifyState = (state: ConnectionState) => {
@@ -347,6 +364,23 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				break;
 			}
 		}
+	};
+
+	const sendWorkspaceJoinNow = (subscription: { clientId?: string; lastSeq: number }): boolean => {
+		if (!socket || socket.readyState !== WebSocket.OPEN) {
+			return false;
+		}
+
+		socket.send(
+			JSON.stringify({
+				data: {
+					lastSeq: subscription.lastSeq,
+					...(subscription.clientId ? { clientId: subscription.clientId } : {}),
+				},
+				event: "join_workspace",
+			}),
+		);
+		return true;
 	};
 
 	const scheduleReconnect = () => {
@@ -466,13 +500,17 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			});
 		},
 		sendJoinWorkspace: (lastSeq = 0, clientId?: string) => {
-			send({
-				data: {
-					lastSeq,
-					...(clientId ? { clientId } : {}),
-				},
-				event: "join_workspace",
-			});
+			const normalizedLastSeq =
+				typeof lastSeq === "number" && Number.isFinite(lastSeq) && lastSeq > 0
+					? Math.floor(lastSeq)
+					: 0;
+			activeWorkspaceSubscription = {
+				lastSeq: normalizedLastSeq,
+				...(clientId ? { clientId } : {}),
+			};
+			if (activeWorkspaceSubscription) {
+				sendWorkspaceJoinNow(activeWorkspaceSubscription);
+			}
 		},
 		sendUserMessage: (
 			chatId: string,
