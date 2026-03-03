@@ -916,15 +916,16 @@ export const useWorkspaceShell = () => {
 		[projectsQuery.data, selectedProjectId],
 	);
 
-	const selectedChat = useMemo(
-		() => chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null,
-		[chatsQuery.data, selectedChatId],
-	);
-	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
-	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
-	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
-	const messages = messagesQuery.messages;
-	const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
+const selectedChat = useMemo(
+	() => chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null,
+	[chatsQuery.data, selectedChatId],
+);
+const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
+const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
+const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
+const isChatsLoading = Boolean(selectedProjectId) && chatsQuery.isPending;
+const messages = messagesQuery.messages;
+const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],
@@ -937,6 +938,7 @@ export const useWorkspaceShell = () => {
 		hasOlderMessages: messagesQuery.hasOlderMessages,
 		isLoaded: !projectsQuery.isLoading && selectionQuery.isFetched,
 		isLoadingOlderMessages: messagesQuery.isLoadingOlderMessages,
+		isChatsLoading,
 		isMessagesLoading,
 		isSending,
 		lastError,

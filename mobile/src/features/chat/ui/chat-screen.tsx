@@ -127,6 +127,7 @@ export const ChatScreen = () => {
 		deleteProject,
 		hasOlderMessages,
 		isLoaded,
+		isChatsLoading,
 		isLoadingOlderMessages,
 		isMessagesLoading,
 		isSending,
@@ -188,6 +189,7 @@ export const ChatScreen = () => {
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
 	const [openWorkspaceSwipeRowId, setOpenWorkspaceSwipeRowId] = useState<string | null>(null);
+	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
 	const gitStatusQuery = useQuery({
 		enabled: Boolean(selectedProjectId),
 		queryKey: queryKeys.projectGitStatus(selectedProjectId),
@@ -500,6 +502,22 @@ export const ChatScreen = () => {
 		});
 	};
 
+	useEffect(() => {
+		if (!openingWorkspaceId) {
+			return;
+		}
+
+		if (selectedProjectId !== openingWorkspaceId) {
+			return;
+		}
+
+		if (isChatsLoading) {
+			return;
+		}
+
+		setOpeningWorkspaceId(null);
+	}, [isChatsLoading, openingWorkspaceId, selectedProjectId]);
+
 	const closeDrawerThen = (onClosed: () => void) => {
 		Animated.parallel([
 			Animated.timing(drawerOpacity, {
@@ -520,6 +538,7 @@ export const ChatScreen = () => {
 	};
 
 	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
+		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		closeDrawerThen(() => {
 			goBackOr("/threads");
@@ -1477,6 +1496,7 @@ export const ChatScreen = () => {
 
 								{visibleWorkspaces.map((project, index) => (
 									<SwipeableWorkspaceItem
+										isLoading={openingWorkspaceId === project.id}
 										index={index}
 										key={project.id}
 										isActive={openWorkspaceSwipeRowId === project.id}

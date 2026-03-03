@@ -39,6 +39,7 @@ export const WorkspaceSelectionScreen = () => {
 		createProject,
 		deleteProject,
 		isLoaded,
+		isChatsLoading,
 		projects,
 		selectProject,
 		selectedProjectId,
@@ -47,6 +48,7 @@ export const WorkspaceSelectionScreen = () => {
 	const [isDesktopPickerVisible, setIsDesktopPickerVisible] = useState<boolean>(false);
 	const [isCreatingFromFab, setIsCreatingFromFab] = useState<boolean>(false);
 	const [openSwipeRowId, setOpenSwipeRowId] = useState<string | null>(null);
+	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
 	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(
 		new Set(),
 	);
@@ -97,6 +99,22 @@ export const WorkspaceSelectionScreen = () => {
 		);
 	}, [optimisticDeletedWorkspaceIds, projects, searchValue]);
 
+	useEffect(() => {
+		if (!openingWorkspaceId) {
+			return;
+		}
+
+		if (selectedProjectId !== openingWorkspaceId) {
+			return;
+		}
+
+		if (isChatsLoading) {
+			return;
+		}
+
+		setOpeningWorkspaceId(null);
+	}, [isChatsLoading, openingWorkspaceId, selectedProjectId]);
+
 	const markWorkspaceDeleteOptimistic = useCallback((projectId: string) => {
 		setOptimisticDeletedWorkspaceIds((current) => {
 			if (current.has(projectId)) {
@@ -123,6 +141,7 @@ export const WorkspaceSelectionScreen = () => {
 
 	const openWorkspace = (project: (typeof projects)[number]) => {
 		setOpenSwipeRowId(null);
+		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		push("/threads");
 	};
@@ -196,6 +215,7 @@ export const WorkspaceSelectionScreen = () => {
 						) : (
 							visibleProjects.map((project, index) => (
 								<SwipeableWorkspaceItem
+									isLoading={openingWorkspaceId === project.id}
 									deleteTestID={`workspace-item-delete-${String(index)}`}
 									index={index}
 									isActive={openSwipeRowId === project.id}

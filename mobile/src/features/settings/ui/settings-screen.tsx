@@ -429,7 +429,7 @@ export const SettingsScreen = () => {
 											pressed ? styles.listRowPressed : null,
 											isConnecting ? styles.disabledButton : null,
 										]}
-										testID={`saved-server-connect-${String(index)}`}
+										testID={`saved-server-item-${String(index)}`}
 									>
 										<View style={styles.rowTextGroup}>
 											<Text numberOfLines={1} style={styles.rowTitle}>
@@ -440,7 +440,11 @@ export const SettingsScreen = () => {
 											</Text>
 										</View>
 
-										<Text style={styles.disclosureSymbol}>{">"}</Text>
+										{isConnecting ? (
+											<ActivityIndicator color={palette.accent} size="small" />
+										) : (
+											<Text style={styles.disclosureSymbol}>{">"}</Text>
+										)}
 									</Pressable>
 								</SwipeableSavedConnectionItem>
 							);
@@ -490,18 +494,22 @@ export const SettingsScreen = () => {
 										pressed ? styles.listRowPressed : null,
 										isConnecting ? styles.disabledButton : null,
 									]}
-									testID={`server-connect-${String(index)}`}
-								>
-									<View style={styles.rowTextGroup}>
-										<Text numberOfLines={1} style={styles.rowTitle}>
-											{server.hostname}:{String(server.port)}
-										</Text>
-										<Text selectable numberOfLines={1} style={styles.rowMeta}>
-											{server.baseUrl}
-										</Text>
-									</View>
+									testID={`server-item-${String(index)}`}
+									>
+										<View style={styles.rowTextGroup}>
+											<Text numberOfLines={1} style={styles.rowTitle}>
+												{server.hostname}:{String(server.port)}
+											</Text>
+											<Text selectable numberOfLines={1} style={styles.rowMeta}>
+												{server.baseUrl}
+											</Text>
+										</View>
 
-										<Text style={styles.disclosureSymbol}>{">"}</Text>
+										{isConnecting ? (
+											<ActivityIndicator color={palette.accent} size="small" />
+										) : (
+											<Text style={styles.disclosureSymbol}>{">"}</Text>
+										)}
 									</Pressable>
 							);
 						}}

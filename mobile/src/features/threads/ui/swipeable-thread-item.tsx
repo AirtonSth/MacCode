@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { Animated, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Animated, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
 import { MaterialIcons } from "@expo/vector-icons";
 
 import { formatRelativeTime } from "../../../shared/lib/time";
@@ -17,6 +17,7 @@ interface SwipeableThreadItemProps {
 	index: number;
 	isActive: boolean;
 	isSelected: boolean;
+	isLoading?: boolean;
 	onClose: () => void;
 	onDelete: () => void;
 	onOpen: () => void;
@@ -30,6 +31,7 @@ export const SwipeableThreadItem = ({
 	index,
 	isActive,
 	isSelected,
+	isLoading = false,
 	onClose,
 	onDelete,
 	onOpen,
@@ -143,8 +145,14 @@ export const SwipeableThreadItem = ({
 				<Pressable
 					accessibilityLabel={`thread-item-${String(index)}`}
 					accessibilityRole="button"
+					accessibilityState={{ disabled: isLoading }}
 					testID={rowTestID}
+					disabled={isLoading}
 					onPress={() => {
+						if (isLoading) {
+							return;
+						}
+
 						if (isActive) {
 							close();
 							return;
@@ -154,19 +162,23 @@ export const SwipeableThreadItem = ({
 					}}
 					style={({ pressed }) => [pressed ? styles.listRowPressed : null]}
 				>
-						<View style={styles.rowContent}>
-							<View style={styles.rowText}>
-								<Text numberOfLines={1} style={styles.rowTitle}>
-									{chat.title}
-								</Text>
-								<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
-							</View>
-						<MaterialIcons color={palette.text} name="chevron-right" size={20} />
+					<View style={styles.rowContent}>
+						<View style={styles.rowText}>
+							<Text numberOfLines={1} style={styles.rowTitle}>
+								{chat.title}
+							</Text>
+							<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
+						</View>
+							{isLoading ? (
+								<ActivityIndicator color={palette.text} size="small" />
+							) : (
+								<MaterialIcons color={palette.text} name="chevron-right" size={20} />
+							)}
 						</View>
 					</Pressable>
-			</Animated.View>
-		</View>
-	);
+				</Animated.View>
+			</View>
+		);
 };
 
 const styles = StyleSheet.create({

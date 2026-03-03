@@ -47,14 +47,16 @@ export const ThreadSelectionScreen = () => {
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		chats,
-		createChat,
-		createProject,
-		deleteProject,
-		deleteChat,
-		isLoaded,
-		projects,
-		selectChat,
-		selectProject,
+	createChat,
+	createProject,
+	deleteProject,
+	deleteChat,
+	isLoaded,
+	isChatsLoading,
+	isMessagesLoading,
+	projects,
+	selectChat,
+	selectProject,
 		selectedChatId,
 		selectedProject,
 		selectedProjectId,
@@ -65,6 +67,8 @@ export const ThreadSelectionScreen = () => {
 	const [isCreating, setIsCreating] = useState<boolean>(false);
 	const [isWorkspacePickerOpen, setIsWorkspacePickerOpen] = useState<boolean>(false);
 	const [isCreatingWorkspaceFromDrawer, setIsCreatingWorkspaceFromDrawer] = useState<boolean>(false);
+	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
+	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
 	const [optimisticDeletedThreadIds, setOptimisticDeletedThreadIds] = useState<Set<string>>(new Set());
 	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(new Set());
 	const [toastMessage, setToastMessage] = useState<ToastPayload | null>(null);
@@ -234,7 +238,40 @@ export const ThreadSelectionScreen = () => {
 		});
 	};
 
+	useEffect(() => {
+		if (!openingThreadId) {
+			return;
+		}
+
+		if (selectedChatId !== openingThreadId) {
+			return;
+		}
+
+		if (isMessagesLoading) {
+			return;
+		}
+
+		setOpeningThreadId(null);
+	}, [isMessagesLoading, openingThreadId, selectedChatId]);
+
+	useEffect(() => {
+		if (!openingWorkspaceId) {
+			return;
+		}
+
+		if (selectedProjectId !== openingWorkspaceId) {
+			return;
+		}
+
+		if (isChatsLoading) {
+			return;
+		}
+
+		setOpeningWorkspaceId(null);
+	}, [isChatsLoading, openingWorkspaceId, selectedProjectId]);
+
 	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
+		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		closeDrawer();
 		replace("/threads");
@@ -268,6 +305,7 @@ export const ThreadSelectionScreen = () => {
 	};
 
 	const openThread = (chat: (typeof chats)[number]) => {
+		setOpeningThreadId(chat.id);
 		selectChat(chat);
 		push({
 			params: {
@@ -432,6 +470,7 @@ export const ThreadSelectionScreen = () => {
 						) : (
 							visibleThreads.map((chat, index) => (
 								<SwipeableThreadItem
+									isLoading={openingThreadId === chat.id}
 									index={index}
 									isActive={openSwipeRowId === chat.id}
 									isSelected={chat.id === selectedChatId}
@@ -565,6 +604,7 @@ export const ThreadSelectionScreen = () => {
 
 								{visibleWorkspaces.map((project, index) => (
 									<SwipeableWorkspaceItem
+										isLoading={openingWorkspaceId === project.id}
 										index={index}
 										isActive={openWorkspaceSwipeRowId === project.id}
 										isSelected={project.id === selectedProjectId}

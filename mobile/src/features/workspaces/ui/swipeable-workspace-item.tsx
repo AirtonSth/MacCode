@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { Animated, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Animated, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
 import { MaterialIcons } from "@expo/vector-icons";
 
 import type { ProjectDTO } from "../../../shared/api/types";
+
+const palette = {
+	text: "#F1F4FA",
+};
 
 const swipeDeleteWidth = 108;
 const swipeThreshold = 46;
@@ -15,6 +19,7 @@ interface SwipeableWorkspaceItemProps {
 	index: number;
 	isActive: boolean;
 	isSelected: boolean;
+	isLoading?: boolean;
 	onClose: () => void;
 	onDelete: () => void;
 	onOpen: () => void;
@@ -43,6 +48,7 @@ export const SwipeableWorkspaceItem = ({
 	rowBorderColor = defaultRowBorderColor,
 	selectedRowBackgroundColor = defaultSelectedRowBackgroundColor,
 	selectedRowBorderColor = defaultSelectedRowBorderColor,
+	isLoading = false,
 }: SwipeableWorkspaceItemProps) => {
 	const translateX = useRef(new Animated.Value(0)).current;
 	const dragStartRef = useRef(0);
@@ -152,8 +158,8 @@ export const SwipeableWorkspaceItem = ({
 				</Pressable>
 			</Animated.View>
 
-			<Animated.View
-				style={[
+				<Animated.View
+					style={[
 					styles.listRow,
 					isSelected ? styles.listRowActive : null,
 					{
@@ -165,38 +171,46 @@ export const SwipeableWorkspaceItem = ({
 							: rowBorderColor,
 					},
 					{ transform: [{ translateX }] },
-				]}
-				{...panResponder.panHandlers}
-			>
-				<Pressable
-					accessibilityLabel={`workspace-item-${String(index)}`}
-					accessibilityRole="button"
-					testID={rowTestID}
-					onPress={() => {
-						if (isActive) {
-							close();
-							return;
-						}
-
-						onOpenWorkspace();
-					}}
-					style={({ pressed }) => [pressed ? styles.listRowPressed : null]}
+					]}
+					{...panResponder.panHandlers}
 				>
-					<View style={styles.rowContent}>
-						<View style={styles.rowText}>
-							<Text numberOfLines={1} style={styles.rowTitle}>
-								{project.name}
-							</Text>
-							<Text numberOfLines={1} style={styles.rowMeta}>
-								{project.path}
-							</Text>
+					<Pressable
+						accessibilityLabel={`workspace-item-${String(index)}`}
+						accessibilityRole="button"
+						accessibilityState={{ disabled: isLoading }}
+						disabled={isLoading}
+						testID={rowTestID}
+						onPress={() => {
+							if (isLoading) {
+								return;
+							}
+
+							if (isActive) {
+								close();
+								return;
+							}
+
+							onOpenWorkspace();
+						}}
+						style={({ pressed }) => [pressed ? styles.listRowPressed : null]}
+					>
+						<View style={styles.rowContent}>
+							<View style={styles.rowText}>
+								<Text numberOfLines={1} style={styles.rowTitle}>
+									{project.name}
+								</Text>
+								<Text numberOfLines={1} style={styles.rowMeta}>
+									{project.path}
+								</Text>
+							</View>
+							{isLoading ? <ActivityIndicator color={palette.text} size="small" /> : (
+								<MaterialIcons color="#F1F4FA" name="chevron-right" size={20} />
+							)}
 						</View>
-						<MaterialIcons color="#F1F4FA" name="chevron-right" size={20} />
-					</View>
-				</Pressable>
-			</Animated.View>
-		</View>
-	);
+					</Pressable>
+				</Animated.View>
+			</View>
+		);
 };
 
 const styles = StyleSheet.create({

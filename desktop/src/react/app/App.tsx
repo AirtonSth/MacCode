@@ -4,6 +4,7 @@ import {
 	Folder,
 	FolderSearch,
 	FolderOpen,
+	Loader2,
 	MessageSquareText,
 	PanelLeft,
 	SquareTerminal,
@@ -421,6 +422,8 @@ const App = (): JSX.Element => {
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
 	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
 	const [projectThreadsOpen, setProjectThreadsOpen] = useState<Record<string, boolean>>({});
+	const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
+	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
 	const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
 		if (typeof window === "undefined") {
 			return DEFAULT_SIDEBAR_WIDTH;
@@ -1432,17 +1435,20 @@ const App = (): JSX.Element => {
 			selectedProjectIdRef.current = projectId;
 			selectedChatIdRef.current = null;
 			persistedSelectedChatIdRef.current = null;
+			setOpeningProjectId(projectId);
+			setOpeningThreadId(null);
 			await persistWorkspaceSelection(projectId, null);
 		},
 		[dispatch, persistWorkspaceSelection, state.selectedProjectId],
 	);
 
-	const handleSelectChat = useCallback(
+		const handleSelectChat = useCallback(
 		async (chatId: string) => {
 			if (chatId === state.selectedChatId) {
 				return;
 			}
 
+			setOpeningThreadId(chatId);
 			dispatch({ payload: chatId, type: "SET_SELECTED_CHAT" });
 			selectedChatIdRef.current = chatId;
 			persistedSelectedChatIdRef.current = chatId;
@@ -1450,6 +1456,38 @@ const App = (): JSX.Element => {
 		},
 		[dispatch, persistWorkspaceSelection, state.selectedChatId, state.selectedProjectId],
 	);
+
+	useEffect(() => {
+		if (!openingProjectId) {
+			return;
+		}
+
+		if (state.selectedProjectId !== openingProjectId) {
+			return;
+		}
+
+		if (state.chatsLoading) {
+			return;
+		}
+
+		setOpeningProjectId(null);
+	}, [openingProjectId, state.chatsLoading, state.selectedProjectId]);
+
+	useEffect(() => {
+		if (!openingThreadId) {
+			return;
+		}
+
+		if (state.selectedChatId !== openingThreadId) {
+			return;
+		}
+
+		if (state.messagesLoading) {
+			return;
+		}
+
+		setOpeningThreadId(null);
+	}, [openingThreadId, state.messagesLoading, state.selectedChatId]);
 
 	const handleDeleteProject = useCallback(
 		async (projectId: string) => {
@@ -1746,8 +1784,12 @@ const App = (): JSX.Element => {
 																}}
 																role="button"
 																tabIndex={0}
-															>
-																	<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />
+																>
+																	{project.id === openingProjectId ? (
+																		<Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
+																	) : (
+																		<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />
+																	)}
 																	<span className="min-w-0">
 																		<span
 																			className="block truncate text-[13px] font-medium text-slate-100"
@@ -1841,8 +1883,11 @@ const App = (): JSX.Element => {
 																							<span className={cn("inline-flex min-w-0 items-center", state.selectedChatId === chat.id ? "self-center" : "")}>
                                                                                                 <span className="truncate leading-5">{chat.title}</span>
                                                                                             </span>
-                                                                                            <div className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end">
-                                                                                            <span className="pr-1.5 text-[11px] text-slate-500 transition-opacity duration-150 group-hover:opacity-0">
+																				<div className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end">
+																							{chat.id === openingThreadId ? (
+																								<Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-slate-300" />
+																							) : null}
+																							<span className="pr-1.5 text-[11px] text-slate-500 transition-opacity duration-150 group-hover:opacity-0">
 																							{formatRelativeTime(chat.updatedAt)}
 																							</span>
 																							<Tooltip>
