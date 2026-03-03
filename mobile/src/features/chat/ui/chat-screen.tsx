@@ -7,6 +7,7 @@ import {
 	Animated,
 	Keyboard,
 	KeyboardAvoidingView,
+	ActivityIndicator,
 	Modal,
 	Platform,
 	Pressable,
@@ -31,6 +32,7 @@ import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/t
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
+import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
 
 const drawerWidth = 308;
 
@@ -119,6 +121,8 @@ export const ChatScreen = () => {
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		availableModels,
+		createProject,
+		deleteProject,
 		isLoaded,
 		isSending,
 		lastError,
@@ -144,6 +148,10 @@ export const ChatScreen = () => {
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
 	const [activePicker, setActivePicker] = useState<ActivePicker | null>(null);
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
+	const [isWorkspacePickerOpen, setIsWorkspacePickerOpen] = useState<boolean>(false);
+	const [isCreatingWorkspaceFromDrawer, setIsCreatingWorkspaceFromDrawer] = useState<boolean>(false);
+	const [drawerWorkspaceError, setDrawerWorkspaceError] = useState<string>("");
+	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(new Set());
 	const [isTerminalOpen, setIsTerminalOpen] = useState<boolean>(false);
 	const [isFilePickerOpen, setIsFilePickerOpen] = useState<boolean>(false);
 	const [filePickerTarget, setFilePickerTarget] = useState<FilePickerTarget>("chat");
@@ -168,6 +176,7 @@ export const ChatScreen = () => {
 	const terminalScrollRef = useRef<ScrollView | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
+	const [openWorkspaceSwipeRowId, setOpenWorkspaceSwipeRowId] = useState<string | null>(null);
 	const gitStatusQuery = useQuery({
 		enabled: Boolean(selectedProjectId),
 		queryKey: queryKeys.projectGitStatus(selectedProjectId),
@@ -246,15 +255,16 @@ export const ChatScreen = () => {
 			}
 			return left.name.localeCompare(right.name);
 		});
+		const filtered = sorted.filter((project) => !optimisticDeletedWorkspaceIds.has(project.id));
 
 		if (!query) {
-			return sorted;
+			return filtered;
 		}
 
-		return sorted.filter((project) =>
+		return filtered.filter((project) =>
 			project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
 		);
-	}, [projects, drawerSearchValue]);
+	}, [drawerSearchValue, optimisticDeletedWorkspaceIds, projects]);
 
 	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 
@@ -440,6 +450,7 @@ export const ChatScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
+			setOpenWorkspaceSwipeRowId(null);
 		});
 	};
 
@@ -457,6 +468,7 @@ export const ChatScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
+			setOpenWorkspaceSwipeRowId(null);
 			onClosed();
 		});
 	};
@@ -471,6 +483,65 @@ export const ChatScreen = () => {
 		closeDrawerThen(() => {
 			replace("/settings");
 		});
+	};
+
+	const createWorkspaceFromDrawer = async (paths: string[]) => {
+		const selectedPath = paths[0]?.trim();
+		if (!selectedPath) {
+			setDrawerWorkspaceError("Select a folder to create a workspace.");
+			return;
+		}
+
+		setIsWorkspacePickerOpen(false);
+		setIsCreatingWorkspaceFromDrawer(true);
+		setDrawerWorkspaceError("");
+		try {
+			await createProject({ path: selectedPath });
+			closeDrawer();
+			replace("/threads");
+		} catch (error: unknown) {
+			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to create workspace.");
+		} finally {
+			setIsCreatingWorkspaceFromDrawer(false);
+		}
+	};
+
+	const markWorkspaceDeleteOptimistic = useCallback((projectId: string) => {
+		setOptimisticDeletedWorkspaceIds((current) => {
+			if (current.has(projectId)) {
+				return current;
+			}
+
+			const next = new Set(current);
+			next.add(projectId);
+			return next;
+		});
+	}, []);
+
+	const revertWorkspaceDeletionOptimistic = useCallback((projectId: string) => {
+		setOptimisticDeletedWorkspaceIds((current) => {
+			if (!current.has(projectId)) {
+				return current;
+			}
+
+			const next = new Set(current);
+			next.delete(projectId);
+			return next;
+		});
+	}, []);
+
+	const deleteWorkspace = async (project: (typeof projects)[number]) => {
+		const projectId = project.id;
+		setOpenWorkspaceSwipeRowId((current) => (current === projectId ? null : current));
+		markWorkspaceDeleteOptimistic(projectId);
+
+		try {
+			await deleteProject(projectId);
+			setDrawerWorkspaceError("");
+		} catch (error: unknown) {
+			revertWorkspaceDeletionOptimistic(projectId);
+			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to delete workspace.");
+		}
 	};
 
 	const runTerminalCommand = async () => {
@@ -1199,6 +1270,24 @@ export const ChatScreen = () => {
 				onAddPaths={handleAddAttachmentPaths}
 				onClose={closeFilePicker}
 			/>
+			<DesktopFilePickerModal
+				client={api}
+				currentFolderAction="submit"
+				entryScope="directories"
+				isVisible={isWorkspacePickerOpen}
+				onAddPaths={(paths) => {
+					void createWorkspaceFromDrawer(paths);
+				}}
+				onClose={() => {
+					if (isCreatingWorkspaceFromDrawer) {
+						return;
+					}
+
+					setIsWorkspacePickerOpen(false);
+				}}
+				selectionMode="single"
+				isAddButtonVisible={false}
+			/>
 
 			<Modal animationType="none" onRequestClose={closeDrawer} transparent visible={isDrawerOpen}>
 				<View style={styles.drawerRoot}>
@@ -1218,7 +1307,34 @@ export const ChatScreen = () => {
 								y: 0,
 							}}
 						>
-							<Text style={styles.drawerTitle}>Workspaces</Text>
+							<View style={styles.drawerHeader}>
+								<Text style={styles.drawerTitle}>Workspaces</Text>
+								<Pressable
+									accessibilityLabel="drawer-create-workspace-button"
+									accessibilityRole="button"
+									disabled={isCreatingWorkspaceFromDrawer}
+									hitSlop={8}
+									onPress={() => {
+										setDrawerWorkspaceError("");
+										setIsWorkspacePickerOpen(true);
+									}}
+									style={({ pressed }) => [
+										styles.drawerCreateButton,
+										pressed ? styles.drawerCreateButtonPressed : null,
+										isCreatingWorkspaceFromDrawer ? styles.disabledButton : null,
+									]}
+									testID="drawer-create-workspace-button"
+								>
+									{isCreatingWorkspaceFromDrawer ? (
+										<ActivityIndicator color={palette.text} size="small" />
+									) : (
+										<MaterialIcons color={palette.text} name="add" size={18} />
+									)}
+								</Pressable>
+							</View>
+							{drawerWorkspaceError.length > 0 ? (
+								<Text style={styles.drawerErrorText}>{drawerWorkspaceError}</Text>
+							) : null}
 							<TextInput
 								autoCapitalize="none"
 								onChangeText={setDrawerSearchValue}
@@ -1240,27 +1356,32 @@ export const ChatScreen = () => {
 								) : null}
 
 								{visibleWorkspaces.map((project, index) => (
-									<Pressable
-										accessibilityLabel={`drawer-workspace-item-${String(index)}`}
-										accessibilityRole="button"
+									<SwipeableWorkspaceItem
+										index={index}
 										key={project.id}
-										onPress={() => {
+										isActive={openWorkspaceSwipeRowId === project.id}
+										isSelected={project.id === selectedProjectId}
+										onClose={() => {
+											setOpenWorkspaceSwipeRowId((current) => (current === project.id ? null : current));
+										}}
+										onDelete={() => {
+											void deleteWorkspace(project);
+										}}
+										onOpen={() => {
+											setOpenWorkspaceSwipeRowId(project.id);
+										}}
+										onOpenWorkspace={() => {
 											openWorkspaceFromDrawer(project);
 										}}
-										style={({ pressed }) => [
-											styles.drawerItem,
-											project.id === selectedProjectId ? styles.drawerItemActive : null,
-											pressed ? styles.drawerItemPressed : null,
-										]}
+										deleteTestID={`drawer-workspace-delete-${String(index)}`}
+										project={project}
 										testID={`drawer-workspace-item-${String(index)}`}
-									>
-										<Text numberOfLines={1} style={styles.drawerItemTitle}>
-											{project.name}
-										</Text>
-										<Text numberOfLines={1} style={styles.drawerItemMeta}>
-											{project.path}
-										</Text>
-									</Pressable>
+										rowBackgroundColor="rgba(255,255,255,0.04)"
+										rowBorderColor="rgba(255,255,255,0.2)"
+										selectedRowBackgroundColor="rgba(99,200,255,0.16)"
+										selectedRowBorderColor="rgba(99,200,255,0.75)"
+										rowTestID={`drawer-workspace-item-${String(index)}`}
+									/>
 								))}
 							</ScrollView>
 								<View style={styles.drawerFooter}>
@@ -1742,6 +1863,27 @@ const styles = StyleSheet.create({
 	drawerListScroll: {
 		flex: 1,
 	},
+	drawerCreateButton: {
+		alignItems: "center",
+		borderRadius: 10,
+		height: 30,
+		justifyContent: "center",
+		width: 30,
+	},
+	drawerCreateButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	drawerErrorText: {
+		color: "#FF8CA2",
+		fontSize: 12,
+		marginBottom: 8,
+	},
+	drawerHeader: {
+		alignItems: "center",
+		flexDirection: "row",
+		justifyContent: "space-between",
+		marginBottom: 10,
+	},
 	drawerPanel: {
 		elevation: 34,
 		shadowColor: "#000",
@@ -1784,7 +1926,7 @@ const styles = StyleSheet.create({
 		color: palette.text,
 		fontSize: 18,
 		fontWeight: "700",
-		marginBottom: 10,
+		marginBottom: 0,
 	},
 	emptyState: {
 		color: palette.muted,

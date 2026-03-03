@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { MaterialIcons } from "@expo/vector-icons";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
 	ActivityIndicator,
 	KeyboardAvoidingView,
@@ -13,10 +14,12 @@ import {
 } from "react-native";
 
 import { useWorkspaceShell } from "../../chat/model/use-workspace-shell";
+import { DesktopFilePickerModal } from "../../chat/ui/desktop-file-picker-modal";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
+import { SwipeableWorkspaceItem } from "./swipeable-workspace-item";
 
 const palette = {
 	accent: "#63C8FF",
@@ -32,11 +35,21 @@ export const WorkspaceSelectionScreen = () => {
 	const api = useRemoteCodeClient();
 	const { replace } = useFlowNavigator();
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
-	const { createProject, isLoaded, projects, selectProject, selectedProjectId } = useWorkspaceShell();
+	const {
+		createProject,
+		deleteProject,
+		isLoaded,
+		projects,
+		selectProject,
+		selectedProjectId,
+	} = useWorkspaceShell();
 	const [searchValue, setSearchValue] = useState<string>("");
-	const [newWorkspaceName, setNewWorkspaceName] = useState<string>("");
-	const [newWorkspacePath, setNewWorkspacePath] = useState<string>("");
-	const [isCreating, setIsCreating] = useState<boolean>(false);
+	const [isDesktopPickerVisible, setIsDesktopPickerVisible] = useState<boolean>(false);
+	const [isCreatingFromFab, setIsCreatingFromFab] = useState<boolean>(false);
+	const [openSwipeRowId, setOpenSwipeRowId] = useState<string | null>(null);
+	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(
+		new Set(),
+	);
 	const [errorMessage, setErrorMessage] = useState<string>("");
 
 	const serverHealthQuery = useQuery({
@@ -72,41 +85,77 @@ export const WorkspaceSelectionScreen = () => {
 			return left.name.localeCompare(right.name);
 		});
 
+		const filtered = sorted.filter((project) => !optimisticDeletedWorkspaceIds.has(project.id));
+
 		if (!query) {
-			return sorted;
+			return filtered;
 		}
 
-		return sorted.filter((item) =>
-			item.name.toLowerCase().includes(query) || item.path.toLowerCase().includes(query),
+		return filtered.filter(
+			(project) =>
+				project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
 		);
-	}, [projects, searchValue]);
+	}, [optimisticDeletedWorkspaceIds, projects, searchValue]);
+
+	const markWorkspaceDeleteOptimistic = useCallback((projectId: string) => {
+		setOptimisticDeletedWorkspaceIds((current) => {
+			if (current.has(projectId)) {
+				return current;
+			}
+
+			const next = new Set(current);
+			next.add(projectId);
+			return next;
+		});
+	}, []);
+
+	const revertWorkspaceDeletionOptimistic = useCallback((projectId: string) => {
+		setOptimisticDeletedWorkspaceIds((current) => {
+			if (!current.has(projectId)) {
+				return current;
+			}
+
+			const next = new Set(current);
+			next.delete(projectId);
+			return next;
+		});
+	}, []);
 
 	const openWorkspace = (project: (typeof projects)[number]) => {
+		setOpenSwipeRowId(null);
 		selectProject(project);
 		replace("/threads");
 	};
 
-	const createWorkspace = async () => {
-		const path = newWorkspacePath.trim();
-		if (!path) {
-			setErrorMessage("Workspace path is required.");
+	const createWorkspaceFromDesktopPaths = async (paths: string[]) => {
+		const selectedPath = paths[0]?.trim();
+		if (!selectedPath) {
+			setErrorMessage("Select a folder to create a workspace.");
 			return;
 		}
 
-		setIsCreating(true);
+		setIsDesktopPickerVisible(false);
+		setIsCreatingFromFab(true);
 		setErrorMessage("");
 		try {
-			await createProject({
-				name: newWorkspaceName.trim() || undefined,
-				path,
-			});
-			setNewWorkspaceName("");
-			setNewWorkspacePath("");
+			await createProject({ path: selectedPath });
 			replace("/threads");
 		} catch (error: unknown) {
 			setErrorMessage(error instanceof Error ? error.message : "Failed to create workspace.");
 		} finally {
-			setIsCreating(false);
+			setIsCreatingFromFab(false);
+		}
+	};
+
+	const deleteWorkspace = async (project: (typeof projects)[number]) => {
+		setOpenSwipeRowId((current) => (current === project.id ? null : current));
+		markWorkspaceDeleteOptimistic(project.id);
+
+		try {
+			await deleteProject(project.id);
+		} catch (error: unknown) {
+			revertWorkspaceDeletionOptimistic(project.id);
+			setErrorMessage(error instanceof Error ? error.message : "Failed to delete workspace.");
 		}
 	};
 
@@ -124,50 +173,16 @@ export const WorkspaceSelectionScreen = () => {
 				keyboardShouldPersistTaps="handled"
 				showsVerticalScrollIndicator={false}
 			>
-				<TextInput
-					autoCapitalize="none"
-					onChangeText={setSearchValue}
-					placeholder="Search workspaces"
-					placeholderTextColor={palette.muted}
-					style={styles.input}
-					testID="workspaces-search-input"
-					value={searchValue}
-				/>
-
-				<View style={styles.section}>
-					<Text style={styles.sectionTitle}>Create Workspace</Text>
+				<View style={styles.actionsRow}>
 					<TextInput
 						autoCapitalize="none"
-						onChangeText={setNewWorkspacePath}
-						placeholder="Path (required)"
+						onChangeText={setSearchValue}
+						placeholder="Search workspaces"
 						placeholderTextColor={palette.muted}
 						style={styles.input}
-						testID="workspaces-create-path-input"
-						value={newWorkspacePath}
+						testID="workspaces-search-input"
+						value={searchValue}
 					/>
-					<TextInput
-						autoCapitalize="none"
-						onChangeText={setNewWorkspaceName}
-						placeholder="Name (optional)"
-						placeholderTextColor={palette.muted}
-						style={styles.input}
-						testID="workspaces-create-name-input"
-						value={newWorkspaceName}
-					/>
-					<Pressable
-						disabled={isCreating}
-						onPress={() => {
-							void createWorkspace();
-						}}
-						style={({ pressed }) => [
-							styles.primaryButton,
-							pressed ? styles.primaryButtonPressed : null,
-							isCreating ? styles.disabledButton : null,
-						]}
-						testID="workspaces-create-button"
-					>
-						<Text style={styles.primaryLabel}>{isCreating ? "Creating..." : "Create"}</Text>
-					</Pressable>
 				</View>
 
 				{!isLoaded ? (
@@ -175,36 +190,32 @@ export const WorkspaceSelectionScreen = () => {
 						<ActivityIndicator color={palette.accent} />
 					</View>
 				) : (
-					<View style={styles.section}>
-						<Text style={styles.sectionTitle}>Your Workspaces</Text>
+					<View style={styles.list}>
 						{visibleProjects.length === 0 ? (
-							<Text style={styles.supportText}>No workspace available.</Text>
+							<Text style={styles.supportText}>No workspace found.</Text>
 						) : (
 							visibleProjects.map((project, index) => (
-								<Pressable
-									accessibilityLabel={`workspace-item-${String(index)}`}
-									accessibilityRole="button"
+								<SwipeableWorkspaceItem
+									deleteTestID={`workspace-item-delete-${String(index)}`}
+									index={index}
+									isActive={openSwipeRowId === project.id}
+									isSelected={project.id === selectedProjectId}
 									key={project.id}
-									onPress={() => {
+									onClose={() => {
+										setOpenSwipeRowId((current) => (current === project.id ? null : current));
+									}}
+									onDelete={() => {
+										void deleteWorkspace(project);
+									}}
+									onOpen={() => {
+										setOpenSwipeRowId(project.id);
+									}}
+									onOpenWorkspace={() => {
 										openWorkspace(project);
 									}}
-									style={({ pressed }) => [
-										styles.listRow,
-										project.id === selectedProjectId ? styles.listRowActive : null,
-										pressed ? styles.listRowPressed : null,
-									]}
-									testID={`workspace-item-${String(index)}`}
-								>
-									<View style={styles.rowHeader}>
-										<Text numberOfLines={1} style={styles.rowTitle}>
-											{project.name}
-										</Text>
-										{project.isFavorite ? <Text style={styles.favoriteMark}>Favorite</Text> : null}
-									</View>
-									<Text numberOfLines={1} style={styles.rowMeta}>
-										{project.path}
-									</Text>
-								</Pressable>
+									project={project}
+									rowTestID={`workspace-item-${String(index)}`}
+								/>
 							))
 						)}
 					</View>
@@ -218,14 +229,59 @@ export const WorkspaceSelectionScreen = () => {
 					</View>
 				) : null}
 			</ScrollView>
+
+			<Pressable
+				accessibilityRole="button"
+				disabled={isCreatingFromFab}
+				onPress={() => {
+					setErrorMessage("");
+					setIsDesktopPickerVisible(true);
+				}}
+				style={({ pressed }) => [
+					styles.fabButton,
+					pressed ? styles.fabButtonPressed : null,
+					isCreatingFromFab ? styles.disabledButton : null,
+				]}
+				testID="workspaces-create-fab"
+			>
+				{isCreatingFromFab ? (
+					<ActivityIndicator color="#0A1D2B" size="small" />
+				) : (
+					<MaterialIcons color="#0A1D2B" name="add" size={30} />
+				)}
+			</Pressable>
+
+			<DesktopFilePickerModal
+				client={api}
+				currentFolderAction="submit"
+				entryScope="directories"
+				isVisible={isDesktopPickerVisible}
+				onAddPaths={(paths) => {
+					void createWorkspaceFromDesktopPaths(paths);
+				}}
+				onClose={() => {
+					if (isCreatingFromFab) {
+						return;
+					}
+
+					setIsDesktopPickerVisible(false);
+				}}
+				selectionMode="single"
+				isAddButtonVisible={false}
+			/>
 		</KeyboardAvoidingView>
 	);
 };
 
 const styles = StyleSheet.create({
+	actionsRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
+	},
 	content: {
 		gap: 12,
-		paddingBottom: 36,
+		paddingBottom: 112,
 		paddingHorizontal: 16,
 		paddingTop: 14,
 	},
@@ -243,10 +299,29 @@ const styles = StyleSheet.create({
 		color: palette.text,
 		fontSize: 13,
 	},
-	favoriteMark: {
-		color: palette.accent,
-		fontSize: 11,
-		fontWeight: "600",
+	fabButton: {
+		alignItems: "center",
+		backgroundColor: palette.accent,
+		borderRadius: 29,
+		bottom: 22,
+		elevation: 9,
+		height: 58,
+		justifyContent: "center",
+		position: "absolute",
+		right: 18,
+		width: 58,
+		zIndex: 30,
+		shadowColor: "#00111F",
+		shadowOffset: {
+			height: 4,
+			width: 0,
+		},
+		shadowOpacity: 0.34,
+		shadowRadius: 10,
+	},
+	fabButtonPressed: {
+		backgroundColor: palette.accentPressed,
+		opacity: 0.93,
 	},
 	input: {
 		backgroundColor: palette.soft,
@@ -254,78 +329,32 @@ const styles = StyleSheet.create({
 		borderRadius: 12,
 		borderWidth: 1,
 		color: palette.text,
+		flex: 1,
 		fontSize: 15,
 		minHeight: 42,
 		paddingHorizontal: 12,
 		paddingVertical: 8,
 	},
-	listRow: {
-		borderColor: palette.border,
-		borderRadius: 12,
-		borderWidth: 1,
-		gap: 6,
-		padding: 12,
-	},
-	listRowActive: {
-		borderColor: "rgba(99,200,255,0.45)",
-	},
-	listRowPressed: {
-		backgroundColor: "rgba(255,255,255,0.08)",
-	},
 	loading: {
 		alignItems: "center",
-		paddingVertical: 20,
-	},
-	primaryButton: {
-		alignItems: "center",
-		backgroundColor: palette.accent,
-		borderRadius: 11,
-		height: 38,
 		justifyContent: "center",
-		paddingHorizontal: 12,
+		paddingVertical: 22,
 	},
-	primaryButtonPressed: {
-		backgroundColor: palette.accentPressed,
-	},
-	primaryLabel: {
-		color: "#0A1D2B",
-		fontSize: 13,
-		fontWeight: "700",
+	list: {
+		backgroundColor: "#12161E",
+		borderColor: palette.border,
+		borderRadius: 14,
+		borderWidth: 1,
+		gap: 8,
+		padding: 10,
 	},
 	root: {
 		backgroundColor: palette.background,
 		flex: 1,
 	},
-	rowHeader: {
-		alignItems: "center",
-		flexDirection: "row",
-		justifyContent: "space-between",
-	},
-	rowMeta: {
-		color: palette.muted,
-		fontSize: 12,
-	},
-	rowTitle: {
-		color: palette.text,
-		flex: 1,
-		fontSize: 15,
-		fontWeight: "600",
-	},
-	section: {
-		backgroundColor: "#12161E",
-		borderColor: palette.border,
-		borderRadius: 14,
-		borderWidth: 1,
-		gap: 10,
-		padding: 12,
-	},
-	sectionTitle: {
-		color: palette.text,
-		fontSize: 15,
-		fontWeight: "700",
-	},
 	supportText: {
 		color: palette.muted,
 		fontSize: 13,
+		padding: 8,
 	},
 });

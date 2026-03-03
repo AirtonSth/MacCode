@@ -5,6 +5,10 @@ import { MaterialIcons } from "@expo/vector-icons";
 import { formatRelativeTime } from "../../../shared/lib/time";
 import type { ChatDTO } from "../../../shared/api/types";
 
+const palette = {
+	text: "#F1F4FA",
+};
+
 const swipeDeleteWidth = 108;
 const swipeThreshold = 46;
 
@@ -150,11 +154,16 @@ export const SwipeableThreadItem = ({
 					}}
 					style={({ pressed }) => [pressed ? styles.listRowPressed : null]}
 				>
-					<Text numberOfLines={1} style={styles.rowTitle}>
-						{chat.title}
-					</Text>
-					<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
-				</Pressable>
+						<View style={styles.rowContent}>
+							<View style={styles.rowText}>
+								<Text numberOfLines={1} style={styles.rowTitle}>
+									{chat.title}
+								</Text>
+								<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
+							</View>
+						<MaterialIcons color={palette.text} name="chevron-right" size={20} />
+						</View>
+					</Pressable>
 			</Animated.View>
 		</View>
 	);
@@ -192,6 +201,15 @@ const styles = StyleSheet.create({
 		borderWidth: 1,
 		gap: 4,
 		padding: 12,
+	},
+	rowContent: {
+		alignItems: "center",
+		flexDirection: "row",
+		justifyContent: "space-between",
+		gap: 8,
+	},
+	rowText: {
+		flex: 1,
 	},
 	listRowActive: {
 		borderColor: "rgba(99,200,255,0.45)",

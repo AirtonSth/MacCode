@@ -22,6 +22,8 @@ import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator"
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { SwipeableThreadItem } from "./swipeable-thread-item";
+import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
+import { DesktopFilePickerModal } from "../../chat/ui/desktop-file-picker-modal";
 
 const palette = {
 	accent: "#63C8FF",
@@ -46,6 +48,8 @@ export const ThreadSelectionScreen = () => {
 	const {
 		chats,
 		createChat,
+		createProject,
+		deleteProject,
 		deleteChat,
 		isLoaded,
 		projects,
@@ -59,10 +63,15 @@ export const ThreadSelectionScreen = () => {
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const [isCreating, setIsCreating] = useState<boolean>(false);
+	const [isWorkspacePickerOpen, setIsWorkspacePickerOpen] = useState<boolean>(false);
+	const [isCreatingWorkspaceFromDrawer, setIsCreatingWorkspaceFromDrawer] = useState<boolean>(false);
 	const [optimisticDeletedThreadIds, setOptimisticDeletedThreadIds] = useState<Set<string>>(new Set());
+	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(new Set());
 	const [toastMessage, setToastMessage] = useState<ToastPayload | null>(null);
 	const [openSwipeRowId, setOpenSwipeRowId] = useState<string | null>(null);
+	const [openWorkspaceSwipeRowId, setOpenWorkspaceSwipeRowId] = useState<string | null>(null);
 	const [errorMessage, setErrorMessage] = useState<string>("");
+	const [drawerWorkspaceError, setDrawerWorkspaceError] = useState<string>("");
 	const drawerTranslate = useMemo(() => new Animated.Value(-drawerWidth), []);
 	const drawerOpacity = useMemo(() => new Animated.Value(0), []);
 	const toastOpacity = useRef(new Animated.Value(0)).current;
@@ -161,15 +170,16 @@ export const ThreadSelectionScreen = () => {
 			}
 			return left.name.localeCompare(right.name);
 		});
+		const filtered = sorted.filter((project) => !optimisticDeletedWorkspaceIds.has(project.id));
 
 		if (!query) {
-			return sorted;
+			return filtered;
 		}
 
-		return sorted.filter(
+		return filtered.filter(
 			(project) => project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
 		);
-	}, [drawerSearchValue, projects]);
+	}, [drawerSearchValue, optimisticDeletedWorkspaceIds, projects]);
 
 	const openDrawer = () => {
 		setIsDrawerOpen(true);
@@ -201,6 +211,7 @@ export const ThreadSelectionScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
+			setOpenWorkspaceSwipeRowId(null);
 		});
 	};
 
@@ -218,6 +229,7 @@ export const ThreadSelectionScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
+			setOpenWorkspaceSwipeRowId(null);
 			onClosed();
 		});
 	};
@@ -232,6 +244,27 @@ export const ThreadSelectionScreen = () => {
 		closeDrawerThen(() => {
 			replace("/settings");
 		});
+	};
+
+	const createWorkspaceFromDrawer = async (paths: string[]) => {
+		const selectedPath = paths[0]?.trim();
+		if (!selectedPath) {
+			setDrawerWorkspaceError("Select a folder to create a workspace.");
+			return;
+		}
+
+		setIsWorkspacePickerOpen(false);
+		setIsCreatingWorkspaceFromDrawer(true);
+		setDrawerWorkspaceError("");
+		try {
+			await createProject({ path: selectedPath });
+			closeDrawer();
+			replace("/threads");
+		} catch (error: unknown) {
+			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to create workspace.");
+		} finally {
+			setIsCreatingWorkspaceFromDrawer(false);
+		}
 	};
 
 	const openThread = (chat: (typeof chats)[number]) => {
@@ -293,6 +326,30 @@ export const ThreadSelectionScreen = () => {
 		});
 	}, []);
 
+	const markWorkspaceDeleteOptimistic = useCallback((projectId: string) => {
+		setOptimisticDeletedWorkspaceIds((current) => {
+			if (current.has(projectId)) {
+				return current;
+			}
+
+			const next = new Set(current);
+			next.add(projectId);
+			return next;
+		});
+	}, []);
+
+	const revertWorkspaceDeletionOptimistic = useCallback((projectId: string) => {
+		setOptimisticDeletedWorkspaceIds((current) => {
+			if (!current.has(projectId)) {
+				return current;
+			}
+
+			const next = new Set(current);
+			next.delete(projectId);
+			return next;
+		});
+	}, []);
+
 	const deleteThread = async (chat: (typeof chats)[number]) => {
 		const chatId = chat.id;
 		setOpenSwipeRowId((current) => (current === chatId ? null : current));
@@ -308,6 +365,26 @@ export const ThreadSelectionScreen = () => {
 			revertThreadDeletionOptimistic(chatId);
 			showThreadToast({
 				message: error instanceof Error ? error.message : "Failed to delete thread.",
+				type: "error",
+			});
+		}
+	};
+
+	const deleteWorkspace = async (project: (typeof projects)[number]) => {
+		const projectId = project.id;
+		setOpenWorkspaceSwipeRowId((current) => (current === projectId ? null : current));
+		markWorkspaceDeleteOptimistic(projectId);
+
+		try {
+			await deleteProject(projectId);
+			showThreadToast({
+				message: `Workspace "${project.name}" deleted.`,
+				type: "success",
+			});
+		} catch (error: unknown) {
+			revertWorkspaceDeletionOptimistic(projectId);
+			showThreadToast({
+				message: error instanceof Error ? error.message : "Failed to delete workspace.",
 				type: "error",
 			});
 		}
@@ -438,7 +515,34 @@ export const ThreadSelectionScreen = () => {
 								y: 0,
 							}}
 						>
-							<Text style={styles.drawerTitle}>Workspaces</Text>
+							<View style={styles.drawerHeader}>
+								<Text style={styles.drawerTitle}>Workspaces</Text>
+								<Pressable
+									accessibilityLabel="drawer-create-workspace-button"
+									accessibilityRole="button"
+									disabled={isCreatingWorkspaceFromDrawer}
+									hitSlop={8}
+									onPress={() => {
+										setDrawerWorkspaceError("");
+										setIsWorkspacePickerOpen(true);
+									}}
+									style={({ pressed }) => [
+										styles.drawerCreateButton,
+										pressed ? styles.drawerCreateButtonPressed : null,
+										isCreatingWorkspaceFromDrawer ? styles.disabledButton : null,
+									]}
+									testID="drawer-create-workspace-button"
+								>
+									{isCreatingWorkspaceFromDrawer ? (
+										<ActivityIndicator color={palette.text} size="small" />
+									) : (
+										<MaterialIcons color={palette.text} name="add" size={18} />
+									)}
+								</Pressable>
+							</View>
+							{drawerWorkspaceError.length > 0 ? (
+								<Text style={styles.drawerErrorText}>{drawerWorkspaceError}</Text>
+							) : null}
 							<TextInput
 								autoCapitalize="none"
 								onChangeText={setDrawerSearchValue}
@@ -459,30 +563,34 @@ export const ThreadSelectionScreen = () => {
 									<Text style={styles.drawerEmpty}>No workspace found.</Text>
 								) : null}
 
-							{visibleWorkspaces.map((project, index) => (
-									<Pressable
-										accessibilityLabel={`drawer-workspace-item-${String(index)}`}
-										accessibilityRole="button"
+								{visibleWorkspaces.map((project, index) => (
+									<SwipeableWorkspaceItem
+										index={index}
+										isActive={openWorkspaceSwipeRowId === project.id}
+										isSelected={project.id === selectedProjectId}
 										key={project.id}
-										onPress={() => {
+										onClose={() => {
+											setOpenWorkspaceSwipeRowId((current) => (current === project.id ? null : current));
+										}}
+										onDelete={() => {
+											void deleteWorkspace(project);
+										}}
+										onOpen={() => {
+											setOpenWorkspaceSwipeRowId(project.id);
+										}}
+										onOpenWorkspace={() => {
 											openWorkspaceFromDrawer(project);
 										}}
-										style={({ pressed }) => [
-											styles.drawerItem,
-											project.id === selectedProjectId ? styles.drawerItemActive : null,
-											pressed ? styles.drawerItemPressed : null,
-										]}
-										testID={`drawer-workspace-item-${String(index)}`}
-									>
-										<Text numberOfLines={1} style={styles.drawerItemTitle}>
-											{project.name}
-										</Text>
-										<Text numberOfLines={1} style={styles.drawerItemMeta}>
-											{project.path}
-										</Text>
-									</Pressable>
+										deleteTestID={`drawer-workspace-delete-${String(index)}`}
+										project={project}
+										rowBackgroundColor="rgba(255,255,255,0.04)"
+										rowBorderColor="rgba(255,255,255,0.2)"
+										selectedRowBackgroundColor="rgba(99,200,255,0.16)"
+										selectedRowBorderColor="rgba(99,200,255,0.75)"
+										rowTestID={`drawer-workspace-item-${String(index)}`}
+									/>
 								))}
-							</ScrollView>
+						</ScrollView>
 								<View style={styles.drawerFooter}>
 									<Pressable
 										onPress={() => {
@@ -508,6 +616,24 @@ export const ThreadSelectionScreen = () => {
 					</Animated.View>
 				</View>
 			</Modal>
+			<DesktopFilePickerModal
+				client={api}
+				currentFolderAction="submit"
+				entryScope="directories"
+				isVisible={isWorkspacePickerOpen}
+				onAddPaths={(paths) => {
+					void createWorkspaceFromDrawer(paths);
+				}}
+				onClose={() => {
+					if (isCreatingWorkspaceFromDrawer) {
+						return;
+					}
+
+					setIsWorkspacePickerOpen(false);
+				}}
+				selectionMode="single"
+				isAddButtonVisible={false}
+			/>
 		</KeyboardAvoidingView>
 	);
 };
@@ -643,6 +769,27 @@ const styles = StyleSheet.create({
 		fontSize: 13,
 		paddingTop: 12,
 	},
+	drawerErrorText: {
+		color: "#FF8CA2",
+		fontSize: 12,
+		marginBottom: 8,
+	},
+	drawerCreateButton: {
+		alignItems: "center",
+		borderRadius: 10,
+		height: 30,
+		justifyContent: "center",
+		width: 30,
+	},
+	drawerCreateButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	drawerHeader: {
+		alignItems: "center",
+		flexDirection: "row",
+		justifyContent: "space-between",
+		marginBottom: 10,
+	},
 	drawerItem: {
 		backgroundColor: "rgba(255,255,255,0.04)",
 		borderColor: "rgba(255,255,255,0.2)",
@@ -734,6 +881,6 @@ const styles = StyleSheet.create({
 		color: palette.text,
 		fontSize: 18,
 		fontWeight: "700",
-		marginBottom: 10,
+		marginBottom: 0,
 	},
 });

@@ -34,11 +34,19 @@ interface LoadDirectoryOptions {
 	silentLoading?: boolean;
 }
 
+type DesktopFilePickerSelectionMode = "single" | "multiple";
+type DesktopFilePickerEntryScope = "all" | "directories";
+type DesktopFilePickerCurrentFolderAction = "toggle" | "submit";
+
 interface DesktopFilePickerModalProps {
 	client: Pick<RemoteCodeClient, "listFsEntries" | "listFsRoots">;
+	currentFolderAction?: DesktopFilePickerCurrentFolderAction;
+	entryScope?: DesktopFilePickerEntryScope;
 	isVisible: boolean;
 	onAddPaths: (paths: string[]) => void;
 	onClose: () => void;
+	selectionMode?: DesktopFilePickerSelectionMode;
+	isAddButtonVisible?: boolean;
 }
 
 const WINDOWS_DRIVE_PATH_PATTERN = /^[A-Za-z]:\\/u;
@@ -137,9 +145,13 @@ const buildBreadcrumbs = (path: string | null): BreadcrumbPart[] => {
 
 export const DesktopFilePickerModal = ({
 	client,
+	currentFolderAction = "toggle",
+	entryScope = "all",
 	isVisible,
 	onAddPaths,
 	onClose,
+	selectionMode = "multiple",
+	isAddButtonVisible = true,
 }: DesktopFilePickerModalProps): JSX.Element => {
 	const [entries, setEntries] = useState<FsEntryDTO[]>([]);
 	const [currentPath, setCurrentPath] = useState<string | null>(null);
@@ -244,11 +256,28 @@ export const DesktopFilePickerModal = ({
 	}, [initializePicker, isVisible]);
 
 	const breadcrumbs = useMemo(() => buildBreadcrumbs(currentPath), [currentPath]);
+	const visibleEntries = useMemo(
+		() => (entryScope === "directories" ? entries.filter((entry) => entry.type === "directory") : entries),
+		[entries, entryScope],
+	);
 	const selectedCount = selectedPaths.size;
 	const isCurrentFolderSelected = Boolean(currentPath && selectedPaths.has(currentPath));
+	let currentFolderButtonLabel = "Select Current Folder";
+	if (currentFolderAction !== "submit" && isCurrentFolderSelected) {
+		currentFolderButtonLabel = "Unselect Current Folder";
+	}
+	const emptyStateLabel = entryScope === "directories" ? "No folders in this directory." : "This folder is empty.";
 
 	const togglePathSelection = useCallback((path: string) => {
 		setSelectedPaths((currentSelected) => {
+			if (selectionMode === "single") {
+				if (currentSelected.has(path) && currentSelected.size === 1) {
+					return new Set();
+				}
+
+				return new Set([path]);
+			}
+
 			const nextSelected = new Set(currentSelected);
 			if (nextSelected.has(path)) {
 				nextSelected.delete(path);
@@ -257,7 +286,7 @@ export const DesktopFilePickerModal = ({
 			}
 			return nextSelected;
 		});
-	}, []);
+	}, [selectionMode]);
 
 	const handleOpenParent = useCallback(() => {
 		if (!parentPath) {
@@ -279,8 +308,13 @@ export const DesktopFilePickerModal = ({
 			return;
 		}
 
+		if (currentFolderAction === "submit") {
+			onAddPaths([currentPath]);
+			return;
+		}
+
 		togglePathSelection(currentPath);
-	}, [currentPath, togglePathSelection]);
+	}, [currentFolderAction, currentPath, onAddPaths, togglePathSelection]);
 
 	const handleRetry = useCallback(() => {
 		if (currentPath) {
@@ -414,8 +448,8 @@ export const DesktopFilePickerModal = ({
 
 					{!isLoadingRoots && errorMessage.length === 0 ? (
 						<FlatList
-							contentContainerStyle={entries.length === 0 ? styles.emptyListContent : styles.listContent}
-							data={entries}
+							contentContainerStyle={visibleEntries.length === 0 ? styles.emptyListContent : styles.listContent}
+							data={visibleEntries}
 							keyExtractor={(entry) => entry.path}
 							renderItem={({ index, item }) => {
 								const isDirectory = item.type === "directory";
@@ -467,8 +501,8 @@ export const DesktopFilePickerModal = ({
 						/>
 					) : null}
 
-					{!isLoadingRoots && errorMessage.length === 0 && entries.length === 0 ? (
-						<Text style={styles.emptyState}>This folder is empty.</Text>
+					{!isLoadingRoots && errorMessage.length === 0 && visibleEntries.length === 0 ? (
+						<Text style={styles.emptyState}>{emptyStateLabel}</Text>
 					) : null}
 				</View>
 
@@ -484,22 +518,22 @@ export const DesktopFilePickerModal = ({
 						]}
 						testID="chat-file-picker-select-folder-button"
 					>
-						<Text style={styles.footerSecondaryLabel}>
-							{isCurrentFolderSelected ? "Unselect Current Folder" : "Select Current Folder"}
-						</Text>
+						<Text style={styles.footerSecondaryLabel}>{currentFolderButtonLabel}</Text>
 					</Pressable>
-					<Pressable
-						disabled={selectedCount === 0}
-						onPress={handleAdd}
-						style={({ pressed }) => [
-							styles.footerPrimaryButton,
-							selectedCount === 0 ? styles.actionDisabled : null,
-							pressed && selectedCount > 0 ? styles.footerPrimaryButtonPressed : null,
-						]}
-						testID="chat-file-picker-add-button"
-					>
-						<Text style={styles.footerPrimaryLabel}>{`Add ${String(selectedCount)} item${selectedCount === 1 ? "" : "s"}`}</Text>
-					</Pressable>
+					{isAddButtonVisible ? (
+						<Pressable
+							disabled={selectedCount === 0}
+							onPress={handleAdd}
+							style={({ pressed }) => [
+								styles.footerPrimaryButton,
+								selectedCount === 0 ? styles.actionDisabled : null,
+								pressed && selectedCount > 0 ? styles.footerPrimaryButtonPressed : null,
+							]}
+							testID="chat-file-picker-add-button"
+						>
+							<Text style={styles.footerPrimaryLabel}>{`Add ${String(selectedCount)} item${selectedCount === 1 ? "" : "s"}`}</Text>
+						</Pressable>
+					) : null}
 				</View>
 			</View>
 		</Modal>
