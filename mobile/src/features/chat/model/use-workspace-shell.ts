@@ -49,6 +49,37 @@ const isPlaceholderThreadTitle = (title: string): boolean => {
 const toRequestId = (): string =>
 	`req-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 
+const permissionModes = ["plan", "default", "full"] as const;
+const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+
+const normalizePermissionMode = (value: string | null | undefined): string => {
+	return typeof value === "string" && (permissionModes as readonly string[]).includes(value)
+		? value
+		: "default";
+};
+
+const normalizeSelectedModel = (value: string | null | undefined): string | null => {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : null;
+};
+
+const normalizeReasoningEffort = (value: string | null | undefined): string | null => {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	const trimmed = value.trim();
+	if (trimmed.length === 0) {
+		return null;
+	}
+
+	return (reasoningEfforts as readonly string[]).includes(trimmed) ? trimmed : null;
+};
+
 let inMemorySelectedProjectId: string | null = null;
 let inMemorySelectedChatId: string | null = null;
 
@@ -103,14 +134,17 @@ export const useWorkspaceShell = () => {
 	});
 
 	useEffect(() => {
-		if (!selectionQuery.data || hasBootstrappedSelectionRef.current) {
+		if (!selectionQuery.data) {
 			return;
 		}
 
-		inMemorySelectedProjectId ??= selectionQuery.data.selectedProjectId;
-		inMemorySelectedChatId ??= selectionQuery.data.selectedChatId;
-		setSelectedProjectId(inMemorySelectedProjectId);
-		setSelectedChatId(inMemorySelectedChatId);
+		inMemorySelectedProjectId = selectionQuery.data.selectedProjectId;
+		inMemorySelectedChatId = selectionQuery.data.selectedChatId;
+		setSelectedProjectId(selectionQuery.data.selectedProjectId);
+		setSelectedChatId(selectionQuery.data.selectedChatId);
+		setPermissionMode(normalizePermissionMode(selectionQuery.data.permissionMode));
+		setSelectedModel(normalizeSelectedModel(selectionQuery.data.selectedModel));
+		setSelectedReasoningEffort(normalizeReasoningEffort(selectionQuery.data.selectedReasoningEffort));
 		hasBootstrappedSelectionRef.current = true;
 	}, [selectionQuery.data]);
 
@@ -160,6 +194,11 @@ export const useWorkspaceShell = () => {
 						case "chat_deleted":
 						case "chat_updated": {
 							void queryClient.invalidateQueries({ queryKey: queryKeys.chats(selectedProjectId) });
+							break;
+						}
+						case "git_updated": {
+							void queryClient.invalidateQueries({ queryKey: queryKeys.projectGitStatusRoot });
+							void queryClient.invalidateQueries({ queryKey: queryKeys.projectGitBranchesRoot });
 							break;
 						}
 						case "message_created":
@@ -221,6 +260,65 @@ export const useWorkspaceShell = () => {
 		realtimeRef.current.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
 	}, [config.baseUrl, config.token]);
 
+	const persistSelection = useCallback(
+		(input: {
+			selectedProjectId: string | null;
+			selectedChatId: string | null;
+			permissionMode?: string | null;
+			selectedModel?: string | null;
+			selectedReasoningEffort?: string | null;
+		}) => {
+			const selectedProjectId = input.selectedProjectId;
+			const selectedChatId = selectedProjectId ? input.selectedChatId : null;
+			updateSelectionMutation.mutate({
+				selectedProjectId,
+				selectedChatId,
+				permissionMode: normalizePermissionMode(input.permissionMode ?? permissionMode),
+				selectedModel: normalizeSelectedModel(input.selectedModel ?? selectedModel),
+				selectedReasoningEffort: normalizeReasoningEffort(
+					input.selectedReasoningEffort ?? selectedReasoningEffort,
+				),
+			});
+		},
+		[permissionMode, selectedModel, selectedReasoningEffort, updateSelectionMutation],
+	);
+
+	const setPermissionModeWithSync = useCallback(
+		(value: string) => {
+			setPermissionMode(value);
+			persistSelection({
+				selectedProjectId,
+				selectedChatId,
+				permissionMode: value,
+			});
+		},
+		[persistSelection, selectedChatId, selectedProjectId],
+	);
+
+	const setSelectedModelWithSync = useCallback(
+		(value: string | null) => {
+			setSelectedModel(value);
+			persistSelection({
+				selectedProjectId,
+				selectedChatId,
+				selectedModel: value,
+			});
+		},
+		[persistSelection, selectedChatId, selectedProjectId],
+	);
+
+	const setSelectedReasoningEffortWithSync = useCallback(
+		(value: string | null) => {
+			setSelectedReasoningEffort(value);
+			persistSelection({
+				selectedProjectId,
+				selectedChatId,
+				selectedReasoningEffort: value,
+			});
+		},
+		[persistSelection, selectedChatId, selectedProjectId],
+	);
+
 	const selectProject = useCallback(
 		(project: ProjectDTO) => {
 			inMemorySelectedProjectId = project.id;
@@ -229,12 +327,12 @@ export const useWorkspaceShell = () => {
 			setSelectedChatId(null);
 			setLastError(null);
 
-			updateSelectionMutation.mutate({
+			persistSelection({
 				selectedChatId: null,
 				selectedProjectId: project.id,
 			});
 		},
-		[updateSelectionMutation],
+		[persistSelection],
 	);
 
 	const selectChat = useCallback(
@@ -245,14 +343,14 @@ export const useWorkspaceShell = () => {
 			setSelectedChatId(chat.id);
 			setLastError(null);
 
-			updateSelectionMutation.mutate({
+			persistSelection({
 				selectedChatId: chat.id,
 				selectedProjectId: chat.projectId,
 			});
 
 			realtimeRef.current?.sendJoinChat(chat.id);
 		},
-		[updateSelectionMutation],
+		[persistSelection],
 	);
 
 	const toggleFavorite = useCallback(
@@ -272,13 +370,13 @@ export const useWorkspaceShell = () => {
 			if (selectedChatId === chatId) {
 				inMemorySelectedChatId = null;
 				setSelectedChatId(null);
-				updateSelectionMutation.mutate({
+				persistSelection({
 					selectedChatId: null,
 					selectedProjectId,
 				});
 			}
 		},
-		[deleteChatMutation, selectedChatId, selectedProjectId, updateSelectionMutation],
+		[deleteChatMutation, persistSelection, selectedChatId, selectedProjectId],
 	);
 
 	const createChat = useCallback(
@@ -295,7 +393,7 @@ export const useWorkspaceShell = () => {
 			inMemorySelectedProjectId = selectedProjectId;
 			inMemorySelectedChatId = chat.id;
 			setSelectedChatId(chat.id);
-			updateSelectionMutation.mutate({
+			persistSelection({
 				selectedChatId: chat.id,
 				selectedProjectId,
 			});
@@ -303,7 +401,7 @@ export const useWorkspaceShell = () => {
 
 			return chat;
 		},
-		[createChatMutation, selectedProjectId, updateSelectionMutation],
+		[createChatMutation, persistSelection, selectedProjectId],
 	);
 
 	const createProject = useCallback(
@@ -315,14 +413,14 @@ export const useWorkspaceShell = () => {
 			inMemorySelectedChatId = null;
 			setSelectedProjectId(project.id);
 			setSelectedChatId(null);
-			updateSelectionMutation.mutate({
+			persistSelection({
 				selectedChatId: null,
 				selectedProjectId: project.id,
 			});
 
 			return project;
 		},
-		[client, queryClient, updateSelectionMutation],
+		[client, persistSelection, queryClient],
 	);
 
 	const deleteProject = useCallback(
@@ -335,13 +433,13 @@ export const useWorkspaceShell = () => {
 				inMemorySelectedChatId = null;
 				setSelectedProjectId(null);
 				setSelectedChatId(null);
-				updateSelectionMutation.mutate({
+				persistSelection({
 					selectedChatId: null,
 					selectedProjectId: null,
 				});
 			}
 		},
-		[client, queryClient, selectedProjectId, updateSelectionMutation],
+		[client, persistSelection, queryClient, selectedProjectId],
 	);
 
 	const sendMessage = useMutation({
@@ -481,9 +579,9 @@ export const useWorkspaceShell = () => {
 		selectedReasoningEffort,
 		selectChat,
 		selectProject,
-		setPermissionMode,
-		setSelectedModel,
-		setSelectedReasoningEffort,
+		setPermissionMode: setPermissionModeWithSync,
+		setSelectedModel: setSelectedModelWithSync,
+		setSelectedReasoningEffort: setSelectedReasoningEffortWithSync,
 		setStreamItemExpanded,
 		setStreamItemState,
 		selectedChat,

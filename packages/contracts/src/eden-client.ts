@@ -85,13 +85,16 @@ export interface EdenClient {
 		});
 		selection: {
 			get: () => Promise<unknown>;
-			patch: (
-				body: {
-					selectedChatId: string | null;
-					selectedProjectId: string | null;
-				} & MutationRequestMetadata,
-			) => Promise<unknown>;
-		};
+				patch: (
+					body: {
+						selectedChatId: string | null;
+						selectedProjectId: string | null;
+						permissionMode?: string;
+						selectedModel?: string | null;
+						selectedReasoningEffort?: string | null;
+					} & MutationRequestMetadata,
+				) => Promise<unknown>;
+			};
 	};
 }
 

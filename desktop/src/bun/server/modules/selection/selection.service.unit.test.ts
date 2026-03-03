@@ -7,15 +7,24 @@ import { WorkspaceSelectionService, createSelectionService, createWorkspaceSelec
 const createSelection = (input: {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	permissionMode?: "default" | "plan" | "full";
+	selectedModel?: string | null;
+	selectedReasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
 }): WorkspaceSelection => ({
 	selectedChatId: input.selectedChatId,
 	selectedProjectId: input.selectedProjectId,
+	permissionMode: input.permissionMode ?? "default",
+	selectedModel: input.selectedModel ?? null,
+	selectedReasoningEffort: input.selectedReasoningEffort ?? null,
 });
 
 test("Selection service loads workspace selection from repository", async () => {
 	const expected = createSelection({
 		selectedChatId: "chat-id",
 		selectedProjectId: "project-id",
+		permissionMode: "plan",
+		selectedModel: "gpt-5.3-codex",
+		selectedReasoningEffort: "high",
 	});
 
 	const repository = {
@@ -37,17 +46,27 @@ test("Selection service saves workspace selection through repository", async () 
 
 	let saved: WorkspaceSelection | undefined;
 
-	const repository = {
-		getWorkspaceSelection: () => createSelection({ selectedChatId: null, selectedProjectId: null }),
-		saveWorkspaceSelection: (selection: WorkspaceSelection) => {
-			saved = selection;
+		const repository = {
+			getWorkspaceSelection: () =>
+				createSelection({
+					selectedChatId: null,
+					selectedProjectId: null,
+					permissionMode: "default",
+					selectedModel: null,
+					selectedReasoningEffort: null,
+				}),
+			saveWorkspaceSelection: (selection: WorkspaceSelection) => {
+				saved = selection;
 
-			return {
-				selectedProjectId: selection.selectedProjectId,
-				selectedChatId: selection.selectedChatId,
-			};
-		},
-	} as unknown as WorkspaceSelectionRepository;
+				return {
+					selectedProjectId: selection.selectedProjectId,
+					selectedChatId: selection.selectedChatId,
+					permissionMode: selection.permissionMode,
+					selectedModel: selection.selectedModel,
+					selectedReasoningEffort: selection.selectedReasoningEffort,
+				};
+			},
+		} as unknown as WorkspaceSelectionRepository;
 
 	const service = new WorkspaceSelectionService(repository);
 	const savedSelection = await service.saveWorkspaceSelection(input);
@@ -59,8 +78,22 @@ test("Selection service saves workspace selection through repository", async () 
 
 test("Selection service factory aliases preserve WorkspaceSelectionService contract", () => {
 	const repository = {
-		getWorkspaceSelection: () => createSelection({ selectedChatId: null, selectedProjectId: null }),
-		saveWorkspaceSelection: () => createSelection({ selectedChatId: null, selectedProjectId: null }),
+		getWorkspaceSelection: () =>
+			createSelection({
+				selectedChatId: null,
+				selectedProjectId: null,
+				permissionMode: "default",
+				selectedModel: null,
+				selectedReasoningEffort: null,
+			}),
+		saveWorkspaceSelection: () =>
+			createSelection({
+				selectedChatId: null,
+				selectedProjectId: null,
+				permissionMode: "default",
+				selectedModel: null,
+				selectedReasoningEffort: null,
+			}),
 	} as unknown as WorkspaceSelectionRepository;
 
 	const defaultFactory = createSelectionService(repository);

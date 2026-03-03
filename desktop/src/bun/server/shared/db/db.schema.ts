@@ -40,6 +40,9 @@ export const workspaceSelection = sqliteTable("workspace_selection", {
 	id: text("id").primaryKey(),
 	selectedProjectId: text("selectedProjectId").references(() => projects.id, { onDelete: "set null" }),
 	selectedChatId: text("selectedChatId").references(() => chats.id, { onDelete: "set null" }),
+	permissionMode: text("permissionMode"),
+	selectedModel: text("selectedModel"),
+	selectedReasoningEffort: text("selectedReasoningEffort"),
 	updatedAt: text("updatedAt").notNull(),
 });
 

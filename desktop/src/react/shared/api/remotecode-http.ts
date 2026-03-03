@@ -1,4 +1,5 @@
-import type { CodexModelsCatalog } from "../../../shared/codex-model-config";
+import type { CodexModelsCatalog, CodexReasoningEffort } from "../../../shared/codex-model-config";
+import type { CodexPermissionMode } from "../../../shared/codex-permission-mode";
 
 export interface ApiConfig {
 	baseUrl: string;
@@ -36,6 +37,9 @@ export interface MessageDTO {
 export interface WorkspaceSelection {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	permissionMode: CodexPermissionMode;
+	selectedModel: string | null;
+	selectedReasoningEffort: CodexReasoningEffort | null;
 }
 
 export interface DiscoveryInfoDTO {
@@ -198,6 +202,9 @@ interface RestListMessagesResponse {
 interface RestWorkspaceSelectionResponse {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	permissionMode: CodexPermissionMode;
+	selectedModel: string | null;
+	selectedReasoningEffort: CodexReasoningEffort | null;
 }
 
 interface RestDeleteResponse {
@@ -408,11 +415,17 @@ export const RemoteCodeApi = {
 				});
 			},
 
-			updateWorkspaceSelection: async (
-				input: { selectedProjectId: string | null; selectedChatId: string | null },
-			): Promise<WorkspaceSelection> => {
-				const payload = await request<RestWorkspaceSelectionResponse>({
-					body: input,
+				updateWorkspaceSelection: async (
+					input: {
+						selectedProjectId: string | null;
+						selectedChatId: string | null;
+						permissionMode?: CodexPermissionMode;
+						selectedModel?: string | null;
+						selectedReasoningEffort?: CodexReasoningEffort | null;
+					},
+				): Promise<WorkspaceSelection> => {
+					const payload = await request<RestWorkspaceSelectionResponse>({
+						body: input,
 					method: "PATCH",
 					path: "/selection",
 				});

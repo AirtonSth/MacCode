@@ -331,6 +331,9 @@ const App = (): JSX.Element => {
 
 		return parseCodexReasoningEffort(window.localStorage.getItem(REASONING_EFFORT_STORAGE_KEY));
 	});
+	const permissionModeRef = useRef<CodexPermissionMode>(permissionMode);
+	const selectedModelRef = useRef<string | null>(selectedModel);
+	const selectedReasoningEffortRef = useRef<CodexReasoningEffort | null>(selectedReasoningEffort);
 
 	const selectedModelDescriptor = useMemo(
 		() => getModelDescriptorByName(availableModels, selectedModel),
@@ -344,6 +347,18 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		sidebarWidthRef.current = sidebarWidth;
 	}, [sidebarWidth]);
+
+	useEffect(() => {
+		permissionModeRef.current = permissionMode;
+	}, [permissionMode]);
+
+	useEffect(() => {
+		selectedModelRef.current = selectedModel;
+	}, [selectedModel]);
+
+	useEffect(() => {
+		selectedReasoningEffortRef.current = selectedReasoningEffort;
+	}, [selectedReasoningEffort]);
 
 	useEffect(() => {
 		if (typeof window === "undefined") {
@@ -541,11 +556,23 @@ const App = (): JSX.Element => {
 	}, [terminalState.chats]);
 
 	const persistWorkspaceSelection = useCallback(
-		async (selectedProjectId: string | null, selectedChatId: string | null) => {
+		async (
+			selectedProjectId: string | null,
+			selectedChatId: string | null,
+			overrides?: {
+				permissionMode?: CodexPermissionMode;
+				selectedModel?: string | null;
+				selectedReasoningEffort?: CodexReasoningEffort | null;
+			},
+		) => {
 			try {
 				await api.updateWorkspaceSelection({
 					selectedChatId,
 					selectedProjectId,
+					permissionMode: overrides?.permissionMode ?? permissionModeRef.current,
+					selectedModel: overrides?.selectedModel ?? selectedModelRef.current,
+					selectedReasoningEffort:
+						overrides?.selectedReasoningEffort ?? selectedReasoningEffortRef.current,
 				});
 			} catch (error) {
 				addError(
@@ -625,27 +652,51 @@ const App = (): JSX.Element => {
 
 	const loadProjects = useCallback(async () => {
 		dispatch({ payload: true, type: "SET_PROJECTS_LOADING" });
-		try {
-			const [projects, selection] = await Promise.all([
-				api.listProjects(),
-				api.getWorkspaceSelection().catch(() => ({ selectedChatId: null, selectedProjectId: null })),
-			]);
-			const hasSelection = selection.selectedProjectId
-				? projects.some((project) => project.id === selection.selectedProjectId)
-				: false;
-			const selectedProjectId = hasSelection ? selection.selectedProjectId : projects[0]?.id ?? null;
-			const selectedChatId = hasSelection ? selection.selectedChatId : null;
+			try {
+				const [projects, selection] = await Promise.all([
+					api.listProjects(),
+					api.getWorkspaceSelection().catch(() => ({
+						selectedChatId: null,
+						selectedProjectId: null,
+						permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+						selectedModel: null,
+						selectedReasoningEffort: null,
+					})),
+				]);
+				const hasSelection = selection.selectedProjectId
+					? projects.some((project) => project.id === selection.selectedProjectId)
+					: false;
+				const selectedProjectId = hasSelection ? selection.selectedProjectId : projects[0]?.id ?? null;
+				const selectedChatId = hasSelection ? selection.selectedChatId : null;
+				const nextPermissionMode =
+					parseCodexPermissionMode(selection.permissionMode) ?? DEFAULT_CODEX_PERMISSION_MODE;
+				const nextSelectedModel =
+					typeof selection.selectedModel === "string" && selection.selectedModel.trim().length > 0
+						? selection.selectedModel.trim()
+						: null;
+				const nextSelectedReasoningEffort =
+					parseCodexReasoningEffort(selection.selectedReasoningEffort) ?? null;
 
-			persistedSelectedChatIdRef.current = selectedChatId;
-			dispatch({ payload: projects, type: "SET_PROJECTS" });
-			dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
+				persistedSelectedChatIdRef.current = selectedChatId;
+				dispatch({ payload: projects, type: "SET_PROJECTS" });
+				dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
+				setPermissionMode(nextPermissionMode);
+				setSelectedModel(nextSelectedModel);
+				setSelectedReasoningEffort(nextSelectedReasoningEffort);
 
-			if (
-				selection.selectedProjectId !== selectedProjectId ||
-				selection.selectedChatId !== selectedChatId
-			) {
-				await persistWorkspaceSelection(selectedProjectId, selectedChatId);
-			}
+				if (
+					selection.selectedProjectId !== selectedProjectId ||
+					selection.selectedChatId !== selectedChatId ||
+					selection.permissionMode !== nextPermissionMode ||
+					(selection.selectedModel ?? null) !== nextSelectedModel ||
+					(selection.selectedReasoningEffort ?? null) !== nextSelectedReasoningEffort
+				) {
+					await persistWorkspaceSelection(selectedProjectId, selectedChatId, {
+						permissionMode: nextPermissionMode,
+						selectedModel: nextSelectedModel,
+						selectedReasoningEffort: nextSelectedReasoningEffort,
+					});
+				}
 		} catch (error) {
 			addError(
 				formatApiErrorMessage(error, "Unable to load projects"),
@@ -1034,20 +1085,59 @@ const App = (): JSX.Element => {
 		],
 	);
 
-	const handleModelChange = useCallback(
-		(nextModel: string) => {
-			setSelectedModel(nextModel);
-			const nextModelDescriptor = getModelDescriptorByName(availableModels, nextModel);
-			setSelectedReasoningEffort((current) =>
-				resolveSelectedReasoningEffort(nextModelDescriptor, current),
+	const persistCurrentSelectionPreferences = useCallback(
+		(overrides: {
+			permissionMode?: CodexPermissionMode;
+			selectedModel?: string | null;
+			selectedReasoningEffort?: CodexReasoningEffort | null;
+		}) => {
+			const selectedProjectId = selectedProjectIdRef.current;
+			const selectedChatId = selectedProjectId ? selectedChatIdRef.current : null;
+			void persistWorkspaceSelection(
+				selectedProjectId,
+				selectedChatId,
+				overrides,
 			);
 		},
-		[availableModels],
+		[persistWorkspaceSelection],
 	);
 
-	const handleReasoningEffortChange = useCallback((effort: CodexReasoningEffort) => {
-		setSelectedReasoningEffort(effort);
-	}, []);
+	const handlePermissionModeChange = useCallback(
+		(mode: CodexPermissionMode) => {
+			setPermissionMode(mode);
+			persistCurrentSelectionPreferences({
+				permissionMode: mode,
+			});
+		},
+		[persistCurrentSelectionPreferences],
+	);
+
+	const handleModelChange = useCallback(
+		(nextModel: string) => {
+			const nextModelDescriptor = getModelDescriptorByName(availableModels, nextModel);
+			const nextReasoningEffort = resolveSelectedReasoningEffort(
+				nextModelDescriptor,
+				selectedReasoningEffortRef.current,
+			);
+			setSelectedModel(nextModel);
+			setSelectedReasoningEffort(nextReasoningEffort);
+			persistCurrentSelectionPreferences({
+				selectedModel: nextModel,
+				selectedReasoningEffort: nextReasoningEffort,
+			});
+		},
+		[availableModels, persistCurrentSelectionPreferences],
+	);
+
+	const handleReasoningEffortChange = useCallback(
+		(effort: CodexReasoningEffort) => {
+			setSelectedReasoningEffort(effort);
+			persistCurrentSelectionPreferences({
+				selectedReasoningEffort: effort,
+			});
+		},
+		[persistCurrentSelectionPreferences],
+	);
 
 	const handleSetStreamItemExpanded = useCallback(
 		(itemId: string, expanded: boolean, byUser: boolean) => {
@@ -1708,11 +1798,11 @@ const App = (): JSX.Element => {
 														onCheckoutBranch={checkoutBranch}
 														onCreateBranch={createBranch}
 														onModelChange={handleModelChange}
-														onPickContextPaths={
-															electrobunView ? handlePickComposerContextPaths : undefined
-														}
-														onPermissionModeChange={setPermissionMode}
-														onReasoningEffortChange={handleReasoningEffortChange}
+															onPickContextPaths={
+																electrobunView ? handlePickComposerContextPaths : undefined
+															}
+															onPermissionModeChange={handlePermissionModeChange}
+															onReasoningEffortChange={handleReasoningEffortChange}
 														onSend={handleSendMessage}
 														permissionMode={permissionMode}
 														selectedModel={selectedModel}

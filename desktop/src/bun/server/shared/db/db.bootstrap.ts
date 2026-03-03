@@ -221,9 +221,27 @@ export class DatabaseBootstrap {
 				id TEXT PRIMARY KEY,
 				selectedProjectId TEXT REFERENCES projects(id) ON DELETE SET NULL,
 				selectedChatId TEXT REFERENCES chats(id) ON DELETE SET NULL,
+				permissionMode TEXT,
+				selectedModel TEXT,
+				selectedReasoningEffort TEXT,
 				updatedAt TEXT NOT NULL
 			)
 		`);
+		this.ensureWorkspaceSelectionColumns(database);
+	}
+
+	private static ensureWorkspaceSelectionColumns(database: Database): void {
+		if (!this.hasColumn(database, "workspace_selection", "permissionMode")) {
+			database.exec("ALTER TABLE workspace_selection ADD COLUMN permissionMode TEXT");
+		}
+
+		if (!this.hasColumn(database, "workspace_selection", "selectedModel")) {
+			database.exec("ALTER TABLE workspace_selection ADD COLUMN selectedModel TEXT");
+		}
+
+		if (!this.hasColumn(database, "workspace_selection", "selectedReasoningEffort")) {
+			database.exec("ALTER TABLE workspace_selection ADD COLUMN selectedReasoningEffort TEXT");
+		}
 	}
 
 	private static createTerminalCommandsTable(database: Database): void {

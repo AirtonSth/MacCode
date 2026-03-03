@@ -300,7 +300,7 @@ export const GitQuickControl = ({
 							}}
 							role="dialog"
 						>
-							<div className="flex items-center justify-between">
+							<div className="flex items-center justify-between pb-[16px]">
 								<h3 className="text-[18px] font-semibold leading-6 tracking-[-0.01em] text-[#f4f6fa]">
 									{isCommitting ? "Committing changes" : "Commit your changes"}
 								</h3>
@@ -343,7 +343,7 @@ export const GitQuickControl = ({
 							) : isRepo ? (
 								<form className="mt-4 space-y-4" onSubmit={handleContinue}>
 									<div className="space-y-2 text-sm text-[#f4f6fa]">
-										<div className="flex items-center justify-between gap-4">
+										<div className="flex items-center justify-between gap-4 pb-[16px]">
 											<span className="font-semibold text-[#eceff4]">Branch</span>
 											<div className="inline-flex min-w-0 items-center gap-2 text-right">
 												<GitBranch className="h-4 w-4 shrink-0 text-[#d7dbe2]" />
@@ -352,7 +352,7 @@ export const GitQuickControl = ({
 												</span>
 											</div>
 										</div>
-										<div className="flex items-center justify-between gap-4">
+										<div className="flex items-center justify-between gap-4 pb-[16px]">
 											<span className="font-semibold text-[#eceff4]">Changes</span>
 											<div className="inline-flex items-center gap-2 text-[15px] font-medium">
 												<span className="text-[#aeb3bc]">
@@ -370,7 +370,7 @@ export const GitQuickControl = ({
 										</div>
 									</div>
 
-									<label className="flex items-center gap-2.5 py-[4px] text-[14px] font-medium text-[#eceff4]">
+									<label className="flex items-center gap-2.5 pb-[16px] py-[4px] text-[14px] font-medium text-[#eceff4]">
 										<button
 											aria-label={includeUnstaged ? "Disable include unstaged changes" : "Enable include unstaged changes"}
 											className={cn(
@@ -392,7 +392,7 @@ export const GitQuickControl = ({
 										Include unstaged
 									</label>
 
-									<div className="space-y-2">
+									<div className="space-y-2 pb-[16px]">
 										<label className="block text-[13px] font-semibold text-[#eceff4]" htmlFor="git-quick-commit-message">
 											Commit message
 										</label>

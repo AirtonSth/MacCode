@@ -14,6 +14,9 @@ import { createSelectionRepository } from "./selection.repository";
 const createSelectionFromRow = (row: {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	permissionMode?: "default" | "plan" | "full";
+	selectedModel?: string | null;
+	selectedReasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
 }) => ({ ...row });
 
 test("selection repository upserts one row and returns stored selection", async () => {
@@ -30,47 +33,77 @@ test("selection repository upserts one row and returns stored selection", async 
 		const project = await projectRepository.createProject("/tmp", "Project for selection");
 		const chat = await chatRepository.createChat(project.id, "Chat for selection");
 
-		const first = repository.saveWorkspaceSelection({
-			selectedChatId: null,
-			selectedProjectId: null,
-		});
-		expect(first).toEqual(createSelectionFromRow({ selectedProjectId: null, selectedChatId: null }));
+			const first = repository.saveWorkspaceSelection({
+				selectedChatId: null,
+				selectedProjectId: null,
+				permissionMode: "default",
+				selectedModel: null,
+				selectedReasoningEffort: null,
+			});
+			expect(first).toEqual(
+				createSelectionFromRow({
+					selectedProjectId: null,
+					selectedChatId: null,
+					permissionMode: "default",
+					selectedModel: null,
+					selectedReasoningEffort: null,
+				}),
+			);
 
-		const second = repository.saveWorkspaceSelection({
-			selectedProjectId: project.id,
-			selectedChatId: null,
-		});
-		expect(second.selectedProjectId).toBe(project.id);
+			const second = repository.saveWorkspaceSelection({
+				selectedProjectId: project.id,
+				selectedChatId: null,
+				permissionMode: "plan",
+				selectedModel: "gpt-5.3-codex",
+				selectedReasoningEffort: "high",
+			});
+			expect(second.selectedProjectId).toBe(project.id);
+			expect(second.permissionMode).toBe("plan");
 
-		const third = repository.saveWorkspaceSelection({
-			selectedProjectId: project.id,
-			selectedChatId: chat.id,
-		});
-		expect(third).toEqual(
-			createSelectionFromRow({
+			const third = repository.saveWorkspaceSelection({
 				selectedProjectId: project.id,
 				selectedChatId: chat.id,
-			}),
-		);
+				permissionMode: "full",
+				selectedModel: "gpt-5.3-codex-spark",
+				selectedReasoningEffort: "xhigh",
+			});
+			expect(third).toEqual(
+				createSelectionFromRow({
+					selectedProjectId: project.id,
+					selectedChatId: chat.id,
+					permissionMode: "full",
+					selectedModel: "gpt-5.3-codex-spark",
+					selectedReasoningEffort: "xhigh",
+				}),
+			);
 
-		const loaded = repository.getWorkspaceSelection();
-		expect(loaded).toEqual(createSelectionFromRow({
-			selectedProjectId: project.id,
-			selectedChatId: chat.id,
-		}));
+			const loaded = repository.getWorkspaceSelection();
+			expect(loaded).toEqual(createSelectionFromRow({
+				selectedProjectId: project.id,
+				selectedChatId: chat.id,
+				permissionMode: "full",
+				selectedModel: "gpt-5.3-codex-spark",
+				selectedReasoningEffort: "xhigh",
+			}));
 
-		const rows = client.orm.select().from(workspaceSelection).all() as {
-			id: string;
-			selectedChatId: string | null;
-			selectedProjectId: string | null;
-		}[];
+			const rows = client.orm.select().from(workspaceSelection).all() as {
+				id: string;
+				selectedChatId: string | null;
+				selectedProjectId: string | null;
+				permissionMode: string | null;
+				selectedModel: string | null;
+				selectedReasoningEffort: string | null;
+			}[];
 
 		expect(rows).toHaveLength(1);
-		expect(rows[0]).toMatchObject({
-			id: "default",
-			selectedProjectId: project.id,
-			selectedChatId: chat.id,
-		});
+			expect(rows[0]).toMatchObject({
+				id: "default",
+				selectedProjectId: project.id,
+				selectedChatId: chat.id,
+				permissionMode: "full",
+				selectedModel: "gpt-5.3-codex-spark",
+				selectedReasoningEffort: "xhigh",
+			});
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });
@@ -92,16 +125,27 @@ test("selection repository clears ids when selected project is deleted", async (
 		const project = await projectRepository.createProject("/tmp", "Selected project");
 		const chat = await chatRepository.createChat(project.id, "Selected thread");
 
-		await repository.saveWorkspaceSelection({
-			selectedProjectId: project.id,
-			selectedChatId: chat.id,
-		});
+			await repository.saveWorkspaceSelection({
+				selectedProjectId: project.id,
+				selectedChatId: chat.id,
+				permissionMode: "plan",
+				selectedModel: "gpt-5.3-codex",
+				selectedReasoningEffort: "medium",
+			});
 
 		projectRepository.deleteProject(project.id);
 
 		const selection = await repository.getWorkspaceSelection();
-		expect(selection).toEqual(createSelectionFromRow({ selectedProjectId: null, selectedChatId: null }));
-	} finally {
+			expect(selection).toEqual(
+				createSelectionFromRow({
+					selectedProjectId: null,
+					selectedChatId: null,
+					permissionMode: "default",
+					selectedModel: "gpt-5.3-codex",
+					selectedReasoningEffort: "medium",
+				}),
+			);
+		} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });
 	}

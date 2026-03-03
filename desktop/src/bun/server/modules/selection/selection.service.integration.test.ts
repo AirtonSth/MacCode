@@ -26,18 +26,30 @@ test("selection service persists and reads workspace selection", async () => {
 		const chat = await chatRepository.createChat(project.id, "Thread");
 		const service = createSelectionService(repository);
 
-		const initial = await service.getWorkspaceSelection();
-		expect(initial).toEqual({ selectedProjectId: null, selectedChatId: null });
+			const initial = await service.getWorkspaceSelection();
+			expect(initial).toEqual({
+				selectedProjectId: null,
+				selectedChatId: null,
+				permissionMode: "default",
+				selectedModel: null,
+				selectedReasoningEffort: null,
+			});
 
-		const updated = await service.saveWorkspaceSelection({
-			selectedProjectId: project.id,
-			selectedChatId: chat.id,
-		});
+			const updated = await service.saveWorkspaceSelection({
+				selectedProjectId: project.id,
+				selectedChatId: chat.id,
+				permissionMode: "plan",
+				selectedModel: "gpt-5.3-codex",
+				selectedReasoningEffort: "high",
+			});
 
-		expect(updated).toEqual({
-			selectedProjectId: project.id,
-			selectedChatId: chat.id,
-		});
+			expect(updated).toEqual({
+				selectedProjectId: project.id,
+				selectedChatId: chat.id,
+				permissionMode: "plan",
+				selectedModel: "gpt-5.3-codex",
+				selectedReasoningEffort: "high",
+			});
 
 		const loaded = await service.getWorkspaceSelection();
 		expect(loaded).toEqual(updated);

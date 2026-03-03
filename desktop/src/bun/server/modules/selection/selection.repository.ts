@@ -1,5 +1,10 @@
 import { eq } from "drizzle-orm";
 
+import {
+	DEFAULT_CODEX_PERMISSION_MODE,
+	parseCodexPermissionMode,
+} from "../../../../shared/codex-permission-mode";
+import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { workspaceSelection } from "../../shared/db/db.schema";
 import type { WorkspaceSelection } from "./selection.model";
@@ -8,9 +13,20 @@ const WORKSPACE_SELECTION_ID = "default";
 
 export class WorkspaceSelectionRepository {
 	private static toWorkspaceSelectionDto(row: typeof workspaceSelection.$inferSelect | undefined): WorkspaceSelection {
+		const parsedPermissionMode = parseCodexPermissionMode(row?.permissionMode);
+		const permissionMode = parsedPermissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
+		const selectedModel =
+			typeof row?.selectedModel === "string" && row.selectedModel.trim().length > 0
+				? row.selectedModel.trim()
+				: null;
+		const selectedReasoningEffort = parseCodexReasoningEffort(row?.selectedReasoningEffort) ?? null;
+
 		return {
 			selectedChatId: row?.selectedChatId ?? null,
 			selectedProjectId: row?.selectedProjectId ?? null,
+			permissionMode,
+			selectedModel,
+			selectedReasoningEffort,
 		};
 	}
 
@@ -43,6 +59,9 @@ export class WorkspaceSelectionRepository {
 				id: WORKSPACE_SELECTION_ID,
 				selectedChatId: selection.selectedChatId,
 				selectedProjectId: selection.selectedProjectId,
+				permissionMode: selection.permissionMode,
+				selectedModel: selection.selectedModel,
+				selectedReasoningEffort: selection.selectedReasoningEffort,
 				updatedAt: now,
 			})
 			.onConflictDoUpdate({
@@ -50,6 +69,9 @@ export class WorkspaceSelectionRepository {
 				set: {
 					selectedChatId: selection.selectedChatId,
 					selectedProjectId: selection.selectedProjectId,
+					permissionMode: selection.permissionMode,
+					selectedModel: selection.selectedModel,
+					selectedReasoningEffort: selection.selectedReasoningEffort,
 					updatedAt: now,
 				},
 			})

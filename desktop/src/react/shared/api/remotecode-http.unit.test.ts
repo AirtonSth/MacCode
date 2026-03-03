@@ -31,12 +31,15 @@ test("RemoteCodeApi returns workspace selection from GET /v1/selection", async (
 		method = (init?.method ?? "GET").toUpperCase();
 		path = url.pathname;
 
-		return jsonResponse({
-			data: {
-				selectedChatId: "chat-1",
-				selectedProjectId: "project-1",
-			},
-		});
+			return jsonResponse({
+				data: {
+					selectedChatId: "chat-1",
+					selectedProjectId: "project-1",
+					permissionMode: "plan",
+					selectedModel: "gpt-5.3-codex",
+					selectedReasoningEffort: "high",
+				},
+			});
 	});
 
 	try {
@@ -46,9 +49,15 @@ test("RemoteCodeApi returns workspace selection from GET /v1/selection", async (
 		});
 		const selection = await client.getWorkspaceSelection();
 
-		expect(method).toBe("GET");
-		expect(path).toBe("/v1/selection");
-		expect(selection).toEqual({ selectedChatId: "chat-1", selectedProjectId: "project-1" });
+			expect(method).toBe("GET");
+			expect(path).toBe("/v1/selection");
+			expect(selection).toEqual({
+				selectedChatId: "chat-1",
+				selectedProjectId: "project-1",
+				permissionMode: "plan",
+				selectedModel: "gpt-5.3-codex",
+				selectedReasoningEffort: "high",
+			});
 	} finally {
 		restore();
 	}
@@ -60,12 +69,15 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 	const restore = createMockFetch((_url, init) => {
 		method = (init?.method ?? "GET").toUpperCase();
 		receivedBody = String(init?.body ?? "");
-		return jsonResponse({
-			data: {
-				selectedChatId: "chat-2",
-				selectedProjectId: "project-2",
-			},
-		});
+			return jsonResponse({
+				data: {
+					selectedChatId: "chat-2",
+					selectedProjectId: "project-2",
+					permissionMode: "full",
+					selectedModel: "gpt-5.3-codex-spark",
+					selectedReasoningEffort: "xhigh",
+				},
+			});
 	});
 
 	try {
@@ -73,14 +85,31 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 			baseUrl: "http://127.0.0.1:3001",
 			token: "unit-token",
 		});
-		const selection = await client.updateWorkspaceSelection({
-			selectedChatId: "chat-2",
-			selectedProjectId: "project-2",
-		});
+			const selection = await client.updateWorkspaceSelection({
+				selectedChatId: "chat-2",
+				selectedProjectId: "project-2",
+				permissionMode: "full",
+				selectedModel: "gpt-5.3-codex-spark",
+				selectedReasoningEffort: "xhigh",
+			});
 
-		expect(method).toBe("PATCH");
-		expect(receivedBody).toBe(JSON.stringify({ selectedChatId: "chat-2", selectedProjectId: "project-2" }));
-		expect(selection).toEqual({ selectedChatId: "chat-2", selectedProjectId: "project-2" });
+			expect(method).toBe("PATCH");
+			expect(receivedBody).toBe(
+				JSON.stringify({
+					selectedChatId: "chat-2",
+					selectedProjectId: "project-2",
+					permissionMode: "full",
+					selectedModel: "gpt-5.3-codex-spark",
+					selectedReasoningEffort: "xhigh",
+				}),
+			);
+			expect(selection).toEqual({
+				selectedChatId: "chat-2",
+				selectedProjectId: "project-2",
+				permissionMode: "full",
+				selectedModel: "gpt-5.3-codex-spark",
+				selectedReasoningEffort: "xhigh",
+			});
 	} finally {
 		restore();
 	}

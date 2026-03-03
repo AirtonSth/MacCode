@@ -98,6 +98,9 @@ export interface MessageDTO {
 export interface WorkspaceSelectionDTO {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	permissionMode: CodexPermissionMode;
+	selectedModel: string | null;
+	selectedReasoningEffort: CodexReasoningEffort | null;
 }
 
 export interface DiscoveryInfoDTO {

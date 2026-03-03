@@ -35,14 +35,31 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 			]),
 		);
 
-		const terminalEntryColumns = client.sqlite
-			.prepare("PRAGMA table_info(terminal_entries)")
-			.all()
-			.map((row) => (row as { name: string }).name);
+			const terminalEntryColumns = client.sqlite
+				.prepare("PRAGMA table_info(terminal_entries)")
+				.all()
+				.map((row) => (row as { name: string }).name);
 
-		expect(terminalEntryColumns).toEqual(
-			expect.arrayContaining(["id", "commandId", "chatId", "stream", "data", "createdAt"]),
-		);
+			expect(terminalEntryColumns).toEqual(
+				expect.arrayContaining(["id", "commandId", "chatId", "stream", "data", "createdAt"]),
+			);
+
+			const workspaceSelectionColumns = client.sqlite
+				.prepare("PRAGMA table_info(workspace_selection)")
+				.all()
+				.map((row) => (row as { name: string }).name);
+
+			expect(workspaceSelectionColumns).toEqual(
+				expect.arrayContaining([
+					"id",
+					"selectedProjectId",
+					"selectedChatId",
+					"permissionMode",
+					"selectedModel",
+					"selectedReasoningEffort",
+					"updatedAt",
+				]),
+			);
 
 		const commandIndexes = client.sqlite
 			.prepare("PRAGMA index_list(terminal_commands)")
@@ -168,13 +185,21 @@ test("DB initialization migrates legacy chats schema and preserves data", async 
 			.prepare("INSERT INTO messages (id, chatId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)")
 			.run("message-1", "chat-1", "assistant", "legacy message", "2026-01-01T00:00:00.000Z");
 
-		initializeDatabaseSchema(client.sqlite);
+			initializeDatabaseSchema(client.sqlite);
 
-		const chatColumns = client.sqlite
-			.prepare("PRAGMA table_info(chats)")
-			.all()
-			.map((row) => (row as { name: string }).name);
-		expect(chatColumns).toContain("providerThreadId");
+			const chatColumns = client.sqlite
+				.prepare("PRAGMA table_info(chats)")
+				.all()
+				.map((row) => (row as { name: string }).name);
+			expect(chatColumns).toContain("providerThreadId");
+
+			const workspaceSelectionColumns = client.sqlite
+				.prepare("PRAGMA table_info(workspace_selection)")
+				.all()
+				.map((row) => (row as { name: string }).name);
+			expect(workspaceSelectionColumns).toEqual(
+				expect.arrayContaining(["permissionMode", "selectedModel", "selectedReasoningEffort"]),
+			);
 
 		const migratedChat = client.sqlite
 			.prepare("SELECT provider, providerThreadId, diffAdded, diffRemoved FROM chats WHERE id = ?")

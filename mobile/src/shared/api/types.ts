@@ -31,6 +31,9 @@ export interface MessageDTO {
 export interface WorkspaceSelectionDTO {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	permissionMode: string;
+	selectedModel: string | null;
+	selectedReasoningEffort: string | null;
 }
 
 export interface DiscoveryInfoDTO {
