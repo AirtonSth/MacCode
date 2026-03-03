@@ -1794,14 +1794,13 @@ const App = (): JSX.Element => {
 																		<span
 																			className="block truncate text-[13px] font-medium text-slate-100"
 																			title={formatProjectMeta(project.path)}
-																		>
-																			{project.name}
+																			>
+																				{project.name}
+																			</span>
 																		</span>
-																	</span>
-																</div>
-																<Tooltip>
-																	<TooltipTrigger asChild>
-																	<Button
+																	<Tooltip>
+																		<TooltipTrigger asChild>
+																		<Button
 																			aria-label={
 																				project.isFavorite
 																					? "Remove from favorites"
