@@ -1,6 +1,6 @@
 # remodecode.io
 
-![Mobile UI](https://raw.githubusercontent.com/samuelfaj/remotecode.io/main/mobile.png)
+![Mobile UI](https://raw.githubusercontent.com/samuelfaj/remotecode.io/main/gif.gif)
 
 **Code anywhere. Continue everywhere.**
 
