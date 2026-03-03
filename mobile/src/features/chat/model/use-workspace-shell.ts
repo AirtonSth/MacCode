@@ -23,6 +23,7 @@ import type {
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import {
 	applyAssistantEventToTurn,
+	cloneTurn,
 	setStreamItemExpanded as updateStreamItemExpanded,
 	setStreamItemState as updateStreamItemState,
 	type StreamTurnState,
@@ -42,13 +43,42 @@ const upsertTurnHistory = (turns: StreamTurnState[] | undefined, turn: StreamTur
 	return next;
 };
 
+const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
+	const nextTurn = cloneTurn(turn);
+	for (const itemId of nextTurn.itemOrder) {
+		const item = nextTurn.itemsById[itemId];
+		if (!item) {
+			continue;
+		}
+		nextTurn.itemsById[itemId] = {
+			...item,
+			state: item.state === "failed" || item.state === "cancelled" ? item.state : "collapsed",
+			isExpanded: false,
+			expandedByUser: false,
+		};
+	}
+
+	return nextTurn;
+};
+
 const applyAssistantEventToHistory = (
 	turns: StreamTurnState[] | undefined,
 	event: AssistantEventPayload,
 ): StreamTurnState[] => {
 	const current = turns ?? [];
 	const existingTurn = current.find((item) => item.turnId === event.turnId) ?? null;
-	const nextTurn = applyAssistantEventToTurn(existingTurn, event);
+	let nextTurn = applyAssistantEventToTurn(existingTurn, event);
+	if (event.type === "item_completed") {
+		const completedItem = nextTurn.itemsById[event.itemId];
+		const isResponseCompletedSummary =
+			typeof event.summary === "string" && event.summary.toLowerCase().includes("response completed");
+		if (completedItem?.type === "assistant_message" || isResponseCompletedSummary) {
+			nextTurn = collapseTurnItems(nextTurn);
+		}
+	}
+	if (event.type === "turn_completed") {
+		nextTurn = collapseTurnItems(nextTurn);
+	}
 	return upsertTurnHistory(current, nextTurn);
 };
 
@@ -253,13 +283,64 @@ export const useWorkspaceShell = () => {
 			}
 
 			if (event.event === "assistant_done") {
-				queryClient.setQueryData(queryKeys.streamTurn(event.data.chatId), null);
-				void queryClient.invalidateQueries({ queryKey: queryKeys.messages(event.data.chatId) });
+				const chatId = event.data.chatId;
+				queryClient.setQueryData<StreamTurnState | null>(
+					queryKeys.streamTurn(chatId),
+					(current) => (current ? collapseTurnItems(current) : current),
+				);
+				setStreamHistoryByChat((current) => {
+					const turns = current[chatId] ?? [];
+					if (turns.length === 0) {
+						return current;
+					}
+
+					const nextTurns = turns.map((turn, index) => (
+						index === turns.length - 1 ? collapseTurnItems(turn) : turn
+					));
+					queryClient.setQueryData<StreamTurnState | null>(
+						queryKeys.streamTurn(chatId),
+						nextTurns.at(-1) ?? null,
+					);
+					return {
+						...current,
+						[chatId]: nextTurns,
+					};
+				});
+
+				void (async () => {
+					const maxAttempts = 5;
+					const retryDelayMs = 250;
+					const trySyncMessages = async (attempt: number): Promise<void> => {
+						try {
+							const latestMessages = await client.listMessages(chatId);
+							queryClient.setQueryData<MessageDTO[]>(
+								queryKeys.messages(chatId),
+								latestMessages,
+							);
+							if (latestMessages.at(-1)?.role === "assistant") {
+								return;
+							}
+						} catch {
+							// Keep retrying until maxAttempts.
+						}
+
+						if (attempt >= maxAttempts) {
+							void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
+							return;
+						}
+
+						setTimeout(() => {
+							void trySyncMessages(attempt + 1);
+						}, retryDelayMs);
+					};
+
+					await trySyncMessages(1);
+				})();
 				setStreamingTextByChat((current) => ({
 					...current,
-					[event.data.chatId]: "",
+					[chatId]: "",
 				}));
-				clearSendingForChat(event.data.chatId);
+				clearSendingForChat(chatId);
 				return;
 			}
 
@@ -329,7 +410,7 @@ export const useWorkspaceShell = () => {
 				}
 			}
 		},
-		[queryClient, setSendingByChat],
+		[client, queryClient, setSendingByChat],
 	);
 
 	const handleConnectionStateChange = useCallback((state: ConnectionState) => {
@@ -411,8 +492,8 @@ export const useWorkspaceShell = () => {
 					return;
 				}
 
-				const turns = replayAssistantEventsIntoTurns(events);
-				lastAssistantEventIdByChatRef.current[selectedChatId] = lastEventId;
+					const turns = replayAssistantEventsIntoTurns(events);
+					lastAssistantEventIdByChatRef.current[selectedChatId] = lastEventId;
 				setStreamHistoryByChat((current) => ({
 					...current,
 					[selectedChatId]: turns,

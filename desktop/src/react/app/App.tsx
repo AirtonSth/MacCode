@@ -179,7 +179,7 @@ const createStreamItem = (itemId: string, itemType: AssistantStreamItemType) => 
 	startedAtMs: Date.now(),
 	finishedAtMs: null as number | null,
 	expandedByUser: false,
-	isExpanded: false,
+	isExpanded: true,
 });
 
 const replayAssistantEventsIntoTurns = (events: AssistantStreamEvent[]): StreamTurnState[] => {
@@ -774,6 +774,46 @@ const App = (): JSX.Element => {
 		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
 	);
 
+	const syncFinalMessagesAfterDone = useCallback(
+		async (chatId: string) => {
+			const maxAttempts = 5;
+			const retryDelayMs = 250;
+			const trySyncMessages = async (attempt: number): Promise<void> => {
+				if (selectedChatIdRef.current !== chatId) {
+					return;
+				}
+
+				try {
+					const latestMessages = await api.listMessages(chatId);
+					if (selectedChatIdRef.current !== chatId) {
+						return;
+					}
+
+					dispatch({ payload: latestMessages, type: "SET_MESSAGES" });
+					if (latestMessages.at(-1)?.role === "assistant") {
+						return;
+					}
+				} catch {
+					// Keep retrying until maxAttempts.
+				}
+
+				if (attempt >= maxAttempts) {
+					if (selectedChatIdRef.current === chatId) {
+						await loadMessagesForChat(chatId);
+					}
+					return;
+				}
+
+				setTimeout(() => {
+					void trySyncMessages(attempt + 1);
+				}, retryDelayMs);
+			};
+
+			await trySyncMessages(1);
+		},
+		[api, dispatch, loadMessagesForChat],
+	);
+
 	const loadChatsForProject = useCallback(
 		async (projectId: string | null, preferredChatId: string | null = null) => {
 			if (!projectId) {
@@ -937,7 +977,7 @@ const App = (): JSX.Element => {
 						type: "CLEAR_STREAMING",
 					});
 					if (selectedChatIdRef.current === event.data.chatId) {
-						await loadMessagesForChat(event.data.chatId);
+						await syncFinalMessagesAfterDone(event.data.chatId);
 					}
 					clearChatSending(event.data.chatId);
 					break;
@@ -1052,6 +1092,7 @@ const App = (): JSX.Element => {
 			loadMessagesForChat,
 			loadProjects,
 			refreshProjectGit,
+			syncFinalMessagesAfterDone,
 			syncTerminalHistory,
 		],
 	);

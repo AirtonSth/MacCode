@@ -36,7 +36,7 @@ const createStreamItem = (itemId: string, itemType: AssistantStreamItemType): St
 	startedAtMs: Date.now(),
 	finishedAtMs: null,
 	expandedByUser: false,
-	isExpanded: false,
+	isExpanded: true,
 });
 
 export const createStreamTurnState = (turnId: string): StreamTurnState => ({

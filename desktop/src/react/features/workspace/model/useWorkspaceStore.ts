@@ -154,7 +154,7 @@ const createStreamItem = (itemId: string, itemType: AssistantStreamItemType): St
 	startedAtMs: Date.now(),
 	finishedAtMs: null,
 	expandedByUser: false,
-	isExpanded: false,
+	isExpanded: true,
 });
 
 const cloneTurn = (turn: StreamTurnState): StreamTurnState => ({
@@ -206,6 +206,31 @@ const upsertTurnHistory = (
 	const next = [...current];
 	next[index] = turn;
 	return next;
+};
+
+const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
+	const collapsedItems = Object.fromEntries(
+		turn.itemOrder
+			.map((itemId) => [itemId, turn.itemsById[itemId]] as const)
+			.filter((entry): entry is readonly [string, StreamItem] => Boolean(entry[1]))
+			.map(([itemId, item]) => [
+				itemId,
+				{
+					...item,
+					state:
+						item.state === "failed" || item.state === "cancelled"
+							? item.state
+							: "collapsed",
+					isExpanded: false,
+					expandedByUser: false,
+				},
+			]),
+	) as Record<string, StreamItem>;
+
+	return {
+		...turn,
+		itemsById: collapsedItems,
+	};
 };
 
 const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): WorkspaceState => {
@@ -526,14 +551,18 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				};
 			}
 
-			if (streamEvent.type === "turn_completed") {
-				const currentTurn = nextStreamTurnsByChat[chatId];
-				if (currentTurn && currentTurn.turnId === streamEvent.turnId) {
-					const turn = cloneTurn(currentTurn);
-					turn.status = turn.status === "failed" ? "failed" : "completed";
-					turn.finishedAtMs = Date.now();
-					nextStreamTurnsByChat[chatId] = turn;
-					nextStreamHistoryByChat[chatId] = upsertTurnHistory(nextStreamHistoryByChat[chatId], turn);
+				if (streamEvent.type === "turn_completed") {
+					const currentTurn = nextStreamTurnsByChat[chatId];
+					if (currentTurn && currentTurn.turnId === streamEvent.turnId) {
+						const turn = cloneTurn(currentTurn);
+						turn.status = turn.status === "failed" ? "failed" : "completed";
+						turn.finishedAtMs = Date.now();
+					const collapsedTurn = collapseTurnItems(turn);
+					nextStreamTurnsByChat[chatId] = collapsedTurn;
+					nextStreamHistoryByChat[chatId] = upsertTurnHistory(
+						nextStreamHistoryByChat[chatId],
+						collapsedTurn,
+					);
 				}
 				nextStreamingActiveByChat[chatId] = false;
 
@@ -546,7 +575,7 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				};
 			}
 
-			const turn = ensureTurnForEvent(nextStreamTurnsByChat, chatId, streamEvent.turnId);
+			let turn = ensureTurnForEvent(nextStreamTurnsByChat, chatId, streamEvent.turnId);
 			nextStreamingActiveByChat[chatId] = true;
 
 			if (streamEvent.type === "item_started") {
@@ -610,6 +639,15 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 			}
 
 			turn.itemsById[streamEvent.itemId] = item;
+			if (
+				streamEvent.type === "item_completed" &&
+				(
+					item.type === "assistant_message" ||
+					(typeof streamEvent.summary === "string" && streamEvent.summary.toLowerCase().includes("response completed"))
+				)
+			) {
+				turn = collapseTurnItems(turn);
+			}
 			nextStreamTurnsByChat[chatId] = turn;
 			nextStreamHistoryByChat[chatId] = upsertTurnHistory(nextStreamHistoryByChat[chatId], turn);
 
@@ -623,15 +661,18 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 		}
 
 		case "SET_STREAM_HISTORY":
+			const normalizedTurns = action.payload.turns.map((turn) =>
+				turn.status === "running" ? turn : collapseTurnItems(turn),
+			);
 			return {
 				...state,
 				streamHistoryByChat: {
 					...state.streamHistoryByChat,
-					[action.payload.chatId]: action.payload.turns,
+					[action.payload.chatId]: normalizedTurns,
 				},
 				streamTurnsByChat: {
 					...state.streamTurnsByChat,
-					[action.payload.chatId]: action.payload.turns.at(-1),
+					[action.payload.chatId]: normalizedTurns.at(-1),
 				},
 				lastAssistantEventIdByChat: {
 					...state.lastAssistantEventIdByChat,

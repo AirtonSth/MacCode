@@ -40,16 +40,15 @@ export const ConversationPanel = ({
 	const hasMessages = messages.length > 0;
 	const hasStreamingTimeline = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 	const hasStreamingText = streamingText.trim().length > 0;
-	const turnsForDetails = useMemo(() => {
-		if (streamHistoryTurns.length > 0) {
+	const liveTurn = hasStreamingTimeline ? streamingTurn : null;
+	const historicalTurns = useMemo(() => {
+		if (!liveTurn) {
 			return streamHistoryTurns;
 		}
-		if (streamingTurn && streamingTurn.itemOrder.length > 0) {
-			return [streamingTurn];
-		}
-		return [];
-	}, [streamHistoryTurns, streamingTurn]);
-	const hasRunDetails = turnsForDetails.length > 0;
+
+		return streamHistoryTurns.filter((turn) => turn.turnId !== liveTurn.turnId);
+	}, [liveTurn, streamHistoryTurns]);
+	const hasHistoricalRunDetails = historicalTurns.length > 0;
 	const hasStreaming = hasStreamingTimeline || hasStreamingText;
 	const hasContent = hasMessages || hasStreaming;
 	const [showRunDetails, setShowRunDetails] = useState(false);
@@ -253,7 +252,7 @@ export const ConversationPanel = ({
 
 				{hasContent ? (
 					<>
-						{hasRunDetails ? (
+						{hasHistoricalRunDetails ? (
 							<div className={cn("px-5 pt-3", focusMode ? "sm:px-6" : "")}>
 								<button
 									className={cn(
@@ -309,20 +308,31 @@ export const ConversationPanel = ({
 										</motion.article>
 									))}
 
+									{liveTurn ? (
+										<StreamingTimeline
+											focusMode={focusMode}
+											key={`stream-live-${liveTurn.turnId}`}
+											onSetItemExpanded={onSetStreamItemExpanded}
+											onSetItemState={onSetStreamItemState}
+											shouldReduceMotion={shouldReduceMotion}
+											turn={liveTurn}
+										/>
+									) : null}
+
 									{showRunDetails
-										? turnsForDetails.map((turn) => (
-											<StreamingTimeline
-												focusMode={focusMode}
-												key={`stream-turn-${turn.turnId}`}
-												onSetItemExpanded={onSetStreamItemExpanded}
-												onSetItemState={onSetStreamItemState}
-												shouldReduceMotion={shouldReduceMotion}
-												turn={turn}
-											/>
-										))
+										? historicalTurns.map((turn) => (
+												<StreamingTimeline
+													focusMode={focusMode}
+													key={`stream-turn-${turn.turnId}`}
+													onSetItemExpanded={onSetStreamItemExpanded}
+													onSetItemState={onSetStreamItemState}
+													shouldReduceMotion={shouldReduceMotion}
+													turn={turn}
+												/>
+											))
 										: null}
 
-									{streamingText && (!showRunDetails || !hasRunDetails) ? (
+									{streamingText && !hasStreamingTimeline ? (
 										<motion.article
 											className={cn(
 												focusMode

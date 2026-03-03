@@ -9,6 +9,9 @@ import {
 	Sparkles,
 } from "lucide-react";
 import { useEffect, useMemo } from "react";
+import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import type { AssistantStreamItemState } from "../../../../shared/assistant-stream-event";
 import { cn } from "../../../lib/utils";
@@ -31,7 +34,6 @@ interface StreamingTimelineRowProps {
 }
 
 const TOOL_AUTO_EXPAND_MS = 2_000;
-const TOOL_COLLAPSE_DELAY_MS = 200;
 
 const getItemIcon = (item: StreamItem) => {
 	if (item.type === "tool") {
@@ -108,6 +110,73 @@ const StreamingTimelineRow = ({
 	const canToggle = detailText.length > 0;
 	const showExpandedDetails = item.isExpanded && detailText.length > 0;
 	const showPreview = item.state === "preview" && !item.isExpanded && previewText.length > 0;
+	const assistantText = detailText.length > 0 ? detailText : summaryText;
+	const assistantMarkdownComponents = useMemo<Components>(
+		() => ({
+			p: ({ children, ...props }) => (
+				<p
+					className={cn(
+						focusMode ? "text-[15px] leading-7 text-slate-100" : "text-sm leading-6 text-slate-100",
+						"[&_code]:text-inherit [&:not(:first-child)]:mt-3",
+					)}
+					{...props}
+				>
+					{children}
+				</p>
+			),
+			ul: ({ children, ...props }) => <ul className="mb-2 mt-2 list-disc pl-5" {...props}>{children}</ul>,
+			ol: ({ children, ...props }) => <ol className="mb-2 mt-2 list-decimal pl-5" {...props}>{children}</ol>,
+			li: ({ children, ...props }) => <li className="mt-1" {...props}>{children}</li>,
+			a: ({ children, href, ...props }) => (
+				<a
+					className="text-cyan-100 underline underline-offset-2 hover:text-white"
+					href={href}
+					rel="noreferrer noopener"
+					target="_blank"
+					{...props}
+				>
+					{children}
+				</a>
+			),
+			code: (props) => {
+				const { children, className, ...rest } = props;
+				const inline = !className?.includes("language-");
+				return inline ? (
+					<code
+						className={cn(
+							"rounded bg-white/10 px-1.5 py-0.5 font-mono text-[13px] leading-none tracking-tight",
+							focusMode ? "text-slate-100/95" : "text-cyan-100",
+							className,
+						)}
+						{...rest}
+					>
+						{children}
+					</code>
+				) : (
+					<code className={cn("block", className)} {...rest}>
+						{children}
+					</code>
+				);
+			},
+			pre: ({ children, ...props }) => (
+				<pre
+					className={cn(
+						"mb-3 mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/75 p-3",
+						focusMode ? "text-[13px] leading-6" : "text-[12px] leading-5",
+					)}
+					{...props}
+				>
+					{children}
+				</pre>
+			),
+			blockquote: ({ children, ...props }) => (
+				<blockquote className="mt-2 border-l-2 border-white/30 pl-3 italic" {...props}>
+					{children}
+				</blockquote>
+			),
+		}),
+		[focusMode],
+	);
 
 	useEffect(() => {
 		if (item.type !== "tool" || shouldReduceMotion) {
@@ -135,40 +204,15 @@ const StreamingTimelineRow = ({
 		shouldReduceMotion,
 	]);
 
-	useEffect(() => {
-		if (item.type !== "tool") {
-			return;
-		}
-
-		if (item.state !== "completed" || !item.isExpanded || item.expandedByUser) {
-			return;
-		}
-
-		if (shouldReduceMotion) {
-			onSetItemExpanded(item.id, false, false);
-			onSetItemState(item.id, "collapsed");
-			return;
-		}
-
-		onSetItemState(item.id, "preview");
-		const timer = setTimeout(() => {
-			onSetItemExpanded(item.id, false, false);
-			onSetItemState(item.id, "collapsed");
-		}, TOOL_COLLAPSE_DELAY_MS);
-
-		return () => {
-			clearTimeout(timer);
-		};
-	}, [
-		item.expandedByUser,
-		item.id,
-		item.isExpanded,
-		item.state,
-		item.type,
-		onSetItemExpanded,
-		onSetItemState,
-		shouldReduceMotion,
-	]);
+	if (item.type === "assistant_message") {
+		return (
+			<article className="py-1">
+				<ReactMarkdown components={assistantMarkdownComponents} remarkPlugins={[remarkGfm]}>
+					{assistantText}
+				</ReactMarkdown>
+			</article>
+		);
+	}
 
 	return (
 		<article
@@ -180,10 +224,10 @@ const StreamingTimelineRow = ({
 			<div className="flex items-start gap-2.5">
 				<Icon className={cn("mt-0.5 h-4 w-4 shrink-0", getStateTone(item.state))} />
 				<div className="min-w-0 flex-1">
-					<div className="flex items-start justify-between gap-3">
+					<div className="flex items-start gap-3">
 						<p
 							className={cn(
-								"text-sm leading-6",
+								"min-w-0 flex-1 truncate text-sm leading-6",
 								item.state === "running" ? "loading-shimmer-pure-text" : "",
 								focusMode ? "text-slate-100" : "text-sky-50",
 							)}

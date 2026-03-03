@@ -271,19 +271,14 @@ export const ChatScreen = () => {
 
 	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 	const hasStreamingText = streamingText.trim().length > 0;
-	const turnsForDetails = useMemo(() => {
-		if (streamHistoryTurns.length > 0) {
-			if (streamingTurn && !streamHistoryTurns.some((turn) => turn.turnId === streamingTurn.turnId)) {
-				return [...streamHistoryTurns, streamingTurn];
-			}
+	const liveTurn = hasStreamingItems ? streamingTurn : null;
+	const historicalTurns = useMemo(() => {
+		if (!liveTurn) {
 			return streamHistoryTurns;
 		}
-		if (hasStreamingItems && streamingTurn) {
-			return [streamingTurn];
-		}
-		return [];
-	}, [hasStreamingItems, streamHistoryTurns, streamingTurn]);
-	const hasRunDetails = turnsForDetails.length > 0;
+		return streamHistoryTurns.filter((turn) => turn.turnId !== liveTurn.turnId);
+	}, [liveTurn, streamHistoryTurns]);
+	const hasRunDetails = hasStreamingItems || historicalTurns.length > 0;
 	const selectedChatIsRunning = selectedChat?.status === "running";
 
 	useEffect(() => {
@@ -878,11 +873,11 @@ export const ChatScreen = () => {
 						style={styles.messages}
 						testID="chat-message-list"
 					>
-						{messages.length === 0 && !hasStreamingText && !showRunDetails && !selectedChatIsRunning ? (
+						{messages.length === 0 && !hasStreamingText && !hasStreamingItems && !selectedChatIsRunning ? (
 							<Text style={styles.emptyState}>Start a conversation.</Text>
 						) : null}
 
-						{hasRunDetails ? (
+						{historicalTurns.length > 0 ? (
 							<Pressable
 								onPress={() => {
 									setShowRunDetails((current) => !current);
@@ -933,7 +928,7 @@ export const ChatScreen = () => {
 						);
 					})}
 
-						{hasStreamingText ? (
+						{hasStreamingText && !hasStreamingItems ? (
 							<View style={[styles.messageRow, styles.messageRowAssistant]}>
 								<View style={styles.assistantMessageContent}>
 									<MessageMarkdown
@@ -945,8 +940,24 @@ export const ChatScreen = () => {
 						</View>
 					) : null}
 
+						{liveTurn ? (
+							<View style={[styles.messageRow, styles.messageRowAssistant]}>
+								<View style={styles.assistantMessageContent}>
+									<StreamingTimeline
+										onSetItemExpanded={(itemId, expanded, byUser) => {
+											setStreamItemExpanded(itemId, expanded, byUser);
+										}}
+										onSetItemState={(itemId, state) => {
+											setStreamItemState(itemId, state);
+										}}
+										turn={liveTurn}
+									/>
+								</View>
+							</View>
+						) : null}
+
 						{showRunDetails
-							? turnsForDetails.map((turn) => (
+							? historicalTurns.map((turn) => (
 								<View key={`turn-${turn.turnId}`} style={[styles.messageRow, styles.messageRowAssistant]}>
 									<View style={styles.assistantMessageContent}>
 										<StreamingTimeline

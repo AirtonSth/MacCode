@@ -3,10 +3,10 @@ import { useEffect, useMemo, useState } from "react";
 import { AccessibilityInfo, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { AssistantStreamItemState } from "../../../shared/api/types";
+import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import type { StreamItem, StreamTurnState } from "../model/stream-turn-state";
 
 const TOOL_AUTO_EXPAND_MS = 2_000;
-const TOOL_COLLAPSE_DELAY_MS = 200;
 
 interface StreamingTimelineProps {
 	turn: StreamTurnState;
@@ -155,40 +155,6 @@ export const StreamingTimeline = ({
 		};
 	}, [items, onSetItemExpanded, shouldReduceMotion]);
 
-	useEffect(() => {
-		const timers = new Map<string, ReturnType<typeof setTimeout>>();
-
-		for (const item of items) {
-			if (item.type !== "tool") {
-				continue;
-			}
-			if (item.state !== "completed" || !item.isExpanded || item.expandedByUser) {
-				continue;
-			}
-
-			if (shouldReduceMotion) {
-				onSetItemExpanded(item.id, false, false);
-				onSetItemState(item.id, "collapsed");
-				continue;
-			}
-
-			onSetItemState(item.id, "preview");
-			timers.set(
-				item.id,
-				setTimeout(() => {
-					onSetItemExpanded(item.id, false, false);
-					onSetItemState(item.id, "collapsed");
-				}, TOOL_COLLAPSE_DELAY_MS),
-			);
-		}
-
-		return () => {
-			for (const timerId of timers.values()) {
-				clearTimeout(timerId);
-			}
-		};
-	}, [items, onSetItemExpanded, onSetItemState, shouldReduceMotion]);
-
 	if (items.length === 0) {
 		return null;
 	}
@@ -205,12 +171,33 @@ export const StreamingTimeline = ({
 				const canToggle = detailText.length > 0;
 				const showExpandedDetails = item.isExpanded && detailText.length > 0;
 				const showPreview = item.state === "preview" && !item.isExpanded && previewText.length > 0;
+				const assistantText = detailText.length > 0 ? detailText : summaryText;
+
+				if (item.type === "assistant_message") {
+					return (
+						<View key={item.id} style={styles.assistantInlineWrapper}>
+							{assistantText.trim().length > 0 ? (
+								<MessageMarkdown
+									content={assistantText}
+									linkColor="#63C8FF"
+									textColor="#eaf2ff"
+								/>
+							) : (
+								<Text selectable style={[styles.summaryText, styles.assistantInlineCollapsed]}>
+									{assistantText}
+								</Text>
+							)}
+						</View>
+					);
+				}
 
 				return (
 					<View key={item.id} style={styles.itemCard}>
 						<View style={styles.itemHeader}>
 							<MaterialIcons color={getIconColor(item.state)} name={icon} size={16} />
-							<Text style={styles.summaryText}>{summaryText}</Text>
+							<Text ellipsizeMode="tail" numberOfLines={1} style={styles.summaryText}>
+								{summaryText}
+							</Text>
 							<View style={[styles.stateBadge, getStateBadgeStyle(item.state)]}>
 								<Text style={styles.stateBadgeLabel}>{getStateLabel(item.state)}</Text>
 							</View>
@@ -252,6 +239,12 @@ export const StreamingTimeline = ({
 };
 
 const styles = StyleSheet.create({
+	assistantInlineCollapsed: {
+		color: "rgba(148,163,184,0.9)",
+	},
+	assistantInlineWrapper: {
+		paddingVertical: 2,
+	},
 	detailContainer: {
 		backgroundColor: "rgba(2,6,23,0.72)",
 		borderColor: "rgba(255,255,255,0.16)",
@@ -276,7 +269,7 @@ const styles = StyleSheet.create({
 		paddingVertical: 10,
 	},
 	itemHeader: {
-		alignItems: "flex-start",
+		alignItems: "center",
 		flexDirection: "row",
 		gap: 8,
 	},
@@ -315,8 +308,10 @@ const styles = StyleSheet.create({
 	summaryText: {
 		color: "#eaf2ff",
 		flex: 1,
+		flexShrink: 1,
 		fontSize: 14,
 		lineHeight: 20,
+		minWidth: 0,
 	},
 	timeline: {
 		gap: 8,
