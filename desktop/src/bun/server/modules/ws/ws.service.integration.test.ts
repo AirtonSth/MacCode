@@ -142,3 +142,108 @@ test("WsService.startUserMessage emits legacy_chat_provider for fake chat", asyn
 		rmSync(root, { force: true, recursive: true });
 	}
 });
+
+test("WsService.startUserMessage reuses persisted provider thread id across turns", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-ws-service-thread-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
+
+	try {
+		initializeDatabaseSchema(client.sqlite);
+
+		const projectRepository = createProjectRepository(client.orm);
+		const chatRepository = createChatRepository(client.orm);
+		const messageRepository = createMessageRepository(client.orm);
+
+		const runCalls: Array<{ threadId?: string; workspacePath: string }> = [];
+		let threadSequence = 0;
+		const memoryByThread = new Map<string, string>();
+
+		const runner = {
+			run: async ({
+				onDelta,
+				text,
+				threadId,
+				workspacePath,
+			}: {
+				onDelta: (delta: string) => void;
+				text: string;
+				threadId?: string;
+				workspacePath: string;
+			}) => {
+				runCalls.push({
+					threadId,
+					workspacePath,
+				});
+
+				const activeThreadId = threadId ?? `thread-memory-${++threadSequence}`;
+				if (text.startsWith("Remember token: ")) {
+					const token = text.replace("Remember token: ", "").trim();
+					memoryByThread.set(activeThreadId, token);
+					onDelta(`stored ${token}`);
+					return {
+						assistantText: `stored ${token}`,
+						diffAdded: 0,
+						diffRemoved: 0,
+						status: "completed" as const,
+						threadId: activeThreadId,
+					};
+				}
+
+				const remembered = memoryByThread.get(activeThreadId) ?? "NO_MEMORY";
+				onDelta(remembered);
+				return {
+					assistantText: remembered,
+					diffAdded: 0,
+					diffRemoved: 0,
+					status: "completed" as const,
+					threadId: activeThreadId,
+				};
+			},
+		} as CodexProviderRunnerContract;
+
+		const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+
+		const project = projectRepository.createProject("/tmp/ws-thread", "tmp");
+		const chat = chatRepository.createChat(project.id, "thread");
+		const token = `memory-${Date.now()}`;
+
+		await service.startUserMessage({
+			chatId: chat.id,
+			emit: () => {
+				// no-op
+			},
+			text: `Remember token: ${token}`,
+		});
+
+		const persistedThreadId = chatRepository.findProviderThreadIdByChatId(chat.id);
+		expect(persistedThreadId).toBe("thread-memory-1");
+
+		await service.startUserMessage({
+			chatId: chat.id,
+			emit: () => {
+				// no-op
+			},
+			text: "What token should you remember? Reply token only.",
+		});
+
+		expect(runCalls).toEqual([
+			{
+				threadId: undefined,
+				workspacePath: project.path,
+			},
+			{
+				threadId: "thread-memory-1",
+				workspacePath: project.path,
+			},
+		]);
+
+		const messages = messageRepository.listMessagesByChatId(chat.id).messages;
+		expect(messages).toHaveLength(4);
+		expect(messages[3].role).toBe("assistant");
+		expect(messages[3].content).toBe(token);
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});

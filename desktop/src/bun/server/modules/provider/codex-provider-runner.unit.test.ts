@@ -375,7 +375,7 @@ test("CodexProviderRunner defaults to workspace-write mode when permission mode 
 	]);
 });
 
-test("CodexProviderRunner builds full access command for resume flow", async () => {
+test("CodexProviderRunner builds full access resume command with workspace cwd", async () => {
 	let capturedCommand: string[] = [];
 	const runner = new CodexProviderRunner((input) => {
 		capturedCommand = input.cmd;
@@ -415,6 +415,8 @@ test("CodexProviderRunner builds full access command for resume flow", async () 
 		"-c",
 		'model_reasoning_effort="xhigh"',
 		"exec",
+		"--cd",
+		"/tmp/workspace",
 		"resume",
 		"--json",
 		"--skip-git-repo-check",

@@ -853,6 +853,8 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 			...modelFlags,
 			...reasoningFlags,
 			"exec",
+			"--cd",
+			options.workspacePath,
 			"resume",
 			"--json",
 			"--skip-git-repo-check",
