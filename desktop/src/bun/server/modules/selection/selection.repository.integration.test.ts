@@ -14,7 +14,7 @@ import { createSelectionRepository } from "./selection.repository";
 const createSelectionFromRow = (row: {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
-	permissionMode?: "default" | "plan" | "full";
+	permissionMode: "default" | "plan" | "full";
 	selectedModel?: string | null;
 	selectedReasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
 }) => ({ ...row });
