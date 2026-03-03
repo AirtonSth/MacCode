@@ -43,7 +43,7 @@ interface ToastPayload {
 
 export const ThreadSelectionScreen = () => {
 	const api = useRemoteCodeClient();
-	const { replace } = useFlowNavigator();
+	const { push, replace } = useFlowNavigator();
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		chats,
@@ -269,7 +269,7 @@ export const ThreadSelectionScreen = () => {
 
 	const openThread = (chat: (typeof chats)[number]) => {
 		selectChat(chat);
-		replace({
+		push({
 			params: {
 				source: "thread-list",
 			},
@@ -288,7 +288,7 @@ export const ThreadSelectionScreen = () => {
 		try {
 			const newChat = await createChat("New chat");
 			if (newChat) {
-				replace({
+				push({
 					params: {
 						source: "thread-list",
 					},

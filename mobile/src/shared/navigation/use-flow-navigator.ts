@@ -13,7 +13,7 @@ const getPathname = (target: AppFlowTarget): AppFlowRoute => {
 	return typeof target === "string" ? target : target.pathname;
 };
 
-const getReplaceInput = (
+const getNavigationInput = (
 	target: AppFlowTarget,
 ): {
 	pathname: AppFlowRoute;
@@ -47,9 +47,29 @@ export const useFlowNavigator = () => {
 		}
 
 		pendingRouteRef.current = route;
-		router.replace(getReplaceInput(target));
+		router.replace(getNavigationInput(target));
 		return true;
 	}, [pathname, router]);
 
-	return { replace };
+	const push = useCallback((target: AppFlowTarget): boolean => {
+		const route = getPathname(target);
+		if (pathname === route || pendingRouteRef.current === route) {
+			return false;
+		}
+
+		pendingRouteRef.current = route;
+		router.push(getNavigationInput(target));
+		return true;
+	}, [pathname, router]);
+
+	const goBackOr = useCallback((fallback: AppFlowTarget): boolean => {
+		if (router.canGoBack()) {
+			router.back();
+			return true;
+		}
+
+		return replace(fallback);
+	}, [replace, router]);
+
+	return { goBackOr, push, replace };
 };

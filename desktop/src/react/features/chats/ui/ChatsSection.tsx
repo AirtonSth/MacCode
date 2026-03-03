@@ -70,22 +70,27 @@ export const ChatsSection = ({
 					) : (
 						chats.map((chat) => (
 							<li
+								aria-label={`Select ${chat.title} chat`}
 								className={`item ${selectedChatId === chat.id ? "active" : ""}`}
 								key={chat.id}
-							>
-								<button
-									className="item-main"
-									aria-label={`Select ${chat.title} chat`}
-									onClick={() => {
+								onClick={() => {
+									onSelectChat(chat.id);
+								}}
+								onKeyDown={(event) => {
+									if (event.key === "Enter" || event.key === " ") {
+										event.preventDefault();
 										onSelectChat(chat.id);
-									}}
-									type="button"
-								>
+									}
+								}}
+								role="button"
+								tabIndex={0}
+							>
+								<span className="item-main">
 									<div className="chat-title">{chat.title}</div>
 									<div className="chat-meta small-muted">
 										{chat.provider} · Status {chat.status}
 									</div>
-								</button>
+								</span>
 								<span className="chat-badge">
 									+{chat.diffAdded} / -{chat.diffRemoved}
 								</span>

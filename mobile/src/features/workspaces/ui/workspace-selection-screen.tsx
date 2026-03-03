@@ -33,7 +33,7 @@ const palette = {
 
 export const WorkspaceSelectionScreen = () => {
 	const api = useRemoteCodeClient();
-	const { replace } = useFlowNavigator();
+	const { push, replace } = useFlowNavigator();
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		createProject,
@@ -124,7 +124,7 @@ export const WorkspaceSelectionScreen = () => {
 	const openWorkspace = (project: (typeof projects)[number]) => {
 		setOpenSwipeRowId(null);
 		selectProject(project);
-		replace("/threads");
+		push("/threads");
 	};
 
 	const createWorkspaceFromDesktopPaths = async (paths: string[]) => {
@@ -139,7 +139,7 @@ export const WorkspaceSelectionScreen = () => {
 		setErrorMessage("");
 		try {
 			await createProject({ path: selectedPath });
-			replace("/threads");
+			push("/threads");
 		} catch (error: unknown) {
 			setErrorMessage(error instanceof Error ? error.message : "Failed to create workspace.");
 		} finally {

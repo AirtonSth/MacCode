@@ -417,9 +417,19 @@ export const SettingsScreen = () => {
 										setOpenSavedSwipeBaseUrl(connection.baseUrl);
 									}}
 								>
-									<View
-										style={[styles.listRow, index % 2 === 0 ? styles.listRowStriped : null]}
-										testID={`saved-server-item-${String(index)}`}
+									<Pressable
+										accessibilityLabel={`Connect saved server ${toHost(connection.baseUrl) || connection.baseUrl}`}
+										disabled={isConnecting}
+										onPress={() => {
+											void connectSavedConnection(connection);
+										}}
+										style={({ pressed }) => [
+											styles.listRow,
+											index % 2 === 0 ? styles.listRowStriped : null,
+											pressed ? styles.listRowPressed : null,
+											isConnecting ? styles.disabledButton : null,
+										]}
+										testID={`saved-server-connect-${String(index)}`}
 									>
 										<View style={styles.rowTextGroup}>
 											<Text numberOfLines={1} style={styles.rowTitle}>
@@ -430,22 +440,8 @@ export const SettingsScreen = () => {
 											</Text>
 										</View>
 
-										<Pressable
-											accessibilityLabel="Connect saved server"
-											disabled={isConnecting}
-											onPress={() => {
-												void connectSavedConnection(connection);
-											}}
-											style={({ pressed }) => [
-												styles.disclosureButton,
-												pressed ? styles.disclosureButtonPressed : null,
-												isConnecting ? styles.disabledButton : null,
-											]}
-											testID={`saved-server-connect-${String(index)}`}
-										>
-											<Text style={styles.disclosureSymbol}>{">"}</Text>
-										</Pressable>
-									</View>
+										<Text style={styles.disclosureSymbol}>{">"}</Text>
+									</Pressable>
 								</SwipeableSavedConnectionItem>
 							);
 						}}
@@ -460,7 +456,7 @@ export const SettingsScreen = () => {
 				<View style={styles.section}>
 					<View style={styles.sectionHeader}>
 						<Text style={styles.sectionTitle}>LAN Discovery</Text>
-						<Pressable
+									<Pressable
 							onPress={() => {
 								void scanLan();
 							}}
@@ -482,9 +478,19 @@ export const SettingsScreen = () => {
 						renderItem={({ item: server, index }) => {
 							const isConnecting = Boolean(isConnectingByServerId[server.serverId]);
 							return (
-								<View
-									style={[styles.listRow, index % 2 === 0 ? styles.listRowStriped : null]}
-									testID={`server-item-${String(index)}`}
+								<Pressable
+									accessibilityLabel={`Connect server ${server.hostname}:${String(server.port)}`}
+									disabled={isConnecting}
+									onPress={() => {
+										void connectDiscoveredServer(server);
+									}}
+									style={({ pressed }) => [
+										styles.listRow,
+										index % 2 === 0 ? styles.listRowStriped : null,
+										pressed ? styles.listRowPressed : null,
+										isConnecting ? styles.disabledButton : null,
+									]}
+									testID={`server-connect-${String(index)}`}
 								>
 									<View style={styles.rowTextGroup}>
 										<Text numberOfLines={1} style={styles.rowTitle}>
@@ -495,22 +501,8 @@ export const SettingsScreen = () => {
 										</Text>
 									</View>
 
-									<Pressable
-										accessibilityLabel="Connect server"
-										disabled={isConnecting}
-										onPress={() => {
-											void connectDiscoveredServer(server);
-										}}
-										style={({ pressed }) => [
-											styles.disclosureButton,
-											pressed ? styles.disclosureButtonPressed : null,
-											isConnecting ? styles.disabledButton : null,
-										]}
-										testID={`server-connect-${String(index)}`}
-									>
 										<Text style={styles.disclosureSymbol}>{">"}</Text>
 									</Pressable>
-								</View>
 							);
 						}}
 						ListEmptyComponent={<Text style={styles.supportText}>No discovered server.</Text>}
@@ -596,6 +588,7 @@ const styles = StyleSheet.create({
 		paddingVertical: 8,
 	},
 	listRow: {
+		alignItems: "center",
 		gap: 8,
 		flexDirection: "row",
 		borderBottomWidth: StyleSheet.hairlineWidth,
@@ -603,21 +596,14 @@ const styles = StyleSheet.create({
 		paddingBottom: 12,
 		paddingTop: 12,
 	},
+	listRowPressed: {
+		backgroundColor: "rgba(255,255,255,0.06)",
+	},
 	listRowStriped: {
 		backgroundColor: "rgba(255,255,255,0.03)",
 	},
 	connectionList: {
 		paddingTop: 4,
-	},
-	disclosureButton: {
-		alignItems: "center",
-		borderRadius: 16,
-		height: 32,
-		justifyContent: "center",
-		width: 32,
-	},
-	disclosureButtonPressed: {
-		backgroundColor: "rgba(255,255,255,0.1)",
 	},
 	disclosureSymbol: {
 		color: palette.accent,

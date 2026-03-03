@@ -1732,15 +1732,21 @@ const App = (): JSX.Element => {
 															key={project.id}
 															layout={!shouldReduceMotion}
 														>
-															<div className="group flex items-center gap-1.5">
-																<button
+																<div
 																	aria-label={`Select ${project.name}`}
-																	className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 py-1 text-left transition hover:text-slate-100"
-																	onClick={() => {
+																	className="group flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 transition hover:text-slate-100"
+																onClick={() => {
+																	void handleSelectProject(project.id);
+																}}
+																onKeyDown={(event) => {
+																	if (event.key === "Enter" || event.key === " ") {
+																		event.preventDefault();
 																		void handleSelectProject(project.id);
-																	}}
-																	type="button"
-																>
+																	}
+																}}
+																role="button"
+																tabIndex={0}
+															>
 																	<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />
 																	<span className="min-w-0">
 																		<span
@@ -1750,17 +1756,18 @@ const App = (): JSX.Element => {
 																			{project.name}
 																		</span>
 																	</span>
-																</button>
+																</div>
 																<Tooltip>
 																	<TooltipTrigger asChild>
-																		<Button
+																	<Button
 																			aria-label={
 																				project.isFavorite
 																					? "Remove from favorites"
 																					: "Add to favorites"
 																			}
 																			className="h-6 w-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-																			onClick={() => {
+																			onClick={(event) => {
+																				event.stopPropagation();
 																				void handleToggleFavorite(project.id, !project.isFavorite);
 																			}}
 																			size="icon"
@@ -1810,31 +1817,33 @@ const App = (): JSX.Element => {
 																	) : (
 																		<>
 																			{visibleChats.map((chat) => (
-																				<motion.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
+																					<motion.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
 																					<div
+                                                                                        aria-label={`Open ${chat.title}`}
                                                                                         className={cn(
                                                                                             "group relative grid w-full min-h-[2rem] grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-[13px] transition duration-150",
 																							state.selectedChatId === chat.id
 																								? "bg-white/[0.07] text-slate-100"
 																								: "text-slate-300 hover:bg-white/[0.03] hover:text-slate-100",
 																						)}
+                                                                                            onClick={() => {
+                                                                                                 void handleSelectChat(chat.id);
+                                                                                            }}
+                                                                                            onKeyDown={(event) => {
+                                                                                                 if (event.key === "Enter" || event.key === " ") {
+                                                                                                      event.preventDefault();
+                                                                                                      void handleSelectChat(chat.id);
+                                                                                                 }
+                                                                                            }}
+                                                                                            role="button"
+                                                                                            tabIndex={0}
                                                                                         >
-																						<button
-																							aria-label={`Open ${chat.title}`}
-																							className={cn(
-																								"inline-flex min-w-0 items-center",
-																								state.selectedChatId === chat.id ? "self-center" : "",
-																							)}
-																							onClick={() => {
-																								void handleSelectChat(chat.id);
-																							}}
-																							type="button"
-																						>
-																							<span className="truncate leading-5">{chat.title}</span>
-																						</button>
+																							<span className={cn("inline-flex min-w-0 items-center", state.selectedChatId === chat.id ? "self-center" : "")}>
+                                                                                                <span className="truncate leading-5">{chat.title}</span>
+                                                                                            </span>
                                                                                             <div className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end">
                                                                                             <span className="pr-1.5 text-[11px] text-slate-500 transition-opacity duration-150 group-hover:opacity-0">
-																								{formatRelativeTime(chat.updatedAt)}
+																							{formatRelativeTime(chat.updatedAt)}
 																							</span>
 																							<Tooltip>
                                                                                                 <TooltipTrigger asChild>

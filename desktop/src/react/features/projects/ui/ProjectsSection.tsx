@@ -87,23 +87,28 @@ export const ProjectsSection = ({
 					) : (
 						projects.map((project) => (
 							<li
+								aria-label={`Select ${project.name} project`}
 								className={`item ${selectedProjectId === project.id ? "active" : ""}`}
 								key={project.id}
-							>
-								<button
-									className="item-main"
-									aria-label={`Select ${project.name} project`}
-									onClick={() => {
+								onClick={() => {
+									onSelectProject(project.id);
+								}}
+								onKeyDown={(event) => {
+									if (event.key === "Enter" || event.key === " ") {
+										event.preventDefault();
 										onSelectProject(project.id);
-									}}
-									type="button"
-								>
+									}
+								}}
+								role="button"
+								tabIndex={0}
+							>
+								<span className="item-main">
 									<span>{project.name}</span>
 									<span className="small-muted">{project.path}</span>
 									{selectedProjectId === project.id ? (
 										<span className="small-muted">(Selected)</span>
 									) : null}
-								</button>
+								</span>
 								<button
 									aria-label={
 										project.isFavorite
@@ -111,7 +116,8 @@ export const ProjectsSection = ({
 											: "Add to favorites"
 									}
 									className="icon-button"
-									onClick={() => {
+									onClick={(event) => {
+										event.stopPropagation();
 										onToggleFavorite(project.id, !project.isFavorite);
 									}}
 									type="button"
