@@ -140,7 +140,7 @@ test("selection repository clears ids when selected project is deleted", async (
 				createSelectionFromRow({
 					selectedProjectId: null,
 					selectedChatId: null,
-					permissionMode: "default",
+					permissionMode: "plan",
 					selectedModel: "gpt-5.3-codex",
 					selectedReasoningEffort: "medium",
 				}),
