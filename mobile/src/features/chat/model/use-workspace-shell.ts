@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AppState, type AppStateStatus } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
 import { useCreateChatMutation } from "../api/use-create-chat-mutation";
@@ -28,6 +29,10 @@ import type {
 	WorkspaceSelectionDTO,
 } from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import {
+	ensureLocalNotificationPermission,
+	sendThreadCompletionNotification,
+} from "../../../shared/notifications/local-notifications";
 import {
 	applyAssistantEventToTurn,
 	cloneTurn,
@@ -197,7 +202,9 @@ export const useWorkspaceShell = () => {
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
 	const selectedChatIdRef = useRef<string | null>(selectedChatId);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
+	const pendingCompletionNotificationChatIdsRef = useRef<Set<string>>(new Set());
 	const lastAssistantEventIdByChatRef = useRef<Record<string, number>>({});
+	const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 	const clientIdRef = useRef<string>(`mobile-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`);
 	const hasBootstrappedSelectionRef = useRef<boolean>(false);
 	const pendingSelectionRef = useRef<WorkspaceSelectionDTO | null>(null);
@@ -263,6 +270,93 @@ export const useWorkspaceShell = () => {
 	useEffect(() => {
 		selectedChatIdRef.current = selectedChatId;
 	}, [selectedChatId]);
+
+	const notifyMessageCompletion = useCallback(
+		(chatId: string, outcome: "completed" | "error" | "failed") => {
+			if (!pendingCompletionNotificationChatIdsRef.current.has(chatId)) {
+				return;
+			}
+
+			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+			const activeProjectId = selectedProjectIdRef.current;
+			const chats = queryClient.getQueryData<ChatDTO[]>(queryKeys.chats(activeProjectId)) ?? [];
+			const chatTitle = chats.find((chat) => chat.id === chatId)?.title;
+
+			void (async () => {
+				try {
+					await sendThreadCompletionNotification({
+						chatId,
+						chatTitle: chatTitle?.trim().length ? chatTitle : undefined,
+						outcome,
+					});
+				} catch {
+					// Ignore local notification failures.
+				}
+			})();
+		},
+		[queryClient],
+	);
+
+	const syncMissedAssistantEventsForChat = useCallback(
+		async (chatId: string) => {
+			const collectEvents = async (
+				afterId: number,
+				accumulator: ChatStreamEventDTO[],
+			): Promise<ChatStreamEventDTO[]> => {
+				const page = await client.listChatStreamEvents(chatId, {
+					afterId,
+					limit: 500,
+				});
+				const nextEvents = [...accumulator, ...page.events];
+
+				if (!page.hasMore || page.nextAfterId === null) {
+					return nextEvents;
+				}
+
+				return await collectEvents(page.nextAfterId, nextEvents);
+			};
+
+			const lastKnownEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
+			try {
+				const events = await collectEvents(lastKnownEventId, []);
+				if (events.length === 0) {
+					return;
+				}
+
+				setStreamHistoryByChat((current) => {
+					let nextTurns = current[chatId] ?? [];
+					let appliedAnyEvent = false;
+
+					for (const entry of events) {
+						const lastAppliedEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
+						if (entry.id <= lastAppliedEventId) {
+							continue;
+						}
+
+						nextTurns = applyAssistantEventToHistory(nextTurns, entry.event);
+						lastAssistantEventIdByChatRef.current[chatId] = entry.id;
+						appliedAnyEvent = true;
+					}
+
+					if (!appliedAnyEvent) {
+						return current;
+					}
+
+					queryClient.setQueryData<StreamTurnState | null>(
+						queryKeys.streamTurn(chatId),
+						nextTurns.at(-1) ?? null,
+					);
+					return {
+						...current,
+						[chatId]: nextTurns,
+					};
+				});
+			} catch {
+				void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
+			}
+		},
+		[client, queryClient],
+	);
 
 	const handleServerEvent = useCallback(
 		(event: ServerWsEvent) => {
@@ -387,6 +481,7 @@ export const useWorkspaceShell = () => {
 					[chatId]: "",
 				}));
 				clearSendingForChat(chatId);
+				notifyMessageCompletion(chatId, "completed");
 				return;
 			}
 
@@ -398,6 +493,9 @@ export const useWorkspaceShell = () => {
 				);
 				if (event.data.status !== "running") {
 					clearSendingForChat(event.data.chatId);
+				}
+				if (event.data.status === "completed" || event.data.status === "failed") {
+					notifyMessageCompletion(event.data.chatId, event.data.status);
 				}
 				return;
 			}
@@ -412,6 +510,7 @@ export const useWorkspaceShell = () => {
 						[chatId]: "",
 					}));
 					clearSendingForChat(chatId);
+					notifyMessageCompletion(chatId, "error");
 				}
 				return;
 			}
@@ -456,7 +555,7 @@ export const useWorkspaceShell = () => {
 				}
 			}
 		},
-		[client, queryClient, setSendingByChat],
+		[client, notifyMessageCompletion, queryClient, setSendingByChat],
 	);
 
 	const handleConnectionStateChange = useCallback((state: ConnectionState) => {
@@ -496,6 +595,44 @@ export const useWorkspaceShell = () => {
 
 		realtimeRef.current.sendJoinChat(selectedChatId);
 	}, [selectedChatId]);
+
+	useEffect(() => {
+		const subscription = AppState.addEventListener("change", (nextState) => {
+			const previousState = appStateRef.current;
+			appStateRef.current = nextState;
+			const isReturningToForeground =
+				(previousState === "background" || previousState === "inactive") && nextState === "active";
+
+			if (!isReturningToForeground) {
+				return;
+			}
+
+			realtimeRef.current?.connect();
+			realtimeRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
+
+			const activeProjectId = selectedProjectIdRef.current;
+			if (activeProjectId) {
+				void queryClient.invalidateQueries({
+					queryKey: queryKeys.chats(activeProjectId),
+				});
+			}
+
+			const activeChatId = selectedChatIdRef.current;
+			if (!activeChatId) {
+				return;
+			}
+
+			realtimeRef.current?.sendJoinChat(activeChatId);
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.messages(activeChatId),
+			});
+			void syncMissedAssistantEventsForChat(activeChatId);
+		});
+
+		return () => {
+			subscription.remove();
+		};
+	}, [queryClient, syncMissedAssistantEventsForChat]);
 
 	useEffect(() => {
 		let canceled = false;
@@ -685,6 +822,8 @@ export const useWorkspaceShell = () => {
 	const deleteChat = useCallback(
 		async (chatId: string) => {
 			await deleteChatMutation.mutateAsync(chatId);
+			pendingSendChatIdsRef.current.delete(chatId);
+			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
 
 			if (selectedChatId === chatId) {
 				inMemorySelectedChatId = null;
@@ -818,6 +957,8 @@ export const useWorkspaceShell = () => {
 				[activeChatId]: true,
 			}));
 			pendingSendChatIdsRef.current.add(activeChatId);
+			pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
+			void ensureLocalNotificationPermission();
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {
@@ -841,6 +982,7 @@ export const useWorkspaceShell = () => {
 			const selected = selectedChatIdRef.current;
 			if (selected) {
 				pendingSendChatIdsRef.current.delete(selected);
+				pendingCompletionNotificationChatIdsRef.current.delete(selected);
 				setSendingByChat((current) => ({
 					...current,
 					[selected]: false,
@@ -916,16 +1058,29 @@ export const useWorkspaceShell = () => {
 		[projectsQuery.data, selectedProjectId],
 	);
 
-const selectedChat = useMemo(
-	() => chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null,
-	[chatsQuery.data, selectedChatId],
-);
-const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
-const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
-const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
-const isChatsLoading = Boolean(selectedProjectId) && chatsQuery.isPending;
-const messages = messagesQuery.messages;
-const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
+	const selectedChat = useMemo(
+		() => chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null,
+		[chatsQuery.data, selectedChatId],
+	);
+
+	useEffect(() => {
+		if (!selectedChatId || !selectedChat) {
+			return;
+		}
+
+		if (selectedChat.status !== "completed" && selectedChat.status !== "failed") {
+			return;
+		}
+
+		notifyMessageCompletion(selectedChatId, selectedChat.status);
+	}, [notifyMessageCompletion, selectedChat, selectedChatId]);
+
+	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
+	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
+	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
+	const isChatsLoading = Boolean(selectedProjectId) && chatsQuery.isPending;
+	const messages = messagesQuery.messages;
+	const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],

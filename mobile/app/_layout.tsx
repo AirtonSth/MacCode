@@ -7,6 +7,7 @@ import { useEffect } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
 import { queryClient } from "@/shared/api/query-client";
+import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
 import { theme } from "@/shared/theme/tokens";
 
 export {
@@ -18,6 +19,10 @@ SplashScreen.preventAutoHideAsync();
 export default function RootLayout() {
 	useEffect(() => {
 		void SplashScreen.hideAsync();
+	}, []);
+
+	useEffect(() => {
+		void initializeLocalNotifications();
 	}, []);
 
 	return (

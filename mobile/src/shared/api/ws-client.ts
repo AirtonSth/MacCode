@@ -332,11 +332,25 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		return joinedInQueue;
 	};
 
+	const hasQueuedWorkspaceJoin = () => {
+		return sendQueue.some((event) => event.event === "join_workspace");
+	};
+
 	const enqueueMessage = (payload: ClientWsEvent) => {
 		if (payload.event === "join_chat") {
 			const queuedJoinChatIds = getQueuedJoinChatIds();
 			if (queuedJoinChatIds.has(payload.data.chatId)) {
 				return;
+			}
+		}
+
+		if (payload.event === "join_workspace") {
+			for (let index = sendQueue.length - 1; index >= 0; index -= 1) {
+				const queued = sendQueue[index];
+				if (queued?.event === "join_workspace") {
+					sendQueue.splice(index, 1);
+					break;
+				}
 			}
 		}
 
@@ -426,6 +440,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			notifyState("connected");
 
 			const queuedJoinChatIds = getQueuedJoinChatIds();
+			const queuedWorkspaceJoin = hasQueuedWorkspaceJoin();
 			flushQueue();
 
 			for (const chatId of activeChats) {
@@ -441,6 +456,10 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 						event: "join_chat",
 					}),
 				);
+			}
+
+			if (activeWorkspaceSubscription && !queuedWorkspaceJoin) {
+				sendWorkspaceJoinNow(activeWorkspaceSubscription);
 			}
 		};
 
@@ -510,8 +529,16 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				lastSeq: normalizedLastSeq,
 				...(clientId ? { clientId } : {}),
 			};
-			if (activeWorkspaceSubscription) {
-				sendWorkspaceJoinNow(activeWorkspaceSubscription);
+			if (activeWorkspaceSubscription && !sendWorkspaceJoinNow(activeWorkspaceSubscription)) {
+				send({
+					data: {
+						lastSeq: activeWorkspaceSubscription.lastSeq,
+						...(activeWorkspaceSubscription.clientId
+							? { clientId: activeWorkspaceSubscription.clientId }
+							: {}),
+					},
+					event: "join_workspace",
+				});
 			}
 		},
 		sendUserMessage: (
