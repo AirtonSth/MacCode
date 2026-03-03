@@ -1375,7 +1375,6 @@ export const ChatScreen = () => {
 										}}
 										deleteTestID={`drawer-workspace-delete-${String(index)}`}
 										project={project}
-										testID={`drawer-workspace-item-${String(index)}`}
 										rowBackgroundColor="rgba(255,255,255,0.04)"
 										rowBorderColor="rgba(255,255,255,0.2)"
 										selectedRowBackgroundColor="rgba(99,200,255,0.16)"
