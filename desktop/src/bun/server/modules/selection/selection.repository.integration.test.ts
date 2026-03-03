@@ -15,8 +15,8 @@ const createSelectionFromRow = (row: {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
 	permissionMode: "default" | "plan" | "full";
-	selectedModel?: string | null;
-	selectedReasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
+	selectedModel: string | null;
+	selectedReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
 }) => ({ ...row });
 
 test("selection repository upserts one row and returns stored selection", async () => {
