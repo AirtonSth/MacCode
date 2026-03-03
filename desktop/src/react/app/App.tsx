@@ -369,6 +369,7 @@ const App = (): JSX.Element => {
 	const selectedChatIdRef = useRef<string | null>(null);
 	const selectedProjectIdRef = useRef<string | null>(null);
 	const persistedSelectedChatIdRef = useRef<string | null>(null);
+	const isCreatingChatRef = useRef<boolean>(false);
 	const sidebarWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
 	const isSidebarResizingRef = useRef<boolean>(false);
 	const sidebarResizeStartXRef = useRef<number>(0);
@@ -620,6 +621,10 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		selectedProjectIdRef.current = state.selectedProjectId;
 	}, [state.selectedProjectId]);
+
+	useEffect(() => {
+		isCreatingChatRef.current = state.isCreatingChat;
+	}, [state.isCreatingChat]);
 
 	const addError = useCallback(
 		(message: string, source: "rest" | "ws", code = "unknown") => {
@@ -1048,13 +1053,18 @@ const App = (): JSX.Element => {
 							break;
 						case "chat_created":
 						case "chat_updated":
-						case "chat_deleted":
+						case "chat_deleted": {
+							const preferredChatId =
+								envelope.type === "chat_created" && isCreatingChatRef.current && chatId
+									? chatId
+									: selectedChatIdRef.current;
 							if (projectId && projectId === selectedProjectIdRef.current) {
-								await loadChatsForProject(projectId, selectedChatIdRef.current);
+								await loadChatsForProject(projectId, preferredChatId);
 							} else if (selectedProjectIdRef.current) {
-								await loadChatsForProject(selectedProjectIdRef.current, selectedChatIdRef.current);
+								await loadChatsForProject(selectedProjectIdRef.current, preferredChatId);
 							}
 							break;
+						}
 						case "message_created":
 							if (chatId && chatId === selectedChatIdRef.current) {
 								await loadMessagesForChat(chatId);
@@ -1209,6 +1219,9 @@ const App = (): JSX.Element => {
 			try {
 				const chat = await api.createChat(state.selectedProjectId, title);
 				dispatch({ payload: chat, type: "UPSERT_CHAT" });
+				selectedProjectIdRef.current = state.selectedProjectId;
+				selectedChatIdRef.current = chat.id;
+				persistedSelectedChatIdRef.current = chat.id;
 				await persistWorkspaceSelection(state.selectedProjectId, chat.id);
 				return chat;
 			} catch (error) {
@@ -1416,6 +1429,8 @@ const App = (): JSX.Element => {
 
 			dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
 			dispatch({ payload: projectId, type: "SET_SELECTED_PROJECT" });
+			selectedProjectIdRef.current = projectId;
+			selectedChatIdRef.current = null;
 			persistedSelectedChatIdRef.current = null;
 			await persistWorkspaceSelection(projectId, null);
 		},
@@ -1429,6 +1444,7 @@ const App = (): JSX.Element => {
 			}
 
 			dispatch({ payload: chatId, type: "SET_SELECTED_CHAT" });
+			selectedChatIdRef.current = chatId;
 			persistedSelectedChatIdRef.current = chatId;
 			await persistWorkspaceSelection(state.selectedProjectId, chatId);
 		},

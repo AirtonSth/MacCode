@@ -36,8 +36,10 @@ const createStreamItem = (itemId: string, itemType: AssistantStreamItemType): St
 	startedAtMs: Date.now(),
 	finishedAtMs: null,
 	expandedByUser: false,
-	isExpanded: true,
+	isExpanded: false,
 });
+
+const shouldAutoExpandForState = (state: AssistantStreamItemState): boolean => state === "running";
 
 export const createStreamTurnState = (turnId: string): StreamTurnState => ({
 	turnId,
@@ -126,6 +128,9 @@ export const applyAssistantEventToTurn = (
 		if (event.summary !== undefined) {
 			item.summary = event.summary;
 		}
+		if (!item.expandedByUser) {
+			item.isExpanded = shouldAutoExpandForState(item.state);
+		}
 		turn.itemsById[event.itemId] = item;
 		return turn;
 	}
@@ -150,6 +155,9 @@ export const applyAssistantEventToTurn = (
 		if (event.state === "failed" || event.state === "cancelled") {
 			turn.status = "failed";
 		}
+		if (!item.expandedByUser) {
+			item.isExpanded = shouldAutoExpandForState(item.state);
+		}
 	}
 
 	if (event.type === "item_completed") {
@@ -160,6 +168,9 @@ export const applyAssistantEventToTurn = (
 		}
 		if (item.state === "failed" || item.state === "cancelled") {
 			turn.status = "failed";
+		}
+		if (!item.expandedByUser) {
+			item.isExpanded = shouldAutoExpandForState(item.state);
 		}
 	}
 

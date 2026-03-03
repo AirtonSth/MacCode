@@ -124,6 +124,7 @@ export const ChatScreen = () => {
 		createProject,
 		deleteProject,
 		isLoaded,
+		isMessagesLoading,
 		isSending,
 		lastError,
 		selectedModel,
@@ -280,6 +281,21 @@ export const ChatScreen = () => {
 	}, [liveTurn, streamHistoryTurns]);
 	const hasRunDetails = hasStreamingItems || historicalTurns.length > 0;
 	const selectedChatIsRunning = selectedChat?.status === "running";
+	const isResolvingThreadSelection = source === "thread-list" && !selectedChatId;
+	const showMessageHistoryLoading =
+		Boolean(selectedChatId) &&
+		isMessagesLoading &&
+		messages.length === 0 &&
+		!hasStreamingText &&
+		!hasStreamingItems;
+	const shouldShowMessagesLoading = showMessageHistoryLoading || isResolvingThreadSelection;
+	const shouldShowEmptyState =
+		!shouldShowMessagesLoading &&
+		Boolean(selectedChatId) &&
+		messages.length === 0 &&
+		!hasStreamingText &&
+		!hasStreamingItems &&
+		!selectedChatIsRunning;
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -873,7 +889,16 @@ export const ChatScreen = () => {
 						style={styles.messages}
 						testID="chat-message-list"
 					>
-						{messages.length === 0 && !hasStreamingText && !hasStreamingItems && !selectedChatIsRunning ? (
+						{shouldShowMessagesLoading ? (
+							<View style={styles.messagesLoading} testID="chat-messages-loading">
+								<ActivityIndicator color={palette.accent} size="small" />
+								<Text style={styles.messagesLoadingLabel}>
+									{isResolvingThreadSelection ? "Opening thread..." : "Loading messages..."}
+								</Text>
+							</View>
+						) : null}
+
+						{shouldShowEmptyState ? (
 							<Text style={styles.emptyState}>Start a conversation.</Text>
 						) : null}
 
@@ -2049,6 +2074,15 @@ const styles = StyleSheet.create({
 	},
 	messages: {
 		flex: 1,
+	},
+	messagesLoading: {
+		alignItems: "center",
+		gap: 8,
+		paddingVertical: 20,
+	},
+	messagesLoadingLabel: {
+		color: palette.muted,
+		fontSize: 13,
 	},
 	messagesContent: {
 		gap: 8,

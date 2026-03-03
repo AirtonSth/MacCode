@@ -3,7 +3,7 @@ import { AlertTriangle, Bot, ChevronDown, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
 import { ScrollArea } from "../../../components/ui/scroll-area";
 import ReactMarkdown from "react-markdown";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../../lib/utils";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -54,6 +54,7 @@ export const ConversationPanel = ({
 	const [showRunDetails, setShowRunDetails] = useState(false);
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
+	const stickToBottomRef = useRef(true);
 	const bubbleMotion = shouldReduceMotion
 		? {}
 		: {
@@ -81,21 +82,24 @@ export const ConversationPanel = ({
 			return;
 		}
 		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-		setIsAtBottom(distanceFromBottom <= 24);
+		const nextIsAtBottom = distanceFromBottom <= 24;
+		stickToBottomRef.current = nextIsAtBottom;
+		setIsAtBottom(nextIsAtBottom);
 	}, []);
 	useEffect(() => {
+		stickToBottomRef.current = true;
 		setIsAtBottom(true);
 		setShowRunDetails(false);
 	}, [chat?.id]);
 
-	useEffect(() => {
+	useLayoutEffect(() => {
 		if (!hasContent) {
 			return;
 		}
-		if (isAtBottom) {
-			scrollToBottom();
+		if (stickToBottomRef.current) {
+			scrollToBottom("auto");
 		}
-	}, [hasContent, isAtBottom, messages, streamingText, scrollToBottom]);
+	}, [hasContent, historicalTurns, liveTurn, messages, scrollToBottom, streamingText]);
 	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
 	const markdownComponents: Components = {
 		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,
