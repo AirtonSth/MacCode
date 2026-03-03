@@ -1,5 +1,6 @@
 import { useRouter } from "expo-router";
 import type { ReactNode } from "react";
+import { Ionicons } from "@expo/vector-icons";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -60,7 +61,7 @@ export const IosStackHeader = ({
 						]}
 						testID="nav-back"
 					>
-						{left || <Text style={styles.backLabel}>{backLabel}</Text>}
+						{left || (backLabel ? <Text style={styles.backLabel}>{backLabel}</Text> : <Ionicons color={palette.text} name="chevron-back" size={22} />)}
 					</Pressable>
 				) : (
 					<View style={styles.leftSpacer} />
