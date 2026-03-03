@@ -68,6 +68,7 @@ export interface AssistantSnapshotEvent {
 export interface AssistantEvent {
 	data: {
 		chatId: string;
+		eventId?: number;
 		event: AssistantStreamEvent;
 	};
 	event: "assistant_event";
@@ -313,10 +314,12 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 		if (!streamEvent) {
 			return null;
 		}
+		const parsedEventId = isNumber(data.eventId) ? data.eventId : undefined;
 
 		return {
 			data: {
 				chatId,
+				...(parsedEventId !== undefined ? { eventId: parsedEventId } : {}),
 				event: streamEvent,
 			},
 			event: "assistant_event",

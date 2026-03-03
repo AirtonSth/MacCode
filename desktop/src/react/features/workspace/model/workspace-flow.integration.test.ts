@@ -216,6 +216,9 @@ const createInitialWorkspaceState = (): WorkspaceState => ({
 	streamingByChat: {},
 	streamingActiveByChat: {},
 	streamTurnsByChat: {},
+	streamHistoryByChat: {},
+	lastAssistantEventIdByChat: {},
+	sendingByChat: {},
 	isSendingMessage: false,
 	isCreatingProject: false,
 	isCreatingChat: false,
@@ -256,30 +259,38 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 					action.payload,
 				].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : a.updatedAt < b.updatedAt ? 1 : 0)),
 			};
-		case "SET_SELECTED_PROJECT":
-			if (action.payload === null) {
+			case "SET_SELECTED_PROJECT":
+				if (action.payload === null) {
+					return {
+						...state,
+						selectedProjectId: null,
+						chats: [],
+						selectedChatId: null,
+						messages: [],
+						streamingByChat: {},
+						streamingActiveByChat: {},
+						streamTurnsByChat: {},
+						streamHistoryByChat: {},
+						lastAssistantEventIdByChat: {},
+						sendingByChat: {},
+					};
+				}
+			if (state.selectedProjectId === action.payload) {
+				return state;
+			}
 				return {
 					...state,
-					selectedProjectId: null,
+					selectedProjectId: action.payload,
 					chats: [],
 					selectedChatId: null,
 					messages: [],
 					streamingByChat: {},
 					streamingActiveByChat: {},
+					streamTurnsByChat: {},
+					streamHistoryByChat: {},
+					lastAssistantEventIdByChat: {},
+					sendingByChat: {},
 				};
-			}
-			if (state.selectedProjectId === action.payload) {
-				return state;
-			}
-			return {
-				...state,
-				selectedProjectId: action.payload,
-				chats: [],
-				selectedChatId: null,
-				messages: [],
-				streamingByChat: {},
-				streamingActiveByChat: {},
-			};
 		case "SET_CHATS":
 			return {
 				...state,
@@ -354,11 +365,23 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 					[action.payload.chatId]: false,
 				},
 			};
-		case "SET_SENDING_MESSAGE":
-			return {
-				...state,
-				isSendingMessage: action.payload,
-			};
+			case "SET_SENDING_MESSAGE":
+				return {
+					...state,
+					isSendingMessage: action.payload,
+				};
+			case "SET_CHAT_SENDING": {
+				const nextSendingByChat = {
+					...state.sendingByChat,
+					[action.payload.chatId]: action.payload.sending,
+				};
+
+				return {
+					...state,
+					sendingByChat: nextSendingByChat,
+					isSendingMessage: Object.values(nextSendingByChat).some(Boolean),
+				};
+			}
 		case "SET_CREATING_PROJECT":
 			return {
 				...state,
@@ -506,29 +529,39 @@ const createWorkspaceFlowHarness = () => {
 
 	const handleWsEvent = async (event: ServerWsEvent) => {
 		switch (event.event) {
-			case "assistant_delta": {
-				dispatch({
-					type: "APPEND_STREAMING",
-					payload: {
-						chatId: event.data.chatId,
-						delta: event.data.delta,
-					},
-				});
-				if (state.value.selectedChatId === event.data.chatId) {
-					dispatch({ type: "SET_SENDING_MESSAGE", payload: false });
+				case "assistant_delta": {
+					dispatch({
+						type: "APPEND_STREAMING",
+						payload: {
+							chatId: event.data.chatId,
+							delta: event.data.delta,
+						},
+					});
+					dispatch({
+						type: "SET_CHAT_SENDING",
+						payload: {
+							chatId: event.data.chatId,
+							sending: false,
+						},
+					});
+					break;
 				}
-				break;
-			}
 			case "assistant_done":
 				dispatch({
 					type: "CLEAR_STREAMING",
 					payload: { chatId: event.data.chatId },
 				});
-				if (state.value.selectedChatId === event.data.chatId) {
-					await loadMessagesForChat(event.data.chatId);
-				}
-				dispatch({ type: "SET_SENDING_MESSAGE", payload: false });
-				break;
+					if (state.value.selectedChatId === event.data.chatId) {
+						await loadMessagesForChat(event.data.chatId);
+					}
+					dispatch({
+						type: "SET_CHAT_SENDING",
+						payload: {
+							chatId: event.data.chatId,
+							sending: false,
+						},
+					});
+					break;
 			case "chat_updated":
 				dispatch({
 					type: "UPDATE_CHAT",
@@ -543,16 +576,20 @@ const createWorkspaceFlowHarness = () => {
 				break;
 			case "error":
 				addError(event.data.message, "ws", event.data.code);
-				if (event.data.chatId) {
-					dispatch({
-						type: "CLEAR_STREAMING",
-						payload: { chatId: event.data.chatId },
-					});
-					if (state.value.selectedChatId === event.data.chatId) {
-						dispatch({ type: "SET_SENDING_MESSAGE", payload: false });
+					if (event.data.chatId) {
+						dispatch({
+							type: "CLEAR_STREAMING",
+							payload: { chatId: event.data.chatId },
+						});
+						dispatch({
+							type: "SET_CHAT_SENDING",
+							payload: {
+								chatId: event.data.chatId,
+								sending: false,
+							},
+						});
 					}
-				}
-				break;
+					break;
 		}
 	};
 
@@ -727,9 +764,15 @@ const createWorkspaceFlowHarness = () => {
 			onSendUserMessage: (chatId, messageText) => {
 				wsRef?.sendUserMessage(chatId, messageText, permissionMode);
 			},
-			onSetSending: (sending) => {
-				dispatch({ type: "SET_SENDING_MESSAGE", payload: sending });
-			},
+				onSetSending: (chatId, sending) => {
+					dispatch({
+						type: "SET_CHAT_SENDING",
+						payload: {
+							chatId,
+							sending,
+						},
+					});
+				},
 			selectedChatId: state.value.selectedChatId,
 			selectedProjectId: state.value.selectedProjectId,
 			text,

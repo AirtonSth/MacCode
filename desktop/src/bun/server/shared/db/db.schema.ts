@@ -91,6 +91,16 @@ export const chatStreamSnapshots = sqliteTable("chat_stream_snapshots", {
 	updatedAt: text("updatedAt").notNull(),
 });
 
+export const chatStreamEvents = sqliteTable("chat_stream_events", {
+	id: integer("id").primaryKey({ autoIncrement: true }),
+	chatId: text("chatId")
+		.notNull()
+		.references(() => chats.id, { onDelete: "cascade" }),
+	eventJson: text("eventJson").notNull(),
+	turnId: text("turnId").notNull(),
+	createdAt: text("createdAt").notNull(),
+});
+
 export const serverMetadata = sqliteTable("server_metadata", {
 	key: text("key").primaryKey(),
 	value: text("value").notNull(),
@@ -106,6 +116,7 @@ export type TerminalCommandRow = typeof terminalCommands.$inferSelect;
 export type TerminalEntryRow = typeof terminalEntries.$inferSelect;
 export type WorkspaceEventRow = typeof workspaceEvents.$inferSelect;
 export type ChatStreamSnapshotRow = typeof chatStreamSnapshots.$inferSelect;
+export type ChatStreamEventRow = typeof chatStreamEvents.$inferSelect;
 export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
 
 export class DatabaseSchema {
@@ -124,6 +135,8 @@ export class DatabaseSchema {
 	static readonly workspaceEvents = workspaceEvents;
 
 	static readonly chatStreamSnapshots = chatStreamSnapshots;
+
+	static readonly chatStreamEvents = chatStreamEvents;
 
 	static readonly serverMetadata = serverMetadata;
 }

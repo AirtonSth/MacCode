@@ -5,6 +5,7 @@ import type { ChatRepository } from "../chat/chat.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
 import type { ProjectRepository } from "../project/project.repository";
+import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
 import { WsService } from "./ws.service";
 
@@ -153,6 +154,207 @@ test("WsService.startUserMessage blocks chat_running when already running", asyn
 			event: "error",
 		},
 	]);
+});
+
+test("WsService.startUserMessage allows concurrent runs for different chats", async () => {
+	const statusByChat = new Map<string, ChatDTO["status"]>([
+		["chat-a", "pending"],
+		["chat-b", "pending"],
+	]);
+	const updatedAtByChat = new Map<string, string>([
+		["chat-a", new Date().toISOString()],
+		["chat-b", new Date().toISOString()],
+	]);
+
+	const chatRepository = {
+		findChatById: (chatId: string) => {
+			const status = statusByChat.get(chatId);
+			if (!status) {
+				return null;
+			}
+
+			return createChat({
+				id: chatId,
+				status,
+				updatedAt: updatedAtByChat.get(chatId) ?? new Date().toISOString(),
+			});
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => {
+			if (update.status) {
+				statusByChat.set(chatId, update.status);
+			}
+			const nextUpdatedAt = new Date().toISOString();
+			updatedAtByChat.set(chatId, nextUpdatedAt);
+			return createChat({
+				id: chatId,
+				status: statusByChat.get(chatId) ?? "pending",
+				updatedAt: nextUpdatedAt,
+			});
+		},
+		updateProviderThreadId: () => createChat(),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (chatId: string, role: "user" | "assistant", content: string) => ({
+			chatId,
+			content,
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const controls = new Map<string, { promise: Promise<void>; resolve: () => void }>();
+	const getControl = (chatId: string) => {
+		const current = controls.get(chatId);
+		if (current) {
+			return current;
+		}
+		let resolve = () => {};
+		const promise = new Promise<void>((resolver) => {
+			resolve = resolver;
+		});
+		const created = { promise, resolve };
+		controls.set(chatId, created);
+		return created;
+	};
+
+	const runner = {
+		run: async ({ chatId, onDelta }: { chatId: string; onDelta: (delta: string) => void }) => {
+			onDelta(`delta-${chatId}`);
+			await getControl(chatId).promise;
+			return {
+				assistantText: `done-${chatId}`,
+				diffAdded: 1,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	const first = service.startUserMessage({ chatId: "chat-a", emit: collector.emit, text: "one" });
+	const second = service.startUserMessage({ chatId: "chat-b", emit: collector.emit, text: "two" });
+
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	expect(service.isChatRunning("chat-a")).toBe(true);
+	expect(service.isChatRunning("chat-b")).toBe(true);
+
+	getControl("chat-a").resolve();
+	getControl("chat-b").resolve();
+	await Promise.all([first, second]);
+
+	const doneChatIds = collector.events
+		.filter((event) => event.event === "assistant_done")
+		.map((event) => event.data.chatId)
+		.sort();
+
+	expect(doneChatIds).toEqual(["chat-a", "chat-b"]);
+});
+
+test("WsService.startUserMessage blocks a second concurrent run for the same chat", async () => {
+	let chatStatus: ChatDTO["status"] = "pending";
+	let updatedAt = new Date().toISOString();
+
+	const chatRepository = {
+		findChatById: (chatId: string) => {
+			if (chatId !== "chat-a") {
+				return null;
+			}
+
+			return createChat({
+				id: "chat-a",
+				status: chatStatus,
+				updatedAt,
+			});
+		},
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => {
+			if (update.status) {
+				chatStatus = update.status;
+			}
+			updatedAt = new Date().toISOString();
+			return createChat({
+				id: "chat-a",
+				status: chatStatus,
+				updatedAt,
+			});
+		},
+		updateProviderThreadId: () => createChat(),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (chatId: string, role: "user" | "assistant", content: string) => ({
+			chatId,
+			content,
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	let resolveRunner = () => {};
+	const runner = {
+		run: async ({ onDelta }: { onDelta: (delta: string) => void }) => {
+			onDelta("delta-chat-a");
+			await new Promise<void>((resolve) => {
+				resolveRunner = resolve;
+			});
+			return {
+				assistantText: "done-chat-a",
+				diffAdded: 1,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const firstEvents: ServerWsEvent[] = [];
+	const secondEvents: ServerWsEvent[] = [];
+
+	const firstRun = service.startUserMessage({
+		chatId: "chat-a",
+		emit: (event) => {
+			firstEvents.push(event);
+		},
+		text: "first",
+	});
+
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await service.startUserMessage({
+		chatId: "chat-a",
+		emit: (event) => {
+			secondEvents.push(event);
+		},
+		text: "second",
+	});
+
+	expect(secondEvents).toEqual([
+		{
+			data: {
+				chatId: "chat-a",
+				code: "chat_running",
+				message: "chat is already running",
+			},
+			event: "error",
+		},
+	]);
+
+	resolveRunner();
+	await firstRun;
+	expect(firstEvents.some((event) => event.event === "assistant_done")).toBe(true);
 });
 
 test("WsService.startUserMessage emits project_not_found when project does not exist", async () => {
@@ -574,16 +776,40 @@ test("WsService.startUserMessage forwards structured assistant_event payloads", 
 		},
 	} as unknown as CodexProviderRunnerContract;
 
-	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	let nextEventId = 1;
+	const streamEvents: ChatStreamEventRepositoryContract = {
+		append: (chatId, event) => ({
+			id: nextEventId++,
+			chatId,
+			createdAt: new Date().toISOString(),
+			event,
+			turnId: event.turnId,
+		}),
+		listByChatId: () => [],
+	};
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner, undefined, undefined, streamEvents);
 	const collector = await collectEvents(() => {});
 
 	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
 
 	const assistantEvents = collector.events
 		.filter((event) => event.event === "assistant_event")
-		.map((event) => event.data.event.type);
+		.map((event) => ({
+			eventId: event.data.eventId,
+			type: event.data.event.type,
+		}));
 
-	expect(assistantEvents).toEqual(["turn_started", "item_started"]);
+	expect(assistantEvents).toEqual([
+		{
+			eventId: 1,
+			type: "turn_started",
+		},
+		{
+			eventId: 2,
+			type: "item_started",
+		},
+	]);
 });
 
 test("WsService.startUserMessage updates and clears persisted stream snapshots", async () => {

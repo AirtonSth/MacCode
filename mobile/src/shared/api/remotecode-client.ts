@@ -2,6 +2,7 @@ import type { ApiConfig } from "./api-config-store";
 import type {
 	AuthVerifyResponseDTO,
 	ChatDTO,
+	ChatStreamEventsResponseDTO,
 	CodexModelsCatalogDTO,
 	DiscoveryInfoDTO,
 	FsListResponseDTO,
@@ -44,6 +45,8 @@ interface CreateChatResponse {
 interface ListMessagesResponse {
 	messages: MessageDTO[];
 }
+
+type ListChatStreamEventsResponse = ChatStreamEventsResponseDTO;
 
 interface ListCodexModelsResponse {
 	models: CodexModelsCatalogDTO["models"];
@@ -92,6 +95,10 @@ export interface RemoteCodeClient {
 	listFsRoots: () => Promise<FsRootEntryDTO[]>;
 	listChats: (projectId: string) => Promise<ChatDTO[]>;
 	listMessages: (chatId: string) => Promise<MessageDTO[]>;
+	listChatStreamEvents: (
+		chatId: string,
+		options?: { afterId?: number; limit?: number },
+	) => Promise<ChatStreamEventsResponseDTO>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	commitProject: (
 		projectId: string,
@@ -309,6 +316,21 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			});
 
 			return payload.messages;
+		},
+
+		async listChatStreamEvents(chatId: string, options?: { afterId?: number; limit?: number }) {
+			const query = new URLSearchParams();
+			if (typeof options?.afterId === "number" && Number.isFinite(options.afterId) && options.afterId > 0) {
+				query.set("afterId", String(Math.floor(options.afterId)));
+			}
+			if (typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+				query.set("limit", String(Math.floor(options.limit)));
+			}
+			const suffix = query.toString();
+			return await request<ListChatStreamEventsResponse>({
+				method: "GET",
+				path: suffix ? `/chats/${chatId}/stream-events?${suffix}` : `/chats/${chatId}/stream-events`,
+			});
 		},
 
 		async listProjects() {

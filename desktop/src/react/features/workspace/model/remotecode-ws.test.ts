@@ -84,6 +84,7 @@ test("parseServerWsEvent parses assistant_event", () => {
 		event: "assistant_event",
 		data: {
 			chatId: "chat-1",
+			eventId: 42,
 			event: {
 				type: "item_started",
 				turnId: "turn-1",
@@ -99,6 +100,7 @@ test("parseServerWsEvent parses assistant_event", () => {
 		event: "assistant_event",
 		data: {
 			chatId: "chat-1",
+			eventId: 42,
 			event: {
 				type: "item_started",
 				turnId: "turn-1",
@@ -106,6 +108,30 @@ test("parseServerWsEvent parses assistant_event", () => {
 				itemType: "tool",
 				state: "running",
 				summary: "Running command: pwd",
+			},
+		},
+	});
+});
+
+test("parseServerWsEvent accepts assistant_event without eventId during transition", () => {
+	const parsed = parseServerWsEvent({
+		event: "assistant_event",
+		data: {
+			chatId: "chat-1",
+			event: {
+				type: "turn_started",
+				turnId: "turn-1",
+			},
+		},
+	});
+
+	expect(parsed).toEqual({
+		event: "assistant_event",
+		data: {
+			chatId: "chat-1",
+			event: {
+				type: "turn_started",
+				turnId: "turn-1",
 			},
 		},
 	});

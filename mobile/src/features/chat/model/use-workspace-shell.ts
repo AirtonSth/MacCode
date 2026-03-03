@@ -15,6 +15,7 @@ import { createRealtimeClient, type ConnectionState } from "../../../shared/api/
 import type {
 	AssistantStreamItemState,
 	ChatDTO,
+	ChatStreamEventDTO,
 	MessageDTO,
 	ProjectDTO,
 	ServerWsEvent,
@@ -26,6 +27,38 @@ import {
 	setStreamItemState as updateStreamItemState,
 	type StreamTurnState,
 } from "./stream-turn-state";
+
+type AssistantEventPayload = Extract<ServerWsEvent, { event: "assistant_event" }>["data"]["event"];
+
+const upsertTurnHistory = (turns: StreamTurnState[] | undefined, turn: StreamTurnState): StreamTurnState[] => {
+	const current = turns ?? [];
+	const index = current.findIndex((item) => item.turnId === turn.turnId);
+	if (index === -1) {
+		return [...current, turn];
+	}
+
+	const next = Array.from(current);
+	next[index] = turn;
+	return next;
+};
+
+const applyAssistantEventToHistory = (
+	turns: StreamTurnState[] | undefined,
+	event: AssistantEventPayload,
+): StreamTurnState[] => {
+	const current = turns ?? [];
+	const existingTurn = current.find((item) => item.turnId === event.turnId) ?? null;
+	const nextTurn = applyAssistantEventToTurn(existingTurn, event);
+	return upsertTurnHistory(current, nextTurn);
+};
+
+const replayAssistantEventsIntoTurns = (events: ChatStreamEventDTO[]): StreamTurnState[] => {
+	let turns: StreamTurnState[] = [];
+	for (const entry of events) {
+		turns = applyAssistantEventToHistory(turns, entry.event);
+	}
+	return turns;
+};
 
 const upsertUpdatedChat = (chats: ChatDTO[], update: ServerWsEvent & { event: "chat_updated" }): ChatDTO[] => {
 	return chats.map((chat) =>
@@ -89,11 +122,12 @@ export const useWorkspaceShell = () => {
 	const createChatMutation = useCreateChatMutation();
 	const updateSelectionMutation = useUpdateWorkspaceSelectionMutation();
 	const [lastError, setLastError] = useState<string | null>(null);
-	const [isSending, setIsSending] = useState<boolean>(false);
+	const [sendingByChat, setSendingByChat] = useState<Record<string, boolean>>({});
 	const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
 	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(inMemorySelectedProjectId);
 	const [selectedChatId, setSelectedChatId] = useState<string | null>(inMemorySelectedChatId);
 	const [streamingTextByChat, setStreamingTextByChat] = useState<Record<string, string>>({});
+	const [streamHistoryByChat, setStreamHistoryByChat] = useState<Record<string, StreamTurnState[]>>({});
 	const [permissionMode, setPermissionMode] = useState<string>("default");
 	const [selectedModel, setSelectedModel] = useState<string | null>(null);
 	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(null);
@@ -101,7 +135,8 @@ export const useWorkspaceShell = () => {
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
 	const selectedChatIdRef = useRef<string | null>(selectedChatId);
-	const pendingSendChatIdRef = useRef<string | null>(null);
+	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
+	const lastAssistantEventIdByChatRef = useRef<Record<string, number>>({});
 	const clientIdRef = useRef<string>(`mobile-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`);
 	const hasBootstrappedSelectionRef = useRef<boolean>(false);
 	const client = useRemoteCodeClient();
@@ -162,14 +197,24 @@ export const useWorkspaceShell = () => {
 
 	const handleServerEvent = useCallback(
 		(event: ServerWsEvent) => {
+			const clearSendingForChat = (chatId: string) => {
+				if (!pendingSendChatIdsRef.current.has(chatId)) {
+					return;
+				}
+
+				pendingSendChatIdsRef.current.delete(chatId);
+				setSendingByChat((current) => ({
+					...current,
+					[chatId]: false,
+				}));
+			};
+
 			if (event.event === "assistant_delta") {
 				setStreamingTextByChat((current) => ({
 					...current,
 					[event.data.chatId]: `${current[event.data.chatId] ?? ""}${event.data.delta}`,
 				}));
-				if (pendingSendChatIdRef.current === event.data.chatId) {
-					setIsSending(false);
-				}
+				clearSendingForChat(event.data.chatId);
 				return;
 			}
 
@@ -182,14 +227,28 @@ export const useWorkspaceShell = () => {
 			}
 
 			if (event.event === "assistant_event") {
-				const assistantEvent = event.data.event;
-				queryClient.setQueryData<StreamTurnState | null>(
-					queryKeys.streamTurn(event.data.chatId),
-					(current) => applyAssistantEventToTurn(current ?? null, assistantEvent),
-				);
-				if (pendingSendChatIdRef.current === event.data.chatId) {
-					setIsSending(false);
+				const incomingEventId = event.data.eventId;
+				const chatId = event.data.chatId;
+				const lastAppliedEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
+				if (typeof incomingEventId === "number" && incomingEventId <= lastAppliedEventId) {
+					return;
 				}
+				if (typeof incomingEventId === "number") {
+					lastAssistantEventIdByChatRef.current[chatId] = incomingEventId;
+				}
+
+				setStreamHistoryByChat((current) => {
+					const nextHistory = applyAssistantEventToHistory(current[chatId], event.data.event);
+					queryClient.setQueryData<StreamTurnState | null>(
+						queryKeys.streamTurn(chatId),
+						nextHistory.at(-1) ?? null,
+					);
+					return {
+						...current,
+						[chatId]: nextHistory,
+					};
+				});
+				clearSendingForChat(event.data.chatId);
 				return;
 			}
 
@@ -200,10 +259,7 @@ export const useWorkspaceShell = () => {
 					...current,
 					[event.data.chatId]: "",
 				}));
-				if (pendingSendChatIdRef.current === event.data.chatId) {
-					pendingSendChatIdRef.current = null;
-					setIsSending(false);
-				}
+				clearSendingForChat(event.data.chatId);
 				return;
 			}
 
@@ -213,6 +269,9 @@ export const useWorkspaceShell = () => {
 					queryKeys.chats(activeProjectId),
 					(current) => upsertUpdatedChat(current ?? [], event),
 				);
+				if (event.data.status !== "running") {
+					clearSendingForChat(event.data.chatId);
+				}
 				return;
 			}
 
@@ -225,10 +284,7 @@ export const useWorkspaceShell = () => {
 						...current,
 						[chatId]: "",
 					}));
-					if (pendingSendChatIdRef.current === chatId) {
-						pendingSendChatIdRef.current = null;
-						setIsSending(false);
-					}
+					clearSendingForChat(chatId);
 				}
 				return;
 			}
@@ -273,7 +329,7 @@ export const useWorkspaceShell = () => {
 				}
 			}
 		},
-		[queryClient],
+		[queryClient, setSendingByChat],
 	);
 
 	const handleConnectionStateChange = useCallback((state: ConnectionState) => {
@@ -313,6 +369,78 @@ export const useWorkspaceShell = () => {
 
 		realtimeRef.current.sendJoinChat(selectedChatId);
 	}, [selectedChatId]);
+
+	useEffect(() => {
+		let canceled = false;
+		if (!selectedChatId) {
+			return () => {
+				canceled = true;
+			};
+		}
+
+		const collectEvents = async (
+			afterId: number,
+			accumulator: ChatStreamEventDTO[],
+			lastEventId: number,
+		): Promise<{ events: ChatStreamEventDTO[]; lastEventId: number }> => {
+			const page = await client.listChatStreamEvents(selectedChatId, {
+				afterId,
+				limit: 500,
+			});
+			const nextEvents = [...accumulator, ...page.events];
+			const nextLastEventId = page.events.reduce(
+				(currentMax, item) => Math.max(currentMax, item.id),
+				lastEventId,
+			);
+
+			if (!page.hasMore || page.nextAfterId === null) {
+				return {
+					events: nextEvents,
+					lastEventId: nextLastEventId,
+				};
+			}
+
+			return await collectEvents(page.nextAfterId, nextEvents, nextLastEventId);
+		};
+
+		void (async () => {
+			try {
+				const { events, lastEventId } = await collectEvents(0, [], 0);
+
+				if (canceled) {
+					return;
+				}
+
+				const turns = replayAssistantEventsIntoTurns(events);
+				lastAssistantEventIdByChatRef.current[selectedChatId] = lastEventId;
+				setStreamHistoryByChat((current) => ({
+					...current,
+					[selectedChatId]: turns,
+				}));
+				queryClient.setQueryData<StreamTurnState | null>(
+					queryKeys.streamTurn(selectedChatId),
+					turns.at(-1) ?? null,
+				);
+			} catch {
+				if (canceled) {
+					return;
+				}
+				lastAssistantEventIdByChatRef.current[selectedChatId] = 0;
+				setStreamHistoryByChat((current) => ({
+					...current,
+					[selectedChatId]: [],
+				}));
+				queryClient.setQueryData<StreamTurnState | null>(
+					queryKeys.streamTurn(selectedChatId),
+					null,
+				);
+			}
+		})();
+
+		return () => {
+			canceled = true;
+		};
+	}, [client, queryClient, selectedChatId]);
 
 	const persistSelection = useCallback(
 		(input: {
@@ -501,11 +629,14 @@ export const useWorkspaceShell = () => {
 			const text = rawText.trim();
 
 			if (!selectedProjectId || text.length === 0) {
-				pendingSendChatIdRef.current = null;
 				return false;
 			}
 
 			const selectedChat = chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null;
+			if (selectedChat?.status === "running") {
+				setLastError("This thread is currently running. Wait until it finishes.");
+				return false;
+			}
 			const selectedChatHasNoMessages = (messagesQuery.data ?? []).length === 0;
 			const replacementChat =
 				selectedChat &&
@@ -524,7 +655,6 @@ export const useWorkspaceShell = () => {
 				null;
 
 			if (!activeChatId) {
-				pendingSendChatIdRef.current = null;
 				return false;
 			}
 
@@ -546,8 +676,11 @@ export const useWorkspaceShell = () => {
 				[activeChatId]: "",
 			}));
 			setLastError(null);
-			setIsSending(true);
-			pendingSendChatIdRef.current = activeChatId;
+			setSendingByChat((current) => ({
+				...current,
+				[activeChatId]: true,
+			}));
+			pendingSendChatIdsRef.current.add(activeChatId);
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {
@@ -568,8 +701,14 @@ export const useWorkspaceShell = () => {
 			return true;
 		},
 		onError: (error: unknown) => {
-			pendingSendChatIdRef.current = null;
-			setIsSending(false);
+			const selected = selectedChatIdRef.current;
+			if (selected) {
+				pendingSendChatIdsRef.current.delete(selected);
+				setSendingByChat((current) => ({
+					...current,
+					[selected]: false,
+				}));
+			}
 			setLastError(error instanceof Error ? error.message : "Failed to send message");
 		},
 	});
@@ -580,16 +719,31 @@ export const useWorkspaceShell = () => {
 				return;
 			}
 
-		queryClient.setQueryData<StreamTurnState | null>(
-			queryKeys.streamTurn(selectedChatId),
-			(current) =>
-				current
-					? updateStreamItemExpanded(current, itemId, {
-						expanded,
-						byUser,
-					})
-					: current ?? null,
+			queryClient.setQueryData<StreamTurnState | null>(
+				queryKeys.streamTurn(selectedChatId),
+				(current) =>
+					current
+						? updateStreamItemExpanded(current, itemId, {
+							expanded,
+							byUser,
+						})
+						: current ?? null,
 			);
+			setStreamHistoryByChat((current) => {
+				const turns = current[selectedChatId] ?? [];
+				const nextTurns = turns.map((turn) => (
+					turn.turnId === (queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(selectedChatId))?.turnId ?? "")
+						? updateStreamItemExpanded(turn, itemId, {
+							expanded,
+							byUser,
+						})
+						: turn
+				));
+				return {
+					...current,
+					[selectedChatId]: nextTurns,
+				};
+			});
 		},
 		[queryClient, selectedChatId],
 	);
@@ -604,6 +758,18 @@ export const useWorkspaceShell = () => {
 				queryKeys.streamTurn(selectedChatId),
 				(current) => (current ? updateStreamItemState(current, itemId, state) : current ?? null),
 			);
+			setStreamHistoryByChat((current) => {
+				const turns = current[selectedChatId] ?? [];
+				const nextTurns = turns.map((turn) => (
+					turn.turnId === (queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(selectedChatId))?.turnId ?? "")
+						? updateStreamItemState(turn, itemId, state)
+						: turn
+				));
+				return {
+					...current,
+					[selectedChatId]: nextTurns,
+				};
+			});
 		},
 		[queryClient, selectedChatId],
 	);
@@ -618,6 +784,8 @@ export const useWorkspaceShell = () => {
 		[chatsQuery.data, selectedChatId],
 	);
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
+	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
+	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],
@@ -647,6 +815,7 @@ export const useWorkspaceShell = () => {
 		selectedProject,
 		selectedProjectId,
 		sendMessage: sendMessage.mutateAsync,
+		streamHistoryTurns,
 		streamingText,
 		streamingTurn: streamTurnQuery.data ?? null,
 		toggleFavorite,

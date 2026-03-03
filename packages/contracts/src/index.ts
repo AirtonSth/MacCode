@@ -9,6 +9,8 @@ export type {
 	AssistantStructuredServerEvent,
 	AuthVerifyRequestDto,
 	AuthVerifyResponseDto,
+	ChatStreamEventDto,
+	ChatStreamEventsResponseDto,
 	ChatUpdatedServerEvent,
 	ClientJoinChatEvent,
 	ClientJoinWorkspaceEvent,

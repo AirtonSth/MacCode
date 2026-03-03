@@ -28,6 +28,19 @@ export interface MessageDTO {
 	createdAt: string;
 }
 
+export interface ChatStreamEventDTO {
+	id: number;
+	chatId: string;
+	createdAt: string;
+	event: AssistantStreamEvent;
+}
+
+export interface ChatStreamEventsResponseDTO {
+	events: ChatStreamEventDTO[];
+	hasMore: boolean;
+	nextAfterId: number | null;
+}
+
 export interface WorkspaceSelectionDTO {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
@@ -163,6 +176,7 @@ export interface AssistantSnapshotEvent {
 export interface AssistantEvent {
 	data: {
 		chatId: string;
+		eventId?: number;
 		event: AssistantStreamEvent;
 	};
 	event: "assistant_event";

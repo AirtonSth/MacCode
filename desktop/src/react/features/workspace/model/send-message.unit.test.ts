@@ -38,7 +38,7 @@ const createCollector = () => {
 		onCreateMessageError: (message: string, source: "rest" | "ws", code: string) => {
 			errors.push({ message, source, code });
 		},
-		onSetSending: (sending: boolean) => {
+		onSetSending: (_chatId: string, sending: boolean) => {
 			sendingFlags.push(sending);
 		},
 		onSendUserMessage: (chatId: string, text: string) => {

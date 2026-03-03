@@ -8,9 +8,7 @@ export class MessageController {
 		return new MessageController(service).build();
 	}
 
-constructor(private readonly service: MessageService) {}
-
-	
+	constructor(private readonly service: MessageService) {}
 
 	build() {
 		return new Elysia({ name: "message-controller" })
@@ -25,6 +23,38 @@ constructor(private readonly service: MessageService) {}
 				}
 
 				return { messages: result.messages };
+			})
+			.get("/chats/:id/stream-events", async ({ params: parameters, query, set }) => {
+				const afterIdRaw = query.afterId;
+				const limitRaw = query.limit;
+				const afterId = typeof afterIdRaw === "string"
+					? Number.parseInt(afterIdRaw, 10)
+					: typeof afterIdRaw === "number"
+						? afterIdRaw
+						: 0;
+				const limit = typeof limitRaw === "string"
+					? Number.parseInt(limitRaw, 10)
+					: typeof limitRaw === "number"
+						? limitRaw
+						: 500;
+				const boundedLimit = Number.isFinite(limit) && limit > 0
+					? Math.min(Math.floor(limit), 2000)
+					: 500;
+				const result = await this.service.listStreamEventsByChatId(parameters.id, {
+					afterId: Number.isFinite(afterId) && afterId > 0 ? afterId : 0,
+					limit: boundedLimit,
+				});
+
+				if (!result.chatExists) {
+					set.status = 404;
+					return { error: "chat not found" };
+				}
+
+				return {
+					events: result.events,
+					hasMore: result.hasMore,
+					nextAfterId: result.nextAfterId,
+				};
 			});
 	}
 }

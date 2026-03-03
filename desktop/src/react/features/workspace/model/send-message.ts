@@ -12,7 +12,7 @@ export interface SendMessageInput {
 	onAppendMessage: (message: MessageDTO) => void;
 	onClearStreaming: (chatId: string) => void;
 	onCreateMessageError: (message: string, source: ErrorSource, code: string) => void;
-	onSetSending: (sending: boolean) => void;
+	onSetSending: (chatId: string, sending: boolean) => void;
 	onSendUserMessage: (chatId: string, text: string) => void;
 	generateMessageId?: () => string;
 	createTimestamp?: () => string;
@@ -76,7 +76,7 @@ export const sendWorkspaceMessage = async (
 		};
 	}
 
-	input.onSetSending(true);
+	input.onSetSending(chatId, true);
 	input.onAppendMessage(
 		buildUserMessage({
 			chatId,
@@ -89,7 +89,7 @@ export const sendWorkspaceMessage = async (
 
 	if (!input.hasOpenWebSocket) {
 		input.onCreateMessageError("WebSocket client is not ready", "ws", "not_ready");
-		input.onSetSending(false);
+		input.onSetSending(chatId, false);
 		return {
 			chatId,
 			sent: false,

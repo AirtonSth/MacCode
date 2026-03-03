@@ -70,6 +70,15 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 			expect.arrayContaining(["chatId", "partialText", "updatedAt"]),
 		);
 
+		const chatStreamEventColumns = client.sqlite
+			.prepare("PRAGMA table_info(chat_stream_events)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+
+		expect(chatStreamEventColumns).toEqual(
+			expect.arrayContaining(["id", "chatId", "eventJson", "turnId", "createdAt"]),
+		);
+
 		const commandIndexes = client.sqlite
 			.prepare("PRAGMA index_list(terminal_commands)")
 			.all()
@@ -88,6 +97,13 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 			.all()
 			.map((row) => (row as { name: string }).name);
 		expect(chatSnapshotIndexes).toContain("idx_chat_stream_snapshots_updated_at");
+
+		const chatStreamEventIndexes = client.sqlite
+			.prepare("PRAGMA index_list(chat_stream_events)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+		expect(chatStreamEventIndexes).toContain("idx_chat_stream_events_chat_id_id");
+		expect(chatStreamEventIndexes).toContain("idx_chat_stream_events_chat_id_turn_id_id");
 
 		expect(
 			(client.sqlite.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys,
@@ -368,6 +384,14 @@ test("terminal command and entries cascade on chat delete", async () => {
 		client.sqlite
 			.prepare("INSERT INTO chat_stream_snapshots (chatId, partialText, updatedAt) VALUES (?, ?, ?)")
 			.run("chat-1", "in-progress", "2026-01-01T00:00:00.100Z");
+		client.sqlite
+			.prepare("INSERT INTO chat_stream_events (chatId, eventJson, turnId, createdAt) VALUES (?, ?, ?, ?)")
+			.run(
+				"chat-1",
+				"{\"type\":\"turn_started\",\"turnId\":\"turn-1\"}",
+				"turn-1",
+				"2026-01-01T00:00:00.100Z",
+			);
 
 		client.sqlite.prepare("DELETE FROM chats WHERE id = ?").run("chat-1");
 
@@ -380,10 +404,14 @@ test("terminal command and entries cascade on chat delete", async () => {
 		const snapshotCount = client.sqlite
 			.prepare("SELECT COUNT(1) AS count FROM chat_stream_snapshots WHERE chatId = ?")
 			.get("chat-1") as { count: number };
+		const streamEventCount = client.sqlite
+			.prepare("SELECT COUNT(1) AS count FROM chat_stream_events WHERE chatId = ?")
+			.get("chat-1") as { count: number };
 
 		expect(commandCount.count).toBe(0);
 		expect(entryCount.count).toBe(0);
 		expect(snapshotCount.count).toBe(0);
+		expect(streamEventCount.count).toBe(0);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

@@ -28,6 +28,7 @@ import { createTerminalRepository } from "./modules/terminal/terminal.repository
 import { createTerminalService } from "./modules/terminal/terminal.service";
 import { createWorkspaceEventsRepository } from "./modules/workspace-events/workspace-events.repository";
 import { createWorkspaceEventsService } from "./modules/workspace-events/workspace-events.service";
+import { createChatStreamEventRepository } from "./modules/ws/chat-stream-event.repository";
 import { createChatStreamSnapshotRepository } from "./modules/ws/chat-stream-snapshot.repository";
 import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
@@ -47,12 +48,13 @@ export const ServerBootstrap = {
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 		const terminalRepository = createTerminalRepository(databaseClient.orm);
 		const workspaceEventsRepository = createWorkspaceEventsRepository(databaseClient.orm);
+		const chatStreamEventRepository = createChatStreamEventRepository(databaseClient.orm);
 		const chatStreamSnapshotRepository = createChatStreamSnapshotRepository(databaseClient.orm);
 		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
-		const messageService = new MessageService(chatRepository, messageRepository);
+		const messageService = new MessageService(chatRepository, messageRepository, chatStreamEventRepository);
 		const gitService = new GitService(projectService);
 		const fsService = createFsService();
 		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
@@ -70,6 +72,7 @@ export const ServerBootstrap = {
 			undefined,
 			workspaceEventsService,
 			chatStreamSnapshotRepository,
+			chatStreamEventRepository,
 		);
 		const codexModelsService = new CodexModelsService();
 

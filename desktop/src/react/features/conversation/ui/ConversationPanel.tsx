@@ -3,7 +3,7 @@ import { AlertTriangle, Bot, ChevronDown, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
 import { ScrollArea } from "../../../components/ui/scroll-area";
 import ReactMarkdown from "react-markdown";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../../lib/utils";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
@@ -14,6 +14,7 @@ import { StreamingTimeline } from "./StreamingTimeline";
 interface ConversationPanelProps {
 	chat: ChatDTO | null;
 	messages: MessageDTO[];
+	streamHistoryTurns: StreamTurnState[];
 	streamingText: string;
 	streamingTurn: StreamTurnState | null;
 	loading: boolean;
@@ -26,6 +27,7 @@ interface ConversationPanelProps {
 export const ConversationPanel = ({
 	chat,
 	messages,
+	streamHistoryTurns,
 	streamingText,
 	streamingTurn,
 	loading,
@@ -38,8 +40,19 @@ export const ConversationPanel = ({
 	const hasMessages = messages.length > 0;
 	const hasStreamingTimeline = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 	const hasStreamingText = streamingText.trim().length > 0;
+	const turnsForDetails = useMemo(() => {
+		if (streamHistoryTurns.length > 0) {
+			return streamHistoryTurns;
+		}
+		if (streamingTurn && streamingTurn.itemOrder.length > 0) {
+			return [streamingTurn];
+		}
+		return [];
+	}, [streamHistoryTurns, streamingTurn]);
+	const hasRunDetails = turnsForDetails.length > 0;
 	const hasStreaming = hasStreamingTimeline || hasStreamingText;
 	const hasContent = hasMessages || hasStreaming;
+	const [showRunDetails, setShowRunDetails] = useState(false);
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
 	const bubbleMotion = shouldReduceMotion
@@ -73,6 +86,7 @@ export const ConversationPanel = ({
 	}, []);
 	useEffect(() => {
 		setIsAtBottom(true);
+		setShowRunDetails(false);
 	}, [chat?.id]);
 
 	useEffect(() => {
@@ -239,6 +253,24 @@ export const ConversationPanel = ({
 
 				{hasContent ? (
 					<>
+						{hasRunDetails ? (
+							<div className={cn("px-5 pt-3", focusMode ? "sm:px-6" : "")}>
+								<button
+									className={cn(
+										"rounded-lg border px-2.5 py-1 text-xs transition",
+										showRunDetails
+											? "border-sky-300/40 bg-sky-400/12 text-sky-100"
+											: "border-white/15 bg-white/[0.03] text-slate-300 hover:text-slate-100",
+									)}
+									onClick={() => {
+										setShowRunDetails((value) => !value);
+									}}
+									type="button"
+								>
+									{showRunDetails ? "Hide run details" : "Show run details"}
+								</button>
+							</div>
+						) : null}
 						<ScrollArea className="relative h-full" onViewportScroll={handleViewportScroll} viewportRef={scrollViewportRef}>
 							<div
 								aria-live="polite"
@@ -277,18 +309,20 @@ export const ConversationPanel = ({
 										</motion.article>
 									))}
 
-									{hasStreamingTimeline && streamingTurn ? (
-										<StreamingTimeline
-											focusMode={focusMode}
-											key={`stream-turn-${streamingTurn.turnId}`}
-											onSetItemExpanded={onSetStreamItemExpanded}
-											onSetItemState={onSetStreamItemState}
-											shouldReduceMotion={shouldReduceMotion}
-											turn={streamingTurn}
-										/>
-									) : null}
+									{showRunDetails
+										? turnsForDetails.map((turn) => (
+											<StreamingTimeline
+												focusMode={focusMode}
+												key={`stream-turn-${turn.turnId}`}
+												onSetItemExpanded={onSetStreamItemExpanded}
+												onSetItemState={onSetStreamItemState}
+												shouldReduceMotion={shouldReduceMotion}
+												turn={turn}
+											/>
+										))
+										: null}
 
-									{streamingText && !hasStreamingTimeline ? (
+									{streamingText && (!showRunDetails || !hasRunDetails) ? (
 										<motion.article
 											className={cn(
 												focusMode

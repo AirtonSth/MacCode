@@ -131,9 +131,23 @@ export interface AssistantSnapshotServerEvent {
 export interface AssistantStructuredServerEvent {
 	data: {
 		chatId: string;
+		eventId: number;
 		event: unknown;
 	};
 	event: "assistant_event";
+}
+
+export interface ChatStreamEventDto {
+	id: number;
+	chatId: string;
+	createdAt: string;
+	event: unknown;
+}
+
+export interface ChatStreamEventsResponseDto {
+	events: ChatStreamEventDto[];
+	hasMore: boolean;
+	nextAfterId: number | null;
 }
 
 export interface ChatUpdatedServerEvent {

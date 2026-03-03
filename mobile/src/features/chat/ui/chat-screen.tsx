@@ -142,6 +142,7 @@ export const ChatScreen = () => {
 		selectedProjectId,
 		sendMessage,
 		selectedReasoningEffort,
+		streamHistoryTurns,
 		streamingText,
 		streamingTurn,
 	} = useWorkspaceShell();
@@ -165,6 +166,7 @@ export const ChatScreen = () => {
 	const [gitCommitIncludeUnstaged, setGitCommitIncludeUnstaged] = useState<boolean>(true);
 	const [isGitCommitPending, setIsGitCommitPending] = useState<boolean>(false);
 	const [gitCommitError, setGitCommitError] = useState<string>("");
+	const [showRunDetails, setShowRunDetails] = useState<boolean>(false);
 	const selectorsScrollRef = useRef<ScrollView | null>(null);
 	const [terminalInput, setTerminalInput] = useState<string>("");
 	const [terminalOutput, setTerminalOutput] = useState<string>("");
@@ -269,6 +271,20 @@ export const ChatScreen = () => {
 
 	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 	const hasStreamingText = streamingText.trim().length > 0;
+	const turnsForDetails = useMemo(() => {
+		if (streamHistoryTurns.length > 0) {
+			if (streamingTurn && !streamHistoryTurns.some((turn) => turn.turnId === streamingTurn.turnId)) {
+				return [...streamHistoryTurns, streamingTurn];
+			}
+			return streamHistoryTurns;
+		}
+		if (hasStreamingItems && streamingTurn) {
+			return [streamingTurn];
+		}
+		return [];
+	}, [hasStreamingItems, streamHistoryTurns, streamingTurn]);
+	const hasRunDetails = turnsForDetails.length > 0;
+	const selectedChatIsRunning = selectedChat?.status === "running";
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -318,6 +334,10 @@ export const ChatScreen = () => {
 	useEffect(() => {
 		messageScrollRef.current?.scrollToEnd({ animated: true });
 	}, [messages.length, streamingText, streamingTurn]);
+
+	useEffect(() => {
+		setShowRunDetails(false);
+	}, [selectedChatId]);
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -850,17 +870,40 @@ export const ChatScreen = () => {
 			/>
 
 			<View style={styles.body}>
-				<ScrollView
-					contentContainerStyle={styles.messagesContent}
-					contentInsetAdjustmentBehavior="automatic"
-					ref={messageScrollRef}
-					showsVerticalScrollIndicator={false}
-					style={styles.messages}
-					testID="chat-message-list"
-				>
-					{messages.length === 0 && !hasStreamingItems ? (
-						<Text style={styles.emptyState}>Start a conversation.</Text>
-					) : null}
+					<ScrollView
+						contentContainerStyle={styles.messagesContent}
+						contentInsetAdjustmentBehavior="automatic"
+						ref={messageScrollRef}
+						showsVerticalScrollIndicator={false}
+						style={styles.messages}
+						testID="chat-message-list"
+					>
+						{messages.length === 0 && !hasStreamingText && !showRunDetails && !selectedChatIsRunning ? (
+							<Text style={styles.emptyState}>Start a conversation.</Text>
+						) : null}
+
+						{hasRunDetails ? (
+							<Pressable
+								onPress={() => {
+									setShowRunDetails((current) => !current);
+								}}
+								style={({ pressed }) => [
+									styles.runDetailsToggle,
+									showRunDetails ? styles.runDetailsToggleActive : null,
+									pressed ? styles.runDetailsTogglePressed : null,
+								]}
+								testID="chat-run-details-toggle"
+							>
+								<Text
+									style={[
+										styles.runDetailsToggleText,
+										showRunDetails ? styles.runDetailsToggleTextActive : null,
+									]}
+								>
+									{showRunDetails ? "Hide run details" : "Show run details"}
+								</Text>
+							</Pressable>
+						) : null}
 
 					{messages.map((message) => {
 						const isUser = message.role === "user";
@@ -890,38 +933,40 @@ export const ChatScreen = () => {
 						);
 					})}
 
-					{hasStreamingText && !hasStreamingItems ? (
-						<View style={[styles.messageRow, styles.messageRowAssistant]}>
-							<View style={styles.assistantMessageContent}>
-								<MessageMarkdown
-									content={streamingText}
-									linkColor={palette.accent}
+						{hasStreamingText ? (
+							<View style={[styles.messageRow, styles.messageRowAssistant]}>
+								<View style={styles.assistantMessageContent}>
+									<MessageMarkdown
+										content={streamingText}
+										linkColor={palette.accent}
 									textColor={palette.text}
 								/>
 							</View>
 						</View>
 					) : null}
 
-					{hasStreamingItems && streamingTurn ? (
-						<View style={[styles.messageRow, styles.messageRowAssistant]}>
-							<View style={styles.assistantMessageContent}>
-								<StreamingTimeline
-									onSetItemExpanded={(itemId, expanded, byUser) => {
-										setStreamItemExpanded(itemId, expanded, byUser);
-									}}
-									onSetItemState={(itemId, state) => {
-										setStreamItemState(itemId, state);
-									}}
-									turn={streamingTurn}
-								/>
-							</View>
-						</View>
-					) : null}
+						{showRunDetails
+							? turnsForDetails.map((turn) => (
+								<View key={`turn-${turn.turnId}`} style={[styles.messageRow, styles.messageRowAssistant]}>
+									<View style={styles.assistantMessageContent}>
+										<StreamingTimeline
+											onSetItemExpanded={(itemId, expanded, byUser) => {
+												setStreamItemExpanded(itemId, expanded, byUser);
+											}}
+											onSetItemState={(itemId, state) => {
+												setStreamItemState(itemId, state);
+											}}
+											turn={turn}
+										/>
+									</View>
+								</View>
+							))
+							: null}
 
-					{isSending && !hasStreamingItems ? (
-						<Text style={styles.typingLabel}>Thinking...</Text>
-					) : null}
-				</ScrollView>
+						{isSending && !hasStreamingText && !hasRunDetails ? (
+							<Text style={styles.typingLabel}>Thinking...</Text>
+						) : null}
+					</ScrollView>
 
 				{lastError ? (
 					<Text selectable style={styles.errorText}>
@@ -930,18 +975,18 @@ export const ChatScreen = () => {
 				) : null}
 
 				<View style={styles.composerRow}>
-					<Pressable
-						disabled={isSending || !selectedProjectId}
-						onPress={() => {
-							openFilePicker("chat");
-						}}
-						style={({ pressed }) => [
-							styles.attachAction,
-							pressed ? styles.attachActionPressed : null,
-							isSending || !selectedProjectId ? styles.disabledButton : null,
-						]}
-						testID="chat-attach-button"
-					>
+						<Pressable
+							disabled={isSending || !selectedProjectId || selectedChatIsRunning}
+							onPress={() => {
+								openFilePicker("chat");
+							}}
+							style={({ pressed }) => [
+								styles.attachAction,
+								pressed ? styles.attachActionPressed : null,
+								isSending || !selectedProjectId || selectedChatIsRunning ? styles.disabledButton : null,
+							]}
+							testID="chat-attach-button"
+						>
 						<MaterialIcons color={palette.text} name="add" size={22} />
 					</Pressable>
 
@@ -959,18 +1004,18 @@ export const ChatScreen = () => {
 						value={input}
 					/>
 
-					<Pressable
-						disabled={isSending || !selectedProjectId}
-						onPress={() => {
-							void submit();
-						}}
-						style={({ pressed }) => [
-							styles.primaryAction,
-							pressed ? styles.primaryActionPressed : null,
-							isSending || !selectedProjectId ? styles.disabledButton : null,
-						]}
-						testID="chat-send-button"
-					>
+						<Pressable
+							disabled={isSending || !selectedProjectId || selectedChatIsRunning}
+							onPress={() => {
+								void submit();
+							}}
+							style={({ pressed }) => [
+								styles.primaryAction,
+								pressed ? styles.primaryActionPressed : null,
+								isSending || !selectedProjectId || selectedChatIsRunning ? styles.disabledButton : null,
+							]}
+							testID="chat-send-button"
+						>
 						<MaterialIcons
 							color={styles.primaryActionLabel.color}
 							name="send"
@@ -2014,6 +2059,31 @@ const styles = StyleSheet.create({
 	},
 	primaryActionPressed: {
 		backgroundColor: palette.accentPressed,
+	},
+	runDetailsToggle: {
+		alignSelf: "flex-start",
+		backgroundColor: "rgba(255,255,255,0.03)",
+		borderColor: palette.border,
+		borderRadius: 10,
+		borderWidth: 1,
+		marginBottom: 2,
+		paddingHorizontal: 10,
+		paddingVertical: 6,
+	},
+	runDetailsToggleActive: {
+		backgroundColor: "rgba(99,200,255,0.15)",
+		borderColor: "rgba(99,200,255,0.75)",
+	},
+	runDetailsTogglePressed: {
+		opacity: 0.82,
+	},
+	runDetailsToggleText: {
+		color: palette.muted,
+		fontSize: 12,
+		fontWeight: "600",
+	},
+	runDetailsToggleTextActive: {
+		color: palette.text,
 	},
 	root: {
 		backgroundColor: palette.background,

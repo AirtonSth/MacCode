@@ -24,6 +24,7 @@ import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel
 import { type ChatDTO, type StreamTurnState, useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
+import type { AssistantStreamEvent, AssistantStreamItemState, AssistantStreamItemType } from "../../shared/assistant-stream-event";
 import {
 	DEFAULT_CODEX_PERMISSION_MODE,
 	parseCodexPermissionMode,
@@ -159,6 +160,122 @@ const createDraftThreadChat = (projectId: string): ChatDTO => ({
 });
 const SIDEBAR_MAX_VISIBLE_THREADS = 3;
 
+const createStreamTurnState = (turnId: string): StreamTurnState => ({
+	turnId,
+	status: "running",
+	itemsById: {},
+	itemOrder: [],
+	startedAtMs: Date.now(),
+	finishedAtMs: null,
+});
+
+const createStreamItem = (itemId: string, itemType: AssistantStreamItemType) => ({
+	id: itemId,
+	type: itemType,
+	state: "running" as AssistantStreamItemState,
+	summary: "",
+	body: "",
+	output: "",
+	startedAtMs: Date.now(),
+	finishedAtMs: null as number | null,
+	expandedByUser: false,
+	isExpanded: false,
+});
+
+const replayAssistantEventsIntoTurns = (events: AssistantStreamEvent[]): StreamTurnState[] => {
+	const turnIdsInOrder: string[] = [];
+	const turnsById = new Map<string, StreamTurnState>();
+
+	for (const event of events) {
+		const currentTurn = turnsById.get(event.turnId) ?? createStreamTurnState(event.turnId);
+		if (!turnsById.has(event.turnId)) {
+			turnIdsInOrder.push(event.turnId);
+		}
+
+		const nextTurn: StreamTurnState = {
+			...currentTurn,
+			itemsById: { ...currentTurn.itemsById },
+			itemOrder: [...currentTurn.itemOrder],
+		};
+		const existingItem = "itemId" in event ? nextTurn.itemsById[event.itemId] : undefined;
+		const inferredItemType: AssistantStreamItemType =
+			"itemType" in event
+				? event.itemType
+				: event.type === "item_delta" && event.target === "output"
+					? "tool"
+					: existingItem?.type ?? "reasoning";
+		const getItem = (itemId: string) => {
+			const candidate = nextTurn.itemsById[itemId] ?? createStreamItem(itemId, inferredItemType);
+			if (!nextTurn.itemOrder.includes(itemId)) {
+				nextTurn.itemOrder.push(itemId);
+			}
+			return candidate;
+		};
+
+		switch (event.type) {
+			case "turn_started":
+				break;
+			case "turn_completed":
+				nextTurn.status = nextTurn.status === "failed" ? "failed" : "completed";
+				nextTurn.finishedAtMs = nextTurn.finishedAtMs ?? Date.now();
+				break;
+			case "item_started": {
+				const item = getItem(event.itemId);
+				item.type = event.itemType;
+				item.state = event.state ?? "running";
+				if (event.summary !== undefined) {
+					item.summary = event.summary;
+				}
+				nextTurn.itemsById[event.itemId] = item;
+				break;
+			}
+			case "item_delta": {
+				const item = getItem(event.itemId);
+				if (event.target === "summary") {
+					item.summary = `${item.summary}${event.delta}`;
+				}
+				if (event.target === "body") {
+					item.body = `${item.body}${event.delta}`;
+				}
+				if (event.target === "output") {
+					item.output = `${item.output}${event.delta}`;
+				}
+				nextTurn.itemsById[event.itemId] = item;
+				break;
+			}
+			case "item_state": {
+				const item = getItem(event.itemId);
+				item.state = event.state;
+				if (event.summary !== undefined) {
+					item.summary = event.summary;
+				}
+				if (event.state === "failed" || event.state === "cancelled") {
+					nextTurn.status = "failed";
+				}
+				nextTurn.itemsById[event.itemId] = item;
+				break;
+			}
+			case "item_completed": {
+				const item = getItem(event.itemId);
+				item.state = event.state ?? (item.state === "failed" || item.state === "cancelled" ? item.state : "completed");
+				item.finishedAtMs = item.finishedAtMs ?? Date.now();
+				if (event.summary !== undefined) {
+					item.summary = event.summary;
+				}
+				if (item.state === "failed" || item.state === "cancelled") {
+					nextTurn.status = "failed";
+				}
+				nextTurn.itemsById[event.itemId] = item;
+				break;
+			}
+		}
+
+		turnsById.set(event.turnId, nextTurn);
+	}
+
+	return turnIdsInOrder.map((turnId) => turnsById.get(turnId)).filter((turn): turn is StreamTurnState => Boolean(turn));
+};
+
 const clampSidebarWidth = (width: number): number => {
 	const bounded = Number.isFinite(width) ? width : DEFAULT_SIDEBAR_WIDTH;
 	return Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, Math.round(bounded)));
@@ -259,7 +376,7 @@ const App = (): JSX.Element => {
 	const terminalOpenByChatRef = useRef<Record<string, boolean>>({});
 	const workspaceClientIdRef = useRef<string>(resolveWebSocketClientId());
 	const lastWorkspaceSeqRef = useRef<number>(0);
-	const pendingSendChatIdRef = useRef<string | null>(null);
+	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 
 	const baseUrl = useMemo(() => {
 		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim();
@@ -293,6 +410,12 @@ const App = (): JSX.Element => {
 	const streamingTurn: StreamTurnState | null = selectedChatId
 		? state.streamTurnsByChat[selectedChatId] ?? null
 		: null;
+	const streamHistoryTurns: StreamTurnState[] = selectedChatId
+		? state.streamHistoryByChat[selectedChatId] ?? []
+		: [];
+	const selectedChatSending = selectedChatId
+		? Boolean(state.sendingByChat[selectedChatId])
+		: false;
 
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
 	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
@@ -597,10 +720,46 @@ const App = (): JSX.Element => {
 			dispatch({ payload: true, type: "SET_MESSAGES_LOADING" });
 			try {
 				const messages = await api.listMessages(chatId);
+				let afterId = 0;
+				const streamEvents: AssistantStreamEvent[] = [];
+				let lastEventId = 0;
+				while (true) {
+					const page = await api.listChatStreamEvents(chatId, {
+						afterId,
+						limit: 500,
+					});
+					for (const entry of page.events) {
+						streamEvents.push(entry.event);
+						lastEventId = Math.max(lastEventId, entry.id);
+					}
+
+					if (!page.hasMore || page.nextAfterId === null) {
+						break;
+					}
+
+					afterId = page.nextAfterId;
+				}
+
 				dispatch({ payload: messages, type: "SET_MESSAGES" });
+				dispatch({
+					payload: {
+						chatId,
+						turns: replayAssistantEventsIntoTurns(streamEvents),
+						lastEventId,
+					},
+					type: "SET_STREAM_HISTORY",
+				});
 			} catch (error) {
 				if (formatApiErrorCode(error) === "HTTP_404") {
 					dispatch({ payload: [], type: "SET_MESSAGES" });
+					dispatch({
+						payload: {
+							chatId,
+							lastEventId: 0,
+							turns: [],
+						},
+						type: "SET_STREAM_HISTORY",
+					});
 					return;
 				}
 				addError(
@@ -726,6 +885,21 @@ const App = (): JSX.Element => {
 
 	const handleWsEvent = useCallback(
 		async (event: ServerWsEvent) => {
+			const clearChatSending = (chatId: string) => {
+				if (!pendingSendChatIdsRef.current.has(chatId)) {
+					return;
+				}
+
+				pendingSendChatIdsRef.current.delete(chatId);
+				dispatch({
+					payload: {
+						chatId,
+						sending: false,
+					},
+					type: "SET_CHAT_SENDING",
+				});
+			};
+
 			switch (event.event) {
 				case "assistant_delta":
 					dispatch({
@@ -735,12 +909,7 @@ const App = (): JSX.Element => {
 						},
 						type: "APPEND_STREAMING",
 					});
-					if (pendingSendChatIdRef.current === event.data.chatId) {
-						dispatch({
-							payload: false,
-							type: "SET_SENDING_MESSAGE",
-						});
-					}
+					clearChatSending(event.data.chatId);
 					break;
 				case "assistant_snapshot":
 					dispatch({
@@ -755,16 +924,12 @@ const App = (): JSX.Element => {
 					dispatch({
 						payload: {
 							chatId: event.data.chatId,
+							eventId: event.data.eventId,
 							event: event.data.event,
 						},
 						type: "APPLY_ASSISTANT_EVENT",
 					});
-					if (pendingSendChatIdRef.current === event.data.chatId) {
-						dispatch({
-							payload: false,
-							type: "SET_SENDING_MESSAGE",
-						});
-					}
+					clearChatSending(event.data.chatId);
 					break;
 				case "assistant_done":
 					dispatch({
@@ -774,17 +939,7 @@ const App = (): JSX.Element => {
 					if (selectedChatIdRef.current === event.data.chatId) {
 						await loadMessagesForChat(event.data.chatId);
 					}
-					dispatch({
-						payload: { chatId: event.data.chatId },
-						type: "CLEAR_STREAM_TURN",
-					});
-					if (pendingSendChatIdRef.current === event.data.chatId) {
-						pendingSendChatIdRef.current = null;
-						dispatch({
-							payload: false,
-							type: "SET_SENDING_MESSAGE",
-						});
-					}
+					clearChatSending(event.data.chatId);
 					break;
 				case "chat_updated":
 					dispatch({
@@ -797,6 +952,9 @@ const App = (): JSX.Element => {
 						},
 						type: "UPDATE_CHAT",
 					});
+					if (event.data.status !== "running") {
+						clearChatSending(event.data.chatId);
+					}
 					break;
 				case "error":
 					addError(event.data.message, "ws", event.data.code);
@@ -805,17 +963,7 @@ const App = (): JSX.Element => {
 							payload: { chatId: event.data.chatId },
 							type: "CLEAR_STREAMING",
 						});
-						dispatch({
-							payload: { chatId: event.data.chatId },
-							type: "CLEAR_STREAM_TURN",
-						});
-						if (pendingSendChatIdRef.current === event.data.chatId) {
-							pendingSendChatIdRef.current = null;
-							dispatch({
-								payload: false,
-								type: "SET_SENDING_MESSAGE",
-							});
-						}
+						clearChatSending(event.data.chatId);
 					}
 					break;
 				case "workspace_event": {
@@ -1038,6 +1186,11 @@ const App = (): JSX.Element => {
 
 	const handleSendMessage = useCallback(
 		async (text: string) => {
+			if (selectedChat?.status === "running") {
+				addError("This thread is currently running. Wait until it finishes.", "ws", "chat_running");
+				return;
+			}
+
 			const result = await sendWorkspaceMessage({
 				createChatId: async () => {
 					const chat = await handleCreateChat("New thread");
@@ -1074,10 +1227,13 @@ const App = (): JSX.Element => {
 							requestId,
 						);
 					},
-				onSetSending: (sending) => {
+				onSetSending: (chatId, sending) => {
 					dispatch({
-						payload: sending,
-						type: "SET_SENDING_MESSAGE",
+						payload: {
+							chatId,
+							sending,
+						},
+						type: "SET_CHAT_SENDING",
 					});
 				},
 				selectedChatId: state.selectedChatId,
@@ -1087,11 +1243,13 @@ const App = (): JSX.Element => {
 			});
 
 			if (result.sent && result.chatId) {
-				pendingSendChatIdRef.current = result.chatId;
+				pendingSendChatIdsRef.current.add(result.chatId);
 				return;
 			}
 
-			pendingSendChatIdRef.current = null;
+			if (result.chatId) {
+				pendingSendChatIdsRef.current.delete(result.chatId);
+			}
 		},
 		[
 			addError,
@@ -1100,6 +1258,7 @@ const App = (): JSX.Element => {
 			permissionMode,
 			selectedModel,
 			selectedReasoningEffort,
+			selectedChat?.status,
 			selectedChat?.provider,
 			state.selectedChatId,
 			state.selectedProjectId,
@@ -1778,17 +1937,18 @@ const App = (): JSX.Element => {
 											</header>
 
 											<div className="relative min-h-0 flex-1 overflow-hidden">
-												<ConversationPanel
-													chat={activeThreadChat}
-													focusMode
-													hasRestError={state.errors.some((error) => error.source === "rest")}
-													loading={state.messagesLoading}
-													messages={state.messages}
-													onSetStreamItemExpanded={handleSetStreamItemExpanded}
-													onSetStreamItemState={handleSetStreamItemState}
-													streamingTurn={streamingTurn}
-													streamingText={streamingText}
-												/>
+													<ConversationPanel
+														chat={activeThreadChat}
+														focusMode
+														hasRestError={state.errors.some((error) => error.source === "rest")}
+														loading={state.messagesLoading}
+														messages={state.messages}
+														onSetStreamItemExpanded={handleSetStreamItemExpanded}
+														onSetStreamItemState={handleSetStreamItemState}
+														streamHistoryTurns={streamHistoryTurns}
+														streamingTurn={streamingTurn}
+														streamingText={streamingText}
+													/>
 											</div>
 
 											<div className="shrink-0 px-3 pb-4 pt-3 sm:px-6">
@@ -1828,7 +1988,7 @@ const App = (): JSX.Element => {
 														permissionMode={permissionMode}
 														selectedModel={selectedModel}
 														selectedReasoningEffort={selectedReasoningEffort}
-														sending={state.isSendingMessage}
+														sending={selectedChatSending}
 													/>
 												</div>
 											</div>

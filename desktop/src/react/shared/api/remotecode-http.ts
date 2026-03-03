@@ -1,5 +1,6 @@
 import type { CodexModelsCatalog, CodexReasoningEffort } from "../../../shared/codex-model-config";
 import type { CodexPermissionMode } from "../../../shared/codex-permission-mode";
+import type { AssistantStreamEvent } from "../../../shared/assistant-stream-event";
 
 export interface ApiConfig {
 	baseUrl: string;
@@ -32,6 +33,19 @@ export interface MessageDTO {
 	role: "user" | "assistant";
 	content: string;
 	createdAt: string;
+}
+
+export interface ChatStreamEventDTO {
+	id: number;
+	chatId: string;
+	createdAt: string;
+	event: AssistantStreamEvent;
+}
+
+export interface ChatStreamEventsResponseDTO {
+	events: ChatStreamEventDTO[];
+	hasMore: boolean;
+	nextAfterId: number | null;
 }
 
 export interface WorkspaceSelection {
@@ -197,6 +211,12 @@ interface RestCreateChatResponse {
 
 interface RestListMessagesResponse {
 	messages: MessageDTO[];
+}
+
+interface RestListChatStreamEventsResponse {
+	events: ChatStreamEventDTO[];
+	hasMore: boolean;
+	nextAfterId: number | null;
 }
 
 interface RestWorkspaceSelectionResponse {
@@ -406,6 +426,24 @@ export const RemoteCodeApi = {
 				});
 
 				return payload.messages;
+			},
+
+			listChatStreamEvents: async (
+				chatId: string,
+				options?: { afterId?: number; limit?: number },
+			): Promise<ChatStreamEventsResponseDTO> => {
+				const query = new URLSearchParams();
+				if (typeof options?.afterId === "number" && Number.isFinite(options.afterId) && options.afterId > 0) {
+					query.set("afterId", String(Math.floor(options.afterId)));
+				}
+				if (typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+					query.set("limit", String(Math.floor(options.limit)));
+				}
+				const suffix = query.toString();
+				return await request<RestListChatStreamEventsResponse>({
+					method: "GET",
+					path: suffix ? `/chats/${chatId}/stream-events?${suffix}` : `/chats/${chatId}/stream-events`,
+				});
 			},
 
 			getWorkspaceSelection: async (): Promise<WorkspaceSelection> => {

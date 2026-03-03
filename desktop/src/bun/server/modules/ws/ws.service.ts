@@ -9,6 +9,7 @@ import {
 import type { ProjectRepository } from "../project/project.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
+import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
 import type { WsService as WsServiceContract, WsServiceInput } from "./ws.model";
 
@@ -29,6 +30,17 @@ const noopChatStreamSnapshotRepository: ChatStreamSnapshotRepositoryContract = {
 	}),
 };
 
+const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
+	append: (chatId, event) => ({
+		id: Date.now(),
+		chatId,
+		createdAt: new Date().toISOString(),
+		event,
+		turnId: event.turnId,
+	}),
+	listByChatId: () => [],
+};
+
 export class WsService implements WsServiceContract {
 	private readonly runningChats = new Set<string>();
 
@@ -39,6 +51,7 @@ export class WsService implements WsServiceContract {
 		private readonly codexProviderRunner: CodexProviderRunnerContract = new CodexProviderRunner(),
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 		private readonly chatStreamSnapshots: ChatStreamSnapshotRepositoryContract = noopChatStreamSnapshotRepository,
+		private readonly chatStreamEvents: ChatStreamEventRepositoryContract = noopChatStreamEventRepository,
 	) {}
 
 	private static buildClientErrorEvent(
@@ -209,9 +222,11 @@ export class WsService implements WsServiceContract {
 					});
 				},
 				onEvent: (event) => {
+					const persistedEvent = this.chatStreamEvents.append(chatId, event);
 					emit({
 						data: {
 							chatId,
+							eventId: persistedEvent.id,
 							event,
 						},
 						event: "assistant_event",
@@ -283,7 +298,7 @@ export const createWsService = (repositories: {
 	chat: ChatRepository;
 	message: MessageRepository;
 	project: ProjectRepository;
-}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract) =>
+}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract, chatStreamEvents?: ChatStreamEventRepositoryContract) =>
 	new WsService(
 		repositories.chat,
 		repositories.message,
@@ -291,6 +306,7 @@ export const createWsService = (repositories: {
 		undefined,
 		workspaceEvents,
 		chatStreamSnapshots,
+		chatStreamEvents,
 	);
 
 export const { createClientErrorEvent } = WsService;

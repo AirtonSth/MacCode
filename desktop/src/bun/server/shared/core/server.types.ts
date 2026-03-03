@@ -19,6 +19,20 @@ export interface ChatStreamSnapshotDTO {
 	updatedAt: string;
 }
 
+export interface ChatStreamEventDTO {
+	id: number;
+	chatId: string;
+	event: AssistantStreamEvent;
+	turnId: string;
+	createdAt: string;
+}
+
+export interface ChatStreamEventPageDTO {
+	events: ChatStreamEventDTO[];
+	hasMore: boolean;
+	nextAfterId: number | null;
+}
+
 export type ChatProvider = "fake" | "codex";
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
@@ -210,6 +224,7 @@ export type ServerWsEvent =
 	| {
 			data: {
 				chatId: string;
+				eventId: number;
 				event: AssistantStreamEvent;
 			};
 			event: "assistant_event";
