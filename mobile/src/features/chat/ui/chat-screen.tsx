@@ -9,6 +9,8 @@ import {
 	KeyboardAvoidingView,
 	ActivityIndicator,
 	Modal,
+	type NativeScrollEvent,
+	type NativeSyntheticEvent,
 	Platform,
 	Pressable,
 	ScrollView,
@@ -123,10 +125,13 @@ export const ChatScreen = () => {
 		availableModels,
 		createProject,
 		deleteProject,
+		hasOlderMessages,
 		isLoaded,
+		isLoadingOlderMessages,
 		isMessagesLoading,
 		isSending,
 		lastError,
+		loadOlderMessages,
 		selectedModel,
 		messages,
 		projects,
@@ -177,6 +182,7 @@ export const ChatScreen = () => {
 	const terminalInsets = useSafeAreaInsets();
 	const queryClient = useQueryClient();
 	const messageScrollRef = useRef<ScrollView | null>(null);
+	const previousLastMessageIdRef = useRef<string | null>(null);
 	const terminalScrollRef = useRef<ScrollView | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
@@ -343,12 +349,34 @@ export const ChatScreen = () => {
 	}, [activeModel, availableReasoningEfforts, selectedReasoningEffort, setSelectedReasoningEffort]);
 
 	useEffect(() => {
-		messageScrollRef.current?.scrollToEnd({ animated: true });
-	}, [messages.length, streamingText, streamingTurn]);
+		const nextLastMessageId = messages.at(-1)?.id ?? null;
+		const previousLastMessageId = previousLastMessageIdRef.current;
+		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
+		const hasStreaming = streamingText.trim().length > 0 || Boolean(streamingTurn);
+		if (hasNewTailMessage || hasStreaming) {
+			messageScrollRef.current?.scrollToEnd({ animated: true });
+		}
+		previousLastMessageIdRef.current = nextLastMessageId;
+	}, [messages, streamingText, streamingTurn]);
 
 	useEffect(() => {
 		setShowRunDetails(false);
 	}, [selectedChatId]);
+
+	useEffect(() => {
+		previousLastMessageIdRef.current = null;
+	}, [selectedChatId]);
+
+	const handleMessageScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+		if (!hasOlderMessages || isLoadingOlderMessages) {
+			return;
+		}
+
+		const threshold = 32;
+		if (event.nativeEvent.contentOffset.y <= threshold) {
+			void loadOlderMessages();
+		}
+	}, [hasOlderMessages, isLoadingOlderMessages, loadOlderMessages]);
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -884,7 +912,10 @@ export const ChatScreen = () => {
 					<ScrollView
 						contentContainerStyle={styles.messagesContent}
 						contentInsetAdjustmentBehavior="automatic"
+						maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+						onScroll={handleMessageScroll}
 						ref={messageScrollRef}
+						scrollEventThrottle={16}
 						showsVerticalScrollIndicator={false}
 						style={styles.messages}
 						testID="chat-message-list"
@@ -900,6 +931,12 @@ export const ChatScreen = () => {
 
 						{shouldShowEmptyState ? (
 							<Text style={styles.emptyState}>Start a conversation.</Text>
+						) : null}
+
+						{isLoadingOlderMessages ? (
+							<View style={styles.olderMessagesLoading}>
+								<ActivityIndicator color={palette.accent} size="small" />
+							</View>
 						) : null}
 
 						{historicalTurns.length > 0 ? (
@@ -2079,6 +2116,11 @@ const styles = StyleSheet.create({
 		alignItems: "center",
 		gap: 8,
 		paddingVertical: 20,
+	},
+	olderMessagesLoading: {
+		alignItems: "center",
+		paddingBottom: 6,
+		paddingTop: 2,
 	},
 	messagesLoadingLabel: {
 		color: palette.muted,

@@ -1,4 +1,5 @@
 import { Elysia } from "elysia";
+import { gzipSync } from "node:zlib";
 
 import { serverConfig } from "./config";
 import { AuthController } from "./modules/auth/auth.controller";
@@ -34,6 +35,97 @@ import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
 import { DatabaseClientFactory } from "./shared/db/db.client";
+
+const MIN_GZIP_PAYLOAD_BYTES = 1024;
+
+const isGzipAccepted = (request: Request): boolean => {
+	const acceptEncoding = request.headers.get("accept-encoding");
+	return typeof acceptEncoding === "string" && acceptEncoding.toLowerCase().includes("gzip");
+};
+
+const appendVaryValue = (current: string | null, value: string): string => {
+	if (!current || current.trim().length === 0) {
+		return value;
+	}
+
+	const values = current.split(",").map((item) => item.trim().toLowerCase());
+	if (values.includes(value.toLowerCase())) {
+		return current;
+	}
+
+	return `${current}, ${value}`;
+};
+
+const isCompressibleContentType = (contentType: string | null): boolean => {
+	if (!contentType) {
+		return false;
+	}
+
+	const normalized = contentType.toLowerCase();
+	return normalized.startsWith("text/")
+		|| normalized.includes("application/json")
+		|| normalized.includes("application/javascript")
+		|| normalized.includes("application/xml");
+};
+
+const readStatusCode = (value: unknown): number => {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return Math.floor(value);
+	}
+
+	if (typeof value === "string") {
+		const parsed = Number.parseInt(value, 10);
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+
+	return 200;
+};
+
+const mergeSetHeaders = (
+	baseHeaders: Headers,
+	setHeaders: Record<string, string | number>,
+): Headers => {
+	for (const [name, value] of Object.entries(setHeaders)) {
+		baseHeaders.set(name, String(value));
+	}
+
+	return baseHeaders;
+};
+
+const createGzipResponse = (
+	body: Uint8Array,
+	input: {
+		headers: Headers;
+		status: number;
+		statusText?: string;
+	},
+): Response | null => {
+	if (body.byteLength < MIN_GZIP_PAYLOAD_BYTES) {
+		return null;
+	}
+
+	const contentType = input.headers.get("content-type");
+	if (!isCompressibleContentType(contentType)) {
+		return null;
+	}
+
+	const contentEncoding = input.headers.get("content-encoding");
+	if (contentEncoding && contentEncoding.trim().length > 0) {
+		return null;
+	}
+
+	input.headers.set("content-encoding", "gzip");
+	input.headers.set("vary", appendVaryValue(input.headers.get("vary"), "accept-encoding"));
+	input.headers.delete("content-length");
+
+	return new Response(gzipSync(body), {
+		headers: input.headers,
+		status: input.status,
+		statusText: input.statusText,
+	});
+};
 
 export const ServerBootstrap = {
 	async buildServerApp(options?: { databasePath?: string; port?: number }) {
@@ -77,6 +169,58 @@ export const ServerBootstrap = {
 		const codexModelsService = new CodexModelsService();
 
 		const app = new Elysia()
+			.mapResponse(async ({ request, responseValue, set }) => {
+				if (!isGzipAccepted(request)) {
+					return;
+				}
+
+				const fallbackStatus = readStatusCode(set.status);
+				if (fallbackStatus === 204 || fallbackStatus === 304) {
+					return;
+				}
+
+				if (responseValue instanceof Response) {
+					if (responseValue.status === 204 || responseValue.status === 304) {
+						return;
+					}
+
+					const body = new Uint8Array(await responseValue.clone().arrayBuffer());
+					const headers = mergeSetHeaders(new Headers(responseValue.headers), set.headers);
+					return createGzipResponse(body, {
+						headers,
+						status: responseValue.status,
+						statusText: responseValue.statusText,
+					}) ?? responseValue;
+				}
+
+				if (
+					responseValue === null
+					|| responseValue === undefined
+					|| responseValue instanceof ReadableStream
+					|| responseValue instanceof ArrayBuffer
+					|| ArrayBuffer.isView(responseValue)
+				) {
+					return;
+				}
+
+				const payloadText = typeof responseValue === "string"
+					? responseValue
+					: JSON.stringify(responseValue);
+				const headers = mergeSetHeaders(new Headers(), set.headers);
+				if (!headers.has("content-type")) {
+					headers.set(
+						"content-type",
+						typeof responseValue === "string" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+					);
+				}
+
+				const payload = new TextEncoder().encode(payloadText);
+				const compressed = createGzipResponse(payload, {
+					headers,
+					status: fallbackStatus,
+				});
+				return compressed ?? undefined;
+			})
 			.group("/v1", (group) =>
 				group
 					.use(DiscoveryController.build(serverMetadataService))

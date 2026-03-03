@@ -1,6 +1,6 @@
-import type { ChatStreamEventPageDTO, MessageDTO } from "../../types";
+import type { ChatStreamEventPageDTO } from "../../types";
 import type { ChatRepository } from "../chat/chat.repository";
-import type { MessageRepository } from "./message.repository";
+import type { MessageListPage, MessageRepository } from "./message.repository";
 import type { ChatStreamEventRepositoryContract } from "../ws/chat-stream-event.repository";
 
 const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
@@ -15,7 +15,10 @@ const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
 };
 
 export interface MessageServiceContract {
-	listByChatId: (chatId: string) => Promise<{ chatExists: boolean; messages: MessageDTO[] }>;
+	listByChatId: (
+		chatId: string,
+		options?: { beforeMessageId?: string; limit?: number },
+	) => Promise<{ chatExists: boolean } & MessageListPage>;
 	listStreamEventsByChatId: (
 		chatId: string,
 		options?: { afterId?: number; limit?: number },
@@ -29,21 +32,26 @@ export class MessageService implements MessageServiceContract {
 		private readonly chatStreamEventRepository: ChatStreamEventRepositoryContract = noopChatStreamEventRepository,
 	) {}
 
-	async listByChatId(chatId: string): Promise<{ chatExists: boolean; messages: MessageDTO[] }> {
+	async listByChatId(
+		chatId: string,
+		options?: { beforeMessageId?: string; limit?: number },
+	): Promise<{ chatExists: boolean } & MessageListPage> {
 		const chat = await this.chatRepository.findChatById(chatId);
 
 		if (!chat) {
 			return {
 				chatExists: false,
+				hasMore: false,
 				messages: [],
+				nextBeforeMessageId: null,
 			};
 		}
 
-		const messages = await this.messageRepository.listMessagesByChatId(chatId);
+		const page = await this.messageRepository.listMessagesByChatId(chatId, options);
 
 		return {
 			chatExists: true,
-			messages,
+			...page,
 		};
 	}
 

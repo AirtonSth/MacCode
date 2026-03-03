@@ -109,6 +109,143 @@ test("GET /v1/chats/:id/messages returns 404 for missing chat", async () => {
 	}
 });
 
+test("GET /v1/chats/:id/messages supports cursor pagination keeping ascending order", async () => {
+	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
+	const database = new Database(databasePath);
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-message-pagination-"));
+
+	try {
+		const project = await client.v1.projects.post({ path: workspaceRoot });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "message-pagination" });
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		for (let index = 1; index <= 12; index += 1) {
+			const messageId = `message-${String(index).padStart(2, "0")}`;
+			const createdAt = `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`;
+			database
+				.prepare("INSERT INTO messages (id, chatId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)")
+				.run(messageId, chatId, "user", `content-${String(index)}`, createdAt);
+		}
+
+		const firstResponse = await fetch(`${baseUrl}/v1/chats/${chatId}/messages?limit=5`, {
+			headers: {
+				authorization: "Bearer local-dev-token",
+			},
+		});
+		const firstPayload = await firstResponse.json() as {
+			hasMore: boolean;
+			messages: Array<{ id: string }>;
+			nextBeforeMessageId: string | null;
+		};
+
+		expect(firstResponse.status).toBe(200);
+		expect(firstPayload.hasMore).toBe(true);
+		expect(firstPayload.nextBeforeMessageId).toBe("message-08");
+		expect(firstPayload.messages.map((message) => message.id)).toEqual([
+			"message-08",
+			"message-09",
+			"message-10",
+			"message-11",
+			"message-12",
+		]);
+
+		const secondResponse = await fetch(
+			`${baseUrl}/v1/chats/${chatId}/messages?limit=5&beforeMessageId=${encodeURIComponent(firstPayload.nextBeforeMessageId ?? "")}`,
+			{
+				headers: {
+					authorization: "Bearer local-dev-token",
+				},
+			},
+		);
+		const secondPayload = await secondResponse.json() as {
+			hasMore: boolean;
+			messages: Array<{ id: string }>;
+			nextBeforeMessageId: string | null;
+		};
+
+		expect(secondResponse.status).toBe(200);
+		expect(secondPayload.hasMore).toBe(true);
+		expect(secondPayload.nextBeforeMessageId).toBe("message-03");
+		expect(secondPayload.messages.map((message) => message.id)).toEqual([
+			"message-03",
+			"message-04",
+			"message-05",
+			"message-06",
+			"message-07",
+		]);
+
+		const thirdResponse = await fetch(
+			`${baseUrl}/v1/chats/${chatId}/messages?limit=5&beforeMessageId=${encodeURIComponent(secondPayload.nextBeforeMessageId ?? "")}`,
+			{
+				headers: {
+					authorization: "Bearer local-dev-token",
+				},
+			},
+		);
+		const thirdPayload = await thirdResponse.json() as {
+			hasMore: boolean;
+			messages: Array<{ id: string }>;
+			nextBeforeMessageId: string | null;
+		};
+
+		expect(thirdResponse.status).toBe(200);
+		expect(thirdPayload.hasMore).toBe(false);
+		expect(thirdPayload.nextBeforeMessageId).toBeNull();
+		expect(thirdPayload.messages.map((message) => message.id)).toEqual([
+			"message-01",
+			"message-02",
+		]);
+	} finally {
+		database.close();
+		rmSync(workspaceRoot, { force: true, recursive: true });
+		await cleanup();
+	}
+});
+
+test("GET /v1/chats/:id/messages responds with gzip when accepted by client", async () => {
+	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
+	const database = new Database(databasePath);
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-message-gzip-"));
+
+	try {
+		const project = await client.v1.projects.post({ path: workspaceRoot });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "message-gzip" });
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		database
+			.prepare("INSERT INTO messages (id, chatId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)")
+			.run(
+				"message-gzip-1",
+				chatId,
+				"assistant",
+				"x".repeat(3_000),
+				"2026-01-01T00:00:00.000Z",
+			);
+
+		const response = await fetch(`${baseUrl}/v1/chats/${chatId}/messages`, {
+			headers: {
+				"accept-encoding": "gzip",
+				authorization: "Bearer local-dev-token",
+			},
+		});
+		const payload = await response.json() as {
+			messages: Array<{ id: string }>;
+		};
+
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-encoding")).toBe("gzip");
+		expect(response.headers.get("vary")).toContain("accept-encoding");
+		expect(payload.messages).toHaveLength(1);
+		expect(payload.messages[0]?.id).toBe("message-gzip-1");
+	} finally {
+		database.close();
+		rmSync(workspaceRoot, { force: true, recursive: true });
+		await cleanup();
+	}
+});
+
 test("GET /v1/chats/:id/stream-events returns ordered and paginated events", async () => {
 	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
 	const database = new Database(databasePath);

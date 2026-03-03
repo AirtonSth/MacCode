@@ -11,6 +11,7 @@ import type {
 	GitCommitResultDTO,
 	GitStatusDTO,
 	MessageDTO,
+	MessagePageDTO,
 	ProjectDTO,
 	TerminalCommandDTO,
 	TerminalEntryDTO,
@@ -42,9 +43,7 @@ interface CreateChatResponse {
 	chat: ChatDTO;
 }
 
-interface ListMessagesResponse {
-	messages: MessageDTO[];
-}
+type ListMessagesResponse = MessagePageDTO;
 
 type ListChatStreamEventsResponse = ChatStreamEventsResponseDTO;
 
@@ -94,6 +93,10 @@ export interface RemoteCodeClient {
 	listFsEntries: (path: string) => Promise<FsListResponseDTO>;
 	listFsRoots: () => Promise<FsRootEntryDTO[]>;
 	listChats: (projectId: string) => Promise<ChatDTO[]>;
+	listMessagesPage: (
+		chatId: string,
+		options?: { beforeMessageId?: string; limit?: number },
+	) => Promise<MessagePageDTO>;
 	listMessages: (chatId: string) => Promise<MessageDTO[]>;
 	listChatStreamEvents: (
 		chatId: string,
@@ -159,6 +162,7 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 		const response = await fetch(`${resolvedBaseUrl}/v1${input.path}`, {
 			method: input.method,
 			headers: {
+				"accept-encoding": "gzip",
 				authorization: `Bearer ${resolvedToken}`,
 				"content-type": "application/json",
 				"x-remotecode-client-id": clientId,
@@ -309,12 +313,32 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			return payload.chats;
 		},
 
+		async listMessagesPage(chatId: string, options?: { beforeMessageId?: string; limit?: number }) {
+			const query = new URLSearchParams();
+			if (typeof options?.beforeMessageId === "string" && options.beforeMessageId.trim().length > 0) {
+				query.set("beforeMessageId", options.beforeMessageId.trim());
+			}
+			if (typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+				query.set("limit", String(Math.floor(options.limit)));
+			}
+			const suffix = query.toString();
+			const payload = await request<ListMessagesResponse>({
+				method: "GET",
+				path: suffix ? `/chats/${chatId}/messages?${suffix}` : `/chats/${chatId}/messages`,
+			});
+
+			return {
+				hasMore: payload.hasMore,
+				messages: payload.messages,
+				nextBeforeMessageId: payload.nextBeforeMessageId,
+			};
+		},
+
 		async listMessages(chatId: string) {
 			const payload = await request<ListMessagesResponse>({
 				method: "GET",
 				path: `/chats/${chatId}/messages`,
 			});
-
 			return payload.messages;
 		},
 

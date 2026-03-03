@@ -37,6 +37,8 @@ test("message service preserves ascending order by createdAt", async () => {
 		const result = await service.listByChatId(chat.id);
 
 		expect(result.chatExists).toBe(true);
+		expect(result.hasMore).toBe(false);
+		expect(result.nextBeforeMessageId).toBeNull();
 		expect(result.messages).toHaveLength(2);
 		expect(result.messages[0].content).toBe("a");
 		expect(result.messages[1].content).toBe("b");

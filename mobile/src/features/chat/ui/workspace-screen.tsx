@@ -1,9 +1,12 @@
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialIcons } from "@expo/vector-icons";
 import { router } from "expo-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+	ActivityIndicator,
 	KeyboardAvoidingView,
+	type NativeScrollEvent,
+	type NativeSyntheticEvent,
 	Platform,
 	Pressable,
 	ScrollView,
@@ -42,9 +45,12 @@ export const WorkspaceScreen = () => {
 		createProject,
 		deleteProject,
 		deleteChat,
+		hasOlderMessages,
+		isLoadingOlderMessages,
 		isLoaded,
 		isSending,
 		lastError,
+		loadOlderMessages,
 		messages,
 		permissionMode,
 		projects,
@@ -87,6 +93,7 @@ export const WorkspaceScreen = () => {
 	const isWide = dimensions.width >= 960;
 	const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(isWide);
 	const messagesScrollRef = useRef<ScrollView | null>(null);
+	const previousLastMessageIdRef = useRef<string | null>(null);
 	const favoriteProjects = useMemo(
 		() => projects.filter((project) => project.isFavorite),
 		[projects],
@@ -99,8 +106,29 @@ export const WorkspaceScreen = () => {
 	}, [isWide]);
 
 	useEffect(() => {
-		messagesScrollRef.current?.scrollToEnd({ animated: true });
-	}, [messages.length, streamingText, streamingTurn]);
+		const nextLastMessageId = messages.at(-1)?.id ?? null;
+		const previousLastMessageId = previousLastMessageIdRef.current;
+		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
+		const hasStreaming = streamingText.trim().length > 0 || Boolean(streamingTurn);
+		if (hasNewTailMessage || hasStreaming) {
+			messagesScrollRef.current?.scrollToEnd({ animated: true });
+		}
+		previousLastMessageIdRef.current = nextLastMessageId;
+	}, [messages, streamingText, streamingTurn]);
+
+	useEffect(() => {
+		previousLastMessageIdRef.current = null;
+	}, [selectedChatId]);
+
+	const handleMessagesScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+		if (!hasOlderMessages || isLoadingOlderMessages) {
+			return;
+		}
+
+		if (event.nativeEvent.contentOffset.y <= 32) {
+			void loadOlderMessages();
+		}
+	}, [hasOlderMessages, isLoadingOlderMessages, loadOlderMessages]);
 
 	const handleSend = async () => {
 		const text = input.trim();
@@ -734,11 +762,19 @@ export const WorkspaceScreen = () => {
 
 						<ScrollView
 							contentInsetAdjustmentBehavior="automatic"
+							maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+							onScroll={handleMessagesScroll}
 							ref={messagesScrollRef}
+							scrollEventThrottle={16}
 							style={{ flex: 1 }}
 						>
 							{!isLoaded ? (
 								<Text style={{ color: theme.colors.textSecondary }}>Loading workspace...</Text>
+							) : null}
+							{isLoadingOlderMessages ? (
+								<View style={{ alignItems: "center", paddingVertical: 6 }}>
+									<ActivityIndicator color={theme.colors.accent} size="small" />
+								</View>
 							) : null}
 							{messages.map((message) => (
 								<View

@@ -1,10 +1,15 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useChatsQuery } from "../api/use-chats-query";
 import { useCreateChatMutation } from "../api/use-create-chat-mutation";
 import { useDeleteChatMutation } from "../api/use-delete-chat-mutation";
-import { useMessagesQuery } from "../api/use-messages-query";
+import {
+	appendMessageToMessagePages,
+	MESSAGE_PAGE_SIZE,
+	replaceNewestMessagePage,
+	useMessagesQuery,
+} from "../api/use-messages-query";
 import { useUpdateWorkspaceSelectionMutation } from "../../settings/api/use-update-workspace-selection-mutation";
 import { useWorkspaceSelectionQuery } from "../../settings/api/use-workspace-selection-query";
 import { useProjectsQuery } from "../../threads/api/use-projects-query";
@@ -17,6 +22,7 @@ import type {
 	ChatDTO,
 	ChatStreamEventDTO,
 	MessageDTO,
+	MessagePageDTO,
 	ProjectDTO,
 	ServerWsEvent,
 	WorkspaceSelectionDTO,
@@ -148,9 +154,10 @@ const normalizeSelection = (
 	selection: WorkspaceSelectionDTO,
 ): WorkspaceSelectionDTO => {
 	const selectedProjectId = selection.selectedProjectId;
+	const selectedChatId = selectedProjectId && typeof selection.selectedChatId === "string" ? selection.selectedChatId : null;
 	return {
 		selectedProjectId,
-		selectedChatId: selectedProjectId ? selection.selectedChatId : null,
+		selectedChatId,
 		permissionMode: normalizePermissionMode(selection.permissionMode),
 		selectedModel: normalizeSelectedModel(selection.selectedModel),
 		selectedReasoningEffort: normalizeReasoningEffort(selection.selectedReasoningEffort),
@@ -344,12 +351,19 @@ export const useWorkspaceShell = () => {
 					const retryDelayMs = 250;
 					const trySyncMessages = async (attempt: number): Promise<void> => {
 						try {
-							const latestMessages = await client.listMessages(chatId);
-							queryClient.setQueryData<MessageDTO[]>(
-								queryKeys.messages(chatId),
-								latestMessages,
-							);
-							if (latestMessages.at(-1)?.role === "assistant") {
+							const latestPage = await client.listMessagesPage(chatId, {
+								limit: MESSAGE_PAGE_SIZE,
+							});
+							if (latestPage.messages.at(-1)?.role === "assistant") {
+								const currentPages = queryClient.getQueryData<InfiniteData<MessagePageDTO>>(queryKeys.messages(chatId));
+								if ((currentPages?.pages.length ?? 0) > 1) {
+									void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
+								} else {
+									queryClient.setQueryData<InfiniteData<MessagePageDTO>>(
+										queryKeys.messages(chatId),
+										(current) => replaceNewestMessagePage(current, latestPage),
+									);
+								}
 								return;
 							}
 						} catch {
@@ -760,7 +774,7 @@ export const useWorkspaceShell = () => {
 				setLastError("This thread is currently running. Wait until it finishes.");
 				return false;
 			}
-			const selectedChatHasNoMessages = (messagesQuery.data ?? []).length === 0;
+			const selectedChatHasNoMessages = messagesQuery.messages.length === 0;
 			const replacementChat =
 				selectedChat &&
 				selectedChatHasNoMessages &&
@@ -789,9 +803,9 @@ export const useWorkspaceShell = () => {
 				role: "user",
 			};
 
-			queryClient.setQueryData<MessageDTO[]>(
+			queryClient.setQueryData<InfiniteData<MessagePageDTO>>(
 				queryKeys.messages(activeChatId),
-				(current) => [...(current ?? []), nextMessage],
+				(current) => appendMessageToMessagePages(current, nextMessage),
 			);
 			queryClient.setQueryData(queryKeys.streamTurn(activeChatId), null);
 			setStreamingTextByChat((current) => ({
@@ -909,7 +923,8 @@ export const useWorkspaceShell = () => {
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
 	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
 	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
-	const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && !messagesQuery.data;
+	const messages = messagesQuery.messages;
+	const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],
@@ -919,11 +934,14 @@ export const useWorkspaceShell = () => {
 		createProject,
 		deleteProject,
 		deleteChat,
+		hasOlderMessages: messagesQuery.hasOlderMessages,
 		isLoaded: !projectsQuery.isLoading && selectionQuery.isFetched,
+		isLoadingOlderMessages: messagesQuery.isLoadingOlderMessages,
 		isMessagesLoading,
 		isSending,
 		lastError,
-		messages: messagesQuery.data ?? [],
+		loadOlderMessages: messagesQuery.loadOlderMessages,
+		messages,
 		permissionMode,
 		projects: projectsQuery.data ?? [],
 		selectedModel,

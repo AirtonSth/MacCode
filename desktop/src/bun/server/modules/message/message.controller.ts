@@ -13,8 +13,24 @@ export class MessageController {
 	build() {
 		return new Elysia({ name: "message-controller" })
 			.use(withRestAuth())
-			.get("/chats/:id/messages", async ({ params: parameters, set }) => {
-				const result = await this.service.listByChatId(parameters.id);
+			.get("/chats/:id/messages", async ({ params: parameters, query, set }) => {
+				const limitRaw = query.limit;
+				const beforeMessageIdRaw = query.beforeMessageId;
+				const parsedLimit = typeof limitRaw === "string"
+					? Number.parseInt(limitRaw, 10)
+					: typeof limitRaw === "number"
+						? limitRaw
+						: Number.NaN;
+				const limit = Number.isFinite(parsedLimit) && parsedLimit > 0
+					? Math.min(Math.floor(parsedLimit), 200)
+					: undefined;
+				const beforeMessageId = typeof beforeMessageIdRaw === "string" && beforeMessageIdRaw.trim().length > 0
+					? beforeMessageIdRaw.trim()
+					: undefined;
+				const result = await this.service.listByChatId(parameters.id, {
+					beforeMessageId,
+					limit,
+				});
 
 				if (!result.chatExists) {
 					set.status = 404;
@@ -22,7 +38,11 @@ export class MessageController {
 					return { error: "chat not found" };
 				}
 
-				return { messages: result.messages };
+				return {
+					hasMore: result.hasMore,
+					messages: result.messages,
+					nextBeforeMessageId: result.nextBeforeMessageId,
+				};
 			})
 			.get("/chats/:id/stream-events", async ({ params: parameters, query, set }) => {
 				const afterIdRaw = query.afterId;

@@ -28,6 +28,12 @@ export interface MessageDTO {
 	createdAt: string;
 }
 
+export interface MessagePageDTO {
+	messages: MessageDTO[];
+	hasMore: boolean;
+	nextBeforeMessageId: string | null;
+}
+
 export interface ChatStreamEventDTO {
 	id: number;
 	chatId: string;

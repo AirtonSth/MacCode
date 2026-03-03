@@ -73,7 +73,7 @@ test("WsService runs streaming flow with codex runner and persists assistant mes
 		expect(updated?.diffAdded).toBe(12);
 		expect(chatRepository.findProviderThreadIdByChatId(chat.id)).toBe("thread-integration-1");
 
-		const messages = messageRepository.listMessagesByChatId(chat.id);
+		const messages = messageRepository.listMessagesByChatId(chat.id).messages;
 		expect(messages).toHaveLength(2);
 		expect(messages[0].role).toBe("user");
 		expect(messages[1].role).toBe("assistant");

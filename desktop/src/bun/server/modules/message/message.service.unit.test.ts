@@ -17,12 +17,20 @@ const createMessage = (overrides: Partial<MessageDTO> = {}): MessageDTO => ({
 test("MessageService.listByChatId returns empty for missing chat", async () => {
 	const service = new MessageService(
 		{ findChatById: () => null } as unknown as ChatRepository,
-		{ listMessagesByChatId: () => [] } as unknown as MessageRepository,
+		{
+			listMessagesByChatId: () => ({
+				hasMore: false,
+				messages: [],
+				nextBeforeMessageId: null,
+			}),
+		} as unknown as MessageRepository,
 	);
 	const result = await service.listByChatId("missing");
 
 	expect(result.chatExists).toBe(false);
+	expect(result.hasMore).toBe(false);
 	expect(result.messages).toEqual([]);
+	expect(result.nextBeforeMessageId).toBeNull();
 });
 
 test("MessageService.listByChatId returns messages for existing chat", async () => {
@@ -42,11 +50,19 @@ test("MessageService.listByChatId returns messages for existing chat", async () 
 			title: "chat title",
 			updatedAt: "",
 		}) } as unknown as ChatRepository,
-		{ listMessagesByChatId: () => messages } as unknown as MessageRepository,
+		{
+			listMessagesByChatId: () => ({
+				hasMore: false,
+				messages,
+				nextBeforeMessageId: null,
+			}),
+		} as unknown as MessageRepository,
 	);
 
 	const result = await service.listByChatId("chat-id");
 
 	expect(result.chatExists).toBe(true);
+	expect(result.hasMore).toBe(false);
 	expect(result.messages).toEqual(messages);
+	expect(result.nextBeforeMessageId).toBeNull();
 });
