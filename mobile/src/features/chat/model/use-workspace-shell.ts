@@ -34,6 +34,7 @@ import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import {
 	clearThreadLiveActivity,
 	finishThreadLiveActivity,
+	isThreadLiveActivityEnabled,
 	onThreadLiveActivityAppStateChanged,
 	startThreadLiveActivity,
 	updateThreadLiveActivity,
@@ -464,12 +465,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	);
 
 	const startRunningLiveActivity = useCallback(
-		(chatId: string, input?: { chatTitle?: string; statusLine?: string }) => {
+		(chatId: string, input?: { chatTitle?: string; statusLine?: string; restart?: boolean }) => {
 			const title = input?.chatTitle?.trim() || resolveChatTitle(chatId);
 
 			void startThreadLiveActivity({
 				chatId,
 				chatTitle: title,
+				restart: input?.restart,
 				statusLine: input?.statusLine ?? "Running",
 			});
 		},
@@ -519,6 +521,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+			if (isThreadLiveActivityEnabled()) {
+				return;
+			}
 			const chatTitle = resolveChatTitle(chatId);
 
 			void (async () => {
@@ -599,6 +604,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const handleServerEvent = useCallback(
 		(event: ServerWsEvent) => {
+			const isBackgroundAppState = appStateRef.current === "background" || appStateRef.current === "inactive";
+
 			const clearSendingForChat = (chatId: string) => {
 				if (!pendingSendChatIdsRef.current.has(chatId)) {
 					return;
@@ -619,9 +626,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						const nextPreview = `${current[chatId] ?? ""}${event.data.delta}`;
 						updateRunningLiveActivity({
 							chatId,
-							phase: "running",
+							phase: isBackgroundAppState ? "background" : "running",
 							preview: nextPreview,
-							statusLine: "Generating response",
+							statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
+							force: isBackgroundAppState,
 						});
 						return nextPreview;
 					})(),
@@ -637,7 +645,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				}));
 				updateRunningLiveActivity({
 					chatId: event.data.chatId,
+					phase: isBackgroundAppState ? "background" : "running",
 					preview: event.data.partialText,
+					statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
+					force: isBackgroundAppState,
 				});
 				return;
 			}
@@ -695,11 +706,31 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						}
 					}
 				})();
+				const activityPhase: "running" | "background" | "finalizing" = (() => {
+					if (event.data.event.type === "turn_completed") {
+						return "finalizing";
+					}
+					if (isBackgroundAppState) {
+						return "background";
+					}
+					return "running";
+				})();
+				const toFallbackStatusLine = (phase: "running" | "background" | "finalizing"): string | undefined => {
+					if (phase === "background") {
+						return "Running in background";
+					}
+					if (phase === "finalizing") {
+						return "Finalizing response";
+					}
+					return undefined;
+				};
+				const activityStatusLine = statusLine ?? toFallbackStatusLine(activityPhase);
 				updateRunningLiveActivity({
 					chatId,
-					phase: event.data.event.type === "turn_completed" ? "finalizing" : "running",
+					phase: activityPhase,
 					preview: eventPreview,
-					statusLine,
+					statusLine: activityStatusLine,
+					force: isBackgroundAppState,
 				});
 				clearSendingForChat(event.data.chatId);
 				return;
@@ -812,9 +843,18 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					pendingCompletionNotificationChatIdsRef.current.has(event.data.chatId) ||
 					selectedChatIdRef.current === event.data.chatId;
 				if (event.data.status === "running" && shouldTrackLiveActivity) {
+					const runningStatus = isBackgroundAppState ? "Running in background" : "Running";
 					startRunningLiveActivity(event.data.chatId, {
-						statusLine: "Running",
+						statusLine: runningStatus,
 					});
+					if (isBackgroundAppState) {
+						updateRunningLiveActivity({
+							chatId: event.data.chatId,
+							force: true,
+							phase: "background",
+							statusLine: runningStatus,
+						});
+					}
 				}
 				if ((event.data.status === "completed" || event.data.status === "failed") && shouldTrackLiveActivity) {
 					finishLiveActivity(event.data.chatId, {
@@ -1430,9 +1470,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}));
 			pendingSendChatIdsRef.current.add(activeChatId);
 			pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
-			void ensureLocalNotificationPermission();
+			if (!isThreadLiveActivityEnabled()) {
+				void ensureLocalNotificationPermission();
+			}
 			startRunningLiveActivity(activeChatId, {
 				chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
+				restart: true,
 				statusLine: "Running",
 			});
 

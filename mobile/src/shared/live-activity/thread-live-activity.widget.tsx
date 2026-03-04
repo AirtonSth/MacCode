@@ -23,7 +23,15 @@ interface PhaseVisualState {
 	label: string;
 	badgeBackground: string;
 	badgeForeground: string;
+	timerBackground: string;
 	timerForeground: string;
+	titleForeground: string;
+	statusForeground: string;
+	previewForeground: string;
+	cardBackground: string;
+	containerBackground: string;
+	brandBackground: string;
+	brandForeground: string;
 	defaultStatus: string;
 	defaultPreview: string;
 }
@@ -63,16 +71,19 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 			return "Waiting for updates...";
 		}
 
-		return trimmed.length > 120 ? `${trimmed.slice(0, 120)}...` : trimmed;
+		return trimmed.length > 140 ? `${trimmed.slice(0, 140)}...` : trimmed;
 	};
 
 	const globalValues = globalThis as Record<string, unknown>;
 	const textView = globalValues.Text as ((props: Record<string, unknown>) => ReactNode) | undefined;
+	const imageView = globalValues.Image as ((props: Record<string, unknown>) => ReactNode) | undefined;
 	const hStackView = globalValues.HStack as ((props: Record<string, unknown>) => ReactNode) | undefined;
+	const spacerView = globalValues.Spacer as ((props?: Record<string, unknown>) => ReactNode) | undefined;
 	const vStackView = globalValues.VStack as ((props: Record<string, unknown>) => ReactNode) | undefined;
 
 	const background = globalValues.background as ((...args: unknown[]) => unknown) | undefined;
 	const cornerRadius = globalValues.cornerRadius as ((...args: unknown[]) => unknown) | undefined;
+	const frame = globalValues.frame as ((...args: unknown[]) => unknown) | undefined;
 	const font = globalValues.font as ((...args: unknown[]) => unknown) | undefined;
 	const foregroundStyle = globalValues.foregroundStyle as ((...args: unknown[]) => unknown) | undefined;
 	const lineLimit = globalValues.lineLimit as ((...args: unknown[]) => unknown) | undefined;
@@ -96,9 +107,17 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		background: {
 			icon: "BG",
 			label: "Background",
-			badgeBackground: "#E2E8F0",
-			badgeForeground: "#334155",
-			timerForeground: "#334155",
+			badgeBackground: "#DBEAFE",
+			badgeForeground: "#1E3A8A",
+			timerBackground: "#1E3A8A",
+			timerForeground: "#DBEAFE",
+			titleForeground: "#E2E8F0",
+			statusForeground: "#BFDBFE",
+			previewForeground: "#CBD5E1",
+			cardBackground: "#0A2340",
+			containerBackground: "#020617",
+			brandBackground: "#0C2647",
+			brandForeground: "#93C5FD",
 			defaultStatus: "Running in background",
 			defaultPreview: "The response keeps running while the app is not active.",
 		},
@@ -107,7 +126,15 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 			label: "Completed",
 			badgeBackground: "#DCFCE7",
 			badgeForeground: "#166534",
-			timerForeground: "#166534",
+			timerBackground: "#14532D",
+			timerForeground: "#DCFCE7",
+			titleForeground: "#E2E8F0",
+			statusForeground: "#86EFAC",
+			previewForeground: "#D1FAE5",
+			cardBackground: "#052E1D",
+			containerBackground: "#03170F",
+			brandBackground: "#064E3B",
+			brandForeground: "#6EE7B7",
 			defaultStatus: "Response is ready",
 			defaultPreview: "Tap to open the thread and review the full answer.",
 		},
@@ -116,7 +143,15 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 			label: "Error",
 			badgeBackground: "#FEE2E2",
 			badgeForeground: "#991B1B",
-			timerForeground: "#991B1B",
+			timerBackground: "#7F1D1D",
+			timerForeground: "#FEE2E2",
+			titleForeground: "#FEE2E2",
+			statusForeground: "#FCA5A5",
+			previewForeground: "#FECACA",
+			cardBackground: "#3F1115",
+			containerBackground: "#22070B",
+			brandBackground: "#52131A",
+			brandForeground: "#FCA5A5",
 			defaultStatus: "Thread ended with an error",
 			defaultPreview: "Open the thread to see the error details.",
 		},
@@ -125,16 +160,32 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 			label: "Failed",
 			badgeBackground: "#FEE2E2",
 			badgeForeground: "#991B1B",
-			timerForeground: "#991B1B",
+			timerBackground: "#7F1D1D",
+			timerForeground: "#FEE2E2",
+			titleForeground: "#FEE2E2",
+			statusForeground: "#FCA5A5",
+			previewForeground: "#FECACA",
+			cardBackground: "#3F1115",
+			containerBackground: "#22070B",
+			brandBackground: "#52131A",
+			brandForeground: "#FCA5A5",
 			defaultStatus: "Thread failed",
 			defaultPreview: "Open the thread to retry the request.",
 		},
 		finalizing: {
 			icon: "...",
 			label: "Finalizing",
-			badgeBackground: "#DBEAFE",
+			badgeBackground: "#E0EAFF",
 			badgeForeground: "#1D4ED8",
-			timerForeground: "#1D4ED8",
+			timerBackground: "#1D4ED8",
+			timerForeground: "#E0EAFF",
+			titleForeground: "#E2E8F0",
+			statusForeground: "#BFDBFE",
+			previewForeground: "#DBEAFE",
+			cardBackground: "#102A56",
+			containerBackground: "#020617",
+			brandBackground: "#163569",
+			brandForeground: "#93C5FD",
 			defaultStatus: "Finalizing response",
 			defaultPreview: "Wrapping up the final answer.",
 		},
@@ -143,7 +194,15 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 			label: "Running",
 			badgeBackground: "#CCFBF1",
 			badgeForeground: "#0F766E",
-			timerForeground: "#0F766E",
+			timerBackground: "#155E75",
+			timerForeground: "#CCFBF1",
+			titleForeground: "#E2E8F0",
+			statusForeground: "#67E8F9",
+			previewForeground: "#CFFAFE",
+			cardBackground: "#082F49",
+			containerBackground: "#020617",
+			brandBackground: "#0A2A40",
+			brandForeground: "#67E8F9",
 			defaultStatus: "Generating response",
 			defaultPreview: "Working on your latest request.",
 		},
@@ -154,32 +213,79 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 	const statusLine = toTrimmed(data.statusLine, visual.defaultStatus);
 	const preview = toPreview(toTrimmed(data.preview, visual.defaultPreview));
 	const elapsed = toElapsed(data.elapsedSeconds);
-	const leadingGlyph = data.phase === "running" || data.phase === "finalizing" ? "RC" : visual.label.slice(0, 2).toUpperCase();
+	const compactGlyph = data.phase === "running" || data.phase === "finalizing"
+		? "RC"
+		: visual.label.slice(0, 1).toUpperCase();
 
-	const headerText = textView({
-		children: title,
+	const logoIcon = imageView
+		? imageView({
+			color: visual.brandForeground,
+			size: 12,
+			systemName: "arrow.up.right.circle.fill",
+		})
+		: null;
+	const logoFallback = textView({
+		children: "RC",
 		modifiers: [
-			font({ size: 14, weight: "bold", design: "rounded" }),
-			foregroundStyle({ type: "hierarchical", style: "primary" }),
+			font({ size: 11, weight: "bold", design: "rounded" }),
+			foregroundStyle(visual.brandForeground),
 			lineLimit(1),
 		],
 	});
+	const logoWordmark = textView({
+		children: "RemoteCode",
+		modifiers: [
+			font({ size: 10, weight: "semibold", design: "rounded" }),
+			foregroundStyle(visual.brandForeground),
+			lineLimit(1),
+		],
+	});
+	const brandChip = hStackView({
+		spacing: 4,
+		modifiers: [
+			padding({ horizontal: 8, vertical: 4 }),
+			background ? background(visual.brandBackground) : null,
+			cornerRadius ? cornerRadius(999) : null,
+		].filter(Boolean),
+		children: [logoIcon ?? logoFallback, logoWordmark],
+	});
+
 	const phaseBadge = textView({
 		children: visual.label,
 		modifiers: [
 			padding({ horizontal: 8, vertical: 3 }),
 			background ? background(visual.badgeBackground) : null,
 			cornerRadius ? cornerRadius(999) : null,
-			font({ size: 11, weight: "semibold", design: "rounded" }),
+			font({ size: 10, weight: "bold", design: "rounded" }),
 			foregroundStyle(visual.badgeForeground),
 			lineLimit(1),
 		].filter(Boolean),
 	});
-	const statusText = textView({
-		children: statusLine,
+	const elapsedPill = textView({
+		children: elapsed,
 		modifiers: [
-			font({ size: 12, weight: "medium" }),
-			foregroundStyle({ type: "hierarchical", style: "secondary" }),
+			padding({ horizontal: 8, vertical: 3 }),
+			background ? background(visual.timerBackground) : null,
+			cornerRadius ? cornerRadius(999) : null,
+			font({ size: 10, weight: "semibold", design: "monospaced" }),
+			monospacedDigit ? monospacedDigit() : null,
+			foregroundStyle(visual.timerForeground),
+			lineLimit(1),
+		].filter(Boolean),
+	});
+	const titleText = textView({
+		children: title,
+		modifiers: [
+			font({ size: 14, weight: "bold", design: "rounded" }),
+			foregroundStyle(visual.titleForeground),
+			lineLimit(1),
+		],
+	});
+	const statusText = textView({
+		children: `${visual.icon} ${statusLine}`,
+		modifiers: [
+			font({ size: 12, weight: "medium", design: "rounded" }),
+			foregroundStyle(visual.statusForeground),
 			lineLimit(1),
 		],
 	});
@@ -187,31 +293,16 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		children: preview,
 		modifiers: [
 			font({ size: 12, weight: "regular" }),
-			foregroundStyle({ type: "hierarchical", style: "secondary" }),
+			foregroundStyle(visual.previewForeground),
 			lineLimit(2),
 		],
 	});
-	const elapsedText = textView({
-		children: elapsed,
-		modifiers: [
-			font({ size: 12, weight: "semibold", design: "monospaced" }),
-			monospacedDigit ? monospacedDigit() : null,
-			foregroundStyle(visual.timerForeground),
-		].filter(Boolean),
-	});
-	const iconText = textView({
-		children: visual.icon,
-		modifiers: [
-			font({ size: 11, weight: "semibold" }),
-			foregroundStyle(visual.timerForeground),
-			lineLimit(1),
-		],
-	});
+
 	const compactLeading = textView({
-		children: leadingGlyph,
+		children: compactGlyph,
 		modifiers: [
 			font({ size: 11, weight: "bold", design: "rounded" }),
-			foregroundStyle({ type: "hierarchical", style: "primary" }),
+			foregroundStyle(visual.brandForeground),
 			lineLimit(1),
 		],
 	});
@@ -224,34 +315,66 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		].filter(Boolean),
 	});
 	const minimal = textView({
-		children: visual.label.slice(0, 1),
+		children: compactGlyph.slice(0, 1),
 		modifiers: [
 			font({ size: 10, weight: "bold", design: "rounded" }),
-			foregroundStyle(visual.timerForeground),
+			foregroundStyle(visual.brandForeground),
 			lineLimit(1),
 		],
 	});
 
+	const previewCard = vStackView({
+		alignment: "leading",
+		spacing: 4,
+		modifiers: [
+			padding({ horizontal: 10, vertical: 8 }),
+			background ? background(visual.cardBackground) : null,
+			cornerRadius ? cornerRadius(10) : null,
+		].filter(Boolean),
+		children: [statusText, previewText],
+	});
+	const bannerContent = vStackView({
+		alignment: "leading",
+		spacing: 10,
+		modifiers: [
+			padding({ all: 12 }),
+		],
+		children: [
+			hStackView({
+				spacing: 6,
+				children: [brandChip, phaseBadge, elapsedPill],
+			}),
+			titleText,
+			previewCard,
+		],
+	});
+	const bannerChildren = spacerView
+		? [bannerContent, spacerView({ minLength: 0 })]
+		: [bannerContent];
+	const bannerSmallChildren = spacerView
+		? [phaseBadge, elapsedPill, spacerView({ minLength: 0 })]
+		: [phaseBadge, elapsedPill];
+
 	return {
-		banner: vStackView({
-			alignment: "leading",
-			spacing: 8,
+		banner: hStackView({
+			alignment: "top",
+			spacing: 0,
 			modifiers: [
-				padding({ all: 12 }),
-				background ? background("#F8FAFC") : null,
+				frame ? frame({ alignment: "leading", maxWidth: 9_999 }) : null,
+				background ? background(visual.containerBackground) : null,
 				cornerRadius ? cornerRadius(16) : null,
 			].filter(Boolean),
-			children: [
-				hStackView({
-					spacing: 8,
-					children: [headerText, phaseBadge],
-				}),
-				hStackView({
-					spacing: 8,
-					children: [iconText, statusText, elapsedText],
-				}),
-				previewText,
-			],
+			children: bannerChildren,
+		}),
+		bannerSmall: hStackView({
+			spacing: 6,
+			modifiers: [
+				frame ? frame({ alignment: "leading", maxWidth: 9_999 }) : null,
+				padding({ horizontal: 8, vertical: 6 }),
+				background ? background(visual.containerBackground) : null,
+				cornerRadius ? cornerRadius(10) : null,
+			].filter(Boolean),
+			children: bannerSmallChildren,
 		}),
 		compactLeading,
 		compactTrailing,
@@ -259,18 +382,11 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		expandedCenter: vStackView({
 			alignment: "leading",
 			spacing: 4,
-			children: [
-				headerText,
-				hStackView({
-					spacing: 8,
-					children: [iconText, statusText],
-				}),
-				previewText,
-			],
+			children: [titleText, statusText, previewText],
 		}),
-		expandedLeading: phaseBadge,
-		expandedTrailing: elapsedText,
-		expandedBottom: previewText,
+		expandedLeading: brandChip,
+		expandedTrailing: elapsedPill,
+		expandedBottom: previewCard,
 	};
 };
 

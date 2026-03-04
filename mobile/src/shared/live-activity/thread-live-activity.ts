@@ -35,6 +35,7 @@ interface LiveActivityStartInput {
 	preview?: string;
 	startedAtMs?: number;
 	statusLine?: string;
+	restart?: boolean;
 }
 
 interface LiveActivityUpdateInput {
@@ -272,6 +273,11 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	}
 
 	await initializeThreadLiveActivityManager();
+	if (input.restart && activeState) {
+		await clearThreadLiveActivity({
+			chatId: activeState.chatId,
+		});
+	}
 
 	let startedAtMs = nowMs();
 	const hasExplicitStartTime =
@@ -279,7 +285,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	if (hasExplicitStartTime) {
 		startedAtMs = Math.floor(input.startedAtMs ?? nowMs());
 	}
-	if (!hasExplicitStartTime && activeState?.chatId === input.chatId) {
+	if (!hasExplicitStartTime && !input.restart && activeState?.chatId === input.chatId) {
 		startedAtMs = activeState.startedAtMs;
 	}
 
@@ -510,5 +516,7 @@ export const onThreadLiveActivityAppStateChanged = async (nextState: AppStateSta
 		});
 	}
 };
+
+export const isThreadLiveActivityEnabled = (): boolean => canUseLiveActivities();
 
 export const getThreadLiveActivityStateForBackgroundTask = (): PersistedLiveActivityState | null => activeState;
