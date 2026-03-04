@@ -20,7 +20,8 @@
     "test:quick:desktop": "bun run --cwd desktop test:backend",
     "dev:desktop": "bun run --cwd desktop dev:hmr",
     "dev:mobile": "bun run --cwd mobile start",
-    "dev:mobile:ios": "cd mobile && bunx expo run ios"
+    "dev:mobile:ios": "cd mobile && bunx expo run ios",
+    "mcp:playwright-electron": "bun run --cwd desktop mcp:playwright-electron"
   },
   "devDependencies": {
     "eslint": "8.57.1",

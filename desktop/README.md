@@ -55,3 +55,42 @@ Want to extend this app? Try adding:
 - Multiple windows and views
 
 Happy building! 🚀
+
+## Playwright MCP for Electron Automation
+
+To run Playwright MCP Server against this Electrobun app:
+
+```bash
+bun run --cwd desktop mcp:playwright-electron
+```
+
+Optional overrides:
+
+```bash
+ELECTROBUN_EXECUTABLE_PATH="/absolute/path/to/electrobun" PLAYWRIGHT_MCP_PORT=8931 bun run --cwd desktop mcp:playwright-electron
+```
+
+The server starts in SSE mode on `http://localhost:8931` and prints the MCP client
+snippet on startup.
+
+MCP config template:
+- `desktop/playwright-e2e/playwright-electron.mcp.json`
+- Automation utilities overview:
+  - `desktop/playwright-e2e/README.md`
+
+## CEF + CDP Screenshot Automation
+
+For automation via DevTools/CDP (works with BrowserView when CEF is enabled):
+
+```bash
+cd desktop
+ELECTROBUN_CDP=1 ELECTROBUN_CDP_PORT=9333 ELECTROBUN_WINDOW_WIDTH=1200 ELECTROBUN_WINDOW_HEIGHT=700 bun run automation:cdp-screenshot
+```
+
+This launches the app with `bundleCEF=true`, enables:
+- `--remote-debugging-address=127.0.0.1`
+- `--remote-debugging-port=<ELECTROBUN_CDP_PORT>`
+- `ELECTROBUN_WINDOW_WIDTH` / `ELECTROBUN_WINDOW_HEIGHT` (defaults: `1200x700`)
+
+and captures a screenshot from the active page using `puppeteer-core` into
+`desktop/playwright-e2e/artifacts/electrobun-cdp-screenshot.png`.

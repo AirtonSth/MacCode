@@ -3,6 +3,23 @@ import type { ElectrobunConfig } from "electrobun";
 const appIconPath = "assets/app-icon.png";
 const macIconsetPath = "icon.iconset";
 
+const isCdpEnabled = ["1", "true", "yes"].includes(
+	(process.env.ELECTROBUN_CDP ?? "").toLowerCase(),
+);
+const cdpPort = process.env.ELECTROBUN_CDP_PORT ?? "9333";
+const chromiumFlags = isCdpEnabled
+	? {
+			"remote-debugging-address": "127.0.0.1",
+			"remote-debugging-port": cdpPort,
+		}
+	: undefined;
+
+const runtimeConfig = {
+	bundleCEF: isCdpEnabled,
+	defaultRenderer: isCdpEnabled ? ("cef" as const) : ("native" as const),
+	chromiumFlags,
+};
+
 const config: ElectrobunConfig = {
 	app: {
 		identifier: "remotecode-electrobun.local",
@@ -17,24 +34,22 @@ const config: ElectrobunConfig = {
 			"dist/index.html": "views/react/index.html",
 		},
 
-
 		linux: {
 			icon: appIconPath,
-			bundleCEF: false,
+			...runtimeConfig,
 		},
 
 		mac: {
 			icons: macIconsetPath,
-			bundleCEF: false,
+			...runtimeConfig,
 		},
-
 
 		// Ignore Vite output in watch mode; HMR process handles rebuilds
 		watchIgnore: ["dist/**"],
 
 		win: {
 			icon: appIconPath,
-			bundleCEF: false,
+			...runtimeConfig,
 		},
 	},
 };
