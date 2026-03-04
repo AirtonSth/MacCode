@@ -439,11 +439,21 @@ export const useWorkspaceShell = () => {
 			};
 
 			if (event.event === "assistant_delta") {
+				const chatId = event.data.chatId;
 				setStreamingTextByChat((current) => ({
 					...current,
-					[event.data.chatId]: `${current[event.data.chatId] ?? ""}${event.data.delta}`,
+					[chatId]: (() => {
+						const nextPreview = `${current[chatId] ?? ""}${event.data.delta}`;
+						updateRunningLiveActivity({
+							chatId,
+							phase: "running",
+							preview: nextPreview,
+							statusLine: "Generating response",
+						});
+						return nextPreview;
+					})(),
 				}));
-				clearSendingForChat(event.data.chatId);
+				clearSendingForChat(chatId);
 				return;
 			}
 
@@ -500,9 +510,22 @@ export const useWorkspaceShell = () => {
 						}
 					}
 				})();
+				const eventPreview = (() => {
+					switch (event.data.event.type) {
+						case "item_completed":
+						case "item_started":
+						case "item_state": {
+							return event.data.event.summary;
+						}
+						default: {
+							return undefined;
+						}
+					}
+				})();
 				updateRunningLiveActivity({
 					chatId,
 					phase: event.data.event.type === "turn_completed" ? "finalizing" : "running",
+					preview: eventPreview,
 					statusLine,
 				});
 				clearSendingForChat(event.data.chatId);

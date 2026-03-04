@@ -59,7 +59,7 @@ let activeState: PersistedLiveActivityState | null = null;
 let activeActivity: LiveActivity<ThreadLiveActivityProps> | null = null;
 let activityPushTokenSubscription: Subscription | null = null;
 let pushToStartTokenSubscription: Subscription | null = null;
-let lastUpdateAt = 0;
+let lastContentUpdateAt = 0;
 let elapsedTickInterval: ReturnType<typeof setInterval> | null = null;
 let finishingChatId: string | null = null;
 let liveActivitiesUnavailable = false;
@@ -219,7 +219,6 @@ const pushElapsedTickUpdate = async (): Promise<void> => {
 
 	try {
 		await activity.update(toProps(activeState));
-		lastUpdateAt = nowMs();
 	} catch {
 		// Ignore elapsed tick update failures.
 	}
@@ -236,7 +235,7 @@ const ensureElapsedTick = (): void => {
 };
 
 const shouldSkipThrottledUpdate = (force = false): boolean =>
-	!force && nowMs() - lastUpdateAt < UPDATE_THROTTLE_MS;
+	!force && nowMs() - lastContentUpdateAt < UPDATE_THROTTLE_MS;
 
 export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 	if (!canUseLiveActivities() || initialized) {
@@ -261,7 +260,7 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 		detachActivityPushTokenSubscription();
 		activeActivity = null;
 		activeState = null;
-		lastUpdateAt = 0;
+		lastContentUpdateAt = 0;
 		// eslint-disable-next-line require-atomic-updates
 		initialized = false;
 	}
@@ -308,7 +307,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	if (existing) {
 		try {
 			await existing.update(toProps(nextState));
-			lastUpdateAt = nowMs();
+			lastContentUpdateAt = nowMs();
 			return;
 		} catch {
 			activeActivity = null;
@@ -318,7 +317,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	try {
 		activeActivity = threadLiveActivityFactory.start(toProps(nextState), `remotecode-mobile://chat?chatId=${encodeURIComponent(nextState.chatId)}`);
 		attachActivityPushTokenSubscription(activeActivity);
-		lastUpdateAt = nowMs();
+		lastContentUpdateAt = nowMs();
 	} catch {
 		// Ignore Live Activity startup failures.
 	}
@@ -350,7 +349,7 @@ export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): 
 
 	try {
 		await activity.update(toProps(activeState));
-		lastUpdateAt = nowMs();
+		lastContentUpdateAt = nowMs();
 	} catch {
 		// Ignore runtime update failures.
 	}
@@ -441,7 +440,7 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 			activeActivity = null;
 			// eslint-disable-next-line require-atomic-updates
 			activeState = null;
-			lastUpdateAt = 0;
+			lastContentUpdateAt = 0;
 			await persistActiveState();
 		}
 	} finally {
@@ -479,7 +478,7 @@ export const clearThreadLiveActivity = async (input: { chatId: string }): Promis
 	activeActivity = null;
 	// eslint-disable-next-line require-atomic-updates
 	activeState = null;
-	lastUpdateAt = 0;
+	lastContentUpdateAt = 0;
 	await persistActiveState();
 };
 
