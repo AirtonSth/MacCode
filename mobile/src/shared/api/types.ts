@@ -7,6 +7,18 @@ export interface ProjectDTO {
 	updatedAt: string;
 }
 
+export interface WorkspaceSummaryDTO {
+	id: string;
+	name: string;
+	path: string;
+}
+
+export interface ProjectSummaryDTO {
+	id: string;
+	name: string;
+	path: string;
+}
+
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
 
 export interface ChatDTO {
@@ -18,6 +30,17 @@ export interface ChatDTO {
 	diffAdded: number;
 	diffRemoved: number;
 	updatedAt: string;
+}
+
+export interface ThreadSummaryDTO {
+	id: string;
+	title: string;
+	updatedAt: string;
+}
+
+export interface ChatContextDTO {
+	chat: ChatDTO;
+	project: ProjectSummaryDTO;
 }
 
 export interface MessageDTO {

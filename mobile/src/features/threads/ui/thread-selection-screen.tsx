@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useIsFocused } from "@react-navigation/native";
 import {
 	ActivityIndicator,
 	Animated,
@@ -45,6 +46,8 @@ export const ThreadSelectionScreen = () => {
 	const api = useRemoteCodeClient();
 	const { push, replace } = useFlowNavigator();
 	const { isLoaded: isConfigLoaded } = useApiConfig();
+	const isFocused = useIsFocused();
+	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const {
 		chats,
 		chatsErrorMessage,
@@ -61,10 +64,13 @@ export const ThreadSelectionScreen = () => {
 		selectedChatId,
 		selectedProject,
 		selectedProjectId,
-	} = useWorkspaceShell();
+	} = useWorkspaceShell({
+		isActive: isFocused,
+		scope: "threads",
+		shouldLoadDrawerWorkspaces: isDrawerOpen,
+	});
 	const [searchValue, setSearchValue] = useState<string>("");
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
-	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const [isCreating, setIsCreating] = useState<boolean>(false);
 	const [isWorkspacePickerOpen, setIsWorkspacePickerOpen] = useState<boolean>(false);
 	const [isCreatingWorkspaceFromDrawer, setIsCreatingWorkspaceFromDrawer] = useState<boolean>(false);

@@ -13,6 +13,29 @@ export interface ChatDTO {
 	updatedAt: string;
 }
 
+export interface WorkspaceSummaryDTO {
+	id: string;
+	name: string;
+	path: string;
+}
+
+export interface ThreadSummaryDTO {
+	id: string;
+	title: string;
+	updatedAt: string;
+}
+
+export interface ProjectSummaryDTO {
+	id: string;
+	name: string;
+	path: string;
+}
+
+export interface ChatContextDTO {
+	chat: ChatDTO;
+	project: ProjectSummaryDTO;
+}
+
 export interface ChatStreamSnapshotDTO {
 	chatId: string;
 	partialText: string;

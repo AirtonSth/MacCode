@@ -106,11 +106,12 @@ export const replaceNewestMessagePage = (
 	};
 };
 
-export const useMessagesQuery = (chatId: string | null) => {
+export const useMessagesQuery = (chatId: string | null, options?: { enabled?: boolean }) => {
 	const client = useRemoteCodeClient();
+	const enabled = options?.enabled ?? true;
 
 	const query = useInfiniteQuery<MessagePageDTO, Error, InfiniteData<MessagePageDTO>, ReturnType<typeof queryKeys.messages>, string | null>({
-		enabled: Boolean(chatId),
+		enabled: Boolean(chatId) && enabled,
 		getNextPageParam: (lastPage) => (
 			lastPage.hasMore && typeof lastPage.nextBeforeMessageId === "string"
 				? lastPage.nextBeforeMessageId

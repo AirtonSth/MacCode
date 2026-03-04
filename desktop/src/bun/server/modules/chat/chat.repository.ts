@@ -4,7 +4,7 @@ import { desc, eq } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { chats } from "../../shared/db/db.schema";
-import type { ChatDTO, ChatProvider, ChatStatus } from "../../types";
+import type { ChatDTO, ChatProvider, ChatStatus, ThreadSummaryDTO } from "../../types";
 
 export class ChatRepository {
 	private readonly database: DrizzleDatabaseClient["orm"];
@@ -29,6 +29,14 @@ export class ChatRepository {
 			projectId: row.projectId,
 			provider: ChatRepository.normalizeProvider(row.provider),
 			status: row.status as ChatStatus,
+			title: row.title,
+			updatedAt: row.updatedAt,
+		};
+	}
+
+	private static toThreadSummaryDto(row: { id: string; title: string; updatedAt: string }): ThreadSummaryDTO {
+		return {
+			id: row.id,
 			title: row.title,
 			updatedAt: row.updatedAt,
 		};
@@ -91,6 +99,21 @@ export class ChatRepository {
 			.all() as typeof chats.$inferSelect[];
 
 		return rows.map(ChatRepository.toChatDto);
+	}
+
+	getThreadSummariesByProjectId(projectId: string): ThreadSummaryDTO[] {
+		const rows = this.database
+			.select({
+				id: chats.id,
+				title: chats.title,
+				updatedAt: chats.updatedAt,
+			})
+			.from(chats)
+			.where(eq(chats.projectId, projectId))
+			.orderBy(desc(chats.updatedAt))
+			.all() as Array<{ id: string; title: string; updatedAt: string }>;
+
+		return rows.map(ChatRepository.toThreadSummaryDto);
 	}
 
 	updateChat(

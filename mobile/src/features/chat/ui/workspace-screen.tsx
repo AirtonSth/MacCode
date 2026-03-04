@@ -1,5 +1,6 @@
 import { LinearGradient } from "expo-linear-gradient";
 import { MaterialIcons } from "@expo/vector-icons";
+import { useIsFocused } from "@react-navigation/native";
 import { router } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -37,6 +38,7 @@ const styles = StyleSheet.create({
 });
 
 export const WorkspaceScreen = () => {
+	const isFocused = useIsFocused();
 	const {
 		availableModels,
 		chats,
@@ -70,7 +72,9 @@ export const WorkspaceScreen = () => {
 		streamingText,
 		streamingTurn,
 		toggleFavorite,
-	} = useWorkspaceShell();
+	} = useWorkspaceShell({
+		isActive: isFocused,
+	});
 	const [input, setInput] = useState<string>("");
 	const [newProjectPath, setNewProjectPath] = useState<string>("");
 	const [newProjectName, setNewProjectName] = useState<string>("");

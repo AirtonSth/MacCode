@@ -4,7 +4,7 @@ import { desc, eq } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { projects } from "../../shared/db/db.schema";
-import type { ProjectDTO } from "../../types";
+import type { ProjectDTO, WorkspaceSummaryDTO } from "../../types";
 
 export class ProjectRepository {
 	private static toBoolean(value: number | boolean | null | undefined): boolean {
@@ -19,7 +19,7 @@ export class ProjectRepository {
 		return false;
 	}
 
-private static toProjectDto(row: typeof projects.$inferSelect): ProjectDTO {
+	private static toProjectDto(row: typeof projects.$inferSelect): ProjectDTO {
 		return {
 			createdAt: row.createdAt,
 			id: row.id,
@@ -27,6 +27,14 @@ private static toProjectDto(row: typeof projects.$inferSelect): ProjectDTO {
 			name: row.name,
 			path: row.path,
 			updatedAt: row.updatedAt,
+		};
+	}
+
+	private static toWorkspaceSummaryDto(row: { id: string; name: string; path: string }): WorkspaceSummaryDTO {
+		return {
+			id: row.id,
+			name: row.name,
+			path: row.path,
 		};
 	}
 
@@ -101,6 +109,20 @@ private readonly database: DrizzleDatabaseClient["orm"];
 			.all() as typeof projects.$inferSelect[];
 
 		return rows.map(ProjectRepository.toProjectDto);
+	}
+
+	listWorkspaceSummaries(): WorkspaceSummaryDTO[] {
+		const rows = this.database
+			.select({
+				id: projects.id,
+				name: projects.name,
+				path: projects.path,
+			})
+			.from(projects)
+			.orderBy(desc(projects.updatedAt))
+			.all() as Array<{ id: string; name: string; path: string }>;
+
+		return rows.map(ProjectRepository.toWorkspaceSummaryDto);
 	}
 
 	updateProjectFavorite(id: string, isFavorite: boolean): ProjectDTO | null {

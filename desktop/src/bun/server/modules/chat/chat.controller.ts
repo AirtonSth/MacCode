@@ -20,6 +20,17 @@ constructor(
 	build() {
 		return new Elysia({ name: "chat-controller" })
 			.use(withRestAuth())
+			.get("/projects/:id/threads", async ({ params: parameters, set }) => {
+				const threads = await this.service.listThreadSummariesByProjectId(parameters.id);
+
+				if (!threads) {
+					set.status = 404;
+
+					return { error: "project not found" };
+				}
+
+				return { threads };
+			})
 			.get("/projects/:id/chats", async ({ params: parameters, set }) => {
 				const chats = await this.service.listByProjectId(parameters.id);
 
@@ -55,14 +66,24 @@ constructor(
 
 					set.status = 201;
 
-					return { chat };
-				},
+				return { chat };
+			},
 				{
 					body: t.Object({
 						title: t.Optional(t.String()),
 					}),
 				},
 			)
+			.get("/chats/:id/context", async ({ params: parameters, set }) => {
+				const context = await this.service.getChatContext(parameters.id);
+
+				if (!context) {
+					set.status = 404;
+					return { error: "chat not found" };
+				}
+
+				return context;
+			})
 			.delete("/chats/:id", async ({ params: parameters, request, set }) => {
 				const deleted = await this.service.deleteChat(parameters.id);
 

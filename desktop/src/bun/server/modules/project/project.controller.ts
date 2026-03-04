@@ -20,6 +20,11 @@ constructor(
 	build() {
 		return new Elysia({ name: "project-controller" })
 			.use(withRestAuth())
+			.get("/projects/workspaces", async () => {
+				const workspaces = await this.service.listWorkspaceSummaries();
+
+				return { workspaces };
+			})
 			.get("/projects", async () => {
 				const projects = await this.service.listProjects();
 

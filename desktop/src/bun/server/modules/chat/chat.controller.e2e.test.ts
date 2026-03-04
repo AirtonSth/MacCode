@@ -60,6 +60,81 @@ test("POST /v1/projects/:id/chats creates pending chat and lists by project orde
 	}
 });
 
+test("GET /v1/projects/:id/threads returns lightweight thread summaries", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+
+		await client.v1.projects({ id: projectId }).chats.post({ title: "First" });
+		await client.v1.projects({ id: projectId }).chats.post({ title: "Second" });
+
+		const list = await client.v1.projects({ id: projectId }).threads.get();
+		const payload = list.data as { threads: Array<{ id: string; title: string; updatedAt: string }> };
+
+		expect(list.status).toBe(200);
+		expect(payload.threads.length).toBe(2);
+		for (const thread of payload.threads) {
+			expect(Object.keys(thread as unknown as Record<string, unknown>).sort()).toEqual(["id", "title", "updatedAt"]);
+		}
+	} finally {
+		await cleanup();
+	}
+});
+
+test("GET /v1/chats/:id/context returns chat and project context", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectPayload = (project.data as { project: { id: string; name: string; path: string } }).project;
+		const createdChat = await client.v1.projects({ id: projectPayload.id }).chats.post({ title: "Context" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		const context = await client.v1.chats({ id: chatId }).context.get();
+		const contextPayload = context.data as {
+			chat: {
+				id: string;
+				projectId: string;
+				title: string;
+			};
+			project: {
+				id: string;
+				name: string;
+				path: string;
+			};
+		};
+
+		expect(context.status).toBe(200);
+		expect(contextPayload.chat.id).toBe(chatId);
+		expect(contextPayload.chat.projectId).toBe(projectPayload.id);
+		expect(contextPayload.project).toEqual({
+			id: projectPayload.id,
+			name: projectPayload.name,
+			path: projectPayload.path,
+		});
+	} finally {
+		await cleanup();
+	}
+});
+
+test("GET /v1/chats/:id/context returns 404 for missing chat", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const response = await client.v1.chats({ id: "missing-chat" }).context.get();
+		const errorPayload = response.error && "value" in response.error
+			? (response.error as { value: { error?: string } }).value
+			: undefined;
+
+		expect(response.status).toBe(404);
+		expect(errorPayload?.error).toBe("chat not found");
+	} finally {
+		await cleanup();
+	}
+});
+
 test("POST /v1/projects/:id/chats returns 404 for missing project", async () => {
 	const { cleanup, client } = await createTestServer();
 

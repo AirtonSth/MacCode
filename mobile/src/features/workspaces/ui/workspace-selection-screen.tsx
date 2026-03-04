@@ -1,5 +1,6 @@
 import { MaterialIcons } from "@expo/vector-icons";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useIsFocused } from "@react-navigation/native";
 import {
 	ActivityIndicator,
 	KeyboardAvoidingView,
@@ -35,6 +36,7 @@ export const WorkspaceSelectionScreen = () => {
 	const api = useRemoteCodeClient();
 	const { push, replace } = useFlowNavigator();
 	const { isLoaded: isConfigLoaded } = useApiConfig();
+	const isFocused = useIsFocused();
 	const {
 		createProject,
 		deleteProject,
@@ -43,7 +45,11 @@ export const WorkspaceSelectionScreen = () => {
 		projects,
 		selectProject,
 		selectedProjectId,
-	} = useWorkspaceShell();
+	} = useWorkspaceShell({
+		isActive: isFocused,
+		scope: "workspaces",
+		shouldLoadDrawerWorkspaces: true,
+	});
 	const [searchValue, setSearchValue] = useState<string>("");
 	const [isDesktopPickerVisible, setIsDesktopPickerVisible] = useState<boolean>(false);
 	const [isCreatingFromFab, setIsCreatingFromFab] = useState<boolean>(false);

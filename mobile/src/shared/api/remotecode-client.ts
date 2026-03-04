@@ -1,6 +1,7 @@
 import type { ApiConfig } from "./api-config-store";
 import type {
 	AuthVerifyResponseDTO,
+	ChatContextDTO,
 	ChatDTO,
 	ChatStreamEventsResponseDTO,
 	CodexModelsCatalogDTO,
@@ -12,9 +13,12 @@ import type {
 	GitStatusDTO,
 	MessageDTO,
 	MessagePageDTO,
+	ProjectSummaryDTO,
 	ProjectDTO,
+	ThreadSummaryDTO,
 	TerminalCommandDTO,
 	TerminalEntryDTO,
+	WorkspaceSummaryDTO,
 	WorkspaceSelectionDTO,
 } from "./types";
 
@@ -31,6 +35,10 @@ interface ListProjectsResponse {
 	projects: ProjectDTO[];
 }
 
+interface ListWorkspaceSummariesResponse {
+	workspaces: WorkspaceSummaryDTO[];
+}
+
 interface ProjectPatchResponse {
 	project: ProjectDTO;
 }
@@ -39,8 +47,17 @@ interface ListChatsResponse {
 	chats: ChatDTO[];
 }
 
+interface ListThreadsResponse {
+	threads: ThreadSummaryDTO[];
+}
+
 interface CreateChatResponse {
 	chat: ChatDTO;
+}
+
+interface ChatContextResponse {
+	chat: ChatDTO;
+	project: ProjectSummaryDTO;
 }
 
 type ListMessagesResponse = MessagePageDTO;
@@ -84,6 +101,7 @@ export interface RemoteCodeClient {
 	getDiscoveryInfo: (baseUrlOverride?: string) => Promise<DiscoveryInfoDTO>;
 	getProjectGitBranches: (projectId: string) => Promise<GitBranchListDTO>;
 	getProjectGitStatus: (projectId: string) => Promise<GitStatusDTO>;
+	getChatContext: (chatId: string) => Promise<ChatContextDTO>;
 	getTerminalHistory: (
 		chatId: string,
 		options?: { cursor?: number; limit?: number },
@@ -93,6 +111,8 @@ export interface RemoteCodeClient {
 	listFsEntries: (path: string) => Promise<FsListResponseDTO>;
 	listFsRoots: () => Promise<FsRootEntryDTO[]>;
 	listChats: (projectId: string) => Promise<ChatDTO[]>;
+	listThreadSummaries: (projectId: string) => Promise<ThreadSummaryDTO[]>;
+	listWorkspaceSummaries: () => Promise<WorkspaceSummaryDTO[]>;
 	listMessagesPage: (
 		chatId: string,
 		options?: { beforeMessageId?: string; limit?: number },
@@ -254,6 +274,13 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			});
 		},
 
+		async getChatContext(chatId: string) {
+			return await request<ChatContextResponse>({
+				method: "GET",
+				path: `/chats/${chatId}/context`,
+			});
+		},
+
 		async getTerminalHistory(chatId: string, options?: { cursor?: number; limit?: number }) {
 			const query = new URLSearchParams();
 			if (typeof options?.cursor === "number" && Number.isFinite(options.cursor) && options.cursor > 0) {
@@ -313,6 +340,15 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			return payload.chats;
 		},
 
+		async listThreadSummaries(projectId: string) {
+			const payload = await request<ListThreadsResponse>({
+				method: "GET",
+				path: `/projects/${projectId}/threads`,
+			});
+
+			return payload.threads;
+		},
+
 		async listMessagesPage(chatId: string, options?: { beforeMessageId?: string; limit?: number }) {
 			const query = new URLSearchParams();
 			if (typeof options?.beforeMessageId === "string" && options.beforeMessageId.trim().length > 0) {
@@ -364,6 +400,15 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			});
 
 			return payload.projects;
+		},
+
+		async listWorkspaceSummaries() {
+			const payload = await request<ListWorkspaceSummariesResponse>({
+				method: "GET",
+				path: "/projects/workspaces",
+			});
+
+			return payload.workspaces;
 		},
 
 		async commitProject(projectId: string, input: { message: string; includeUnstaged?: boolean; push?: boolean }) {

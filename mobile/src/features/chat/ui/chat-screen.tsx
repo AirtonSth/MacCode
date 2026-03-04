@@ -3,6 +3,7 @@ import { Ionicons, MaterialIcons } from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocalSearchParams } from "expo-router";
+import { useIsFocused } from "@react-navigation/native";
 import {
 	Animated,
 	Keyboard,
@@ -122,6 +123,8 @@ export const ChatScreen = () => {
 	const api = useRemoteCodeClient();
 	const { goBackOr, replace } = useFlowNavigator();
 	const { isLoaded: isConfigLoaded } = useApiConfig();
+	const isFocused = useIsFocused();
+	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const {
 		availableModels,
 		createProject,
@@ -153,11 +156,14 @@ export const ChatScreen = () => {
 		streamHistoryTurns,
 		streamingText,
 		streamingTurn,
-	} = useWorkspaceShell();
+	} = useWorkspaceShell({
+		isActive: isFocused,
+		scope: "chat",
+		shouldLoadDrawerWorkspaces: isDrawerOpen,
+	});
 	const [input, setInput] = useState<string>("");
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
 	const [activePicker, setActivePicker] = useState<ActivePicker | null>(null);
-	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const [isWorkspacePickerOpen, setIsWorkspacePickerOpen] = useState<boolean>(false);
 	const [isCreatingWorkspaceFromDrawer, setIsCreatingWorkspaceFromDrawer] = useState<boolean>(false);
 	const [drawerWorkspaceError, setDrawerWorkspaceError] = useState<string>("");
@@ -192,7 +198,7 @@ export const ChatScreen = () => {
 	const [openWorkspaceSwipeRowId, setOpenWorkspaceSwipeRowId] = useState<string | null>(null);
 	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
 	const gitStatusQuery = useQuery({
-		enabled: Boolean(selectedProjectId),
+		enabled: isFocused && Boolean(selectedProjectId),
 		queryKey: queryKeys.projectGitStatus(selectedProjectId),
 		queryFn: async () => {
 			if (!selectedProjectId) {
@@ -204,7 +210,7 @@ export const ChatScreen = () => {
 		staleTime: 30_000,
 	});
 	const gitBranchesQuery = useQuery({
-		enabled: Boolean(selectedProjectId),
+		enabled: isFocused && Boolean(selectedProjectId),
 		queryKey: queryKeys.projectGitBranches(selectedProjectId),
 		queryFn: async () => {
 			if (!selectedProjectId) {

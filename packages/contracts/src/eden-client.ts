@@ -26,6 +26,9 @@ export interface EdenClient {
 			};
 		};
 		chats: (params: { id: string }) => {
+			context: {
+				get: () => Promise<unknown>;
+			};
 			delete: () => Promise<unknown>;
 			messages: {
 				get: () => Promise<unknown>;
@@ -58,7 +61,13 @@ export interface EdenClient {
 		projects: {
 			get: () => Promise<unknown>;
 			post: (body: { path: string; name?: string } & MutationRequestMetadata) => Promise<unknown>;
+			workspaces: {
+				get: () => Promise<unknown>;
+			};
 		} & ((params: { id: string }) => {
+			threads: {
+				get: () => Promise<unknown>;
+			};
 			chats: {
 				get: () => Promise<unknown>;
 				post: (body: { title?: string } & MutationRequestMetadata) => Promise<unknown>;

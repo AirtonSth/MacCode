@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
+import { useChatContextQuery } from "../api/use-chat-context-query";
 import { useCreateChatMutation } from "../api/use-create-chat-mutation";
 import { useDeleteChatMutation } from "../api/use-delete-chat-mutation";
 import {
@@ -20,6 +21,7 @@ import { queryKeys } from "../../../shared/api/query-keys";
 import { createRealtimeClient, type ConnectionState } from "../../../shared/api/ws-client";
 import type {
 	AssistantStreamItemState,
+	ChatContextDTO,
 	ChatDTO,
 	ChatStreamEventDTO,
 	MessageDTO,
@@ -47,6 +49,14 @@ import {
 	setStreamItemState as updateStreamItemState,
 	type StreamTurnState,
 } from "./stream-turn-state";
+
+type WorkspaceShellScope = "legacy" | "workspaces" | "threads" | "chat";
+
+interface UseWorkspaceShellOptions {
+	scope?: WorkspaceShellScope;
+	shouldLoadDrawerWorkspaces?: boolean;
+	isActive?: boolean;
+}
 
 type AssistantEventPayload = Extract<ServerWsEvent, { event: "assistant_event" }>["data"]["event"];
 
@@ -107,20 +117,6 @@ const replayAssistantEventsIntoTurns = (events: ChatStreamEventDTO[]): StreamTur
 		turns = applyAssistantEventToHistory(turns, entry.event);
 	}
 	return turns;
-};
-
-const upsertUpdatedChat = (chats: ChatDTO[], update: ServerWsEvent & { event: "chat_updated" }): ChatDTO[] => {
-	return chats.map((chat) =>
-		chat.id === update.data.chatId
-			? {
-				...chat,
-				diffAdded: update.data.diffAdded,
-				diffRemoved: update.data.diffRemoved,
-				status: update.data.status,
-				updatedAt: update.data.updatedAt,
-			}
-			: chat,
-	);
 };
 
 const isPlaceholderThreadTitle = (title: string): boolean => {
@@ -281,9 +277,43 @@ const parseWorkspaceEventSelection = (payload: Record<string, unknown> | null): 
 let inMemorySelectedProjectId: string | null = null;
 let inMemorySelectedChatId: string | null = null;
 
-export const useWorkspaceShell = () => {
+const toProjectDtoFromSummary = (project: { id: string; name: string; path: string }): ProjectDTO => ({
+	createdAt: "",
+	id: project.id,
+	isFavorite: false,
+	name: project.name,
+	path: project.path,
+	updatedAt: "",
+});
+
+const toChatDtoFromThreadSummary = (
+	chat: { id: string; title: string; updatedAt: string },
+	projectId: string | null,
+): ChatDTO => ({
+	diffAdded: 0,
+	diffRemoved: 0,
+	id: chat.id,
+	projectId: projectId ?? "",
+	provider: "codex",
+	status: "pending",
+	title: chat.title,
+	updatedAt: chat.updatedAt,
+});
+
+export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const queryClient = useQueryClient();
 	const { config } = useApiConfig();
+	const scope = options?.scope ?? "legacy";
+	const isActive = options?.isActive ?? true;
+	const shouldLoadDrawerWorkspaces = options?.shouldLoadDrawerWorkspaces ?? (scope === "legacy" || scope === "workspaces");
+	const shouldLoadWorkspaceSummaries = isActive && scope !== "legacy";
+	const shouldEnableProjectsQuery = isActive && (scope === "legacy" || scope === "workspaces" || shouldLoadDrawerWorkspaces);
+	const shouldEnableChatsQuery = isActive && (scope === "legacy" || scope === "threads");
+	const shouldLoadThreadSummaries = isActive && scope === "threads";
+	const shouldEnableMessagesQuery = isActive && (scope === "legacy" || scope === "chat");
+	const shouldEnableChatContextQuery = isActive && scope === "chat";
+	const shouldEnableSelectionQuery = isActive;
+	const shouldEnableModelsQuery = isActive && (scope === "legacy" || scope === "chat");
 	const createChatMutation = useCreateChatMutation();
 	const updateSelectionMutation = useUpdateWorkspaceSelectionMutation();
 	const [lastError, setLastError] = useState<string | null>(null);
@@ -308,13 +338,29 @@ export const useWorkspaceShell = () => {
 	const hasBootstrappedSelectionRef = useRef<boolean>(false);
 	const pendingSelectionRef = useRef<WorkspaceSelectionDTO | null>(null);
 	const client = useRemoteCodeClient();
-	const projectsQuery = useProjectsQuery();
-	const chatsQuery = useChatsQuery(selectedProjectId);
-	const messagesQuery = useMessagesQuery(selectedChatId);
-	const selectionQuery = useWorkspaceSelectionQuery();
+	const projectsQuery = useProjectsQuery({
+		enabled: shouldEnableProjectsQuery,
+		gcTime: shouldLoadWorkspaceSummaries ? 15 * 60_000 : undefined,
+		mode: shouldLoadWorkspaceSummaries ? "summary" : "full",
+		staleTime: shouldLoadWorkspaceSummaries ? 60_000 : undefined,
+	});
+	const chatsQuery = useChatsQuery(selectedProjectId, {
+		enabled: shouldEnableChatsQuery,
+		mode: shouldLoadThreadSummaries ? "summary" : "full",
+	});
+	const chatContextQuery = useChatContextQuery(selectedChatId, {
+		enabled: shouldEnableChatContextQuery,
+	});
+	const messagesQuery = useMessagesQuery(shouldEnableMessagesQuery ? selectedChatId : null, {
+		enabled: shouldEnableMessagesQuery,
+	});
+	const selectionQuery = useWorkspaceSelectionQuery({
+		enabled: shouldEnableSelectionQuery,
+	});
 	const toggleFavoriteMutation = useToggleFavoriteMutation();
 	const deleteChatMutation = useDeleteChatMutation(selectedProjectId);
 	const modelsQuery = useQuery({
+		enabled: shouldEnableModelsQuery,
 		queryKey: ["codex-models"],
 		queryFn: async () => await client.listCodexModels(),
 		staleTime: 5 * 60_000,
@@ -325,6 +371,16 @@ export const useWorkspaceShell = () => {
 			cancelRefetch: false,
 		});
 	}, [queryClient]);
+
+	const invalidateSelectedProjectGitQueries = useCallback(() => {
+		const activeProjectId = selectedProjectIdRef.current;
+		if (!activeProjectId) {
+			return;
+		}
+
+		invalidateWorkspaceQuery(queryKeys.projectGitStatus(activeProjectId));
+		invalidateWorkspaceQuery(queryKeys.projectGitBranches(activeProjectId));
+	}, [invalidateWorkspaceQuery]);
 
 	useEffect(() => {
 		const models = modelsQuery.data?.models ?? [];
@@ -345,6 +401,24 @@ export const useWorkspaceShell = () => {
 		queryKey: queryKeys.streamTurn(selectedChatId),
 		staleTime: Number.POSITIVE_INFINITY,
 	});
+
+	const projects = useMemo<ProjectDTO[]>(() => {
+		const rawProjects = (projectsQuery.data ?? []) as (ProjectDTO | { id: string; name: string; path: string })[];
+		return rawProjects.map((project) => (
+			"isFavorite" in project
+				? project
+				: toProjectDtoFromSummary(project)
+		));
+	}, [projectsQuery.data]);
+
+	const chats = useMemo<ChatDTO[]>(() => {
+		const rawChats = (chatsQuery.data ?? []) as (ChatDTO | { id: string; title: string; updatedAt: string })[];
+		return rawChats.map((chat) => (
+			"projectId" in chat
+				? chat
+				: toChatDtoFromThreadSummary(chat, selectedProjectId)
+		));
+	}, [chatsQuery.data, selectedProjectId]);
 
 	useEffect(() => {
 		if (!selectionQuery.data) {
@@ -378,12 +452,15 @@ export const useWorkspaceShell = () => {
 
 	const resolveChatTitle = useCallback(
 		(chatId: string): string | undefined => {
-			const activeProjectId = selectedProjectIdRef.current;
-			const chats = queryClient.getQueryData<ChatDTO[]>(queryKeys.chats(activeProjectId)) ?? [];
+			const contextTitle = queryClient.getQueryData<ChatContextDTO>(queryKeys.chatContext(chatId))?.chat.title?.trim();
+			if (contextTitle && contextTitle.length > 0) {
+				return contextTitle;
+			}
+
 			const title = chats.find((chat) => chat.id === chatId)?.title?.trim();
 			return title && title.length > 0 ? title : undefined;
 		},
-		[queryClient],
+		[chats, queryClient],
 	);
 
 	const startRunningLiveActivity = useCallback(
@@ -442,9 +519,7 @@ export const useWorkspaceShell = () => {
 			}
 
 			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
-			const activeProjectId = selectedProjectIdRef.current;
-			const chats = queryClient.getQueryData<ChatDTO[]>(queryKeys.chats(activeProjectId)) ?? [];
-			const chatTitle = chats.find((chat) => chat.id === chatId)?.title;
+			const chatTitle = resolveChatTitle(chatId);
 
 			void (async () => {
 				try {
@@ -458,7 +533,7 @@ export const useWorkspaceShell = () => {
 				}
 			})();
 		},
-		[queryClient],
+		[resolveChatTitle],
 	);
 
 	const syncMissedAssistantEventsForChat = useCallback(
@@ -696,6 +771,10 @@ export const useWorkspaceShell = () => {
 					[chatId]: "",
 				}));
 				clearSendingForChat(chatId);
+				if (selectedChatIdRef.current === chatId) {
+					invalidateSelectedProjectGitQueries();
+					invalidateWorkspaceQuery(queryKeys.chatContext(chatId));
+				}
 				finishLiveActivity(chatId, {
 					outcome: "completed",
 					statusLine: "Response is ready",
@@ -706,9 +785,25 @@ export const useWorkspaceShell = () => {
 
 			if (event.event === "chat_updated") {
 				const activeProjectId = selectedProjectIdRef.current;
-				queryClient.setQueryData<ChatDTO[]>(
-					queryKeys.chats(activeProjectId),
-					(current) => upsertUpdatedChat(current ?? [], event),
+				if (activeProjectId && shouldEnableChatsQuery) {
+					invalidateWorkspaceQuery(queryKeys.chats(activeProjectId));
+				}
+				queryClient.setQueryData<ChatContextDTO>(
+					queryKeys.chatContext(event.data.chatId),
+					(current) => (
+						current
+							? {
+								...current,
+								chat: {
+									...current.chat,
+									diffAdded: event.data.diffAdded,
+									diffRemoved: event.data.diffRemoved,
+									status: event.data.status,
+									updatedAt: event.data.updatedAt,
+								},
+							}
+							: current
+					),
 				);
 				if (event.data.status !== "running") {
 					clearSendingForChat(event.data.chatId);
@@ -726,6 +821,13 @@ export const useWorkspaceShell = () => {
 						outcome: event.data.status,
 					});
 					notifyMessageCompletion(event.data.chatId, event.data.status);
+				}
+				if (
+					selectedChatIdRef.current === event.data.chatId
+					&& (event.data.status === "completed" || event.data.status === "failed")
+				) {
+					invalidateSelectedProjectGitQueries();
+					invalidateWorkspaceQuery(queryKeys.chatContext(event.data.chatId));
 				}
 				return;
 			}
@@ -769,6 +871,10 @@ export const useWorkspaceShell = () => {
 					case "chat_created":
 					case "chat_deleted":
 					case "chat_updated": {
+						if (activeChatId && workspaceChatId && workspaceChatId === activeChatId) {
+							invalidateWorkspaceQuery(queryKeys.chatContext(activeChatId));
+						}
+
 						if (!activeProjectId) {
 							break;
 						}
@@ -778,8 +884,13 @@ export const useWorkspaceShell = () => {
 						}
 
 						if (!workspaceProjectId && workspaceChatId) {
-							const cachedChats = queryClient.getQueryData<ChatDTO[]>(queryKeys.chats(activeProjectId));
-							if (cachedChats && !cachedChats.some((chat) => chat.id === workspaceChatId)) {
+							const cachedChats = queryClient.getQueriesData<ChatDTO[] | { id: string }[]>({
+								queryKey: queryKeys.chats(activeProjectId),
+							});
+							const hasCachedChat = cachedChats.some(([, value]) =>
+								Array.isArray(value) && value.some((chat) => chat.id === workspaceChatId)
+							);
+							if (!hasCachedChat) {
 								break;
 							}
 						}
@@ -868,9 +979,11 @@ export const useWorkspaceShell = () => {
 		[
 			client,
 			finishLiveActivity,
+			invalidateSelectedProjectGitQueries,
 			notifyMessageCompletion,
 			queryClient,
 			setSendingByChat,
+			shouldEnableChatsQuery,
 			startRunningLiveActivity,
 			invalidateWorkspaceQuery,
 			updateRunningLiveActivity,
@@ -885,12 +998,17 @@ export const useWorkspaceShell = () => {
 
 		realtimeRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
 		const activeChatId = selectedChatIdRef.current;
-		if (activeChatId) {
+		if (activeChatId && shouldEnableMessagesQuery) {
 			realtimeRef.current?.sendJoinChat(activeChatId);
 		}
-	}, []);
+	}, [shouldEnableMessagesQuery]);
 
-	useEffect(() => {
+	useEffect(function handleWorkspaceRealtimeEffect() {
+		if (!isActive) {
+			setConnectionState("idle");
+			return;
+		}
+
 		const realtime = createRealtimeClient({
 			baseUrl: config.baseUrl,
 			onConnectionStateChange: handleConnectionStateChange,
@@ -901,21 +1019,26 @@ export const useWorkspaceShell = () => {
 		realtime.connect();
 		realtimeRef.current = realtime;
 
+		// eslint-disable-next-line @typescript-eslint/consistent-return
 		return () => {
 			realtime.disconnect();
 			realtimeRef.current = null;
 		};
-	}, [config.baseUrl, config.token, handleConnectionStateChange, handleServerEvent]);
+	}, [config.baseUrl, config.token, handleConnectionStateChange, handleServerEvent, isActive]);
 
 	useEffect(() => {
-		if (!selectedChatId || !realtimeRef.current) {
+		if (!shouldEnableMessagesQuery || !selectedChatId || !realtimeRef.current) {
 			return;
 		}
 
 		realtimeRef.current.sendJoinChat(selectedChatId);
-	}, [selectedChatId]);
+	}, [selectedChatId, shouldEnableMessagesQuery]);
 
-	useEffect(() => {
+	useEffect(function handleAppStateEffect() {
+		if (!isActive) {
+			return;
+		}
+
 		const subscription = AppState.addEventListener("change", (nextState) => {
 			const previousState = appStateRef.current;
 			appStateRef.current = nextState;
@@ -931,14 +1054,14 @@ export const useWorkspaceShell = () => {
 			realtimeRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
 
 			const activeProjectId = selectedProjectIdRef.current;
-			if (activeProjectId) {
+			if (activeProjectId && shouldEnableChatsQuery) {
 				void queryClient.invalidateQueries({
 					queryKey: queryKeys.chats(activeProjectId),
 				});
 			}
 
 			const activeChatId = selectedChatIdRef.current;
-			if (!activeChatId) {
+			if (!activeChatId || !shouldEnableMessagesQuery) {
 				return;
 			}
 
@@ -952,17 +1075,25 @@ export const useWorkspaceShell = () => {
 			void queryClient.invalidateQueries({
 				queryKey: queryKeys.messages(activeChatId),
 			});
-			void syncMissedAssistantEventsForChat(activeChatId);
+		void syncMissedAssistantEventsForChat(activeChatId);
 		});
 
+		// eslint-disable-next-line @typescript-eslint/consistent-return
 		return () => {
 			subscription.remove();
 		};
-	}, [queryClient, syncMissedAssistantEventsForChat, updateRunningLiveActivity]);
+	}, [
+		isActive,
+		queryClient,
+		shouldEnableChatsQuery,
+		shouldEnableMessagesQuery,
+		syncMissedAssistantEventsForChat,
+		updateRunningLiveActivity,
+	]);
 
 	useEffect(() => {
 		let canceled = false;
-		if (!selectedChatId) {
+		if (!shouldEnableMessagesQuery || !selectedChatId) {
 			return () => {
 				canceled = true;
 			};
@@ -1030,7 +1161,7 @@ export const useWorkspaceShell = () => {
 		return () => {
 			canceled = true;
 		};
-	}, [client, queryClient, selectedChatId]);
+	}, [client, queryClient, selectedChatId, shouldEnableMessagesQuery]);
 
 	const persistSelection = useCallback(
 		(input: {
@@ -1109,7 +1240,6 @@ export const useWorkspaceShell = () => {
 			setSelectedChatId(null);
 			setLastError(null);
 			void queryClient.invalidateQueries({
-				exact: true,
 				queryKey: queryKeys.chats(project.id),
 			});
 
@@ -1246,7 +1376,11 @@ export const useWorkspaceShell = () => {
 				return false;
 			}
 
-			const selectedChat = chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null;
+			const selectedChatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
+			const selectedChatFromContext = selectedChatId
+				? queryClient.getQueryData<ChatContextDTO>(queryKeys.chatContext(selectedChatId))?.chat ?? null
+				: null;
+			const selectedChat = selectedChatFromList ?? selectedChatFromContext;
 			if (selectedChat?.status === "running") {
 				setLastError("This thread is currently running. Wait until it finishes.");
 				return false;
@@ -1399,13 +1533,26 @@ export const useWorkspaceShell = () => {
 	);
 
 	const selectedProject = useMemo(
-		() => projectsQuery.data?.find((project) => project.id === selectedProjectId) ?? null,
-		[projectsQuery.data, selectedProjectId],
+		() => {
+			const fromList = projects.find((project) => project.id === selectedProjectId) ?? null;
+			const fromChatContext = chatContextQuery.data?.project
+				? toProjectDtoFromSummary(chatContextQuery.data.project)
+				: null;
+
+			return fromList ?? fromChatContext;
+		},
+		[chatContextQuery.data?.project, projects, selectedProjectId],
 	);
 
 	const selectedChat = useMemo(
-		() => chatsQuery.data?.find((chat) => chat.id === selectedChatId) ?? null,
-		[chatsQuery.data, selectedChatId],
+		() => {
+			if (scope === "chat") {
+				return chatContextQuery.data?.chat ?? null;
+			}
+
+			return chats.find((chat) => chat.id === selectedChatId) ?? null;
+		},
+		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
 	);
 
 	useEffect(() => {
@@ -1429,36 +1576,44 @@ export const useWorkspaceShell = () => {
 	const hasChatsData = Array.isArray(chatsQuery.data);
 	const isChatsLoading =
 		Boolean(selectedProjectId) &&
+		shouldEnableChatsQuery &&
 		(chatsQuery.isPending || (chatsQuery.fetchStatus === "fetching" && !hasChatsData));
 	let chatsErrorMessage: string | null = null;
-	if (chatsQuery.isError) {
+	if (shouldEnableChatsQuery && chatsQuery.isError) {
 		chatsErrorMessage = chatsQuery.error instanceof Error
 			? chatsQuery.error.message
 			: "Failed to load threads.";
 	}
-	const messages = messagesQuery.messages;
-	const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
+	const messages = shouldEnableMessagesQuery ? messagesQuery.messages : [];
+	const isMessagesLoading =
+		shouldEnableMessagesQuery &&
+		Boolean(selectedChatId) &&
+		messagesQuery.isPending &&
+		messages.length === 0;
+	const isProjectsLoading =
+		shouldEnableProjectsQuery &&
+		(projectsQuery.isPending || (projectsQuery.fetchStatus === "fetching" && projects.length === 0));
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],
 		chatsErrorMessage,
-		chats: chatsQuery.data ?? [],
+		chats,
 		connectionState,
 		createChat,
 		createProject,
 		deleteProject,
 		deleteChat,
-		hasOlderMessages: messagesQuery.hasOlderMessages,
-		isLoaded: !projectsQuery.isLoading && selectionQuery.isFetched,
-		isLoadingOlderMessages: messagesQuery.isLoadingOlderMessages,
+		hasOlderMessages: shouldEnableMessagesQuery ? messagesQuery.hasOlderMessages : false,
+		isLoaded: !isProjectsLoading && selectionQuery.isFetched,
+		isLoadingOlderMessages: shouldEnableMessagesQuery ? messagesQuery.isLoadingOlderMessages : false,
 		isChatsLoading,
 		isMessagesLoading,
 		isSending,
 		lastError,
-		loadOlderMessages: messagesQuery.loadOlderMessages,
+		loadOlderMessages: shouldEnableMessagesQuery ? messagesQuery.loadOlderMessages : async () => undefined,
 		messages,
 		permissionMode,
-		projects: projectsQuery.data ?? [],
+		projects,
 		selectedModel,
 		selectedReasoningEffort,
 		selectChat,

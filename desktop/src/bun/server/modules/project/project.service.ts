@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { basename, isAbsolute, normalize, resolve } from "node:path";
 
-import type { ProjectDTO } from "../../types";
+import type { ProjectDTO, WorkspaceSummaryDTO } from "../../types";
 import type { CreateProjectInput } from "./project.model";
 import type { ProjectRepository } from "./project.repository";
 
@@ -21,6 +21,7 @@ export interface ProjectServiceContract {
 	) => Promise<{ created: boolean; project: ProjectDTO } | { type: "invalid_path" }>;
 	getProjectById: (id: string) => Promise<ProjectDTO | null>;
 	listProjects: () => Promise<ProjectDTO[]>;
+	listWorkspaceSummaries: () => Promise<WorkspaceSummaryDTO[]>;
 	setFavorite: (id: string, isFavorite: boolean) => Promise<ProjectDTO | null>;
 	deleteProject: (id: string) => Promise<boolean>;
 }
@@ -76,6 +77,10 @@ async createProject({
 
 	async listProjects(): Promise<ProjectDTO[]> {
 		return this.repository.listProjects();
+	}
+
+	async listWorkspaceSummaries(): Promise<WorkspaceSummaryDTO[]> {
+		return this.repository.listWorkspaceSummaries();
 	}
 
 	async setFavorite(id: string, isFavorite: boolean): Promise<ProjectDTO | null> {
