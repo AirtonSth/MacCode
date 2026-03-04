@@ -1,15 +1,9 @@
-import { getServerDiscoveryInfo, getServerId } from "../../shared/core/server-identity";
+import { getServerConnectHints, getServerDiscoveryInfo, getServerId } from "../../shared/core/server-identity";
 import { isValidToken } from "../../shared/auth/auth.service";
+import type { DiscoveryInfoDTO } from "../../shared/core/server.types";
 import type { ServerMetadataRepository } from "./server-metadata.repository";
 
-export interface DiscoveryMetadata {
-	serverId: string;
-	hostname: string;
-	port: number;
-	version: string;
-	authMode: string;
-	capabilitiesVersion: string;
-}
+export type DiscoveryMetadata = DiscoveryInfoDTO;
 
 export interface ServerMetadataServiceContract {
 	getDiscoveryMetadata: () => DiscoveryMetadata;
@@ -23,17 +17,13 @@ export class ServerMetadataService implements ServerMetadataServiceContract {
 	constructor(
 		private readonly repository: ServerMetadataRepository,
 		private readonly port: number,
-		) {
-			this.repository.setValue("serverId", getServerId());
-			const discovery = getServerDiscoveryInfo();
-			this.metadata = {
-				authMode: discovery.authMode,
-				capabilitiesVersion: discovery.capabilitiesVersion,
-				hostname: discovery.hostname,
-				port: this.port,
-				serverId: discovery.serverId,
-				version: discovery.version,
-			};
+	) {
+		this.repository.setValue("serverId", getServerId());
+		const discovery = getServerDiscoveryInfo();
+		this.metadata = {
+			...discovery,
+			port: this.port,
+		};
 		this.repository.setValue("lastPort", String(this.metadata.port));
 		this.repository.setValue("version", this.metadata.version);
 		this.repository.setValue("capabilitiesVersion", this.metadata.capabilitiesVersion);
@@ -48,7 +38,10 @@ export class ServerMetadataService implements ServerMetadataServiceContract {
 	}
 
 	getDiscoveryMetadata(): DiscoveryMetadata {
-		return this.metadata;
+		return {
+			...this.metadata,
+			connectHints: getServerConnectHints(this.metadata.port),
+		};
 	}
 }
 

@@ -3,9 +3,16 @@ export interface MutationMetadata {
 	requestId?: string;
 }
 
+export interface DiscoveryConnectHintsDto {
+	addresses: string[];
+	recommendedBaseUrls: string[];
+	tailscaleAddresses: string[];
+}
+
 export interface DiscoveryResponseDto {
 	authMode: "token_lan";
 	capabilitiesVersion: string;
+	connectHints?: DiscoveryConnectHintsDto;
 	hostname: string;
 	port: number;
 	serverId: string;

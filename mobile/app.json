@@ -16,6 +16,9 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.anonymous.remotecode-mobile",
       "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        },
         "NSLocalNetworkUsageDescription": "Remotecode discovers and connects to your local desktop server.",
         "NSUserNotificationsUsageDescription": "Remotecode notifies you when a thread response is ready.",
         "UIBackgroundModes": [
@@ -33,7 +36,8 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "POST_NOTIFICATIONS"
-      ]
+      ],
+      "usesCleartextTraffic": true
     },
     "web": {
       "bundler": "metro",

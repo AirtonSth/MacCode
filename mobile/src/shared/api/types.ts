@@ -62,6 +62,13 @@ export interface DiscoveryInfoDTO {
 	version: string;
 	authMode: "token_lan";
 	capabilitiesVersion: string;
+	connectHints?: DiscoveryConnectHintsDTO;
+}
+
+export interface DiscoveryConnectHintsDTO {
+	addresses: string[];
+	recommendedBaseUrls: string[];
+	tailscaleAddresses: string[];
 }
 
 export interface AuthVerifyResponseDTO {

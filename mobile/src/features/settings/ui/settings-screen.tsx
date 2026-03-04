@@ -131,35 +131,34 @@ export const SettingsScreen = () => {
 	const scanLan = useCallback(async () => {
 		setIsScanning(true);
 		setStatusMessage("");
+		setDiscoveredServers([]);
+		setRememberedTokenByServerId({});
 		try {
 			const found = await DiscoveryManager.scan();
 			setDiscoveredServers(found);
+
+			const pairs = await Promise.all(
+				found.map(async (server) => {
+					const storedToken = await ApiConfigStore.readTokenForServer(server.serverId);
+					return [server.serverId, storedToken ?? ""] as const;
+				}),
+			);
+
+			setRememberedTokenByServerId((current) => {
+				const next: Record<string, string> = { ...current };
+				for (const [serverId, storedToken] of pairs) {
+					if (storedToken.length > 0) {
+						next[serverId] = storedToken;
+					}
+				}
+				return next;
+			});
 			setStatusMessage("");
 		} catch (error: unknown) {
 			setStatus(error instanceof Error ? error.message : "Failed to scan local network.", "error");
 		} finally {
 			setIsScanning(false);
 		}
-	}, []);
-
-	const hydrateRecentServers = useCallback(async () => {
-		const recent = await DiscoveryManager.readRecent();
-		setDiscoveredServers(recent);
-
-		const pairs = await Promise.all(
-			recent.map(async (server) => {
-				const storedToken = await ApiConfigStore.readTokenForServer(server.serverId);
-				return [server.serverId, storedToken ?? ""] as const;
-			}),
-		);
-
-		setRememberedTokenByServerId((current) => {
-			const next = { ...current };
-			for (const [serverId, storedToken] of pairs) {
-				next[serverId] ||= storedToken;
-			}
-			return next;
-		});
 	}, []);
 
 	const hydrateSavedConnections = useCallback(async () => {
@@ -186,9 +185,8 @@ export const SettingsScreen = () => {
 	}, [config.baseUrl, config.token]);
 
 	useEffect(() => {
-		void hydrateRecentServers();
 		void scanLan();
-	}, [hydrateRecentServers, scanLan]);
+	}, [scanLan]);
 
 	useEffect(() => {
 		void hydrateSavedConnections();
@@ -254,17 +252,11 @@ export const SettingsScreen = () => {
 					[serverId]: candidateToken,
 				}));
 			}
-			const isLanConnection = Boolean(serverId) || isLanBaseUrl(normalizedBaseUrl);
-			if (isLanConnection) {
-				const next = await ApiConfigStore.deleteSavedConnection(normalizedBaseUrl);
-				setSavedConnections(filterSavedConnections(next));
-			} else {
-				const next = await ApiConfigStore.saveSavedConnection({
-					baseUrl: normalizedBaseUrl,
-					token: candidateToken,
-				});
-				setSavedConnections(filterSavedConnections(next));
-			}
+			const next = await ApiConfigStore.saveSavedConnection({
+				baseUrl: normalizedBaseUrl,
+				token: candidateToken,
+			});
+			setSavedConnections(filterSavedConnections(next));
 			await update({
 				baseUrl: normalizedBaseUrl,
 				token: candidateToken,

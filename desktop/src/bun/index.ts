@@ -98,11 +98,32 @@ const waitForBackendReady = async () => {
 interface DiscoveryMetadata {
 	authMode: string;
 	capabilitiesVersion: string;
+	connectHints?: DiscoveryConnectHints;
 	hostname: string;
 	port: number;
 	serverId: string;
 	version: string;
 }
+
+interface DiscoveryConnectHints {
+	addresses: string[];
+	recommendedBaseUrls: string[];
+	tailscaleAddresses: string[];
+}
+
+const logDiscoveryHints = (hints: DiscoveryConnectHints | undefined): void => {
+	if (!hints) {
+		return;
+	}
+
+	if (hints.recommendedBaseUrls.length > 0) {
+		console.log("Reachable server URLs:", hints.recommendedBaseUrls.join(", "));
+	}
+
+	if (hints.tailscaleAddresses.length > 0) {
+		console.log("Detected Tailscale addresses:", hints.tailscaleAddresses.join(", "));
+	}
+};
 
 const installMacShortcutsMenu = () => {
 	ApplicationMenu.setApplicationMenu([
@@ -154,6 +175,7 @@ try {
 	});
 	if (discoveryResponse.ok) {
 		const discoveryMetadata = (await discoveryResponse.json()) as DiscoveryMetadata;
+		logDiscoveryHints(discoveryMetadata.connectHints);
 		stopMdns = await startMdnsBroadcast({
 			capabilitiesVersion: discoveryMetadata.capabilitiesVersion,
 			port: discoveryMetadata.port,

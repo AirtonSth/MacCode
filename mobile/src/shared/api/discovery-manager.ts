@@ -1,16 +1,11 @@
 import * as Network from "expo-network";
-import * as SecureStore from "expo-secure-store";
 
 import type { DiscoveryInfoDTO } from "./types";
-import { ApiConfigStore } from "./api-config-store";
+import { ApiConfigStore, type SavedConnection } from "./api-config-store";
 
 export interface DiscoveredServer extends DiscoveryInfoDTO {
 	baseUrl: string;
 	lastSeenAt: string;
-}
-
-interface DiscoveryCacheRecord {
-	items: DiscoveredServer[];
 }
 
 const normalizeToken = (value: string): string => {
@@ -22,10 +17,8 @@ const normalizeToken = (value: string): string => {
 
 const DISCOVERY_PORT = 8835;
 const DISCOVERY_PATH = "/v1/discovery";
-const CACHE_KEY = "remotecode.discovery.cache";
-const DEFAULT_TIMEOUT_MS = 500;
+const DEFAULT_TIMEOUT_MS = 1200;
 const DEFAULT_CONCURRENCY = 24;
-const MAX_CACHE_ITEMS = 32;
 const LOG_PREFIX = "[LAN_DISCOVERY]";
 
 const log = (...args: unknown[]) => {
@@ -63,16 +56,70 @@ const parseHostFromBaseUrl = (baseUrl: string): string | null => {
 	return normalized.length > 0 ? normalized : null;
 };
 
-const parseJson = (input: string | null): unknown => {
-	if (!input) {
-		return null;
+const isPrivateIPv4 = (host: string): boolean => {
+	const parts = host.split(".");
+	if (parts.length !== 4) {
+		return false;
 	}
 
-	try {
-		return JSON.parse(input) as unknown;
-	} catch {
-		return null;
+	const numbers = parts.map((part) => Number.parseInt(part, 10));
+	if (numbers.some((part) => Number.isNaN(part) || part < 0 || part > 255)) {
+		return false;
 	}
+
+	return (
+		numbers[0] === 10 ||
+		numbers[0] === 127 ||
+		(numbers[0] === 169 && numbers[1] === 254) ||
+		(numbers[0] === 172 && numbers[1] >= 16 && numbers[1] <= 31) ||
+		(numbers[0] === 192 && numbers[1] === 168)
+	);
+};
+
+const isLanHost = (host: string): boolean => {
+	const normalized = host.trim().toLowerCase();
+	if (!normalized) {
+		return false;
+	}
+
+	if (
+		normalized === "localhost" ||
+		normalized === "::1" ||
+		normalized.endsWith(".local") ||
+		normalized.endsWith(".lan") ||
+		normalized.endsWith(".home") ||
+		normalized.startsWith("fe80:")
+	) {
+		return true;
+	}
+
+	return isPrivateIPv4(normalized);
+};
+
+const isLanBaseUrl = (baseUrl: string): boolean => {
+	const host = parseHostFromBaseUrl(baseUrl);
+	return host ? isLanHost(host) : false;
+};
+
+interface SavedLanProbeTarget {
+	connection: SavedConnection;
+	host: string;
+}
+
+interface SavedLanProbeResult {
+	connection: SavedConnection;
+	host: string;
+	server: DiscoveredServer | null;
+}
+
+const toStringArray = (value: unknown): string[] => {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+
+	return value
+		.map((item) => (typeof item === "string" ? item.trim() : ""))
+		.filter((item) => item.length > 0);
 };
 
 const isDiscoveryInfo = (value: unknown): value is DiscoveryInfoDTO => {
@@ -264,28 +311,6 @@ const runLimited = async <T>(
 	return results;
 };
 
-const readCache = async (): Promise<DiscoveredServer[]> => {
-	const raw = await SecureStore.getItemAsync(CACHE_KEY);
-	const parsed = parseJson(raw) as DiscoveryCacheRecord | null;
-	if (!parsed || !Array.isArray(parsed.items)) {
-		return [];
-	}
-
-	return parsed.items.filter((item) => isDiscoveryInfo(item)).map((item) => ({
-		...item,
-		baseUrl: typeof item.baseUrl === "string" ? item.baseUrl : normalizeBaseUrl(item.hostname),
-		lastSeenAt: typeof item.lastSeenAt === "string" ? item.lastSeenAt : new Date(0).toISOString(),
-	}));
-};
-
-const writeCache = async (items: DiscoveredServer[]): Promise<void> => {
-	const payload: DiscoveryCacheRecord = {
-		items: items.slice(0, MAX_CACHE_ITEMS),
-	};
-
-	await SecureStore.setItemAsync(CACHE_KEY, JSON.stringify(payload));
-};
-
 const pushUniqueHost = (hosts: string[], seen: Set<string>, host: string | null | undefined): void => {
 	const normalized = host?.trim();
 	if (!normalized || normalized.length === 0) {
@@ -300,7 +325,11 @@ const pushUniqueHost = (hosts: string[], seen: Set<string>, host: string | null 
 	hosts.push(normalized);
 };
 
-const resolveCandidateHosts = async (recent: DiscoveredServer[]): Promise<string[]> => {
+const resolveCandidateHosts = async (input: {
+	activeBaseUrl: string;
+	recent: DiscoveredServer[];
+	savedConnections: SavedConnection[];
+}): Promise<string[]> => {
 	let ip = "";
 	try {
 		ip = await Network.getIpAddressAsync();
@@ -313,9 +342,25 @@ const resolveCandidateHosts = async (recent: DiscoveredServer[]): Promise<string
 	const hosts: string[] = [];
 	const seen = new Set<string>();
 
-	for (const item of recent) {
+	for (const item of input.recent) {
+		pushUniqueHost(hosts, seen, parseHostFromBaseUrl(item.baseUrl));
+		pushUniqueHost(hosts, seen, item.hostname);
+
+		for (const hintAddress of toStringArray(item.connectHints?.addresses)) {
+			pushUniqueHost(hosts, seen, hintAddress);
+		}
+		for (const hintAddress of toStringArray(item.connectHints?.tailscaleAddresses)) {
+			pushUniqueHost(hosts, seen, hintAddress);
+		}
+		for (const hintBaseUrl of toStringArray(item.connectHints?.recommendedBaseUrls)) {
+			pushUniqueHost(hosts, seen, parseHostFromBaseUrl(hintBaseUrl));
+		}
+	}
+
+	for (const item of input.savedConnections) {
 		pushUniqueHost(hosts, seen, parseHostFromBaseUrl(item.baseUrl));
 	}
+	pushUniqueHost(hosts, seen, parseHostFromBaseUrl(input.activeBaseUrl));
 
 	pushUniqueHost(hosts, seen, ip);
 	pushUniqueHost(hosts, seen, "127.0.0.1");
@@ -333,41 +378,97 @@ const resolveCandidateHosts = async (recent: DiscoveredServer[]): Promise<string
 
 	log("scan candidates prepared", {
 		count: hosts.length,
-		recentCount: recent.length,
+		recentCount: input.recent.length,
+		savedConnectionCount: input.savedConnections.length,
 	});
 	return hosts;
 };
 
+const toSavedLanProbeTargets = (savedConnections: SavedConnection[]): SavedLanProbeTarget[] => {
+	const targets: SavedLanProbeTarget[] = [];
+	for (const connection of savedConnections) {
+		if (!isLanBaseUrl(connection.baseUrl)) {
+			continue;
+		}
+
+		const host = parseHostFromBaseUrl(connection.baseUrl);
+		if (!host) {
+			continue;
+		}
+
+		targets.push({
+			connection,
+			host,
+		});
+	}
+
+	return targets;
+};
+
+const probeSavedLanConnections = async (
+	targets: SavedLanProbeTarget[],
+	timeoutMs: number,
+): Promise<SavedLanProbeResult[]> =>
+	await Promise.all(
+		targets.map(async (target) => ({
+			connection: target.connection,
+			host: target.host,
+			server: await probeServer(target.host, timeoutMs, normalizeToken(target.connection.token)),
+		})),
+	);
+
 export const DiscoveryManager = {
 	async readRecent(): Promise<DiscoveredServer[]> {
-		const recent = await readCache();
-		log("cache read", { count: recent.length });
-		return recent;
+		return [];
 	},
 
 	async scan(input?: { concurrency?: number; timeoutMs?: number; token?: string }): Promise<DiscoveredServer[]> {
 		const timeoutMs = input?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		const concurrency = input?.concurrency ?? DEFAULT_CONCURRENCY;
 		const config = await ApiConfigStore.read();
+		const savedConnections = await ApiConfigStore.readSavedConnections();
 		const token = normalizeToken(input?.token ?? config.token);
 		log("scan start", { timeoutMs, concurrency });
-		const recent = await readCache();
-		const candidateHosts = await resolveCandidateHosts(recent);
+
+		const savedLanTargets = toSavedLanProbeTargets(savedConnections);
+		log("scan saved lan targets", { count: savedLanTargets.length });
+		const savedLanProbeResults = await probeSavedLanConnections(savedLanTargets, timeoutMs);
+		const savedLanOnline = savedLanProbeResults
+			.filter((result) => Boolean(result.server))
+			.map((result) => result.server!);
+		const savedLanOfflineBaseUrls = savedLanProbeResults
+			.filter((result) => !result.server)
+			.map((result) => result.connection.baseUrl);
+		log("scan saved lan results", {
+			onlineCount: savedLanOnline.length,
+			offlineCount: savedLanOfflineBaseUrls.length,
+		});
+			await Promise.all(
+				savedLanOfflineBaseUrls.map(async (baseUrl) => await ApiConfigStore.deleteSavedConnection(baseUrl)),
+			);
+
+		const nonLanSavedConnections = savedConnections.filter((item) => !isLanBaseUrl(item.baseUrl));
+		const candidateHosts = await resolveCandidateHosts({
+			activeBaseUrl: config.baseUrl,
+			recent: savedLanOnline,
+			savedConnections: nonLanSavedConnections,
+		});
+		const savedLanProbedHosts = new Set(savedLanTargets.map((item) => item.host));
+		const hostsToScan = candidateHosts.filter((host) => !savedLanProbedHosts.has(host));
 		log("scan start candidates", {
-			candidateCount: candidateHosts.length,
-			recentCount: recent.length,
+			candidateCount: hostsToScan.length,
+			recentCount: savedLanOnline.length,
 		});
 
 		const scanned = await runLimited(
-			candidateHosts,
+			hostsToScan,
 			async (host) => await probeServer(host, timeoutMs, token),
 			concurrency,
 		);
 		log("scan results", { scannedCount: scanned.length });
 
-		const merged = dedupeServers([...scanned, ...recent]);
+		const merged = dedupeServers([...savedLanOnline, ...scanned]);
 		log("scan merged", { mergedCount: merged.length });
-		await writeCache(merged);
 		return merged;
 	},
 };
