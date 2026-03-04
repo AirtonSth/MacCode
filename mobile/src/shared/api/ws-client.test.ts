@@ -146,4 +146,34 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 		assert.equal(workspaceMessages[0]?.data.lastSeq, 11);
 		assert.equal(workspaceMessages[0]?.data.clientId, "client-b");
 	});
+
+	test("sends only the latest queued join_workspace after reconnect", async () => {
+		const realtime = createRealtimeClient({
+			baseUrl: "http://127.0.0.1:8835",
+			onEvent: () => {
+				// no-op
+			},
+			token: "token",
+		});
+
+		realtime.connect();
+		const firstSocket = MockWebSocket?.instances[0];
+		assert.ok(firstSocket, "missing first websocket");
+		firstSocket.openConnection();
+
+		realtime.sendJoinWorkspace(4, "client-c");
+		firstSocket.close();
+		realtime.sendJoinWorkspace(6, "client-c");
+		realtime.sendJoinWorkspace(15, "client-c");
+
+		await delay(350);
+		const secondSocket = MockWebSocket?.instances[1];
+		assert.ok(secondSocket, "missing reconnected websocket");
+		secondSocket.openConnection();
+
+		const workspaceMessages = toPayloads(secondSocket).filter((payload) => payload.event === "join_workspace");
+		assert.equal(workspaceMessages.length, 1);
+		assert.equal(workspaceMessages[0]?.data.lastSeq, 15);
+		assert.equal(workspaceMessages[0]?.data.clientId, "client-c");
+	});
 });

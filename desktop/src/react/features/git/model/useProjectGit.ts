@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { CommitProjectRequestDTO, GitBranchDTO, GitStatusDTO } from "../../../shared/api/remotecode-http";
-import { RemoteCodeApi } from "../../../shared/api/remotecode-http";
+import {
+	RemoteCodeApi,
+	type CommitProjectRequestDTO,
+	type GitBranchDTO,
+	type GitStatusDTO,
+} from "../../../shared/api/remotecode-http";
 
 export interface ProjectGitState {
 	status: GitStatusDTO | null;
@@ -42,7 +46,219 @@ const createEmptyProjectGitState = (): ProjectGitState => ({
 	error: null,
 });
 
-const GIT_STATUS_POLL_INTERVAL_MS = 2_000;
+export const PROJECT_GIT_POLL_INTERVALS_MS = Object.freeze({
+	active: 3_000,
+	bootstrap: 5_000,
+	error: 15_000,
+	idle: 12_000,
+	inactive: 30_000,
+	nonRepository: 60_000,
+});
+
+export interface ProjectGitPollingRuntimeState {
+	visibilityState: DocumentVisibilityState;
+	hasWindowFocus: boolean;
+}
+
+interface ProjectGitPollingIntervalInput {
+	state: ProjectGitState;
+	runtime: ProjectGitPollingRuntimeState;
+}
+
+const hasGitStatusActivity = (status: GitStatusDTO): boolean => {
+	return (
+		status.changedFiles > 0 ||
+		status.conflictedFiles > 0 ||
+		status.ahead > 0 ||
+		status.behind > 0 ||
+		status.stagedFiles > 0 ||
+		status.unstagedFiles > 0 ||
+		status.untrackedFiles > 0
+	);
+};
+
+export const resolveProjectGitPollIntervalMs = ({
+	runtime,
+	state,
+}: ProjectGitPollingIntervalInput): number | null => {
+	if (runtime.visibilityState === "hidden") {
+		return null;
+	}
+
+	if (!runtime.hasWindowFocus) {
+		return PROJECT_GIT_POLL_INTERVALS_MS.inactive;
+	}
+
+	if (state.error !== null) {
+		return PROJECT_GIT_POLL_INTERVALS_MS.error;
+	}
+
+	if (state.status === null) {
+		return PROJECT_GIT_POLL_INTERVALS_MS.bootstrap;
+	}
+
+	if (!state.status.isRepo) {
+		return PROJECT_GIT_POLL_INTERVALS_MS.nonRepository;
+	}
+
+	return hasGitStatusActivity(state.status)
+		? PROJECT_GIT_POLL_INTERVALS_MS.active
+		: PROJECT_GIT_POLL_INTERVALS_MS.idle;
+};
+
+export interface ProjectGitPollingDocumentRuntime {
+	readonly visibilityState: DocumentVisibilityState;
+	hasFocus?: () => boolean;
+	addEventListener: (type: "visibilitychange", listener: () => void) => void;
+	removeEventListener: (type: "visibilitychange", listener: () => void) => void;
+}
+
+export interface ProjectGitPollingWindowRuntime {
+	hasFocus?: () => boolean;
+	addEventListener: (type: "focus" | "blur", listener: () => void) => void;
+	removeEventListener: (type: "focus" | "blur", listener: () => void) => void;
+}
+
+type ProjectGitPollTimeoutHandle = ReturnType<typeof globalThis.setTimeout>;
+
+interface StartProjectGitPollingOptions {
+	projectId: string;
+	getActiveProjectId: () => string | null;
+	getState: () => ProjectGitState;
+	refresh: () => Promise<void>;
+	runtimeDocument?: ProjectGitPollingDocumentRuntime;
+	runtimeWindow?: ProjectGitPollingWindowRuntime;
+	scheduleTimeout?: (callback: () => void, timeoutMs: number) => ProjectGitPollTimeoutHandle;
+	clearScheduledTimeout?: (timeoutHandle: ProjectGitPollTimeoutHandle) => void;
+}
+
+const getProjectGitPollingRuntimeState = (
+	runtimeWindow?: ProjectGitPollingWindowRuntime,
+	runtimeDocument?: ProjectGitPollingDocumentRuntime,
+): ProjectGitPollingRuntimeState => {
+	let hasWindowFocus = true;
+
+	try {
+		if (typeof runtimeDocument?.hasFocus === "function") {
+			hasWindowFocus = runtimeDocument.hasFocus();
+		} else if (typeof runtimeWindow?.hasFocus === "function") {
+			hasWindowFocus = runtimeWindow.hasFocus();
+		}
+	} catch {
+		hasWindowFocus = true;
+	}
+
+	return {
+		hasWindowFocus,
+		visibilityState: runtimeDocument?.visibilityState ?? "visible",
+	};
+};
+
+export const startProjectGitPolling = (options: StartProjectGitPollingOptions): (() => void) => {
+	const runtimeWindow = options.runtimeWindow ?? globalThis.window;
+	const runtimeDocument = options.runtimeDocument ?? globalThis.document;
+	const scheduleTimeout =
+		options.scheduleTimeout ?? ((callback, timeoutMs) => globalThis.setTimeout(callback, timeoutMs));
+	const clearScheduledTimeout =
+		options.clearScheduledTimeout ??
+		((timeoutHandle) => {
+			globalThis.clearTimeout(timeoutHandle);
+		});
+
+	let disposed = false;
+	let timeoutHandle: ProjectGitPollTimeoutHandle | null = null;
+
+	const clearScheduledRefresh = () => {
+		if (timeoutHandle === null) {
+			return;
+		}
+
+		clearScheduledTimeout(timeoutHandle);
+		timeoutHandle = null;
+	};
+
+	const isActiveProject = (): boolean => {
+		return options.projectId === normalizeProjectId(options.getActiveProjectId());
+	};
+
+	const scheduleNextRefresh = () => {
+		clearScheduledRefresh();
+		if (disposed || !isActiveProject()) {
+			return;
+		}
+
+		const intervalMs = resolveProjectGitPollIntervalMs({
+			runtime: getProjectGitPollingRuntimeState(runtimeWindow, runtimeDocument),
+			state: options.getState(),
+		});
+		if (intervalMs === null) {
+			return;
+		}
+
+		timeoutHandle = scheduleTimeout(() => {
+			timeoutHandle = null;
+			void runRefreshCycle();
+		}, intervalMs);
+	};
+
+	const runRefreshCycle = async (): Promise<void> => {
+		if (disposed || !isActiveProject()) {
+			return;
+		}
+
+		const runtime = getProjectGitPollingRuntimeState(runtimeWindow, runtimeDocument);
+		if (runtime.visibilityState === "hidden") {
+			scheduleNextRefresh();
+			return;
+		}
+
+		try {
+			await options.refresh();
+		} finally {
+			scheduleNextRefresh();
+		}
+	};
+
+	const triggerImmediateRefresh = () => {
+		if (disposed || !isActiveProject()) {
+			return;
+		}
+
+		clearScheduledRefresh();
+		void runRefreshCycle();
+	};
+
+	const handleVisibilityChange = () => {
+		if (runtimeDocument?.visibilityState === "hidden") {
+			clearScheduledRefresh();
+			return;
+		}
+
+		triggerImmediateRefresh();
+	};
+
+	const handleFocus = () => {
+		triggerImmediateRefresh();
+	};
+
+	const handleBlur = () => {
+		scheduleNextRefresh();
+	};
+
+	runtimeDocument?.addEventListener("visibilitychange", handleVisibilityChange);
+	runtimeWindow?.addEventListener("focus", handleFocus);
+	runtimeWindow?.addEventListener("blur", handleBlur);
+
+	scheduleNextRefresh();
+
+	return () => {
+		disposed = true;
+		clearScheduledRefresh();
+		runtimeDocument?.removeEventListener("visibilitychange", handleVisibilityChange);
+		runtimeWindow?.removeEventListener("focus", handleFocus);
+		runtimeWindow?.removeEventListener("blur", handleBlur);
+	};
+};
 
 const normalizeProjectId = (projectId: string | null): string | null => {
 	const trimmed = projectId?.trim() ?? "";
@@ -278,17 +494,19 @@ export const useProjectGit = (dependencies: ProjectGitDependencies): UseProjectG
 	}, [dependencies.projectId]);
 
 	useEffect(() => {
-		if (normalizeProjectId(dependencies.projectId) === null) {
+		const projectId = normalizeProjectId(dependencies.projectId);
+		if (projectId === null) {
 			return;
 		}
 
-		const intervalHandle = globalThis.setInterval(() => {
-			void controllerRef.current?.refresh({ silent: true });
-		}, GIT_STATUS_POLL_INTERVAL_MS);
-
-		return () => {
-			globalThis.clearInterval(intervalHandle);
-		};
+		return startProjectGitPolling({
+			projectId,
+			getActiveProjectId: () => dependenciesRef.current.projectId,
+			getState: () => controllerRef.current?.getState() ?? createEmptyProjectGitState(),
+			refresh: async () => {
+				await (controllerRef.current?.refresh({ silent: true }) ?? Promise.resolve());
+			},
+		});
 	}, [dependencies.projectId]);
 
 	return {

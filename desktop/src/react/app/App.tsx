@@ -22,7 +22,13 @@ import { GitQuickControl } from "../features/git/ui/GitQuickControl";
 import { useProjectGit } from "../features/git/model/useProjectGit";
 import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
 import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
-import { type ChatDTO, type StreamTurnState, useWorkspaceStore } from "../features/workspace/model/useWorkspaceStore";
+import {
+	type ChatDTO,
+	type MessageDTO,
+	type ProjectDTO,
+	type StreamTurnState,
+	useWorkspaceStore,
+} from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
 import type { AssistantStreamEvent, AssistantStreamItemState, AssistantStreamItemType } from "../../shared/assistant-stream-event";
@@ -363,6 +369,43 @@ const resolveWebSocketClientId = (): string => {
 	}
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+};
+
+const isChatStatus = (value: unknown): value is ChatDTO["status"] => {
+	return value === "pending" || value === "running" || value === "completed" || value === "failed";
+};
+
+const isProjectPayload = (value: unknown): value is ProjectDTO => {
+	if (!isRecord(value)) {
+		return false;
+	}
+
+	return (
+		typeof value.id === "string" &&
+		typeof value.name === "string" &&
+		typeof value.path === "string" &&
+		typeof value.isFavorite === "boolean" &&
+		typeof value.createdAt === "string" &&
+		typeof value.updatedAt === "string"
+	);
+};
+
+const isMessagePayload = (value: unknown): value is MessageDTO => {
+	if (!isRecord(value)) {
+		return false;
+	}
+
+	return (
+		typeof value.id === "string" &&
+		typeof value.chatId === "string" &&
+		(value.role === "user" || value.role === "assistant") &&
+		typeof value.content === "string" &&
+		typeof value.createdAt === "string"
+	);
+};
+
 const App = (): JSX.Element => {
 	const { dispatch, state } = useWorkspaceStore();
 	const shouldReduceMotion = useReducedMotion();
@@ -379,6 +422,12 @@ const App = (): JSX.Element => {
 	const workspaceClientIdRef = useRef<string>(resolveWebSocketClientId());
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
+	const projectsLoadInFlightRef = useRef<Promise<void> | null>(null);
+	const projectsLoadQueuedRef = useRef<boolean>(false);
+	const chatsLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+	const chatsLoadQueuedRef = useRef<Map<string, string | null>>(new Map());
+	const messagesLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+	const messagesLoadQueuedRef = useRef<Set<string>>(new Set());
 
 	const baseUrl = useMemo(() => {
 		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim();
@@ -717,7 +766,7 @@ const App = (): JSX.Element => {
 		[addError, api, formatApiErrorCode, formatApiErrorMessage],
 	);
 
-	const loadMessagesForChat = useCallback(
+	const loadMessagesForChatCore = useCallback(
 		async (chatId: string | null) => {
 			if (!chatId) {
 				dispatch({ payload: [], type: "SET_MESSAGES" });
@@ -748,7 +797,9 @@ const App = (): JSX.Element => {
 					afterId = page.nextAfterId;
 				}
 
-				dispatch({ payload: messages, type: "SET_MESSAGES" });
+				if (selectedChatIdRef.current === chatId) {
+					dispatch({ payload: messages, type: "SET_MESSAGES" });
+				}
 				dispatch({
 					payload: {
 						chatId,
@@ -759,7 +810,9 @@ const App = (): JSX.Element => {
 				});
 			} catch (error) {
 				if (formatApiErrorCode(error) === "HTTP_404") {
-					dispatch({ payload: [], type: "SET_MESSAGES" });
+					if (selectedChatIdRef.current === chatId) {
+						dispatch({ payload: [], type: "SET_MESSAGES" });
+					}
 					dispatch({
 						payload: {
 							chatId,
@@ -776,10 +829,42 @@ const App = (): JSX.Element => {
 					formatApiErrorCode(error),
 				);
 			} finally {
-				dispatch({ payload: false, type: "SET_MESSAGES_LOADING" });
+				if (selectedChatIdRef.current === chatId) {
+					dispatch({ payload: false, type: "SET_MESSAGES_LOADING" });
+				}
 			}
 		},
 		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
+	);
+
+	const loadMessagesForChat = useCallback(
+		async (chatId: string | null) => {
+			if (!chatId) {
+				await loadMessagesForChatCore(chatId);
+				return;
+			}
+
+			const inFlight = messagesLoadInFlightRef.current.get(chatId);
+			if (inFlight) {
+				messagesLoadQueuedRef.current.add(chatId);
+				await inFlight;
+				return;
+			}
+
+			const task = (async () => {
+				do {
+					messagesLoadQueuedRef.current.delete(chatId);
+					await loadMessagesForChatCore(chatId);
+				} while (messagesLoadQueuedRef.current.has(chatId));
+			})().finally(() => {
+				messagesLoadInFlightRef.current.delete(chatId);
+				messagesLoadQueuedRef.current.delete(chatId);
+			});
+
+			messagesLoadInFlightRef.current.set(chatId, task);
+			await task;
+		},
+		[loadMessagesForChatCore],
 	);
 
 	const syncFinalMessagesAfterDone = useCallback(
@@ -822,7 +907,7 @@ const App = (): JSX.Element => {
 		[api, dispatch, loadMessagesForChat],
 	);
 
-	const loadChatsForProject = useCallback(
+	const loadChatsForProjectCore = useCallback(
 		async (projectId: string | null, preferredChatId: string | null = null) => {
 			if (!projectId) {
 				dispatch({ payload: [], type: "SET_CHATS" });
@@ -831,80 +916,138 @@ const App = (): JSX.Element => {
 				return;
 			}
 
-			dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
+			if (selectedProjectIdRef.current !== projectId) {
+				dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
+			}
+
 			dispatch({ payload: true, type: "SET_CHATS_LOADING" });
 			try {
 				const chats = await api.listChats(projectId);
+				if (selectedProjectIdRef.current !== projectId) {
+					return;
+				}
+
 				const hasPreferredChat = preferredChatId ? chats.some((chat) => chat.id === preferredChatId) : false;
-				const selectedChatId = hasPreferredChat ? preferredChatId : chats[0]?.id ?? null;
+				const nextSelectedChatId = hasPreferredChat ? preferredChatId : chats[0]?.id ?? null;
 
 				dispatch({ payload: chats, type: "SET_CHATS" });
 				if (hasPreferredChat) {
 					dispatch({ payload: preferredChatId, type: "SET_SELECTED_CHAT" });
 				}
-				await persistWorkspaceSelection(projectId, selectedChatId);
+
+				if (
+					selectedProjectIdRef.current !== projectId ||
+					selectedChatIdRef.current !== nextSelectedChatId
+				) {
+					await persistWorkspaceSelection(projectId, nextSelectedChatId);
+				}
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to load chats for project"),
 					"rest",
 					formatApiErrorCode(error),
 				);
-				dispatch({ payload: [], type: "SET_CHATS" });
+				if (selectedProjectIdRef.current === projectId) {
+					dispatch({ payload: [], type: "SET_CHATS" });
+				}
 			} finally {
-				dispatch({ payload: false, type: "SET_CHATS_LOADING" });
-				persistedSelectedChatIdRef.current = null;
+				if (selectedProjectIdRef.current === projectId) {
+					dispatch({ payload: false, type: "SET_CHATS_LOADING" });
+					persistedSelectedChatIdRef.current = null;
+				}
 			}
 		},
 		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
 	);
 
-	const loadProjects = useCallback(async () => {
-		dispatch({ payload: true, type: "SET_PROJECTS_LOADING" });
-			try {
-				const [projects, selection] = await Promise.all([
-					api.listProjects(),
-					api.getWorkspaceSelection().catch(() => ({
-						selectedChatId: null,
-						selectedProjectId: null,
-						permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
-						selectedModel: null,
-						selectedReasoningEffort: null,
-					})),
-				]);
-				const hasSelection = selection.selectedProjectId
-					? projects.some((project) => project.id === selection.selectedProjectId)
-					: false;
-				const selectedProjectId = hasSelection ? selection.selectedProjectId : projects[0]?.id ?? null;
-				const selectedChatId = hasSelection ? selection.selectedChatId : null;
-				const nextPermissionMode =
-					parseCodexPermissionMode(selection.permissionMode) ?? DEFAULT_CODEX_PERMISSION_MODE;
-				const nextSelectedModel =
-					typeof selection.selectedModel === "string" && selection.selectedModel.trim().length > 0
-						? selection.selectedModel.trim()
-						: null;
-				const nextSelectedReasoningEffort =
-					parseCodexReasoningEffort(selection.selectedReasoningEffort) ?? null;
+	const loadChatsForProject = useCallback(
+		async (projectId: string | null, preferredChatId: string | null = null) => {
+			if (!projectId) {
+				await loadChatsForProjectCore(projectId, preferredChatId);
+				return;
+			}
 
-				persistedSelectedChatIdRef.current = selectedChatId;
-				dispatch({ payload: projects, type: "SET_PROJECTS" });
-				dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
-				setPermissionMode(nextPermissionMode);
-				setSelectedModel(nextSelectedModel);
-				setSelectedReasoningEffort(nextSelectedReasoningEffort);
-
-				if (
-					selection.selectedProjectId !== selectedProjectId ||
-					selection.selectedChatId !== selectedChatId ||
-					selection.permissionMode !== nextPermissionMode ||
-					(selection.selectedModel ?? null) !== nextSelectedModel ||
-					(selection.selectedReasoningEffort ?? null) !== nextSelectedReasoningEffort
-				) {
-					await persistWorkspaceSelection(selectedProjectId, selectedChatId, {
-						permissionMode: nextPermissionMode,
-						selectedModel: nextSelectedModel,
-						selectedReasoningEffort: nextSelectedReasoningEffort,
-					});
+			const inFlight = chatsLoadInFlightRef.current.get(projectId);
+			if (inFlight) {
+				const queuedPreferred = chatsLoadQueuedRef.current.get(projectId);
+				if (preferredChatId !== null) {
+					chatsLoadQueuedRef.current.set(projectId, preferredChatId);
+				} else if (queuedPreferred === undefined) {
+					chatsLoadQueuedRef.current.set(projectId, null);
 				}
+				await inFlight;
+				return;
+			}
+
+			let nextPreferredChatId = preferredChatId;
+			const task = (async () => {
+				while (true) {
+					chatsLoadQueuedRef.current.delete(projectId);
+					await loadChatsForProjectCore(projectId, nextPreferredChatId);
+					const queuedPreferred = chatsLoadQueuedRef.current.get(projectId);
+					if (queuedPreferred === undefined) {
+						break;
+					}
+					nextPreferredChatId = queuedPreferred;
+				}
+			})().finally(() => {
+				chatsLoadInFlightRef.current.delete(projectId);
+				chatsLoadQueuedRef.current.delete(projectId);
+			});
+
+			chatsLoadInFlightRef.current.set(projectId, task);
+			await task;
+		},
+		[loadChatsForProjectCore],
+	);
+
+	const loadProjectsCore = useCallback(async () => {
+		dispatch({ payload: true, type: "SET_PROJECTS_LOADING" });
+		try {
+			const [projects, selection] = await Promise.all([
+				api.listProjects(),
+				api.getWorkspaceSelection().catch(() => ({
+					selectedChatId: null,
+					selectedProjectId: null,
+					permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+					selectedModel: null,
+					selectedReasoningEffort: null,
+				})),
+			]);
+			const hasSelection = selection.selectedProjectId
+				? projects.some((project) => project.id === selection.selectedProjectId)
+				: false;
+			const selectedProjectId = hasSelection ? selection.selectedProjectId : projects[0]?.id ?? null;
+			const selectedChatId = hasSelection ? selection.selectedChatId : null;
+			const nextPermissionMode =
+				parseCodexPermissionMode(selection.permissionMode) ?? DEFAULT_CODEX_PERMISSION_MODE;
+			const nextSelectedModel =
+				typeof selection.selectedModel === "string" && selection.selectedModel.trim().length > 0
+					? selection.selectedModel.trim()
+					: null;
+			const nextSelectedReasoningEffort =
+				parseCodexReasoningEffort(selection.selectedReasoningEffort) ?? null;
+
+			persistedSelectedChatIdRef.current = selectedChatId;
+			dispatch({ payload: projects, type: "SET_PROJECTS" });
+			dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
+			setPermissionMode(nextPermissionMode);
+			setSelectedModel(nextSelectedModel);
+			setSelectedReasoningEffort(nextSelectedReasoningEffort);
+
+			if (
+				selection.selectedProjectId !== selectedProjectId ||
+				selection.selectedChatId !== selectedChatId ||
+				selection.permissionMode !== nextPermissionMode ||
+				(selection.selectedModel ?? null) !== nextSelectedModel ||
+				(selection.selectedReasoningEffort ?? null) !== nextSelectedReasoningEffort
+			) {
+				await persistWorkspaceSelection(selectedProjectId, selectedChatId, {
+					permissionMode: nextPermissionMode,
+					selectedModel: nextSelectedModel,
+					selectedReasoningEffort: nextSelectedReasoningEffort,
+				});
+			}
 		} catch (error) {
 			addError(
 				formatApiErrorMessage(error, "Unable to load projects"),
@@ -915,6 +1058,28 @@ const App = (): JSX.Element => {
 			dispatch({ payload: false, type: "SET_PROJECTS_LOADING" });
 		}
 	}, [addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection]);
+
+	const loadProjects = useCallback(async () => {
+		const inFlight = projectsLoadInFlightRef.current;
+		if (inFlight) {
+			projectsLoadQueuedRef.current = true;
+			await inFlight;
+			return;
+		}
+
+		const task = (async () => {
+			do {
+				projectsLoadQueuedRef.current = false;
+				await loadProjectsCore();
+			} while (projectsLoadQueuedRef.current);
+		})().finally(() => {
+			projectsLoadInFlightRef.current = null;
+			projectsLoadQueuedRef.current = false;
+		});
+
+		projectsLoadInFlightRef.current = task;
+		await task;
+	}, [loadProjectsCore]);
 
 	const loadCodexModels = useCallback(async () => {
 		try {
@@ -1017,66 +1182,132 @@ const App = (): JSX.Element => {
 				case "workspace_event": {
 					const envelope = event.data;
 					lastWorkspaceSeqRef.current = Math.max(lastWorkspaceSeqRef.current, envelope.seq);
+					const isSelfWorkspaceEvent =
+						envelope.originClientId !== null &&
+						envelope.originClientId === workspaceClientIdRef.current;
 
-					const payload =
-						envelope.payload && typeof envelope.payload === "object" && !Array.isArray(envelope.payload)
-							? (envelope.payload as Record<string, unknown>)
-							: null;
-					const payloadChat = payload?.chat;
-					const payloadMessage = payload?.message;
-					const payloadCommand = payload?.command;
+					const payload = isRecord(envelope.payload) ? envelope.payload : null;
+					const payloadChat = isRecord(payload?.chat) ? payload.chat : null;
+					const payloadMessage = isRecord(payload?.message) ? payload.message : null;
+					const payloadCommand = isRecord(payload?.command) ? payload.command : null;
 					const chatId =
 						typeof payload?.chatId === "string"
 							? payload.chatId
-							: typeof payloadChat === "object" && payloadChat && typeof (payloadChat as { id?: unknown }).id === "string"
-								? ((payloadChat as { id: string }).id)
-								: typeof payloadMessage === "object" &&
-									  payloadMessage &&
-									  typeof (payloadMessage as { chatId?: unknown }).chatId === "string"
-									? ((payloadMessage as { chatId: string }).chatId)
-									: typeof payloadCommand === "object" &&
-										  payloadCommand &&
-										  typeof (payloadCommand as { chatId?: unknown }).chatId === "string"
-										? ((payloadCommand as { chatId: string }).chatId)
+							: typeof payloadChat?.id === "string"
+								? payloadChat.id
+								: typeof payloadMessage?.chatId === "string"
+									? payloadMessage.chatId
+									: typeof payloadCommand?.chatId === "string"
+										? payloadCommand.chatId
 										: null;
 					const projectId =
 						typeof payload?.projectId === "string"
 							? payload.projectId
-							: typeof payloadChat === "object" &&
-								  payloadChat &&
-								  typeof (payloadChat as { projectId?: unknown }).projectId === "string"
-								? ((payloadChat as { projectId: string }).projectId)
+							: typeof payloadChat?.projectId === "string"
+								? payloadChat.projectId
 								: null;
+					const projectPayload = payload?.project;
+					const messagePayload = payload?.message;
 
 					switch (envelope.type) {
 						case "project_created":
 						case "project_updated":
-						case "project_deleted":
+							if (isSelfWorkspaceEvent) {
+								break;
+							}
+							if (isProjectPayload(projectPayload)) {
+								dispatch({
+									payload: projectPayload,
+									type: "UPSERT_PROJECT",
+								});
+								break;
+							}
 							await loadProjects();
 							break;
+						case "project_deleted":
+							if (!isSelfWorkspaceEvent) {
+								await loadProjects();
+							}
+							break;
 						case "chat_created":
-						case "chat_updated":
 						case "chat_deleted": {
+							if (isSelfWorkspaceEvent) {
+								break;
+							}
 							const preferredChatId =
 								envelope.type === "chat_created" && isCreatingChatRef.current && chatId
 									? chatId
 									: selectedChatIdRef.current;
-							if (projectId && projectId === selectedProjectIdRef.current) {
-								await loadChatsForProject(projectId, preferredChatId);
-							} else if (selectedProjectIdRef.current) {
-								await loadChatsForProject(selectedProjectIdRef.current, preferredChatId);
+							const selectedProjectId = selectedProjectIdRef.current;
+							if (projectId && selectedProjectId && projectId !== selectedProjectId) {
+								break;
+							}
+							if (selectedProjectId) {
+								await loadChatsForProject(selectedProjectId, preferredChatId);
+							}
+							break;
+						}
+						case "chat_updated": {
+							if (isSelfWorkspaceEvent || chatId === selectedChatIdRef.current) {
+								break;
+							}
+
+							const diffAdded = payload?.diffAdded;
+							const diffRemoved = payload?.diffRemoved;
+							const status = payload?.status;
+							const updatedAt = payload?.updatedAt;
+
+							if (
+								chatId &&
+								typeof diffAdded === "number" &&
+								typeof diffRemoved === "number" &&
+								isChatStatus(status) &&
+								typeof updatedAt === "string"
+							) {
+								dispatch({
+									payload: {
+										diffAdded,
+										diffRemoved,
+										id: chatId,
+										status,
+										updatedAt,
+									},
+									type: "UPDATE_CHAT",
+								});
+								break;
+							}
+
+							if (selectedProjectIdRef.current && (!projectId || projectId === selectedProjectIdRef.current)) {
+								await loadChatsForProject(selectedProjectIdRef.current, selectedChatIdRef.current);
 							}
 							break;
 						}
 						case "message_created":
+							if (isSelfWorkspaceEvent) {
+								break;
+							}
+							if (isMessagePayload(messagePayload)) {
+								if (messagePayload.chatId === selectedChatIdRef.current) {
+									dispatch({
+										payload: messagePayload,
+										type: "APPEND_MESSAGE",
+									});
+								}
+								break;
+							}
 							if (chatId && chatId === selectedChatIdRef.current) {
 								await loadMessagesForChat(chatId);
 							}
 							break;
 						case "selection_updated":
-							await loadProjects();
+							if (!isSelfWorkspaceEvent) {
+								await loadProjects();
+							}
 							break;
 						case "git_updated":
+							if (isSelfWorkspaceEvent) {
+								break;
+							}
 							if (projectId && projectId === selectedProjectIdRef.current) {
 								void refreshProjectGit();
 							}
@@ -1084,6 +1315,9 @@ const App = (): JSX.Element => {
 						case "terminal_command_started":
 						case "terminal_entry_appended":
 						case "terminal_command_finished":
+							if (isSelfWorkspaceEvent) {
+								break;
+							}
 							if (
 								chatId &&
 								chatId === selectedChatIdRef.current &&

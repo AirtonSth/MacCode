@@ -1103,6 +1103,62 @@ describe("workspace frontend flow coverage", () => {
 		}
 	});
 
+	test("assistant_done for non-selected chat does not reload messages", async () => {
+		const routeFixture: RuntimeRoutes = {
+			listProjects: () => [],
+			createProject: ({ name, path }) => ({
+				createdAt: "2026-01-01T12:00:00.000Z",
+				id: "project-1",
+				isFavorite: false,
+				name: name ?? "Demo project",
+				path,
+				updatedAt: "2026-01-01T12:00:00.000Z",
+			}),
+			createChat: (projectId, { title }) => {
+				const id = title?.includes("Second") ? "chat-2" : "chat-1";
+				return {
+					diffAdded: 0,
+					diffRemoved: 0,
+					id,
+					projectId,
+					provider: "fake",
+					status: "pending",
+					title: title ?? "New chat",
+					updatedAt: "2026-01-01T12:00:01.000Z",
+				};
+			},
+			listMessages: () => [],
+		};
+
+		const fetchMock = setupMockFetch(routeFixture);
+		const wsMock = setupMockWebSocket();
+
+		try {
+			const harness = createWorkspaceFlowHarness();
+			await harness.bootstrap();
+			await harness.createProject({ name: "Demo", path: "/tmp/demo" });
+			await harness.createChat("First chat");
+			await harness.createChat("Second chat");
+
+			expect(harness.getState().selectedChatId).toBe("chat-2");
+
+			await harness.handleWsEvent({
+				event: "assistant_done",
+				data: {
+					chatId: "chat-1",
+				},
+			});
+
+			const messageLoads = fetchMock.requests.filter(
+				(request) => request.method === "GET" && /^\/v1\/chats\/[^/]+\/messages$/.test(request.path),
+			);
+			expect(messageLoads).toHaveLength(0);
+		} finally {
+			fetchMock.restore();
+			wsMock.restore();
+		}
+	});
+
 	test("reconnect re-joins selected chat", async () => {
 			const routeFixture: RuntimeRoutes = {
 				listProjects: () => [],
@@ -1165,6 +1221,11 @@ describe("workspace frontend flow coverage", () => {
 				return parsed.event === "join_chat" && parsed.data?.chatId === "chat-1";
 			});
 			expect(joinCalls.length).toBeGreaterThan(0);
+
+			const messageLoadRequests = fetchMock.requests.filter(
+				(request) => request.method === "GET" && request.path === "/v1/chats/chat-1/messages",
+			);
+			expect(messageLoadRequests).toHaveLength(2);
 		} finally {
 			globalThis.setTimeout = originalSetTimeout;
 			globalThis.clearTimeout = originalClearTimeout;

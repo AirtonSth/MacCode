@@ -6,6 +6,7 @@ export const queryKeys = {
 	projectGitStatus: (projectId: string | null) => ["project-git-status", projectId] as const,
 	projectGitBranchesRoot: ["project-git-branches"] as const,
 	projectGitBranches: (projectId: string | null) => ["project-git-branches", projectId] as const,
+	serverHealth: (baseUrl: string, token: string) => ["mobile-server-health", baseUrl, token] as const,
 	selection: ["workspace-selection"] as const,
 	streamTurn: (chatId: string | null) => ["stream-turn", chatId] as const,
 };

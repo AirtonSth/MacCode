@@ -186,6 +186,98 @@ const hasSameSelection = (
 	left.selectedModel === right.selectedModel &&
 	left.selectedReasoningEffort === right.selectedReasoningEffort;
 
+const asRecord = (value: unknown): Record<string, unknown> | null => (
+	typeof value === "object" &&
+	value !== null &&
+	!Array.isArray(value)
+		? value as Record<string, unknown>
+		: null
+);
+
+const asNullableString = (value: unknown): string | null =>
+	typeof value === "string" ? value : null;
+
+const extractWorkspaceEventChatId = (payload: Record<string, unknown> | null): string | null => {
+	if (!payload) {
+		return null;
+	}
+
+	const payloadChat = asRecord(payload.chat);
+	const payloadMessage = asRecord(payload.message);
+	const payloadCommand = asRecord(payload.command);
+	const payloadEntry = asRecord(payload.entry);
+
+	return (
+		asNullableString(payload.chatId) ??
+		asNullableString(payloadChat?.id) ??
+		asNullableString(payloadMessage?.chatId) ??
+		asNullableString(payloadCommand?.chatId) ??
+		asNullableString(payloadEntry?.chatId) ??
+		null
+	);
+};
+
+const extractWorkspaceEventProjectId = (payload: Record<string, unknown> | null): string | null => {
+	if (!payload) {
+		return null;
+	}
+
+	const payloadProject = asRecord(payload.project);
+	const payloadChat = asRecord(payload.chat);
+	const payloadSelection = asRecord(payload.selection);
+
+	return (
+		asNullableString(payload.projectId) ??
+		asNullableString(payloadProject?.id) ??
+		asNullableString(payloadChat?.projectId) ??
+		asNullableString(payloadSelection?.selectedProjectId) ??
+		null
+	);
+};
+
+const parseWorkspaceEventMessage = (payload: Record<string, unknown> | null): MessageDTO | null => {
+	const rawMessage = asRecord(payload?.message);
+	if (!rawMessage) {
+		return null;
+	}
+
+	const role = rawMessage.role;
+	if (role !== "assistant" && role !== "user") {
+		return null;
+	}
+
+	const id = asNullableString(rawMessage.id);
+	const chatId = asNullableString(rawMessage.chatId);
+	const content = asNullableString(rawMessage.content);
+	const createdAt = asNullableString(rawMessage.createdAt);
+	if (!id || !chatId || content === null || !createdAt) {
+		return null;
+	}
+
+	return {
+		id,
+		chatId,
+		content,
+		createdAt,
+		role,
+	};
+};
+
+const parseWorkspaceEventSelection = (payload: Record<string, unknown> | null): WorkspaceSelectionDTO | null => {
+	const rawSelection = asRecord(payload?.selection);
+	if (!rawSelection) {
+		return null;
+	}
+
+	return normalizeSelection({
+		selectedProjectId: asNullableString(rawSelection.selectedProjectId),
+		selectedChatId: asNullableString(rawSelection.selectedChatId),
+		permissionMode: asNullableString(rawSelection.permissionMode) ?? "default",
+		selectedModel: asNullableString(rawSelection.selectedModel),
+		selectedReasoningEffort: asNullableString(rawSelection.selectedReasoningEffort),
+	});
+};
+
 let inMemorySelectedProjectId: string | null = null;
 let inMemorySelectedChatId: string | null = null;
 
@@ -227,6 +319,12 @@ export const useWorkspaceShell = () => {
 		queryFn: async () => await client.listCodexModels(),
 		staleTime: 5 * 60_000,
 	});
+
+	const invalidateWorkspaceQuery = useCallback((queryKey: readonly unknown[]) => {
+		void queryClient.invalidateQueries({ queryKey }, {
+			cancelRefetch: false,
+		});
+	}, [queryClient]);
 
 	useEffect(() => {
 		const models = modelsQuery.data?.models ?? [];
@@ -654,34 +752,111 @@ export const useWorkspaceShell = () => {
 				lastWorkspaceSeqRef.current = Math.max(lastWorkspaceSeqRef.current, event.data.seq);
 				const activeProjectId = selectedProjectIdRef.current;
 				const activeChatId = selectedChatIdRef.current;
+				const workspacePayload = asRecord(event.data.payload);
+				const workspaceChatId = extractWorkspaceEventChatId(workspacePayload);
+				const workspaceProjectId = extractWorkspaceEventProjectId(workspacePayload);
+				const workspaceMessage = parseWorkspaceEventMessage(workspacePayload);
+				const workspaceSelection = parseWorkspaceEventSelection(workspacePayload);
+				const isSelfOriginatedWorkspaceEvent =
+					event.data.originClientId !== null &&
+					event.data.originClientId === clientIdRef.current;
+
+				if (isSelfOriginatedWorkspaceEvent) {
+					return;
+				}
 
 				switch (event.data.type) {
 					case "chat_created":
 					case "chat_deleted":
 					case "chat_updated": {
-						void queryClient.invalidateQueries({ queryKey: queryKeys.chats(activeProjectId) });
+						if (!activeProjectId) {
+							break;
+						}
+
+						if (workspaceProjectId && workspaceProjectId !== activeProjectId) {
+							break;
+						}
+
+						if (!workspaceProjectId && workspaceChatId) {
+							const cachedChats = queryClient.getQueryData<ChatDTO[]>(queryKeys.chats(activeProjectId));
+							if (cachedChats && !cachedChats.some((chat) => chat.id === workspaceChatId)) {
+								break;
+							}
+						}
+
+						invalidateWorkspaceQuery(queryKeys.chats(activeProjectId));
 						break;
 					}
 					case "git_updated": {
-						void queryClient.invalidateQueries({ queryKey: queryKeys.projectGitStatusRoot });
-						void queryClient.invalidateQueries({ queryKey: queryKeys.projectGitBranchesRoot });
+						if (!activeProjectId) {
+							break;
+						}
+
+						if (workspaceProjectId && workspaceProjectId !== activeProjectId) {
+							break;
+						}
+
+						invalidateWorkspaceQuery(queryKeys.projectGitStatus(activeProjectId));
+						invalidateWorkspaceQuery(queryKeys.projectGitBranches(activeProjectId));
 						break;
 					}
-					case "message_created":
-					case "terminal_command_finished":
-					case "terminal_command_started":
-					case "terminal_entry_appended": {
-						void queryClient.invalidateQueries({ queryKey: queryKeys.messages(activeChatId) });
+					case "message_created": {
+						if (!activeChatId) {
+							break;
+						}
+
+						if (workspaceChatId && workspaceChatId !== activeChatId) {
+							break;
+						}
+
+						if (workspaceMessage && workspaceMessage.chatId === activeChatId) {
+							const messagesQueryKey = queryKeys.messages(activeChatId);
+							const currentPages = queryClient.getQueryData<InfiniteData<MessagePageDTO>>(
+								messagesQueryKey,
+							);
+							if (!currentPages) {
+								invalidateWorkspaceQuery(messagesQueryKey);
+								break;
+							}
+
+							queryClient.setQueryData<InfiniteData<MessagePageDTO>>(
+								messagesQueryKey,
+								(current) => {
+									const hasMessage = (current?.pages ?? []).some((page) =>
+										page.messages.some((message) => message.id === workspaceMessage.id)
+									);
+									if (hasMessage) {
+										return current;
+									}
+
+									return appendMessageToMessagePages(current, workspaceMessage);
+								},
+							);
+							break;
+						}
+
+						invalidateWorkspaceQuery(queryKeys.messages(activeChatId));
 						break;
 					}
 					case "project_created":
 					case "project_deleted":
 					case "project_updated": {
-						void queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+						invalidateWorkspaceQuery(queryKeys.projects);
 						break;
 					}
 					case "selection_updated": {
-						void queryClient.invalidateQueries({ queryKey: queryKeys.selection });
+						if (workspaceSelection) {
+							queryClient.setQueryData(queryKeys.selection, workspaceSelection);
+							break;
+						}
+
+						invalidateWorkspaceQuery(queryKeys.selection);
+						break;
+					}
+					case "terminal_command_finished":
+					case "terminal_command_started":
+					case "terminal_entry_appended": {
+						// Terminal updates are handled outside the messages query.
 						break;
 					}
 					default: {
@@ -697,6 +872,7 @@ export const useWorkspaceShell = () => {
 			queryClient,
 			setSendingByChat,
 			startRunningLiveActivity,
+			invalidateWorkspaceQuery,
 			updateRunningLiveActivity,
 		],
 	);

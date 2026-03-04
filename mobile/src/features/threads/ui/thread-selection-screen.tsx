@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	ActivityIndicator,
@@ -20,6 +19,7 @@ import { useWorkspaceShell } from "../../chat/model/use-workspace-shell";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { SwipeableThreadItem } from "./swipeable-thread-item";
 import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
@@ -44,7 +44,7 @@ interface ToastPayload {
 export const ThreadSelectionScreen = () => {
 	const api = useRemoteCodeClient();
 	const { push, replace } = useFlowNavigator();
-	const { config, isLoaded: isConfigLoaded } = useApiConfig();
+	const { isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		chats,
 		chatsErrorMessage,
@@ -121,13 +121,7 @@ export const ThreadSelectionScreen = () => {
 		};
 	}, [clearThreadToast]);
 
-	const serverHealthQuery = useQuery({
-		enabled: isConfigLoaded,
-		queryKey: ["mobile-server-health-threads", config.baseUrl, config.token],
-		queryFn: async () => await api.verifyToken(config.token, config.baseUrl),
-		retry: 1,
-		staleTime: 30_000,
-	});
+	const serverHealthQuery = useServerHealthQuery();
 
 	useEffect(() => {
 		if (!isConfigLoaded || !isLoaded || serverHealthQuery.isPending) {

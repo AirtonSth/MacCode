@@ -1,5 +1,5 @@
 import { MaterialIcons } from "@expo/vector-icons";
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { AccessibilityInfo, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { AssistantStreamItemState } from "../../../shared/api/types";
@@ -12,6 +12,13 @@ interface StreamingTimelineProps {
 	turn: StreamTurnState;
 	onSetItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void;
 	onSetItemState: (itemId: string, state: AssistantStreamItemState) => void;
+}
+
+interface CachedRenderedItem {
+	item: StreamItem;
+	onSetItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void;
+	onSetItemState: (itemId: string, state: AssistantStreamItemState) => void;
+	element: JSX.Element;
 }
 
 const getItemIcon = (item: StreamItem): keyof typeof MaterialIcons.glyphMap => {
@@ -49,14 +56,14 @@ const getStateLabel = (state: AssistantStreamItemState): string => {
 	return "collapsed";
 };
 
-const getSummaryFallback = (item: StreamItem): string => {
-	if (item.type === "assistant_message") {
+const getSummaryFallback = (itemType: StreamItem["type"]): string => {
+	if (itemType === "assistant_message") {
 		return "Writing response...";
 	}
-	if (item.type === "tool") {
+	if (itemType === "tool") {
 		return "Running command...";
 	}
-	if (item.type === "plan") {
+	if (itemType === "plan") {
 		return "Planning...";
 	}
 	return "Thinking...";
@@ -84,12 +91,114 @@ const getIconColor = (state: AssistantStreamItemState): string => {
 
 const normalizeWhitespace = (value: string): string => value.trim().split(/\s+/).join(" ");
 
-export const StreamingTimeline = ({
+const getDetailText = (item: StreamItem): string => {
+	const body = item.body.trim();
+	const output = item.output.trim();
+
+	if (body.length === 0) {
+		return output;
+	}
+	if (output.length === 0) {
+		return body;
+	}
+
+	return `${body}\n\n${output}`;
+};
+
+const getPreviewText = (item: StreamItem): string => {
+	const output = item.output.trim();
+	if (output.length > 0) {
+		return normalizeWhitespace(output).slice(0, 200);
+	}
+	return normalizeWhitespace(item.body.trim()).slice(0, 200);
+};
+
+const renderTimelineItem = (
+	item: StreamItem,
+	onSetItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void,
+	onSetItemState: (itemId: string, state: AssistantStreamItemState) => void,
+): JSX.Element => {
+	const icon = getItemIcon(item);
+	const summaryText = item.summary.trim().length > 0 ? item.summary : getSummaryFallback(item.type);
+	const detailText = getDetailText(item);
+	const previewText = getPreviewText(item);
+	const canToggle = detailText.length > 0;
+	const showExpandedDetails = item.isExpanded && detailText.length > 0;
+	const showPreview = item.state === "preview" && !item.isExpanded && previewText.length > 0;
+	const assistantText = detailText.length > 0 ? detailText : summaryText;
+	const hasAssistantText = assistantText.trim().length > 0;
+
+	if (item.type === "assistant_message") {
+		return (
+			<View key={item.id} style={styles.assistantInlineWrapper}>
+				{hasAssistantText ? (
+					<MessageMarkdown
+						content={assistantText}
+						linkColor="#63C8FF"
+						textColor="#eaf2ff"
+					/>
+				) : (
+					<Text selectable style={[styles.summaryText, styles.assistantInlineCollapsed]}>
+						{assistantText}
+					</Text>
+				)}
+			</View>
+		);
+	}
+
+	return (
+		<View key={item.id} style={styles.itemCard}>
+			<View style={styles.itemHeader}>
+				<MaterialIcons color={getIconColor(item.state)} name={icon} size={16} />
+				<Text ellipsizeMode="tail" numberOfLines={1} style={styles.summaryText}>
+					{summaryText}
+				</Text>
+				<View style={[styles.stateBadge, getStateBadgeStyle(item.state)]}>
+					<Text style={styles.stateBadgeLabel}>{getStateLabel(item.state)}</Text>
+				</View>
+				{canToggle ? (
+					<Pressable
+						accessibilityLabel={item.isExpanded ? "Collapse stream item" : "Expand stream item"}
+						onPress={() => {
+							const nextExpanded = !item.isExpanded;
+							onSetItemExpanded(item.id, nextExpanded, true);
+							if (nextExpanded && item.state === "collapsed") {
+								onSetItemState(item.id, "completed");
+							}
+						}}
+						style={({ pressed }) => [styles.toggleButton, pressed ? styles.toggleButtonPressed : null]}
+					>
+						<MaterialIcons
+							color="#d9e2f2"
+							name={item.isExpanded ? "expand-less" : "chevron-right"}
+							size={16}
+						/>
+					</Pressable>
+				) : null}
+			</View>
+
+			{showPreview ? <Text style={styles.previewText}>{previewText}</Text> : null}
+
+			{showExpandedDetails ? (
+				<View style={styles.detailContainer}>
+					<Text selectable style={styles.detailText}>
+						{detailText}
+					</Text>
+				</View>
+			) : null}
+		</View>
+	);
+};
+
+const StreamingTimelineComponent = ({
 	turn,
 	onSetItemExpanded,
 	onSetItemState,
 }: StreamingTimelineProps): JSX.Element | null => {
 	const [shouldReduceMotion, setShouldReduceMotion] = useState<boolean>(false);
+	const autoExpandTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+	const itemRenderCacheRef = useRef<Map<string, CachedRenderedItem>>(new Map());
+	const onSetItemExpandedRef = useRef(onSetItemExpanded);
 
 	const items = useMemo(
 		() =>
@@ -98,6 +207,10 @@ export const StreamingTimeline = ({
 				.filter((item): item is StreamItem => item !== undefined && item !== null),
 		[turn.itemOrder, turn.itemsById],
 	);
+
+	useEffect(() => {
+		onSetItemExpandedRef.current = onSetItemExpanded;
+	}, [onSetItemExpanded]);
 
 	useEffect(() => {
 		let active = true;
@@ -130,113 +243,105 @@ export const StreamingTimeline = ({
 	}, []);
 
 	useEffect(() => {
-		const timers = new Map<string, ReturnType<typeof setTimeout>>();
+		const timers = autoExpandTimersRef.current;
+
+		if (shouldReduceMotion) {
+			for (const timeoutId of timers.values()) {
+				clearTimeout(timeoutId);
+			}
+			timers.clear();
+			return;
+		}
+
+		const pendingAutoExpandIds = new Set<string>();
 
 		for (const item of items) {
-			if (item.type !== "tool" || shouldReduceMotion) {
+			if (item.type !== "tool") {
 				continue;
 			}
 			if (item.state !== "running" || item.isExpanded || item.expandedByUser) {
 				continue;
 			}
 
-			timers.set(
-				item.id,
-				setTimeout(() => {
-					onSetItemExpanded(item.id, true, false);
-				}, TOOL_AUTO_EXPAND_MS),
-			);
+			pendingAutoExpandIds.add(item.id);
+			if (timers.has(item.id)) {
+				continue;
+			}
+
+			const timeoutId = setTimeout(() => {
+				autoExpandTimersRef.current.delete(item.id);
+				onSetItemExpandedRef.current(item.id, true, false);
+			}, TOOL_AUTO_EXPAND_MS);
+			timers.set(item.id, timeoutId);
 		}
 
-		return () => {
-			for (const timerId of timers.values()) {
-				clearTimeout(timerId);
+		for (const [itemId, timeoutId] of timers.entries()) {
+			if (pendingAutoExpandIds.has(itemId)) {
+				continue;
 			}
-		};
-	}, [items, onSetItemExpanded, shouldReduceMotion]);
+			clearTimeout(timeoutId);
+			timers.delete(itemId);
+		}
+	}, [items, shouldReduceMotion]);
 
-	if (items.length === 0) {
+	useEffect(() => () => {
+		for (const timeoutId of autoExpandTimersRef.current.values()) {
+			clearTimeout(timeoutId);
+		}
+		autoExpandTimersRef.current.clear();
+		itemRenderCacheRef.current.clear();
+	}, []);
+
+	const renderedItems = useMemo(() => {
+		const previousCache = itemRenderCacheRef.current;
+		const nextCache = new Map<string, CachedRenderedItem>();
+		const nextItems: JSX.Element[] = [];
+
+		for (const item of items) {
+			const cached = previousCache.get(item.id);
+			if (
+				cached &&
+				cached.item === item &&
+				cached.onSetItemExpanded === onSetItemExpanded &&
+				cached.onSetItemState === onSetItemState
+			) {
+				nextCache.set(item.id, cached);
+				nextItems.push(cached.element);
+				continue;
+			}
+
+			const element = renderTimelineItem(item, onSetItemExpanded, onSetItemState);
+			const nextCached: CachedRenderedItem = {
+				item,
+				onSetItemExpanded,
+				onSetItemState,
+				element,
+			};
+			nextCache.set(item.id, nextCached);
+			nextItems.push(element);
+		}
+
+		itemRenderCacheRef.current = nextCache;
+		return nextItems;
+	}, [items, onSetItemExpanded, onSetItemState]);
+
+	if (renderedItems.length === 0) {
 		return null;
 	}
 
-	return (
-		<View style={styles.timeline}>
-			{items.map((item) => {
-				const icon = getItemIcon(item);
-				const summaryText = item.summary.trim().length > 0 ? item.summary : getSummaryFallback(item);
-				const detailText = [item.body.trim(), item.output.trim()].filter((entry) => entry.length > 0).join("\n\n");
-				const previewText = item.output.trim().length > 0
-					? String(normalizeWhitespace(item.output.trim())).slice(0, 200)
-					: String(normalizeWhitespace(item.body.trim())).slice(0, 200);
-				const canToggle = detailText.length > 0;
-				const showExpandedDetails = item.isExpanded && detailText.length > 0;
-				const showPreview = item.state === "preview" && !item.isExpanded && previewText.length > 0;
-				const assistantText = detailText.length > 0 ? detailText : summaryText;
-
-				if (item.type === "assistant_message") {
-					return (
-						<View key={item.id} style={styles.assistantInlineWrapper}>
-							{assistantText.trim().length > 0 ? (
-								<MessageMarkdown
-									content={assistantText}
-									linkColor="#63C8FF"
-									textColor="#eaf2ff"
-								/>
-							) : (
-								<Text selectable style={[styles.summaryText, styles.assistantInlineCollapsed]}>
-									{assistantText}
-								</Text>
-							)}
-						</View>
-					);
-				}
-
-				return (
-					<View key={item.id} style={styles.itemCard}>
-						<View style={styles.itemHeader}>
-							<MaterialIcons color={getIconColor(item.state)} name={icon} size={16} />
-							<Text ellipsizeMode="tail" numberOfLines={1} style={styles.summaryText}>
-								{summaryText}
-							</Text>
-							<View style={[styles.stateBadge, getStateBadgeStyle(item.state)]}>
-								<Text style={styles.stateBadgeLabel}>{getStateLabel(item.state)}</Text>
-							</View>
-							{canToggle ? (
-								<Pressable
-									accessibilityLabel={item.isExpanded ? "Collapse stream item" : "Expand stream item"}
-									onPress={() => {
-										const nextExpanded = !item.isExpanded;
-										onSetItemExpanded(item.id, nextExpanded, true);
-										if (nextExpanded && item.state === "collapsed") {
-											onSetItemState(item.id, "completed");
-										}
-									}}
-									style={({ pressed }) => [styles.toggleButton, pressed ? styles.toggleButtonPressed : null]}
-								>
-									<MaterialIcons
-										color="#d9e2f2"
-										name={item.isExpanded ? "expand-less" : "chevron-right"}
-										size={16}
-									/>
-								</Pressable>
-							) : null}
-						</View>
-
-						{showPreview ? <Text style={styles.previewText}>{previewText}</Text> : null}
-
-						{showExpandedDetails ? (
-							<View style={styles.detailContainer}>
-								<Text selectable style={styles.detailText}>
-									{detailText}
-								</Text>
-							</View>
-						) : null}
-					</View>
-				);
-			})}
-		</View>
-	);
+	return <View style={styles.timeline}>{renderedItems}</View>;
 };
+
+export const StreamingTimeline = memo(
+	StreamingTimelineComponent,
+	(previousProps, nextProps) => (
+		previousProps.turn === nextProps.turn &&
+		previousProps.onSetItemExpanded === nextProps.onSetItemExpanded &&
+		previousProps.onSetItemState === nextProps.onSetItemState
+	),
+);
+
+StreamingTimeline.displayName = "StreamingTimeline";
 
 const styles = StyleSheet.create({
 	assistantInlineCollapsed: {

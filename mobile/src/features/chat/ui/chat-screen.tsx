@@ -29,8 +29,9 @@ import { BranchPickerModal } from "./branch-picker-modal";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { queryKeys } from "../../../shared/api/query-keys";
+import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
-import type { TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
+import type { AssistantStreamItemState, TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
@@ -120,7 +121,7 @@ export const ChatScreen = () => {
 	const { source } = useLocalSearchParams<{ source?: string }>();
 	const api = useRemoteCodeClient();
 	const { goBackOr, replace } = useFlowNavigator();
-	const { config, isLoaded: isConfigLoaded } = useApiConfig();
+	const { isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		availableModels,
 		createProject,
@@ -251,13 +252,7 @@ export const ChatScreen = () => {
 		return [gitCurrentBranch, ...availableBranches];
 	}, [availableBranches, gitCurrentBranch, isGitRepository]);
 
-	const serverHealthQuery = useQuery({
-		enabled: isConfigLoaded,
-		queryKey: ["mobile-server-health-chat", config.baseUrl, config.token],
-		queryFn: async () => await api.verifyToken(config.token, config.baseUrl),
-		retry: 1,
-		staleTime: 30_000,
-	});
+	const serverHealthQuery = useServerHealthQuery();
 
 	const visibleWorkspaces = useMemo(() => {
 		const query = drawerSearchValue.trim().toLowerCase();
@@ -282,12 +277,13 @@ export const ChatScreen = () => {
 	const hasStreamingItems = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
 	const hasStreamingText = streamingText.trim().length > 0;
 	const liveTurn = hasStreamingItems ? streamingTurn : null;
+	const liveTurnId = liveTurn?.turnId ?? null;
 	const historicalTurns = useMemo(() => {
-		if (!liveTurn) {
+		if (!liveTurnId) {
 			return streamHistoryTurns;
 		}
-		return streamHistoryTurns.filter((turn) => turn.turnId !== liveTurn.turnId);
-	}, [liveTurn, streamHistoryTurns]);
+		return streamHistoryTurns.filter((turn) => turn.turnId !== liveTurnId);
+	}, [liveTurnId, streamHistoryTurns]);
 	const hasRunDetails = hasStreamingItems || historicalTurns.length > 0;
 	const selectedChatIsRunning = selectedChat?.status === "running";
 	const isResolvingThreadSelection = source === "thread-list" && !selectedChatId;
@@ -355,12 +351,12 @@ export const ChatScreen = () => {
 		const nextLastMessageId = messages.at(-1)?.id ?? null;
 		const previousLastMessageId = previousLastMessageIdRef.current;
 		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
-		const hasStreaming = streamingText.trim().length > 0 || Boolean(streamingTurn);
+		const hasStreaming = hasStreamingText || Boolean(streamingTurn);
 		if (hasNewTailMessage || hasStreaming) {
 			messageScrollRef.current?.scrollToEnd({ animated: true });
 		}
 		previousLastMessageIdRef.current = nextLastMessageId;
-	}, [messages, streamingText, streamingTurn]);
+	}, [hasStreamingText, messages, streamingTurn]);
 
 	useEffect(() => {
 		setShowRunDetails(false);
@@ -788,6 +784,69 @@ export const ChatScreen = () => {
 		],
 	);
 
+	const handleStreamItemExpanded = useCallback(
+		(itemId: string, expanded: boolean, byUser: boolean) => {
+			setStreamItemExpanded(itemId, expanded, byUser);
+		},
+		[setStreamItemExpanded],
+	);
+
+	const handleStreamItemState = useCallback(
+		(itemId: string, state: AssistantStreamItemState) => {
+			setStreamItemState(itemId, state);
+		},
+		[setStreamItemState],
+	);
+
+	const renderedMessages = useMemo(
+		() => messages.map((message) => {
+			const isUser = message.role === "user";
+			return (
+				<View
+					key={message.id}
+					style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAssistant]}
+				>
+					{isUser ? (
+						<View style={[styles.messageBubble, styles.userBubble]}>
+							<MessageMarkdown
+								content={message.content}
+								linkColor={palette.accent}
+								textColor={palette.text}
+							/>
+						</View>
+					) : (
+						<View style={styles.assistantMessageContent}>
+							<MessageMarkdown
+								content={message.content}
+								linkColor={palette.accent}
+								textColor={palette.text}
+							/>
+						</View>
+					)}
+				</View>
+			);
+		}),
+		[messages],
+	);
+
+	const historicalTurnNodes = useMemo(() => {
+		if (!showRunDetails) {
+			return null;
+		}
+
+		return historicalTurns.map((turn) => (
+			<View key={`turn-${turn.turnId}`} style={[styles.messageRow, styles.messageRowAssistant]}>
+				<View style={styles.assistantMessageContent}>
+					<StreamingTimeline
+						onSetItemExpanded={handleStreamItemExpanded}
+						onSetItemState={handleStreamItemState}
+						turn={turn}
+					/>
+				</View>
+			</View>
+		));
+	}, [handleStreamItemExpanded, handleStreamItemState, historicalTurns, showRunDetails]);
+
 	const activePickerOptions = useMemo((): JSX.Element[] => {
 		const options: JSX.Element[] = [];
 
@@ -969,33 +1028,7 @@ export const ChatScreen = () => {
 							</Pressable>
 						) : null}
 
-					{messages.map((message) => {
-						const isUser = message.role === "user";
-						return (
-							<View
-								key={message.id}
-								style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAssistant]}
-							>
-								{isUser ? (
-									<View style={[styles.messageBubble, styles.userBubble]}>
-										<MessageMarkdown
-											content={message.content}
-											linkColor={palette.accent}
-											textColor={palette.text}
-										/>
-									</View>
-								) : (
-									<View style={styles.assistantMessageContent}>
-										<MessageMarkdown
-											content={message.content}
-											linkColor={palette.accent}
-											textColor={palette.text}
-										/>
-									</View>
-								)}
-							</View>
-						);
-					})}
+					{renderedMessages}
 
 						{hasStreamingText && !hasStreamingItems ? (
 							<View style={[styles.messageRow, styles.messageRowAssistant]}>
@@ -1013,35 +1046,15 @@ export const ChatScreen = () => {
 							<View style={[styles.messageRow, styles.messageRowAssistant]}>
 								<View style={styles.assistantMessageContent}>
 									<StreamingTimeline
-										onSetItemExpanded={(itemId, expanded, byUser) => {
-											setStreamItemExpanded(itemId, expanded, byUser);
-										}}
-										onSetItemState={(itemId, state) => {
-											setStreamItemState(itemId, state);
-										}}
+										onSetItemExpanded={handleStreamItemExpanded}
+										onSetItemState={handleStreamItemState}
 										turn={liveTurn}
 									/>
 								</View>
 							</View>
 						) : null}
 
-						{showRunDetails
-							? historicalTurns.map((turn) => (
-								<View key={`turn-${turn.turnId}`} style={[styles.messageRow, styles.messageRowAssistant]}>
-									<View style={styles.assistantMessageContent}>
-										<StreamingTimeline
-											onSetItemExpanded={(itemId, expanded, byUser) => {
-												setStreamItemExpanded(itemId, expanded, byUser);
-											}}
-											onSetItemState={(itemId, state) => {
-												setStreamItemState(itemId, state);
-											}}
-											turn={turn}
-										/>
-									</View>
-								</View>
-							))
-							: null}
+						{historicalTurnNodes}
 
 						{isSending && !hasStreamingText && !hasRunDetails ? (
 							<Text style={styles.typingLabel}>Thinking...</Text>

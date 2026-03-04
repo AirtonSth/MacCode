@@ -140,4 +140,30 @@ describe("DiscoveryManager saved VPN probing", () => {
 		expect(discovered[0]?.baseUrl).toBe(`${HTTP_SCHEME}://${vpnHost}:${String(DISCOVERY_PORT)}`);
 		expect(authorizationByHost.get(vpnHost) ?? []).toContain("Bearer vpn-token");
 	});
+
+	test("probes duplicate saved VPN host only once", async () => {
+		storeState.savedConnections = [
+			{
+				baseUrl: `https://${vpnHost}:${String(DISCOVERY_PORT)}`,
+				lastConnectedAt: new Date().toISOString(),
+				token: "vpn-token",
+			},
+			{
+				baseUrl: `${HTTP_SCHEME}://${vpnHost}:${String(DISCOVERY_PORT)}`,
+				lastConnectedAt: new Date().toISOString(),
+				token: "second-token",
+			},
+		];
+
+		const discovered = await DiscoveryManager.scan({
+			concurrency: 2,
+			timeoutMs: 25,
+		});
+
+		expect(discovered).toHaveLength(1);
+		expect(discovered[0]?.serverId).toBe("server-vpn");
+		const authorizations = authorizationByHost.get(vpnHost) ?? [];
+		expect(authorizations.filter((value) => value.length > 0)).toEqual(["Bearer vpn-token"]);
+		expect(authorizations).not.toContain("Bearer second-token");
+	});
 });

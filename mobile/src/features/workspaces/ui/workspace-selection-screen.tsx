@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import { MaterialIcons } from "@expo/vector-icons";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -17,6 +16,7 @@ import { useWorkspaceShell } from "../../chat/model/use-workspace-shell";
 import { DesktopFilePickerModal } from "../../chat/ui/desktop-file-picker-modal";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { SwipeableWorkspaceItem } from "./swipeable-workspace-item";
@@ -34,7 +34,7 @@ const palette = {
 export const WorkspaceSelectionScreen = () => {
 	const api = useRemoteCodeClient();
 	const { push, replace } = useFlowNavigator();
-	const { config, isLoaded: isConfigLoaded } = useApiConfig();
+	const { isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		createProject,
 		deleteProject,
@@ -54,13 +54,7 @@ export const WorkspaceSelectionScreen = () => {
 	);
 	const [errorMessage, setErrorMessage] = useState<string>("");
 
-	const serverHealthQuery = useQuery({
-		enabled: isConfigLoaded,
-		queryKey: ["mobile-server-health-workspaces", config.baseUrl, config.token],
-		queryFn: async () => await api.verifyToken(config.token, config.baseUrl),
-		retry: 1,
-		staleTime: 30_000,
-	});
+	const serverHealthQuery = useServerHealthQuery();
 
 	useEffect(() => {
 		if (!isConfigLoaded || !isLoaded || serverHealthQuery.isPending) {
