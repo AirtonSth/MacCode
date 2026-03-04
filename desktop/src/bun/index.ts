@@ -128,7 +128,7 @@ const logDiscoveryHints = (hints: DiscoveryConnectHints | undefined): void => {
 const installMacShortcutsMenu = () => {
 	ApplicationMenu.setApplicationMenu([
 		{
-			label: "Remotecode",
+			label: "RemoteCode",
 			submenu: [{ role: "about" }, { type: "separator" }, { role: "quit" }],
 		},
 		{
@@ -204,7 +204,7 @@ const mainWindow = new BrowserWindow({
 		x: 200,
 		y: 200,
 	},
-	title: "Remotecode + Electrobun",
+	title: "RemoteCode + Electrobun",
 	url,
 	rpc: appRPC,
 });

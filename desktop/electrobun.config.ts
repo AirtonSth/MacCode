@@ -1,9 +1,12 @@
 import type { ElectrobunConfig } from "electrobun";
 
+const appIconPath = "assets/app-icon.png";
+const macIconsetPath = "icon.iconset";
+
 const config: ElectrobunConfig = {
 	app: {
 		identifier: "remotecode-electrobun.local",
-		name: "remotecode-electrobun",
+		name: "RemoteCode",
 		version: "0.0.1",
 	},
 
@@ -16,10 +19,12 @@ const config: ElectrobunConfig = {
 
 
 		linux: {
+			icon: appIconPath,
 			bundleCEF: false,
 		},
 
 		mac: {
+			icons: macIconsetPath,
 			bundleCEF: false,
 		},
 
@@ -28,6 +33,7 @@ const config: ElectrobunConfig = {
 		watchIgnore: ["dist/**"],
 
 		win: {
+			icon: appIconPath,
 			bundleCEF: false,
 		},
 	},
