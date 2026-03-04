@@ -54,7 +54,7 @@ test("getStatus returns not-repo state when project is not a git repository", as
 		createProjectService(),
 		createGitExecutor([
 			{
-				args: ["status", "--branch", "--short", "--untracked-files=all"],
+				args: ["status", "--branch", "--short", "--untracked-files=normal"],
 				exitCode: 1,
 				stderr: "fatal: not a git repository (or any of the parent directories): .git",
 			},
