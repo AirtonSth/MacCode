@@ -22,7 +22,9 @@
         "NSLocalNetworkUsageDescription": "Remotecode discovers and connects to your local desktop server.",
         "NSUserNotificationsUsageDescription": "Remotecode notifies you when a thread response is ready.",
         "UIBackgroundModes": [
-          "fetch"
+          "fetch",
+          "processing",
+          "remote-notification"
         ]
       }
     },
@@ -46,7 +48,17 @@
     },
     "plugins": [
       "expo-router",
-      "expo-notifications"
+      "expo-notifications",
+      [
+        "expo-widgets",
+        {
+          "bundleIdentifier": "com.anonymous.remotecode-mobile.ExpoWidgetsTarget",
+          "groupIdentifier": "group.com.anonymous.remotecode-mobile",
+          "enablePushNotifications": true,
+          "frequentUpdates": true,
+          "widgets": []
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

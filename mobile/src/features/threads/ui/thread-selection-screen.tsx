@@ -47,16 +47,17 @@ export const ThreadSelectionScreen = () => {
 	const { config, isLoaded: isConfigLoaded } = useApiConfig();
 	const {
 		chats,
-	createChat,
-	createProject,
-	deleteProject,
-	deleteChat,
-	isLoaded,
-	isChatsLoading,
-	isMessagesLoading,
-	projects,
-	selectChat,
-	selectProject,
+		chatsErrorMessage,
+		createChat,
+		createProject,
+		deleteProject,
+		deleteChat,
+		isLoaded,
+		isChatsLoading,
+		isMessagesLoading,
+		projects,
+		selectChat,
+		selectProject,
 		selectedChatId,
 		selectedProject,
 		selectedProjectId,
@@ -184,6 +185,8 @@ export const ThreadSelectionScreen = () => {
 			(project) => project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
 		);
 	}, [drawerSearchValue, optimisticDeletedWorkspaceIds, projects]);
+	const shouldShowThreadsLoading = !isLoaded || isChatsLoading;
+	const effectiveErrorMessage = errorMessage.length > 0 ? errorMessage : (chatsErrorMessage ?? "");
 
 	const openDrawer = () => {
 		setIsDrawerOpen(true);
@@ -271,6 +274,7 @@ export const ThreadSelectionScreen = () => {
 	}, [isChatsLoading, openingWorkspaceId, selectedProjectId]);
 
 	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
+		setErrorMessage("");
 		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		closeDrawer();
@@ -459,7 +463,7 @@ export const ThreadSelectionScreen = () => {
 					/>
 				</View>
 
-				{!isLoaded ? (
+				{shouldShowThreadsLoading ? (
 					<View style={styles.loading}>
 						<ActivityIndicator color={palette.accent} />
 					</View>
@@ -496,10 +500,10 @@ export const ThreadSelectionScreen = () => {
 					</View>
 				)}
 
-				{errorMessage.length > 0 ? (
+				{effectiveErrorMessage.length > 0 ? (
 					<View style={styles.errorBox}>
 						<Text selectable style={styles.errorText}>
-							{errorMessage}
+							{effectiveErrorMessage}
 						</Text>
 					</View>
 				) : null}

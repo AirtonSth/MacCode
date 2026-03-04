@@ -7,6 +7,8 @@ import { useEffect } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
 import { queryClient } from "@/shared/api/query-client";
+import { registerThreadLiveActivityBackgroundTask } from "@/shared/live-activity/thread-live-activity-background";
+import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
 import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
 import { theme } from "@/shared/theme/tokens";
 
@@ -22,7 +24,25 @@ export default function RootLayout() {
 	}, []);
 
 	useEffect(() => {
-		void initializeLocalNotifications();
+		void (async () => {
+			try {
+				await initializeLocalNotifications();
+			} catch {
+				// Ignore startup notification initialization failures.
+			}
+
+			try {
+				await initializeThreadLiveActivityManager();
+			} catch {
+				// Ignore startup live-activity initialization failures.
+			}
+
+			try {
+				await registerThreadLiveActivityBackgroundTask();
+			} catch {
+				// Ignore startup background-task initialization failures.
+			}
+		})();
 	}, []);
 
 	return (

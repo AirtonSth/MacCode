@@ -30,6 +30,13 @@ import type {
 } from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import {
+	clearThreadLiveActivity,
+	finishThreadLiveActivity,
+	onThreadLiveActivityAppStateChanged,
+	startThreadLiveActivity,
+	updateThreadLiveActivity,
+} from "../../../shared/live-activity/thread-live-activity";
+import {
 	ensureLocalNotificationPermission,
 	sendThreadCompletionNotification,
 } from "../../../shared/notifications/local-notifications";
@@ -271,6 +278,65 @@ export const useWorkspaceShell = () => {
 		selectedChatIdRef.current = selectedChatId;
 	}, [selectedChatId]);
 
+	const resolveChatTitle = useCallback(
+		(chatId: string): string | undefined => {
+			const activeProjectId = selectedProjectIdRef.current;
+			const chats = queryClient.getQueryData<ChatDTO[]>(queryKeys.chats(activeProjectId)) ?? [];
+			const title = chats.find((chat) => chat.id === chatId)?.title?.trim();
+			return title && title.length > 0 ? title : undefined;
+		},
+		[queryClient],
+	);
+
+	const startRunningLiveActivity = useCallback(
+		(chatId: string, input?: { chatTitle?: string; statusLine?: string }) => {
+			const title = input?.chatTitle?.trim() || resolveChatTitle(chatId);
+
+			void startThreadLiveActivity({
+				chatId,
+				chatTitle: title,
+				statusLine: input?.statusLine ?? "Running",
+			});
+		},
+		[resolveChatTitle],
+	);
+
+	const updateRunningLiveActivity = useCallback(
+		(input: {
+			chatId: string;
+			chatTitle?: string;
+			phase?: "running" | "background" | "finalizing";
+			preview?: string;
+			statusLine?: string;
+			force?: boolean;
+		}) => {
+			const title = input.chatTitle?.trim() || resolveChatTitle(input.chatId);
+
+			void updateThreadLiveActivity({
+				chatId: input.chatId,
+				chatTitle: title,
+				phase: input.phase,
+				preview: input.preview,
+				statusLine: input.statusLine,
+				force: input.force,
+			});
+		},
+		[resolveChatTitle],
+	);
+
+	const finishLiveActivity = useCallback(
+		(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
+			const title = resolveChatTitle(chatId);
+			void finishThreadLiveActivity({
+				chatId,
+				chatTitle: title,
+				outcome: input.outcome,
+				statusLine: input.statusLine,
+			});
+		},
+		[resolveChatTitle],
+	);
+
 	const notifyMessageCompletion = useCallback(
 		(chatId: string, outcome: "completed" | "error" | "failed") => {
 			if (!pendingCompletionNotificationChatIdsRef.current.has(chatId)) {
@@ -386,6 +452,10 @@ export const useWorkspaceShell = () => {
 					...current,
 					[event.data.chatId]: event.data.partialText,
 				}));
+				updateRunningLiveActivity({
+					chatId: event.data.chatId,
+					preview: event.data.partialText,
+				});
 				return;
 			}
 
@@ -410,6 +480,30 @@ export const useWorkspaceShell = () => {
 						...current,
 						[chatId]: nextHistory,
 					};
+				});
+				const statusLine = (() => {
+					switch (event.data.event.type) {
+						case "item_completed": {
+							return event.data.event.summary ?? "Step completed";
+						}
+						case "item_started": {
+							return event.data.event.summary ?? "Working...";
+						}
+						case "item_state": {
+							return event.data.event.summary ?? `Step ${event.data.event.state}`;
+						}
+						case "turn_completed": {
+							return "Finalizing response";
+						}
+						default: {
+							return undefined;
+						}
+					}
+				})();
+				updateRunningLiveActivity({
+					chatId,
+					phase: event.data.event.type === "turn_completed" ? "finalizing" : "running",
+					statusLine,
 				});
 				clearSendingForChat(event.data.chatId);
 				return;
@@ -481,6 +575,10 @@ export const useWorkspaceShell = () => {
 					[chatId]: "",
 				}));
 				clearSendingForChat(chatId);
+				finishLiveActivity(chatId, {
+					outcome: "completed",
+					statusLine: "Response is ready",
+				});
 				notifyMessageCompletion(chatId, "completed");
 				return;
 			}
@@ -494,7 +592,18 @@ export const useWorkspaceShell = () => {
 				if (event.data.status !== "running") {
 					clearSendingForChat(event.data.chatId);
 				}
-				if (event.data.status === "completed" || event.data.status === "failed") {
+				const shouldTrackLiveActivity =
+					pendingCompletionNotificationChatIdsRef.current.has(event.data.chatId) ||
+					selectedChatIdRef.current === event.data.chatId;
+				if (event.data.status === "running" && shouldTrackLiveActivity) {
+					startRunningLiveActivity(event.data.chatId, {
+						statusLine: "Running",
+					});
+				}
+				if ((event.data.status === "completed" || event.data.status === "failed") && shouldTrackLiveActivity) {
+					finishLiveActivity(event.data.chatId, {
+						outcome: event.data.status,
+					});
 					notifyMessageCompletion(event.data.chatId, event.data.status);
 				}
 				return;
@@ -510,6 +619,9 @@ export const useWorkspaceShell = () => {
 						[chatId]: "",
 					}));
 					clearSendingForChat(chatId);
+					finishLiveActivity(chatId, {
+						outcome: "error",
+					});
 					notifyMessageCompletion(chatId, "error");
 				}
 				return;
@@ -555,7 +667,15 @@ export const useWorkspaceShell = () => {
 				}
 			}
 		},
-		[client, notifyMessageCompletion, queryClient, setSendingByChat],
+		[
+			client,
+			finishLiveActivity,
+			notifyMessageCompletion,
+			queryClient,
+			setSendingByChat,
+			startRunningLiveActivity,
+			updateRunningLiveActivity,
+		],
 	);
 
 	const handleConnectionStateChange = useCallback((state: ConnectionState) => {
@@ -600,6 +720,7 @@ export const useWorkspaceShell = () => {
 		const subscription = AppState.addEventListener("change", (nextState) => {
 			const previousState = appStateRef.current;
 			appStateRef.current = nextState;
+			void onThreadLiveActivityAppStateChanged(nextState);
 			const isReturningToForeground =
 				(previousState === "background" || previousState === "inactive") && nextState === "active";
 
@@ -622,6 +743,12 @@ export const useWorkspaceShell = () => {
 				return;
 			}
 
+			updateRunningLiveActivity({
+				chatId: activeChatId,
+				phase: "running",
+				statusLine: "Running",
+				force: true,
+			});
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			void queryClient.invalidateQueries({
 				queryKey: queryKeys.messages(activeChatId),
@@ -632,7 +759,7 @@ export const useWorkspaceShell = () => {
 		return () => {
 			subscription.remove();
 		};
-	}, [queryClient, syncMissedAssistantEventsForChat]);
+	}, [queryClient, syncMissedAssistantEventsForChat, updateRunningLiveActivity]);
 
 	useEffect(() => {
 		let canceled = false;
@@ -782,13 +909,17 @@ export const useWorkspaceShell = () => {
 			setSelectedProjectId(project.id);
 			setSelectedChatId(null);
 			setLastError(null);
+			void queryClient.invalidateQueries({
+				exact: true,
+				queryKey: queryKeys.chats(project.id),
+			});
 
 			persistSelection({
 				selectedChatId: null,
 				selectedProjectId: project.id,
 			});
 		},
-		[persistSelection],
+		[persistSelection, queryClient],
 	);
 
 	const selectChat = useCallback(
@@ -824,6 +955,9 @@ export const useWorkspaceShell = () => {
 			await deleteChatMutation.mutateAsync(chatId);
 			pendingSendChatIdsRef.current.delete(chatId);
 			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+			await clearThreadLiveActivity({
+				chatId,
+			});
 
 			if (selectedChatId === chatId) {
 				inMemorySelectedChatId = null;
@@ -896,6 +1030,11 @@ export const useWorkspaceShell = () => {
 					selectedProjectId: null,
 				});
 			}
+			if (selectedChatIdRef.current) {
+				await clearThreadLiveActivity({
+					chatId: selectedChatIdRef.current,
+				});
+			}
 		},
 		[client, persistSelection, queryClient, selectedProjectId],
 	);
@@ -959,6 +1098,10 @@ export const useWorkspaceShell = () => {
 			pendingSendChatIdsRef.current.add(activeChatId);
 			pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
 			void ensureLocalNotificationPermission();
+			startRunningLiveActivity(activeChatId, {
+				chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
+				statusLine: "Running",
+			});
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {
@@ -987,6 +1130,9 @@ export const useWorkspaceShell = () => {
 					...current,
 					[selected]: false,
 				}));
+				finishLiveActivity(selected, {
+					outcome: "error",
+				});
 			}
 			setLastError(error instanceof Error ? error.message : "Failed to send message");
 		},
@@ -1072,18 +1218,31 @@ export const useWorkspaceShell = () => {
 			return;
 		}
 
+		finishLiveActivity(selectedChatId, {
+			outcome: selectedChat.status,
+		});
 		notifyMessageCompletion(selectedChatId, selectedChat.status);
-	}, [notifyMessageCompletion, selectedChat, selectedChatId]);
+	}, [finishLiveActivity, notifyMessageCompletion, selectedChat, selectedChatId]);
 
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
 	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
 	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
-	const isChatsLoading = Boolean(selectedProjectId) && chatsQuery.isPending;
+	const hasChatsData = Array.isArray(chatsQuery.data);
+	const isChatsLoading =
+		Boolean(selectedProjectId) &&
+		(chatsQuery.isPending || (chatsQuery.fetchStatus === "fetching" && !hasChatsData));
+	let chatsErrorMessage: string | null = null;
+	if (chatsQuery.isError) {
+		chatsErrorMessage = chatsQuery.error instanceof Error
+			? chatsQuery.error.message
+			: "Failed to load threads.";
+	}
 	const messages = messagesQuery.messages;
 	const isMessagesLoading = Boolean(selectedChatId) && messagesQuery.isPending && messages.length === 0;
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],
+		chatsErrorMessage,
 		chats: chatsQuery.data ?? [],
 		connectionState,
 		createChat,

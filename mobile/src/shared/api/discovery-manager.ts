@@ -17,7 +17,7 @@ const normalizeToken = (value: string): string => {
 
 const DISCOVERY_PORT = 8835;
 const DISCOVERY_PATH = "/v1/discovery";
-const DEFAULT_TIMEOUT_MS = 1200;
+const DEFAULT_TIMEOUT_MS = 1_200;
 const DEFAULT_CONCURRENCY = 24;
 const LOG_PREFIX = "[LAN_DISCOVERY]";
 
@@ -56,7 +56,18 @@ const parseHostFromBaseUrl = (baseUrl: string): string | null => {
 	return normalized.length > 0 ? normalized : null;
 };
 
-const isPrivateIPv4 = (host: string): boolean => {
+interface SavedProbeTarget {
+	connection: SavedConnection;
+	host: string;
+}
+
+interface SavedProbeResult {
+	connection: SavedConnection;
+	host: string;
+	server: DiscoveredServer | null;
+}
+
+const isPrivateOrVpnIPv4 = (host: string): boolean => {
 	const parts = host.split(".");
 	if (parts.length !== 4) {
 		return false;
@@ -72,13 +83,14 @@ const isPrivateIPv4 = (host: string): boolean => {
 		numbers[0] === 127 ||
 		(numbers[0] === 169 && numbers[1] === 254) ||
 		(numbers[0] === 172 && numbers[1] >= 16 && numbers[1] <= 31) ||
-		(numbers[0] === 192 && numbers[1] === 168)
+		(numbers[0] === 192 && numbers[1] === 168) ||
+		(numbers[0] === 100 && numbers[1] >= 64 && numbers[1] <= 127)
 	);
 };
 
-const isLanHost = (host: string): boolean => {
+const isSavedProbeHost = (host: string): boolean => {
 	const normalized = host.trim().toLowerCase();
-	if (!normalized) {
+	if (normalized.length === 0) {
 		return false;
 	}
 
@@ -88,29 +100,15 @@ const isLanHost = (host: string): boolean => {
 		normalized.endsWith(".local") ||
 		normalized.endsWith(".lan") ||
 		normalized.endsWith(".home") ||
-		normalized.startsWith("fe80:")
+		normalized.startsWith("fe80:") ||
+		normalized.startsWith("fc") ||
+		normalized.startsWith("fd")
 	) {
 		return true;
 	}
 
-	return isPrivateIPv4(normalized);
+	return isPrivateOrVpnIPv4(normalized);
 };
-
-const isLanBaseUrl = (baseUrl: string): boolean => {
-	const host = parseHostFromBaseUrl(baseUrl);
-	return host ? isLanHost(host) : false;
-};
-
-interface SavedLanProbeTarget {
-	connection: SavedConnection;
-	host: string;
-}
-
-interface SavedLanProbeResult {
-	connection: SavedConnection;
-	host: string;
-	server: DiscoveredServer | null;
-}
 
 const toStringArray = (value: unknown): string[] => {
 	if (!Array.isArray(value)) {
@@ -384,18 +382,25 @@ const resolveCandidateHosts = async (input: {
 	return hosts;
 };
 
-const toSavedLanProbeTargets = (savedConnections: SavedConnection[]): SavedLanProbeTarget[] => {
-	const targets: SavedLanProbeTarget[] = [];
+const toSavedProbeTargets = (savedConnections: SavedConnection[]): SavedProbeTarget[] => {
+	const targets: SavedProbeTarget[] = [];
+	const seen = new Set<string>();
 	for (const connection of savedConnections) {
-		if (!isLanBaseUrl(connection.baseUrl)) {
-			continue;
-		}
-
 		const host = parseHostFromBaseUrl(connection.baseUrl);
 		if (!host) {
 			continue;
 		}
 
+		if (!isSavedProbeHost(host)) {
+			continue;
+		}
+
+		const dedupeKey = host.trim().toLowerCase();
+		if (seen.has(dedupeKey)) {
+			continue;
+		}
+
+		seen.add(dedupeKey);
 		targets.push({
 			connection,
 			host,
@@ -405,10 +410,10 @@ const toSavedLanProbeTargets = (savedConnections: SavedConnection[]): SavedLanPr
 	return targets;
 };
 
-const probeSavedLanConnections = async (
-	targets: SavedLanProbeTarget[],
+const probeSavedConnections = async (
+	targets: SavedProbeTarget[],
 	timeoutMs: number,
-): Promise<SavedLanProbeResult[]> =>
+): Promise<SavedProbeResult[]> =>
 	await Promise.all(
 		targets.map(async (target) => ({
 			connection: target.connection,
@@ -430,34 +435,30 @@ export const DiscoveryManager = {
 		const token = normalizeToken(input?.token ?? config.token);
 		log("scan start", { timeoutMs, concurrency });
 
-		const savedLanTargets = toSavedLanProbeTargets(savedConnections);
-		log("scan saved lan targets", { count: savedLanTargets.length });
-		const savedLanProbeResults = await probeSavedLanConnections(savedLanTargets, timeoutMs);
-		const savedLanOnline = savedLanProbeResults
+		const savedProbeTargets = toSavedProbeTargets(savedConnections);
+		log("scan saved targets", { count: savedProbeTargets.length });
+		const savedProbeResults = await probeSavedConnections(savedProbeTargets, timeoutMs);
+		const savedOnline = savedProbeResults
 			.filter((result) => Boolean(result.server))
 			.map((result) => result.server!);
-		const savedLanOfflineBaseUrls = savedLanProbeResults
+		const savedOfflineBaseUrls = savedProbeResults
 			.filter((result) => !result.server)
 			.map((result) => result.connection.baseUrl);
-		log("scan saved lan results", {
-			onlineCount: savedLanOnline.length,
-			offlineCount: savedLanOfflineBaseUrls.length,
+		log("scan saved results", {
+			onlineCount: savedOnline.length,
+			offlineCount: savedOfflineBaseUrls.length,
 		});
-			await Promise.all(
-				savedLanOfflineBaseUrls.map(async (baseUrl) => await ApiConfigStore.deleteSavedConnection(baseUrl)),
-			);
 
-		const nonLanSavedConnections = savedConnections.filter((item) => !isLanBaseUrl(item.baseUrl));
 		const candidateHosts = await resolveCandidateHosts({
 			activeBaseUrl: config.baseUrl,
-			recent: savedLanOnline,
-			savedConnections: nonLanSavedConnections,
+			recent: savedOnline,
+			savedConnections,
 		});
-		const savedLanProbedHosts = new Set(savedLanTargets.map((item) => item.host));
-		const hostsToScan = candidateHosts.filter((host) => !savedLanProbedHosts.has(host));
+		const savedProbedHosts = new Set(savedProbeTargets.map((item) => item.host.trim().toLowerCase()));
+		const hostsToScan = candidateHosts.filter((host) => !savedProbedHosts.has(host.trim().toLowerCase()));
 		log("scan start candidates", {
 			candidateCount: hostsToScan.length,
-			recentCount: savedLanOnline.length,
+			recentCount: savedOnline.length,
 		});
 
 		const scanned = await runLimited(
@@ -467,7 +468,7 @@ export const DiscoveryManager = {
 		);
 		log("scan results", { scannedCount: scanned.length });
 
-		const merged = dedupeServers([...savedLanOnline, ...scanned]);
+		const merged = dedupeServers([...savedOnline, ...scanned]);
 		log("scan merged", { mergedCount: merged.length });
 		return merged;
 	},
