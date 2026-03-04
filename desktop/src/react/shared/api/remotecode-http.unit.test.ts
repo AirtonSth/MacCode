@@ -63,6 +63,130 @@ test("RemoteCodeApi returns workspace selection from GET /v1/selection", async (
 	}
 });
 
+test("RemoteCodeApi lists workspace summaries from GET /v1/projects/workspaces", async () => {
+	let method = "";
+	let path = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		return jsonResponse({
+			data: {
+				workspaces: [
+					{
+						id: "project-1",
+						name: "Workspace 1",
+						path: "/tmp/workspace-1",
+					},
+				],
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001/",
+			token: "unit-token",
+		});
+		const workspaces = await client.listWorkspaceSummaries();
+
+		expect(method).toBe("GET");
+		expect(path).toBe("/v1/projects/workspaces");
+		expect(workspaces).toEqual([
+			{
+				id: "project-1",
+				name: "Workspace 1",
+				path: "/tmp/workspace-1",
+			},
+		]);
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi lists thread summaries from GET /v1/projects/:id/threads", async () => {
+	let method = "";
+	let path = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		return jsonResponse({
+			data: {
+				threads: [
+					{
+						id: "chat-1",
+						title: "Thread 1",
+						updatedAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001/",
+			token: "unit-token",
+		});
+		const threads = await client.listThreadSummaries("project-1");
+
+		expect(method).toBe("GET");
+		expect(path).toBe("/v1/projects/project-1/threads");
+		expect(threads).toEqual([
+			{
+				id: "chat-1",
+				title: "Thread 1",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+			},
+		]);
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi returns chat context from GET /v1/chats/:id/context", async () => {
+	let method = "";
+	let path = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		return jsonResponse({
+			data: {
+				chat: {
+					id: "chat-1",
+					projectId: "project-1",
+					title: "Thread 1",
+					status: "completed",
+					provider: "codex",
+					diffAdded: 3,
+					diffRemoved: 1,
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				},
+				project: {
+					id: "project-1",
+					name: "Workspace 1",
+					path: "/tmp/workspace-1",
+				},
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001/",
+			token: "unit-token",
+		});
+		const context = await client.getChatContext("chat-1");
+
+		expect(method).toBe("GET");
+		expect(path).toBe("/v1/chats/chat-1/context");
+		expect(context.chat.id).toBe("chat-1");
+		expect(context.chat.status).toBe("completed");
+		expect(context.project.path).toBe("/tmp/workspace-1");
+	} finally {
+		restore();
+	}
+});
+
 test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", async () => {
 	let receivedBody = "";
 	let method = "";

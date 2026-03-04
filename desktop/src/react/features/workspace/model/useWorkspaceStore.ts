@@ -131,7 +131,8 @@ export type WorkspaceAction =
 	| { type: "CLEAR_CONNECTION_ERROR" }
 	| { type: "ADD_ERROR"; payload: Omit<UiError, "id" | "timestamp"> }
 	| { type: "REMOVE_ERROR"; payload: string }
-	| { type: "CLEAR_ERRORS" };
+	| { type: "CLEAR_ERRORS" }
+	| { type: "CLEAR_ERRORS_BY_SOURCE"; payload: "rest" | "ws" };
 
 const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
@@ -833,6 +834,12 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 			return {
 				...state,
 				errors: [],
+			};
+
+		case "CLEAR_ERRORS_BY_SOURCE":
+			return {
+				...state,
+				errors: state.errors.filter((error) => error.source !== action.payload),
 			};
 
 		default:

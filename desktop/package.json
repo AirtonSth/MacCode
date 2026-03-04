@@ -12,6 +12,7 @@
     "e2e:serve": "bunx vite e2e/frontend --host 127.0.0.1 --port 4173 --strictPort",
     "e2e:run": "bunx wdio run wdio.conf.mjs",
     "e2e:run:frontend": "bunx wdio run wdio.conf.mjs --spec ./e2e/frontend/**/*.e2e.mjs",
+    "e2e:run:playwright": "bunx playwright test -c e2e/playwright/playwright.config.mjs",
     "mcp:playwright-electron": "bun run ./playwright-e2e/playwright-mcp-electron.ts",
     "automation:cdp-screenshot": "bun run ./playwright-e2e/cdp-screenshot.ts",
     "test:e2e": "bunx concurrently \"bun run e2e:serve\" \"bunx wait-on tcp:127.0.0.1:4173 && bun run e2e:run\" --kill-others --success first",
@@ -43,27 +44,28 @@
     "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/bun": "latest",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
     "@wdio/cli": "^8.46.0",
     "@wdio/local-runner": "^8.46.0",
     "@wdio/mocha-framework": "^8.46.0",
     "@wdio/spec-reporter": "^8.43.0",
-    "wdio-chromedriver-service": "^8.1.1",
-    "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.0",
     "eslint": "8.57.1",
     "eslint-config-hardcore": "^49.0.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.3.0",
-    "postcss": "^8.4.49",
     "pngjs": "^7.0.0",
+    "postcss": "^8.4.49",
     "tailwindcss": "^3.4.16",
     "tailwindcss-animate": "^1.0.7",
-    "wait-on": "^8.0.3",
     "typescript": "^5.7.2",
-    "vite": "5.4.11"
+    "vite": "5.4.11",
+    "wait-on": "^8.0.3",
+    "wdio-chromedriver-service": "^8.1.1"
   }
 }

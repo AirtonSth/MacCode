@@ -18,6 +18,7 @@ type GitProjectLookup = {
 };
 
 const DEFAULT_COMMIT_PUSH = false;
+const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 20_000;
 const GIT_NOT_REPOSITORY_MARKERS = [
 	"not a git repository",
 	"not a git work tree",
@@ -73,12 +74,31 @@ const defaultRunGitCommand: GitExecutor = async ({ cwd, args }) => {
 			stderr: "pipe",
 			stdout: "pipe",
 		});
+		let timedOut = false;
+		const timeoutId = setTimeout(() => {
+			timedOut = true;
+			try {
+				process.kill();
+			} catch {
+				// no-op
+			}
+		}, DEFAULT_GIT_COMMAND_TIMEOUT_MS);
 
 		const [stdout, stderr, exitCode] = await Promise.all([
 			readStreamText(process.stdout),
 			readStreamText(process.stderr),
 			process.exited,
 		]);
+		clearTimeout(timeoutId);
+
+		if (timedOut) {
+			const timeoutMessage = `git command timed out after ${DEFAULT_GIT_COMMAND_TIMEOUT_MS}ms`;
+			return {
+				exitCode: 1,
+				stderr: stderr ? `${stderr}\n${timeoutMessage}` : timeoutMessage,
+				stdout,
+			};
+		}
 
 		return {
 			exitCode: exitCode ?? 1,
@@ -330,7 +350,7 @@ export class GitService implements GitServiceContract {
 		}
 
 		const result = await this.executeGit({
-			args: ["status", "--branch", "--short", "--untracked-files=all"],
+			args: ["status", "--branch", "--short", "--untracked-files=normal"],
 			cwd: project.path,
 		});
 

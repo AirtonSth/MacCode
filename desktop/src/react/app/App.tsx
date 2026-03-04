@@ -8,7 +8,6 @@ import {
 	MessageSquareText,
 	PanelLeft,
 	SquareTerminal,
-	Star,
 	Trash2,
 } from "lucide-react";
 
@@ -48,6 +47,8 @@ import {
 	type ConnectionState,
 	type ServerWsEvent,
 } from "../shared/realtime/remotecode-ws";
+
+const FALLBACK_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 
 const formatRelativeTime = (dateString: string): string => {
 	const timestamp = new Date(dateString).getTime();
@@ -164,6 +165,30 @@ const createDraftThreadChat = (projectId: string): ChatDTO => ({
 	diffAdded: 0,
 	diffRemoved: 0,
 	updatedAt: new Date().toISOString(),
+});
+
+const toProjectDtoFromWorkspaceSummary = (workspace: {
+	id: string;
+	name: string;
+	path: string;
+}): ProjectDTO => ({
+	id: workspace.id,
+	name: workspace.name,
+	path: workspace.path,
+	isFavorite: false,
+	createdAt: FALLBACK_TIMESTAMP,
+	updatedAt: FALLBACK_TIMESTAMP,
+});
+
+const toChatDtoFromThreadSummary = (thread: { id: string; title: string; updatedAt: string }, projectId: string): ChatDTO => ({
+	id: thread.id,
+	projectId,
+	title: thread.title,
+	provider: "codex",
+	status: "pending",
+	diffAdded: 0,
+	diffRemoved: 0,
+	updatedAt: thread.updatedAt,
 });
 const SIDEBAR_MAX_VISIBLE_THREADS = 3;
 
@@ -428,6 +453,7 @@ const App = (): JSX.Element => {
 	const chatsLoadQueuedRef = useRef<Map<string, string | null>>(new Map());
 	const messagesLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	const messagesLoadQueuedRef = useRef<Set<string>>(new Set());
+	const chatContextLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 
 	const baseUrl = useMemo(() => {
 		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim();
@@ -688,6 +714,10 @@ const App = (): JSX.Element => {
 		[dispatch],
 	);
 
+	const clearRestErrors = useCallback(() => {
+		dispatch({ type: "CLEAR_ERRORS_BY_SOURCE", payload: "rest" });
+	}, [dispatch]);
+
 	const formatApiErrorCode = useCallback((error: unknown) => {
 		return error instanceof RemoteCodeApiError ? `HTTP_${error.status}` : "NETWORK";
 	}, []);
@@ -747,24 +777,25 @@ const App = (): JSX.Element => {
 			},
 		) => {
 			try {
-				await api.updateWorkspaceSelection({
-					selectedChatId,
-					selectedProjectId,
-					permissionMode: overrides?.permissionMode ?? permissionModeRef.current,
-					selectedModel: overrides?.selectedModel ?? selectedModelRef.current,
-					selectedReasoningEffort:
-						overrides?.selectedReasoningEffort ?? selectedReasoningEffortRef.current,
-				});
-			} catch (error) {
-				addError(
-					formatApiErrorMessage(error, "Unable to persist selection"),
-					"rest",
-					formatApiErrorCode(error),
-				);
-			}
-		},
-		[addError, api, formatApiErrorCode, formatApiErrorMessage],
-	);
+					await api.updateWorkspaceSelection({
+						selectedChatId,
+						selectedProjectId,
+						permissionMode: overrides?.permissionMode ?? permissionModeRef.current,
+						selectedModel: overrides?.selectedModel ?? selectedModelRef.current,
+						selectedReasoningEffort:
+							overrides?.selectedReasoningEffort ?? selectedReasoningEffortRef.current,
+					});
+					clearRestErrors();
+				} catch (error) {
+					addError(
+						formatApiErrorMessage(error, "Unable to persist selection"),
+						"rest",
+						formatApiErrorCode(error),
+					);
+				}
+			},
+			[addError, api, clearRestErrors, formatApiErrorCode, formatApiErrorMessage],
+		);
 
 	const loadMessagesForChatCore = useCallback(
 		async (chatId: string | null) => {
@@ -797,22 +828,23 @@ const App = (): JSX.Element => {
 					afterId = page.nextAfterId;
 				}
 
-				if (selectedChatIdRef.current === chatId) {
-					dispatch({ payload: messages, type: "SET_MESSAGES" });
-				}
-				dispatch({
-					payload: {
-						chatId,
-						turns: replayAssistantEventsIntoTurns(streamEvents),
-						lastEventId,
-					},
-					type: "SET_STREAM_HISTORY",
-				});
-			} catch (error) {
-				if (formatApiErrorCode(error) === "HTTP_404") {
 					if (selectedChatIdRef.current === chatId) {
-						dispatch({ payload: [], type: "SET_MESSAGES" });
+						dispatch({ payload: messages, type: "SET_MESSAGES" });
 					}
+					dispatch({
+						payload: {
+							chatId,
+							turns: replayAssistantEventsIntoTurns(streamEvents),
+							lastEventId,
+						},
+						type: "SET_STREAM_HISTORY",
+					});
+					clearRestErrors();
+				} catch (error) {
+					if (formatApiErrorCode(error) === "HTTP_404") {
+						if (selectedChatIdRef.current === chatId) {
+							dispatch({ payload: [], type: "SET_MESSAGES" });
+						}
 					dispatch({
 						payload: {
 							chatId,
@@ -821,6 +853,7 @@ const App = (): JSX.Element => {
 						},
 						type: "SET_STREAM_HISTORY",
 					});
+					clearRestErrors();
 					return;
 				}
 				addError(
@@ -834,7 +867,7 @@ const App = (): JSX.Element => {
 				}
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
+			[addError, api, clearRestErrors, dispatch, formatApiErrorCode, formatApiErrorMessage],
 	);
 
 	const loadMessagesForChat = useCallback(
@@ -883,6 +916,7 @@ const App = (): JSX.Element => {
 					}
 
 					dispatch({ payload: latestMessages, type: "SET_MESSAGES" });
+					clearRestErrors();
 					if (latestMessages.at(-1)?.role === "assistant") {
 						return;
 					}
@@ -904,11 +938,11 @@ const App = (): JSX.Element => {
 
 			await trySyncMessages(1);
 		},
-		[api, dispatch, loadMessagesForChat],
+		[api, clearRestErrors, dispatch, loadMessagesForChat],
 	);
 
-	const loadChatsForProjectCore = useCallback(
-		async (projectId: string | null, preferredChatId: string | null = null) => {
+		const loadChatsForProjectCore = useCallback(
+			async (projectId: string | null, preferredChatId: string | null = null) => {
 			if (!projectId) {
 				dispatch({ payload: [], type: "SET_CHATS" });
 				dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
@@ -920,15 +954,18 @@ const App = (): JSX.Element => {
 				dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
 			}
 
-			dispatch({ payload: true, type: "SET_CHATS_LOADING" });
-			try {
-				const chats = await api.listChats(projectId);
-				if (selectedProjectIdRef.current !== projectId) {
-					return;
-				}
+				dispatch({ payload: true, type: "SET_CHATS_LOADING" });
+				try {
+						const chats = (await api.listThreadSummaries(projectId)).map((chat) =>
+							toChatDtoFromThreadSummary(chat, projectId),
+						);
+						if (selectedProjectIdRef.current !== projectId) {
+							return;
+						}
+						clearRestErrors();
 
-				const hasPreferredChat = preferredChatId ? chats.some((chat) => chat.id === preferredChatId) : false;
-				const nextSelectedChatId = hasPreferredChat ? preferredChatId : chats[0]?.id ?? null;
+					const hasPreferredChat = preferredChatId ? chats.some((chat) => chat.id === preferredChatId) : false;
+					const nextSelectedChatId = hasPreferredChat ? preferredChatId : chats[0]?.id ?? null;
 
 				dispatch({ payload: chats, type: "SET_CHATS" });
 				if (hasPreferredChat) {
@@ -957,8 +994,8 @@ const App = (): JSX.Element => {
 				}
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
-	);
+			[addError, api, clearRestErrors, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
+		);
 
 	const loadChatsForProject = useCallback(
 		async (projectId: string | null, preferredChatId: string | null = null) => {
@@ -1001,14 +1038,69 @@ const App = (): JSX.Element => {
 		[loadChatsForProjectCore],
 	);
 
-	const loadProjectsCore = useCallback(async () => {
-		dispatch({ payload: true, type: "SET_PROJECTS_LOADING" });
-		try {
-			const [projects, selection] = await Promise.all([
-				api.listProjects(),
-				api.getWorkspaceSelection().catch(() => ({
-					selectedChatId: null,
-					selectedProjectId: null,
+	const loadChatContext = useCallback(
+		async (chatId: string | null) => {
+			if (!chatId) {
+				return;
+			}
+
+			const inFlight = chatContextLoadInFlightRef.current.get(chatId);
+			if (inFlight) {
+				await inFlight;
+				return;
+			}
+
+			const task = (async () => {
+				try {
+					const context = await api.getChatContext(chatId);
+					if (selectedChatIdRef.current !== chatId) {
+						return;
+					}
+
+						dispatch({
+							payload: {
+								id: context.chat.id,
+								projectId: context.chat.projectId,
+								provider: context.chat.provider,
+							title: context.chat.title,
+							status: context.chat.status,
+							diffAdded: context.chat.diffAdded,
+							diffRemoved: context.chat.diffRemoved,
+							updatedAt: context.chat.updatedAt,
+							},
+							type: "UPDATE_CHAT",
+						});
+						clearRestErrors();
+					} catch (error) {
+						if (formatApiErrorCode(error) === "HTTP_404") {
+							return;
+						}
+					addError(
+						formatApiErrorMessage(error, "Unable to fetch chat context"),
+						"rest",
+						formatApiErrorCode(error),
+					);
+				}
+			})().finally(() => {
+				chatContextLoadInFlightRef.current.delete(chatId);
+			});
+
+			chatContextLoadInFlightRef.current.set(chatId, task);
+			await task;
+		},
+		[addError, api, clearRestErrors, dispatch, formatApiErrorCode, formatApiErrorMessage],
+	);
+
+		const loadProjectsCore = useCallback(async () => {
+			dispatch({ payload: true, type: "SET_PROJECTS_LOADING" });
+			try {
+				const [projects, selection] = await Promise.all([
+					api.listWorkspaceSummaries().then((workspaces) =>
+						workspaces.map(toProjectDtoFromWorkspaceSummary),
+					),
+					api.getWorkspaceSelection().catch(() => ({
+						selectedChatId: null,
+						selectedProjectId: null,
 					permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
 					selectedModel: null,
 					selectedReasoningEffort: null,
@@ -1034,6 +1126,7 @@ const App = (): JSX.Element => {
 			setPermissionMode(nextPermissionMode);
 			setSelectedModel(nextSelectedModel);
 			setSelectedReasoningEffort(nextSelectedReasoningEffort);
+			clearRestErrors();
 
 			if (
 				selection.selectedProjectId !== selectedProjectId ||
@@ -1057,7 +1150,15 @@ const App = (): JSX.Element => {
 		} finally {
 			dispatch({ payload: false, type: "SET_PROJECTS_LOADING" });
 		}
-	}, [addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection]);
+	}, [
+		addError,
+		api,
+		clearRestErrors,
+		dispatch,
+		formatApiErrorCode,
+		formatApiErrorMessage,
+		persistWorkspaceSelection,
+	]);
 
 	const loadProjects = useCallback(async () => {
 		const inFlight = projectsLoadInFlightRef.current;
@@ -1085,6 +1186,7 @@ const App = (): JSX.Element => {
 		try {
 			const catalog = await api.listCodexModels();
 			setAvailableModels(catalog.models);
+			clearRestErrors();
 		} catch (error) {
 			addError(
 				formatApiErrorMessage(error, "Unable to load codex models"),
@@ -1094,7 +1196,7 @@ const App = (): JSX.Element => {
 		} finally {
 			setHasLoadedCodexModels(true);
 		}
-	}, [addError, api, formatApiErrorCode, formatApiErrorMessage]);
+	}, [addError, api, clearRestErrors, formatApiErrorCode, formatApiErrorMessage]);
 
 	const handleWsEvent = useCallback(
 		async (event: ServerWsEvent) => {
@@ -1144,16 +1246,17 @@ const App = (): JSX.Element => {
 					});
 					clearChatSending(event.data.chatId);
 					break;
-				case "assistant_done":
-					dispatch({
-						payload: { chatId: event.data.chatId },
-						type: "CLEAR_STREAMING",
-					});
-					if (selectedChatIdRef.current === event.data.chatId) {
-						await syncFinalMessagesAfterDone(event.data.chatId);
-					}
-					clearChatSending(event.data.chatId);
-					break;
+					case "assistant_done":
+						dispatch({
+							payload: { chatId: event.data.chatId },
+							type: "CLEAR_STREAMING",
+						});
+						if (selectedChatIdRef.current === event.data.chatId) {
+							await syncFinalMessagesAfterDone(event.data.chatId);
+							void refreshProjectGit();
+						}
+						clearChatSending(event.data.chatId);
+						break;
 				case "chat_updated":
 					dispatch({
 						payload: {
@@ -1165,10 +1268,16 @@ const App = (): JSX.Element => {
 						},
 						type: "UPDATE_CHAT",
 					});
-					if (event.data.status !== "running") {
-						clearChatSending(event.data.chatId);
-					}
-					break;
+						if (event.data.status !== "running") {
+							clearChatSending(event.data.chatId);
+						}
+						if (
+							selectedChatIdRef.current === event.data.chatId &&
+							(event.data.status === "completed" || event.data.status === "failed")
+						) {
+							void refreshProjectGit();
+						}
+						break;
 				case "error":
 					addError(event.data.message, "ws", event.data.code);
 					if (event.data.chatId) {
@@ -1351,11 +1460,10 @@ const App = (): JSX.Element => {
 					wsRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, workspaceClientIdRef.current);
 					if (selectedChatIdRef.current) {
 						wsRef.current?.sendJoinChat(selectedChatIdRef.current);
-						void loadMessagesForChat(selectedChatIdRef.current);
 					}
 				}
 			},
-			[dispatch, loadMessagesForChat],
+			[dispatch],
 	);
 
 	const handleBootstrap = useCallback(() => {
@@ -1377,6 +1485,10 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		void loadMessagesForChat(state.selectedChatId);
 	}, [loadMessagesForChat, state.selectedChatId]);
+
+	useEffect(() => {
+		void loadChatContext(state.selectedChatId);
+	}, [loadChatContext, state.selectedChatId]);
 
 	useEffect(() => {
 		const client = RemoteCodeRealtime.createClient({
@@ -1413,6 +1525,7 @@ const App = (): JSX.Element => {
 				dispatch({ payload: project, type: "UPSERT_PROJECT" });
 				dispatch({ payload: project.id, type: "SET_SELECTED_PROJECT" });
 				await persistWorkspaceSelection(project.id, null);
+				clearRestErrors();
 				return project;
 			} catch (error) {
 				addError(
@@ -1425,24 +1538,7 @@ const App = (): JSX.Element => {
 				dispatch({ payload: false, type: "SET_CREATING_PROJECT" });
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
-	);
-
-	const handleToggleFavorite = useCallback(
-		async (projectId: string, isFavorite: boolean) => {
-			dispatch({ payload: { id: projectId, isFavorite }, type: "TOGGLE_FAVORITE" });
-			try {
-				const project = await api.toggleFavorite(projectId, isFavorite);
-				dispatch({ payload: project, type: "UPSERT_PROJECT" });
-			} catch (error) {
-				addError(
-					formatApiErrorMessage(error, "Unable to update project"),
-					"rest",
-					formatApiErrorCode(error),
-				);
-			}
-		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
+		[addError, api, clearRestErrors, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection],
 	);
 
 	const handleCreateChat = useCallback(
@@ -1460,6 +1556,7 @@ const App = (): JSX.Element => {
 				selectedChatIdRef.current = chat.id;
 				persistedSelectedChatIdRef.current = chat.id;
 				await persistWorkspaceSelection(state.selectedProjectId, chat.id);
+				clearRestErrors();
 				return chat;
 			} catch (error) {
 				addError(
@@ -1472,8 +1569,17 @@ const App = (): JSX.Element => {
 				dispatch({ payload: false, type: "SET_CREATING_CHAT" });
 			}
 		},
-		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage, persistWorkspaceSelection, state.selectedProjectId],
-	);
+			[
+				addError,
+				api,
+				clearRestErrors,
+				dispatch,
+				formatApiErrorCode,
+				formatApiErrorMessage,
+				persistWorkspaceSelection,
+				state.selectedProjectId,
+			],
+		);
 
 	const handleSendMessage = useCallback(
 		async (text: string) => {
@@ -1735,6 +1841,7 @@ const App = (): JSX.Element => {
 				}
 
 				await loadProjects();
+				clearRestErrors();
 			} catch (error) {
 				addError(
 					formatApiErrorMessage(error, "Unable to delete workspace"),
@@ -1746,6 +1853,7 @@ const App = (): JSX.Element => {
 		[
 			addError,
 			api,
+			clearRestErrors,
 			formatApiErrorCode,
 			formatApiErrorMessage,
 			loadProjects,
@@ -1787,11 +1895,13 @@ const App = (): JSX.Element => {
 			if (state.selectedProjectId) {
 				await loadChatsForProject(state.selectedProjectId, nextSelectedChatId);
 			}
+			clearRestErrors();
 		},
 		[
 			addError,
 			api,
 			dispatch,
+			clearRestErrors,
 			formatApiErrorCode,
 			formatApiErrorMessage,
 			loadChatsForProject,
@@ -2032,37 +2142,6 @@ const App = (): JSX.Element => {
 																				{project.name}
 																			</span>
 																		</span>
-																	<Tooltip>
-																		<TooltipTrigger asChild>
-																		<Button
-																			aria-label={
-																				project.isFavorite
-																					? "Remove from favorites"
-																					: "Add to favorites"
-																			}
-																			className="h-6 w-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
-																			onClick={(event) => {
-																				event.stopPropagation();
-																				void handleToggleFavorite(project.id, !project.isFavorite);
-																			}}
-																			size="icon"
-																			type="button"
-																			variant="ghost"
-																		>
-																			<Star
-																				className={cn(
-																					"h-4 w-4",
-																					project.isFavorite
-																						? "fill-amber-300 text-amber-300"
-																						: "text-slate-500",
-																				)}
-																			/>
-																		</Button>
-																	</TooltipTrigger>
-																	<TooltipContent>
-																		{project.isFavorite ? "Remove favorite" : "Mark as favorite"}
-																	</TooltipContent>
-																</Tooltip>
 																<Tooltip>
 																	<TooltipTrigger asChild>
 																		<Button

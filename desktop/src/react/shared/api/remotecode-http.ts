@@ -16,6 +16,12 @@ export interface ProjectDTO {
 	updatedAt: string;
 }
 
+export interface WorkspaceSummaryDTO {
+	id: string;
+	name: string;
+	path: string;
+}
+
 export interface ChatDTO {
 	id: string;
 	projectId: string;
@@ -25,6 +31,23 @@ export interface ChatDTO {
 	diffAdded: number;
 	diffRemoved: number;
 	updatedAt: string;
+}
+
+export interface ThreadSummaryDTO {
+	id: string;
+	title: string;
+	updatedAt: string;
+}
+
+export interface ProjectSummaryDTO {
+	id: string;
+	name: string;
+	path: string;
+}
+
+export interface ChatContextDTO {
+	chat: ChatDTO;
+	project: ProjectSummaryDTO;
 }
 
 export interface MessageDTO {
@@ -192,6 +215,10 @@ interface RestListProjectsResponse {
 	projects: ProjectDTO[];
 }
 
+interface RestListWorkspaceSummariesResponse {
+	workspaces: WorkspaceSummaryDTO[];
+}
+
 interface RestCreateProjectResponse {
 	created: boolean;
 	project: ProjectDTO;
@@ -205,9 +232,15 @@ interface RestListChatsResponse {
 	chats: ChatDTO[];
 }
 
+interface RestListThreadSummariesResponse {
+	threads: ThreadSummaryDTO[];
+}
+
 interface RestCreateChatResponse {
 	chat: ChatDTO;
 }
+
+type RestChatContextResponse = ChatContextDTO;
 
 interface RestListMessagesResponse {
 	messages: MessageDTO[];
@@ -363,15 +396,24 @@ export const RemoteCodeApi = {
 			return unpackResponse<T>(body);
 		};
 
-		return {
-			listProjects: async (): Promise<ProjectDTO[]> => {
-				const payload = await request<RestListProjectsResponse>({
-					method: "GET",
-					path: "/projects",
-				});
+			return {
+				listProjects: async (): Promise<ProjectDTO[]> => {
+					const payload = await request<RestListProjectsResponse>({
+						method: "GET",
+						path: "/projects",
+					});
 
-				return payload.projects;
-			},
+					return payload.projects;
+				},
+
+				listWorkspaceSummaries: async (): Promise<WorkspaceSummaryDTO[]> => {
+					const payload = await request<RestListWorkspaceSummariesResponse>({
+						method: "GET",
+						path: "/projects/workspaces",
+					});
+
+					return payload.workspaces;
+				},
 
 			createProject: async (input: { name?: string; path: string }): Promise<ProjectDTO> => {
 				const payload = await request<RestCreateProjectResponse>({
@@ -393,24 +435,40 @@ export const RemoteCodeApi = {
 				return payload.project;
 			},
 
-			listChats: async (projectId: string): Promise<ChatDTO[]> => {
-				const payload = await request<RestListChatsResponse>({
-					method: "GET",
-					path: `/projects/${projectId}/chats`,
-				});
+				listChats: async (projectId: string): Promise<ChatDTO[]> => {
+					const payload = await request<RestListChatsResponse>({
+						method: "GET",
+						path: `/projects/${projectId}/chats`,
+					});
 
-				return payload.chats;
-			},
+					return payload.chats;
+				},
 
-			createChat: async (projectId: string, title?: string): Promise<ChatDTO> => {
-				const payload = await request<RestCreateChatResponse>({
-					body: { title },
-					method: "POST",
-					path: `/projects/${projectId}/chats`,
-				});
+				listThreadSummaries: async (projectId: string): Promise<ThreadSummaryDTO[]> => {
+					const payload = await request<RestListThreadSummariesResponse>({
+						method: "GET",
+						path: `/projects/${projectId}/threads`,
+					});
 
-				return payload.chat;
-			},
+					return payload.threads;
+				},
+
+				createChat: async (projectId: string, title?: string): Promise<ChatDTO> => {
+					const payload = await request<RestCreateChatResponse>({
+						body: { title },
+						method: "POST",
+						path: `/projects/${projectId}/chats`,
+					});
+
+					return payload.chat;
+				},
+
+				getChatContext: async (chatId: string): Promise<ChatContextDTO> => {
+					return await request<RestChatContextResponse>({
+						method: "GET",
+						path: `/chats/${chatId}/context`,
+					});
+				},
 
 			listCodexModels: async (): Promise<CodexModelsCatalog> => {
 				return await request<RestCodexModelsResponse>({
