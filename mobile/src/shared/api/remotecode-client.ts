@@ -87,6 +87,11 @@ interface TerminalExecResponse {
 	entries: TerminalEntryDTO[];
 }
 
+interface LiveActivitySubscriptionResponse {
+	enabled: boolean;
+	subscribed: boolean;
+}
+
 type SelectionResponse = WorkspaceSelectionDTO;
 
 export interface RemoteCodeClient {
@@ -122,6 +127,10 @@ export interface RemoteCodeClient {
 		chatId: string,
 		options?: { afterId?: number; limit?: number },
 	) => Promise<ChatStreamEventsResponseDTO>;
+	upsertChatLiveActivitySubscription: (
+		chatId: string,
+		input: { chatTitle?: string; fcmToken: string; liveActivityToken: string },
+	) => Promise<LiveActivitySubscriptionResponse>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	commitProject: (
 		projectId: string,
@@ -391,6 +400,28 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 				method: "GET",
 				path: suffix ? `/chats/${chatId}/stream-events?${suffix}` : `/chats/${chatId}/stream-events`,
 			});
+		},
+
+		async upsertChatLiveActivitySubscription(
+			chatId: string,
+			input: { chatTitle?: string; fcmToken: string; liveActivityToken: string },
+		) {
+			try {
+				return await request<LiveActivitySubscriptionResponse>({
+					method: "POST",
+					path: `/chats/${chatId}/live-activity/subscription`,
+					body: input,
+				});
+			} catch (error) {
+				if (error instanceof RemoteCodeRequestError && (error.status === 404 || error.status === 501)) {
+					return {
+						enabled: false,
+						subscribed: false,
+					};
+				}
+
+				throw error;
+			}
 		},
 
 		async listProjects() {
