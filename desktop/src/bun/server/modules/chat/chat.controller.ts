@@ -5,14 +5,31 @@ import { readMutationRequestMetadata } from "../../shared/core/request-context";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { ChatService } from "./chat.service";
 
+interface RuntimeActiveThreadReader {
+	listRunningChatIds: () => string[];
+	stopRunningChat: (input: {
+		chatId: string;
+		clientId?: string;
+		requestId?: string;
+	}) => Promise<{
+		chat: Awaited<ReturnType<ChatService["getChatById"]>>;
+		state: "not_found" | "not_running" | "stale_cleared" | "stopping";
+	}>;
+}
+
 export class ChatController {
-	static build(service: ChatService, workspaceEvents?: WorkspaceEventsServiceContract) {
-		return new ChatController(service, workspaceEvents).build();
+	static build(
+		service: ChatService,
+		workspaceEvents?: WorkspaceEventsServiceContract,
+		runtimeActiveThreadReader?: RuntimeActiveThreadReader,
+	) {
+		return new ChatController(service, workspaceEvents, runtimeActiveThreadReader).build();
 	}
 
 constructor(
 		private readonly service: ChatService,
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
+		private readonly runtimeActiveThreadReader?: RuntimeActiveThreadReader,
 	) {}
 
 	
@@ -20,6 +37,39 @@ constructor(
 	build() {
 		return new Elysia({ name: "chat-controller" })
 			.use(withRestAuth())
+			.get("/threads/active", async () => {
+				const threads = await this.service.listActiveThreads();
+				return { threads };
+			})
+			.get("/threads/active/runtime", async () => {
+				const runtimeChatIds = this.runtimeActiveThreadReader?.listRunningChatIds() ?? [];
+				const threads = await this.service.listActiveThreadsByIds(runtimeChatIds);
+				return { threads };
+			})
+			.post("/chats/:id/stop", async ({ params: parameters, request, set }) => {
+				if (!this.runtimeActiveThreadReader) {
+					set.status = 503;
+					return { error: "runtime controller unavailable" };
+				}
+
+				const metadata = readMutationRequestMetadata(request);
+				const result = await this.runtimeActiveThreadReader.stopRunningChat({
+					chatId: parameters.id,
+					clientId: metadata.clientId ?? undefined,
+					requestId: metadata.requestId ?? undefined,
+				});
+
+				if (result.state === "not_found") {
+					set.status = 404;
+					return { error: "chat not found" };
+				}
+
+				return {
+					chat: result.chat,
+					state: result.state,
+					stopped: result.state === "stale_cleared" || result.state === "stopping",
+				};
+			})
 			.get("/projects/:id/threads", async ({ params: parameters, set }) => {
 				const threads = await this.service.listThreadSummariesByProjectId(parameters.id);
 
@@ -108,5 +158,9 @@ constructor(
 	}
 }
 
-export const createChatController = (service: ChatService, workspaceEvents?: WorkspaceEventsServiceContract) =>
-	ChatController.build(service, workspaceEvents);
+export const createChatController = (
+	service: ChatService,
+	workspaceEvents?: WorkspaceEventsServiceContract,
+	runtimeActiveThreadReader?: RuntimeActiveThreadReader,
+) =>
+	ChatController.build(service, workspaceEvents, runtimeActiveThreadReader);

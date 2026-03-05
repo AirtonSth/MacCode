@@ -13,6 +13,7 @@ const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
 	diffAdded: 0,
 	diffRemoved: 0,
 	id: "chat-id",
+	isActive: false,
 	projectId: "project-id",
 	provider: "codex",
 	status: "pending",
@@ -119,6 +120,7 @@ test("WsService.startUserMessage blocks chat_running when already running", asyn
 	const chatRepository = {
 		findChatById: () =>
 			createChat({
+				isActive: true,
 				status: "running",
 			}),
 	} as unknown as ChatRepository;
@@ -180,7 +182,7 @@ test("WsService.startUserMessage allows concurrent runs for different chats", as
 			});
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => {
+		updateChat: (chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => {
 			if (update.status) {
 				statusByChat.set(chatId, update.status);
 			}
@@ -276,7 +278,7 @@ test("WsService.startUserMessage blocks a second concurrent run for the same cha
 			});
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => {
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => {
 			if (update.status) {
 				chatStatus = update.status;
 			}
@@ -416,7 +418,7 @@ test("WsService.startUserMessage forwards explicit permission mode to codex runn
 			};
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			...update,
 			updatedAt: new Date().toISOString(),
@@ -493,7 +495,7 @@ test("WsService.startUserMessage defaults permission mode to default", async () 
 			};
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			...update,
 			updatedAt: new Date().toISOString(),
@@ -566,7 +568,7 @@ test("WsService persists providerThreadId returned by codex runner", async () =>
 			};
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			status: "running",
 			updatedAt: new Date().toISOString(),
@@ -641,7 +643,7 @@ test("WsService.startUserMessage always forwards project workspace path and exis
 			};
 		},
 		findProviderThreadIdByChatId: () => existingThreadId,
-		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			...update,
 			updatedAt: new Date().toISOString(),
@@ -712,7 +714,7 @@ test("WsService.startUserMessage forwards intermediate assistant deltas in order
 			};
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			status: "running",
 			updatedAt: new Date().toISOString(),
@@ -792,7 +794,7 @@ test("WsService.startUserMessage forwards structured assistant_event payloads", 
 			};
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, _update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			status: "running",
 			updatedAt: new Date().toISOString(),
@@ -905,7 +907,7 @@ test("WsService.startUserMessage updates and clears persisted stream snapshots",
 			};
 		},
 		findProviderThreadIdByChatId: () => null,
-		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => ({
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
 			...chat,
 			...update,
 			updatedAt: new Date().toISOString(),
@@ -993,4 +995,152 @@ test("WsService.startUserMessage updates and clears persisted stream snapshots",
 		{ chatId: "chat-id", delta: "partial-2" },
 	]);
 	expect(snapshotCalls.clear).toEqual(["chat-id"]);
+});
+
+test("WsService.stopRunningChat clears stale active state when chat is not running in runtime", async () => {
+	const currentChat = createChat({
+		isActive: true,
+		status: "running",
+		updatedAt: "2026-01-01T00:00:01.000Z",
+	});
+
+	const chatRepository = {
+		findChatById: () => currentChat,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => {
+			if (typeof update.isActive === "boolean") {
+				currentChat.isActive = update.isActive;
+			}
+			if (typeof update.status === "string") {
+				currentChat.status = update.status;
+			}
+			currentChat.updatedAt = new Date().toISOString();
+			return currentChat;
+		},
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => {
+			throw new Error("should not call");
+		},
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async () => ({
+			assistantText: "",
+			diffAdded: 0,
+			diffRemoved: 0,
+			status: "completed" as const,
+		}),
+	} as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+
+	const result = await service.stopRunningChat({ chatId: currentChat.id });
+
+	expect(result.state).toBe("stale_cleared");
+	expect(result.chat?.isActive).toBe(false);
+	expect(result.chat?.status).toBe("failed");
+});
+
+test("WsService.stopRunningChat aborts in-flight run and returns stopping", async () => {
+	const currentChat = createChat({
+		id: "chat-running",
+		isActive: false,
+		status: "pending",
+		updatedAt: "2026-01-01T00:00:01.000Z",
+	});
+	const started = Promise.withResolvers<void>();
+	let wasAborted = false;
+
+	const chatRepository = {
+		findChatById: () => currentChat,
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => {
+			if (typeof update.diffAdded === "number") {
+				currentChat.diffAdded = update.diffAdded;
+			}
+			if (typeof update.diffRemoved === "number") {
+				currentChat.diffRemoved = update.diffRemoved;
+			}
+			if (typeof update.isActive === "boolean") {
+				currentChat.isActive = update.isActive;
+			}
+			if (typeof update.status === "string") {
+				currentChat.status = update.status;
+			}
+			currentChat.updatedAt = new Date().toISOString();
+			return currentChat;
+		},
+		updateProviderThreadId: () => currentChat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (chatId: string, role: "user" | "assistant", content: string) => ({
+			chatId,
+			content,
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async (options: {
+			signal?: AbortSignal;
+		}) => {
+			wasAborted = options.signal?.aborted ?? false;
+			started.resolve();
+
+			await new Promise<void>((resolve) => {
+				if (!options.signal) {
+					resolve();
+					return;
+				}
+
+				options.signal.addEventListener("abort", () => {
+					wasAborted = true;
+					resolve();
+				}, { once: true });
+			});
+
+			return {
+				assistantText: "",
+				cancelled: true,
+				diffAdded: 0,
+				diffRemoved: 0,
+				error: "cancelled",
+				status: "failed" as const,
+			};
+		},
+	} as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner);
+	const collector = await collectEvents(() => {});
+
+	const runningPromise = service.startUserMessage({
+		chatId: currentChat.id,
+		emit: collector.emit,
+		text: "run",
+	});
+
+	await started.promise;
+
+	const result = await service.stopRunningChat({ chatId: currentChat.id });
+	expect(result.state).toBe("stopping");
+	expect(wasAborted).toBe(true);
+
+	await runningPromise;
+	expect(currentChat.isActive).toBe(false);
+	expect(currentChat.status).toBe("failed");
+	expect(
+		collector.events.some((event) => event.event === "error" && event.data.code === "chat_cancelled"),
+	).toBe(true);
 });

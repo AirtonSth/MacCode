@@ -1,4 +1,5 @@
 export const queryKeys = {
+	activeThreads: ["active-threads"] as const,
 	chatContext: (chatId: string | null) => ["chat-context", chatId] as const,
 	chats: (projectId: string | null) => ["chats", projectId] as const,
 	messages: (chatId: string | null | undefined) => ["messages-v2", chatId ?? null] as const,

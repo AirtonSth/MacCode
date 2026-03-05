@@ -1,5 +1,5 @@
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { AlertTriangle, Bot, ChevronDown, Sparkles, User2 } from "lucide-react";
+import { AlertTriangle, Bot, ChevronDown, Loader2, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
 import { ScrollArea } from "../../../components/ui/scroll-area";
 import ReactMarkdown from "react-markdown";
@@ -17,6 +17,7 @@ interface ConversationPanelProps {
 	streamHistoryTurns: StreamTurnState[];
 	streamingText: string;
 	streamingTurn: StreamTurnState | null;
+	isWorking: boolean;
 	loading: boolean;
 	hasRestError: boolean;
 	onSetStreamItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void;
@@ -30,6 +31,7 @@ export const ConversationPanel = ({
 	streamHistoryTurns,
 	streamingText,
 	streamingTurn,
+	isWorking,
 	loading,
 	hasRestError,
 	onSetStreamItemExpanded,
@@ -50,7 +52,7 @@ export const ConversationPanel = ({
 	}, [liveTurn, streamHistoryTurns]);
 	const hasHistoricalRunDetails = historicalTurns.length > 0;
 	const hasStreaming = hasStreamingTimeline || hasStreamingText;
-	const hasContent = hasMessages || hasStreaming;
+	const hasContent = hasMessages || hasStreaming || isWorking;
 	const [showRunDetails, setShowRunDetails] = useState(false);
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
@@ -363,6 +365,22 @@ export const ConversationPanel = ({
 												/>
 											</div>
 											<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>{streamingText}</p>
+										</motion.article>
+									) : null}
+
+									{isWorking ? (
+										<motion.article
+											{...bubbleMotion}
+											aria-label="working-indicator"
+											className={cn(
+												"mr-auto inline-flex items-center gap-2 rounded-xl border border-sky-300/25 bg-sky-400/10 px-3 py-2 text-sm text-sky-100",
+												focusMode ? "mt-2" : "",
+											)}
+											data-testid="conversation-working-indicator"
+											key="conversation-working-indicator"
+										>
+											<Loader2 className="h-4 w-4 animate-spin" />
+											<span>Working...</span>
 										</motion.article>
 									) : null}
 								</AnimatePresence>

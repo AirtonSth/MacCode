@@ -32,6 +32,7 @@ export interface ClientMessageEvent {
 		clientId?: string;
 		model?: string;
 		permissionMode?: CodexPermissionMode;
+		projectId?: string;
 		requestId?: string;
 		reasoningEffort?: CodexReasoningEffort;
 		text: string;
@@ -79,6 +80,7 @@ export interface ChatUpdatedEvent {
 		chatId: string;
 		diffAdded: number;
 		diffRemoved: number;
+		isActive: boolean;
 		status: "pending" | "running" | "completed" | "failed";
 		updatedAt: string;
 	};
@@ -339,6 +341,7 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				chatId,
 				diffAdded: data.diffAdded,
 				diffRemoved: data.diffRemoved,
+				isActive: typeof data.isActive === "boolean" ? data.isActive : false,
 				status: data.status,
 				updatedAt: data.updatedAt,
 			},
@@ -607,6 +610,7 @@ export const RemoteCodeRealtime = {
 			sendUserMessage(
 				chatId: string,
 				text: string,
+				projectId?: string,
 				permissionMode?: CodexPermissionMode,
 				model?: string,
 				reasoningEffort?: CodexReasoningEffort,
@@ -619,6 +623,7 @@ export const RemoteCodeRealtime = {
 						...(clientId ? { clientId } : {}),
 						...(model ? { model } : {}),
 						...(permissionMode ? { permissionMode } : {}),
+						...(projectId ? { projectId } : {}),
 						...(requestId ? { requestId } : {}),
 						...(reasoningEffort ? { reasoningEffort } : {}),
 						text,

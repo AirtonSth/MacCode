@@ -9,6 +9,7 @@ const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
 	diffAdded: 0,
 	diffRemoved: 0,
 	id: "chat-id",
+	isActive: false,
 	projectId: "project-id",
 	provider: "fake",
 	status: "pending",
@@ -52,6 +53,7 @@ test("ChatService.updateChat merges existing state", async () => {
 	let capturedUpdate: {
 		diffAdded?: number;
 		diffRemoved?: number;
+		isActive?: boolean;
 		status?: ChatStatus;
 	} | undefined;
 
@@ -60,10 +62,11 @@ test("ChatService.updateChat merges existing state", async () => {
 			findChatById: () => chat,
 			getChatsByProjectId: () => [chat],
 
-			updateChat: (_chatId: string, value: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>) => {
+			updateChat: (_chatId: string, value: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => {
 				capturedUpdate = {
 					diffAdded: value.diffAdded,
 					diffRemoved: value.diffRemoved,
+					isActive: value.isActive,
 					status: value.status,
 				};
 
@@ -83,6 +86,7 @@ test("ChatService.updateChat merges existing state", async () => {
 	expect(capturedUpdate).toEqual({
 		diffAdded: 2,
 		diffRemoved: 1,
+		isActive: false,
 		status: "completed" as ChatStatus,
 	});
 	expect(updatedChat).toEqual(

@@ -1,7 +1,7 @@
 import { usePathname, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef } from "react";
 
-export type AppFlowRoute = "/workspaces" | "/threads" | "/chat" | "/settings";
+export type AppFlowRoute = "/workspaces" | "/threads" | "/active-threads" | "/chat" | "/settings";
 export type AppFlowTarget =
 	| AppFlowRoute
 	| {
@@ -47,7 +47,7 @@ export const useFlowNavigator = () => {
 		}
 
 		pendingRouteRef.current = route;
-		router.replace(getNavigationInput(target));
+		router.replace(getNavigationInput(target) as never);
 		return true;
 	}, [pathname, router]);
 
@@ -58,7 +58,7 @@ export const useFlowNavigator = () => {
 		}
 
 		pendingRouteRef.current = route;
-		router.push(getNavigationInput(target));
+		router.push(getNavigationInput(target) as never);
 		return true;
 	}, [pathname, router]);
 

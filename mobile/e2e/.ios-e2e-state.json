@@ -1,0 +1,18 @@
+{
+  "baseUrl": "http://127.0.0.1:8835",
+  "chats": {
+    "active": {
+      "id": "2a0069bb-2cec-46e5-a850-152cd25a06e7",
+      "title": "Active Thread"
+    },
+    "idleBottom": {
+      "id": "f073c81d-86bd-4958-b445-142e6a062e4f",
+      "title": "Idle Bottom"
+    },
+    "idleTop": {
+      "id": "fdb1f20a-a849-4f61-9a1c-21b3317812d9",
+      "title": "Idle Top"
+    }
+  },
+  "projectId": "23e66c62-8e40-4c4c-b9ac-2d8f6673c9bc"
+}

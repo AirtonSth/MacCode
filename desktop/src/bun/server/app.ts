@@ -137,6 +137,7 @@ export const ServerBootstrap = {
 		const projectRepository = new ProjectRepository(databaseClient.orm);
 		const chatRepository = new ChatRepository(databaseClient.orm);
 		const messageRepository = new MessageRepository(databaseClient.orm);
+		chatRepository.resetRuntimeActivityState();
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 		const terminalRepository = createTerminalRepository(databaseClient.orm);
 		const workspaceEventsRepository = createWorkspaceEventsRepository(databaseClient.orm);
@@ -226,7 +227,7 @@ export const ServerBootstrap = {
 					.use(DiscoveryController.build(serverMetadataService))
 					.use(AuthController.build(serverMetadataService))
 					.use(ProjectController.build(projectService, workspaceEventsService))
-					.use(ChatController.build(chatService, workspaceEventsService))
+					.use(ChatController.build(chatService, workspaceEventsService, wsService))
 					.use(MessageController.build(messageService))
 					.use(GitController.build(gitService, workspaceEventsService))
 					.use(ProviderController.build(codexModelsService))

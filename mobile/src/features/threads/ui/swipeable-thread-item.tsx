@@ -16,6 +16,7 @@ interface SwipeableThreadItemProps {
 	chat: ChatDTO;
 	index: number;
 	isActive: boolean;
+	isWorking?: boolean;
 	isSelected: boolean;
 	isLoading?: boolean;
 	onClose: () => void;
@@ -30,6 +31,7 @@ export const SwipeableThreadItem = ({
 	chat,
 	index,
 	isActive,
+	isWorking = false,
 	isSelected,
 	isLoading = false,
 	onClose,
@@ -164,10 +166,25 @@ export const SwipeableThreadItem = ({
 				>
 					<View style={styles.rowContent}>
 						<View style={styles.rowText}>
-							<Text numberOfLines={1} style={styles.rowTitle}>
+							<Text
+								numberOfLines={1}
+								style={styles.rowTitle}
+								testID={`thread-item-title-${String(index)}`}
+							>
 								{chat.title}
 							</Text>
-							<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
+							<View style={styles.metaRow}>
+								<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
+								{isWorking ? (
+									<View
+										style={styles.activeBadge}
+										testID={`thread-item-status-${String(index)}`}
+									>
+										<ActivityIndicator color="#9FDBFF" size={10} />
+										<Text style={styles.activeBadgeLabel}>Active</Text>
+									</View>
+								) : null}
+							</View>
 						</View>
 							{isLoading ? (
 								<ActivityIndicator color={palette.text} size="small" />
@@ -232,6 +249,29 @@ const styles = StyleSheet.create({
 	rowMeta: {
 		color: "#98A0AF",
 		fontSize: 12,
+	},
+	metaRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
+		paddingTop: 3,
+	},
+	activeBadge: {
+		alignItems: "center",
+		backgroundColor: "rgba(99,200,255,0.12)",
+		borderColor: "rgba(99,200,255,0.5)",
+		borderRadius: 999,
+		borderWidth: 1,
+		flexDirection: "row",
+		gap: 4,
+		paddingHorizontal: 8,
+		paddingVertical: 2,
+	},
+	activeBadgeLabel: {
+		color: "#9FDBFF",
+		fontSize: 10,
+		fontWeight: "700",
+		textTransform: "uppercase",
 	},
 	rowTitle: {
 		color: "#F1F4FA",

@@ -114,6 +114,7 @@ test("RemoteCodeApi lists thread summaries from GET /v1/projects/:id/threads", a
 				threads: [
 					{
 						id: "chat-1",
+						isActive: false,
 						title: "Thread 1",
 						updatedAt: "2026-01-01T00:00:00.000Z",
 					},
@@ -134,6 +135,7 @@ test("RemoteCodeApi lists thread summaries from GET /v1/projects/:id/threads", a
 		expect(threads).toEqual([
 			{
 				id: "chat-1",
+				isActive: false,
 				title: "Thread 1",
 				updatedAt: "2026-01-01T00:00:00.000Z",
 			},
@@ -153,6 +155,7 @@ test("RemoteCodeApi returns chat context from GET /v1/chats/:id/context", async 
 			data: {
 				chat: {
 					id: "chat-1",
+					isActive: false,
 					projectId: "project-1",
 					title: "Thread 1",
 					status: "completed",
@@ -309,6 +312,49 @@ test("RemoteCodeApi issues delete requests for projects and chats", async () => 
 		expect(calls).toEqual(["/v1/projects/project-1", "/v1/chats/chat-1"]);
 		expect(deletedProject).toEqual({ deleted: true });
 		expect(deletedChat).toEqual({ deleted: true });
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi issues force-stop request for chat runtime", async () => {
+	let method = "";
+	let pathname = "";
+
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		pathname = url.pathname;
+		return jsonResponse({
+			data: {
+				chat: {
+					diffAdded: 0,
+					diffRemoved: 0,
+					id: "chat-1",
+					isActive: false,
+					projectId: "project-1",
+					provider: "codex",
+					status: "failed",
+					title: "Thread 1",
+					updatedAt: "2026-01-01T00:00:01.000Z",
+				},
+				state: "stale_cleared",
+				stopped: true,
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+		const stopped = await client.stopChat("chat-1");
+
+		expect(method).toBe("POST");
+		expect(pathname).toBe("/v1/chats/chat-1/stop");
+		expect(stopped.stopped).toBe(true);
+		expect(stopped.state).toBe("stale_cleared");
+		expect(stopped.chat?.isActive).toBe(false);
 	} finally {
 		restore();
 	}

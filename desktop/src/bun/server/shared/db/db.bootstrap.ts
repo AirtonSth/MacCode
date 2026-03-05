@@ -8,6 +8,7 @@ const chatsCreateSql = `
 		provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex')),
 		providerThreadId TEXT,
 		status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+		isActive INTEGER NOT NULL DEFAULT 0,
 		diffAdded INTEGER NOT NULL DEFAULT 0,
 		diffRemoved INTEGER NOT NULL DEFAULT 0,
 		updatedAt TEXT NOT NULL
@@ -152,14 +153,19 @@ export class DatabaseBootstrap {
 
 	private static needsChatsMigration(database: Database): boolean {
 		const hasThreadColumn = this.hasColumn(database, "chats", "providerThreadId");
+		const hasIsActiveColumn = this.hasColumn(database, "chats", "isActive");
 		const createSql = this.getTableDefinition(database, "chats");
 		const hasLegacyProviderConstraint = createSql.includes("CHECK(provider = 'fake')");
-		return hasLegacyProviderConstraint || !hasThreadColumn;
+		return hasLegacyProviderConstraint || !hasThreadColumn || !hasIsActiveColumn;
 	}
 
 	private static rebuildChatsTable(database: Database): void {
 		const hasThreadColumn = this.hasColumn(database, "chats", "providerThreadId");
+		const hasIsActiveColumn = this.hasColumn(database, "chats", "isActive");
 		const threadSelection = hasThreadColumn ? "providerThreadId" : "NULL";
+		const isActiveSelection = hasIsActiveColumn
+			? "COALESCE(isActive, CASE WHEN status = 'running' THEN 1 ELSE 0 END)"
+			: "CASE WHEN status = 'running' THEN 1 ELSE 0 END";
 
 		database.exec("PRAGMA foreign_keys = OFF;");
 		database.exec("BEGIN;");
@@ -173,6 +179,7 @@ export class DatabaseBootstrap {
 					provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex')),
 					providerThreadId TEXT,
 					status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+					isActive INTEGER NOT NULL DEFAULT 0,
 					diffAdded INTEGER NOT NULL DEFAULT 0,
 					diffRemoved INTEGER NOT NULL DEFAULT 0,
 					updatedAt TEXT NOT NULL
@@ -187,6 +194,7 @@ export class DatabaseBootstrap {
 					provider,
 					providerThreadId,
 					status,
+					isActive,
 					diffAdded,
 					diffRemoved,
 					updatedAt
@@ -201,6 +209,7 @@ export class DatabaseBootstrap {
 					END,
 					${threadSelection},
 					status,
+					${isActiveSelection},
 					COALESCE(diffAdded, 0),
 					COALESCE(diffRemoved, 0),
 					updatedAt

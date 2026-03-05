@@ -20,6 +20,7 @@ import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { queryKeys } from "../../../shared/api/query-keys";
 import { createRealtimeClient, type ConnectionState } from "../../../shared/api/ws-client";
 import type {
+	ActiveThreadSummaryDTO,
 	AssistantStreamItemState,
 	ChatContextDTO,
 	ChatDTO,
@@ -274,15 +275,16 @@ const toProjectDtoFromSummary = (project: { id: string; name: string; path: stri
 });
 
 const toChatDtoFromThreadSummary = (
-	chat: { id: string; title: string; updatedAt: string },
+	chat: { id: string; isActive: boolean; title: string; updatedAt: string },
 	projectId: string | null,
 ): ChatDTO => ({
 	diffAdded: 0,
 	diffRemoved: 0,
 	id: chat.id,
+	isActive: chat.isActive,
 	projectId: projectId ?? "",
 	provider: "codex",
-	status: "pending",
+	status: chat.isActive ? "running" : "pending",
 	title: chat.title,
 	updatedAt: chat.updatedAt,
 });
@@ -317,6 +319,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const [selectedChatId, setSelectedChatId] = useState<string | null>(initialSelection.selectedChatId);
 	const [streamingTextByChat, setStreamingTextByChat] = useState<Record<string, string>>({});
 	const [streamHistoryByChat, setStreamHistoryByChat] = useState<Record<string, StreamTurnState[]>>({});
+	const [stoppingByChat, setStoppingByChat] = useState<Record<string, boolean>>({});
 	const [permissionMode, setPermissionMode] = useState<string>(initialSelection.permissionMode);
 	const [selectedModel, setSelectedModel] = useState<string | null>(initialSelection.selectedModel);
 	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(
@@ -328,6 +331,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const selectedChatIdRef = useRef<string | null>(selectedChatId);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const pendingCompletionNotificationChatIdsRef = useRef<Set<string>>(new Set());
+	const lastSendAttemptChatIdRef = useRef<string | null>(null);
 	const fcmTokenRef = useRef<string | null>(null);
 	const liveActivityTokenByChatRef = useRef<Record<string, string>>({});
 	const registeredLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
@@ -362,6 +366,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		queryKey: ["codex-models"],
 		queryFn: async () => await client.listCodexModels(),
 		staleTime: 5 * 60_000,
+	});
+	const activeThreadsQuery = useQuery({
+		enabled: isActive,
+		queryFn: async () => await client.listActiveThreads(),
+		queryKey: queryKeys.activeThreads,
+		refetchInterval: 2_500,
+		staleTime: 1_000,
 	});
 
 	const invalidateWorkspaceQuery = useCallback((queryKey: readonly unknown[]) => {
@@ -410,11 +421,20 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	}, [projectsQuery.data]);
 
 	const chats = useMemo<ChatDTO[]>(() => {
-		const rawChats = (chatsQuery.data ?? []) as (ChatDTO | { id: string; title: string; updatedAt: string })[];
+		const rawChats = (chatsQuery.data ?? []) as Array<
+			| ChatDTO
+			| { id: string; isActive?: boolean; title: string; updatedAt: string }
+		>;
 		return rawChats.map((chat) => (
 			"projectId" in chat
 				? chat
-				: toChatDtoFromThreadSummary(chat, selectedProjectId)
+				: toChatDtoFromThreadSummary(
+					{
+						...chat,
+						isActive: chat.isActive ?? false,
+					},
+					selectedProjectId,
+				)
 		));
 	}, [chatsQuery.data, selectedProjectId]);
 
@@ -913,6 +933,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			if (event.event === "chat_updated") {
+				invalidateWorkspaceQuery(queryKeys.activeThreads);
 				const activeProjectId = selectedProjectIdRef.current;
 				if (activeProjectId && shouldEnableChatsQuery) {
 					invalidateWorkspaceQuery(queryKeys.chats(activeProjectId));
@@ -927,6 +948,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 									...current.chat,
 									diffAdded: event.data.diffAdded,
 									diffRemoved: event.data.diffRemoved,
+									isActive: event.data.isActive,
 									status: event.data.status,
 									updatedAt: event.data.updatedAt,
 								},
@@ -1007,6 +1029,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					case "chat_created":
 					case "chat_deleted":
 					case "chat_updated": {
+						invalidateWorkspaceQuery(queryKeys.activeThreads);
 						if (activeChatId && workspaceChatId && workspaceChatId === activeChatId) {
 							invalidateWorkspaceQuery(queryKeys.chatContext(activeChatId));
 						}
@@ -1509,17 +1532,24 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const sendMessage = useMutation({
 		mutationFn: async (rawText: string) => {
 			const text = rawText.trim();
+			lastSendAttemptChatIdRef.current = null;
 
-			if (!selectedProjectId || text.length === 0) {
+			const activeProjectId = selectedProjectIdRef.current;
+			if (!activeProjectId || text.length === 0) {
 				return false;
 			}
 
-			const selectedChatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
-			const selectedChatFromContext = selectedChatId
-				? queryClient.getQueryData<ChatContextDTO>(queryKeys.chatContext(selectedChatId))?.chat ?? null
+			const activeSelectedChatId = selectedChatIdRef.current;
+			const selectedChatFromList = chats.find((chat) => chat.id === activeSelectedChatId) ?? null;
+			const selectedChatFromContext = activeSelectedChatId
+				? queryClient.getQueryData<ChatContextDTO>(queryKeys.chatContext(activeSelectedChatId))?.chat ?? null
 				: null;
 			const selectedChat = selectedChatFromList ?? selectedChatFromContext;
-			if (selectedChat?.status === "running") {
+			const isSelectedChatActiveFromThreadList = Boolean(
+				activeSelectedChatId &&
+				(activeThreadsQuery.data ?? []).some((thread) => thread.id === activeSelectedChatId),
+			);
+			if (selectedChat?.isActive || isSelectedChatActiveFromThreadList) {
 				setLastError("This thread is currently running. Wait until it finishes.");
 				return false;
 			}
@@ -1533,16 +1563,17 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			const placeholderChatIdToDelete =
 				replacementChat && selectedChat ? selectedChat.id : null;
 			const fallbackChat =
-				replacementChat || selectedChatId ? null : await createChat(text);
+				replacementChat || selectedChat ? null : await createChat(text);
 			const activeChatId =
 				replacementChat?.id ??
-				selectedChatId ??
+				selectedChat?.id ??
 				fallbackChat?.id ??
 				null;
 
 			if (!activeChatId) {
 				return false;
 			}
+			lastSendAttemptChatIdRef.current = activeChatId;
 
 			const nextMessage: MessageDTO = {
 				chatId: activeChatId,
@@ -1568,6 +1599,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}));
 			pendingSendChatIdsRef.current.add(activeChatId);
 			pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
+			invalidateWorkspaceQuery(queryKeys.activeThreads);
 			if (!isThreadLiveActivityEnabled()) {
 				void ensureLocalNotificationPermission();
 			}
@@ -1582,6 +1614,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				clientId: clientIdRef.current,
 				model: selectedModel ?? undefined,
 				permissionMode,
+				projectId: activeProjectId,
 				reasoningEffort: selectedReasoningEffort ?? undefined,
 				requestId: toRequestId(),
 			});
@@ -1596,7 +1629,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			return true;
 		},
 		onError: (error: unknown) => {
-			const selected = selectedChatIdRef.current;
+			const selected = lastSendAttemptChatIdRef.current ?? selectedChatIdRef.current;
 			if (selected) {
 				pendingSendChatIdsRef.current.delete(selected);
 				pendingCompletionNotificationChatIdsRef.current.delete(selected);
@@ -1610,7 +1643,136 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 			setLastError(error instanceof Error ? error.message : "Failed to send message");
 		},
+		onSettled: () => {
+			lastSendAttemptChatIdRef.current = null;
+		},
 	});
+
+	const forceStopActiveChat = useCallback(async (): Promise<boolean> => {
+		const chatId = selectedChatIdRef.current;
+		if (!chatId) {
+			return false;
+		}
+
+		setStoppingByChat((current) => ({
+			...current,
+			[chatId]: true,
+		}));
+
+		try {
+			const result = await client.stopChat(chatId);
+			const activeProjectId = selectedProjectIdRef.current;
+			const stoppedChat = result.chat;
+
+			if (stoppedChat) {
+				queryClient.setQueryData<ChatContextDTO>(
+					queryKeys.chatContext(chatId),
+					(current) => (
+						current
+							? {
+								...current,
+								chat: {
+									...current.chat,
+									diffAdded: stoppedChat.diffAdded,
+									diffRemoved: stoppedChat.diffRemoved,
+									isActive: stoppedChat.isActive,
+									status: stoppedChat.status,
+									title: stoppedChat.title,
+									updatedAt: stoppedChat.updatedAt,
+								},
+							}
+							: current
+					),
+				);
+
+				if (activeProjectId) {
+					queryClient.setQueryData<Array<ChatDTO | { id: string; isActive?: boolean; title: string; updatedAt: string }>>(
+						queryKeys.chats(activeProjectId),
+						(current) => {
+							if (!Array.isArray(current)) {
+								return current;
+							}
+
+							return current.map((chat) => {
+								if (chat.id !== chatId) {
+									return chat;
+								}
+
+								if ("projectId" in chat) {
+									return {
+										...chat,
+										diffAdded: stoppedChat.diffAdded,
+										diffRemoved: stoppedChat.diffRemoved,
+										isActive: stoppedChat.isActive,
+										status: stoppedChat.status,
+										title: stoppedChat.title,
+										updatedAt: stoppedChat.updatedAt,
+									};
+								}
+
+								return {
+									...chat,
+									isActive: stoppedChat.isActive,
+									title: stoppedChat.title,
+									updatedAt: stoppedChat.updatedAt,
+								};
+							});
+						},
+					);
+				}
+			}
+
+			if (result.stopped) {
+				queryClient.setQueryData<ActiveThreadSummaryDTO[]>(
+					queryKeys.activeThreads,
+					(current) => Array.isArray(current) ? current.filter((thread) => thread.id !== chatId) : current,
+				);
+				queryClient.setQueryData(queryKeys.streamTurn(chatId), null);
+				setStreamingTextByChat((current) => ({
+					...current,
+					[chatId]: "",
+				}));
+				pendingSendChatIdsRef.current.delete(chatId);
+				setSendingByChat((current) => ({
+					...current,
+					[chatId]: false,
+				}));
+				pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+				finishLiveActivity(chatId, {
+					outcome: "error",
+				});
+				setLastError(null);
+				invalidateWorkspaceQuery(queryKeys.activeThreads);
+				if (activeProjectId && shouldEnableChatsQuery) {
+					invalidateWorkspaceQuery(queryKeys.chats(activeProjectId));
+				}
+				invalidateWorkspaceQuery(queryKeys.chatContext(chatId));
+				return true;
+			}
+
+			setLastError("This thread is no longer running.");
+			return false;
+		} catch (error) {
+			setLastError(error instanceof Error ? error.message : "Failed to stop thread");
+			return false;
+		} finally {
+			setStoppingByChat((current) => {
+				if (!current[chatId]) {
+					return current;
+				}
+
+				const next = { ...current };
+				delete next[chatId];
+				return next;
+			});
+		}
+	}, [
+		client,
+		finishLiveActivity,
+		invalidateWorkspaceQuery,
+		queryClient,
+		shouldEnableChatsQuery,
+	]);
 
 	const setStreamItemExpanded = useCallback(
 		(itemId: string, expanded: boolean, byUser: boolean) => {
@@ -1714,6 +1876,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
 	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
 	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
+	const isStopping = selectedChatId ? Boolean(stoppingByChat[selectedChatId]) : false;
 	const hasChatsData = Array.isArray(chatsQuery.data);
 	const isChatsLoading =
 		Boolean(selectedProjectId) &&
@@ -1735,8 +1898,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		shouldEnableProjectsQuery &&
 		(projectsQuery.isPending || (projectsQuery.fetchStatus === "fetching" && projects.length === 0));
 	const hasSelectionSnapshot = selectionQuery.data !== undefined || selectionQuery.isFetched;
+	const activeThreads = activeThreadsQuery.data ?? [];
+	const isActiveThreadsLoading = activeThreadsQuery.isPending && activeThreads.length === 0;
 
 	return {
+		activeThreads,
 		availableModels: modelsQuery.data?.models ?? [],
 		chatsErrorMessage,
 		chats,
@@ -1750,7 +1916,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		isLoadingOlderMessages: shouldEnableMessagesQuery ? messagesQuery.isLoadingOlderMessages : false,
 		isChatsLoading,
 		isMessagesLoading,
+		isActiveThreadsLoading,
 		isSending,
+		isStopping,
 		lastError,
 		loadOlderMessages: shouldEnableMessagesQuery ? messagesQuery.loadOlderMessages : async () => undefined,
 		messages,
@@ -1772,6 +1940,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		selectedProject,
 		selectedProjectId,
 		sendMessage: sendMessage.mutateAsync,
+		forceStopActiveChat,
 		streamHistoryTurns,
 		streamingText,
 		streamingTurn: streamTurnQuery.data ?? null,

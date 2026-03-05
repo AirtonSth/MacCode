@@ -8,7 +8,12 @@ const createMockService = (): WsService => ({
 	getChatById: async (): Promise<ChatDTO | null> => null,
 	getChatStreamSnapshot: async (): Promise<ChatStreamSnapshotDTO | null> => null,
 	isChatRunning: (): boolean => false,
+	listRunningChatIds: (): string[] => [],
 	listWorkspaceEventsAfter: () => [],
+	stopRunningChat: async () => ({
+		chat: null,
+		state: "not_running" as const,
+	}),
 	startUserMessage: async () => {
 		// no-op
 	},
@@ -60,6 +65,7 @@ test("WsController emits assistant stream events to chat and workspace subscribe
 			chatId: "chat-1",
 			diffAdded: 0,
 			diffRemoved: 0,
+			isActive: true,
 			status: "running",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 		},

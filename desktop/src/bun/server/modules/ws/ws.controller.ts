@@ -257,7 +257,7 @@ export class WsController {
 						}
 
 						this.joinChat(chatId, ws as BroadcastSocket);
-						if (chat.status === "running") {
+						if (chat.isActive && this.service.isChatRunning(chatId)) {
 							const snapshot = await this.service.getChatStreamSnapshot(chatId);
 							if (snapshot && snapshot.partialText.length > 0) {
 								(ws as BroadcastSocket).send({
@@ -361,6 +361,22 @@ export class WsController {
 							});
 							return;
 						}
+						const rawProjectId = (payload.data as { projectId?: unknown }).projectId;
+						const projectId =
+							typeof rawProjectId === "string" && rawProjectId.trim().length > 0
+								? rawProjectId.trim()
+								: null;
+						if (rawProjectId !== undefined && projectId === null) {
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: invalid projectId",
+								},
+								event: "error",
+							});
+							return;
+						}
 
 						this.joinChat(chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
@@ -369,6 +385,7 @@ export class WsController {
 							emit,
 							model: model ?? undefined,
 							permissionMode: permissionMode ?? undefined,
+							projectId: projectId ?? undefined,
 							requestId:
 								typeof payload.data.requestId === "string"
 									? payload.data.requestId.trim() || undefined

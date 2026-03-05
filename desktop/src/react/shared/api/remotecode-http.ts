@@ -24,6 +24,7 @@ export interface WorkspaceSummaryDTO {
 
 export interface ChatDTO {
 	id: string;
+	isActive: boolean;
 	projectId: string;
 	provider: "fake" | "codex";
 	title: string;
@@ -35,6 +36,15 @@ export interface ChatDTO {
 
 export interface ThreadSummaryDTO {
 	id: string;
+	isActive: boolean;
+	title: string;
+	updatedAt: string;
+}
+
+export interface ActiveThreadSummaryDTO {
+	id: string;
+	projectId: string;
+	projectName: string;
 	title: string;
 	updatedAt: string;
 }
@@ -236,6 +246,10 @@ interface RestListThreadSummariesResponse {
 	threads: ThreadSummaryDTO[];
 }
 
+interface RestListActiveThreadsResponse {
+	threads: ActiveThreadSummaryDTO[];
+}
+
 interface RestCreateChatResponse {
 	chat: ChatDTO;
 }
@@ -262,6 +276,12 @@ interface RestWorkspaceSelectionResponse {
 
 interface RestDeleteResponse {
 	deleted: boolean;
+}
+
+export interface StopChatResponseDTO {
+	chat: ChatDTO | null;
+	state: "not_running" | "stale_cleared" | "stopping";
+	stopped: boolean;
 }
 
 interface RestFsRootsResponse {
@@ -453,6 +473,15 @@ export const RemoteCodeApi = {
 					return payload.threads;
 				},
 
+				listActiveThreads: async (): Promise<ActiveThreadSummaryDTO[]> => {
+					const payload = await request<RestListActiveThreadsResponse>({
+						method: "GET",
+						path: "/threads/active/runtime",
+					});
+
+					return payload.threads;
+				},
+
 				createChat: async (projectId: string, title?: string): Promise<ChatDTO> => {
 					const payload = await request<RestCreateChatResponse>({
 						body: { title },
@@ -572,6 +601,13 @@ export const RemoteCodeApi = {
 				return await request<RestDeleteResponse>({
 					method: "DELETE",
 					path: `/chats/${id}`,
+				});
+			},
+
+			stopChat: async (id: string): Promise<StopChatResponseDTO> => {
+				return await request<StopChatResponseDTO>({
+					method: "POST",
+					path: `/chats/${id}/stop`,
 				});
 			},
 

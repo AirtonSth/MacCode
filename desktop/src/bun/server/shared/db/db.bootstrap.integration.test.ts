@@ -105,6 +105,12 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 		expect(chatStreamEventIndexes).toContain("idx_chat_stream_events_chat_id_id");
 		expect(chatStreamEventIndexes).toContain("idx_chat_stream_events_chat_id_turn_id_id");
 
+		const chatColumns = client.sqlite
+			.prepare("PRAGMA table_info(chats)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+		expect(chatColumns).toContain("isActive");
+
 		expect(
 			(client.sqlite.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys,
 		).toBe(1);
@@ -223,6 +229,7 @@ test("DB initialization migrates legacy chats schema and preserves data", async 
 				.all()
 				.map((row) => (row as { name: string }).name);
 			expect(chatColumns).toContain("providerThreadId");
+			expect(chatColumns).toContain("isActive");
 
 			const workspaceSelectionColumns = client.sqlite
 				.prepare("PRAGMA table_info(workspace_selection)")
@@ -233,16 +240,18 @@ test("DB initialization migrates legacy chats schema and preserves data", async 
 			);
 
 		const migratedChat = client.sqlite
-			.prepare("SELECT provider, providerThreadId, diffAdded, diffRemoved FROM chats WHERE id = ?")
+			.prepare("SELECT provider, providerThreadId, isActive, diffAdded, diffRemoved FROM chats WHERE id = ?")
 			.get("chat-1") as {
 				diffAdded: number;
 				diffRemoved: number;
+				isActive: number;
 				provider: string;
 				providerThreadId: string | null;
 			};
 
 		expect(migratedChat.provider).toBe("fake");
 		expect(migratedChat.providerThreadId).toBeNull();
+		expect(migratedChat.isActive).toBe(0);
 		expect(migratedChat.diffAdded).toBe(9);
 		expect(migratedChat.diffRemoved).toBe(2);
 	} finally {

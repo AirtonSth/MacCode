@@ -11,7 +11,12 @@ import type { MessageRepository } from "../message/message.repository";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
-import type { WsService as WsServiceContract, WsServiceInput } from "./ws.model";
+import type {
+	StopRunningChatInput,
+	StopRunningChatResult,
+	WsService as WsServiceContract,
+	WsServiceInput,
+} from "./ws.model";
 
 const noopChatStreamSnapshotRepository: ChatStreamSnapshotRepositoryContract = {
 	appendDelta: (chatId: string, delta: string) => ({
@@ -43,6 +48,7 @@ const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
 
 export class WsService implements WsServiceContract {
 	private readonly runningChats = new Set<string>();
+	private readonly runningChatAbortControllers = new Map<string, AbortController>();
 
 	constructor(
 		private readonly chatRepository: ChatRepository,
@@ -92,6 +98,7 @@ export class WsService implements WsServiceContract {
 				chatId,
 				diffAdded: updatedChat.diffAdded,
 				diffRemoved: updatedChat.diffRemoved,
+				isActive: updatedChat.isActive,
 				status: updatedChat.status,
 				updatedAt: updatedChat.updatedAt,
 			},
@@ -103,6 +110,7 @@ export class WsService implements WsServiceContract {
 				chatId,
 				diffAdded: updatedChat.diffAdded,
 				diffRemoved: updatedChat.diffRemoved,
+				isActive: updatedChat.isActive,
 				status: updatedChat.status,
 				updatedAt: updatedChat.updatedAt,
 			},
@@ -117,12 +125,76 @@ export class WsService implements WsServiceContract {
 		return this.runningChats.has(chatId);
 	}
 
+	listRunningChatIds(): string[] {
+		return [...this.runningChats];
+	}
+
 	listWorkspaceEventsAfter(lastSeq: number, options?: { limit?: number }): WorkspaceEventEnvelope[] {
 		if (!this.workspaceEvents) {
 			return [];
 		}
 
 		return this.workspaceEvents.listAfterSeq(lastSeq, options?.limit);
+	}
+
+	async stopRunningChat(input: StopRunningChatInput): Promise<StopRunningChatResult> {
+		const chat = await this.chatRepository.findChatById(input.chatId);
+
+		if (!chat) {
+			return {
+				chat: null,
+				state: "not_found",
+			};
+		}
+
+		if (this.runningChats.has(input.chatId)) {
+			const controller = this.runningChatAbortControllers.get(input.chatId);
+			if (!controller) {
+				return {
+					chat,
+					state: "not_running",
+				};
+			}
+
+			controller.abort("force_stop");
+			return {
+				chat,
+				state: "stopping",
+			};
+		}
+
+		if (!chat.isActive && chat.status !== "running") {
+			return {
+				chat,
+				state: "not_running",
+			};
+		}
+
+		const updatedChat = await this.chatRepository.updateChat(input.chatId, {
+			isActive: false,
+			status: "failed",
+		});
+
+		if (updatedChat) {
+			this.workspaceEvents?.append({
+				type: "chat_updated",
+				payload: {
+					chatId: updatedChat.id,
+					diffAdded: updatedChat.diffAdded,
+					diffRemoved: updatedChat.diffRemoved,
+					isActive: updatedChat.isActive,
+					status: updatedChat.status,
+					updatedAt: updatedChat.updatedAt,
+				},
+				originClientId: input.clientId ?? null,
+				requestId: input.requestId ?? null,
+			});
+		}
+
+		return {
+			chat: updatedChat,
+			state: "stale_cleared",
+		};
 	}
 
 	async getChatById(chatId: string): Promise<ChatDTO | null> {
@@ -142,6 +214,18 @@ export class WsService implements WsServiceContract {
 			return;
 		}
 
+		const requestedProjectId = input.projectId?.trim();
+		if (requestedProjectId && requestedProjectId !== chat.projectId) {
+			emit(
+				WsService.createClientErrorEvent(
+					"chat_stale_target",
+					"selected chat does not belong to the selected project",
+					chatId,
+				),
+			);
+			return;
+		}
+
 		if (chat.provider === "fake") {
 			emit(
 				WsService.createClientErrorEvent(
@@ -153,7 +237,7 @@ export class WsService implements WsServiceContract {
 			return;
 		}
 
-		if (this.runningChats.has(chatId) || chat.status === "running") {
+		if (this.runningChats.has(chatId) || chat.isActive) {
 			emit(WsService.createClientErrorEvent("chat_running", "chat is already running", chatId));
 			return;
 		}
@@ -165,9 +249,10 @@ export class WsService implements WsServiceContract {
 			return;
 		}
 
-		await this.chatRepository.updateChat(chatId, {
+		const runningChat = await this.chatRepository.updateChat(chatId, {
 			diffAdded: 0,
 			diffRemoved: 0,
+			isActive: true,
 			status: "running",
 		});
 		const userMessage = await this.messageRepository.createMessage(chatId, "user", text);
@@ -179,13 +264,14 @@ export class WsService implements WsServiceContract {
 			originClientId: clientId ?? null,
 			requestId: requestId ?? null,
 		});
-		const runningUpdatedAt = new Date().toISOString();
+		const runningUpdatedAt = runningChat?.updatedAt ?? new Date().toISOString();
 		this.workspaceEvents?.append({
 			type: "chat_updated",
 			payload: {
 				chatId,
 				diffAdded: 0,
 				diffRemoved: 0,
+				isActive: true,
 				status: "running",
 				updatedAt: runningUpdatedAt,
 			},
@@ -197,6 +283,7 @@ export class WsService implements WsServiceContract {
 				chatId,
 				diffAdded: 0,
 				diffRemoved: 0,
+				isActive: true,
 				status: "running",
 				updatedAt: runningUpdatedAt,
 			},
@@ -205,6 +292,8 @@ export class WsService implements WsServiceContract {
 		this.chatStreamSnapshots.reset(chatId);
 
 		this.runningChats.add(chatId);
+		const runAbortController = new AbortController();
+		this.runningChatAbortControllers.set(chatId, runAbortController);
 
 		try {
 			const permissionMode = input.permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
@@ -234,6 +323,7 @@ export class WsService implements WsServiceContract {
 				},
 				permissionMode,
 				reasoningEffort: input.reasoningEffort,
+				signal: runAbortController.signal,
 				text,
 				threadId: this.chatRepository.findProviderThreadIdByChatId(chatId) ?? undefined,
 				workspacePath: project.path,
@@ -247,16 +337,18 @@ export class WsService implements WsServiceContract {
 				await this.chatRepository.updateChat(chatId, {
 					diffAdded: providerResult.diffAdded,
 					diffRemoved: providerResult.diffRemoved,
+					isActive: false,
 					status: "failed",
 				});
 				await this.emitChatUpdatedEvent(chatId, emit, {
 					clientId,
 					requestId,
 				});
+				const wasCancelled = providerResult.cancelled === true || runAbortController.signal.aborted;
 				emit(
 					WsService.createClientErrorEvent(
-						"provider_failed",
-						providerResult.error || "provider failed",
+						wasCancelled ? "chat_cancelled" : "provider_failed",
+						wasCancelled ? "chat run cancelled" : (providerResult.error || "provider failed"),
 						chatId,
 					),
 				);
@@ -267,6 +359,7 @@ export class WsService implements WsServiceContract {
 			await this.chatRepository.updateChat(chatId, {
 				diffAdded: providerResult.diffAdded,
 				diffRemoved: providerResult.diffRemoved,
+				isActive: false,
 				status: "completed",
 			});
 			this.workspaceEvents?.append({
@@ -287,8 +380,26 @@ export class WsService implements WsServiceContract {
 				clientId,
 				requestId,
 			});
+		} catch (error) {
+			await this.chatRepository.updateChat(chatId, {
+				isActive: false,
+				status: "failed",
+			});
+			await this.emitChatUpdatedEvent(chatId, emit, {
+				clientId,
+				requestId,
+			});
+			const wasCancelled = runAbortController.signal.aborted;
+			emit(
+				WsService.createClientErrorEvent(
+					wasCancelled ? "chat_cancelled" : "provider_failed",
+					wasCancelled ? "chat run cancelled" : (error instanceof Error ? error.message : "provider failed"),
+					chatId,
+				),
+			);
 		} finally {
 			this.runningChats.delete(chatId);
+			this.runningChatAbortControllers.delete(chatId);
 			this.chatStreamSnapshots.clear(chatId);
 		}
 	}

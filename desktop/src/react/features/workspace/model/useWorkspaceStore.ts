@@ -18,6 +18,7 @@ export type ChatStatus = "pending" | "running" | "completed" | "failed";
 
 export interface ChatDTO {
 	id: string;
+	isActive: boolean;
 	projectId: string;
 	title: string;
 	provider: "fake" | "codex";
@@ -135,6 +136,13 @@ export type WorkspaceAction =
 	| { type: "CLEAR_ERRORS_BY_SOURCE"; payload: "rest" | "ws" };
 
 const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+const sortChatsByUpdatedAtDesc = (chats: ChatDTO[]): ChatDTO[] =>
+	[...chats].sort((a, b) => {
+		if (a.updatedAt > b.updatedAt) return -1;
+		if (a.updatedAt < b.updatedAt) return 1;
+		return 0;
+	});
 
 const createStreamTurnState = (turnId: string): StreamTurnState => ({
 	turnId,
@@ -335,27 +343,24 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				chatsLoading: action.payload,
 			};
 
-		case "SET_CHATS":
+		case "SET_CHATS": {
+			const sortedChats = sortChatsByUpdatedAtDesc(action.payload);
 			return {
 				...state,
-				chats: action.payload,
+				chats: sortedChats,
 				chatsLoading: false,
-				selectedChatId: action.payload[0]?.id ?? null,
+				selectedChatId: sortedChats[0]?.id ?? null,
 				messages: [],
 			};
+		}
 
 		case "UPSERT_CHAT":
 			return {
 				...state,
-				chats: [
+				chats: sortChatsByUpdatedAtDesc([
 					...state.chats.filter((chat) => chat.id !== action.payload.id),
 					action.payload,
-				]
-					.sort((a, b) => {
-						if (a.updatedAt > b.updatedAt) return -1;
-						if (a.updatedAt < b.updatedAt) return 1;
-						return 0;
-					}),
+				]),
 				selectedChatId: action.payload.id,
 				messages: [],
 			};
@@ -363,8 +368,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 		case "UPDATE_CHAT":
 			return {
 				...state,
-				chats: state.chats.map((chat) =>
-					chat.id === action.payload.id ? { ...chat, ...action.payload } : chat,
+				chats: sortChatsByUpdatedAtDesc(
+					state.chats.map((chat) =>
+						chat.id === action.payload.id ? { ...chat, ...action.payload } : chat,
+					),
 				),
 			};
 

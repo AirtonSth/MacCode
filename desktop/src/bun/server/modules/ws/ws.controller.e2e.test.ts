@@ -327,7 +327,63 @@ test("WS emits validation error for invalid payload", async () => {
 	}
 });
 
-test("WS join_chat emits assistant_snapshot for running chats with persisted partial text", async () => {
+test("WS rejects stale chat target when projectId does not match chat project", async () => {
+	const { baseUrl, cleanup, client } = await createTestServer();
+	const firstWorkspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-stale-first-"));
+	const secondWorkspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-stale-second-"));
+	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	const events: ServerEvent[] = [];
+
+	try {
+		const firstProject = await client.v1.projects.post({ path: firstWorkspaceRoot });
+		const secondProject = await client.v1.projects.post({ path: secondWorkspaceRoot });
+		const firstProjectId = (firstProject.data as { project: { id: string } }).project.id;
+		const secondProjectId = (secondProject.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: firstProjectId }).chats.post({ title: "stale-target" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
+		ws.subscribe((raw: unknown) => {
+			const event = parseEvent((raw as { data: unknown }).data);
+			if (!event) {
+				return;
+			}
+			events.push(event);
+		});
+
+		ws.send({
+			data: {
+				chatId,
+				projectId: secondProjectId,
+				text: "This should be rejected as stale target.",
+			},
+			event: "user_message",
+		});
+
+		await waitForCondition(
+			() => events.some((event) => event.event === "error" && event.data.code === "chat_stale_target"),
+			5_000,
+			"chat_stale_target error event",
+		);
+
+		const staleError = events.find(
+			(event) => event.event === "error" && event.data.code === "chat_stale_target",
+		);
+		expect(staleError?.data.chatId).toBe(chatId);
+		expect(staleError?.data.message).toBe("selected chat does not belong to the selected project");
+
+		const messages = await client.v1.chats({ id: chatId }).messages.get();
+		const payload = messages.data as { messages: unknown[] };
+		expect(payload.messages).toHaveLength(0);
+	} finally {
+		ws?.close();
+		rmSync(firstWorkspaceRoot, { force: true, recursive: true });
+		rmSync(secondWorkspaceRoot, { force: true, recursive: true });
+		await cleanup();
+	}
+});
+
+test("WS join_chat does not emit assistant_snapshot for stale persisted running state after restart", async () => {
 	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
 	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-snapshot-"));
 	let socket: WebSocket | undefined;
@@ -341,8 +397,8 @@ test("WS join_chat emits assistant_snapshot for running chats with persisted par
 		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
 
 		database
-			.prepare("UPDATE chats SET status = ?, updatedAt = ? WHERE id = ?")
-			.run("running", "2026-01-01T00:00:01.000Z", chatId);
+			.prepare("UPDATE chats SET status = ?, isActive = ?, updatedAt = ? WHERE id = ?")
+			.run("running", 1, "2026-01-01T00:00:01.000Z", chatId);
 		database
 			.prepare(
 				"INSERT INTO chat_stream_snapshots (chatId, partialText, updatedAt) VALUES (?, ?, ?) ON CONFLICT(chatId) DO UPDATE SET partialText = excluded.partialText, updatedAt = excluded.updatedAt",
@@ -376,21 +432,8 @@ test("WS join_chat emits assistant_snapshot for running chats with persisted par
 			}),
 		);
 
-		await waitForCondition(
-			() => events.some((event) => event.event === "assistant_snapshot"),
-			5_000,
-			"assistant_snapshot event",
-		);
-
-		const snapshotEvent = events.find((event) => event.event === "assistant_snapshot");
-		expect(snapshotEvent).toEqual({
-			data: {
-				chatId,
-				partialText: "Recovered partial output",
-				updatedAt: "2026-01-01T00:00:02.000Z",
-			},
-			event: "assistant_snapshot",
-		});
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(events.some((event) => event.event === "assistant_snapshot")).toBe(false);
 	} finally {
 		socket?.close();
 		database.close();

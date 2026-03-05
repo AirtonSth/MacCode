@@ -157,6 +157,7 @@ test("parseServerWsEvent parses chat_updated with expected fields", () => {
 			chatId: "chat-1",
 			diffAdded: 3,
 			diffRemoved: 1,
+			isActive: false,
 			status: "running",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 		},

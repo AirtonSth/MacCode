@@ -1,4 +1,10 @@
-import type { ChatContextDTO, ChatDTO, ProjectSummaryDTO, ThreadSummaryDTO } from "../../types";
+import type {
+	ActiveThreadSummaryDTO,
+	ChatContextDTO,
+	ChatDTO,
+	ProjectSummaryDTO,
+	ThreadSummaryDTO,
+} from "../../types";
 import type { ProjectRepository } from "../project/project.repository";
 import type { ChatRepository } from "./chat.repository";
 
@@ -8,9 +14,11 @@ export interface ChatServiceContract {
 	getChatById: (chatId: string) => Promise<ChatDTO | null>;
 	listByProjectId: (projectId: string) => Promise<ChatDTO[] | null>;
 	listThreadSummariesByProjectId: (projectId: string) => Promise<ThreadSummaryDTO[] | null>;
+	listActiveThreads: () => Promise<ActiveThreadSummaryDTO[]>;
+	listActiveThreadsByIds: (chatIds: string[]) => Promise<ActiveThreadSummaryDTO[]>;
 	updateChat: (
 		chatId: string,
-		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>,
 	) => Promise<ChatDTO | null>;
 	deleteChat: (id: string) => Promise<boolean>;
 }
@@ -80,7 +88,18 @@ async createChat(projectId: string, title: string): Promise<ChatDTO | null> {
 		return this.chatRepository.getThreadSummariesByProjectId(projectId);
 	}
 
-	async updateChat(chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved">>): Promise<ChatDTO | null> {
+	async listActiveThreads(): Promise<ActiveThreadSummaryDTO[]> {
+		return this.chatRepository.getActiveThreadSummaries();
+	}
+
+	async listActiveThreadsByIds(chatIds: string[]): Promise<ActiveThreadSummaryDTO[]> {
+		return this.chatRepository.getThreadSummariesByIds(chatIds);
+	}
+
+	async updateChat(
+		chatId: string,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>,
+	): Promise<ChatDTO | null> {
 		const current = await this.chatRepository.findChatById(chatId);
 
 		if (!current) {
@@ -90,6 +109,7 @@ async createChat(projectId: string, title: string): Promise<ChatDTO | null> {
 		const merged = {
 			diffAdded: update.diffAdded ?? current.diffAdded,
 			diffRemoved: update.diffRemoved ?? current.diffRemoved,
+			isActive: update.isActive ?? current.isActive,
 			status: update.status ?? current.status,
 		};
 

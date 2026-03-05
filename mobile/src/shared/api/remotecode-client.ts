@@ -1,5 +1,6 @@
 import type { ApiConfig } from "./api-config-store";
 import type {
+	ActiveThreadSummaryDTO,
 	AuthVerifyResponseDTO,
 	ChatContextDTO,
 	ChatDTO,
@@ -26,6 +27,12 @@ interface DeleteResponse {
 	deleted: boolean;
 }
 
+interface StopChatResponse {
+	chat: ChatDTO | null;
+	state: "not_running" | "stale_cleared" | "stopping";
+	stopped: boolean;
+}
+
 interface CreateProjectResponse {
 	created: boolean;
 	project: ProjectDTO;
@@ -49,6 +56,10 @@ interface ListChatsResponse {
 
 interface ListThreadsResponse {
 	threads: ThreadSummaryDTO[];
+}
+
+interface ListActiveThreadsResponse {
+	threads: ActiveThreadSummaryDTO[];
 }
 
 interface CreateChatResponse {
@@ -98,6 +109,7 @@ export interface RemoteCodeClient {
 	createChat: (projectId: string, title?: string) => Promise<ChatDTO>;
 	createProject: (input: { name?: string; path: string }) => Promise<ProjectDTO>;
 	deleteChat: (chatId: string) => Promise<DeleteResponse>;
+	stopChat: (chatId: string) => Promise<StopChatResponse>;
 	deleteProject: (projectId: string) => Promise<DeleteResponse>;
 	execTerminalCommand: (
 		chatId: string,
@@ -117,6 +129,7 @@ export interface RemoteCodeClient {
 	listFsRoots: () => Promise<FsRootEntryDTO[]>;
 	listChats: (projectId: string) => Promise<ChatDTO[]>;
 	listThreadSummaries: (projectId: string) => Promise<ThreadSummaryDTO[]>;
+	listActiveThreads: () => Promise<ActiveThreadSummaryDTO[]>;
 	listWorkspaceSummaries: () => Promise<WorkspaceSummaryDTO[]>;
 	listMessagesPage: (
 		chatId: string,
@@ -246,6 +259,13 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			});
 		},
 
+		async stopChat(chatId: string) {
+			return await request<StopChatResponse>({
+				method: "POST",
+				path: `/chats/${chatId}/stop`,
+			});
+		},
+
 		async deleteProject(projectId: string) {
 			return await request<DeleteResponse>({
 				method: "DELETE",
@@ -353,6 +373,15 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			const payload = await request<ListThreadsResponse>({
 				method: "GET",
 				path: `/projects/${projectId}/threads`,
+			});
+
+			return payload.threads;
+		},
+
+		async listActiveThreads() {
+			const payload = await request<ListActiveThreadsResponse>({
+				method: "GET",
+				path: "/threads/active/runtime",
 			});
 
 			return payload.threads;

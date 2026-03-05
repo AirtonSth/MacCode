@@ -86,6 +86,7 @@ interface CodexRunnerState {
 type SpawnCodexProcess = (input: {
 	cmd: string[];
 	env: Record<string, string>;
+	signal?: AbortSignal;
 }) => CodexSpawnedProcess;
 
 const asString = (value: unknown): string | null => {
@@ -877,10 +878,11 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 	];
 };
 
-const defaultSpawnProcess: SpawnCodexProcess = ({ cmd, env }) => {
+const defaultSpawnProcess: SpawnCodexProcess = ({ cmd, env, signal }) => {
 	return Bun.spawn({
 		cmd,
 		env,
+		signal,
 		stderr: "pipe",
 		stdout: "pipe",
 	});
@@ -899,6 +901,15 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 			...process.env,
 			RUST_LOG: "off",
 		};
+		const buildCancelledResult = (assistantTextValue: string, threadId?: string): CodexProviderResult => ({
+			assistantText: assistantTextValue,
+			cancelled: true,
+			diffAdded: assistantTextValue.length,
+			diffRemoved: 0,
+			error: "codex run cancelled by user",
+			status: "failed",
+			threadId,
+		});
 
 		let spawnedProcess: CodexSpawnedProcess;
 
@@ -906,8 +917,13 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 			spawnedProcess = this.spawnProcess({
 				cmd: command,
 				env: environment,
+				signal: options.signal,
 			});
 		} catch (error) {
+			if (options.signal?.aborted) {
+				return buildCancelledResult("", options.threadId);
+			}
+
 			return {
 				assistantText: "",
 				diffAdded: 0,
@@ -933,6 +949,16 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 		let stdoutReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 		let stderrText = "";
 		let resolvedExitCode = 0;
+		let executionError: unknown = null;
+		let wasCancelled = Boolean(options.signal?.aborted);
+		let abortListener: (() => void) | null = null;
+
+		if (options.signal) {
+			abortListener = () => {
+				wasCancelled = true;
+			};
+			options.signal.addEventListener("abort", abortListener);
+		}
 
 		try {
 			const stdoutTask = (async () => {
@@ -982,17 +1008,28 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 				? new Response(spawnedProcess.stderr).text()
 				: Promise.resolve("");
 
-			const results = await Promise.all([
-				stdoutTask,
-				stderrTask,
-				spawnedProcess.exited,
-			]);
-			const stderrOutput = results[1];
-			const exitCode = results[2];
+			try {
+				const results = await Promise.all([
+					stdoutTask,
+					stderrTask,
+					spawnedProcess.exited,
+				]);
+				const stderrOutput = results[1];
+				const exitCode = results[2];
 
-			resolvedExitCode = exitCode;
-			stderrText = stderrOutput.trim();
+				resolvedExitCode = exitCode;
+				stderrText = stderrOutput.trim();
+			} catch (error) {
+				executionError = error;
+				if (options.signal?.aborted) {
+					wasCancelled = true;
+				}
+			}
 		} finally {
+			if (options.signal && abortListener) {
+				options.signal.removeEventListener("abort", abortListener);
+			}
+
 			if (stdoutReader) {
 				try {
 					(stdoutReader as ReadableStreamDefaultReader<Uint8Array>).releaseLock();
@@ -1019,6 +1056,22 @@ export class CodexProviderRunner implements CodexProviderRunnerContract {
 		}
 
 		const assistantText = (state.assistantMessage ?? state.agentMessageDeltaText).trim();
+
+		if (wasCancelled) {
+			return buildCancelledResult(assistantText, state.threadId);
+		}
+
+		if (executionError) {
+			return {
+				assistantText,
+				diffAdded: assistantText.length,
+				diffRemoved: 0,
+				error: executionError instanceof Error ? executionError.message : "provider failed",
+				status: "failed",
+				threadId: state.threadId,
+			};
+		}
+
 		const exitCode = resolvedExitCode;
 
 		if (exitCode !== 0) {

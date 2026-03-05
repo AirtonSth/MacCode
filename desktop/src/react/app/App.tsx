@@ -158,6 +158,7 @@ const electrobunView = (() => {
 
 const createDraftThreadChat = (projectId: string): ChatDTO => ({
 	id: `draft-thread-${projectId}`,
+	isActive: false,
 	projectId,
 	title: "New thread",
 	provider: "fake",
@@ -180,12 +181,16 @@ const toProjectDtoFromWorkspaceSummary = (workspace: {
 	updatedAt: FALLBACK_TIMESTAMP,
 });
 
-const toChatDtoFromThreadSummary = (thread: { id: string; title: string; updatedAt: string }, projectId: string): ChatDTO => ({
+const toChatDtoFromThreadSummary = (
+	thread: { id: string; isActive: boolean; title: string; updatedAt: string },
+	projectId: string,
+): ChatDTO => ({
 	id: thread.id,
+	isActive: thread.isActive,
 	projectId,
 	title: thread.title,
 	provider: "codex",
-	status: "pending",
+	status: thread.isActive ? "running" : "pending",
 	diffAdded: 0,
 	diffRemoved: 0,
 	updatedAt: thread.updatedAt,
@@ -454,6 +459,7 @@ const App = (): JSX.Element => {
 	const messagesLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	const messagesLoadQueuedRef = useRef<Set<string>>(new Set());
 	const chatContextLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+	const [stoppingByChat, setStoppingByChat] = useState<Record<string, boolean>>({});
 
 	const baseUrl = useMemo(() => {
 		return (import.meta.env.VITE_REMOTECODE_SERVER_URL || "http://127.0.0.1:8835").trim();
@@ -493,6 +499,19 @@ const App = (): JSX.Element => {
 	const selectedChatSending = selectedChatId
 		? Boolean(state.sendingByChat[selectedChatId])
 		: false;
+	const selectedChatStopping = selectedChatId ? Boolean(stoppingByChat[selectedChatId]) : false;
+	const isChatActive = useCallback(
+		(chatId: string): boolean => {
+			const chat = state.chats.find((item) => item.id === chatId);
+			return Boolean(
+				chat?.isActive ||
+				state.sendingByChat[chatId] ||
+				state.streamingActiveByChat[chatId],
+			);
+		},
+		[state.chats, state.sendingByChat, state.streamingActiveByChat],
+	);
+	const isSelectedThreadWorking = activeThreadChat ? isChatActive(activeThreadChat.id) : false;
 
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
 	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
@@ -1263,6 +1282,7 @@ const App = (): JSX.Element => {
 							diffAdded: event.data.diffAdded,
 							diffRemoved: event.data.diffRemoved,
 							id: event.data.chatId,
+							isActive: event.data.isActive,
 							status: event.data.status,
 							updatedAt: event.data.updatedAt,
 						},
@@ -1363,6 +1383,7 @@ const App = (): JSX.Element => {
 
 							const diffAdded = payload?.diffAdded;
 							const diffRemoved = payload?.diffRemoved;
+							const isActive = payload?.isActive;
 							const status = payload?.status;
 							const updatedAt = payload?.updatedAt;
 
@@ -1370,6 +1391,7 @@ const App = (): JSX.Element => {
 								chatId &&
 								typeof diffAdded === "number" &&
 								typeof diffRemoved === "number" &&
+								typeof isActive === "boolean" &&
 								isChatStatus(status) &&
 								typeof updatedAt === "string"
 							) {
@@ -1378,6 +1400,7 @@ const App = (): JSX.Element => {
 										diffAdded,
 										diffRemoved,
 										id: chatId,
+										isActive,
 										status,
 										updatedAt,
 									},
@@ -1583,7 +1606,7 @@ const App = (): JSX.Element => {
 
 	const handleSendMessage = useCallback(
 		async (text: string) => {
-			if (selectedChat?.status === "running") {
+			if (selectedChat?.isActive) {
 				addError("This thread is currently running. Wait until it finishes.", "ws", "chat_running");
 				return;
 			}
@@ -1610,6 +1633,15 @@ const App = (): JSX.Element => {
 				},
 					onCreateMessageError: addError,
 					onSendUserMessage: (chatId, messageText) => {
+						dispatch({
+							payload: {
+								id: chatId,
+								isActive: true,
+								status: "running",
+								updatedAt: new Date().toISOString(),
+							},
+							type: "UPDATE_CHAT",
+						});
 						const requestId =
 							typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
 								? crypto.randomUUID()
@@ -1617,6 +1649,7 @@ const App = (): JSX.Element => {
 						wsRef.current?.sendUserMessage(
 							chatId,
 							messageText,
+							state.selectedProjectId ?? undefined,
 							permissionMode,
 							selectedModel ?? undefined,
 							selectedReasoningEffort ?? undefined,
@@ -1634,6 +1667,7 @@ const App = (): JSX.Element => {
 					});
 				},
 				selectedChatId: state.selectedChatId,
+				selectedChatExists: Boolean(selectedChat),
 				selectedChatProvider: selectedChat?.provider ?? null,
 				selectedProjectId: state.selectedProjectId,
 				text,
@@ -1660,6 +1694,73 @@ const App = (): JSX.Element => {
 			state.selectedChatId,
 			state.selectedProjectId,
 		],
+	);
+
+	const handleForceStop = useCallback(
+		async () => {
+			const chatId = selectedChatIdRef.current;
+			if (!chatId) {
+				return;
+			}
+
+			setStoppingByChat((current) => ({
+				...current,
+				[chatId]: true,
+			}));
+
+			try {
+				const result = await api.stopChat(chatId);
+				if (result.chat) {
+					dispatch({
+						payload: {
+							diffAdded: result.chat.diffAdded,
+							diffRemoved: result.chat.diffRemoved,
+							id: result.chat.id,
+							isActive: result.chat.isActive,
+							status: result.chat.status,
+							updatedAt: result.chat.updatedAt,
+						},
+						type: "UPDATE_CHAT",
+					});
+
+					if (!result.chat.isActive) {
+						pendingSendChatIdsRef.current.delete(result.chat.id);
+						dispatch({
+							payload: {
+								chatId: result.chat.id,
+								sending: false,
+							},
+							type: "SET_CHAT_SENDING",
+						});
+						dispatch({
+							payload: { chatId: result.chat.id },
+							type: "CLEAR_STREAMING",
+						});
+					}
+				}
+
+				if (!result.stopped) {
+					addError("This thread is no longer running.", "rest", "chat_not_running");
+				}
+			} catch (error) {
+				addError(
+					formatApiErrorMessage(error, "Unable to force stop thread"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			} finally {
+				setStoppingByChat((current) => {
+					if (!current[chatId]) {
+						return current;
+					}
+
+					const next = { ...current };
+					delete next[chatId];
+					return next;
+				});
+			}
+		},
+		[addError, api, dispatch, formatApiErrorCode, formatApiErrorMessage],
 	);
 
 	const persistCurrentSelectionPreferences = useCallback(
@@ -2170,7 +2271,7 @@ const App = (): JSX.Element => {
 																		<li className="px-1.5 py-1 text-[11px] text-slate-400">No threads yet.</li>
 																	) : (
 																		<>
-																			{visibleChats.map((chat) => (
+													{visibleChats.map((chat) => (
 																					<motion.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
 																					<div
                                                                                         aria-label={`Open ${chat.title}`}
@@ -2192,8 +2293,14 @@ const App = (): JSX.Element => {
                                                                                             role="button"
                                                                                             tabIndex={0}
                                                                                         >
-																							<span className={cn("inline-flex min-w-0 items-center", state.selectedChatId === chat.id ? "self-center" : "")}>
+																							<span className={cn("inline-flex min-w-0 items-center gap-1.5", state.selectedChatId === chat.id ? "self-center" : "")}>
                                                                                                 <span className="truncate leading-5">{chat.title}</span>
+																								{isChatActive(chat.id) ? (
+																									<span className="inline-flex items-center gap-1 rounded-full border border-sky-300/25 bg-sky-400/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.06em] text-sky-100">
+																										<Loader2 className="h-2.5 w-2.5 animate-spin" />
+																										Active
+																									</span>
+																								) : null}
                                                                                             </span>
 																				<div className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end">
 																							{chat.id === openingThreadId ? (
@@ -2364,6 +2471,7 @@ const App = (): JSX.Element => {
 														chat={activeThreadChat}
 														focusMode
 														hasRestError={state.errors.some((error) => error.source === "rest")}
+														isWorking={isSelectedThreadWorking}
 														loading={state.messagesLoading}
 														messages={state.messages}
 														onSetStreamItemExpanded={handleSetStreamItemExpanded}
@@ -2392,7 +2500,7 @@ const App = (): JSX.Element => {
 														gitChangedFiles={projectGitState.status?.changedFiles ?? 0}
 														gitAdded={projectGitState.status?.added ?? 0}
 														gitRemoved={projectGitState.status?.removed ?? 0}
-														chatStatus={activeThreadChat?.status ?? null}
+														chatStatus={isSelectedThreadWorking ? "running" : activeThreadChat?.status ?? null}
 														disabled={!state.selectedProjectId}
 														focusMode
 														isGitLoading={projectGitState.loading}
@@ -2405,14 +2513,16 @@ const App = (): JSX.Element => {
 															onPickContextPaths={
 																electrobunView ? handlePickComposerContextPaths : undefined
 															}
-															onPermissionModeChange={handlePermissionModeChange}
-															onReasoningEffortChange={handleReasoningEffortChange}
-														onSend={handleSendMessage}
-														permissionMode={permissionMode}
-														selectedModel={selectedModel}
-														selectedReasoningEffort={selectedReasoningEffort}
-														sending={selectedChatSending}
-													/>
+										onPermissionModeChange={handlePermissionModeChange}
+										onReasoningEffortChange={handleReasoningEffortChange}
+										onForceStop={handleForceStop}
+									onSend={handleSendMessage}
+									permissionMode={permissionMode}
+									selectedModel={selectedModel}
+									selectedReasoningEffort={selectedReasoningEffort}
+									sending={selectedChatSending}
+									stopping={selectedChatStopping}
+								/>
 												</div>
 											</div>
 

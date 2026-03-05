@@ -6,6 +6,7 @@ export interface ChatDTO {
 	diffAdded: number;
 	diffRemoved: number;
 	id: string;
+	isActive: boolean;
 	projectId: string;
 	provider: ChatProvider;
 	status: ChatStatus;
@@ -21,6 +22,15 @@ export interface WorkspaceSummaryDTO {
 
 export interface ThreadSummaryDTO {
 	id: string;
+	isActive: boolean;
+	title: string;
+	updatedAt: string;
+}
+
+export interface ActiveThreadSummaryDTO {
+	id: string;
+	projectId: string;
+	projectName: string;
 	title: string;
 	updatedAt: string;
 }
@@ -82,6 +92,7 @@ export interface ClientMessageEvent {
 		clientId?: string;
 		model?: string;
 		permissionMode?: CodexPermissionMode;
+		projectId?: string;
 		requestId?: string;
 		reasoningEffort?: CodexReasoningEffort;
 		text: string;
@@ -111,6 +122,7 @@ export interface FakeProviderRunOptions {
 
 export interface CodexProviderResult {
 	assistantText: string;
+	cancelled?: boolean;
 	diffAdded: number;
 	diffRemoved: number;
 	error?: string;
@@ -125,6 +137,7 @@ export interface CodexProviderRunOptions {
 	onEvent?: (event: AssistantStreamEvent) => void;
 	permissionMode?: CodexPermissionMode;
 	reasoningEffort?: CodexReasoningEffort;
+	signal?: AbortSignal;
 	text: string;
 	threadId?: string;
 	workspacePath: string;
@@ -278,6 +291,7 @@ export type ServerWsEvent =
 				chatId: string;
 				diffAdded: number;
 				diffRemoved: number;
+				isActive: boolean;
 				status: ChatStatus;
 				updatedAt: string;
 			};

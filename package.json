@@ -21,6 +21,7 @@
     "dev:desktop": "bun run --cwd desktop dev:hmr",
     "dev:mobile": "bun run --cwd mobile start",
     "dev:mobile:ios": "cd mobile && bunx expo run ios",
+    "dev:mobile:ios-device": "cd mobile && bunx expo run:ios --device --configuration Release",
     "mcp:playwright-electron": "bun run --cwd desktop mcp:playwright-electron"
   },
   "devDependencies": {

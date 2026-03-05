@@ -5,6 +5,7 @@ type ErrorSource = "rest" | "ws";
 export interface SendMessageInput {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
+	selectedChatExists?: boolean;
 	selectedChatProvider?: "fake" | "codex" | null;
 	text: string;
 	createChatId: () => Promise<string | null>;
@@ -52,7 +53,10 @@ export const sendWorkspaceMessage = async (
 
 	let chatId = input.selectedChatId;
 	let createdNewChat = false;
-	const shouldCreateNewChat = !chatId || input.selectedChatProvider === "fake";
+	const shouldCreateNewChat =
+		!chatId ||
+		input.selectedChatProvider === "fake" ||
+		input.selectedChatExists === false;
 
 	if (shouldCreateNewChat) {
 		const created = await input.createChatId();

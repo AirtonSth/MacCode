@@ -226,6 +226,7 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				chatId,
 				diffAdded: data.diffAdded,
 				diffRemoved: data.diffRemoved,
+				isActive: typeof data.isActive === "boolean" ? data.isActive : false,
 				status: data.status,
 				updatedAt: data.updatedAt,
 			},
@@ -548,6 +549,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				clientId?: string;
 				model?: string;
 				permissionMode?: string;
+				projectId?: string;
 				reasoningEffort?: string;
 				requestId?: string;
 			},
@@ -559,6 +561,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 					...(options?.clientId ? { clientId: options.clientId } : {}),
 					...(options?.model ? { model: options.model } : {}),
 					...(options?.permissionMode ? { permissionMode: options.permissionMode } : {}),
+					...(options?.projectId ? { projectId: options.projectId } : {}),
 					...(options?.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
 					...(options?.requestId ? { requestId: options.requestId } : {}),
 				},

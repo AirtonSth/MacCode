@@ -23,6 +23,7 @@ export type ChatStatus = "pending" | "running" | "completed" | "failed";
 
 export interface ChatDTO {
 	id: string;
+	isActive: boolean;
 	projectId: string;
 	provider: "fake" | "codex";
 	title: string;
@@ -34,6 +35,15 @@ export interface ChatDTO {
 
 export interface ThreadSummaryDTO {
 	id: string;
+	isActive: boolean;
+	title: string;
+	updatedAt: string;
+}
+
+export interface ActiveThreadSummaryDTO {
+	id: string;
+	projectId: string;
+	projectName: string;
 	title: string;
 	updatedAt: string;
 }
@@ -223,6 +233,7 @@ export interface ChatUpdatedEvent {
 		chatId: string;
 		diffAdded: number;
 		diffRemoved: number;
+		isActive: boolean;
 		status: ChatStatus;
 		updatedAt: string;
 	};
@@ -275,6 +286,7 @@ export interface ClientMessageEvent {
 		text: string;
 		model?: string;
 		permissionMode?: string;
+		projectId?: string;
 		requestId?: string;
 		reasoningEffort?: string;
 	};

@@ -7,6 +7,7 @@ const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
 	diffAdded: 0,
 	diffRemoved: 0,
 	id: "chat-id",
+	isActive: false,
 	projectId: "project-id",
 	provider: "codex",
 	status: "pending",

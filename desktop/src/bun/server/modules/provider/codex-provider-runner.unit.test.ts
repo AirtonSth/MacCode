@@ -282,6 +282,29 @@ test("CodexProviderRunner uses resolved process exit code when subprocess fails"
 	expect(result.error).toContain("simulated stderr failure");
 });
 
+test("CodexProviderRunner returns cancelled result when abort signal is already aborted", async () => {
+	const controller = new AbortController();
+	controller.abort();
+
+	const runner = new CodexProviderRunner(() => {
+		throw new Error("aborted before spawn");
+	});
+
+	const result = await runner.run({
+		chatId: "chat-cancelled",
+		onDelta: () => {
+			// no-op
+		},
+		signal: controller.signal,
+		text: "hello",
+		workspacePath: "/tmp",
+	});
+
+	expect(result.status).toBe("failed");
+	expect(result.cancelled).toBe(true);
+	expect(result.error).toBe("codex run cancelled by user");
+});
+
 test("CodexProviderRunner builds plan mode command for fresh exec", async () => {
 	let capturedCommand: string[] = [];
 	const runner = new CodexProviderRunner((input) => {

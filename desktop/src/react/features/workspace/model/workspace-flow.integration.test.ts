@@ -21,12 +21,14 @@ type HttpRequest = {
 	body?: unknown;
 };
 
+type RuntimeChat = Omit<ChatDTO, "isActive"> & { isActive?: boolean };
+
 type RuntimeRoutes = {
 	listProjects: () => ProjectDTO[];
 	createProject: (input: { name?: string; path: string }) => ProjectDTO;
-	createChat: (projectId: string, input: { title?: string }) => ChatDTO;
+	createChat: (projectId: string, input: { title?: string }) => RuntimeChat;
 	listMessages: (chatId: string) => MessageDTO[];
-	listChats?: (projectId: string) => ChatDTO[];
+	listChats?: (projectId: string) => RuntimeChat[];
 	getWorkspaceSelection?: () => { selectedChatId: string | null; selectedProjectId: string | null };
 	updateWorkspaceSelection?: (
 		selection: { selectedChatId: string | null; selectedProjectId: string | null },
@@ -55,6 +57,11 @@ const parseBody = (body: BodyInit | null | undefined): unknown => {
 		return undefined;
 	}
 };
+
+const toChatDto = (chat: RuntimeChat): ChatDTO => ({
+	...chat,
+	isActive: chat.isActive ?? false,
+});
 
 const setupMockFetch = (routes: RuntimeRoutes) => {
 	const requests: HttpRequest[] = [];
@@ -95,11 +102,11 @@ const setupMockFetch = (routes: RuntimeRoutes) => {
 		if (method === "POST" && createChatMatch) {
 			const projectId = createChatMatch[1];
 			const payload = body as { title?: string };
-			return json({ chat: routes.createChat(projectId, payload) });
+			return json({ chat: toChatDto(routes.createChat(projectId, payload)) });
 		}
 		if (method === "GET" && createChatMatch) {
 			const projectId = createChatMatch[1];
-			const chats = routes.listChats?.(projectId) ?? [];
+			const chats = (routes.listChats?.(projectId) ?? []).map(toChatDto);
 			return json({ chats });
 		}
 
@@ -569,6 +576,7 @@ const createWorkspaceFlowHarness = () => {
 						id: event.data.chatId,
 						diffAdded: event.data.diffAdded,
 						diffRemoved: event.data.diffRemoved,
+						isActive: event.data.isActive,
 						status: event.data.status,
 						updatedAt: event.data.updatedAt,
 					},
@@ -762,7 +770,12 @@ const createWorkspaceFlowHarness = () => {
 			},
 			onCreateMessageError: addError,
 			onSendUserMessage: (chatId, messageText) => {
-				wsRef?.sendUserMessage(chatId, messageText, permissionMode);
+				wsRef?.sendUserMessage(
+					chatId,
+					messageText,
+					state.value.selectedProjectId ?? undefined,
+					permissionMode,
+				);
 			},
 				onSetSending: (chatId, sending) => {
 					dispatch({
@@ -1082,16 +1095,17 @@ describe("workspace frontend flow coverage", () => {
 			await harness.bootstrap();
 			await harness.createProject({ name: "Demo", path: "/tmp/demo" });
 			await harness.createChat("Main chat");
-			await harness.handleWsEvent({
-				event: "chat_updated",
-				data: {
-					chatId: "chat-1",
-					diffAdded: 5,
-					diffRemoved: 2,
-					status: "running",
-					updatedAt: "2026-01-01T12:00:02.000Z",
-				},
-			});
+				await harness.handleWsEvent({
+					event: "chat_updated",
+					data: {
+						chatId: "chat-1",
+						diffAdded: 5,
+						diffRemoved: 2,
+						isActive: true,
+						status: "running",
+						updatedAt: "2026-01-01T12:00:02.000Z",
+					},
+				});
 
 			const chat = harness.getState().chats.find((item) => item.id === "chat-1");
 			expect(chat?.status).toBe("running");
@@ -1241,6 +1255,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-11",
+					isActive: false,
 					projectId: "project-1",
 					provider: "fake",
 					status: "pending",
@@ -1251,6 +1266,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-12",
+					isActive: false,
 					projectId: "project-1",
 					provider: "fake",
 					status: "pending",
@@ -1263,6 +1279,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-21",
+					isActive: false,
 					projectId: "project-2",
 					provider: "fake",
 					status: "pending",
@@ -1341,6 +1358,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-11",
+					isActive: false,
 					projectId: "project-1",
 					provider: "fake",
 					status: "pending",
@@ -1353,6 +1371,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-21",
+					isActive: false,
 					projectId: "project-2",
 					provider: "fake",
 					status: "pending",
@@ -1667,6 +1686,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-1",
+					isActive: false,
 					projectId: "project-1",
 					provider: "fake",
 					status: "pending",
@@ -1677,6 +1697,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-2",
+					isActive: false,
 					projectId: "project-1",
 					provider: "fake",
 					status: "pending",
@@ -1711,12 +1732,13 @@ describe("workspace frontend flow coverage", () => {
 						diffAdded: 0,
 						diffRemoved: 0,
 						id,
-					projectId,
-					provider: "fake",
-					status: "pending",
-					title: title ?? "Chat",
-					updatedAt: "2026-01-01T12:00:01.000Z",
-				};
+						isActive: false,
+						projectId,
+						provider: "fake",
+						status: "pending",
+						title: title ?? "Chat",
+						updatedAt: "2026-01-01T12:00:01.000Z",
+					};
 				chatsByProject[projectId] = [...(chatsByProject[projectId] ?? []), chat];
 				return chat;
 			},
@@ -1782,6 +1804,7 @@ describe("workspace frontend flow coverage", () => {
 					diffAdded: 0,
 					diffRemoved: 0,
 					id: "chat-21",
+					isActive: false,
 					projectId: "project-2",
 					provider: "fake",
 					status: "pending",

@@ -1,6 +1,6 @@
 import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useLayoutEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
-import { ArrowUp, ChevronDown, Loader2, Plus } from "lucide-react";
+import { ArrowUp, ChevronDown, Loader2, Plus, Square } from "lucide-react";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
 import { cn } from "../../../lib/utils";
@@ -25,6 +25,8 @@ interface MessageComposerProps {
 	sending: boolean;
 	chatStatus: ChatStatus | null;
 	onSend: (text: string) => void;
+	onForceStop?: () => Promise<void> | void;
+	stopping?: boolean;
 	permissionMode: CodexPermissionMode;
 	onPermissionModeChange: (mode: CodexPermissionMode) => void;
 	availableModels: CodexModelDescriptor[];
@@ -53,6 +55,8 @@ export const MessageComposer = ({
 	sending,
 	chatStatus,
 	onSend,
+	onForceStop,
+	stopping = false,
 	permissionMode,
 	onPermissionModeChange,
 	availableModels,
@@ -80,7 +84,7 @@ export const MessageComposer = ({
 	const [isDraggingPaths, setIsDraggingPaths] = useState(false);
 	const shouldReduceMotion = useReducedMotion();
 	const isRunning = chatStatus === "running";
-	const isLocked = disabled || sending || isRunning;
+	const isInputLocked = disabled || sending || isRunning;
 	const hasText = value.trim().length > 0;
 	const isOverLimit = value.length > MAX_MESSAGE_LENGTH;
 	const hasValidationError = !hasText || isOverLimit;
@@ -98,7 +102,7 @@ export const MessageComposer = ({
 	};
 
 	const send = () => {
-		if (isLocked) {
+		if (isInputLocked) {
 			return;
 		}
 
@@ -121,7 +125,7 @@ export const MessageComposer = ({
 	};
 
 	const handleAttachContextClick = async () => {
-		if (isLocked) {
+		if (isInputLocked) {
 			return;
 		}
 
@@ -167,7 +171,7 @@ export const MessageComposer = ({
 	};
 
 	const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
-		if (isLocked) {
+		if (isInputLocked) {
 			return;
 		}
 
@@ -181,7 +185,7 @@ export const MessageComposer = ({
 	};
 
 	const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
-		if (isLocked) {
+		if (isInputLocked) {
 			return;
 		}
 
@@ -206,7 +210,7 @@ export const MessageComposer = ({
 
 	const handleDrop = (event: DragEvent<HTMLDivElement>) => {
 		setIsDraggingPaths(false);
-		if (isLocked) {
+		if (isInputLocked) {
 			return;
 		}
 
@@ -253,7 +257,7 @@ export const MessageComposer = ({
 
 	const statusText =
 		isRunning
-			? "Assistant is running. Wait for it to finish."
+			? (stopping ? "Stopping thread..." : "Assistant is running. Force stop to interrupt.")
 			: sending
 				? "Sending message..."
 				: validationError ?? (hasText ? `${value.length}/${MAX_MESSAGE_LENGTH}` : "Type a message to send.");
@@ -261,11 +265,25 @@ export const MessageComposer = ({
 	const modelSelectId = focusMode ? "model-focus" : "model";
 	const reasoningSelectId = focusMode ? "reasoning-focus" : "reasoning";
 
-	const submitDisabled = isLocked || hasValidationError;
-	const buttonLabel = isRunning ? "Wait" : sending ? "Sending..." : "Send";
+	const submitDisabled = isInputLocked || hasValidationError;
+	const forceStopDisabled = disabled || sending || stopping || !onForceStop;
+	const actionDisabled = isRunning ? forceStopDisabled : submitDisabled;
+	const buttonLabel = isRunning ? (stopping ? "Stopping..." : "Force Stop") : sending ? "Sending..." : "Send";
 	const composerTextClass = "text-sm leading-6 text-[#e5e7eb]";
 	const subtleSelectClass =
 		"h-6 appearance-none bg-transparent px-1 pr-4 text-xs leading-4 font-normal text-[#9a9da5] transition-colors hover:text-[#c8ccd6] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+	const handlePrimaryAction = () => {
+		if (isRunning) {
+			if (forceStopDisabled) {
+				return;
+			}
+
+			void onForceStop?.();
+			return;
+		}
+
+		send();
+	};
 
 	return (
 		<section className={cn(focusMode ? "w-full" : "rounded-[24px] border border-white/10 bg-slate-950/65 p-3 backdrop-blur-2xl")}>
@@ -274,7 +292,7 @@ export const MessageComposer = ({
 					className={cn(
 						`codex-sidebar rounded-2xl border border-[#2c3038] bg-[linear-gradient(180deg,#181a1f_0%,#15171b_100%)] px-4 pb-1 pt-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04),_0_16px_30px_rgba(0,0,0,0.35)] ${composerTextClass}`,
 						isDraggingPaths ? "border-sky-300/70 bg-[linear-gradient(180deg,#1b2029_0%,#171b24_100%)]" : "",
-						isLocked ? "opacity-85" : "",
+						isInputLocked ? "opacity-85" : "",
 					)}
 					onDragEnter={handleDragEnter}
 					onDragLeave={handleDragLeave}
@@ -299,7 +317,7 @@ export const MessageComposer = ({
 								? `min-h-[56px] max-h-[220px] resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`
 								: `min-h-[56px] max-h-[220px] resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`,
 						)}
-						disabled={isLocked}
+						disabled={isInputLocked}
 						maxLength={MAX_MESSAGE_LENGTH}
 						onChange={handleInputChange}
 						onKeyDown={handleInputKeyDown}
@@ -319,7 +337,7 @@ export const MessageComposer = ({
 							<Button
 								aria-label="Attach context"
 								className="h-6 w-6 shrink-0 rounded-full p-0 text-[#9a9da5] hover:bg-white/[0.04] hover:text-[#c8ccd6]"
-								disabled={isLocked}
+								disabled={isInputLocked}
 								onClick={() => {
 									void handleAttachContextClick();
 								}}
@@ -331,10 +349,10 @@ export const MessageComposer = ({
 							</Button>
 
 							<div className="relative shrink-0">
-								<select
+							<select
 									aria-label="Model"
 									className={cn(subtleSelectClass, "min-w-[180px]")}
-									disabled={isLocked || availableModels.length === 0}
+								disabled={isInputLocked || availableModels.length === 0}
 									id={modelSelectId}
 									onChange={(event) => {
 										onModelChange(event.target.value);
@@ -352,10 +370,10 @@ export const MessageComposer = ({
 							</div>
 
 							<div className="relative shrink-0">
-								<select
+							<select
 									aria-label="Reasoning"
 									className={cn(subtleSelectClass, "min-w-[132px]")}
-									disabled={isLocked || availableReasoningEfforts.length === 0}
+								disabled={isInputLocked || availableReasoningEfforts.length === 0}
 									id={reasoningSelectId}
 									onChange={(event) => {
 										onReasoningEffortChange(event.target.value as CodexReasoningEffort);
@@ -373,10 +391,10 @@ export const MessageComposer = ({
 							</div>
 
 							<div className="relative shrink-0">
-								<select
+							<select
 									aria-label="Permission mode"
 									className={cn(subtleSelectClass, "min-w-[128px]")}
-									disabled={isLocked}
+								disabled={isInputLocked}
 									id={permissionSelectId}
 									onChange={(event) => {
 										onPermissionModeChange(event.target.value as CodexPermissionMode);
@@ -395,13 +413,13 @@ export const MessageComposer = ({
 						<div className="flex items-center gap-1">
 							{onCheckoutBranch && onCreateBranch ? (
 								<div className="shrink-0">
-									<GitBranchControl
+								<GitBranchControl
 										branches={gitBranches}
 										currentBranch={gitCurrentBranch}
 										changedFiles={gitChangedFiles}
 										added={gitAdded}
 										removed={gitRemoved}
-										disabled={isLocked}
+									disabled={isInputLocked}
 										isLoading={isGitLoading}
 										isGitRepository={isGitRepository}
 										onCheckoutBranch={onCheckoutBranch}
@@ -414,11 +432,19 @@ export const MessageComposer = ({
 						<motion.div className="ml-1" whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
 							<Button
 								aria-label={buttonLabel}
-								className="h-8 w-8 shrink-0 rounded-full bg-[#aeb2bb] p-0 text-[#181a20] shadow-none hover:bg-[#c0c5ce]"
-								disabled={submitDisabled}
-								type="submit"
+								className={cn(
+									"h-8 w-8 shrink-0 rounded-full p-0 shadow-none",
+									isRunning
+										? "bg-rose-500 text-rose-50 hover:bg-rose-400"
+										: "bg-[#aeb2bb] text-[#181a20] hover:bg-[#c0c5ce]",
+								)}
+								disabled={actionDisabled}
+								onClick={handlePrimaryAction}
+								type={isRunning ? "button" : "submit"}
 							>
-								{sending || isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
+								{isRunning
+									? (stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5" />)
+									: (sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />)}
 							</Button>
 						</motion.div>
 					</div>

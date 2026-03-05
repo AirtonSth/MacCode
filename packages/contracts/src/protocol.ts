@@ -100,6 +100,7 @@ export interface ClientMessageEvent {
 		chatId: string;
 		model?: string;
 		permissionMode?: string;
+		projectId?: string;
 		reasoningEffort?: string;
 		text: string;
 	};
@@ -162,6 +163,7 @@ export interface ChatUpdatedServerEvent {
 		chatId: string;
 		diffAdded: number;
 		diffRemoved: number;
+		isActive: boolean;
 		status: "pending" | "running" | "completed" | "failed";
 		updatedAt: string;
 	};

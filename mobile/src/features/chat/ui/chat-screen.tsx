@@ -126,15 +126,18 @@ export const ChatScreen = () => {
 	const isFocused = useIsFocused();
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const {
+		activeThreads,
 		availableModels,
 		createProject,
 		deleteProject,
+		forceStopActiveChat,
 		hasOlderMessages,
 		isLoaded,
 		isChatsLoading,
 		isLoadingOlderMessages,
 		isMessagesLoading,
 		isSending,
+		isStopping,
 		lastError,
 		loadOlderMessages,
 		selectedModel,
@@ -291,7 +294,14 @@ export const ChatScreen = () => {
 		return streamHistoryTurns.filter((turn) => turn.turnId !== liveTurnId);
 	}, [liveTurnId, streamHistoryTurns]);
 	const hasRunDetails = hasStreamingItems || historicalTurns.length > 0;
-	const selectedChatIsRunning = selectedChat?.status === "running";
+	const selectedChatIsRunning = Boolean(
+		selectedChat?.isActive ||
+		(selectedChatId && activeThreads.some((thread) => thread.id === selectedChatId)),
+	);
+	const isSendActionDisabled =
+		isSending || isStopping || !selectedProjectId || selectedChatIsRunning;
+	const isForceStopDisabled =
+		isSending || isStopping || !selectedChatId || !selectedChatIsRunning;
 	const isResolvingThreadSelection = source === "thread-list" && !selectedChatId;
 	const showMessageHistoryLoading =
 		Boolean(selectedChatId) &&
@@ -1062,8 +1072,11 @@ export const ChatScreen = () => {
 
 						{historicalTurnNodes}
 
-						{isSending && !hasStreamingText && !hasRunDetails ? (
-							<Text style={styles.typingLabel}>Thinking...</Text>
+						{selectedChatIsRunning || isSending ? (
+							<View style={styles.workingIndicator} testID="chat-bottom-working-indicator">
+								<ActivityIndicator color={palette.accent} size="small" />
+								<Text style={styles.workingIndicatorLabel}>Working...</Text>
+							</View>
 						) : null}
 					</ScrollView>
 
@@ -1075,14 +1088,14 @@ export const ChatScreen = () => {
 
 				<View style={styles.composerRow}>
 						<Pressable
-							disabled={isSending || !selectedProjectId || selectedChatIsRunning}
+							disabled={isSendActionDisabled}
 							onPress={() => {
 								openFilePicker("chat");
 							}}
 							style={({ pressed }) => [
 								styles.attachAction,
 								pressed ? styles.attachActionPressed : null,
-								isSending || !selectedProjectId || selectedChatIsRunning ? styles.disabledButton : null,
+								isSendActionDisabled ? styles.disabledButton : null,
 							]}
 							testID="chat-attach-button"
 						>
@@ -1104,23 +1117,37 @@ export const ChatScreen = () => {
 					/>
 
 						<Pressable
-							disabled={isSending || !selectedProjectId || selectedChatIsRunning}
+							disabled={selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled}
 							onPress={() => {
+								if (selectedChatIsRunning) {
+									void forceStopActiveChat();
+									return;
+								}
+
 								void submit();
 							}}
 							style={({ pressed }) => [
 								styles.primaryAction,
-								pressed ? styles.primaryActionPressed : null,
-								isSending || !selectedProjectId || selectedChatIsRunning ? styles.disabledButton : null,
+								selectedChatIsRunning ? styles.forceStopAction : null,
+								pressed
+									? (selectedChatIsRunning ? styles.forceStopActionPressed : styles.primaryActionPressed)
+									: null,
+								(selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled)
+									? styles.disabledButton
+									: null,
 							]}
-							testID="chat-send-button"
+							testID={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
 						>
-						<MaterialIcons
-							color={styles.primaryActionLabel.color}
-							name="send"
-							size={20}
-						/>
-					</Pressable>
+							{isStopping ? (
+								<ActivityIndicator color={selectedChatIsRunning ? "#FFEDEE" : styles.primaryActionLabel.color} size="small" />
+							) : (
+								<MaterialIcons
+									color={selectedChatIsRunning ? "#FFEDEE" : styles.primaryActionLabel.color}
+									name={selectedChatIsRunning ? "stop" : "send"}
+									size={20}
+								/>
+							)}
+						</Pressable>
 				</View>
 
 				{!isKeyboardVisible ? (
@@ -2174,6 +2201,12 @@ const styles = StyleSheet.create({
 	primaryActionPressed: {
 		backgroundColor: palette.accentPressed,
 	},
+	forceStopAction: {
+		backgroundColor: "#D23B45",
+	},
+	forceStopActionPressed: {
+		backgroundColor: "#BE313A",
+	},
 	runDetailsToggle: {
 		alignSelf: "flex-start",
 		backgroundColor: "rgba(255,255,255,0.03)",
@@ -2256,10 +2289,23 @@ const styles = StyleSheet.create({
 		fontSize: 13,
 		lineHeight: 20,
 	},
-	typingLabel: {
-		color: palette.muted,
+	workingIndicator: {
+		alignItems: "center",
+		alignSelf: "flex-start",
+		backgroundColor: "rgba(99,200,255,0.12)",
+		borderColor: "rgba(99,200,255,0.42)",
+		borderRadius: 999,
+		borderWidth: 1,
+		flexDirection: "row",
+		gap: 8,
+		marginTop: 6,
+		paddingHorizontal: 12,
+		paddingVertical: 6,
+	},
+	workingIndicatorLabel: {
+		color: palette.text,
 		fontSize: 13,
-		paddingTop: 4,
+		fontWeight: "600",
 	},
 	userBubble: {
 		backgroundColor: palette.userBubble,

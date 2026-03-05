@@ -19,6 +19,7 @@ import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
+import { ActiveThreadsFooterCta } from "../../../shared/ui/active-threads-footer-cta";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { SwipeableWorkspaceItem } from "./swipeable-workspace-item";
 
@@ -38,9 +39,11 @@ export const WorkspaceSelectionScreen = () => {
 	const { isLoaded: isConfigLoaded } = useApiConfig();
 	const isFocused = useIsFocused();
 	const {
+		activeThreads,
 		createProject,
 		deleteProject,
 		isLoaded,
+		isActiveThreadsLoading,
 		isChatsLoading,
 		projects,
 		selectProject,
@@ -98,6 +101,7 @@ export const WorkspaceSelectionScreen = () => {
 				project.name.toLowerCase().includes(query) || project.path.toLowerCase().includes(query),
 		);
 	}, [optimisticDeletedWorkspaceIds, projects, searchValue]);
+	const activeThreadsCount = activeThreads.length;
 
 	useEffect(() => {
 		if (!openingWorkspaceId) {
@@ -249,6 +253,14 @@ export const WorkspaceSelectionScreen = () => {
 					</View>
 				) : null}
 			</ScrollView>
+			<ActiveThreadsFooterCta
+				count={activeThreadsCount}
+				isLoading={isActiveThreadsLoading}
+				onPress={() => {
+					push("/active-threads");
+				}}
+				testID="workspaces-active-threads-cta"
+			/>
 
 			<Pressable
 				accessibilityRole="button"

@@ -22,6 +22,7 @@ import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator"
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
+import { ActiveThreadsFooterCta } from "../../../shared/ui/active-threads-footer-cta";
 import { SwipeableThreadItem } from "./swipeable-thread-item";
 import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
 import { DesktopFilePickerModal } from "../../chat/ui/desktop-file-picker-modal";
@@ -49,6 +50,7 @@ export const ThreadSelectionScreen = () => {
 	const isFocused = useIsFocused();
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
 	const {
+		activeThreads,
 		chats,
 		chatsErrorMessage,
 		createChat,
@@ -56,6 +58,7 @@ export const ThreadSelectionScreen = () => {
 		deleteProject,
 		deleteChat,
 		isLoaded,
+		isActiveThreadsLoading,
 		isChatsLoading,
 		isMessagesLoading,
 		projects,
@@ -165,6 +168,14 @@ export const ThreadSelectionScreen = () => {
 			(chat) => !optimisticDeletedThreadIds.has(chat.id) && chat.title.toLowerCase().includes(query),
 		);
 	}, [chats, optimisticDeletedThreadIds, searchValue]);
+	const activeThreadIds = useMemo(
+		() => new Set(activeThreads.map((thread) => thread.id)),
+		[activeThreads],
+	);
+	const selectedProjectActiveThreadsCount = useMemo(
+		() => activeThreads.filter((thread) => thread.projectId === selectedProjectId).length,
+		[activeThreads, selectedProjectId],
+	);
 
 	const visibleWorkspaces = useMemo(() => {
 		const query = drawerSearchValue.trim().toLowerCase();
@@ -477,6 +488,7 @@ export const ThreadSelectionScreen = () => {
 									isLoading={openingThreadId === chat.id}
 									index={index}
 									isActive={openSwipeRowId === chat.id}
+									isWorking={activeThreadIds.has(chat.id)}
 									isSelected={chat.id === selectedChatId}
 									chat={chat}
 									key={chat.id}
@@ -508,6 +520,14 @@ export const ThreadSelectionScreen = () => {
 					</View>
 				) : null}
 			</ScrollView>
+			<ActiveThreadsFooterCta
+				count={selectedProjectActiveThreadsCount}
+				isLoading={isActiveThreadsLoading}
+				onPress={() => {
+					push("/active-threads");
+				}}
+				testID="threads-active-threads-cta"
+			/>
 			<Pressable
 				accessibilityLabel="threads-new-button"
 				accessibilityRole="button"
