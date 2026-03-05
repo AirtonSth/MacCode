@@ -615,11 +615,6 @@ const createFirebaseSender = (input: {
 				? error.code
 				: undefined
 		);
-		const toMessagingErrorMessage = (error: unknown): string | undefined => (
-			typeof error === "object" && error !== null && "message" in error && typeof error.message === "string"
-				? error.message
-				: undefined
-		);
 
 		try {
 			await sendWithHeaders(explicitLiveActivityHeaders);
@@ -629,7 +624,6 @@ const createFirebaseSender = (input: {
 			};
 		} catch (primaryError) {
 			const primaryCode = toMessagingErrorCode(primaryError);
-			const primaryMessage = toMessagingErrorMessage(primaryError);
 
 			logLiveActivityWarn("push send failed", {
 				chatId: deliveryInput.contentState.chatId,
