@@ -6,6 +6,7 @@ import { formatRelativeTime } from "../../../shared/lib/time";
 import type { ChatDTO } from "../../../shared/api/types";
 
 const palette = {
+	accent: "#9FDBFF",
 	text: "#F1F4FA",
 };
 
@@ -44,6 +45,15 @@ export const SwipeableThreadItem = ({
 	const translateX = useRef(new Animated.Value(0)).current;
 	const dragStartRef = useRef(0);
 	const isAnimatingRef = useRef(false);
+	const deleteActionOpacity = useMemo(
+		() =>
+			translateX.interpolate({
+				extrapolate: "clamp",
+				inputRange: [-swipeDeleteWidth, -8, 0],
+				outputRange: [1, 1, 0],
+			}),
+		[translateX],
+	);
 
 	const animateTo = useCallback(
 		(value: number, onFinish?: () => void) => {
@@ -125,7 +135,7 @@ export const SwipeableThreadItem = ({
 
 	return (
 		<View style={styles.swipeRowRoot}>
-			<View style={styles.deleteActionRoot}>
+			<Animated.View style={[styles.deleteActionRoot, { opacity: deleteActionOpacity }]}>
 				<Pressable
 					accessibilityLabel={`thread-item-delete-${String(index)}`}
 					accessibilityRole="button"
@@ -135,13 +145,18 @@ export const SwipeableThreadItem = ({
 						onDelete();
 					}}
 					style={styles.deleteActionButton}
-				>
-					<MaterialIcons color="#0A0D14" name="delete-outline" size={20} />
-				</Pressable>
-			</View>
+					>
+						<MaterialIcons color="#0A0D14" name="delete-outline" size={20} />
+					</Pressable>
+			</Animated.View>
 
 			<Animated.View
-				style={[styles.listRow, isSelected ? styles.listRowActive : null, { transform: [{ translateX }] }]}
+				style={[
+					styles.listRow,
+					isSelected ? styles.listRowSelected : null,
+					isWorking ? styles.listRowWorking : null,
+					{ transform: [{ translateX }] },
+				]}
 				{...panResponder.panHandlers}
 			>
 				<Pressable
@@ -165,34 +180,32 @@ export const SwipeableThreadItem = ({
 					style={({ pressed }) => [pressed ? styles.listRowPressed : null]}
 				>
 					<View style={styles.rowContent}>
-						<View style={styles.rowText}>
-							<Text
-								numberOfLines={1}
-								style={styles.rowTitle}
-								testID={`thread-item-title-${String(index)}`}
-							>
-								{chat.title}
-							</Text>
-							<View style={styles.metaRow}>
-								<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
-								{isWorking ? (
-									<View
-										style={styles.activeBadge}
-										testID={`thread-item-status-${String(index)}`}
-									>
-										<ActivityIndicator color="#9FDBFF" size={10} />
-										<Text style={styles.activeBadgeLabel}>Active</Text>
-									</View>
-								) : null}
+						<View style={styles.rowMain}>
+							{isWorking ? (
+								<View style={styles.rowLeading} testID={`thread-item-status-${String(index)}`}>
+									<ActivityIndicator color={palette.accent} size={11} />
+								</View>
+							) : null}
+							<View style={styles.rowText}>
+								<Text
+									numberOfLines={1}
+									style={styles.rowTitle}
+									testID={`thread-item-title-${String(index)}`}
+								>
+									{chat.title}
+								</Text>
+								<View style={styles.metaRow}>
+									<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
+								</View>
 							</View>
 						</View>
-							{isLoading ? (
-								<ActivityIndicator color={palette.text} size="small" />
-							) : (
-								<MaterialIcons color={palette.text} name="chevron-right" size={20} />
-							)}
-						</View>
-					</Pressable>
+						{isLoading ? (
+							<ActivityIndicator color={palette.text} size="small" />
+						) : (
+							<MaterialIcons color={palette.text} name="chevron-right" size={20} />
+						)}
+					</View>
+				</Pressable>
 				</Animated.View>
 			</View>
 		);
@@ -237,11 +250,28 @@ const styles = StyleSheet.create({
 		justifyContent: "space-between",
 		gap: 8,
 	},
+	rowMain: {
+		alignItems: "center",
+		flex: 1,
+		flexDirection: "row",
+		gap: 8,
+		minWidth: 0,
+	},
+	rowLeading: {
+		alignItems: "center",
+		justifyContent: "center",
+		width: 12,
+	},
 	rowText: {
 		flex: 1,
+		minWidth: 0,
 	},
-	listRowActive: {
+	listRowSelected: {
 		borderColor: "rgba(99,200,255,0.45)",
+	},
+	listRowWorking: {
+		backgroundColor: "rgba(99,200,255,0.18)",
+		borderColor: "rgba(99,200,255,0.74)",
 	},
 	listRowPressed: {
 		opacity: 0.8,
@@ -253,25 +283,7 @@ const styles = StyleSheet.create({
 	metaRow: {
 		alignItems: "center",
 		flexDirection: "row",
-		gap: 8,
 		paddingTop: 3,
-	},
-	activeBadge: {
-		alignItems: "center",
-		backgroundColor: "rgba(99,200,255,0.12)",
-		borderColor: "rgba(99,200,255,0.5)",
-		borderRadius: 999,
-		borderWidth: 1,
-		flexDirection: "row",
-		gap: 4,
-		paddingHorizontal: 8,
-		paddingVertical: 2,
-	},
-	activeBadgeLabel: {
-		color: "#9FDBFF",
-		fontSize: 10,
-		fontWeight: "700",
-		textTransform: "uppercase",
 	},
 	rowTitle: {
 		color: "#F1F4FA",

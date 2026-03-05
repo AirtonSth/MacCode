@@ -5,6 +5,7 @@ const palette = {
 	background: "#0D0F14",
 	text: "#F1F4FA",
 };
+const footerCtaHeight = 58;
 
 interface ActiveThreadsFooterCtaProps {
 	count: number;
@@ -60,13 +61,13 @@ const styles = StyleSheet.create({
 		alignItems: "center",
 		backgroundColor: "rgba(99,200,255,0.18)",
 		borderColor: "rgba(99,200,255,0.74)",
-		borderRadius: 999,
+		borderRadius: footerCtaHeight / 2,
 		borderWidth: 1,
 		flexDirection: "row",
 		gap: 10,
-		minHeight: 44,
+		height: footerCtaHeight,
+		justifyContent: "center",
 		paddingHorizontal: 16,
-		paddingVertical: 10,
 	},
 	buttonPressed: {
 		opacity: 0.88,
