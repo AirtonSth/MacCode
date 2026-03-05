@@ -40,7 +40,7 @@ export const ActiveThreadsScreen = () => {
 
 	const visibleThreads = useMemo(
 		() =>
-			[...activeThreads].sort(
+			Array.from(activeThreads).sort(
 				(left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
 			),
 		[activeThreads],

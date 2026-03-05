@@ -1,4 +1,4 @@
-import { usePathname, useRouter } from "expo-router";
+import { type Href, usePathname, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef } from "react";
 
 export type AppFlowRoute = "/workspaces" | "/threads" | "/active-threads" | "/chat" | "/settings";
@@ -11,22 +11,6 @@ export type AppFlowTarget =
 
 const getPathname = (target: AppFlowTarget): AppFlowRoute => {
 	return typeof target === "string" ? target : target.pathname;
-};
-
-const getNavigationInput = (
-	target: AppFlowTarget,
-): {
-	pathname: AppFlowRoute;
-	params?: Record<string, string>;
-} => {
-	if (typeof target === "string") {
-		return { pathname: target };
-	}
-
-	return {
-		pathname: target.pathname,
-		params: target.params,
-	};
 };
 
 export const useFlowNavigator = () => {
@@ -47,7 +31,14 @@ export const useFlowNavigator = () => {
 		}
 
 		pendingRouteRef.current = route;
-		router.replace(getNavigationInput(target) as never);
+		if (typeof target === "string") {
+			router.replace(target);
+		} else {
+			router.replace({
+				params: target.params,
+				pathname: target.pathname,
+			} satisfies Href);
+		}
 		return true;
 	}, [pathname, router]);
 
@@ -58,7 +49,14 @@ export const useFlowNavigator = () => {
 		}
 
 		pendingRouteRef.current = route;
-		router.push(getNavigationInput(target) as never);
+		if (typeof target === "string") {
+			router.push(target);
+		} else {
+			router.push({
+				params: target.params,
+				pathname: target.pathname,
+			} satisfies Href);
+		}
 		return true;
 	}, [pathname, router]);
 
