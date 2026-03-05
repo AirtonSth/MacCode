@@ -36,9 +36,15 @@ import {
 	finishThreadLiveActivity,
 	isThreadLiveActivityEnabled,
 	onThreadLiveActivityAppStateChanged,
+	setThreadLiveActivityRemoteManaged,
 	startThreadLiveActivity,
+	subscribeThreadLiveActivityPushToken,
 	updateThreadLiveActivity,
 } from "../../../shared/live-activity/thread-live-activity";
+import {
+	ensureFirebaseMessagingToken,
+	subscribeFirebaseMessagingTokenRefresh,
+} from "../../../shared/notifications/firebase-messaging";
 import {
 	ensureLocalNotificationPermission,
 	sendThreadCompletionNotification,
@@ -173,15 +179,13 @@ const normalizeSelection = (
 	};
 };
 
-const hasSameSelection = (
-	left: WorkspaceSelectionDTO,
-	right: WorkspaceSelectionDTO,
-): boolean =>
-	left.selectedProjectId === right.selectedProjectId &&
-	left.selectedChatId === right.selectedChatId &&
-	left.permissionMode === right.permissionMode &&
-	left.selectedModel === right.selectedModel &&
-	left.selectedReasoningEffort === right.selectedReasoningEffort;
+const DEFAULT_SELECTION: WorkspaceSelectionDTO = {
+	permissionMode: "default",
+	selectedChatId: null,
+	selectedModel: null,
+	selectedProjectId: null,
+	selectedReasoningEffort: null,
+};
 
 const asRecord = (value: unknown): Record<string, unknown> | null => (
 	typeof value === "object" &&
@@ -260,24 +264,6 @@ const parseWorkspaceEventMessage = (payload: Record<string, unknown> | null): Me
 	};
 };
 
-const parseWorkspaceEventSelection = (payload: Record<string, unknown> | null): WorkspaceSelectionDTO | null => {
-	const rawSelection = asRecord(payload?.selection);
-	if (!rawSelection) {
-		return null;
-	}
-
-	return normalizeSelection({
-		selectedProjectId: asNullableString(rawSelection.selectedProjectId),
-		selectedChatId: asNullableString(rawSelection.selectedChatId),
-		permissionMode: asNullableString(rawSelection.permissionMode) ?? "default",
-		selectedModel: asNullableString(rawSelection.selectedModel),
-		selectedReasoningEffort: asNullableString(rawSelection.selectedReasoningEffort),
-	});
-};
-
-let inMemorySelectedProjectId: string | null = null;
-let inMemorySelectedChatId: string | null = null;
-
 const toProjectDtoFromSummary = (project: { id: string; name: string; path: string }): ProjectDTO => ({
 	createdAt: "",
 	id: project.id,
@@ -304,6 +290,13 @@ const toChatDtoFromThreadSummary = (
 export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const queryClient = useQueryClient();
 	const { config } = useApiConfig();
+	const initialSelectionRef = useRef<WorkspaceSelectionDTO | null>(null);
+	if (!initialSelectionRef.current) {
+		const cachedSelection = queryClient.getQueryData<WorkspaceSelectionDTO>(queryKeys.selection);
+		initialSelectionRef.current = normalizeSelection(cachedSelection ?? DEFAULT_SELECTION);
+	}
+
+	const initialSelection = initialSelectionRef.current;
 	const scope = options?.scope ?? "legacy";
 	const isActive = options?.isActive ?? true;
 	const shouldLoadDrawerWorkspaces = options?.shouldLoadDrawerWorkspaces ?? (scope === "legacy" || scope === "workspaces");
@@ -320,24 +313,28 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const [lastError, setLastError] = useState<string | null>(null);
 	const [sendingByChat, setSendingByChat] = useState<Record<string, boolean>>({});
 	const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
-	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(inMemorySelectedProjectId);
-	const [selectedChatId, setSelectedChatId] = useState<string | null>(inMemorySelectedChatId);
+	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(initialSelection.selectedProjectId);
+	const [selectedChatId, setSelectedChatId] = useState<string | null>(initialSelection.selectedChatId);
 	const [streamingTextByChat, setStreamingTextByChat] = useState<Record<string, string>>({});
 	const [streamHistoryByChat, setStreamHistoryByChat] = useState<Record<string, StreamTurnState[]>>({});
-	const [permissionMode, setPermissionMode] = useState<string>("default");
-	const [selectedModel, setSelectedModel] = useState<string | null>(null);
-	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(null);
+	const [permissionMode, setPermissionMode] = useState<string>(initialSelection.permissionMode);
+	const [selectedModel, setSelectedModel] = useState<string | null>(initialSelection.selectedModel);
+	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(
+		initialSelection.selectedReasoningEffort,
+	);
 	const realtimeRef = useRef<ReturnType<typeof createRealtimeClient> | null>(null);
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
 	const selectedChatIdRef = useRef<string | null>(selectedChatId);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const pendingCompletionNotificationChatIdsRef = useRef<Set<string>>(new Set());
+	const fcmTokenRef = useRef<string | null>(null);
+	const liveActivityTokenByChatRef = useRef<Record<string, string>>({});
+	const registeredLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
+	const remoteManagedLiveActivityByChatRef = useRef<Record<string, boolean>>({});
 	const lastAssistantEventIdByChatRef = useRef<Record<string, number>>({});
 	const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 	const clientIdRef = useRef<string>(`mobile-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`);
-	const hasBootstrappedSelectionRef = useRef<boolean>(false);
-	const pendingSelectionRef = useRef<WorkspaceSelectionDTO | null>(null);
 	const client = useRemoteCodeClient();
 	const projectsQuery = useProjectsQuery({
 		enabled: shouldEnableProjectsQuery,
@@ -427,20 +424,23 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const normalizedSelection = normalizeSelection(selectionQuery.data);
-		const pendingSelection = pendingSelectionRef.current;
-		if (pendingSelection && !hasSameSelection(pendingSelection, normalizedSelection)) {
-			return;
-		}
-
-		pendingSelectionRef.current = null;
-		inMemorySelectedProjectId = normalizedSelection.selectedProjectId;
-		inMemorySelectedChatId = normalizedSelection.selectedChatId;
-		setSelectedProjectId(normalizedSelection.selectedProjectId);
-		setSelectedChatId(normalizedSelection.selectedChatId);
-		setPermissionMode(normalizedSelection.permissionMode);
-		setSelectedModel(normalizedSelection.selectedModel);
-		setSelectedReasoningEffort(normalizedSelection.selectedReasoningEffort);
-		hasBootstrappedSelectionRef.current = true;
+		setSelectedProjectId((current) => (
+			current === normalizedSelection.selectedProjectId ? current : normalizedSelection.selectedProjectId
+		));
+		setSelectedChatId((current) => (
+			current === normalizedSelection.selectedChatId ? current : normalizedSelection.selectedChatId
+		));
+		setPermissionMode((current) => (
+			current === normalizedSelection.permissionMode ? current : normalizedSelection.permissionMode
+		));
+		setSelectedModel((current) => (
+			current === normalizedSelection.selectedModel ? current : normalizedSelection.selectedModel
+		));
+		setSelectedReasoningEffort((current) => (
+			current === normalizedSelection.selectedReasoningEffort
+				? current
+				: normalizedSelection.selectedReasoningEffort
+		));
 	}, [selectionQuery.data]);
 
 	useEffect(() => {
@@ -471,6 +471,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			void startThreadLiveActivity({
 				chatId,
 				chatTitle: title,
+				remoteManaged: true,
 				restart: input?.restart,
 				statusLine: input?.statusLine ?? "Running",
 			});
@@ -479,14 +480,18 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	);
 
 	const updateRunningLiveActivity = useCallback(
-		(input: {
-			chatId: string;
-			chatTitle?: string;
-			phase?: "running" | "background" | "finalizing";
-			preview?: string;
-			statusLine?: string;
-			force?: boolean;
-		}) => {
+			(input: {
+				chatId: string;
+				chatTitle?: string;
+				phase?: "running" | "background" | "finalizing";
+				preview?: string;
+				statusLine?: string;
+				force?: boolean;
+			}) => {
+				if (remoteManagedLiveActivityByChatRef.current[input.chatId]) {
+					return;
+				}
+
 			const title = input.chatTitle?.trim() || resolveChatTitle(input.chatId);
 
 			void updateThreadLiveActivity({
@@ -501,8 +506,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		[resolveChatTitle],
 	);
 
-	const finishLiveActivity = useCallback(
-		(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
+		const finishLiveActivity = useCallback(
+			(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
+				if (remoteManagedLiveActivityByChatRef.current[chatId]) {
+					return;
+				}
+
 			const title = resolveChatTitle(chatId);
 			void finishThreadLiveActivity({
 				chatId,
@@ -512,7 +521,14 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			});
 		},
 		[resolveChatTitle],
-	);
+		);
+
+		const removeRemoteManagedLiveActivity = useCallback((chatId: string) => {
+			const nextEntries = Object.entries(remoteManagedLiveActivityByChatRef.current).filter(([key]) =>
+				key !== chatId
+			);
+			remoteManagedLiveActivityByChatRef.current = Object.fromEntries(nextEntries);
+		}, []);
 
 	const notifyMessageCompletion = useCallback(
 		(chatId: string, outcome: "completed" | "error" | "failed") => {
@@ -540,6 +556,98 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		},
 		[resolveChatTitle],
 	);
+
+	const flushLiveActivitySubscriptions = useCallback(() => {
+		const fcmToken = fcmTokenRef.current?.trim() ?? "";
+		if (fcmToken.length === 0) {
+			return;
+		}
+
+		for (const [chatId, liveActivityToken] of Object.entries(liveActivityTokenByChatRef.current)) {
+			const normalizedLiveActivityToken = liveActivityToken.trim();
+			if (normalizedLiveActivityToken.length === 0) {
+				continue;
+			}
+
+			const signature = `${fcmToken}::${normalizedLiveActivityToken}`;
+			if (registeredLiveActivitySignatureByChatRef.current[chatId] === signature) {
+				continue;
+			}
+
+			const chatTitle = resolveChatTitle(chatId);
+			void (async () => {
+				try {
+					const result = await client.upsertChatLiveActivitySubscription(chatId, {
+						chatTitle: chatTitle?.trim().length ? chatTitle : undefined,
+						fcmToken,
+						liveActivityToken: normalizedLiveActivityToken,
+					});
+					if (!result.enabled || !result.subscribed) {
+						remoteManagedLiveActivityByChatRef.current[chatId] = false;
+						void setThreadLiveActivityRemoteManaged({
+							chatId,
+							remoteManaged: false,
+						});
+						return;
+					}
+
+					remoteManagedLiveActivityByChatRef.current[chatId] = true;
+					registeredLiveActivitySignatureByChatRef.current[chatId] = signature;
+					void setThreadLiveActivityRemoteManaged({
+						chatId,
+						remoteManaged: true,
+					});
+				} catch {
+					// Ignore remote live activity subscription failures.
+				}
+			})();
+		}
+	}, [client, resolveChatTitle]);
+
+	useEffect(() => {
+		let canceled = false;
+
+		void (async () => {
+			const token = await ensureFirebaseMessagingToken();
+			if (canceled || !token || token.trim().length === 0) {
+				return;
+			}
+
+			fcmTokenRef.current = token.trim();
+			flushLiveActivitySubscriptions();
+		})();
+
+		const unsubscribe = subscribeFirebaseMessagingTokenRefresh((token) => {
+			const normalized = token.trim();
+			if (normalized.length === 0) {
+				return;
+			}
+
+			fcmTokenRef.current = normalized;
+			flushLiveActivitySubscriptions();
+		});
+
+		return () => {
+			canceled = true;
+			unsubscribe();
+		};
+	}, [flushLiveActivitySubscriptions]);
+
+	useEffect(() => {
+		const unsubscribe = subscribeThreadLiveActivityPushToken((event) => {
+			const normalizedPushToken = event.pushToken.trim();
+			if (normalizedPushToken.length === 0) {
+				return;
+			}
+
+			liveActivityTokenByChatRef.current[event.chatId] = normalizedPushToken;
+			flushLiveActivitySubscriptions();
+		});
+
+		return () => {
+			unsubscribe();
+		};
+	}, [flushLiveActivitySubscriptions]);
 
 	const syncMissedAssistantEventsForChat = useCallback(
 		async (chatId: string) => {
@@ -595,11 +703,17 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						[chatId]: nextTurns,
 					};
 				});
+				const isBackgroundAppState = appStateRef.current === "background" || appStateRef.current === "inactive";
+				updateRunningLiveActivity({
+					chatId,
+					phase: isBackgroundAppState ? "background" : "running",
+					statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
+				});
 			} catch {
 				void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
 			}
 		},
-		[client, queryClient],
+		[client, queryClient, updateRunningLiveActivity],
 	);
 
 	const handleServerEvent = useCallback(
@@ -629,7 +743,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 							phase: isBackgroundAppState ? "background" : "running",
 							preview: nextPreview,
 							statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
-							force: isBackgroundAppState,
 						});
 						return nextPreview;
 					})(),
@@ -648,7 +761,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					phase: isBackgroundAppState ? "background" : "running",
 					preview: event.data.partialText,
 					statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
-					force: isBackgroundAppState,
 				});
 				return;
 			}
@@ -694,18 +806,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						}
 					}
 				})();
-				const eventPreview = (() => {
-					switch (event.data.event.type) {
-						case "item_completed":
-						case "item_started":
-						case "item_state": {
-							return event.data.event.summary;
-						}
-						default: {
-							return undefined;
-						}
-					}
-				})();
 				const activityPhase: "running" | "background" | "finalizing" = (() => {
 					if (event.data.event.type === "turn_completed") {
 						return "finalizing";
@@ -728,9 +828,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				updateRunningLiveActivity({
 					chatId,
 					phase: activityPhase,
-					preview: eventPreview,
 					statusLine: activityStatusLine,
-					force: isBackgroundAppState,
 				});
 				clearSendingForChat(event.data.chatId);
 				return;
@@ -850,7 +948,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					if (isBackgroundAppState) {
 						updateRunningLiveActivity({
 							chatId: event.data.chatId,
-							force: true,
 							phase: "background",
 							statusLine: runningStatus,
 						});
@@ -898,7 +995,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				const workspaceChatId = extractWorkspaceEventChatId(workspacePayload);
 				const workspaceProjectId = extractWorkspaceEventProjectId(workspacePayload);
 				const workspaceMessage = parseWorkspaceEventMessage(workspacePayload);
-				const workspaceSelection = parseWorkspaceEventSelection(workspacePayload);
 				const isSelfOriginatedWorkspaceEvent =
 					event.data.originClientId !== null &&
 					event.data.originClientId === clientIdRef.current;
@@ -996,12 +1092,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						break;
 					}
 					case "selection_updated": {
-						if (workspaceSelection) {
-							queryClient.setQueryData(queryKeys.selection, workspaceSelection);
-							break;
-						}
-
-						invalidateWorkspaceQuery(queryKeys.selection);
+						// Keep selection local on mobile to prevent cross-client navigation jumps.
 						break;
 					}
 					case "terminal_command_finished":
@@ -1080,9 +1171,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const subscription = AppState.addEventListener("change", (nextState) => {
-			const previousState = appStateRef.current;
-			appStateRef.current = nextState;
-			void onThreadLiveActivityAppStateChanged(nextState);
+				const previousState = appStateRef.current;
+				appStateRef.current = nextState;
+				const activeChatIdForState = selectedChatIdRef.current;
+				if (!activeChatIdForState || !remoteManagedLiveActivityByChatRef.current[activeChatIdForState]) {
+					void onThreadLiveActivityAppStateChanged(nextState);
+				}
 			const isReturningToForeground =
 				(previousState === "background" || previousState === "inactive") && nextState === "active";
 
@@ -1109,7 +1203,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				chatId: activeChatId,
 				phase: "running",
 				statusLine: "Running",
-				force: true,
 			});
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			void queryClient.invalidateQueries({
@@ -1218,18 +1311,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				selectedModel: input.selectedModel ?? selectedModel,
 				selectedReasoningEffort: input.selectedReasoningEffort ?? selectedReasoningEffort,
 			});
-			pendingSelectionRef.current = nextSelection;
 			queryClient.setQueryData(queryKeys.selection, nextSelection);
 
 			updateSelectionMutation.mutate(nextSelection, {
-				onSettled: (result, error) => {
-					void result;
-					if (pendingSelectionRef.current && hasSameSelection(pendingSelectionRef.current, nextSelection)) {
-						pendingSelectionRef.current = null;
-					}
-					if (error) {
-						void queryClient.invalidateQueries({ queryKey: queryKeys.selection });
-					}
+				onError: () => {
+					void queryClient.invalidateQueries({ queryKey: queryKeys.selection });
 				},
 			});
 		},
@@ -1272,41 +1358,66 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		[persistSelection, selectedChatId, selectedProjectId],
 	);
 
-	const selectProject = useCallback(
-		(project: ProjectDTO) => {
-			inMemorySelectedProjectId = project.id;
-			inMemorySelectedChatId = null;
-			setSelectedProjectId(project.id);
+	const selectProjectById = useCallback(
+		(projectId: string | null) => {
+			setSelectedProjectId(projectId);
 			setSelectedChatId(null);
 			setLastError(null);
-			void queryClient.invalidateQueries({
-				queryKey: queryKeys.chats(project.id),
-			});
+			if (projectId) {
+				void queryClient.invalidateQueries({
+					queryKey: queryKeys.chats(projectId),
+				});
+			}
 
 			persistSelection({
 				selectedChatId: null,
-				selectedProjectId: project.id,
+				selectedProjectId: projectId,
 			});
 		},
 		[persistSelection, queryClient],
 	);
 
-	const selectChat = useCallback(
-		(chat: ChatDTO) => {
-			inMemorySelectedProjectId = chat.projectId;
-			inMemorySelectedChatId = chat.id;
-			setSelectedProjectId(chat.projectId);
-			setSelectedChatId(chat.id);
+	const selectProject = useCallback(
+		(project: ProjectDTO) => {
+			selectProjectById(project.id);
+		},
+		[selectProjectById],
+	);
+
+	const selectChatById = useCallback(
+		(input: { chatId: string; projectId: string | null }) => {
+			const normalizedChatId = input.chatId.trim();
+			if (normalizedChatId.length === 0) {
+				return;
+			}
+
+			const normalizedProjectId = input.projectId?.trim() ?? "";
+			const nextProjectId = normalizedProjectId.length > 0 ? normalizedProjectId : selectedProjectIdRef.current;
+			if (!nextProjectId) {
+				return;
+			}
+			setSelectedProjectId(nextProjectId ?? null);
+			setSelectedChatId(normalizedChatId);
 			setLastError(null);
 
 			persistSelection({
-				selectedChatId: chat.id,
-				selectedProjectId: chat.projectId,
+				selectedChatId: normalizedChatId,
+				selectedProjectId: nextProjectId,
 			});
 
-			realtimeRef.current?.sendJoinChat(chat.id);
+			realtimeRef.current?.sendJoinChat(normalizedChatId);
 		},
 		[persistSelection],
+	);
+
+	const selectChat = useCallback(
+		(chat: ChatDTO) => {
+			selectChatById({
+				chatId: chat.id,
+				projectId: chat.projectId,
+			});
+		},
+		[selectChatById],
 	);
 
 	const toggleFavorite = useCallback(
@@ -1321,24 +1432,24 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const deleteChat = useCallback(
 		async (chatId: string) => {
-			await deleteChatMutation.mutateAsync(chatId);
-			pendingSendChatIdsRef.current.delete(chatId);
-			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
-			await clearThreadLiveActivity({
-				chatId,
-			});
+				await deleteChatMutation.mutateAsync(chatId);
+				pendingSendChatIdsRef.current.delete(chatId);
+				pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+				removeRemoteManagedLiveActivity(chatId);
+				await clearThreadLiveActivity({
+					chatId,
+				});
 
 			if (selectedChatId === chatId) {
-				inMemorySelectedChatId = null;
 				setSelectedChatId(null);
 				persistSelection({
 					selectedChatId: null,
 					selectedProjectId,
 				});
 			}
-		},
-		[deleteChatMutation, persistSelection, selectedChatId, selectedProjectId],
-	);
+			},
+			[deleteChatMutation, persistSelection, removeRemoteManagedLiveActivity, selectedChatId, selectedProjectId],
+		);
 
 	const createChat = useCallback(
 		async (title?: string): Promise<ChatDTO | null> => {
@@ -1351,18 +1462,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				title,
 			});
 
-			inMemorySelectedProjectId = selectedProjectId;
-			inMemorySelectedChatId = chat.id;
-			setSelectedChatId(chat.id);
-			persistSelection({
-				selectedChatId: chat.id,
-				selectedProjectId,
+			selectChatById({
+				chatId: chat.id,
+				projectId: selectedProjectId,
 			});
-			realtimeRef.current?.sendJoinChat(chat.id);
-
 			return chat;
 		},
-		[createChatMutation, persistSelection, selectedProjectId],
+		[createChatMutation, selectedProjectId, selectChatById],
 	);
 
 	const createProject = useCallback(
@@ -1370,18 +1476,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			const project = await client.createProject(input);
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 
-			inMemorySelectedProjectId = project.id;
-			inMemorySelectedChatId = null;
-			setSelectedProjectId(project.id);
-			setSelectedChatId(null);
-			persistSelection({
-				selectedChatId: null,
-				selectedProjectId: project.id,
-			});
+			selectProjectById(project.id);
 
 			return project;
 		},
-		[client, persistSelection, queryClient],
+		[client, queryClient, selectProjectById],
 	);
 
 	const deleteProject = useCallback(
@@ -1390,23 +1489,22 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 
 			if (selectedProjectId === projectId) {
-				inMemorySelectedProjectId = null;
-				inMemorySelectedChatId = null;
 				setSelectedProjectId(null);
 				setSelectedChatId(null);
 				persistSelection({
 					selectedChatId: null,
 					selectedProjectId: null,
 				});
-			}
-			if (selectedChatIdRef.current) {
-				await clearThreadLiveActivity({
-					chatId: selectedChatIdRef.current,
-				});
-			}
-		},
-		[client, persistSelection, queryClient, selectedProjectId],
-	);
+				}
+				if (selectedChatIdRef.current) {
+					removeRemoteManagedLiveActivity(selectedChatIdRef.current);
+					await clearThreadLiveActivity({
+						chatId: selectedChatIdRef.current,
+					});
+				}
+			},
+			[client, persistSelection, queryClient, removeRemoteManagedLiveActivity, selectedProjectId],
+		);
 
 	const sendMessage = useMutation({
 		mutationFn: async (rawText: string) => {
@@ -1636,6 +1734,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const isProjectsLoading =
 		shouldEnableProjectsQuery &&
 		(projectsQuery.isPending || (projectsQuery.fetchStatus === "fetching" && projects.length === 0));
+	const hasSelectionSnapshot = selectionQuery.data !== undefined || selectionQuery.isFetched;
 
 	return {
 		availableModels: modelsQuery.data?.models ?? [],
@@ -1647,7 +1746,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		deleteProject,
 		deleteChat,
 		hasOlderMessages: shouldEnableMessagesQuery ? messagesQuery.hasOlderMessages : false,
-		isLoaded: !isProjectsLoading && selectionQuery.isFetched,
+		isLoaded: !isProjectsLoading && hasSelectionSnapshot,
 		isLoadingOlderMessages: shouldEnableMessagesQuery ? messagesQuery.isLoadingOlderMessages : false,
 		isChatsLoading,
 		isMessagesLoading,
@@ -1660,7 +1759,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		selectedModel,
 		selectedReasoningEffort,
 		selectChat,
+		selectChatById,
 		selectProject,
+		selectProjectById,
 		setPermissionMode: setPermissionModeWithSync,
 		setSelectedModel: setSelectedModelWithSync,
 		setSelectedReasoningEffort: setSelectedReasoningEffortWithSync,

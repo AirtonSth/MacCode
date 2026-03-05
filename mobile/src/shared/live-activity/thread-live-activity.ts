@@ -11,8 +11,9 @@ import {
 const ACTIVE_STATE_KEY = "remotecode.live_activity.active_state";
 const PUSH_TOKEN_KEY = "remotecode.live_activity.push_token";
 const PUSH_TO_START_TOKEN_KEY = "remotecode.live_activity.push_to_start_token";
-const UPDATE_THROTTLE_MS = 1_200;
-const ELAPSED_TICK_INTERVAL_MS = 1_000;
+const LOCAL_UPDATE_MIN_INTERVAL_MS = 5_000;
+const LOCAL_HEARTBEAT_INTERVAL_MS = 5_000;
+const LOCAL_ELAPSED_BUCKET_SECONDS = 5;
 const MIN_IOS_LIVE_ACTIVITIES_MAJOR = 16;
 const MIN_IOS_LIVE_ACTIVITIES_MINOR = 1;
 
@@ -27,6 +28,7 @@ interface PersistedLiveActivityState {
 	preview: string;
 	startedAtMs: number;
 	statusLine: string;
+	remoteManaged: boolean;
 }
 
 interface LiveActivityStartInput {
@@ -35,6 +37,7 @@ interface LiveActivityStartInput {
 	preview?: string;
 	startedAtMs?: number;
 	statusLine?: string;
+	remoteManaged?: boolean;
 	restart?: boolean;
 }
 
@@ -55,15 +58,35 @@ interface LiveActivityFinishInput {
 	statusLine?: string;
 }
 
+interface LiveActivityPushTokenUpdate {
+	chatId: string;
+	pushToken: string;
+}
+
 let initialized = false;
+let liveActivitiesUnavailable = false;
 let activeState: PersistedLiveActivityState | null = null;
 let activeActivity: LiveActivity<ThreadLiveActivityProps> | null = null;
 let activityPushTokenSubscription: Subscription | null = null;
 let pushToStartTokenSubscription: Subscription | null = null;
-let lastContentUpdateAt = 0;
-let elapsedTickInterval: ReturnType<typeof setInterval> | null = null;
 let finishingChatId: string | null = null;
-let liveActivitiesUnavailable = false;
+let flushTimeout: ReturnType<typeof setTimeout> | null = null;
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+let writeInFlight = false;
+let writeAgain = false;
+let pendingForceWrite = false;
+let lastContentSignature = "";
+let lastContentUpdateAtMs = 0;
+let lastStatePersistAtMs = 0;
+let currentAppState: AppStateStatus = "active";
+const pushTokenListeners = new Set<(event: LiveActivityPushTokenUpdate) => void>();
+
+const nowMs = (): number => Date.now();
+
+const withDefault = (value: string | undefined, fallback: string): string => {
+	const trimmed = value?.trim();
+	return trimmed && trimmed.length > 0 ? trimmed : fallback;
+};
 
 const isSupportedIosVersion = (): boolean => {
 	if (Platform.OS !== "ios") {
@@ -88,18 +111,14 @@ const isSupportedIosVersion = (): boolean => {
 
 const canUseLiveActivities = (): boolean => !liveActivitiesUnavailable && isSupportedIosVersion();
 
-const nowMs = (): number => Date.now();
-
-const withDefault = (value: string | undefined, fallback: string): string => {
-	const trimmed = value?.trim();
-	return trimmed && trimmed.length > 0 ? trimmed : fallback;
-};
-
 const toElapsedSeconds = (startedAtMs: number): number => {
 	const started = Number.isFinite(startedAtMs) && startedAtMs > 0 ? startedAtMs : nowMs();
 	const deltaMs = Math.max(0, nowMs() - started);
-	return Math.floor(deltaMs / 1000);
+	return Math.floor(deltaMs / 1_000);
 };
+
+const toElapsedBucket = (startedAtMs: number): number =>
+	Math.floor(toElapsedSeconds(startedAtMs) / LOCAL_ELAPSED_BUCKET_SECONDS);
 
 const toProps = (state: PersistedLiveActivityState): ThreadLiveActivityProps => ({
 	chatId: state.chatId,
@@ -113,13 +132,25 @@ const toProps = (state: PersistedLiveActivityState): ThreadLiveActivityProps => 
 const isTerminalPhase = (phase: ThreadLiveActivityPhase): boolean =>
 	phase === "completed" || phase === "failed" || phase === "error";
 
+const toContentSignature = (state: PersistedLiveActivityState): string =>
+	[
+		state.chatId,
+		state.chatTitle,
+		state.phase,
+		state.statusLine,
+		state.preview,
+		String(toElapsedBucket(state.startedAtMs)),
+	].join("\u0001");
+
 const persistActiveState = async (): Promise<void> => {
 	if (!activeState) {
 		await SecureStore.deleteItemAsync(ACTIVE_STATE_KEY);
+		lastStatePersistAtMs = 0;
 		return;
 	}
 
 	await SecureStore.setItemAsync(ACTIVE_STATE_KEY, JSON.stringify(activeState));
+	lastStatePersistAtMs = nowMs();
 };
 
 const hydratePersistedState = async (): Promise<void> => {
@@ -139,29 +170,21 @@ const hydratePersistedState = async (): Promise<void> => {
 			return;
 		}
 
-		activeState = {
-			chatId,
-			chatTitle: withDefault(parsed.chatTitle, "Thread"),
-			phase: parsed.phase ?? "running",
-			preview: withDefault(parsed.preview, "Waiting for updates..."),
+			activeState = {
+				chatId,
+				chatTitle: withDefault(parsed.chatTitle, "Thread"),
+				phase: parsed.phase ?? "running",
+				preview: withDefault(parsed.preview, "Waiting for updates..."),
 			startedAtMs:
 				typeof parsed.startedAtMs === "number" && Number.isFinite(parsed.startedAtMs) && parsed.startedAtMs > 0
 					? Math.floor(parsed.startedAtMs)
 					: nowMs(),
-			statusLine: withDefault(parsed.statusLine, "Running"),
-		};
+				statusLine: withDefault(parsed.statusLine, "Running"),
+				remoteManaged: Boolean(parsed.remoteManaged),
+			};
 	} catch {
-		// Ignore malformed state and continue.
+		// Ignore malformed persisted state.
 	}
-};
-
-const clearElapsedTick = (): void => {
-	if (!elapsedTickInterval) {
-		return;
-	}
-
-	clearInterval(elapsedTickInterval);
-	elapsedTickInterval = null;
 };
 
 const detachActivityPushTokenSubscription = (): void => {
@@ -173,11 +196,54 @@ const detachActivityPushTokenSubscription = (): void => {
 	activityPushTokenSubscription = null;
 };
 
+const emitPushToken = (chatId: string, pushToken: string): void => {
+	for (const listener of pushTokenListeners) {
+		try {
+			listener({
+				chatId,
+				pushToken,
+			});
+		} catch {
+			// Keep listeners isolated from one another.
+		}
+	}
+};
+
 const attachActivityPushTokenSubscription = (activity: LiveActivity<ThreadLiveActivityProps>): void => {
 	detachActivityPushTokenSubscription();
 	activityPushTokenSubscription = activity.addPushTokenListener((event) => {
-		void SecureStore.setItemAsync(PUSH_TOKEN_KEY, event.pushToken);
+		const chatId = activeState?.chatId;
+		if (!chatId) {
+			return;
+		}
+
+		const normalizedPushToken = withDefault(event.pushToken, "");
+		if (normalizedPushToken.length === 0) {
+			return;
+		}
+
+		void SecureStore.setItemAsync(PUSH_TOKEN_KEY, normalizedPushToken);
+		emitPushToken(chatId, normalizedPushToken);
 	});
+};
+
+const syncCurrentActivityPushToken = async (): Promise<void> => {
+	const chatId = activeState?.chatId;
+	if (!chatId || !activeActivity) {
+		return;
+	}
+
+	try {
+		const pushToken = withDefault(await activeActivity.getPushToken() ?? "", "");
+		if (pushToken.length === 0) {
+			return;
+		}
+
+		await SecureStore.setItemAsync(PUSH_TOKEN_KEY, pushToken);
+		emitPushToken(chatId, pushToken);
+	} catch {
+		// Ignore push-token synchronization failures.
+	}
 };
 
 async function normalizeActivityInstance(): Promise<LiveActivity<ThreadLiveActivityProps> | null> {
@@ -199,7 +265,7 @@ async function normalizeActivityInstance(): Promise<LiveActivity<ThreadLiveActiv
 				try {
 					await instance.end("immediate");
 				} catch {
-					// Ignore duplicate cleanup failures.
+					// Ignore duplicate activity cleanup failures.
 				}
 			}),
 		);
@@ -208,35 +274,150 @@ async function normalizeActivityInstance(): Promise<LiveActivity<ThreadLiveActiv
 	return activeActivity;
 }
 
-const pushElapsedTickUpdate = async (): Promise<void> => {
-	if (!activeState || isTerminalPhase(activeState.phase)) {
+const clearScheduledFlush = (): void => {
+	if (!flushTimeout) {
 		return;
 	}
 
+	clearTimeout(flushTimeout);
+	flushTimeout = null;
+};
+
+const clearHeartbeat = (): void => {
+	if (!heartbeatInterval) {
+		return;
+	}
+
+	clearInterval(heartbeatInterval);
+	heartbeatInterval = null;
+};
+
+const ensureHeartbeat = (): void => {
+	if (
+		heartbeatInterval
+		|| !activeState
+		|| activeState.remoteManaged
+		|| isTerminalPhase(activeState.phase)
+		|| currentAppState !== "active"
+	) {
+		return;
+	}
+
+	heartbeatInterval = setInterval(() => {
+		void queueStateUpdate();
+	}, LOCAL_HEARTBEAT_INTERVAL_MS);
+};
+
+const flushStateUpdate = async (input?: { force?: boolean }): Promise<void> => {
+	if (!activeState || activeState.remoteManaged || isTerminalPhase(activeState.phase)) {
+		return;
+	}
+
+	if (writeInFlight) {
+		if (input?.force) {
+			pendingForceWrite = true;
+		}
+		writeAgain = true;
+		return;
+	}
+
+	writeInFlight = true;
 	const activity = await normalizeActivityInstance();
-	if (!activity) {
+	if (!activity || !activeState || isTerminalPhase(activeState.phase)) {
+		// eslint-disable-next-line require-atomic-updates
+		writeInFlight = false;
+		if (writeAgain || pendingForceWrite) {
+			writeAgain = false;
+			void queueStateUpdate({
+				force: pendingForceWrite,
+			});
+		}
 		return;
 	}
 
+	const force = (input?.force ?? false) || pendingForceWrite;
+	const elapsedSinceLastUpdate = nowMs() - lastContentUpdateAtMs;
+	if (!force && lastContentUpdateAtMs > 0 && elapsedSinceLastUpdate < LOCAL_UPDATE_MIN_INTERVAL_MS) {
+		// eslint-disable-next-line require-atomic-updates
+		writeInFlight = false;
+		void queueStateUpdate();
+		return;
+	}
+
+	const signature = toContentSignature(activeState);
+	if (!force && signature === lastContentSignature) {
+		// eslint-disable-next-line require-atomic-updates
+		writeInFlight = false;
+		return;
+	}
+
+	pendingForceWrite = false;
 	try {
 		await activity.update(toProps(activeState));
+		// eslint-disable-next-line require-atomic-updates
+		lastContentSignature = signature;
+		// eslint-disable-next-line require-atomic-updates
+		lastContentUpdateAtMs = nowMs();
 	} catch {
-		// Ignore elapsed tick update failures.
+		// Ignore runtime update failures.
+	} finally {
+		// eslint-disable-next-line require-atomic-updates
+		writeInFlight = false;
+		if (writeAgain) {
+			writeAgain = false;
+			void queueStateUpdate({
+				force: pendingForceWrite,
+			});
+		}
 	}
 };
 
-const ensureElapsedTick = (): void => {
-	if (elapsedTickInterval || !activeState || isTerminalPhase(activeState.phase)) {
+async function queueStateUpdate(input?: { immediate?: boolean; force?: boolean }): Promise<void> {
+	if (!activeState || activeState.remoteManaged || isTerminalPhase(activeState.phase)) {
 		return;
 	}
 
-	elapsedTickInterval = setInterval(() => {
-		void pushElapsedTickUpdate();
-	}, ELAPSED_TICK_INTERVAL_MS);
-};
+	if (input?.force) {
+		pendingForceWrite = true;
+	}
 
-const shouldSkipThrottledUpdate = (force = false): boolean =>
-	!force && nowMs() - lastContentUpdateAt < UPDATE_THROTTLE_MS;
+	if (input?.immediate) {
+		clearScheduledFlush();
+		await flushStateUpdate({
+			force: true,
+		});
+		return;
+	}
+
+	if (flushTimeout) {
+		return;
+	}
+
+	const elapsedSinceLastUpdate = nowMs() - lastContentUpdateAtMs;
+	const delayMs = lastContentUpdateAtMs <= 0
+		? 0
+		: Math.max(0, LOCAL_UPDATE_MIN_INTERVAL_MS - elapsedSinceLastUpdate);
+
+	flushTimeout = setTimeout(() => {
+		flushTimeout = null;
+		void flushStateUpdate();
+	}, delayMs);
+}
+
+const resetRuntimeState = async (): Promise<void> => {
+	clearScheduledFlush();
+	clearHeartbeat();
+	detachActivityPushTokenSubscription();
+	activeActivity = null;
+	activeState = null;
+	writeInFlight = false;
+	writeAgain = false;
+	pendingForceWrite = false;
+	lastContentSignature = "";
+	lastContentUpdateAtMs = 0;
+	lastStatePersistAtMs = 0;
+	await persistActiveState();
+};
 
 export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 	if (!canUseLiveActivities() || initialized) {
@@ -247,9 +428,19 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 		initialized = true;
 		await hydratePersistedState();
 		await normalizeActivityInstance();
+		await syncCurrentActivityPushToken();
 
 		if (activeState && !isTerminalPhase(activeState.phase)) {
-			ensureElapsedTick();
+			if (activeState.remoteManaged) {
+				clearHeartbeat();
+				clearScheduledFlush();
+			} else {
+				ensureHeartbeat();
+				await queueStateUpdate({
+					immediate: true,
+					force: true,
+				});
+			}
 		}
 
 		pushToStartTokenSubscription ||= addPushToStartTokenListener((event) => {
@@ -257,11 +448,7 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 		});
 	} catch {
 		liveActivitiesUnavailable = true;
-		clearElapsedTick();
-		detachActivityPushTokenSubscription();
-		activeActivity = null;
-		activeState = null;
-		lastContentUpdateAt = 0;
+		await resetRuntimeState();
 		// eslint-disable-next-line require-atomic-updates
 		initialized = false;
 	}
@@ -279,53 +466,63 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		});
 	}
 
-	let startedAtMs = nowMs();
-	const hasExplicitStartTime =
-		typeof input.startedAtMs === "number" && Number.isFinite(input.startedAtMs) && input.startedAtMs > 0;
-	if (hasExplicitStartTime) {
-		startedAtMs = Math.floor(input.startedAtMs ?? nowMs());
-	}
-	if (!hasExplicitStartTime && !input.restart && activeState?.chatId === input.chatId) {
-		startedAtMs = activeState.startedAtMs;
-	}
-
-	const nextState: PersistedLiveActivityState = {
-		chatId: input.chatId,
-		chatTitle: withDefault(input.chatTitle, activeState?.chatId === input.chatId ? activeState.chatTitle : "Thread"),
-		phase: "running",
-		preview: withDefault(input.preview, "Waiting for updates..."),
-		startedAtMs,
-		statusLine: withDefault(input.statusLine, "Running"),
-	};
-
 	if (activeState && activeState.chatId !== input.chatId) {
 		await clearThreadLiveActivity({
 			chatId: activeState.chatId,
 		});
 	}
 
-	// eslint-disable-next-line require-atomic-updates
-	activeState = nextState;
+	const hasExplicitStartTime =
+		typeof input.startedAtMs === "number" && Number.isFinite(input.startedAtMs) && input.startedAtMs > 0;
+	let startedAtMs = nowMs();
+	if (hasExplicitStartTime) {
+		startedAtMs = Math.floor(input.startedAtMs ?? startedAtMs);
+	} else if (activeState?.chatId === input.chatId && !input.restart) {
+		startedAtMs = activeState.startedAtMs;
+	} else {
+		startedAtMs = nowMs();
+	}
+
+	activeState = {
+		chatId: input.chatId,
+		chatTitle: withDefault(input.chatTitle, activeState?.chatId === input.chatId ? activeState.chatTitle : "Thread"),
+		phase: "running",
+		preview: withDefault(input.preview, "Waiting for updates..."),
+		startedAtMs,
+		statusLine: withDefault(input.statusLine, "Running"),
+		remoteManaged: Boolean(input.remoteManaged),
+	};
 	await persistActiveState();
-	ensureElapsedTick();
+	if (activeState.remoteManaged) {
+		clearHeartbeat();
+		clearScheduledFlush();
+	} else {
+		ensureHeartbeat();
+	}
 
 	const existing = await normalizeActivityInstance();
 	if (existing) {
-		try {
-			await existing.update(toProps(nextState));
-			lastContentUpdateAt = nowMs();
-			return;
-		} catch {
-			activeActivity = null;
+		if (!activeState.remoteManaged) {
+			await queueStateUpdate({
+				immediate: true,
+				force: true,
+			});
 		}
+		await syncCurrentActivityPushToken();
+		return;
 	}
 
 	try {
-		activeActivity = threadLiveActivityFactory.start(toProps(nextState), `remotecode-mobile://chat?chatId=${encodeURIComponent(nextState.chatId)}`);
+		activeActivity = threadLiveActivityFactory.start(
+			toProps(activeState),
+			`remotecode-mobile://chat?chatId=${encodeURIComponent(activeState.chatId)}`,
+		);
 		attachActivityPushTokenSubscription(activeActivity);
-		lastContentUpdateAt = nowMs();
+		lastContentSignature = toContentSignature(activeState);
+		lastContentUpdateAtMs = nowMs();
+		await syncCurrentActivityPushToken();
 	} catch {
-		// Ignore Live Activity startup failures.
+		// Ignore startup failures to keep app flow resilient.
 	}
 };
 
@@ -335,30 +532,40 @@ export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): 
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState || activeState.chatId !== input.chatId || shouldSkipThrottledUpdate(input.force)) {
+	if (!activeState || activeState.chatId !== input.chatId) {
+		return;
+	}
+	if (activeState.remoteManaged) {
 		return;
 	}
 
-	activeState = {
+	const nextState: PersistedLiveActivityState = {
 		...activeState,
 		chatTitle: withDefault(input.chatTitle, activeState.chatTitle),
 		phase: input.phase ?? activeState.phase,
 		preview: withDefault(input.preview, activeState.preview),
 		statusLine: withDefault(input.statusLine, activeState.statusLine),
 	};
-	await persistActiveState();
-
-	const activity = await normalizeActivityInstance();
-	if (!activity) {
-		return;
+	const shouldPersistState =
+		Boolean(input.force)
+		|| nextState.chatTitle !== activeState.chatTitle
+		|| nextState.phase !== activeState.phase
+		|| nextState.statusLine !== activeState.statusLine
+		|| nowMs() - lastStatePersistAtMs >= LOCAL_UPDATE_MIN_INTERVAL_MS;
+	activeState = nextState;
+	if (shouldPersistState) {
+		await persistActiveState();
 	}
-
-	try {
-		await activity.update(toProps(activeState));
-		lastContentUpdateAt = nowMs();
-	} catch {
-		// Ignore runtime update failures.
+	if (isTerminalPhase(nextState.phase)) {
+		clearHeartbeat();
+		clearScheduledFlush();
+	} else {
+		ensureHeartbeat();
 	}
+	await queueStateUpdate({
+		force: input.force,
+		immediate: false,
+	});
 };
 
 export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): Promise<void> => {
@@ -367,15 +574,11 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState) {
+	if (!activeState || activeState.chatId !== input.chatId) {
 		return;
 	}
 
 	if (finishingChatId === input.chatId) {
-		return;
-	}
-
-	if (activeState.chatId !== input.chatId) {
 		return;
 	}
 
@@ -415,41 +618,36 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 	})();
 	const finalState: PersistedLiveActivityState = {
 		chatId: input.chatId,
-		chatTitle: withDefault(input.chatTitle, activeState?.chatTitle ?? "Thread"),
+		chatTitle: withDefault(input.chatTitle, activeState.chatTitle),
 		phase: outcomePhase,
-		preview: withDefault(input.preview, activeState?.preview ?? "Done"),
-		startedAtMs: activeState?.startedAtMs ?? nowMs(),
+		preview: withDefault(input.preview, activeState.preview),
+		startedAtMs: activeState.startedAtMs,
 		statusLine: withDefault(input.statusLine, defaultStatusLine),
+		remoteManaged: activeState.remoteManaged,
 	};
 
 	try {
+		clearHeartbeat();
+		clearScheduledFlush();
 		activeState = finalState;
 		await persistActiveState();
-		clearElapsedTick();
 
 		const activity = await normalizeActivityInstance();
-		if (!activity) {
-			activeActivity = null;
-			// eslint-disable-next-line require-atomic-updates
-			activeState = null;
-			await persistActiveState();
-			return;
-		}
+		if (activity) {
+			try {
+				await activity.update(toProps(finalState));
+			} catch {
+				// Ignore final update failures.
+			}
 
-		try {
-			await activity.update(toProps(finalState));
-			await activity.end("default", toProps(finalState));
-		} catch {
-			// Ignore completion failures.
-		} finally {
-			detachActivityPushTokenSubscription();
-			activeActivity = null;
-			// eslint-disable-next-line require-atomic-updates
-			activeState = null;
-			lastContentUpdateAt = 0;
-			await persistActiveState();
+			try {
+				await activity.end("default", toProps(finalState));
+			} catch {
+				// Ignore completion failures.
+			}
 		}
 	} finally {
+		await resetRuntimeState();
 		if (finishingChatId === input.chatId) {
 			finishingChatId = null;
 		}
@@ -462,15 +660,12 @@ export const clearThreadLiveActivity = async (input: { chatId: string }): Promis
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState) {
+	if (!activeState || activeState.chatId !== input.chatId) {
 		return;
 	}
 
-	if (activeState.chatId !== input.chatId) {
-		return;
-	}
-
-	clearElapsedTick();
+	clearHeartbeat();
+	clearScheduledFlush();
 	const activity = await normalizeActivityInstance();
 	if (activity) {
 		try {
@@ -480,15 +675,12 @@ export const clearThreadLiveActivity = async (input: { chatId: string }): Promis
 		}
 	}
 
-	detachActivityPushTokenSubscription();
-	activeActivity = null;
-	// eslint-disable-next-line require-atomic-updates
-	activeState = null;
-	lastContentUpdateAt = 0;
-	await persistActiveState();
+	await resetRuntimeState();
 };
 
 export const onThreadLiveActivityAppStateChanged = async (nextState: AppStateStatus): Promise<void> => {
+	currentAppState = nextState;
+
 	if (!canUseLiveActivities() || !activeState) {
 		return;
 	}
@@ -496,27 +688,79 @@ export const onThreadLiveActivityAppStateChanged = async (nextState: AppStateSta
 	if (isTerminalPhase(activeState.phase)) {
 		return;
 	}
+	if (activeState.remoteManaged) {
+		clearHeartbeat();
+		clearScheduledFlush();
+		return;
+	}
 
 	if (nextState === "background" || nextState === "inactive") {
+		clearHeartbeat();
 		await updateThreadLiveActivity({
 			chatId: activeState.chatId,
 			phase: "background",
 			statusLine: "Running in background",
-			force: true,
+			force: false,
 		});
 		return;
 	}
 
 	if (nextState === "active") {
+		ensureHeartbeat();
 		await updateThreadLiveActivity({
 			chatId: activeState.chatId,
 			phase: "running",
 			statusLine: "Running",
-			force: true,
+			force: false,
 		});
 	}
 };
 
 export const isThreadLiveActivityEnabled = (): boolean => canUseLiveActivities();
+
+export const setThreadLiveActivityRemoteManaged = async (input: {
+	chatId: string;
+	remoteManaged: boolean;
+}): Promise<void> => {
+	if (!canUseLiveActivities()) {
+		return;
+	}
+
+	await initializeThreadLiveActivityManager();
+	if (!activeState || activeState.chatId !== input.chatId) {
+		return;
+	}
+
+	if (activeState.remoteManaged === input.remoteManaged) {
+		return;
+	}
+
+	activeState = {
+		...activeState,
+		remoteManaged: input.remoteManaged,
+	};
+	await persistActiveState();
+
+	if (input.remoteManaged) {
+		clearHeartbeat();
+		clearScheduledFlush();
+		return;
+	}
+
+	ensureHeartbeat();
+	await queueStateUpdate({
+		immediate: true,
+		force: true,
+	});
+};
+
+export const subscribeThreadLiveActivityPushToken = (
+	listener: (event: LiveActivityPushTokenUpdate) => void,
+): (() => void) => {
+	pushTokenListeners.add(listener);
+	return () => {
+		pushTokenListeners.delete(listener);
+	};
+};
 
 export const getThreadLiveActivityStateForBackgroundTask = (): PersistedLiveActivityState | null => activeState;
