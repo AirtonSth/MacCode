@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
-import { createLiveActivityPushServiceForTests } from "./live-activity-push.service";
+import { buildLiveActivityApnsHeaders, createLiveActivityPushServiceForTests } from "./live-activity-push.service";
+import type { LiveActivityPushSubscriptionStoreContract } from "./live-activity-push.model";
 
 interface CapturedDelivery {
 	event: "update" | "end";
@@ -58,7 +59,8 @@ test("LiveActivityPushService aggressively sanitizes payload text and truncates 
 	await service.upsertSubscription({
 		chatId: "chat-1",
 		chatTitle: "Thread",
-		fcmToken: "fcm-token-1",
+		pushToken: "fcm-token-1",
+		pushTokenType: "fcm",
 		liveActivityToken: "live-token-1",
 	});
 	await service.onChatFinished({
@@ -94,7 +96,8 @@ test("LiveActivityPushService keeps short previews unchanged", async () => {
 	await service.upsertSubscription({
 		chatId: "chat-2",
 		chatTitle: "Thread",
-		fcmToken: "fcm-token-2",
+		pushToken: "fcm-token-2",
+		pushTokenType: "fcm",
 		liveActivityToken: "live-token-2",
 	});
 	await service.onChatFinished({
@@ -128,7 +131,8 @@ test("LiveActivityPushService stays stable with hostile mixed payloads", async (
 	await service.upsertSubscription({
 		chatId: "chat-3",
 		chatTitle: "Thread",
-		fcmToken: "fcm-token-3",
+		pushToken: "fcm-token-3",
+		pushTokenType: "fcm",
 		liveActivityToken: "live-token-3",
 	});
 	await service.onChatFinished({
@@ -147,4 +151,131 @@ test("LiveActivityPushService stays stable with hostile mixed payloads", async (
 	expect(endDelivery?.preview).not.toContain("<");
 	expect(endDelivery?.preview).not.toContain(">");
 	expect(endDelivery?.preview).not.toContain("\\");
+});
+
+test("buildLiveActivityApnsHeaders uses low priority for updates and high priority for end", () => {
+	const updateHeaders = buildLiveActivityApnsHeaders({
+		event: "update",
+		expirationSeconds: 123,
+		topic: "com.example.app.push-type.liveactivity",
+	});
+	const endHeaders = buildLiveActivityApnsHeaders({
+		event: "end",
+		expirationSeconds: 456,
+		topic: "com.example.app.push-type.liveactivity",
+	});
+
+	expect(updateHeaders["apns-priority"]).toBe("5");
+	expect(endHeaders["apns-priority"]).toBe("10");
+	expect(updateHeaders["apns-push-type"]).toBe("liveactivity");
+	expect(updateHeaders["apns-topic"]).toBe("com.example.app.push-type.liveactivity");
+});
+
+test("LiveActivityPushService persists subscriptions and clears them after a successful end", async () => {
+	const persistedRows = new Map<string, {
+		chatId: string;
+		chatTitle?: string;
+		liveActivityToken: string;
+		pushToken: string;
+		pushTokenType: "apns" | "fcm";
+		updatedAt: string;
+	}>();
+	const deleteByChatCalls: string[] = [];
+	const store: LiveActivityPushSubscriptionStoreContract = {
+		deleteByChatId: (chatId) => {
+			deleteByChatCalls.push(chatId);
+			for (const [key, row] of persistedRows.entries()) {
+				if (row.chatId === chatId) {
+					persistedRows.delete(key);
+				}
+			}
+		},
+		deleteExact: ({ chatId, liveActivityToken, pushToken, pushTokenType }) => {
+			persistedRows.delete([chatId, pushTokenType, pushToken, liveActivityToken].join("::"));
+		},
+		listAll: () => [...persistedRows.values()],
+		upsert: (input) => {
+			const row = {
+				...input,
+				updatedAt: "2026-03-05T00:00:00.000Z",
+			};
+			persistedRows.set(
+				[input.chatId, input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"),
+				row,
+			);
+			return row;
+		},
+	};
+	const service = createLiveActivityPushServiceForTests(async () => ({
+		delivered: true,
+		shouldDropSubscription: false,
+	}), store);
+
+	service.onChatStarted({
+		chatId: "chat-store",
+		chatTitle: "Stored chat",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-store",
+		chatTitle: "Stored chat",
+		liveActivityToken: "activity-token-store",
+		pushToken: "push-token-store",
+		pushTokenType: "apns",
+	});
+
+	expect(store.listAll()).toHaveLength(1);
+
+	await service.onChatFinished({
+		chatId: "chat-store",
+		outcome: "completed",
+	});
+
+	expect(deleteByChatCalls).toEqual(["chat-store"]);
+	expect(store.listAll()).toEqual([]);
+});
+
+test("LiveActivityPushService immediately flushes a follow-up update when new state arrives during an in-flight send", async () => {
+	let releaseFirstDelivery = () => {
+		// Assigned once the first delivery starts.
+	};
+	const deliveryEvents: Array<"update" | "end"> = [];
+	const sender = async (input: { event: "update" | "end" }) => {
+		deliveryEvents.push(input.event);
+		if (deliveryEvents.length === 1) {
+			await new Promise<void>((resolve) => {
+				releaseFirstDelivery = resolve;
+			});
+		}
+
+		return {
+			delivered: true,
+			shouldDropSubscription: false,
+		};
+	};
+	const service = createLiveActivityPushServiceForTests(sender);
+
+	service.onChatStarted({
+		chatId: "chat-race",
+		chatTitle: "Race",
+	});
+
+	const subscriptionPromise = service.upsertSubscription({
+		chatId: "chat-race",
+		chatTitle: "Race",
+		liveActivityToken: "activity-token-race",
+		pushToken: "push-token-race",
+		pushTokenType: "apns",
+	});
+
+	await Promise.resolve();
+	service.onAssistantDelta("chat-race", "fresh delta while first send is still running");
+	releaseFirstDelivery();
+	await subscriptionPromise;
+	for (let attempt = 0; attempt < 10 && deliveryEvents.length < 2; attempt += 1) {
+		await new Promise<void>((resolve) => {
+			setTimeout(resolve, 25);
+		});
+	}
+
+	expect(deliveryEvents).toEqual(["update", "update"]);
 });

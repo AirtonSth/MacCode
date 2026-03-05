@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { connect } from "node:http2";
+import { createSign } from "node:crypto";
 
 import { cert, getApps, initializeApp, type ServiceAccount } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
@@ -9,11 +11,14 @@ import type {
 	LiveActivityPushFinishInput,
 	LiveActivityPushServiceContract,
 	LiveActivityPushStartInput,
+	LiveActivityPushStoredSubscription,
 	LiveActivityPushSubscriptionInput,
+	LiveActivityPushSubscriptionStoreContract,
+	LiveActivityPushTokenType,
 } from "./live-activity-push.model";
 
-const PUSH_MIN_UPDATE_INTERVAL_MS = 5_000;
-const PUSH_HEARTBEAT_INTERVAL_MS = 5_000;
+const PUSH_MIN_UPDATE_INTERVAL_MS = 15_000;
+const PUSH_HEARTBEAT_INTERVAL_MS = 15_000;
 const PUSH_STALE_WINDOW_SECONDS = 180;
 const PUSH_UPDATE_EXPIRATION_SECONDS = 300;
 const PUSH_END_EXPIRATION_SECONDS = 120;
@@ -27,6 +32,10 @@ const LIVE_ACTIVITY_NAME = "ThreadLiveActivity";
 const LIVE_ACTIVITY_TOPIC_SUFFIX = ".push-type.liveactivity";
 const LIVE_ACTIVITY_LOG_PREFIX = "[live-activity]";
 const LIVE_ACTIVITY_VERBOSE_LOGS = process.env.REMOTECODE_LIVE_ACTIVITY_VERBOSE_LOGS === "1";
+const APNS_PRODUCTION_HOST = "https://api.push.apple.com";
+const APNS_SANDBOX_HOST = "https://api.sandbox.push.apple.com";
+const APNS_AUTH_TOKEN_TTL_MS = 50 * 60_000;
+const APNS_REQUEST_TIMEOUT_MS = 15_000;
 
 type PushEvent = "update" | "end";
 
@@ -42,7 +51,8 @@ interface LiveActivityContentState {
 interface LiveActivitySubscription {
 	chatId: string;
 	chatTitle?: string;
-	fcmToken: string;
+	pushToken: string;
+	pushTokenType: LiveActivityPushTokenType;
 	liveActivityToken: string;
 	lastDeliveredSignature?: string;
 	lastTimestampSeconds?: number;
@@ -67,18 +77,50 @@ interface ChatRuntimeState {
 interface LiveActivityPushDeliveryInput {
 	contentState: LiveActivityContentState;
 	event: PushEvent;
-	fcmToken: string;
+	pushToken: string;
+	pushTokenType: LiveActivityPushTokenType;
 	liveActivityToken: string;
 	timestampSeconds: number;
 }
 
-interface LiveActivityPushDeliveryResult {
+export interface LiveActivityPushDeliveryResult {
 	delivered: boolean;
 	errorCode?: string;
 	shouldDropSubscription: boolean;
 }
 
 type LiveActivityPushSender = (input: LiveActivityPushDeliveryInput) => Promise<LiveActivityPushDeliveryResult>;
+
+export interface LiveActivityPushEnvironmentInput {
+	apnsAuthKeyId?: string;
+	apnsPrivateKeyPath?: string;
+	apnsTeamId?: string;
+	apnsUseSandbox?: boolean;
+	bundleIdentifier: string;
+	firebaseProjectId?: string;
+	serviceAccountPath?: string;
+	subscriptionStore?: LiveActivityPushSubscriptionStoreContract;
+}
+
+export interface LiveActivityPushDebugSendInput {
+	chatId: string;
+	chatTitle?: string;
+	elapsedSeconds?: number;
+	event: PushEvent;
+	liveActivityToken: string;
+	phase?: LiveActivityPhase;
+	preview?: string;
+	pushToken: string;
+	pushTokenType: LiveActivityPushTokenType;
+	statusLine?: string;
+	timestampSeconds?: number;
+}
+
+export interface LiveActivityPushDebugClientContract {
+	getIsEnabled(): boolean;
+	getSupportedPushTokenTypes(): ReadonlySet<LiveActivityPushTokenType>;
+	send(input: LiveActivityPushDebugSendInput): Promise<LiveActivityPushDeliveryResult>;
+}
 
 export const buildLiveActivityApsPayload = (input: {
 	contentState: {
@@ -375,8 +417,9 @@ const toElapsedSeconds = (startedAtMs: number): number => {
 	return Math.max(0, Math.floor((Date.now() - started) / 1_000));
 };
 
-const toSubscriptionKey = (subscription: { fcmToken: string; liveActivityToken: string }): string =>
-	`${subscription.fcmToken}::${subscription.liveActivityToken}`;
+const toSubscriptionKey = (
+	subscription: { liveActivityToken: string; pushToken: string; pushTokenType: LiveActivityPushTokenType },
+): string => `${subscription.pushTokenType}::${subscription.pushToken}::${subscription.liveActivityToken}`;
 
 const toDeliverySignature = (input: {
 	contentState: LiveActivityContentState;
@@ -415,6 +458,31 @@ const toLiveActivityTopic = (bundleIdentifier: string): string => {
 	return `${normalizedBundleId}${LIVE_ACTIVITY_TOPIC_SUFFIX}`;
 };
 
+const isLikelyWidgetExtensionBundleIdentifier = (bundleIdentifier: string): boolean => {
+	const normalizedTopic = toNormalized(bundleIdentifier).toLowerCase();
+	const normalized = normalizedTopic.endsWith(LIVE_ACTIVITY_TOPIC_SUFFIX)
+		? normalizedTopic.slice(0, -LIVE_ACTIVITY_TOPIC_SUFFIX.length)
+		: normalizedTopic;
+	return normalized.endsWith(".expowidgetstarget")
+		|| normalized.endsWith(".widget")
+		|| normalized.endsWith(".widgetextension");
+};
+
+const toApnsPriority = (event: PushEvent): "10" | "5" => (
+	event === "end" ? "10" : "5"
+);
+
+export const buildLiveActivityApnsHeaders = (input: {
+	event: PushEvent;
+	expirationSeconds: number;
+	topic: string;
+}): Record<string, string> => ({
+	"apns-expiration": String(input.expirationSeconds),
+	"apns-priority": toApnsPriority(input.event),
+	"apns-push-type": "liveactivity",
+	"apns-topic": input.topic,
+});
+
 const isTerminalPhase = (phase: LiveActivityPhase): boolean =>
 	phase === "completed" || phase === "failed" || phase === "error";
 
@@ -422,6 +490,13 @@ const isPermanentMessagingFailure = (code: string | undefined): boolean => (
 	code === "messaging/registration-token-not-registered"
 	|| code === "messaging/invalid-registration-token"
 );
+
+const APNS_PERMANENT_REASONS = new Set<string>([
+	"BadDeviceToken",
+	"DeviceTokenNotForTopic",
+	"TopicDisallowed",
+	"Unregistered",
+]);
 
 const LIVE_ACTIVITY_LOG_META_KEY_WIDTH = 24;
 const LIVE_ACTIVITY_COLOR_RESET = "\u001B[0m";
@@ -468,7 +543,8 @@ const toSortedLogEntries = (meta: Record<string, unknown>): [string, unknown][] 
 		"remainingSubscriptions",
 		"transientFailureCount",
 		"droppedSubscriptionsCount",
-		"fcmToken",
+		"pushTokenType",
+		"pushToken",
 		"liveActivityToken",
 	] as const;
 
@@ -559,6 +635,189 @@ const createNoopSender = (): LiveActivityPushSender => async () => ({
 	shouldDropSubscription: false,
 });
 
+const toBase64Url = (value: Buffer | string): string => Buffer
+	.from(value)
+	.toString("base64")
+	.replace(/\+/gu, "-")
+	.replace(/\//gu, "_")
+	.replace(/=+$/gu, "");
+
+const createApnsJwtSigner = (input: {
+	keyId: string;
+	privateKey: string;
+	teamId: string;
+}): (() => string) => {
+	let cachedToken: string | null = null;
+	let cachedTokenExpiresAtMs = 0;
+
+	return () => {
+		const now = Date.now();
+		if (cachedToken && cachedTokenExpiresAtMs > now) {
+			return cachedToken;
+		}
+
+		const issuedAt = Math.floor(now / 1_000);
+		const encodedHeader = toBase64Url(JSON.stringify({
+			alg: "ES256",
+			kid: input.keyId,
+		}));
+		const encodedPayload = toBase64Url(JSON.stringify({
+			iat: issuedAt,
+			iss: input.teamId,
+		}));
+		const unsignedToken = `${encodedHeader}.${encodedPayload}`;
+		const signer = createSign("sha256");
+		signer.update(unsignedToken);
+		signer.end();
+		const signature = signer.sign(input.privateKey);
+		const encodedSignature = toBase64Url(signature);
+		const token = `${unsignedToken}.${encodedSignature}`;
+		cachedToken = token;
+		cachedTokenExpiresAtMs = now + APNS_AUTH_TOKEN_TTL_MS;
+		return token;
+	};
+};
+
+const createApnsSender = (input: {
+	apnsAuthKeyId: string;
+	apnsPrivateKeyPath: string;
+	apnsTeamId: string;
+	bundleIdentifier: string;
+	useSandbox: boolean;
+}): LiveActivityPushSender => {
+	const privateKey = readFileSync(input.apnsPrivateKeyPath, "utf8");
+	const topic = toLiveActivityTopic(input.bundleIdentifier);
+	const host = input.useSandbox ? APNS_SANDBOX_HOST : APNS_PRODUCTION_HOST;
+	const toBearerToken = createApnsJwtSigner({
+		keyId: input.apnsAuthKeyId,
+		privateKey,
+		teamId: input.apnsTeamId,
+	});
+
+	return async (deliveryInput) => {
+		if (deliveryInput.pushTokenType !== "apns") {
+			return {
+				delivered: false,
+				errorCode: "apns/unsupported-token-type",
+				shouldDropSubscription: false,
+			};
+		}
+
+		const apsPayload = buildLiveActivityApsPayload({
+			contentState: deliveryInput.contentState,
+			event: deliveryInput.event,
+			timestampSeconds: deliveryInput.timestampSeconds,
+		});
+		const nowSeconds = Math.floor(Date.now() / 1_000);
+		const expirationSeconds = deliveryInput.event === "end"
+			? nowSeconds + PUSH_END_EXPIRATION_SECONDS
+			: nowSeconds + PUSH_UPDATE_EXPIRATION_SECONDS;
+		const headers = buildLiveActivityApnsHeaders({
+			event: deliveryInput.event,
+			expirationSeconds,
+			topic,
+		});
+
+			const requestBody = JSON.stringify({
+				aps: apsPayload,
+			});
+			const session = connect(host);
+			return await new Promise<LiveActivityPushDeliveryResult>((resolve) => {
+				let settled = false;
+				let statusCode = 0;
+				let responseBody = "";
+				let request: ReturnType<typeof session.request> | null = null;
+				const timeout = setTimeout(() => {
+					try {
+						request?.close();
+					} catch {
+						// Ignore timeout teardown errors.
+					}
+					try {
+						session.destroy();
+					} catch {
+						// Ignore timeout teardown errors.
+					}
+					settle({
+						delivered: false,
+						errorCode: "apns/timeout",
+						shouldDropSubscription: false,
+					});
+				}, APNS_REQUEST_TIMEOUT_MS);
+				const settle = (result: LiveActivityPushDeliveryResult): void => {
+					if (settled) {
+						return;
+					}
+					settled = true;
+					clearTimeout(timeout);
+					try {
+						session.close();
+					} catch {
+						// Ignore teardown errors.
+					}
+					resolve(result);
+				};
+
+				session.on("error", () => {
+					settle({
+						delivered: false,
+						errorCode: "apns/session-error",
+						shouldDropSubscription: false,
+					});
+				});
+
+				request = session.request({
+					":method": "POST",
+					":path": `/3/device/${deliveryInput.liveActivityToken}`,
+					authorization: `bearer ${toBearerToken()}`,
+					"content-type": "application/json",
+					...headers,
+				});
+				request.setEncoding("utf8");
+				request.on("response", (responseHeaders) => {
+					const rawStatus = responseHeaders[":status"];
+					statusCode = typeof rawStatus === "number" ? rawStatus : Number(rawStatus ?? 0);
+				});
+				request.on("data", (chunk) => {
+					responseBody += chunk;
+				});
+				request.on("error", () => {
+					settle({
+						delivered: false,
+						errorCode: "apns/request-error",
+						shouldDropSubscription: false,
+					});
+				});
+				request.on("end", () => {
+					if (statusCode === 200) {
+						settle({
+							delivered: true,
+							shouldDropSubscription: false,
+						});
+						return;
+					}
+
+					let reason: string | undefined;
+					try {
+						const parsed = JSON.parse(responseBody) as { reason?: unknown };
+						reason = typeof parsed.reason === "string" ? parsed.reason : undefined;
+					} catch {
+						reason = undefined;
+					}
+					const shouldDropSubscription = statusCode === 410
+						|| (statusCode === 400 && Boolean(reason && APNS_PERMANENT_REASONS.has(reason)));
+					settle({
+						delivered: false,
+						errorCode: reason ? `apns/${reason}` : `apns/status-${statusCode}`,
+						shouldDropSubscription,
+					});
+				});
+
+				request.end(requestBody);
+		});
+	};
+};
+
 const createFirebaseSender = (input: {
 	bundleIdentifier: string;
 	firebaseProjectId?: string;
@@ -580,8 +839,21 @@ const createFirebaseSender = (input: {
 	);
 	const messaging = getMessaging(app);
 	const topic = toLiveActivityTopic(input.bundleIdentifier);
+	const toMessagingErrorCode = (error: unknown): string | undefined => (
+		typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+			? error.code
+			: undefined
+	);
 
 	return async (deliveryInput) => {
+		if (deliveryInput.pushTokenType !== "fcm") {
+			return {
+				delivered: false,
+				errorCode: "messaging/unsupported-token-type",
+				shouldDropSubscription: false,
+			};
+		}
+
 		const apsPayload = buildLiveActivityApsPayload({
 			contentState: deliveryInput.contentState,
 			event: deliveryInput.event,
@@ -591,40 +863,23 @@ const createFirebaseSender = (input: {
 		const expirationSeconds = deliveryInput.event === "end"
 			? nowSeconds + PUSH_END_EXPIRATION_SECONDS
 			: nowSeconds + PUSH_UPDATE_EXPIRATION_SECONDS;
-		const baseHeaders: Record<string, string> = {
-			"apns-expiration": String(expirationSeconds),
-			"apns-priority": "10",
-		};
-		const explicitLiveActivityHeaders: Record<string, string> = {
-			...baseHeaders,
-			"apns-push-type": "liveactivity",
-			"apns-topic": topic,
-		};
-		const toFirebaseMessage = (headers: Record<string, string>) => ({
-			token: deliveryInput.fcmToken,
-			apns: {
-				liveActivityToken: deliveryInput.liveActivityToken,
-				headers,
-				payload: {
-					aps: apsPayload as never,
-				},
-			},
+		const headers = buildLiveActivityApnsHeaders({
+			event: deliveryInput.event,
+			expirationSeconds,
+			topic,
 		});
 
-		const sendWithHeaders = async (headers: Record<string, string>): Promise<string> => {
-			const message = toFirebaseMessage(headers);
-			const messageId = await messaging.send(message);
-			return messageId;
-		};
-
-		const toMessagingErrorCode = (error: unknown): string | undefined => (
-			typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
-				? error.code
-				: undefined
-		);
-
 		try {
-			await sendWithHeaders(explicitLiveActivityHeaders);
+			await messaging.send({
+				token: deliveryInput.pushToken,
+				apns: {
+					liveActivityToken: deliveryInput.liveActivityToken,
+					headers,
+					payload: {
+						aps: apsPayload as never,
+					},
+				},
+			});
 			return {
 				delivered: true,
 				shouldDropSubscription: false,
@@ -636,7 +891,8 @@ const createFirebaseSender = (input: {
 				chatId: deliveryInput.contentState.chatId,
 				code: primaryCode ?? "unknown",
 				event: deliveryInput.event,
-				fcmToken: toTokenPreview(deliveryInput.fcmToken),
+				pushTokenType: deliveryInput.pushTokenType,
+				pushToken: toTokenPreview(deliveryInput.pushToken),
 				liveActivityToken: toTokenPreview(deliveryInput.liveActivityToken),
 			});
 			return {
@@ -645,6 +901,61 @@ const createFirebaseSender = (input: {
 				shouldDropSubscription: isPermanentMessagingFailure(primaryCode),
 			};
 		}
+	};
+};
+
+const createRoutedSender = (input: {
+	apnsSender?: LiveActivityPushSender;
+	firebaseSender?: LiveActivityPushSender;
+}): LiveActivityPushSender => async (deliveryInput) => {
+	if (deliveryInput.pushTokenType === "apns") {
+		if (input.apnsSender) {
+			return await input.apnsSender(deliveryInput);
+		}
+
+		return {
+			delivered: false,
+			errorCode: "apns/no-sender-configured",
+			shouldDropSubscription: true,
+		};
+	}
+
+	if (input.firebaseSender) {
+		return await input.firebaseSender(deliveryInput);
+	}
+
+	return {
+		delivered: false,
+		errorCode: "messaging/no-sender-configured",
+		shouldDropSubscription: true,
+	};
+};
+
+const toDebugContentState = (input: LiveActivityPushDebugSendInput): LiveActivityContentState => {
+	const phase = input.phase ?? (input.event === "end" ? "completed" : "running");
+	const chatTitle = toSafeLiveActivityText(
+		toNormalized(input.chatTitle) || "Manual Live Activity Debug",
+		TITLE_LIMIT,
+		"title",
+	);
+	const preview = toSafeLiveActivityText(
+		toNormalized(input.preview) || toDefaultPreview(phase),
+		PREVIEW_LIMIT,
+		"preview",
+	);
+	const statusLine = toSafeLiveActivityText(
+		toNormalized(input.statusLine) || toDefaultStatusLine(phase),
+		STATUS_LIMIT,
+		"status",
+	);
+
+	return {
+		chatId: toNormalized(input.chatId) || "manual-debug",
+		chatTitle: chatTitle.length > 0 ? chatTitle : "Manual Live Activity Debug",
+		elapsedSeconds: Math.max(0, Math.floor(input.elapsedSeconds ?? 0)),
+		phase,
+		preview: preview.length > 0 ? preview : toDefaultPreview(phase),
+		statusLine: statusLine.length > 0 ? statusLine : toDefaultStatusLine(phase),
 	};
 };
 
@@ -670,10 +981,107 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 	private readonly runtimesByChatId = new Map<string, ChatRuntimeState>();
 	private readonly subscriptionsByChatId = new Map<string, Map<string, LiveActivitySubscription>>();
 
-	constructor(private readonly sender: LiveActivityPushSender) {}
+	constructor(
+		private readonly sender: LiveActivityPushSender,
+		private readonly supportedPushTokenTypes: ReadonlySet<LiveActivityPushTokenType> = new Set(["apns", "fcm"]),
+		private readonly subscriptionStore?: LiveActivityPushSubscriptionStoreContract,
+	) {
+		this.restorePersistedSubscriptions();
+	}
+
+	private restorePersistedSubscriptions(): void {
+		const persistedSubscriptions = this.subscriptionStore?.listAll() ?? [];
+		for (const subscription of persistedSubscriptions) {
+			if (!this.supportedPushTokenTypes.has(subscription.pushTokenType)) {
+				continue;
+			}
+			this.setSubscriptionInMemory(subscription);
+		}
+
+		if (persistedSubscriptions.length > 0) {
+			logLiveActivityInfo("restored persisted subscriptions", {
+				subscriptionsCount: [...this.subscriptionsByChatId.values()].reduce((total, byChat) => total + byChat.size, 0),
+			});
+		}
+	}
+
+	private setSubscriptionInMemory(input: LiveActivityPushStoredSubscription): LiveActivitySubscription {
+		const existingByChat = this.subscriptionsByChatId.get(input.chatId) ?? new Map<string, LiveActivitySubscription>();
+		const subscriptionKey = toSubscriptionKey({
+			pushToken: input.pushToken,
+			pushTokenType: input.pushTokenType,
+			liveActivityToken: input.liveActivityToken,
+		});
+		const previousSubscription = existingByChat.get(subscriptionKey);
+		const subscription: LiveActivitySubscription = {
+			chatId: input.chatId,
+			chatTitle: toNormalized(input.chatTitle) || undefined,
+			liveActivityToken: input.liveActivityToken,
+			pushToken: input.pushToken,
+			pushTokenType: input.pushTokenType,
+			lastDeliveredSignature: previousSubscription?.lastDeliveredSignature,
+			lastTimestampSeconds: previousSubscription?.lastTimestampSeconds,
+			updatedAtMs: Date.parse(input.updatedAt) || Date.now(),
+		};
+		existingByChat.set(subscriptionKey, subscription);
+		this.subscriptionsByChatId.set(input.chatId, existingByChat);
+		return subscription;
+	}
 
 	getIsEnabled(): boolean {
 		return true;
+	}
+
+	private persistSubscription(input: LiveActivityPushSubscriptionInput): LiveActivityPushStoredSubscription | null {
+		if (!this.subscriptionStore) {
+			return {
+				...input,
+				updatedAt: new Date().toISOString(),
+			};
+		}
+
+		try {
+			return this.subscriptionStore.upsert(input);
+		} catch {
+			logLiveActivityWarn("subscription persistence failed", {
+				chatId: input.chatId,
+				pushTokenType: input.pushTokenType,
+				pushToken: toTokenPreview(input.pushToken),
+				liveActivityToken: toTokenPreview(input.liveActivityToken),
+			});
+			return null;
+		}
+	}
+
+	private deletePersistedSubscription(input: LiveActivityPushSubscriptionInput): void {
+		if (!this.subscriptionStore) {
+			return;
+		}
+
+		try {
+			this.subscriptionStore.deleteExact(input);
+		} catch {
+			logLiveActivityWarn("subscription persistence delete failed", {
+				chatId: input.chatId,
+				pushTokenType: input.pushTokenType,
+				pushToken: toTokenPreview(input.pushToken),
+				liveActivityToken: toTokenPreview(input.liveActivityToken),
+			});
+		}
+	}
+
+	private deletePersistedSubscriptionsByChatId(chatId: string): void {
+		if (!this.subscriptionStore) {
+			return;
+		}
+
+		try {
+			this.subscriptionStore.deleteByChatId(chatId);
+		} catch {
+			logLiveActivityWarn("subscription persistence delete-by-chat failed", {
+				chatId,
+			});
+		}
 	}
 
 	private getRuntime(chatId: string): ChatRuntimeState | null {
@@ -823,6 +1231,10 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		this.markPendingEvent(runtime, event);
+		if (runtime.sending) {
+			runtime.sendAgain = true;
+			return;
+		}
 		const immediate = input?.immediate ?? event === "end";
 		if (immediate) {
 			if (LIVE_ACTIVITY_VERBOSE_LOGS) {
@@ -939,35 +1351,45 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 				const timestampSeconds = toNextTimestampSeconds({
 					lastTimestampSeconds: subscription.lastTimestampSeconds,
 				});
-				const deliveryResult = await this.sender({
-					contentState,
-					event: nextEvent,
-					fcmToken: subscription.fcmToken,
-					liveActivityToken: subscription.liveActivityToken,
-					timestampSeconds,
-				});
+					const deliveryResult = await this.sender({
+						contentState,
+						event: nextEvent,
+						pushToken: subscription.pushToken,
+						pushTokenType: subscription.pushTokenType,
+						liveActivityToken: subscription.liveActivityToken,
+						timestampSeconds,
+					});
 				if (deliveryResult.shouldDropSubscription) {
 					subscriptions.delete(key);
-					droppedSubscriptionsCount += 1;
-					logLiveActivityWarn("dropping subscription after permanent delivery error", {
+					this.deletePersistedSubscription({
 						chatId,
-						event: nextEvent,
-						code: deliveryResult.errorCode ?? "unknown",
-						fcmToken: toTokenPreview(subscription.fcmToken),
-						liveActivityToken: toTokenPreview(subscription.liveActivityToken),
+						chatTitle: subscription.chatTitle,
+						liveActivityToken: subscription.liveActivityToken,
+						pushToken: subscription.pushToken,
+						pushTokenType: subscription.pushTokenType,
 					});
+					droppedSubscriptionsCount += 1;
+						logLiveActivityWarn("dropping subscription after permanent delivery error", {
+							chatId,
+							event: nextEvent,
+							code: deliveryResult.errorCode ?? "unknown",
+							pushTokenType: subscription.pushTokenType,
+							pushToken: toTokenPreview(subscription.pushToken),
+							liveActivityToken: toTokenPreview(subscription.liveActivityToken),
+						});
 					continue;
 				}
 				if (!deliveryResult.delivered) {
 					hadTransientFailure = true;
 					transientFailureCount += 1;
-					logLiveActivityWarn("transient push delivery failure", {
-						chatId,
-						event: nextEvent,
-						code: deliveryResult.errorCode ?? "unknown",
-						fcmToken: toTokenPreview(subscription.fcmToken),
-						liveActivityToken: toTokenPreview(subscription.liveActivityToken),
-					});
+						logLiveActivityWarn("transient push delivery failure", {
+							chatId,
+							event: nextEvent,
+							code: deliveryResult.errorCode ?? "unknown",
+							pushTokenType: subscription.pushTokenType,
+							pushToken: toTokenPreview(subscription.pushToken),
+							liveActivityToken: toTokenPreview(subscription.liveActivityToken),
+						});
 					continue;
 				}
 
@@ -1013,6 +1435,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			if (completedEndEvent && runtime.pendingEvent !== "end") {
 				this.clearScheduledFlush(chatId);
 				this.clearHeartbeat(chatId);
+				this.deletePersistedSubscriptionsByChatId(chatId);
 				this.runtimesByChatId.delete(chatId);
 				this.subscriptionsByChatId.delete(chatId);
 				return;
@@ -1021,7 +1444,14 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 				this.scheduleEndRetry(chatId);
 				return;
 			}
-			if (shouldFlushAgain || runtime.pendingEvent === "update") {
+			if (shouldFlushAgain) {
+				this.queueFlush(chatId, "update", {
+					immediate: true,
+				});
+				return;
+			}
+			if (runtime.pendingEvent === "update") {
+				this.scheduleUpdateFlush(chatId);
 				this.ensureHeartbeat(chatId);
 				return;
 			}
@@ -1169,6 +1599,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		this.clearScheduledFlush(input.chatId);
+		this.deletePersistedSubscriptionsByChatId(input.chatId);
 		this.runtimesByChatId.delete(input.chatId);
 		this.subscriptionsByChatId.delete(input.chatId);
 		logLiveActivityInfo("chat finish cleanup completed", {
@@ -1177,49 +1608,72 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 	}
 
 	async upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
-		const fcmToken = toNormalized(input.fcmToken);
+		const pushToken = toNormalized(input.pushToken);
+		const pushTokenType = input.pushTokenType;
 		const liveActivityToken = toNormalized(input.liveActivityToken);
 		const chatId = toNormalized(input.chatId);
-		if (chatId.length === 0 || fcmToken.length === 0 || liveActivityToken.length === 0) {
+		if (
+			chatId.length === 0
+			|| pushToken.length === 0
+			|| liveActivityToken.length === 0
+			|| (pushTokenType !== "apns" && pushTokenType !== "fcm")
+		) {
+			return false;
+		}
+		if (!this.supportedPushTokenTypes.has(pushTokenType)) {
+			logLiveActivityWarn("subscription ignored (unsupported push token type)", {
+				chatId,
+				pushTokenType,
+			});
 			return false;
 		}
 
 		const existingByChat = this.subscriptionsByChatId.get(chatId) ?? new Map<string, LiveActivitySubscription>();
 		for (const [key, subscriptionEntry] of existingByChat.entries()) {
-			const sameFcmTokenWithOldActivityToken =
-				subscriptionEntry.fcmToken === fcmToken && subscriptionEntry.liveActivityToken !== liveActivityToken;
-			const sameActivityTokenWithOldFcmToken =
-				subscriptionEntry.liveActivityToken === liveActivityToken && subscriptionEntry.fcmToken !== fcmToken;
-			if (sameFcmTokenWithOldActivityToken || sameActivityTokenWithOldFcmToken) {
+			const samePushTokenWithOldActivityToken =
+				subscriptionEntry.pushToken === pushToken
+				&& subscriptionEntry.pushTokenType === pushTokenType
+				&& subscriptionEntry.liveActivityToken !== liveActivityToken;
+			const sameActivityTokenWithDifferentPushToken =
+				subscriptionEntry.liveActivityToken === liveActivityToken
+				&& (
+					subscriptionEntry.pushToken !== pushToken
+					|| subscriptionEntry.pushTokenType !== pushTokenType
+				);
+			if (samePushTokenWithOldActivityToken || sameActivityTokenWithDifferentPushToken) {
 				existingByChat.delete(key);
 				logLiveActivityInfo("replacing stale subscription token pair", {
 					chatId,
-					fcmToken: toTokenPreview(subscriptionEntry.fcmToken),
+					pushTokenType: subscriptionEntry.pushTokenType,
+					pushToken: toTokenPreview(subscriptionEntry.pushToken),
 					liveActivityToken: toTokenPreview(subscriptionEntry.liveActivityToken),
 				});
 			}
 		}
+		const persistedSubscription = this.persistSubscription({
+			chatId,
+			chatTitle: toNormalized(input.chatTitle) || undefined,
+			liveActivityToken,
+			pushToken,
+			pushTokenType,
+		});
+		if (!persistedSubscription) {
+			return false;
+		}
+
 		const subscriptionKey = toSubscriptionKey({
-			fcmToken,
+			pushToken,
+			pushTokenType,
 			liveActivityToken,
 		});
 		const previousSubscription = existingByChat.get(subscriptionKey);
-		const subscription: LiveActivitySubscription = {
-			chatId,
-			chatTitle: toNormalized(input.chatTitle) || undefined,
-			fcmToken,
-			liveActivityToken,
-			lastDeliveredSignature: previousSubscription?.lastDeliveredSignature,
-			lastTimestampSeconds: previousSubscription?.lastTimestampSeconds,
-			updatedAtMs: Date.now(),
-		};
-		existingByChat.set(subscriptionKey, subscription);
-		this.subscriptionsByChatId.set(chatId, existingByChat);
+		this.setSubscriptionInMemory(persistedSubscription);
 		logLiveActivityInfo("subscription upserted", {
 			chatId,
 			isNewSubscription: !previousSubscription,
-			subscriptionsForChat: existingByChat.size,
-			fcmToken: toTokenPreview(fcmToken),
+			subscriptionsForChat: this.subscriptionsByChatId.get(chatId)?.size ?? 0,
+			pushTokenType,
+			pushToken: toTokenPreview(pushToken),
 			liveActivityToken: toTokenPreview(liveActivityToken),
 		});
 
@@ -1250,37 +1704,148 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 export const createNoopLiveActivityPushService = (): LiveActivityPushServiceContract =>
 	new NoopLiveActivityPushService();
 
-export const createLiveActivityPushServiceFromEnvironment = (input: {
+interface ResolvedLiveActivityPushEnvironment {
 	bundleIdentifier: string;
 	firebaseProjectId?: string;
-	serviceAccountPath?: string;
-}): LiveActivityPushServiceContract => {
+	sender: LiveActivityPushSender;
+	supportedPushTokenTypes: ReadonlySet<LiveActivityPushTokenType>;
+}
+
+const resolveLiveActivityPushEnvironment = (
+	input: LiveActivityPushEnvironmentInput,
+): ResolvedLiveActivityPushEnvironment | null => {
 	const serviceAccountPath = toNormalized(input.serviceAccountPath);
+	const apnsTeamId = toNormalized(input.apnsTeamId);
+	const apnsAuthKeyId = toNormalized(input.apnsAuthKeyId);
+	const apnsPrivateKeyPath = toNormalized(input.apnsPrivateKeyPath);
 	const bundleIdentifier = toNormalized(input.bundleIdentifier);
-	if (serviceAccountPath.length === 0 || bundleIdentifier.length === 0) {
-		logLiveActivityWarn("service disabled (missing configuration)", {
-			hasBundleIdentifier: bundleIdentifier.length > 0,
-			hasServiceAccountPath: serviceAccountPath.length > 0,
-		});
-		return createNoopLiveActivityPushService();
+		if (bundleIdentifier.length === 0) {
+			logLiveActivityWarn("service disabled (missing configuration)", {
+				hasBundleIdentifier: bundleIdentifier.length > 0,
+			});
+			return null;
+		}
+		if (isLikelyWidgetExtensionBundleIdentifier(bundleIdentifier)) {
+			logLiveActivityWarn("service disabled (invalid bundle identifier for apns-topic)", {
+				bundleIdentifier,
+			});
+			return null;
+		}
+
+	let firebaseSender: LiveActivityPushSender | undefined;
+	if (serviceAccountPath.length > 0) {
+		try {
+			firebaseSender = createFirebaseSender({
+				bundleIdentifier,
+				firebaseProjectId: input.firebaseProjectId,
+				serviceAccountPath,
+			});
+		} catch {
+			logLiveActivityWarn("firebase sender disabled (failed to initialize)");
+		}
 	}
 
-	try {
-		const sender = createFirebaseSender({
-			bundleIdentifier,
-			firebaseProjectId: input.firebaseProjectId,
-			serviceAccountPath,
+	let apnsSender: LiveActivityPushSender | undefined;
+	const hasAnyApnsConfig =
+		apnsTeamId.length > 0 || apnsAuthKeyId.length > 0 || apnsPrivateKeyPath.length > 0;
+	const hasCompleteApnsConfig =
+		apnsTeamId.length > 0 && apnsAuthKeyId.length > 0 && apnsPrivateKeyPath.length > 0;
+	if (hasAnyApnsConfig && !hasCompleteApnsConfig) {
+		logLiveActivityWarn("apns sender disabled (incomplete configuration)", {
+			hasApnsAuthKeyId: apnsAuthKeyId.length > 0,
+			hasApnsPrivateKeyPath: apnsPrivateKeyPath.length > 0,
+			hasApnsTeamId: apnsTeamId.length > 0,
 		});
-		logLiveActivityInfo("service enabled", {
-			bundleIdentifier,
-			firebaseProjectId: toNormalized(input.firebaseProjectId) || "default",
-		});
-		return new LiveActivityPushService(sender);
-	} catch {
-		logLiveActivityWarn("service disabled (failed to initialize firebase sender)");
-		return createNoopLiveActivityPushService();
 	}
+	if (hasCompleteApnsConfig) {
+		try {
+			apnsSender = createApnsSender({
+				apnsAuthKeyId,
+				apnsPrivateKeyPath,
+				apnsTeamId,
+				bundleIdentifier,
+				useSandbox: input.apnsUseSandbox ?? false,
+			});
+		} catch {
+			logLiveActivityWarn("apns sender disabled (failed to initialize)");
+		}
+	}
+
+	if (!firebaseSender && !apnsSender) {
+		logLiveActivityWarn("service disabled (no sender configured)", {
+			hasApnsConfig: hasAnyApnsConfig,
+			hasFirebaseConfig: serviceAccountPath.length > 0,
+		});
+		return null;
+	}
+
+	const sender = createRoutedSender({
+		apnsSender,
+		firebaseSender,
+	});
+	const supportedPushTokenTypes = new Set<LiveActivityPushTokenType>([
+		...(firebaseSender ? (["fcm"] as const) : []),
+		...(apnsSender ? (["apns"] as const) : []),
+	]);
+	logLiveActivityInfo("service enabled", {
+		bundleIdentifier,
+		enabledProviders: [
+			...(firebaseSender ? ["firebase"] : []),
+			...(apnsSender ? ["apns"] : []),
+		],
+		firebaseProjectId: toNormalized(input.firebaseProjectId) || "default",
+	});
+	return {
+		bundleIdentifier,
+		firebaseProjectId: toNormalized(input.firebaseProjectId) || undefined,
+		sender,
+		supportedPushTokenTypes,
+	};
 };
 
-export const createLiveActivityPushServiceForTests = (sender?: LiveActivityPushSender): LiveActivityPushService =>
-	new LiveActivityPushService(sender ?? createNoopSender());
+export const createLiveActivityPushServiceFromEnvironment = (
+	input: LiveActivityPushEnvironmentInput,
+): LiveActivityPushServiceContract => {
+	const resolved = resolveLiveActivityPushEnvironment(input);
+	if (!resolved) {
+		return createNoopLiveActivityPushService();
+	}
+
+	return new LiveActivityPushService(resolved.sender, resolved.supportedPushTokenTypes, input.subscriptionStore);
+};
+
+export const createLiveActivityPushDebugClientFromEnvironment = (
+	input: LiveActivityPushEnvironmentInput,
+): LiveActivityPushDebugClientContract => {
+	const resolved = resolveLiveActivityPushEnvironment(input);
+	if (!resolved) {
+		return {
+			getIsEnabled: () => false,
+			getSupportedPushTokenTypes: () => new Set<LiveActivityPushTokenType>(),
+			send: async () => ({
+				delivered: false,
+				errorCode: "live-activity/not-configured",
+				shouldDropSubscription: false,
+			}),
+		};
+	}
+
+	return {
+		getIsEnabled: () => true,
+		getSupportedPushTokenTypes: () => resolved.supportedPushTokenTypes,
+		send: async (debugInput) => await resolved.sender({
+			contentState: toDebugContentState(debugInput),
+			event: debugInput.event,
+			liveActivityToken: toNormalized(debugInput.liveActivityToken),
+			pushToken: toNormalized(debugInput.pushToken),
+			pushTokenType: debugInput.pushTokenType,
+			timestampSeconds: debugInput.timestampSeconds ?? Math.floor(Date.now() / 1_000),
+		}),
+	};
+};
+
+export const createLiveActivityPushServiceForTests = (
+	sender?: LiveActivityPushSender,
+	subscriptionStore?: LiveActivityPushSubscriptionStoreContract,
+): LiveActivityPushService =>
+	new LiveActivityPushService(sender ?? createNoopSender(), new Set(["apns", "fcm"]), subscriptionStore);

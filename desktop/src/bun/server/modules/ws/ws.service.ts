@@ -9,6 +9,12 @@ import {
 import type { ProjectRepository } from "../project/project.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
+import type {
+	LiveActivityPushFinishInput,
+	LiveActivityPushServiceContract,
+	LiveActivityPushStartInput,
+	LiveActivityPushSubscriptionInput,
+} from "../live-activity/live-activity-push.model";
 import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
 import type {
@@ -46,6 +52,23 @@ const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
 	listByChatId: () => [],
 };
 
+const noopLiveActivityPushService: LiveActivityPushServiceContract = {
+	getIsEnabled: () => false,
+	onAssistantDelta: () => {
+		// no-op
+	},
+	onAssistantEvent: () => {
+		// no-op
+	},
+	onChatFinished: async () => {
+		// no-op
+	},
+	onChatStarted: () => {
+		// no-op
+	},
+	upsertSubscription: async () => false,
+};
+
 export class WsService implements WsServiceContract {
 	private readonly runningChats = new Set<string>();
 	private readonly runningChatAbortControllers = new Map<string, AbortController>();
@@ -58,7 +81,32 @@ export class WsService implements WsServiceContract {
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 		private readonly chatStreamSnapshots: ChatStreamSnapshotRepositoryContract = noopChatStreamSnapshotRepository,
 		private readonly chatStreamEvents: ChatStreamEventRepositoryContract = noopChatStreamEventRepository,
+		private readonly liveActivityPushService: LiveActivityPushServiceContract = noopLiveActivityPushService,
 	) {}
+
+	getLiveActivityPushIsEnabled(): boolean {
+		return this.liveActivityPushService.getIsEnabled();
+	}
+
+	async upsertLiveActivityPushSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
+		return await this.liveActivityPushService.upsertSubscription(input);
+	}
+
+	private async finishLiveActivity(input: LiveActivityPushFinishInput): Promise<void> {
+		try {
+			await this.liveActivityPushService.onChatFinished(input);
+		} catch {
+			// Keep ws execution resilient when live-activity push fails.
+		}
+	}
+
+	private startLiveActivity(input: LiveActivityPushStartInput): void {
+		try {
+			this.liveActivityPushService.onChatStarted(input);
+		} catch {
+			// Keep ws execution resilient when live-activity push fails.
+		}
+	}
 
 	private static buildClientErrorEvent(
 		code: string,
@@ -290,6 +338,10 @@ export class WsService implements WsServiceContract {
 			event: "chat_updated",
 		});
 		this.chatStreamSnapshots.reset(chatId);
+		this.startLiveActivity({
+			chatId,
+			chatTitle: chat.title,
+		});
 
 		this.runningChats.add(chatId);
 		const runAbortController = new AbortController();
@@ -302,6 +354,7 @@ export class WsService implements WsServiceContract {
 				model: input.model,
 				onDelta: (delta: string) => {
 					this.chatStreamSnapshots.appendDelta(chatId, delta);
+					this.liveActivityPushService.onAssistantDelta(chatId, delta);
 					emit({
 						data: {
 							chatId,
@@ -312,6 +365,7 @@ export class WsService implements WsServiceContract {
 				},
 				onEvent: (event) => {
 					const persistedEvent = this.chatStreamEvents.append(chatId, event);
+					this.liveActivityPushService.onAssistantEvent(chatId, event);
 					emit({
 						data: {
 							chatId,
@@ -352,6 +406,11 @@ export class WsService implements WsServiceContract {
 						chatId,
 					),
 				);
+				await this.finishLiveActivity({
+					chatId,
+					chatTitle: chat.title,
+					outcome: wasCancelled ? "error" : "failed",
+				});
 				return;
 			}
 
@@ -380,6 +439,11 @@ export class WsService implements WsServiceContract {
 				clientId,
 				requestId,
 			});
+			await this.finishLiveActivity({
+				chatId,
+				chatTitle: chat.title,
+				outcome: "completed",
+			});
 		} catch (error) {
 			await this.chatRepository.updateChat(chatId, {
 				isActive: false,
@@ -397,6 +461,11 @@ export class WsService implements WsServiceContract {
 					chatId,
 				),
 			);
+			await this.finishLiveActivity({
+				chatId,
+				chatTitle: chat.title,
+				outcome: wasCancelled ? "error" : "failed",
+			});
 		} finally {
 			this.runningChats.delete(chatId);
 			this.runningChatAbortControllers.delete(chatId);
@@ -409,7 +478,7 @@ export const createWsService = (repositories: {
 	chat: ChatRepository;
 	message: MessageRepository;
 	project: ProjectRepository;
-}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract, chatStreamEvents?: ChatStreamEventRepositoryContract) =>
+}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract, chatStreamEvents?: ChatStreamEventRepositoryContract, liveActivityPushService?: LiveActivityPushServiceContract) =>
 	new WsService(
 		repositories.chat,
 		repositories.message,
@@ -418,6 +487,7 @@ export const createWsService = (repositories: {
 		workspaceEvents,
 		chatStreamSnapshots,
 		chatStreamEvents,
+		liveActivityPushService,
 	);
 
 export const { createClientErrorEvent } = WsService;

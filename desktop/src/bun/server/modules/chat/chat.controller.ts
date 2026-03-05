@@ -3,7 +3,23 @@ import { Elysia, t } from "elysia";
 import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
+import type { LiveActivityPushSubscriptionInput } from "../live-activity/live-activity-push.model";
 import type { ChatService } from "./chat.service";
+
+const LIVE_ACTIVITY_SUBSCRIPTION_LOG_PREFIX = "[live-activity-subscription]";
+
+const toTokenPreview = (value: string): string => {
+	const normalized = value.trim();
+	if (normalized.length <= 12) {
+		return normalized;
+	}
+
+	return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`;
+};
+
+const logLiveActivitySubscription = (message: string, meta: Record<string, unknown>): void => {
+	console.info(`${LIVE_ACTIVITY_SUBSCRIPTION_LOG_PREFIX} ${message}`, meta);
+};
 
 interface RuntimeActiveThreadReader {
 	listRunningChatIds: () => string[];
@@ -17,22 +33,27 @@ interface RuntimeActiveThreadReader {
 	}>;
 }
 
+interface LiveActivitySubscriptionReader {
+	getLiveActivityPushIsEnabled: () => boolean;
+	upsertLiveActivityPushSubscription: (input: LiveActivityPushSubscriptionInput) => Promise<boolean>;
+}
+
 export class ChatController {
 	static build(
 		service: ChatService,
 		workspaceEvents?: WorkspaceEventsServiceContract,
 		runtimeActiveThreadReader?: RuntimeActiveThreadReader,
+		liveActivitySubscriptionReader?: LiveActivitySubscriptionReader,
 	) {
-		return new ChatController(service, workspaceEvents, runtimeActiveThreadReader).build();
+		return new ChatController(service, workspaceEvents, runtimeActiveThreadReader, liveActivitySubscriptionReader).build();
 	}
 
-constructor(
+	constructor(
 		private readonly service: ChatService,
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 		private readonly runtimeActiveThreadReader?: RuntimeActiveThreadReader,
+		private readonly liveActivitySubscriptionReader?: LiveActivitySubscriptionReader,
 	) {}
-
-	
 
 	build() {
 		return new Elysia({ name: "chat-controller" })
@@ -70,6 +91,99 @@ constructor(
 					stopped: result.state === "stale_cleared" || result.state === "stopping",
 				};
 			})
+			.post(
+				"/chats/:id/live-activity/subscription",
+				async ({ body, params: parameters, set }) => {
+					const liveActivitySubscriptionReader = this.liveActivitySubscriptionReader;
+					const legacyFcmToken = body.fcmToken?.trim() || "";
+					const pushToken = body.pushToken?.trim() || legacyFcmToken;
+					const pushTokenType = body.pushTokenType ?? (legacyFcmToken.length > 0 ? "fcm" : null);
+					const liveActivityToken = body.liveActivityToken.trim();
+					const enabled = liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false;
+					logLiveActivitySubscription("request received", {
+						chatId: parameters.id,
+						enabled,
+						liveActivityToken: toTokenPreview(liveActivityToken),
+						pushToken: toTokenPreview(pushToken),
+						pushTokenType,
+					});
+					if (
+						pushToken.length === 0
+						|| liveActivityToken.length === 0
+						|| (pushTokenType !== "apns" && pushTokenType !== "fcm")
+					) {
+						logLiveActivitySubscription("request rejected (invalid payload)", {
+							chatId: parameters.id,
+							enabled,
+							liveActivityToken: toTokenPreview(liveActivityToken),
+							pushToken: toTokenPreview(pushToken),
+							pushTokenType,
+						});
+						set.status = 400;
+						return {
+							error: "invalid live activity subscription payload",
+						};
+					}
+
+					const chat = await this.service.getChatById(parameters.id);
+					if (!chat) {
+						logLiveActivitySubscription("request rejected (chat not found)", {
+							chatId: parameters.id,
+							enabled,
+							liveActivityToken: toTokenPreview(liveActivityToken),
+							pushToken: toTokenPreview(pushToken),
+							pushTokenType,
+						});
+						set.status = 404;
+						return { error: "chat not found" };
+					}
+
+					if (!liveActivitySubscriptionReader || !enabled) {
+						logLiveActivitySubscription("request completed", {
+							chatId: parameters.id,
+							enabled,
+							liveActivityToken: toTokenPreview(liveActivityToken),
+							pushToken: toTokenPreview(pushToken),
+							pushTokenType,
+							subscribed: false,
+						});
+						return {
+							enabled: false,
+							subscribed: false,
+						};
+					}
+
+					const subscribed = await liveActivitySubscriptionReader.upsertLiveActivityPushSubscription({
+						chatId: parameters.id,
+						chatTitle: body.chatTitle?.trim() || chat.title,
+						pushToken,
+						pushTokenType,
+						liveActivityToken,
+					});
+					logLiveActivitySubscription("request completed", {
+						chatId: parameters.id,
+						enabled,
+						liveActivityToken: toTokenPreview(liveActivityToken),
+						pushToken: toTokenPreview(pushToken),
+						pushTokenType,
+						subscribed,
+					});
+
+					return {
+						enabled: true,
+						subscribed,
+					};
+				},
+				{
+					body: t.Object({
+						chatTitle: t.Optional(t.String()),
+						fcmToken: t.Optional(t.String()),
+						pushToken: t.Optional(t.String()),
+						pushTokenType: t.Optional(t.Union([t.Literal("apns"), t.Literal("fcm")])),
+						liveActivityToken: t.String(),
+					}),
+				},
+			)
 			.get("/projects/:id/threads", async ({ params: parameters, set }) => {
 				const threads = await this.service.listThreadSummariesByProjectId(parameters.id);
 
@@ -116,8 +230,8 @@ constructor(
 
 					set.status = 201;
 
-				return { chat };
-			},
+					return { chat };
+				},
 				{
 					body: t.Object({
 						title: t.Optional(t.String()),
@@ -162,5 +276,6 @@ export const createChatController = (
 	service: ChatService,
 	workspaceEvents?: WorkspaceEventsServiceContract,
 	runtimeActiveThreadReader?: RuntimeActiveThreadReader,
+	liveActivitySubscriptionReader?: LiveActivitySubscriptionReader,
 ) =>
-	ChatController.build(service, workspaceEvents, runtimeActiveThreadReader);
+	ChatController.build(service, workspaceEvents, runtimeActiveThreadReader, liveActivitySubscriptionReader);

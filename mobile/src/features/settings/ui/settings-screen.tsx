@@ -1,4 +1,4 @@
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	ActivityIndicator,
@@ -22,6 +22,17 @@ import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 
 type StatusTone = "error" | "neutral" | "success";
+type SettingsScreenSearchParam = string | string[] | undefined;
+
+interface SettingsScreenSearchParams {
+	debugAutoConnect?: SettingsScreenSearchParam;
+	debugAutoSendMessage?: SettingsScreenSearchParam;
+	debugBaseUrl?: SettingsScreenSearchParam;
+	debugChatId?: SettingsScreenSearchParam;
+	debugNextPath?: SettingsScreenSearchParam;
+	debugProjectId?: SettingsScreenSearchParam;
+	debugToken?: SettingsScreenSearchParam;
+}
 
 const palette = {
 	accent: "#63C8FF",
@@ -35,6 +46,21 @@ const palette = {
 
 const DEFAULT_SERVER_TOKEN = "remotecode.io-token";
 const DEFAULT_SERVER_PORT = "8835";
+
+const normalizeSearchParam = (value: SettingsScreenSearchParam): string | null => {
+	const rawValue = Array.isArray(value) ? value[0] : value;
+	if (typeof rawValue !== "string") {
+		return null;
+	}
+
+	const trimmedValue = rawValue.trim();
+	return trimmedValue.length > 0 ? trimmedValue : null;
+};
+
+const toBooleanSearchParam = (value: SettingsScreenSearchParam): boolean => {
+	const normalized = normalizeSearchParam(value)?.toLowerCase();
+	return normalized === "1" || normalized === "true" || normalized === "yes";
+};
 
 const toHost = (value: string): string => {
 	const trimmed = value.trim().toLowerCase();
@@ -165,6 +191,7 @@ const normalizeConnectionBaseUrl = (value: string): string => {
 };
 
 export const SettingsScreen = () => {
+	const searchParams = useLocalSearchParams() as SettingsScreenSearchParams;
 	const router = useRouter();
 	const { config, update } = useApiConfig();
 	const [baseUrl, setBaseUrl] = useState<string>(() => toManualConnectionInput(config.baseUrl));
@@ -179,7 +206,15 @@ export const SettingsScreen = () => {
 	const [savedConnections, setSavedConnections] = useState<SavedConnection[]>([]);
 	const [rememberedTokenByServerId, setRememberedTokenByServerId] = useState<Record<string, string>>({});
 	const ignoreSavedPressByBaseUrlRef = useRef<Set<string>>(new Set());
+	const debugAutoConnectSignatureRef = useRef<string | null>(null);
 	const visibleSavedConnections = useMemo(() => filterSavedConnections(savedConnections), [savedConnections]);
+	const debugBaseUrl = normalizeSearchParam(searchParams.debugBaseUrl);
+	const debugChatId = normalizeSearchParam(searchParams.debugChatId);
+	const debugToken = normalizeSearchParam(searchParams.debugToken);
+	const debugProjectId = normalizeSearchParam(searchParams.debugProjectId);
+	const debugAutoSendMessage = normalizeSearchParam(searchParams.debugAutoSendMessage);
+	const debugNextPath = normalizeSearchParam(searchParams.debugNextPath);
+	const shouldDebugAutoConnect = toBooleanSearchParam(searchParams.debugAutoConnect);
 
 	const setStatus = (message: string, tone: StatusTone = "neutral") => {
 		setStatusMessage(message);
@@ -254,7 +289,7 @@ export const SettingsScreen = () => {
 		void hydrateSavedConnections();
 	}, [hydrateSavedConnections]);
 
-	const promptForServerToken = async (): Promise<string | null> => {
+	const promptForServerToken = useCallback(async (): Promise<string | null> => {
 		if (Platform.OS !== "ios" || typeof Alert.prompt !== "function") {
 			setStatus("Server rejected the default token. Manual token prompt is available only on iOS.", "error");
 			return null;
@@ -284,9 +319,9 @@ export const SettingsScreen = () => {
 				"secure-text",
 			);
 		});
-	};
+	}, []);
 
-	const connectAndPersist = async (input: { baseUrl: string; token?: string; serverId?: string }) => {
+	const connectAndPersist = useCallback(async (input: { baseUrl: string; token?: string; serverId?: string }) => {
 		const normalizedBaseUrl = normalizeConnectionBaseUrl(input.baseUrl);
 		const requestedToken = input.token?.trim() ?? "";
 
@@ -375,8 +410,8 @@ export const SettingsScreen = () => {
 		}
 	};
 
-	return await tryWithToken(0);
-};
+		return await tryWithToken(0);
+	}, [config.token, promptForServerToken, update]);
 
 	const connectManual = async () => {
 		setIsConnectingManual(true);
@@ -430,6 +465,82 @@ export const SettingsScreen = () => {
 			goNext();
 		}
 	};
+
+	useEffect(() => {
+		if (!shouldDebugAutoConnect || !debugBaseUrl || isConnectingManual) {
+			return;
+		}
+
+		const signature = `${debugBaseUrl}::${debugToken ?? ""}::${debugNextPath ?? ""}`;
+		if (debugAutoConnectSignatureRef.current === signature) {
+			return;
+		}
+
+		debugAutoConnectSignatureRef.current = signature;
+		setIsConnectingManual(true);
+		setStatusMessage("");
+		console.log("[settings-debug] auto-connecting from route", {
+			baseUrl: debugBaseUrl,
+			hasToken: Boolean(debugToken),
+			nextPath: debugNextPath ?? "/workspaces",
+		});
+
+		void (async () => {
+			try {
+				const connected = await connectAndPersist({
+					baseUrl: debugBaseUrl,
+					token: debugToken ?? undefined,
+				});
+				if (!connected) {
+					debugAutoConnectSignatureRef.current = null;
+					console.log("[settings-debug] auto-connect deferred", {
+						baseUrl: debugBaseUrl,
+					});
+					return;
+				}
+
+				console.log("[settings-debug] auto-connect complete", {
+					chatId: debugChatId,
+					baseUrl: debugBaseUrl,
+					nextPath: debugNextPath ?? "/workspaces",
+					projectId: debugProjectId,
+				});
+				if (debugProjectId && debugChatId) {
+					router.replace({
+						pathname: "/chat",
+						params: {
+							chatId: debugChatId,
+							debugAutoSendMessage: debugAutoSendMessage ?? undefined,
+							projectId: debugProjectId,
+							source: "thread-list",
+						},
+					});
+					return;
+				}
+
+				router.replace("/workspaces");
+			} catch (error: unknown) {
+				debugAutoConnectSignatureRef.current = null;
+				console.log("[settings-debug] auto-connect failed", {
+					baseUrl: debugBaseUrl,
+					error: error instanceof Error ? error.message : "unknown-error",
+				});
+			} finally {
+				setIsConnectingManual(false);
+			}
+		})();
+	}, [
+		debugBaseUrl,
+		debugChatId,
+		debugAutoSendMessage,
+		connectAndPersist,
+		debugNextPath,
+		debugProjectId,
+		debugToken,
+		isConnectingManual,
+		router,
+		shouldDebugAutoConnect,
+	]);
 
 	return (
 		<KeyboardAvoidingView

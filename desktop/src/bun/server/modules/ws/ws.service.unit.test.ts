@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 
 import type { ChatDTO, ServerWsEvent } from "../../types";
 import type { ChatRepository } from "../chat/chat.repository";
+import type { LiveActivityPushServiceContract } from "../live-activity/live-activity-push.model";
 import type { MessageRepository } from "../message/message.repository";
 import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
 import type { ProjectRepository } from "../project/project.repository";
@@ -114,6 +115,100 @@ test("WsService.startUserMessage blocks legacy fake chats", async () => {
 			event: "error",
 		},
 	]);
+});
+
+test("WsService.startUserMessage forwards lifecycle updates to live activity push service", async () => {
+	const chatRepository = {
+		findChatById: () => createChat({ title: "Live Chat" }),
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) =>
+			createChat({
+				diffAdded: update.diffAdded ?? 0,
+				diffRemoved: update.diffRemoved ?? 0,
+				isActive: update.isActive ?? false,
+				status: update.status ?? "pending",
+				title: "Live Chat",
+			}),
+		updateProviderThreadId: () => createChat(),
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (chatId: string, role: "user" | "assistant", content: string) => ({
+			chatId,
+			content,
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({
+			onDelta,
+			onEvent,
+		}: {
+			onDelta: (delta: string) => void;
+			onEvent: (event: { type: "item_started"; turnId: string; itemId: string; itemType: "assistant_message" }) => void;
+		}) => {
+			onDelta("delta one");
+			onEvent({
+				type: "item_started",
+				turnId: "turn-1",
+				itemId: "item-1",
+				itemType: "assistant_message",
+			});
+			return {
+				assistantText: "done",
+				diffAdded: 1,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const started: Array<{ chatId: string; chatTitle?: string }> = [];
+	const deltas: string[] = [];
+	const events: string[] = [];
+	const finished: Array<{ chatId: string; outcome: string; chatTitle?: string }> = [];
+	const liveActivityPushService: LiveActivityPushServiceContract = {
+		getIsEnabled: () => true,
+		onAssistantDelta: (_chatId, delta) => {
+			deltas.push(delta);
+		},
+		onAssistantEvent: (_chatId, event) => {
+			events.push(event.type);
+		},
+		onChatFinished: async (input) => {
+			finished.push(input);
+		},
+		onChatStarted: (input) => {
+			started.push(input);
+		},
+		upsertSubscription: async () => true,
+	};
+
+	const service = new WsService(
+		chatRepository,
+		messageRepository,
+		projectRepository,
+		runner,
+		undefined,
+		undefined,
+		undefined,
+		liveActivityPushService,
+	);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(started).toEqual([{ chatId: "chat-id", chatTitle: "Live Chat" }]);
+	expect(deltas).toEqual(["delta one"]);
+	expect(events).toEqual(["item_started"]);
+	expect(finished).toEqual([{ chatId: "chat-id", chatTitle: "Live Chat", outcome: "completed" }]);
 });
 
 test("WsService.startUserMessage blocks chat_running when already running", async () => {

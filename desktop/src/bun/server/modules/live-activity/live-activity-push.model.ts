@@ -19,11 +19,25 @@ export interface LiveActivityPushFinishInput {
 	outcome: "completed" | "error" | "failed";
 }
 
+export type LiveActivityPushTokenType = "apns" | "fcm";
+
 export interface LiveActivityPushSubscriptionInput {
 	chatId: string;
 	chatTitle?: string;
-	fcmToken: string;
+	pushToken: string;
+	pushTokenType: LiveActivityPushTokenType;
 	liveActivityToken: string;
+}
+
+export interface LiveActivityPushStoredSubscription extends LiveActivityPushSubscriptionInput {
+	updatedAt: string;
+}
+
+export interface LiveActivityPushSubscriptionStoreContract {
+	deleteByChatId(chatId: string): void;
+	deleteExact(input: LiveActivityPushSubscriptionInput): void;
+	listAll(): LiveActivityPushStoredSubscription[];
+	upsert(input: LiveActivityPushSubscriptionInput): LiveActivityPushStoredSubscription;
 }
 
 export interface LiveActivityPushServiceContract {

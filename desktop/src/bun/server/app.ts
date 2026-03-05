@@ -12,6 +12,11 @@ import { createFsService } from "./modules/fs/fs.service";
 import { MessageController } from "./modules/message/message.controller";
 import { MessageRepository } from "./modules/message/message.repository";
 import { MessageService } from "./modules/message/message.service";
+import { createLiveActivitySubscriptionRepository } from "./modules/live-activity/live-activity-subscription.repository";
+import {
+	createLiveActivityPushServiceFromEnvironment,
+	createNoopLiveActivityPushService,
+} from "./modules/live-activity/live-activity-push.service";
 import { ProjectController } from "./modules/project/project.controller";
 import { ProjectRepository } from "./modules/project/project.repository";
 import { ProjectService } from "./modules/project/project.service";
@@ -128,7 +133,7 @@ const createGzipResponse = (
 };
 
 export const ServerBootstrap = {
-	async buildServerApp(options?: { databasePath?: string; port?: number }) {
+	async buildServerApp(options?: { databasePath?: string; disableLiveActivityPush?: boolean; port?: number }) {
 		const listenPort = options?.port ?? serverConfig.port;
 		const databaseClient = await DatabaseClientFactory.create(options?.databasePath);
 
@@ -144,6 +149,7 @@ export const ServerBootstrap = {
 		const chatStreamEventRepository = createChatStreamEventRepository(databaseClient.orm);
 		const chatStreamSnapshotRepository = createChatStreamSnapshotRepository(databaseClient.orm);
 		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
+		const liveActivitySubscriptionRepository = createLiveActivitySubscriptionRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
@@ -158,6 +164,18 @@ export const ServerBootstrap = {
 		});
 		const workspaceEventsService = createWorkspaceEventsService(workspaceEventsRepository);
 		const serverMetadataService = createServerMetadataService(serverMetadataRepository, listenPort);
+		const liveActivityPushService = options?.disableLiveActivityPush
+			? createNoopLiveActivityPushService()
+			: createLiveActivityPushServiceFromEnvironment({
+				apnsAuthKeyId: serverConfig.liveActivityApnsAuthKeyId,
+				apnsPrivateKeyPath: serverConfig.liveActivityApnsPrivateKeyPath,
+				apnsTeamId: serverConfig.liveActivityApnsTeamId,
+				apnsUseSandbox: serverConfig.liveActivityApnsUseSandbox,
+				bundleIdentifier: serverConfig.liveActivityBundleIdentifier ?? "",
+				firebaseProjectId: serverConfig.liveActivityFirebaseProjectId,
+				serviceAccountPath: serverConfig.liveActivityServiceAccountPath,
+				subscriptionStore: liveActivitySubscriptionRepository,
+			});
 		const wsService = new WsService(
 			chatRepository,
 			messageRepository,
@@ -166,6 +184,7 @@ export const ServerBootstrap = {
 			workspaceEventsService,
 			chatStreamSnapshotRepository,
 			chatStreamEventRepository,
+			liveActivityPushService,
 		);
 		const codexModelsService = new CodexModelsService();
 
@@ -227,7 +246,7 @@ export const ServerBootstrap = {
 					.use(DiscoveryController.build(serverMetadataService))
 					.use(AuthController.build(serverMetadataService))
 					.use(ProjectController.build(projectService, workspaceEventsService))
-					.use(ChatController.build(chatService, workspaceEventsService, wsService))
+					.use(ChatController.build(chatService, workspaceEventsService, wsService, wsService))
 					.use(MessageController.build(messageService))
 					.use(GitController.build(gitService, workspaceEventsService))
 					.use(ProviderController.build(codexModelsService))
@@ -248,10 +267,11 @@ export const ServerBootstrap = {
 		};
 	},
 
-	async createBackendServer(options?: { databasePath?: string; port?: number }): Promise<BackendHandle> {
+	async createBackendServer(options?: { databasePath?: string; disableLiveActivityPush?: boolean; port?: number }): Promise<BackendHandle> {
 		const listenPort = options?.port ?? serverConfig.port;
 		const handle = await ServerBootstrap.buildServerApp({
 			databasePath: options?.databasePath,
+			disableLiveActivityPush: options?.disableLiveActivityPush,
 			port: listenPort,
 		});
 
@@ -288,7 +308,9 @@ export interface BackendHandle {
 	server: unknown;
 }
 
-export const createBackendServer = async (options?: { databasePath?: string; port?: number }): Promise<BackendHandle> =>
+export const createBackendServer = async (
+	options?: { databasePath?: string; disableLiveActivityPush?: boolean; port?: number },
+): Promise<BackendHandle> =>
 	await ServerBootstrap.createBackendServer(options);
 
 export type ServerApp = Awaited<ReturnType<typeof buildServerApp>>["app"];

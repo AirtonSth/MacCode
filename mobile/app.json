@@ -14,7 +14,8 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.remotecode-mobile",
+      "bundleIdentifier": "io.remotecode",
+      "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true
@@ -52,8 +53,8 @@
       [
         "expo-widgets",
         {
-          "bundleIdentifier": "com.anonymous.remotecode-mobile.ExpoWidgetsTarget",
-          "groupIdentifier": "group.com.anonymous.remotecode-mobile",
+          "bundleIdentifier": "io.remotecode.ExpoWidgetsTarget",
+          "groupIdentifier": "group.io.remotecode",
           "enablePushNotifications": true,
           "frequentUpdates": true,
           "widgets": []

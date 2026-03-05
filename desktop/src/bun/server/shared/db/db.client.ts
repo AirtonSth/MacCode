@@ -64,6 +64,7 @@ static async create(pathOverride?: string): Promise<DrizzleDatabaseClient> {
 		const orm = drizzle(sqlite, {
 			schema: {
 				chats: DatabaseSchema.chats,
+				liveActivitySubscriptions: DatabaseSchema.liveActivitySubscriptions,
 				messages: DatabaseSchema.messages,
 				projects: DatabaseSchema.projects,
 				terminalCommands: DatabaseSchema.terminalCommands,

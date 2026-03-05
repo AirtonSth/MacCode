@@ -7,7 +7,6 @@ import { useEffect, useState } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
 import { queryClient } from "@/shared/api/query-client";
-import { registerThreadLiveActivityBackgroundTask } from "@/shared/live-activity/thread-live-activity-background";
 import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
 import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
 import { ForegroundInsomniaMode } from "@/shared/runtime/foreground-insomnia-mode";
@@ -45,12 +44,6 @@ export default function RootLayout() {
 				await initializeThreadLiveActivityManager();
 			} catch {
 				// Ignore startup live-activity initialization failures.
-			}
-
-			try {
-				await registerThreadLiveActivityBackgroundTask();
-			} catch {
-				// Ignore startup background-task initialization failures.
 			}
 		})();
 	}, []);

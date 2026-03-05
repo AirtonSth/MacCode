@@ -9,7 +9,7 @@
     "web": "expo start --web",
     "lint": "bunx eslint .",
     "typecheck": "bun run tsc --noEmit",
-    "test": "bun test src/shared/api/ws-client.test.ts src/shared/api/discovery-manager.test.ts src/shared/notifications/local-notifications.test.ts",
+    "test": "bun test src/shared/api/ws-client.test.ts src/shared/api/discovery-manager.test.ts src/shared/api/remotecode-client.test.ts src/shared/notifications/local-notifications.test.ts",
     "test:e2e:ios": "bash ./e2e/run-ios-e2e.sh",
     "test:e2e:ios:navigation": "bash ./e2e/ios-navigation-flow.sh",
     "test:e2e:ios:terminal": "bash ./e2e/ios-terminal-flow.sh"

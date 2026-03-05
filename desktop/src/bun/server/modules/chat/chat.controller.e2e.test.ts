@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createBackendServer } from "../../app";
+import { serverConfig } from "../../config";
 import { createEdenClient } from "../../eden-client";
 import { createTestServer } from "../../shared/core/test-server";
 
@@ -317,6 +318,136 @@ test("POST /v1/chats/:id/stop returns 404 for missing chat", async () => {
 
 		expect(response.status).toBe(404);
 		expect(errorPayload?.error).toBe("chat not found");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("POST /v1/chats/:id/live-activity/subscription returns disabled when backend push is not configured", async () => {
+	const { cleanup, client, baseUrl } = await createTestServer({
+		disableLiveActivityPush: true,
+	});
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: projectId }).chats.post({ title: "Live Activity" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		const response = await fetch(`${baseUrl}/v1/chats/${chatId}/live-activity/subscription`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${serverConfig.token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				chatTitle: "Live Activity",
+				fcmToken: "fcm-token",
+				liveActivityToken: "activity-token",
+			}),
+		});
+		const payload = await response.json() as { enabled: boolean; subscribed: boolean };
+
+		expect(response.status).toBe(200);
+		expect(payload).toEqual({
+			enabled: false,
+			subscribed: false,
+		});
+	} finally {
+		await cleanup();
+	}
+});
+
+test("POST /v1/chats/:id/live-activity/subscription accepts pushToken payload shape", async () => {
+	const { cleanup, client, baseUrl } = await createTestServer({
+		disableLiveActivityPush: true,
+	});
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: projectId }).chats.post({ title: "Live Activity" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		const response = await fetch(`${baseUrl}/v1/chats/${chatId}/live-activity/subscription`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${serverConfig.token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				chatTitle: "Live Activity",
+				pushToken: "apns-token",
+				pushTokenType: "apns",
+				liveActivityToken: "activity-token",
+			}),
+		});
+		const payload = await response.json() as { enabled: boolean; subscribed: boolean };
+
+		expect(response.status).toBe(200);
+		expect(payload).toEqual({
+			enabled: false,
+			subscribed: false,
+		});
+	} finally {
+		await cleanup();
+	}
+});
+
+test("POST /v1/chats/:id/live-activity/subscription returns 404 for missing chat", async () => {
+	const { cleanup, baseUrl } = await createTestServer({
+		disableLiveActivityPush: true,
+	});
+
+	try {
+		const response = await fetch(`${baseUrl}/v1/chats/missing-chat/live-activity/subscription`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${serverConfig.token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				chatTitle: "Missing",
+				fcmToken: "fcm-token",
+				liveActivityToken: "activity-token",
+			}),
+		});
+		const payload = await response.json() as { error?: string };
+
+		expect(response.status).toBe(404);
+		expect(payload.error).toBe("chat not found");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("POST /v1/chats/:id/live-activity/subscription returns 400 when pushTokenType is missing for pushToken payload", async () => {
+	const { cleanup, client, baseUrl } = await createTestServer({
+		disableLiveActivityPush: true,
+	});
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: projectId }).chats.post({ title: "Live Activity" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		const response = await fetch(`${baseUrl}/v1/chats/${chatId}/live-activity/subscription`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${serverConfig.token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				chatTitle: "Live Activity",
+				pushToken: "apns-token",
+				liveActivityToken: "activity-token",
+			}),
+		});
+		const payload = await response.json() as { error?: string };
+
+		expect(response.status).toBe(400);
+		expect(payload.error).toBe("invalid live activity subscription payload");
 	} finally {
 		await cleanup();
 	}

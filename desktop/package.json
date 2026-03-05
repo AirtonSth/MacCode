@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Electrobun app with React + Vite",
   "scripts": {
-    "start": "vite build && electrobun dev",
+    "start": "vite build && electrobun dev --watch",
     "build:vite": "vite build",
     "dev": "electrobun dev --watch",
     "dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
@@ -15,6 +15,7 @@
     "e2e:run:playwright": "bunx playwright test -c e2e/playwright/playwright.config.mjs",
     "mcp:playwright-electron": "bun run ./playwright-e2e/playwright-mcp-electron.ts",
     "automation:cdp-screenshot": "bun run ./playwright-e2e/cdp-screenshot.ts",
+    "live-activity:send-test": "bun run ./src/bun/server/scripts/live-activity-send-test.ts",
     "test:e2e": "bunx concurrently \"bun run e2e:serve\" \"bunx wait-on tcp:127.0.0.1:4173 && bun run e2e:run\" --kill-others --success first",
     "test:e2e:frontend": "bunx concurrently \"bun run e2e:serve\" \"bunx wait-on tcp:127.0.0.1:4173 && bun run e2e:run:frontend\" --kill-others --success first",
     "test:backend": "bun test $(find ./src/bun/server -name \"*.test.ts\")",

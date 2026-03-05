@@ -1,4 +1,31 @@
 import * as Notifications from "expo-notifications";
+import { AppState, Platform, type AppStateStatus } from "react-native";
+
+export type PushDeliveryTokenType = "apns" | "fcm";
+
+export interface PushDeliveryToken {
+	token: string;
+	type: PushDeliveryTokenType;
+}
+
+const LOG_PREFIX = "[push-delivery-token]";
+const TOKEN_RETRY_INTERVAL_MS = 1_000;
+const TOKEN_RESOLUTION_TIMEOUT_MS = 20_000;
+
+const toTokenPreview = (token: string): string => (
+	token.length <= 16
+		? token
+		: `${token.slice(0, 8)}...${token.slice(-4)}`
+);
+
+const log = (message: string, meta?: Record<string, unknown>): void => {
+	if (meta) {
+		console.log(LOG_PREFIX, message, meta);
+		return;
+	}
+
+	console.log(LOG_PREFIX, message);
+};
 
 const hasGrantedPermission = (status: Notifications.NotificationPermissionsStatus): boolean => {
 	if (status.granted) {
@@ -6,6 +33,45 @@ const hasGrantedPermission = (status: Notifications.NotificationPermissionsStatu
 	}
 
 	return status.ios?.status === Notifications.IosAuthorizationStatus.PROVISIONAL;
+};
+
+const isActiveAppState = (status: AppStateStatus): boolean => status === "active";
+
+const wait = async (durationMs: number): Promise<void> => {
+	// eslint-disable-next-line promise/avoid-new -- setTimeout is callback-based in React Native.
+	await new Promise((resolve) => {
+		setTimeout(resolve, durationMs);
+	});
+};
+
+const waitForActiveAppState = async (timeoutMs: number): Promise<boolean> => {
+	if (isActiveAppState(AppState.currentState)) {
+		return true;
+	}
+
+	// eslint-disable-next-line promise/avoid-new -- AppState subscriptions are callback-based in React Native.
+	return await new Promise((resolve) => {
+		let settled = false;
+		const subscription = AppState.addEventListener("change", (nextState) => {
+			if (!isActiveAppState(nextState) || settled) {
+				return;
+			}
+
+			settled = true;
+			subscription.remove();
+			resolve(true);
+		});
+
+		setTimeout(() => {
+			if (settled) {
+				return;
+			}
+
+			settled = true;
+			subscription.remove();
+			resolve(isActiveAppState(AppState.currentState));
+		}, timeoutMs);
+	});
 };
 
 const normalizeToken = (value: unknown): string | null => {
@@ -17,30 +83,72 @@ const normalizeToken = (value: unknown): string | null => {
 	return normalized.length > 0 ? normalized : null;
 };
 
-const extractToken = (value: unknown): string | null => {
+const normalizePushDeliveryTokenType = (value: unknown): PushDeliveryTokenType | null => {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "android" || normalized === "fcm") {
+		return "fcm";
+	}
+
+	if (normalized === "ios" || normalized === "apns") {
+		return "apns";
+	}
+
+	return null;
+};
+
+const inferPushDeliveryTokenType = (): PushDeliveryTokenType => (
+	Platform.OS === "android" ? "fcm" : "apns"
+);
+
+const toPushDeliveryToken = (token: string, type: PushDeliveryTokenType | null): PushDeliveryToken => ({
+	token,
+	type: type ?? inferPushDeliveryTokenType(),
+});
+
+const extractPushDeliveryToken = (value: unknown): PushDeliveryToken | null => {
 	const directToken = normalizeToken(value);
 	if (directToken) {
-		return directToken;
+		return toPushDeliveryToken(directToken, null);
 	}
 
 	if (typeof value !== "object" || value === null) {
 		return null;
 	}
 
-	const withData = value as { data?: unknown; token?: unknown };
-	const directDataToken = normalizeToken(withData.data);
+	const entry = value as {
+		data?: unknown;
+		token?: unknown;
+		type?: unknown;
+	};
+
+	const directDataToken = normalizeToken(entry.data);
 	if (directDataToken) {
-		return directDataToken;
+		return toPushDeliveryToken(directDataToken, normalizePushDeliveryTokenType(entry.type));
 	}
 
-	if (typeof withData.data === "object" && withData.data !== null) {
-		const nestedDataToken = normalizeToken((withData.data as { token?: unknown }).token);
-		if (nestedDataToken) {
-			return nestedDataToken;
+	if (typeof entry.data === "object" && entry.data !== null) {
+		const nested = entry.data as {
+			data?: unknown;
+			token?: unknown;
+			type?: unknown;
+		};
+		const nestedToken = normalizeToken(nested.token) ?? normalizeToken(nested.data);
+		if (nestedToken) {
+			const nestedType = normalizePushDeliveryTokenType(nested.type) ?? normalizePushDeliveryTokenType(entry.type);
+			return toPushDeliveryToken(nestedToken, nestedType);
 		}
 	}
 
-	return normalizeToken(withData.token);
+	const token = normalizeToken(entry.token);
+	if (!token) {
+		return null;
+	}
+
+	return toPushDeliveryToken(token, normalizePushDeliveryTokenType(entry.type));
 };
 
 const ensurePushPermission = async (): Promise<boolean> => {
@@ -59,41 +167,128 @@ const ensurePushPermission = async (): Promise<boolean> => {
 	return hasGrantedPermission(requestedPermissions);
 };
 
-let cachedMessagingToken: string | null = null;
+let cachedPushDeliveryToken: PushDeliveryToken | null = null;
+let inflightPushDeliveryTokenPromise: Promise<PushDeliveryToken | null> | null = null;
 
-export const ensureFirebaseMessagingToken = async (): Promise<string | null> => {
-	if (cachedMessagingToken) {
-		return cachedMessagingToken;
-	}
+interface ResolvePushDeliveryTokenOptions {
+	attempt: number;
+	requestedPermission: boolean;
+	startedAtMs: number;
+}
 
-	try {
-		const hasPermission = await ensurePushPermission();
-		if (!hasPermission) {
-			return null;
-		}
-
-		const getDevicePushTokenAsync = (Notifications as unknown as {
-			getDevicePushTokenAsync?: () => Promise<unknown>;
-		}).getDevicePushTokenAsync;
-		if (typeof getDevicePushTokenAsync !== "function") {
-			return null;
-		}
-
-		const token = extractToken(await getDevicePushTokenAsync());
-		if (!token) {
-			return null;
-		}
-
-		// eslint-disable-next-line require-atomic-updates
-		cachedMessagingToken = token;
-		return token;
-	} catch {
+const readPushDeliveryToken = async (): Promise<PushDeliveryToken | null> => {
+	const getDevicePushTokenAsync = (Notifications as unknown as {
+		getDevicePushTokenAsync?: () => Promise<unknown>;
+	}).getDevicePushTokenAsync;
+	if (typeof getDevicePushTokenAsync !== "function") {
+		log("getDevicePushTokenAsync unavailable");
 		return null;
 	}
+
+	const token = extractPushDeliveryToken(await getDevicePushTokenAsync());
+	if (!token) {
+		log("failed to extract token");
+		return null;
+	}
+
+	return token;
 };
 
-export const subscribeFirebaseMessagingTokenRefresh = (
-	listener: (token: string) => void,
+const resolvePushDeliveryTokenWithRetry = async (
+	options: ResolvePushDeliveryTokenOptions,
+): Promise<PushDeliveryToken | null> => {
+	const attempt = options.attempt + 1;
+	const hasPermission = options.requestedPermission
+		? hasGrantedPermission(await Notifications.getPermissionsAsync())
+		: await ensurePushPermission();
+
+	if (!hasPermission) {
+		if (attempt === 1) {
+			log("permission not granted");
+		} else {
+			log("permission still unavailable; retrying", {
+				appState: AppState.currentState,
+				attempt,
+			});
+		}
+	} else {
+		const token = await readPushDeliveryToken();
+		if (token) {
+			cachedPushDeliveryToken = token;
+			log("token obtained", {
+				token: toTokenPreview(token.token),
+				type: token.type,
+			});
+			return token;
+		}
+
+		log("token unavailable; retrying", {
+			appState: AppState.currentState,
+			attempt,
+		});
+	}
+
+	const remainingMs = TOKEN_RESOLUTION_TIMEOUT_MS - (Date.now() - options.startedAtMs);
+	if (remainingMs <= 0) {
+		log("token resolution timed out", {
+			appState: AppState.currentState,
+			attempts: attempt,
+		});
+		return null;
+	}
+
+	if (!isActiveAppState(AppState.currentState)) {
+		log("waiting for active app state before retry", {
+			appState: AppState.currentState,
+			attempt,
+		});
+		await waitForActiveAppState(Math.min(remainingMs, TOKEN_RETRY_INTERVAL_MS * 4));
+	} else {
+		await wait(Math.min(remainingMs, TOKEN_RETRY_INTERVAL_MS));
+	}
+
+	return await resolvePushDeliveryTokenWithRetry({
+		attempt,
+		requestedPermission: true,
+		startedAtMs: options.startedAtMs,
+	});
+};
+
+export const ensurePushDeliveryToken = async (): Promise<PushDeliveryToken | null> => {
+	if (cachedPushDeliveryToken) {
+		log("using cached token", {
+			token: toTokenPreview(cachedPushDeliveryToken.token),
+			type: cachedPushDeliveryToken.type,
+		});
+		return cachedPushDeliveryToken;
+	}
+
+	if (inflightPushDeliveryTokenPromise) {
+		return await inflightPushDeliveryTokenPromise;
+	}
+
+	inflightPushDeliveryTokenPromise = (async () => {
+		try {
+			return await resolvePushDeliveryTokenWithRetry({
+				attempt: 0,
+				requestedPermission: false,
+				startedAtMs: Date.now(),
+			});
+		} catch (error) {
+			log("token request failed", {
+				error: error instanceof Error ? error.message : "unknown",
+			});
+			return null;
+		} finally {
+			inflightPushDeliveryTokenPromise = null;
+		}
+	})();
+
+	return await inflightPushDeliveryTokenPromise;
+};
+
+export const subscribePushDeliveryTokenRefresh = (
+	listener: (token: PushDeliveryToken) => void,
 ): (() => void) => {
 	const addPushTokenListener = (Notifications as unknown as {
 		addPushTokenListener?: (callback: (event: unknown) => void) => { remove: () => void };
@@ -104,12 +299,17 @@ export const subscribeFirebaseMessagingTokenRefresh = (
 	}
 
 	const subscription = addPushTokenListener((event) => {
-		const token = extractToken(event);
+		const token = extractPushDeliveryToken(event);
 		if (!token) {
+			log("token refresh event ignored");
 			return;
 		}
 
-		cachedMessagingToken = token;
+		cachedPushDeliveryToken = token;
+		log("token refreshed", {
+			token: toTokenPreview(token.token),
+			type: token.type,
+		});
 		listener(token);
 	});
 
@@ -117,3 +317,6 @@ export const subscribeFirebaseMessagingTokenRefresh = (
 		subscription.remove();
 	};
 };
+
+export const ensureFirebaseMessagingToken = ensurePushDeliveryToken;
+export const subscribeFirebaseMessagingTokenRefresh = subscribePushDeliveryTokenRefresh;

@@ -105,6 +105,30 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 		expect(chatStreamEventIndexes).toContain("idx_chat_stream_events_chat_id_id");
 		expect(chatStreamEventIndexes).toContain("idx_chat_stream_events_chat_id_turn_id_id");
 
+		const liveActivitySubscriptionColumns = client.sqlite
+			.prepare("PRAGMA table_info(live_activity_subscriptions)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+		expect(liveActivitySubscriptionColumns).toEqual(
+			expect.arrayContaining([
+				"id",
+				"chatId",
+				"chatTitle",
+				"pushToken",
+				"pushTokenType",
+				"liveActivityToken",
+				"updatedAt",
+			]),
+		);
+
+		const liveActivitySubscriptionIndexes = client.sqlite
+			.prepare("PRAGMA index_list(live_activity_subscriptions)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+		expect(liveActivitySubscriptionIndexes).toContain("idx_live_activity_subscriptions_chat_id");
+		expect(liveActivitySubscriptionIndexes).toContain("idx_live_activity_subscriptions_updated_at");
+		expect(liveActivitySubscriptionIndexes).toContain("idx_live_activity_subscriptions_token_pair");
+
 		const chatColumns = client.sqlite
 			.prepare("PRAGMA table_info(chats)")
 			.all()

@@ -13,6 +13,10 @@ export interface RunningServer {
 	client: ReturnType<typeof createEdenClient>;
 }
 
+interface CreateTestServerOptions {
+	disableLiveActivityPush?: boolean;
+}
+
 const toPort = (server: unknown): number => {
 	if (!server || typeof server !== "object") {
 		return 3001;
@@ -22,11 +26,12 @@ const toPort = (server: unknown): number => {
 };
 
 export const TestServerFactory = {
-	async create(): Promise<RunningServer> {
+	async create(options?: CreateTestServerOptions): Promise<RunningServer> {
 		const root = mkdtempSync(join(tmpdir(), "remotecode-tests-"));
 		const databasePath = join(root, "remodecode.sqlite");
 		const backend = await createBackendServer({
 			databasePath,
+			disableLiveActivityPush: options?.disableLiveActivityPush,
 			port: 0,
 		});
 
@@ -50,4 +55,5 @@ export const TestServerFactory = {
 	},
 };
 
-export const createTestServer = async (): Promise<RunningServer> => await TestServerFactory.create();
+export const createTestServer = async (options?: CreateTestServerOptions): Promise<RunningServer> =>
+	await TestServerFactory.create(options);

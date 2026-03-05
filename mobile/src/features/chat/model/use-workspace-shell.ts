@@ -18,6 +18,7 @@ import { useProjectsQuery } from "../../threads/api/use-projects-query";
 import { useToggleFavoriteMutation } from "../../threads/api/use-toggle-favorite-mutation";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { queryKeys } from "../../../shared/api/query-keys";
+import { RemoteCodeRequestError } from "../../../shared/api/remotecode-client";
 import { createRealtimeClient, type ConnectionState } from "../../../shared/api/ws-client";
 import type {
 	ActiveThreadSummaryDTO,
@@ -34,17 +35,14 @@ import type {
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import {
 	clearThreadLiveActivity,
-	finishThreadLiveActivity,
 	isThreadLiveActivityEnabled,
-	onThreadLiveActivityAppStateChanged,
-	setThreadLiveActivityRemoteManaged,
 	startThreadLiveActivity,
 	subscribeThreadLiveActivityPushToken,
-	updateThreadLiveActivity,
 } from "../../../shared/live-activity/thread-live-activity";
 import {
-	ensureFirebaseMessagingToken,
-	subscribeFirebaseMessagingTokenRefresh,
+	ensurePushDeliveryToken,
+	subscribePushDeliveryTokenRefresh,
+	type PushDeliveryToken,
 } from "../../../shared/notifications/firebase-messaging";
 import {
 	ensureLocalNotificationPermission,
@@ -137,6 +135,29 @@ const toRequestId = (): string =>
 
 const permissionModes = ["plan", "default", "full"] as const;
 const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh"] as const;
+const LIVE_ACTIVITY_SUBSCRIPTION_LOG_PREFIX = "[live-activity-subscription]";
+const LIVE_ACTIVITY_SUBSCRIPTION_RETRY_INTERVAL_MS = 5_000;
+
+const toTokenPreview = (token: string): string => (
+	token.length <= 16
+		? token
+		: `${token.slice(0, 8)}...${token.slice(-4)}`
+);
+
+const logLiveActivitySubscription = (message: string, meta?: Record<string, unknown>): void => {
+	if (meta) {
+		console.log(LIVE_ACTIVITY_SUBSCRIPTION_LOG_PREFIX, message, meta);
+		return;
+	}
+
+	console.log(LIVE_ACTIVITY_SUBSCRIPTION_LOG_PREFIX, message);
+};
+
+const omitRecordKey = <T>(input: Record<string, T>, key: string): Record<string, T> => {
+	const { [key]: ignore, ...next } = input;
+	void ignore;
+	return next;
+};
 
 const normalizePermissionMode = (value: string | null | undefined): string => {
 	return typeof value === "string" && (permissionModes as readonly string[]).includes(value)
@@ -332,10 +353,14 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const pendingCompletionNotificationChatIdsRef = useRef<Set<string>>(new Set());
 	const lastSendAttemptChatIdRef = useRef<string | null>(null);
-	const fcmTokenRef = useRef<string | null>(null);
+	const pushDeliveryTokenRef = useRef<PushDeliveryToken | null>(null);
 	const liveActivityTokenByChatRef = useRef<Record<string, string>>({});
 	const registeredLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
-	const remoteManagedLiveActivityByChatRef = useRef<Record<string, boolean>>({});
+	const pendingLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
+	const liveActivitySubscriptionRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const flushLiveActivitySubscriptionsRef = useRef<() => void>(() => {
+		// no-op
+	});
 	const lastAssistantEventIdByChatRef = useRef<Record<string, number>>({});
 	const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 	const clientIdRef = useRef<string>(`mobile-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`);
@@ -498,55 +523,75 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	);
 
 	const updateRunningLiveActivity = useCallback(
-			(input: {
-				chatId: string;
-				chatTitle?: string;
-				phase?: "running" | "background" | "finalizing";
-				preview?: string;
-				statusLine?: string;
-				force?: boolean;
-			}) => {
-				if (remoteManagedLiveActivityByChatRef.current[input.chatId]) {
-					return;
-				}
+		(input: {
+			chatId: string;
+			chatTitle?: string;
+			phase?: "running" | "background" | "finalizing";
+			preview?: string;
+			statusLine?: string;
+			force?: boolean;
+		}) => {
+			void input;
 
-			const title = input.chatTitle?.trim() || resolveChatTitle(input.chatId);
-
-			void updateThreadLiveActivity({
-				chatId: input.chatId,
-				chatTitle: title,
-				phase: input.phase,
-				preview: input.preview,
-				statusLine: input.statusLine,
-				force: input.force,
-			});
+			// Live Activity updates are backend-managed.
 		},
-		[resolveChatTitle],
+		[],
 	);
 
-		const finishLiveActivity = useCallback(
-			(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
-				if (remoteManagedLiveActivityByChatRef.current[chatId]) {
-					return;
-				}
-
-			const title = resolveChatTitle(chatId);
-			void finishThreadLiveActivity({
+	const finishLiveActivity = useCallback(
+		(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
+			liveActivityTokenByChatRef.current = omitRecordKey(liveActivityTokenByChatRef.current, chatId);
+			registeredLiveActivitySignatureByChatRef.current = omitRecordKey(
+				registeredLiveActivitySignatureByChatRef.current,
 				chatId,
-				chatTitle: title,
-				outcome: input.outcome,
-				statusLine: input.statusLine,
-			});
-		},
-		[resolveChatTitle],
-		);
-
-		const removeRemoteManagedLiveActivity = useCallback((chatId: string) => {
-			const nextEntries = Object.entries(remoteManagedLiveActivityByChatRef.current).filter(([key]) =>
-				key !== chatId
 			);
-			remoteManagedLiveActivityByChatRef.current = Object.fromEntries(nextEntries);
-		}, []);
+			pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
+				pendingLiveActivitySignatureByChatRef.current,
+				chatId,
+			);
+			void input;
+
+			// Live Activity completion is backend-managed.
+		},
+		[],
+	);
+
+	const clearLiveActivitySubscriptionRetry = useCallback(() => {
+		if (!liveActivitySubscriptionRetryTimeoutRef.current) {
+			return;
+		}
+
+		clearTimeout(liveActivitySubscriptionRetryTimeoutRef.current);
+		liveActivitySubscriptionRetryTimeoutRef.current = null;
+	}, []);
+
+	const clearLiveActivitySubscriptionState = useCallback((chatId: string) => {
+		liveActivityTokenByChatRef.current = omitRecordKey(liveActivityTokenByChatRef.current, chatId);
+		registeredLiveActivitySignatureByChatRef.current = omitRecordKey(
+			registeredLiveActivitySignatureByChatRef.current,
+			chatId,
+		);
+		pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
+			pendingLiveActivitySignatureByChatRef.current,
+			chatId,
+		);
+	}, []);
+
+	const scheduleLiveActivitySubscriptionRetry = useCallback((input: { chatId?: string; reason: string }) => {
+		if (liveActivitySubscriptionRetryTimeoutRef.current) {
+			return;
+		}
+
+		logLiveActivitySubscription("scheduling subscription retry", {
+			chatId: input.chatId ?? null,
+			delayMs: LIVE_ACTIVITY_SUBSCRIPTION_RETRY_INTERVAL_MS,
+			reason: input.reason,
+		});
+		liveActivitySubscriptionRetryTimeoutRef.current = setTimeout(() => {
+			liveActivitySubscriptionRetryTimeoutRef.current = null;
+			flushLiveActivitySubscriptionsRef.current();
+		}, LIVE_ACTIVITY_SUBSCRIPTION_RETRY_INTERVAL_MS);
+	}, []);
 
 	const notifyMessageCompletion = useCallback(
 		(chatId: string, outcome: "completed" | "error" | "failed") => {
@@ -576,89 +621,233 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	);
 
 	const flushLiveActivitySubscriptions = useCallback(() => {
-		const fcmToken = fcmTokenRef.current?.trim() ?? "";
-		if (fcmToken.length === 0) {
+		const pushDeliveryToken = pushDeliveryTokenRef.current;
+		const pushToken = pushDeliveryToken?.token.trim() ?? "";
+		const pushTokenType = pushDeliveryToken?.type;
+		if (pushToken.length === 0 || (pushTokenType !== "apns" && pushTokenType !== "fcm")) {
+			logLiveActivitySubscription("flush skipped (missing push delivery token)", {
+				hasPushToken: pushToken.length > 0,
+				pushTokenType: pushTokenType ?? null,
+			});
 			return;
 		}
 
 		for (const [chatId, liveActivityToken] of Object.entries(liveActivityTokenByChatRef.current)) {
 			const normalizedLiveActivityToken = liveActivityToken.trim();
 			if (normalizedLiveActivityToken.length === 0) {
+				logLiveActivitySubscription("flush skipped (missing live activity token)", {
+					chatId,
+				});
 				continue;
 			}
 
-			const signature = `${fcmToken}::${normalizedLiveActivityToken}`;
+			const signature = `${pushTokenType}::${pushToken}::${normalizedLiveActivityToken}`;
 			if (registeredLiveActivitySignatureByChatRef.current[chatId] === signature) {
+				logLiveActivitySubscription("flush skipped (already registered)", {
+					chatId,
+					liveActivityToken: toTokenPreview(normalizedLiveActivityToken),
+					pushToken: toTokenPreview(pushToken),
+					pushTokenType,
+				});
+				continue;
+			}
+			if (pendingLiveActivitySignatureByChatRef.current[chatId] === signature) {
+				logLiveActivitySubscription("flush skipped (subscription already in flight)", {
+					chatId,
+					liveActivityToken: toTokenPreview(normalizedLiveActivityToken),
+					pushToken: toTokenPreview(pushToken),
+					pushTokenType,
+				});
 				continue;
 			}
 
 			const chatTitle = resolveChatTitle(chatId);
 			void (async () => {
+				pendingLiveActivitySignatureByChatRef.current[chatId] = signature;
+				logLiveActivitySubscription("sending subscription", {
+					chatId,
+					chatTitle: chatTitle ?? null,
+					liveActivityToken: toTokenPreview(normalizedLiveActivityToken),
+					pushToken: toTokenPreview(pushToken),
+					pushTokenType,
+				});
 				try {
 					const result = await client.upsertChatLiveActivitySubscription(chatId, {
 						chatTitle: chatTitle?.trim().length ? chatTitle : undefined,
-						fcmToken,
+						pushToken,
+						pushTokenType,
 						liveActivityToken: normalizedLiveActivityToken,
 					});
+					logLiveActivitySubscription("subscription response", {
+						chatId,
+						enabled: result.enabled,
+						subscribed: result.subscribed,
+					});
 					if (!result.enabled || !result.subscribed) {
-						remoteManagedLiveActivityByChatRef.current[chatId] = false;
-						void setThreadLiveActivityRemoteManaged({
+						if (!result.enabled) {
+							logLiveActivitySubscription("clearing live activity after disabled subscription", {
+								chatId,
+							});
+							clearLiveActivitySubscriptionState(chatId);
+							void clearThreadLiveActivity({
+								chatId,
+							});
+							return;
+						}
+
+						logLiveActivitySubscription("subscription not accepted yet; keeping activity and retrying", {
 							chatId,
-							remoteManaged: false,
+						});
+						scheduleLiveActivitySubscriptionRetry({
+							chatId,
+							reason: "subscription-not-accepted",
 						});
 						return;
 					}
 
-					remoteManagedLiveActivityByChatRef.current[chatId] = true;
+					const currentPushToken = pushDeliveryTokenRef.current?.token.trim() ?? "";
+					const currentPushTokenType = pushDeliveryTokenRef.current?.type ?? null;
+					const currentLiveActivityToken = liveActivityTokenByChatRef.current[chatId]?.trim() ?? "";
+					if (
+						currentPushToken !== pushToken
+						|| currentPushTokenType !== pushTokenType
+						|| currentLiveActivityToken !== normalizedLiveActivityToken
+					) {
+						logLiveActivitySubscription("subscription response ignored (stale token state)", {
+							chatId,
+						});
+						return;
+					}
+
 					registeredLiveActivitySignatureByChatRef.current[chatId] = signature;
-					void setThreadLiveActivityRemoteManaged({
+				} catch (error) {
+					if (error instanceof RemoteCodeRequestError && (error.status === 400 || error.status === 404)) {
+						logLiveActivitySubscription("clearing live activity after permanent subscription failure", {
+							chatId,
+							error: error.message,
+							status: error.status,
+						});
+						clearLiveActivitySubscriptionState(chatId);
+						void clearThreadLiveActivity({
+							chatId,
+						});
+						return;
+					}
+
+					logLiveActivitySubscription("subscription request failed", {
 						chatId,
-						remoteManaged: true,
+						error: error instanceof Error ? error.message : "unknown",
 					});
-				} catch {
-					// Ignore remote live activity subscription failures.
+					scheduleLiveActivitySubscriptionRetry({
+						chatId,
+						reason: error instanceof Error ? error.message : "request-failed",
+					});
+				} finally {
+					if (pendingLiveActivitySignatureByChatRef.current[chatId] === signature) {
+						pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
+							pendingLiveActivitySignatureByChatRef.current,
+							chatId,
+						);
+					}
 				}
 			})();
 		}
-	}, [client, resolveChatTitle]);
+	}, [clearLiveActivitySubscriptionState, client, resolveChatTitle, scheduleLiveActivitySubscriptionRetry]);
+
+	useEffect(() => {
+		flushLiveActivitySubscriptionsRef.current = flushLiveActivitySubscriptions;
+	}, [flushLiveActivitySubscriptions]);
 
 	useEffect(() => {
 		let canceled = false;
 
-		void (async () => {
-			const token = await ensureFirebaseMessagingToken();
-			if (canceled || !token || token.trim().length === 0) {
-				return;
-			}
-
-			fcmTokenRef.current = token.trim();
-			flushLiveActivitySubscriptions();
-		})();
-
-		const unsubscribe = subscribeFirebaseMessagingTokenRefresh((token) => {
-			const normalized = token.trim();
+		const storePushDeliveryToken = (
+			token: PushDeliveryToken,
+			reason: "initial" | "foreground retry" | "refresh",
+		): void => {
+			const normalized = token.token.trim();
 			if (normalized.length === 0) {
 				return;
 			}
 
-			fcmTokenRef.current = normalized;
+			pushDeliveryTokenRef.current = {
+				...token,
+				token: normalized,
+			};
+			logLiveActivitySubscription(`${reason} push delivery token stored`, {
+				pushToken: toTokenPreview(normalized),
+				pushTokenType: token.type,
+			});
 			flushLiveActivitySubscriptions();
-		});
-
-		return () => {
-			canceled = true;
-			unsubscribe();
 		};
-	}, [flushLiveActivitySubscriptions]);
+
+		const syncPushDeliveryToken = async (
+			reason: "initial" | "foreground retry",
+		): Promise<void> => {
+			const token = await ensurePushDeliveryToken();
+			if (canceled || !token || token.token.trim().length === 0) {
+				logLiveActivitySubscription(`${reason} push delivery token unavailable`, {
+					canceled,
+					hasToken: Boolean(token?.token.trim().length),
+				});
+				return;
+			}
+
+			storePushDeliveryToken(token, reason);
+		};
+
+		void syncPushDeliveryToken("initial");
+
+		const unsubscribe = subscribePushDeliveryTokenRefresh((token) => {
+			if (canceled) {
+				return;
+			}
+
+			storePushDeliveryToken(token, "refresh");
+		});
+			const appStateSubscription = AppState.addEventListener("change", (nextState) => {
+				if (canceled || nextState !== "active") {
+					return;
+				}
+
+				if (!pushDeliveryTokenRef.current?.token.trim().length) {
+					logLiveActivitySubscription("retrying push delivery token on foreground");
+					void syncPushDeliveryToken("foreground retry");
+					return;
+				}
+
+				logLiveActivitySubscription("retrying live activity subscriptions on foreground");
+				flushLiveActivitySubscriptionsRef.current();
+			});
+
+			return () => {
+				canceled = true;
+				unsubscribe();
+				appStateSubscription.remove();
+			};
+		}, [flushLiveActivitySubscriptions]);
+
+	useEffect(() => {
+		return () => {
+			clearLiveActivitySubscriptionRetry();
+		};
+	}, [clearLiveActivitySubscriptionRetry]);
 
 	useEffect(() => {
 		const unsubscribe = subscribeThreadLiveActivityPushToken((event) => {
 			const normalizedPushToken = event.pushToken.trim();
 			if (normalizedPushToken.length === 0) {
+				logLiveActivitySubscription("live activity token event ignored", {
+					chatId: event.chatId,
+				});
 				return;
 			}
 
 			liveActivityTokenByChatRef.current[event.chatId] = normalizedPushToken;
+			logLiveActivitySubscription("live activity token received", {
+				chatId: event.chatId,
+				liveActivityToken: toTokenPreview(normalizedPushToken),
+			});
 			flushLiveActivitySubscriptions();
 		});
 
@@ -1192,12 +1381,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const subscription = AppState.addEventListener("change", (nextState) => {
-				const previousState = appStateRef.current;
-				appStateRef.current = nextState;
-				const activeChatIdForState = selectedChatIdRef.current;
-				if (!activeChatIdForState || !remoteManagedLiveActivityByChatRef.current[activeChatIdForState]) {
-					void onThreadLiveActivityAppStateChanged(nextState);
-				}
+			const previousState = appStateRef.current;
+			appStateRef.current = nextState;
 			const isReturningToForeground =
 				(previousState === "background" || previousState === "inactive") && nextState === "active";
 
@@ -1220,11 +1405,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				return;
 			}
 
-			updateRunningLiveActivity({
-				chatId: activeChatId,
-				phase: "running",
-				statusLine: "Running",
-			});
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			void queryClient.invalidateQueries({
 				queryKey: queryKeys.messages(activeChatId),
@@ -1453,13 +1633,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const deleteChat = useCallback(
 		async (chatId: string) => {
-				await deleteChatMutation.mutateAsync(chatId);
-				pendingSendChatIdsRef.current.delete(chatId);
-				pendingCompletionNotificationChatIdsRef.current.delete(chatId);
-				removeRemoteManagedLiveActivity(chatId);
-				await clearThreadLiveActivity({
-					chatId,
-				});
+			await deleteChatMutation.mutateAsync(chatId);
+			pendingSendChatIdsRef.current.delete(chatId);
+			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+			clearLiveActivitySubscriptionState(chatId);
+			await clearThreadLiveActivity({
+				chatId,
+			});
 
 			if (selectedChatId === chatId) {
 				setSelectedChatId(null);
@@ -1468,9 +1648,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					selectedProjectId,
 				});
 			}
-			},
-			[deleteChatMutation, persistSelection, removeRemoteManagedLiveActivity, selectedChatId, selectedProjectId],
-		);
+		},
+		[clearLiveActivitySubscriptionState, deleteChatMutation, persistSelection, selectedChatId, selectedProjectId],
+	);
 
 	const createChat = useCallback(
 		async (title?: string): Promise<ChatDTO | null> => {
@@ -1516,16 +1696,16 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					selectedChatId: null,
 					selectedProjectId: null,
 				});
-				}
-				if (selectedChatIdRef.current) {
-					removeRemoteManagedLiveActivity(selectedChatIdRef.current);
-					await clearThreadLiveActivity({
-						chatId: selectedChatIdRef.current,
-					});
-				}
-			},
-			[client, persistSelection, queryClient, removeRemoteManagedLiveActivity, selectedProjectId],
-		);
+			}
+			if (selectedChatIdRef.current) {
+				clearLiveActivitySubscriptionState(selectedChatIdRef.current);
+				await clearThreadLiveActivity({
+					chatId: selectedChatIdRef.current,
+				});
+			}
+		},
+		[clearLiveActivitySubscriptionState, client, persistSelection, queryClient, selectedProjectId],
+	);
 
 	const renameProject = useCallback(
 		async (projectId: string, name: string) => {

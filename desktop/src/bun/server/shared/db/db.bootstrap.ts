@@ -78,6 +78,18 @@ const serverMetadataCreateSql = `
 	)
 `;
 
+const liveActivitySubscriptionsCreateSql = `
+	CREATE TABLE IF NOT EXISTS live_activity_subscriptions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+		chatTitle TEXT,
+		pushToken TEXT NOT NULL,
+		pushTokenType TEXT NOT NULL CHECK(pushTokenType IN ('apns', 'fcm')),
+		liveActivityToken TEXT NOT NULL,
+		updatedAt TEXT NOT NULL
+	)
+`;
+
 export class DatabaseBootstrap {
 	static initialize(database: Database): void {
 		this.enableForeignKeys(database);
@@ -92,6 +104,7 @@ export class DatabaseBootstrap {
 		this.createChatStreamSnapshotsTable(database);
 		this.createChatStreamEventsTable(database);
 		this.createServerMetadataTable(database);
+		this.createLiveActivitySubscriptionsTable(database);
 		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
 	}
@@ -332,6 +345,10 @@ export class DatabaseBootstrap {
 		database.exec(serverMetadataCreateSql);
 	}
 
+	private static createLiveActivitySubscriptionsTable(database: Database): void {
+		database.exec(liveActivitySubscriptionsCreateSql);
+	}
+
 	private static dropLegacyTerminalSessionsTable(database: Database): void {
 		if (!this.hasTable(database, "terminal_sessions")) {
 			return;
@@ -370,6 +387,15 @@ export class DatabaseBootstrap {
 			"CREATE INDEX IF NOT EXISTS idx_chat_stream_events_chat_id_turn_id_id ON chat_stream_events(chatId, turnId, id ASC)",
 		);
 		database.exec("CREATE INDEX IF NOT EXISTS idx_server_metadata_updated_at ON server_metadata(updatedAt DESC)");
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_live_activity_subscriptions_chat_id ON live_activity_subscriptions(chatId)",
+		);
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_live_activity_subscriptions_updated_at ON live_activity_subscriptions(updatedAt DESC)",
+		);
+		database.exec(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_live_activity_subscriptions_token_pair ON live_activity_subscriptions(chatId, pushTokenType, pushToken, liveActivityToken)",
+		);
 	}
 }
 

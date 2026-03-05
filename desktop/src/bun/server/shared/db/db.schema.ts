@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const projects = sqliteTable("projects", {
 	createdAt: text("createdAt").notNull(),
@@ -108,6 +108,31 @@ export const serverMetadata = sqliteTable("server_metadata", {
 	updatedAt: text("updatedAt").notNull(),
 });
 
+export const liveActivitySubscriptions = sqliteTable(
+	"live_activity_subscriptions",
+	{
+		id: integer("id").primaryKey({ autoIncrement: true }),
+		chatId: text("chatId")
+			.notNull()
+			.references(() => chats.id, { onDelete: "cascade" }),
+		chatTitle: text("chatTitle"),
+		pushToken: text("pushToken").notNull(),
+		pushTokenType: text("pushTokenType").notNull(),
+		liveActivityToken: text("liveActivityToken").notNull(),
+		updatedAt: text("updatedAt").notNull(),
+	},
+	(table) => ({
+		chatIdIndex: index("idx_live_activity_subscriptions_chat_id").on(table.chatId),
+		updatedAtIndex: index("idx_live_activity_subscriptions_updated_at").on(table.updatedAt),
+		uniqueTokenPair: uniqueIndex("idx_live_activity_subscriptions_token_pair").on(
+			table.chatId,
+			table.pushTokenType,
+			table.pushToken,
+			table.liveActivityToken,
+		),
+	}),
+);
+
 export type ChatRow = typeof chats.$inferSelect;
 
 export type MessageRow = typeof messages.$inferSelect;
@@ -119,6 +144,7 @@ export type WorkspaceEventRow = typeof workspaceEvents.$inferSelect;
 export type ChatStreamSnapshotRow = typeof chatStreamSnapshots.$inferSelect;
 export type ChatStreamEventRow = typeof chatStreamEvents.$inferSelect;
 export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
+export type LiveActivitySubscriptionRow = typeof liveActivitySubscriptions.$inferSelect;
 
 export class DatabaseSchema {
 	static readonly projects = projects;
@@ -140,4 +166,6 @@ export class DatabaseSchema {
 	static readonly chatStreamEvents = chatStreamEvents;
 
 	static readonly serverMetadata = serverMetadata;
+
+	static readonly liveActivitySubscriptions = liveActivitySubscriptions;
 }

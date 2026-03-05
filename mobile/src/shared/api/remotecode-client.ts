@@ -142,7 +142,7 @@ export interface RemoteCodeClient {
 	) => Promise<ChatStreamEventsResponseDTO>;
 	upsertChatLiveActivitySubscription: (
 		chatId: string,
-		input: { chatTitle?: string; fcmToken: string; liveActivityToken: string },
+		input: { chatTitle?: string; liveActivityToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
 	) => Promise<LiveActivitySubscriptionResponse>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	commitProject: (
@@ -432,27 +432,37 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 			});
 		},
 
-		async upsertChatLiveActivitySubscription(
-			chatId: string,
-			input: { chatTitle?: string; fcmToken: string; liveActivityToken: string },
-		) {
-			try {
-				return await request<LiveActivitySubscriptionResponse>({
-					method: "POST",
-					path: `/chats/${chatId}/live-activity/subscription`,
-					body: input,
-				});
-			} catch (error) {
-				if (error instanceof RemoteCodeRequestError && (error.status === 404 || error.status === 501)) {
-					return {
-						enabled: false,
-						subscribed: false,
-					};
-				}
+			async upsertChatLiveActivitySubscription(
+				chatId: string,
+				input: { chatTitle?: string; liveActivityToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
+			) {
+				try {
+					return await request<LiveActivitySubscriptionResponse>({
+						method: "POST",
+						path: `/chats/${chatId}/live-activity/subscription`,
+						body: input,
+					});
+				} catch (error) {
+					if (error instanceof RemoteCodeRequestError && error.status === 501) {
+						return {
+							enabled: false,
+							subscribed: false,
+						};
+					}
+					if (
+						error instanceof RemoteCodeRequestError
+						&& error.status === 404
+						&& error.message.trim().toLowerCase() !== "chat not found"
+					) {
+						return {
+							enabled: false,
+							subscribed: false,
+						};
+					}
 
-				throw error;
-			}
-		},
+					throw error;
+				}
+			},
 
 		async listProjects() {
 			const payload = await request<ListProjectsResponse>({

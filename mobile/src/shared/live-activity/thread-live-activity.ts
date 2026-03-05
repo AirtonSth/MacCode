@@ -8,6 +8,7 @@ import {
 	type ThreadLiveActivityProps,
 } from "./thread-live-activity.widget";
 
+const LOG_PREFIX = "[thread-live-activity]";
 const ACTIVE_STATE_KEY = "remotecode.live_activity.active_state";
 const PUSH_TOKEN_KEY = "remotecode.live_activity.push_token";
 const PUSH_TO_START_TOKEN_KEY = "remotecode.live_activity.push_to_start_token";
@@ -82,6 +83,21 @@ let currentAppState: AppStateStatus = "active";
 const pushTokenListeners = new Set<(event: LiveActivityPushTokenUpdate) => void>();
 
 const nowMs = (): number => Date.now();
+
+const toTokenPreview = (token: string): string => (
+	token.length <= 16
+		? token
+		: `${token.slice(0, 8)}...${token.slice(-4)}`
+);
+
+const log = (message: string, meta?: Record<string, unknown>): void => {
+	if (meta) {
+		console.log(LOG_PREFIX, message, meta);
+		return;
+	}
+
+	console.log(LOG_PREFIX, message);
+};
 
 const withDefault = (value: string | undefined, fallback: string): string => {
 	const trimmed = value?.trim();
@@ -175,12 +191,12 @@ const hydratePersistedState = async (): Promise<void> => {
 				chatTitle: withDefault(parsed.chatTitle, "Thread"),
 				phase: parsed.phase ?? "running",
 				preview: withDefault(parsed.preview, "Waiting for updates..."),
-			startedAtMs:
-				typeof parsed.startedAtMs === "number" && Number.isFinite(parsed.startedAtMs) && parsed.startedAtMs > 0
-					? Math.floor(parsed.startedAtMs)
-					: nowMs(),
+				startedAtMs:
+					typeof parsed.startedAtMs === "number" && Number.isFinite(parsed.startedAtMs) && parsed.startedAtMs > 0
+						? Math.floor(parsed.startedAtMs)
+						: nowMs(),
 				statusLine: withDefault(parsed.statusLine, "Running"),
-				remoteManaged: Boolean(parsed.remoteManaged),
+				remoteManaged: true,
 			};
 	} catch {
 		// Ignore malformed persisted state.
@@ -197,6 +213,10 @@ const detachActivityPushTokenSubscription = (): void => {
 };
 
 const emitPushToken = (chatId: string, pushToken: string): void => {
+	log("push token emitted", {
+		chatId,
+		pushToken: toTokenPreview(pushToken),
+	});
 	for (const listener of pushTokenListeners) {
 		try {
 			listener({
@@ -222,6 +242,10 @@ const attachActivityPushTokenSubscription = (activity: LiveActivity<ThreadLiveAc
 			return;
 		}
 
+		log("push token listener received", {
+			chatId,
+			pushToken: toTokenPreview(normalizedPushToken),
+		});
 		void SecureStore.setItemAsync(PUSH_TOKEN_KEY, normalizedPushToken);
 		emitPushToken(chatId, normalizedPushToken);
 	});
@@ -236,10 +260,17 @@ const syncCurrentActivityPushToken = async (): Promise<void> => {
 	try {
 		const pushToken = withDefault(await activeActivity.getPushToken() ?? "", "");
 		if (pushToken.length === 0) {
+			log("current activity push token unavailable", {
+				chatId,
+			});
 			return;
 		}
 
 		await SecureStore.setItemAsync(PUSH_TOKEN_KEY, pushToken);
+		log("current activity push token synchronized", {
+			chatId,
+			pushToken: toTokenPreview(pushToken),
+		});
 		emitPushToken(chatId, pushToken);
 	} catch {
 		// Ignore push-token synchronization failures.
@@ -416,7 +447,11 @@ const resetRuntimeState = async (): Promise<void> => {
 	lastContentSignature = "";
 	lastContentUpdateAtMs = 0;
 	lastStatePersistAtMs = 0;
-	await persistActiveState();
+	await Promise.all([
+		persistActiveState(),
+		SecureStore.deleteItemAsync(PUSH_TOKEN_KEY),
+		SecureStore.deleteItemAsync(PUSH_TO_START_TOKEN_KEY),
+	]);
 };
 
 export const initializeThreadLiveActivityManager = async (): Promise<void> => {
@@ -443,10 +478,13 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 			}
 		}
 
-		pushToStartTokenSubscription ||= addPushToStartTokenListener((event) => {
-			void SecureStore.setItemAsync(PUSH_TO_START_TOKEN_KEY, event.activityPushToStartToken);
-		});
-	} catch {
+			pushToStartTokenSubscription ||= addPushToStartTokenListener((event) => {
+				log("push-to-start token received", {
+					pushToken: toTokenPreview(event.activityPushToStartToken),
+				});
+				void SecureStore.setItemAsync(PUSH_TO_START_TOKEN_KEY, event.activityPushToStartToken);
+			});
+		} catch {
 		liveActivitiesUnavailable = true;
 		await resetRuntimeState();
 		// eslint-disable-next-line require-atomic-updates
@@ -490,8 +528,14 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		preview: withDefault(input.preview, "Waiting for updates..."),
 		startedAtMs,
 		statusLine: withDefault(input.statusLine, "Running"),
-		remoteManaged: Boolean(input.remoteManaged),
+		remoteManaged: true,
 	};
+	log("start requested", {
+		chatId: activeState.chatId,
+		chatTitle: activeState.chatTitle,
+		remoteManaged: activeState.remoteManaged,
+		restart: input.restart ?? false,
+	});
 	await persistActiveState();
 	if (activeState.remoteManaged) {
 		clearHeartbeat();
@@ -502,6 +546,9 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 
 	const existing = await normalizeActivityInstance();
 	if (existing) {
+		log("reusing existing activity instance", {
+			chatId: activeState.chatId,
+		});
 		if (!activeState.remoteManaged) {
 			await queueStateUpdate({
 				immediate: true,
@@ -517,6 +564,9 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 			toProps(activeState),
 			`remotecode-mobile://chat?chatId=${encodeURIComponent(activeState.chatId)}`,
 		);
+		log("activity instance started", {
+			chatId: activeState.chatId,
+		});
 		attachActivityPushTokenSubscription(activeActivity);
 		lastContentSignature = toContentSignature(activeState);
 		lastContentUpdateAtMs = nowMs();
@@ -728,6 +778,9 @@ export const setThreadLiveActivityRemoteManaged = async (input: {
 
 	await initializeThreadLiveActivityManager();
 	if (!activeState || activeState.chatId !== input.chatId) {
+		return;
+	}
+	if (!input.remoteManaged) {
 		return;
 	}
 
