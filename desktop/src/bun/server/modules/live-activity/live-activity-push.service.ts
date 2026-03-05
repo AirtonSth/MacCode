@@ -21,6 +21,7 @@ const PUSH_END_DISMISS_SECONDS = 30;
 const PREVIEW_LIMIT = 30;
 const TITLE_LIMIT = 80;
 const STATUS_LIMIT = 80;
+const SANITIZE_INPUT_CODEPOINT_LIMIT = 4_096;
 const PREVIEW_ELLIPSIS = "...";
 const LIVE_ACTIVITY_NAME = "ThreadLiveActivity";
 const LIVE_ACTIVITY_TOPIC_SUFFIX = ".push-type.liveactivity";
@@ -142,8 +143,12 @@ const ANSI_ESCAPE_PATTERN =
 	/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\)|P[^\u001B]*\u001B\\|\^.*?\u001B\\|_.*?\u001B\\)/gu;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F-\u009F]/gu;
 const INVISIBLE_FORMAT_CHARACTER_PATTERN = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/gu;
-const TITLE_STATUS_ALLOWED_PATTERN = /[^\p{L}\p{N}\p{Zs}'".,;:!?@#%&+\-_/()]/gu;
-const PREVIEW_ALLOWED_PATTERN = /[^\p{L}\p{N}\p{Zs}'".,;:!?@#%&+\-_/()$*=<>\[\]{}|]/gu;
+const BROKEN_SURROGATE_PATTERN = /[\uD800-\uDFFF]/gu;
+const MARKDOWN_CODE_FENCE_PATTERN = /```[\s\S]*?```/gu;
+const INLINE_CODE_PATTERN = /`[^`]*`/gu;
+const STRUCTURAL_CODE_CHARACTER_PATTERN = /[`\\<>{}\[\]|$*=~^"]/gu;
+const TITLE_STATUS_ALLOWED_PATTERN = /[^\p{L}\p{N}\p{Zs}'.,;:!?@#%&+\-_/()]/gu;
+const PREVIEW_ALLOWED_PATTERN = /[^\p{L}\p{N}\p{Zs}'.,;:!?@#%&+\-_/()]/gu;
 const PREVIEW_UTF8_BYTE_LIMIT = 192;
 const TITLE_UTF8_BYTE_LIMIT = 256;
 const STATUS_UTF8_BYTE_LIMIT = 256;
@@ -214,12 +219,18 @@ const toSafeLiveActivityText = (value: string, maxLength: number, field: LiveAct
 		return "";
 	}
 
-	const normalizedValue = (value ?? "").normalize("NFKC");
+	const boundedInput = toCodePointHead(String(value ?? ""), SANITIZE_INPUT_CODEPOINT_LIMIT);
+	const normalizedValue = boundedInput.normalize("NFKC");
 	const withoutAnsi = normalizedValue.replace(ANSI_ESCAPE_PATTERN, " ");
 	const withoutControlChars = withoutAnsi
 		.replace(CONTROL_CHARACTER_PATTERN, " ")
-		.replace(INVISIBLE_FORMAT_CHARACTER_PATTERN, " ");
-	const asciiSafeQuotes = withoutControlChars
+		.replace(INVISIBLE_FORMAT_CHARACTER_PATTERN, " ")
+		.replace(BROKEN_SURROGATE_PATTERN, " ");
+	const withoutCodeFrames = withoutControlChars
+		.replace(MARKDOWN_CODE_FENCE_PATTERN, " ")
+		.replace(INLINE_CODE_PATTERN, " ")
+		.replace(STRUCTURAL_CODE_CHARACTER_PATTERN, " ");
+	const asciiSafeQuotes = withoutCodeFrames
 		.replace(/[\u2018\u2019]/gu, "'")
 		.replace(/[\u201C\u201D]/gu, "\"");
 	const fieldOnlyAllowed = asciiSafeQuotes.replace(toFieldAllowPattern(field), " ");
@@ -356,11 +367,7 @@ const toPreviewChunk = (preview: string, delta: string): string => {
 
 	const base = toNormalizedPreviewText(preview);
 	const next = `${base} ${normalizedDelta}`.trim();
-	if (next.length <= PREVIEW_LIMIT) {
-		return next;
-	}
-
-	return next.slice(-PREVIEW_LIMIT);
+	return toUtf8Head(next, PREVIEW_UTF8_BYTE_LIMIT);
 };
 
 const toElapsedSeconds = (startedAtMs: number): number => {
