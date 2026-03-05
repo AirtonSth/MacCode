@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
-import { ActivityIndicator, Animated, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
+import { useRef } from "react";
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { MaterialIcons } from "@expo/vector-icons";
 
 import { formatRelativeTime } from "../../../shared/lib/time";
@@ -10,232 +10,104 @@ const palette = {
 	text: "#F1F4FA",
 };
 
-const swipeDeleteWidth = 108;
-const swipeThreshold = 46;
-
 interface SwipeableThreadItemProps {
 	chat: ChatDTO;
 	index: number;
-	isActive: boolean;
 	isWorking?: boolean;
 	isSelected: boolean;
 	isLoading?: boolean;
-	onClose: () => void;
-	onDelete: () => void;
-	onOpen: () => void;
+	onLongPress: () => void;
 	onOpenChat: () => void;
-	deleteTestID: string;
 	rowTestID: string;
 }
 
 export const SwipeableThreadItem = ({
 	chat,
 	index,
-	isActive,
 	isWorking = false,
 	isSelected,
 	isLoading = false,
-	onClose,
-	onDelete,
-	onOpen,
+	onLongPress,
 	onOpenChat,
-	deleteTestID,
 	rowTestID,
 }: SwipeableThreadItemProps) => {
-	const translateX = useRef(new Animated.Value(0)).current;
-	const dragStartRef = useRef(0);
-	const isAnimatingRef = useRef(false);
-	const deleteActionOpacity = useMemo(
-		() =>
-			translateX.interpolate({
-				extrapolate: "clamp",
-				inputRange: [-swipeDeleteWidth, -8, 0],
-				outputRange: [1, 1, 0],
-			}),
-		[translateX],
-	);
-
-	const animateTo = useCallback(
-		(value: number, onFinish?: () => void) => {
-			isAnimatingRef.current = true;
-			Animated.spring(translateX, {
-				damping: 24,
-				toValue: value,
-				useNativeDriver: true,
-			}).start(() => {
-				isAnimatingRef.current = false;
-				onFinish?.();
-			});
-		},
-		[translateX],
-	);
-
-	const open = useCallback(() => {
-		onOpen();
-		animateTo(-swipeDeleteWidth);
-	}, [animateTo, onOpen]);
-
-	const close = useCallback(() => {
-		onClose();
-		animateTo(0);
-	}, [animateTo, onClose]);
-
-	const panResponder = useMemo(
-		() =>
-			PanResponder.create({
-				onMoveShouldSetPanResponder: (event, gesture) => {
-					void event;
-					return Math.abs(gesture.dx) > 8 && Math.abs(gesture.dx) > Math.abs(gesture.dy);
-				},
-				onPanResponderGrant: (event, gesture) => {
-					void event;
-					void gesture;
-					translateX.stopAnimation((value) => {
-						dragStartRef.current = value ?? 0;
-					});
-				},
-				onPanResponderMove: (event, gesture) => {
-					void event;
-					const isSwipingLeft = dragStartRef.current + gesture.dx < 0;
-					if (!isSwipingLeft && !isActive) {
-						return;
-					}
-
-					if (isAnimatingRef.current) {
-						return;
-					}
-
-					const next = Math.min(0, dragStartRef.current + gesture.dx);
-					translateX.setValue(Math.max(-swipeDeleteWidth * 1.1, next));
-				},
-				onPanResponderRelease: (event, gesture) => {
-					void event;
-					const finalPosition = dragStartRef.current + gesture.dx;
-
-					if (finalPosition < -swipeThreshold) {
-						open();
-					} else {
-						close();
-					}
-				},
-				onPanResponderTerminate: () => {
-					close();
-				},
-			}),
-		[close, isActive, open, translateX],
-	);
-
-	useEffect(() => {
-		if (isActive) {
-			animateTo(-swipeDeleteWidth);
-		} else {
-			animateTo(0);
-		}
-	}, [animateTo, isActive]);
+	const shouldIgnorePressRef = useRef(false);
 
 	return (
-		<View style={styles.swipeRowRoot}>
-			<Animated.View style={[styles.deleteActionRoot, { opacity: deleteActionOpacity }]}>
-				<Pressable
-					accessibilityLabel={`thread-item-delete-${String(index)}`}
-					accessibilityRole="button"
-					testID={deleteTestID}
-					onPress={() => {
-						onClose();
-						onDelete();
-					}}
-					style={styles.deleteActionButton}
-					>
-						<MaterialIcons color="#0A0D14" name="delete-outline" size={20} />
-					</Pressable>
-			</Animated.View>
+		<Pressable
+			accessibilityLabel={`thread-item-${String(index)}`}
+			accessibilityRole="button"
+			accessibilityState={{ disabled: isLoading }}
+			delayLongPress={280}
+			disabled={isLoading}
+			onLongPress={() => {
+				if (isLoading) {
+					return;
+				}
 
-			<Animated.View
-				style={[
-					styles.listRow,
-					isSelected ? styles.listRowSelected : null,
-					isWorking ? styles.listRowWorking : null,
-					{ transform: [{ translateX }] },
-				]}
-				{...panResponder.panHandlers}
-			>
-				<Pressable
-					accessibilityLabel={`thread-item-${String(index)}`}
-					accessibilityRole="button"
-					accessibilityState={{ disabled: isLoading }}
-					testID={rowTestID}
-					disabled={isLoading}
-					onPress={() => {
-						if (isLoading) {
-							return;
-						}
+				shouldIgnorePressRef.current = true;
+				onLongPress();
+			}}
+			onPress={() => {
+				if (isLoading) {
+					return;
+				}
 
-						if (isActive) {
-							close();
-							return;
-						}
+				if (shouldIgnorePressRef.current) {
+					shouldIgnorePressRef.current = false;
+					return;
+				}
 
-						onOpenChat();
-					}}
-					style={({ pressed }) => [pressed ? styles.listRowPressed : null]}
-				>
-					<View style={styles.rowContent}>
-						<View style={styles.rowMain}>
-							{isWorking ? (
-								<View style={styles.rowLeading} testID={`thread-item-status-${String(index)}`}>
-									<ActivityIndicator color={palette.accent} size={11} />
-								</View>
-							) : null}
-							<View style={styles.rowText}>
-								<Text
-									numberOfLines={1}
-									style={styles.rowTitle}
-									testID={`thread-item-title-${String(index)}`}
-								>
-									{chat.title}
-								</Text>
-								<View style={styles.metaRow}>
-									<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
-								</View>
-							</View>
+				onOpenChat();
+			}}
+			onPressOut={() => {
+				if (!shouldIgnorePressRef.current) {
+					return;
+				}
+
+				setTimeout(() => {
+					shouldIgnorePressRef.current = false;
+				}, 0);
+			}}
+			style={({ pressed }) => [
+				styles.listRow,
+				isSelected ? styles.listRowSelected : null,
+				isWorking ? styles.listRowWorking : null,
+				pressed ? styles.listRowPressed : null,
+			]}
+			testID={rowTestID}
+		>
+			<View style={styles.rowContent}>
+				<View style={styles.rowMain}>
+					{isWorking ? (
+						<View style={styles.rowLeading} testID={`thread-item-status-${String(index)}`}>
+							<ActivityIndicator color={palette.accent} size={11} />
 						</View>
-						{isLoading ? (
-							<ActivityIndicator color={palette.text} size="small" />
-						) : (
-							<MaterialIcons color={palette.text} name="chevron-right" size={20} />
-						)}
+					) : null}
+					<View style={styles.rowText}>
+						<Text
+							numberOfLines={1}
+							style={styles.rowTitle}
+							testID={`thread-item-title-${String(index)}`}
+						>
+							{chat.title}
+						</Text>
+						<View style={styles.metaRow}>
+							<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
+						</View>
 					</View>
-				</Pressable>
-				</Animated.View>
+				</View>
+				{isLoading ? (
+					<ActivityIndicator color={palette.text} size="small" />
+				) : (
+					<MaterialIcons color={palette.text} name="chevron-right" size={20} />
+				)}
 			</View>
-		);
+		</Pressable>
+	);
 };
 
 const styles = StyleSheet.create({
-	swipeRowRoot: {
-		borderRadius: 11,
-		overflow: "hidden",
-	},
-	deleteActionRoot: {
-		alignItems: "center",
-		backgroundColor: "#ff5d5f",
-		borderRadius: 11,
-		flexDirection: "row",
-		height: "100%",
-		justifyContent: "center",
-		overflow: "hidden",
-		position: "absolute",
-		right: 0,
-		top: 0,
-		width: swipeDeleteWidth,
-	},
-	deleteActionButton: {
-		alignItems: "center",
-		flex: 1,
-		height: "100%",
-		justifyContent: "center",
-		width: swipeDeleteWidth,
-	},
 	listRow: {
 		backgroundColor: "#12161E",
 		borderColor: "rgba(255,255,255,0.11)",
@@ -244,27 +116,8 @@ const styles = StyleSheet.create({
 		gap: 4,
 		padding: 12,
 	},
-	rowContent: {
-		alignItems: "center",
-		flexDirection: "row",
-		justifyContent: "space-between",
-		gap: 8,
-	},
-	rowMain: {
-		alignItems: "center",
-		flex: 1,
-		flexDirection: "row",
-		gap: 8,
-		minWidth: 0,
-	},
-	rowLeading: {
-		alignItems: "center",
-		justifyContent: "center",
-		width: 12,
-	},
-	rowText: {
-		flex: 1,
-		minWidth: 0,
+	listRowPressed: {
+		opacity: 0.8,
 	},
 	listRowSelected: {
 		borderColor: "rgba(99,200,255,0.45)",
@@ -273,17 +126,36 @@ const styles = StyleSheet.create({
 		backgroundColor: "rgba(99,200,255,0.18)",
 		borderColor: "rgba(99,200,255,0.74)",
 	},
-	listRowPressed: {
-		opacity: 0.8,
+	metaRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		paddingTop: 3,
+	},
+	rowContent: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
+		justifyContent: "space-between",
+	},
+	rowLeading: {
+		alignItems: "center",
+		justifyContent: "center",
+		width: 12,
+	},
+	rowMain: {
+		alignItems: "center",
+		flex: 1,
+		flexDirection: "row",
+		gap: 8,
+		minWidth: 0,
 	},
 	rowMeta: {
 		color: "#98A0AF",
 		fontSize: 12,
 	},
-	metaRow: {
-		alignItems: "center",
-		flexDirection: "row",
-		paddingTop: 3,
+	rowText: {
+		flex: 1,
+		minWidth: 0,
 	},
 	rowTitle: {
 		color: "#F1F4FA",

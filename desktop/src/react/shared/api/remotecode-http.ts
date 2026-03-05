@@ -445,6 +445,22 @@ export const RemoteCodeApi = {
 				return payload.project;
 			},
 
+			updateProject: async (
+				id: string,
+				input: {
+					isFavorite?: boolean;
+					name?: string;
+				},
+			): Promise<ProjectDTO> => {
+				const payload = await request<RestProjectPatchResponse>({
+					body: input,
+					method: "PATCH",
+					path: `/projects/${id}`,
+				});
+
+				return payload.project;
+			},
+
 			toggleFavorite: async (id: string, isFavorite: boolean): Promise<ProjectDTO> => {
 				const payload = await request<RestProjectPatchResponse>({
 					body: { isFavorite },

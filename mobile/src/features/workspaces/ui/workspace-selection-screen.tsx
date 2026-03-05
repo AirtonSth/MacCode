@@ -17,11 +17,14 @@ import { useWorkspaceShell } from "../../chat/model/use-workspace-shell";
 import { DesktopFilePickerModal } from "../../chat/ui/desktop-file-picker-modal";
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
+import type { ProjectDTO } from "../../../shared/api/types";
 import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import { ActiveThreadsFooterCta } from "../../../shared/ui/active-threads-footer-cta";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
+import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import { SwipeableWorkspaceItem } from "./swipeable-workspace-item";
+import { WorkspaceRenameModal } from "./workspace-rename-modal";
 
 const palette = {
 	accent: "#63C8FF",
@@ -46,6 +49,7 @@ export const WorkspaceSelectionScreen = () => {
 		isActiveThreadsLoading,
 		isChatsLoading,
 		projects,
+		renameProject,
 		selectProject,
 		selectedProjectId,
 	} = useWorkspaceShell({
@@ -56,8 +60,11 @@ export const WorkspaceSelectionScreen = () => {
 	const [searchValue, setSearchValue] = useState<string>("");
 	const [isDesktopPickerVisible, setIsDesktopPickerVisible] = useState<boolean>(false);
 	const [isCreatingFromFab, setIsCreatingFromFab] = useState<boolean>(false);
-	const [openSwipeRowId, setOpenSwipeRowId] = useState<string | null>(null);
+	const [workspaceActionTarget, setWorkspaceActionTarget] = useState<ProjectDTO | null>(null);
 	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
+	const [workspaceNameInput, setWorkspaceNameInput] = useState<string>("");
+	const [workspaceToRename, setWorkspaceToRename] = useState<ProjectDTO | null>(null);
+	const [isRenamingWorkspace, setIsRenamingWorkspace] = useState<boolean>(false);
 	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(
 		new Set(),
 	);
@@ -144,7 +151,7 @@ export const WorkspaceSelectionScreen = () => {
 	}, []);
 
 	const openWorkspace = (project: (typeof projects)[number]) => {
-		setOpenSwipeRowId(null);
+		setWorkspaceActionTarget(null);
 		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		push("/threads");
@@ -171,7 +178,6 @@ export const WorkspaceSelectionScreen = () => {
 	};
 
 	const deleteWorkspace = async (project: (typeof projects)[number]) => {
-		setOpenSwipeRowId((current) => (current === project.id ? null : current));
 		markWorkspaceDeleteOptimistic(project.id);
 
 		try {
@@ -181,6 +187,45 @@ export const WorkspaceSelectionScreen = () => {
 			setErrorMessage(error instanceof Error ? error.message : "Failed to delete workspace.");
 		}
 	};
+
+	const closeRenameWorkspaceModal = useCallback(() => {
+		if (isRenamingWorkspace) {
+			return;
+		}
+
+		setWorkspaceToRename(null);
+		setWorkspaceNameInput("");
+	}, [isRenamingWorkspace]);
+
+	const confirmRenameWorkspace = useCallback(async () => {
+		if (!workspaceToRename) {
+			return;
+		}
+
+		const nextName = workspaceNameInput.trim();
+		if (nextName.length === 0) {
+			setErrorMessage("Workspace name cannot be empty.");
+			return;
+		}
+
+		if (nextName === workspaceToRename.name) {
+			setWorkspaceToRename(null);
+			setWorkspaceNameInput("");
+			return;
+		}
+
+		setIsRenamingWorkspace(true);
+		setErrorMessage("");
+		try {
+			await renameProject(workspaceToRename.id, nextName);
+			setWorkspaceToRename(null);
+			setWorkspaceNameInput("");
+		} catch (error: unknown) {
+			setErrorMessage(error instanceof Error ? error.message : "Failed to rename workspace.");
+		} finally {
+			setIsRenamingWorkspace(false);
+		}
+	}, [renameProject, workspaceNameInput, workspaceToRename]);
 
 	return (
 		<KeyboardAvoidingView
@@ -220,19 +265,12 @@ export const WorkspaceSelectionScreen = () => {
 							visibleProjects.map((project, index) => (
 								<SwipeableWorkspaceItem
 									isLoading={openingWorkspaceId === project.id}
-									deleteTestID={`workspace-item-delete-${String(index)}`}
 									index={index}
-									isActive={openSwipeRowId === project.id}
 									isSelected={project.id === selectedProjectId}
 									key={project.id}
-									onClose={() => {
-										setOpenSwipeRowId((current) => (current === project.id ? null : current));
-									}}
-									onDelete={() => {
-										void deleteWorkspace(project);
-									}}
-									onOpen={() => {
-										setOpenSwipeRowId(project.id);
+									onLongPress={() => {
+										setErrorMessage("");
+										setWorkspaceActionTarget(project);
 									}}
 									onOpenWorkspace={() => {
 										openWorkspace(project);
@@ -300,6 +338,52 @@ export const WorkspaceSelectionScreen = () => {
 				}}
 				selectionMode="single"
 				isAddButtonVisible={false}
+			/>
+			<IosActionSheet
+				actions={[
+					{
+						icon: "edit",
+						key: "rename-workspace",
+						label: "Rename",
+						onPress: () => {
+							if (!workspaceActionTarget) {
+								return;
+							}
+							setWorkspaceToRename(workspaceActionTarget);
+							setWorkspaceNameInput(workspaceActionTarget.name);
+						},
+						testID: "workspace-item-rename",
+					},
+					{
+						icon: "delete-outline",
+						key: "delete-workspace",
+						label: "Delete",
+						onPress: () => {
+							if (!workspaceActionTarget) {
+								return;
+							}
+							void deleteWorkspace(workspaceActionTarget);
+						},
+						testID: "workspace-item-delete",
+						tone: "destructive",
+					},
+				]}
+				onClose={() => {
+					setWorkspaceActionTarget(null);
+				}}
+				testID="workspace-action-sheet"
+				title={workspaceActionTarget?.name ?? "Workspace options"}
+				isVisible={workspaceActionTarget !== null}
+			/>
+			<WorkspaceRenameModal
+				isSubmitting={isRenamingWorkspace}
+				isVisible={workspaceToRename !== null}
+				name={workspaceNameInput}
+				onCancel={closeRenameWorkspaceModal}
+				onChangeName={setWorkspaceNameInput}
+				onSubmit={() => {
+					void confirmRenameWorkspace();
+				}}
 			/>
 		</KeyboardAvoidingView>
 	);

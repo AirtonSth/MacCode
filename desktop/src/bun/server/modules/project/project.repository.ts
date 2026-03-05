@@ -38,15 +38,11 @@ export class ProjectRepository {
 		};
 	}
 
-private readonly database: DrizzleDatabaseClient["orm"];
+	private readonly database: DrizzleDatabaseClient["orm"];
 
 	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
 		this.database = databaseClient;
 	}
-
-	
-
-	
 
 	createProject(path: string, name: string): ProjectDTO {
 		const now = new Date().toISOString();
@@ -125,10 +121,33 @@ private readonly database: DrizzleDatabaseClient["orm"];
 		return rows.map(ProjectRepository.toWorkspaceSummaryDto);
 	}
 
-	updateProjectFavorite(id: string, isFavorite: boolean): ProjectDTO | null {
+	updateProject(
+		id: string,
+		input: {
+			isFavorite?: boolean;
+			name?: string;
+		},
+	): ProjectDTO | null {
+		const now = new Date().toISOString();
+		const updatePayload: {
+			isFavorite?: number;
+			name?: string;
+			updatedAt: string;
+		} = {
+			updatedAt: now,
+		};
+
+		if (typeof input.isFavorite === "boolean") {
+			updatePayload.isFavorite = input.isFavorite ? 1 : 0;
+		}
+
+		if (typeof input.name === "string") {
+			updatePayload.name = input.name;
+		}
+
 		this.database
 			.update(projects)
-			.set({ isFavorite: isFavorite ? 1 : 0, updatedAt: new Date().toISOString() })
+			.set(updatePayload)
 			.where(eq(projects.id, id))
 			.run();
 
@@ -143,6 +162,10 @@ private readonly database: DrizzleDatabaseClient["orm"];
 		}
 
 		return ProjectRepository.toProjectDto(rows[0]);
+	}
+
+	updateProjectFavorite(id: string, isFavorite: boolean): ProjectDTO | null {
+		return this.updateProject(id, { isFavorite });
 	}
 }
 

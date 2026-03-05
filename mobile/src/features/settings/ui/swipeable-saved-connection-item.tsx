@@ -1,8 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
-import { Animated, PanResponder, Pressable, StyleSheet, Text, View } from "react-native";
-
-const swipeDeleteWidth = 92;
-const swipeThreshold = 44;
+import type { ReactNode } from "react";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import { MaterialIcons } from "@expo/vector-icons";
 
 interface SwipeableSavedConnectionItemProps {
 	children: ReactNode;
@@ -11,7 +9,6 @@ interface SwipeableSavedConnectionItemProps {
 	isActive: boolean;
 	onClose: () => void;
 	onDelete: () => void;
-	onOpen: () => void;
 }
 
 export const SwipeableSavedConnectionItem = ({
@@ -21,139 +18,79 @@ export const SwipeableSavedConnectionItem = ({
 	isActive,
 	onClose,
 	onDelete,
-	onOpen,
 }: SwipeableSavedConnectionItemProps) => {
-	const translateX = useRef(new Animated.Value(0)).current;
-	const dragStartRef = useRef(0);
-	const isAnimatingRef = useRef(false);
-
-	const animateTo = useCallback(
-		(value: number, onFinish?: () => void) => {
-			isAnimatingRef.current = true;
-			Animated.spring(translateX, {
-				damping: 24,
-				toValue: value,
-				useNativeDriver: true,
-			}).start(() => {
-				isAnimatingRef.current = false;
-				onFinish?.();
-			});
-		},
-		[translateX],
-	);
-
-	const open = useCallback(() => {
-		onOpen();
-		animateTo(-swipeDeleteWidth);
-	}, [animateTo, onOpen]);
-
-	const close = useCallback(() => {
-		onClose();
-		animateTo(0);
-	}, [animateTo, onClose]);
-
-	const panResponder = useMemo(
-		() =>
-			PanResponder.create({
-				onMoveShouldSetPanResponder: (event, gesture) => {
-					void event;
-					return Math.abs(gesture.dx) > 8 && Math.abs(gesture.dx) > Math.abs(gesture.dy);
-				},
-				onPanResponderGrant: (event, gesture) => {
-					void event;
-					void gesture;
-					translateX.stopAnimation((value) => {
-						dragStartRef.current = value ?? 0;
-					});
-				},
-				onPanResponderMove: (event, gesture) => {
-					void event;
-					const isSwipingLeft = dragStartRef.current + gesture.dx < 0;
-					if (!isSwipingLeft && !isActive) {
-						return;
-					}
-
-					if (isAnimatingRef.current) {
-						return;
-					}
-
-					const next = Math.min(0, dragStartRef.current + gesture.dx);
-					translateX.setValue(Math.max(-swipeDeleteWidth * 1.1, next));
-				},
-				onPanResponderRelease: (event, gesture) => {
-					void event;
-					const finalPosition = dragStartRef.current + gesture.dx;
-					if (finalPosition < -swipeThreshold) {
-						open();
-						return;
-					}
-
-					close();
-				},
-				onPanResponderTerminate: () => {
-					close();
-				},
-			}),
-		[close, isActive, open, translateX],
-	);
-
-	useEffect(() => {
-		if (isActive) {
-			animateTo(-swipeDeleteWidth);
-		} else {
-			animateTo(0);
-		}
-	}, [animateTo, isActive]);
-
 	return (
-		<View style={styles.swipeRowRoot}>
-			<View style={styles.deleteActionRoot}>
-				<Pressable
-					accessibilityLabel={`saved-connection-delete-${String(index)}`}
-					accessibilityRole="button"
-					onPress={() => {
-						onClose();
-						onDelete();
-					}}
-					style={styles.deleteActionButton}
-					testID={deleteTestID}
-				>
-					<Text style={styles.deleteActionLabel}>Delete</Text>
-				</Pressable>
-			</View>
+		<View style={styles.rowRoot}>
+			{children}
 
-			<Animated.View style={{ transform: [{ translateX }] }} {...panResponder.panHandlers}>
-				{children}
-			</Animated.View>
+			{isActive ? (
+				<View style={styles.optionsTooltip} testID={`saved-connection-options-${String(index)}`}>
+					<View style={styles.optionsCaret} />
+					<Pressable
+						accessibilityLabel={`saved-connection-delete-${String(index)}`}
+						accessibilityRole="button"
+						onPress={() => {
+							onClose();
+							onDelete();
+						}}
+						style={({ pressed }) => [styles.optionButton, pressed ? styles.optionButtonPressed : null]}
+						testID={deleteTestID}
+					>
+						<MaterialIcons color="#FF9BA2" name="delete-outline" size={16} />
+						<Text style={styles.optionDeleteLabel}>Delete</Text>
+					</Pressable>
+				</View>
+			) : null}
 		</View>
 	);
 };
 
 const styles = StyleSheet.create({
-	deleteActionButton: {
+	optionButton: {
 		alignItems: "center",
-		flex: 1,
-		height: "100%",
-		justifyContent: "center",
-		width: swipeDeleteWidth,
-	},
-	deleteActionLabel: {
-		color: "#FFFFFF",
-		fontSize: 13,
-		fontWeight: "700",
-	},
-	deleteActionRoot: {
-		alignItems: "center",
-		backgroundColor: "#ff5d5f",
 		flexDirection: "row",
-		height: "100%",
-		justifyContent: "center",
-		position: "absolute",
-		right: 0,
-		top: 0,
-		width: swipeDeleteWidth,
+		gap: 8,
+		paddingHorizontal: 11,
+		paddingVertical: 9,
 	},
-	swipeRowRoot: {
+	optionButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.06)",
+	},
+	optionDeleteLabel: {
+		color: "#FF9BA2",
+		fontSize: 13,
+		fontWeight: "600",
+	},
+	optionsCaret: {
+		backgroundColor: "#101521",
+		borderColor: "rgba(255,255,255,0.16)",
+		borderLeftWidth: 1,
+		borderTopWidth: 1,
+		height: 10,
+		position: "absolute",
+		right: 16,
+		top: -5,
+		transform: [{ rotate: "45deg" }],
+		width: 10,
+	},
+	optionsTooltip: {
+		backgroundColor: "#101521",
+		borderColor: "rgba(255,255,255,0.16)",
+		borderRadius: 10,
+		borderWidth: 1,
+		minWidth: 122,
 		overflow: "hidden",
+		position: "absolute",
+		right: 10,
+		shadowColor: "#000",
+		shadowOffset: { height: 8, width: 0 },
+		shadowOpacity: 0.34,
+		shadowRadius: 12,
+		top: 12,
+		zIndex: 40,
+		elevation: 9,
+	},
+	rowRoot: {
+		position: "relative",
 	},
 });

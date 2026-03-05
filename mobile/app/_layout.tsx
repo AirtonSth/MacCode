@@ -3,14 +3,16 @@ import "react-native-reanimated";
 import { QueryClientProvider } from "@tanstack/react-query";
 import * as SplashScreen from "expo-splash-screen";
 import { Stack } from "expo-router";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
 import { queryClient } from "@/shared/api/query-client";
 import { registerThreadLiveActivityBackgroundTask } from "@/shared/live-activity/thread-live-activity-background";
 import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
 import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
+import { ForegroundInsomniaMode } from "@/shared/runtime/foreground-insomnia-mode";
 import { theme } from "@/shared/theme/tokens";
+import { AnimatedLaunchSplash } from "@/shared/ui/animated-launch-splash";
 
 export {
 	ErrorBoundary,
@@ -19,8 +21,16 @@ export {
 SplashScreen.preventAutoHideAsync();
 
 export default function RootLayout() {
+	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);
+
 	useEffect(() => {
-		void SplashScreen.hideAsync();
+		void (async () => {
+			try {
+				await SplashScreen.hideAsync();
+			} catch {
+				// Ignore native splash hide failures.
+			}
+		})();
 	}, []);
 
 	useEffect(() => {
@@ -48,6 +58,7 @@ export default function RootLayout() {
 	return (
 		<ApiConfigProvider>
 			<QueryClientProvider client={queryClient}>
+				<ForegroundInsomniaMode />
 				<Stack
 					screenOptions={{
 						contentStyle: {
@@ -66,6 +77,13 @@ export default function RootLayout() {
 					<Stack.Screen name="chat" options={{ headerShown: false }} />
 					<Stack.Screen name="settings" options={{ headerShown: false }} />
 				</Stack>
+				{isLaunchSplashVisible ? (
+					<AnimatedLaunchSplash
+						onFinish={() => {
+							setIsLaunchSplashVisible(false);
+						}}
+					/>
+				) : null}
 			</QueryClientProvider>
 		</ApiConfigProvider>
 	);

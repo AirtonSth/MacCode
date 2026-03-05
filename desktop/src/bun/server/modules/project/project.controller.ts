@@ -10,12 +10,10 @@ export class ProjectController {
 		return new ProjectController(service, workspaceEvents).build();
 	}
 
-constructor(
+	constructor(
 		private readonly service: ProjectService,
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 	) {}
-
-	
 
 	build() {
 		return new Elysia({ name: "project-controller" })
@@ -74,7 +72,22 @@ constructor(
 			.patch(
 				"/projects/:id",
 				async ({ body, params: parameters, request, set }) => {
-					const project = await this.service.setFavorite(parameters.id, body.isFavorite);
+					const hasFavorite = typeof body.isFavorite === "boolean";
+					const hasName = typeof body.name === "string";
+					if (!hasFavorite && !hasName) {
+						set.status = 400;
+						return { error: "name or isFavorite is required" };
+					}
+
+					const project = await this.service.updateProject(parameters.id, {
+						isFavorite: body.isFavorite,
+						name: body.name,
+					});
+
+					if (project && "type" in project) {
+						set.status = 400;
+						return { error: "name must be a non-empty string" };
+					}
 
 					if (!project) {
 						set.status = 404;
@@ -96,7 +109,8 @@ constructor(
 				},
 				{
 					body: t.Object({
-						isFavorite: t.Boolean(),
+						isFavorite: t.Optional(t.Boolean()),
+						name: t.Optional(t.String()),
 					}),
 				},
 			)

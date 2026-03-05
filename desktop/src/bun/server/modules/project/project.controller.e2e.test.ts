@@ -57,6 +57,42 @@ test("PATCH /v1/projects/:id toggles favorite", async () => {
 	}
 });
 
+test("PATCH /v1/projects/:id renames workspace", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const created = await client.v1.projects.post({ path: "/tmp" });
+		const createdProject = (created.data as { project: { id: string; name: string } }).project;
+
+		const updated = await client.v1.projects({ id: createdProject.id }).patch({ name: "Renamed Workspace" });
+		const updatedProject = (updated.data as { project: { name: string } }).project;
+
+		expect(updated.status).toBe(200);
+		expect(updatedProject.name).toBe("Renamed Workspace");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("PATCH /v1/projects/:id returns 400 for empty rename value", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const created = await client.v1.projects.post({ path: "/tmp" });
+		const createdProject = (created.data as { project: { id: string } }).project;
+
+		const response = await client.v1.projects({ id: createdProject.id }).patch({ name: "   " });
+		const errorPayload = response.error && "value" in response.error
+			? (response.error as { value: { error?: string } }).value
+			: undefined;
+
+		expect(response.status).toBe(400);
+		expect(errorPayload?.error).toBe("name must be a non-empty string");
+	} finally {
+		await cleanup();
+	}
+});
+
 test("GET /v1/projects/workspaces returns lightweight workspace summaries", async () => {
 	const { cleanup, client } = await createTestServer();
 

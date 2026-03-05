@@ -421,10 +421,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	}, [projectsQuery.data]);
 
 	const chats = useMemo<ChatDTO[]>(() => {
-		const rawChats = (chatsQuery.data ?? []) as Array<
-			| ChatDTO
-			| { id: string; isActive?: boolean; title: string; updatedAt: string }
-		>;
+		const rawChats = (chatsQuery.data ?? []) as (| ChatDTO
+			| { id: string; isActive?: boolean; title: string; updatedAt: string })[];
 		return rawChats.map((chat) => (
 			"projectId" in chat
 				? chat
@@ -1529,6 +1527,19 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			[client, persistSelection, queryClient, removeRemoteManagedLiveActivity, selectedProjectId],
 		);
 
+	const renameProject = useCallback(
+		async (projectId: string, name: string) => {
+			const normalizedName = name.trim();
+			if (normalizedName.length === 0) {
+				throw new Error("Workspace name cannot be empty.");
+			}
+
+			await client.renameProject(projectId, normalizedName);
+			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
+		},
+		[client, queryClient],
+	);
+
 	const sendMessage = useMutation({
 		mutationFn: async (rawText: string) => {
 			const text = rawText.trim();
@@ -1686,7 +1697,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				);
 
 				if (activeProjectId) {
-					queryClient.setQueryData<Array<ChatDTO | { id: string; isActive?: boolean; title: string; updatedAt: string }>>(
+					queryClient.setQueryData<(ChatDTO | { id: string; isActive?: boolean; title: string; updatedAt: string })[]>(
 						queryKeys.chats(activeProjectId),
 						(current) => {
 							if (!Array.isArray(current)) {
@@ -1755,18 +1766,18 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		} catch (error) {
 			setLastError(error instanceof Error ? error.message : "Failed to stop thread");
 			return false;
-		} finally {
-			setStoppingByChat((current) => {
-				if (!current[chatId]) {
-					return current;
-				}
+			} finally {
+				setStoppingByChat((current) => {
+					if (!current[chatId]) {
+						return current;
+					}
 
-				const next = { ...current };
-				delete next[chatId];
-				return next;
-			});
-		}
-	}, [
+					const { [chatId]: ignore, ...next } = current;
+					void ignore;
+					return next;
+				});
+			}
+		}, [
 		client,
 		finishLiveActivity,
 		invalidateWorkspaceQuery,
@@ -1924,6 +1935,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		messages,
 		permissionMode,
 		projects,
+		renameProject,
 		selectedModel,
 		selectedReasoningEffort,
 		selectChat,

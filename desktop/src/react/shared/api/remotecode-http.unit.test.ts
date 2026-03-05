@@ -317,6 +317,44 @@ test("RemoteCodeApi issues delete requests for projects and chats", async () => 
 	}
 });
 
+test("RemoteCodeApi updates workspace fields via PATCH /v1/projects/:id", async () => {
+	let method = "";
+	let path = "";
+	let body = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		body = String(init?.body ?? "");
+		return jsonResponse({
+			data: {
+				project: {
+					createdAt: "2026-01-01T00:00:00.000Z",
+					id: "project-1",
+					isFavorite: false,
+					name: "Renamed Workspace",
+					path: "/tmp/workspace",
+					updatedAt: "2026-01-01T00:00:02.000Z",
+				},
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001",
+			token: "unit-token",
+		});
+		const project = await client.updateProject("project-1", { name: "Renamed Workspace" });
+
+		expect(method).toBe("PATCH");
+		expect(path).toBe("/v1/projects/project-1");
+		expect(body).toContain("\"name\":\"Renamed Workspace\"");
+		expect(project.name).toBe("Renamed Workspace");
+	} finally {
+		restore();
+	}
+});
+
 test("RemoteCodeApi issues force-stop request for chat runtime", async () => {
 	let method = "";
 	let pathname = "";

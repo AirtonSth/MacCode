@@ -152,6 +152,7 @@ export interface RemoteCodeClient {
 	createProjectGitBranch: (projectId: string, name: string) => Promise<string>;
 	checkoutProjectGitBranch: (projectId: string, branch: string) => Promise<string>;
 	toggleFavorite: (projectId: string, isFavorite: boolean) => Promise<ProjectDTO>;
+	renameProject: (projectId: string, name: string) => Promise<ProjectDTO>;
 	updateSelection: (selection: WorkspaceSelectionDTO) => Promise<WorkspaceSelectionDTO>;
 	verifyToken: (token: string, baseUrlOverride?: string) => Promise<AuthVerifyResponseDTO>;
 }
@@ -506,6 +507,16 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 				method: "PATCH",
 				path: `/projects/${projectId}`,
 				body: { isFavorite },
+			});
+
+			return payload.project;
+		},
+
+		async renameProject(projectId: string, name: string) {
+			const payload = await request<ProjectPatchResponse>({
+				method: "PATCH",
+				path: `/projects/${projectId}`,
+				body: { name },
 			});
 
 			return payload.project;

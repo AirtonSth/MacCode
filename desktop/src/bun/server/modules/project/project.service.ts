@@ -15,6 +15,15 @@ export interface CreateProjectResult {
 	project: ProjectDTO;
 }
 
+export interface UpdateProjectInput {
+	isFavorite?: boolean;
+	name?: string;
+}
+
+export interface UpdateProjectError {
+	type: "invalid_name";
+}
+
 export interface ProjectServiceContract {
 	createProject: (
 		input: CreateProjectInput,
@@ -22,6 +31,10 @@ export interface ProjectServiceContract {
 	getProjectById: (id: string) => Promise<ProjectDTO | null>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	listWorkspaceSummaries: () => Promise<WorkspaceSummaryDTO[]>;
+	updateProject: (
+		id: string,
+		input: UpdateProjectInput,
+	) => Promise<ProjectDTO | UpdateProjectError | null>;
 	setFavorite: (id: string, isFavorite: boolean) => Promise<ProjectDTO | null>;
 	deleteProject: (id: string) => Promise<boolean>;
 }
@@ -45,7 +58,7 @@ export class ProjectService implements ProjectServiceContract {
 		return this.repository.findProjectById(id);
 	}
 
-async createProject({
+	async createProject({
 		name,
 		path,
 	}: CreateProjectInput): Promise<CreateProjectResult | CreateProjectError> {
@@ -73,14 +86,28 @@ async createProject({
 		};
 	}
 
-	
-
 	async listProjects(): Promise<ProjectDTO[]> {
 		return this.repository.listProjects();
 	}
 
 	async listWorkspaceSummaries(): Promise<WorkspaceSummaryDTO[]> {
 		return this.repository.listWorkspaceSummaries();
+	}
+
+	async updateProject(id: string, input: UpdateProjectInput): Promise<ProjectDTO | UpdateProjectError | null> {
+		let normalizedName: string | undefined;
+		if (typeof input.name === "string") {
+			const trimmedName = input.name.trim();
+			if (trimmedName.length === 0) {
+				return { type: "invalid_name" };
+			}
+			normalizedName = trimmedName;
+		}
+
+		return this.repository.updateProject(id, {
+			isFavorite: input.isFavorite,
+			name: normalizedName,
+		});
 	}
 
 	async setFavorite(id: string, isFavorite: boolean): Promise<ProjectDTO | null> {

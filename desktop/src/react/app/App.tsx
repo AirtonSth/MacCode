@@ -5,6 +5,7 @@ import {
 	FolderSearch,
 	FolderOpen,
 	Loader2,
+	MoreHorizontal,
 	MessageSquareText,
 	PanelLeft,
 	SquareTerminal,
@@ -459,6 +460,7 @@ const App = (): JSX.Element => {
 	const messagesLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	const messagesLoadQueuedRef = useRef<Set<string>>(new Set());
 	const chatContextLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+	const workspaceMenuRef = useRef<HTMLDivElement | null>(null);
 	const [stoppingByChat, setStoppingByChat] = useState<Record<string, boolean>>({});
 
 	const baseUrl = useMemo(() => {
@@ -518,6 +520,7 @@ const App = (): JSX.Element => {
 	const [projectThreadsOpen, setProjectThreadsOpen] = useState<Record<string, boolean>>({});
 	const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
 	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
+	const [openWorkspaceMenuProjectId, setOpenWorkspaceMenuProjectId] = useState<string | null>(null);
 	const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
 		if (typeof window === "undefined") {
 			return DEFAULT_SIDEBAR_WIDTH;
@@ -569,6 +572,41 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		sidebarWidthRef.current = sidebarWidth;
 	}, [sidebarWidth]);
+
+	useEffect(() => {
+		if (!openWorkspaceMenuProjectId || typeof window === "undefined") {
+			return;
+		}
+
+		const handlePointerDown = (event: PointerEvent) => {
+			if (!workspaceMenuRef.current) {
+				return;
+			}
+
+			if (!(event.target instanceof Node)) {
+				return;
+			}
+
+			if (!workspaceMenuRef.current.contains(event.target)) {
+				setOpenWorkspaceMenuProjectId(null);
+			}
+		};
+
+		window.addEventListener("pointerdown", handlePointerDown);
+		return () => {
+			window.removeEventListener("pointerdown", handlePointerDown);
+		};
+	}, [openWorkspaceMenuProjectId]);
+
+	useEffect(() => {
+		if (!openWorkspaceMenuProjectId) {
+			return;
+		}
+
+		if (!state.projects.some((project) => project.id === openWorkspaceMenuProjectId)) {
+			setOpenWorkspaceMenuProjectId(null);
+		}
+	}, [openWorkspaceMenuProjectId, state.projects]);
 
 	useEffect(() => {
 		permissionModeRef.current = permissionMode;
@@ -1858,6 +1896,7 @@ const App = (): JSX.Element => {
 
 	const handleSelectProject = useCallback(
 		async (projectId: string) => {
+			setOpenWorkspaceMenuProjectId(null);
 			if (projectId === state.selectedProjectId) {
 				setProjectThreadsOpen((current) => ({
 					...current,
@@ -1932,6 +1971,7 @@ const App = (): JSX.Element => {
 
 	const handleDeleteProject = useCallback(
 		async (projectId: string) => {
+			setOpenWorkspaceMenuProjectId(null);
 			try {
 				const deletionResult = await api.deleteProject(projectId);
 				if (!deletionResult.deleted) {
@@ -1960,6 +2000,53 @@ const App = (): JSX.Element => {
 			loadProjects,
 			persistWorkspaceSelection,
 			state.selectedProjectId,
+		],
+	);
+
+	const handleRenameProject = useCallback(
+		async (project: Pick<ProjectDTO, "id" | "name">) => {
+			setOpenWorkspaceMenuProjectId(null);
+			if (typeof window === "undefined") {
+				return;
+			}
+
+			const nextNameInput = window.prompt("Rename workspace", project.name);
+			if (nextNameInput === null) {
+				return;
+			}
+
+			const nextName = nextNameInput.trim();
+			if (nextName.length === 0) {
+				addError("Workspace name cannot be empty", "rest", "invalid_workspace_name");
+				return;
+			}
+
+			if (nextName === project.name) {
+				return;
+			}
+
+			try {
+				const updatedProject = await api.updateProject(project.id, { name: nextName });
+				dispatch({
+					payload: updatedProject,
+					type: "UPSERT_PROJECT",
+				});
+				clearRestErrors();
+			} catch (error) {
+				addError(
+					formatApiErrorMessage(error, "Unable to rename workspace"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			}
+		},
+		[
+			addError,
+			api,
+			clearRestErrors,
+			dispatch,
+			formatApiErrorCode,
+			formatApiErrorMessage,
 		],
 	);
 
@@ -2017,6 +2104,10 @@ const App = (): JSX.Element => {
 			...current,
 			[projectId]: true,
 		}));
+	}, []);
+
+	const handleToggleWorkspaceMenu = useCallback((projectId: string) => {
+		setOpenWorkspaceMenuProjectId((current) => (current === projectId ? null : projectId));
 	}, []);
 
 	const handleOpenProject = useCallback(async () => {
@@ -2217,7 +2308,7 @@ const App = (): JSX.Element => {
 														>
 																<div
 																	aria-label={`Select ${project.name}`}
-																	className="group flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 transition hover:text-slate-100"
+																	className="group grid min-w-0 cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center gap-1.5 rounded-md px-1.5 py-1 transition hover:text-slate-100"
 																onClick={() => {
 																	void handleSelectProject(project.id);
 																}}
@@ -2230,12 +2321,13 @@ const App = (): JSX.Element => {
 																role="button"
 																tabIndex={0}
 																>
-																	{project.id === openingProjectId ? (
-																		<Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
-																	) : (
-																		<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />
-																	)}
-																	<span className="min-w-0">
+																	<span className="inline-flex min-w-0 items-center gap-1.5">
+																		{project.id === openingProjectId ? (
+																			<Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
+																		) : (
+																			<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />
+																		)}
+																		<span className="min-w-0 flex-1">
 																		<span
 																			className="block truncate text-[13px] font-medium text-slate-100"
 																			title={formatProjectMeta(project.path)}
@@ -2243,24 +2335,63 @@ const App = (): JSX.Element => {
 																				{project.name}
 																			</span>
 																		</span>
-																<Tooltip>
-																	<TooltipTrigger asChild>
-																		<Button
-																			aria-label={`Delete ${project.name}`}
-																			className="h-6 w-6 shrink-0 text-rose-300/80 opacity-0 transition-opacity hover:text-rose-100 group-hover:opacity-100 focus-visible:opacity-100"
-																			onClick={(event) => {
-																				event.stopPropagation();
-																				void handleDeleteProject(project.id);
-																			}}
-																			size="icon"
-																			type="button"
-																			variant="ghost"
-																		>
-																			<Trash2 className="h-4 w-4" />
-																		</Button>
-																	</TooltipTrigger>
-																	<TooltipContent>Delete workspace</TooltipContent>
-																</Tooltip>
+																	</span>
+																<div
+																	className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end"
+																	ref={(node) => {
+																		if (openWorkspaceMenuProjectId === project.id) {
+																			workspaceMenuRef.current = node;
+																		}
+																	}}
+																>
+																	<Tooltip>
+																		<TooltipTrigger asChild>
+																			<Button
+																				aria-label={`Workspace options for ${project.name}`}
+																				className={cn(
+																					"pointer-events-none absolute right-0 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md border border-transparent text-slate-300 opacity-0 transition-opacity hover:border-white/15 hover:text-slate-100 group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto",
+																					openWorkspaceMenuProjectId === project.id
+																						? "opacity-100 pointer-events-auto"
+																						: "",
+																				)}
+																				onClick={(event) => {
+																					event.stopPropagation();
+																					handleToggleWorkspaceMenu(project.id);
+																				}}
+																				size="icon"
+																				type="button"
+																				variant="ghost"
+																			>
+																				<MoreHorizontal className="h-4 w-4" />
+																			</Button>
+																		</TooltipTrigger>
+																		<TooltipContent>Workspace options</TooltipContent>
+																	</Tooltip>
+																	{openWorkspaceMenuProjectId === project.id ? (
+																		<div className="absolute right-0 top-[calc(100%+4px)] z-30 min-w-[9.25rem] overflow-hidden rounded-md border border-white/15 bg-[#1a1f2a] py-1 shadow-[0_14px_30px_rgba(0,0,0,0.5)]">
+																			<button
+																				className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-slate-200 transition hover:bg-white/[0.06] hover:text-slate-100"
+																				onClick={(event) => {
+																					event.stopPropagation();
+																					void handleRenameProject(project);
+																				}}
+																				type="button"
+																			>
+																				Rename workspace
+																			</button>
+																			<button
+																				className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-rose-200 transition hover:bg-rose-500/12 hover:text-rose-100"
+																				onClick={(event) => {
+																					event.stopPropagation();
+																					void handleDeleteProject(project.id);
+																				}}
+																				type="button"
+																			>
+																				Delete workspace
+																			</button>
+																		</div>
+																	) : null}
+																</div>
 															</div>
 
 															{isSelectedProject && isThreadListOpen ? (

@@ -32,11 +32,13 @@ import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { queryKeys } from "../../../shared/api/query-keys";
 import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
-import type { AssistantStreamItemState, TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
+import type { AssistantStreamItemState, ProjectDTO, TerminalCommandDTO, TerminalEntryDTO } from "../../../shared/api/types";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
+import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
+import { WorkspaceRenameModal } from "../../workspaces/ui/workspace-rename-modal";
 
 const drawerWidth = 308;
 
@@ -144,6 +146,7 @@ export const ChatScreen = () => {
 		messages,
 		projects,
 		permissionMode,
+		renameProject,
 		setStreamItemExpanded,
 		setStreamItemState,
 		setSelectedModel,
@@ -198,8 +201,11 @@ export const ChatScreen = () => {
 	const terminalScrollRef = useRef<ScrollView | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
-	const [openWorkspaceSwipeRowId, setOpenWorkspaceSwipeRowId] = useState<string | null>(null);
+	const [drawerWorkspaceActionTarget, setDrawerWorkspaceActionTarget] = useState<ProjectDTO | null>(null);
 	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
+	const [workspaceNameInput, setWorkspaceNameInput] = useState<string>("");
+	const [workspaceToRename, setWorkspaceToRename] = useState<ProjectDTO | null>(null);
+	const [isRenamingWorkspace, setIsRenamingWorkspace] = useState<boolean>(false);
 	const gitStatusQuery = useQuery({
 		enabled: isFocused && Boolean(selectedProjectId),
 		queryKey: queryKeys.projectGitStatus(selectedProjectId),
@@ -293,7 +299,6 @@ export const ChatScreen = () => {
 		}
 		return streamHistoryTurns.filter((turn) => turn.turnId !== liveTurnId);
 	}, [liveTurnId, streamHistoryTurns]);
-	const hasRunDetails = hasStreamingItems || historicalTurns.length > 0;
 	const selectedChatIsRunning = Boolean(
 		selectedChat?.isActive ||
 		(selectedChatId && activeThreads.some((thread) => thread.id === selectedChatId)),
@@ -302,6 +307,10 @@ export const ChatScreen = () => {
 		isSending || isStopping || !selectedProjectId || selectedChatIsRunning;
 	const isForceStopDisabled =
 		isSending || isStopping || !selectedChatId || !selectedChatIsRunning;
+	const primaryActionDisabled = selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled;
+	const primaryActionPressedStyle = selectedChatIsRunning
+		? styles.forceStopActionPressed
+		: styles.primaryActionPressed;
 	const isResolvingThreadSelection = source === "thread-list" && !selectedChatId;
 	const showMessageHistoryLoading =
 		Boolean(selectedChatId) &&
@@ -510,7 +519,7 @@ export const ChatScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
-			setOpenWorkspaceSwipeRowId(null);
+			setDrawerWorkspaceActionTarget(null);
 		});
 	};
 
@@ -544,12 +553,13 @@ export const ChatScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
-			setOpenWorkspaceSwipeRowId(null);
+			setDrawerWorkspaceActionTarget(null);
 			onClosed();
 		});
 	};
 
 	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
+		setDrawerWorkspaceActionTarget(null);
 		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		closeDrawerThen(() => {
@@ -611,7 +621,6 @@ export const ChatScreen = () => {
 
 	const deleteWorkspace = async (project: (typeof projects)[number]) => {
 		const projectId = project.id;
-		setOpenWorkspaceSwipeRowId((current) => (current === projectId ? null : current));
 		markWorkspaceDeleteOptimistic(projectId);
 
 		try {
@@ -622,6 +631,45 @@ export const ChatScreen = () => {
 			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to delete workspace.");
 		}
 	};
+
+	const closeRenameWorkspaceModal = useCallback(() => {
+		if (isRenamingWorkspace) {
+			return;
+		}
+
+		setWorkspaceToRename(null);
+		setWorkspaceNameInput("");
+	}, [isRenamingWorkspace]);
+
+	const confirmRenameWorkspace = useCallback(async () => {
+		if (!workspaceToRename) {
+			return;
+		}
+
+		const nextName = workspaceNameInput.trim();
+		if (nextName.length === 0) {
+			setDrawerWorkspaceError("Workspace name cannot be empty.");
+			return;
+		}
+
+		if (nextName === workspaceToRename.name) {
+			setWorkspaceToRename(null);
+			setWorkspaceNameInput("");
+			return;
+		}
+
+		setIsRenamingWorkspace(true);
+		setDrawerWorkspaceError("");
+		try {
+			await renameProject(workspaceToRename.id, nextName);
+			setWorkspaceToRename(null);
+			setWorkspaceNameInput("");
+		} catch (error: unknown) {
+			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to rename workspace.");
+		} finally {
+			setIsRenamingWorkspace(false);
+		}
+	}, [renameProject, workspaceNameInput, workspaceToRename]);
 
 	const runTerminalCommand = async () => {
 		const command = terminalInput.trim();
@@ -1129,12 +1177,8 @@ export const ChatScreen = () => {
 							style={({ pressed }) => [
 								styles.primaryAction,
 								selectedChatIsRunning ? styles.forceStopAction : null,
-								pressed
-									? (selectedChatIsRunning ? styles.forceStopActionPressed : styles.primaryActionPressed)
-									: null,
-								(selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled)
-									? styles.disabledButton
-									: null,
+								pressed ? primaryActionPressedStyle : null,
+								primaryActionDisabled ? styles.disabledButton : null,
 							]}
 							testID={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
 						>
@@ -1473,6 +1517,16 @@ export const ChatScreen = () => {
 				selectionMode="single"
 				isAddButtonVisible={false}
 			/>
+			<WorkspaceRenameModal
+				isSubmitting={isRenamingWorkspace}
+				isVisible={workspaceToRename !== null}
+				name={workspaceNameInput}
+				onCancel={closeRenameWorkspaceModal}
+				onChangeName={setWorkspaceNameInput}
+				onSubmit={() => {
+					void confirmRenameWorkspace();
+				}}
+			/>
 
 			<Modal animationType="none" onRequestClose={closeDrawer} transparent visible={isDrawerOpen}>
 				<View style={styles.drawerRoot}>
@@ -1545,21 +1599,14 @@ export const ChatScreen = () => {
 										isLoading={openingWorkspaceId === project.id}
 										index={index}
 										key={project.id}
-										isActive={openWorkspaceSwipeRowId === project.id}
 										isSelected={project.id === selectedProjectId}
-										onClose={() => {
-											setOpenWorkspaceSwipeRowId((current) => (current === project.id ? null : current));
-										}}
-										onDelete={() => {
-											void deleteWorkspace(project);
-										}}
-										onOpen={() => {
-											setOpenWorkspaceSwipeRowId(project.id);
+										onLongPress={() => {
+											setDrawerWorkspaceError("");
+											setDrawerWorkspaceActionTarget(project);
 										}}
 										onOpenWorkspace={() => {
 											openWorkspaceFromDrawer(project);
 										}}
-										deleteTestID={`drawer-workspace-delete-${String(index)}`}
 										project={project}
 										rowBackgroundColor="rgba(255,255,255,0.04)"
 										rowBorderColor="rgba(255,255,255,0.2)"
@@ -1569,40 +1616,77 @@ export const ChatScreen = () => {
 									/>
 								))}
 							</ScrollView>
-								<View style={styles.drawerFooter}>
-									<Pressable
-										onPress={() => {
-											openSettingsFromDrawer();
-										}}
-										style={({ pressed }) => [
-											styles.drawerFooterButton,
-											pressed ? styles.drawerFooterButtonPressed : null,
-										]}
-										testID="drawer-settings-button"
-									>
-										<MaterialIcons
-											color={palette.text}
-											name="settings"
-											size={17}
-										/>
-										<Text numberOfLines={1} style={styles.drawerItemTitle}>
-											Settings
-										</Text>
-									</Pressable>
-								</View>
+							<View style={styles.drawerFooter}>
+								<Pressable
+									onPress={() => {
+										openSettingsFromDrawer();
+									}}
+									style={({ pressed }) => [
+										styles.drawerFooterButton,
+										pressed ? styles.drawerFooterButtonPressed : null,
+									]}
+									testID="drawer-settings-button"
+								>
+									<MaterialIcons
+										color={palette.text}
+										name="settings"
+										size={17}
+									/>
+									<Text numberOfLines={1} style={styles.drawerItemTitle}>
+										Settings
+									</Text>
+								</Pressable>
+							</View>
 						</LinearGradient>
 					</Animated.View>
 				</View>
 			</Modal>
 
-			<Modal
-				animationType="slide"
-				onRequestClose={() => {
-					setIsTerminalOpen(false);
-				}}
-				presentationStyle="fullScreen"
-				visible={isTerminalOpen}
-			>
+				<IosActionSheet
+					actions={[
+						{
+							icon: "edit",
+							key: "rename-drawer-workspace",
+							label: "Rename",
+							onPress: () => {
+								if (!drawerWorkspaceActionTarget) {
+									return;
+								}
+								setWorkspaceToRename(drawerWorkspaceActionTarget);
+								setWorkspaceNameInput(drawerWorkspaceActionTarget.name);
+							},
+							testID: "drawer-workspace-rename",
+						},
+						{
+							icon: "delete-outline",
+							key: "delete-drawer-workspace",
+							label: "Delete",
+							onPress: () => {
+								if (!drawerWorkspaceActionTarget) {
+									return;
+								}
+								void deleteWorkspace(drawerWorkspaceActionTarget);
+							},
+							testID: "drawer-workspace-delete",
+							tone: "destructive",
+						},
+					]}
+					onClose={() => {
+						setDrawerWorkspaceActionTarget(null);
+					}}
+					testID="drawer-workspace-action-sheet"
+					title={drawerWorkspaceActionTarget?.name ?? "Workspace options"}
+					isVisible={drawerWorkspaceActionTarget !== null}
+				/>
+
+				<Modal
+					animationType="slide"
+					onRequestClose={() => {
+						setIsTerminalOpen(false);
+					}}
+					presentationStyle="fullScreen"
+					visible={isTerminalOpen}
+				>
 				<KeyboardAvoidingView
 					behavior={Platform.OS === "ios" ? "padding" : "height"}
 					style={styles.terminalRoot}

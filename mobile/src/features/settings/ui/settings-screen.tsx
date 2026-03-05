@@ -1,5 +1,5 @@
 import { useRouter } from "expo-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	ActivityIndicator,
 	Alert,
@@ -19,7 +19,7 @@ import { ApiConfigStore, type SavedConnection } from "../../../shared/api/api-co
 import { DiscoveryManager, type DiscoveredServer } from "../../../shared/api/discovery-manager";
 import { createRemoteCodeClient, isRemoteCodeUnauthorizedError } from "../../../shared/api/remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
-import { SwipeableSavedConnectionItem } from "./swipeable-saved-connection-item";
+import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 
 type StatusTone = "error" | "neutral" | "success";
 
@@ -34,6 +34,7 @@ const palette = {
 };
 
 const DEFAULT_SERVER_TOKEN = "remotecode.io-token";
+const DEFAULT_SERVER_PORT = "8835";
 
 const toHost = (value: string): string => {
 	const trimmed = value.trim().toLowerCase();
@@ -103,20 +104,81 @@ const isLanBaseUrl = (value: string): boolean => {
 const filterSavedConnections = (items: SavedConnection[]): SavedConnection[] =>
 	items.filter((item) => !isLanBaseUrl(item.baseUrl));
 
+const toManualConnectionInput = (value: string): string => {
+	const host = toHost(value);
+	return host.length > 0 ? host : value.trim();
+};
+
+const normalizeConnectionBaseUrl = (value: string): string => {
+	const trimmed = value.trim();
+	if (trimmed.length === 0) {
+		return "";
+	}
+
+	const withProtocol = trimmed.includes("://") ? trimmed : `http://${trimmed}`;
+	const [rawProtocol = "", rawAddress = ""] = withProtocol.split("://", 2);
+	const protocol = rawProtocol.trim().toLowerCase() === "https" ? "https" : "http";
+	const authority = (rawAddress.split(/[/?#]/u, 1)[0] ?? "").trim();
+	if (authority.length === 0) {
+		return "";
+	}
+
+	const authSplitIndex = authority.lastIndexOf("@");
+	const hostPort = authSplitIndex !== -1 ? authority.slice(authSplitIndex + 1) : authority;
+	if (hostPort.length === 0) {
+		return "";
+	}
+
+	if (hostPort.startsWith("[")) {
+		const closingIndex = hostPort.indexOf("]");
+		if (closingIndex <= 1) {
+			return "";
+		}
+
+		const host = hostPort.slice(1, closingIndex).trim();
+		if (host.length === 0) {
+			return "";
+		}
+
+		const suffix = hostPort.slice(closingIndex + 1).trim();
+		const candidatePort = suffix.startsWith(":") ? suffix.slice(1).trim() : "";
+		const port = candidatePort.length > 0 ? candidatePort : DEFAULT_SERVER_PORT;
+		if (!/^\d+$/u.test(port)) {
+			return "";
+		}
+
+		return `${protocol}://[${host}]:${port}`;
+	}
+
+	const [host = "", rawPort = ""] = hostPort.split(":", 2);
+	const normalizedHost = host.trim();
+	if (normalizedHost.length === 0) {
+		return "";
+	}
+
+	const port = rawPort.trim().length > 0 ? rawPort.trim() : DEFAULT_SERVER_PORT;
+	if (!/^\d+$/u.test(port)) {
+		return "";
+	}
+
+	return `${protocol}://${normalizedHost}:${port}`;
+};
+
 export const SettingsScreen = () => {
 	const router = useRouter();
 	const { config, update } = useApiConfig();
-	const [baseUrl, setBaseUrl] = useState<string>(config.baseUrl);
+	const [baseUrl, setBaseUrl] = useState<string>(() => toManualConnectionInput(config.baseUrl));
 	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
 	const [statusMessage, setStatusMessage] = useState<string>("");
 	const [isScanning, setIsScanning] = useState<boolean>(false);
 	const [isConnectingManual, setIsConnectingManual] = useState<boolean>(false);
 	const [isConnectingByServerId, setIsConnectingByServerId] = useState<Record<string, boolean>>({});
 	const [isConnectingBySavedBaseUrl, setIsConnectingBySavedBaseUrl] = useState<Record<string, boolean>>({});
-	const [openSavedSwipeBaseUrl, setOpenSavedSwipeBaseUrl] = useState<string | null>(null);
+	const [savedConnectionActionTarget, setSavedConnectionActionTarget] = useState<SavedConnection | null>(null);
 	const [discoveredServers, setDiscoveredServers] = useState<DiscoveredServer[]>([]);
 	const [savedConnections, setSavedConnections] = useState<SavedConnection[]>([]);
 	const [rememberedTokenByServerId, setRememberedTokenByServerId] = useState<Record<string, string>>({});
+	const ignoreSavedPressByBaseUrlRef = useRef<Set<string>>(new Set());
 	const visibleSavedConnections = useMemo(() => filterSavedConnections(savedConnections), [savedConnections]);
 
 	const setStatus = (message: string, tone: StatusTone = "neutral") => {
@@ -225,11 +287,11 @@ export const SettingsScreen = () => {
 	};
 
 	const connectAndPersist = async (input: { baseUrl: string; token?: string; serverId?: string }) => {
-		const normalizedBaseUrl = input.baseUrl.trim();
+		const normalizedBaseUrl = normalizeConnectionBaseUrl(input.baseUrl);
 		const requestedToken = input.token?.trim() ?? "";
 
 		if (!normalizedBaseUrl) {
-			setStatus("Server URL is required.", "error");
+			setStatus("Server address is invalid.", "error");
 			return false;
 		}
 
@@ -262,7 +324,7 @@ export const SettingsScreen = () => {
 				token: candidateToken,
 			});
 
-			setBaseUrl(normalizedBaseUrl);
+			setBaseUrl(toManualConnectionInput(normalizedBaseUrl));
 			setStatus("Server connected.", "success");
 			return true;
 		};
@@ -318,7 +380,7 @@ export const SettingsScreen = () => {
 
 	const connectManual = async () => {
 		setIsConnectingManual(true);
-		setOpenSavedSwipeBaseUrl(null);
+		setSavedConnectionActionTarget(null);
 		setStatusMessage("");
 		const connected = await connectAndPersist({
 			baseUrl,
@@ -330,7 +392,7 @@ export const SettingsScreen = () => {
 	};
 
 	const connectSavedConnection = async (connection: SavedConnection) => {
-		setOpenSavedSwipeBaseUrl(null);
+		setSavedConnectionActionTarget(null);
 		setIsConnectingBySavedBaseUrl((current) => ({ ...current, [connection.baseUrl]: true }));
 		setStatusMessage("");
 		const connected = await connectAndPersist({
@@ -346,12 +408,14 @@ export const SettingsScreen = () => {
 	const deleteSavedConnection = async (connection: SavedConnection) => {
 		const next = await ApiConfigStore.deleteSavedConnection(connection.baseUrl);
 		setSavedConnections(filterSavedConnections(next));
-		setOpenSavedSwipeBaseUrl((current) => (current === connection.baseUrl ? null : current));
+		setSavedConnectionActionTarget((current) =>
+			current?.baseUrl === connection.baseUrl ? null : current,
+		);
 	};
 
 	const connectDiscoveredServer = async (server: DiscoveredServer) => {
 		const rememberedToken = (rememberedTokenByServerId[server.serverId] ?? "").trim();
-		setOpenSavedSwipeBaseUrl(null);
+		setSavedConnectionActionTarget(null);
 		setIsConnectingByServerId((current) => ({ ...current, [server.serverId]: true }));
 		setStatusMessage("");
 
@@ -386,34 +450,41 @@ export const SettingsScreen = () => {
 						<Text style={styles.sectionTitle}>Saved Connections</Text>
 					</View>
 
-					<FlatList
-						data={visibleSavedConnections}
-						keyExtractor={(item) => item.baseUrl}
-						renderItem={({ item: connection, index }) => {
-							const isConnecting = Boolean(isConnectingBySavedBaseUrl[connection.baseUrl]);
+						<FlatList
+							data={visibleSavedConnections}
+							keyExtractor={(item) => item.baseUrl}
+							renderItem={({ item: connection, index }) => {
+								const isConnecting = Boolean(isConnectingBySavedBaseUrl[connection.baseUrl]);
 
-							return (
-								<SwipeableSavedConnectionItem
-									deleteTestID={`saved-server-delete-${String(index)}`}
-									index={index}
-									isActive={openSavedSwipeBaseUrl === connection.baseUrl}
-									onClose={() => {
-										setOpenSavedSwipeBaseUrl((current) =>
-											current === connection.baseUrl ? null : current,
-										);
-									}}
-									onDelete={() => {
-										void deleteSavedConnection(connection);
-									}}
-									onOpen={() => {
-										setOpenSavedSwipeBaseUrl(connection.baseUrl);
-									}}
-								>
+								return (
 									<Pressable
 										accessibilityLabel={`Connect saved server ${toHost(connection.baseUrl) || connection.baseUrl}`}
+										delayLongPress={280}
 										disabled={isConnecting}
+										onLongPress={() => {
+											if (isConnecting) {
+												return;
+											}
+
+											ignoreSavedPressByBaseUrlRef.current.add(connection.baseUrl);
+											setSavedConnectionActionTarget(connection);
+										}}
 										onPress={() => {
+											if (ignoreSavedPressByBaseUrlRef.current.has(connection.baseUrl)) {
+												ignoreSavedPressByBaseUrlRef.current.delete(connection.baseUrl);
+												return;
+											}
+
 											void connectSavedConnection(connection);
+										}}
+										onPressOut={() => {
+											if (!ignoreSavedPressByBaseUrlRef.current.has(connection.baseUrl)) {
+												return;
+											}
+
+											setTimeout(() => {
+												ignoreSavedPressByBaseUrlRef.current.delete(connection.baseUrl);
+											}, 0);
 										}}
 										style={({ pressed }) => [
 											styles.listRow,
@@ -438,9 +509,8 @@ export const SettingsScreen = () => {
 											<Text style={styles.disclosureSymbol}>{">"}</Text>
 										)}
 									</Pressable>
-								</SwipeableSavedConnectionItem>
-							);
-						}}
+								);
+							}}
 						ListEmptyComponent={<Text style={styles.supportText}>No saved connection.</Text>}
 						contentContainerStyle={styles.connectionList}
 						removeClippedSubviews={false}
@@ -522,7 +592,7 @@ export const SettingsScreen = () => {
 						<TextInput
 							autoCapitalize="none"
 							onChangeText={setBaseUrl}
-							placeholder="http://127.0.0.1:8835"
+							placeholder="127.0.0.1"
 							placeholderTextColor={palette.muted}
 							style={styles.input}
 							testID="server-manual-base-url"
@@ -557,8 +627,35 @@ export const SettingsScreen = () => {
 							{statusMessage}
 						</Text>
 					</View>
-				) : null}
-			</ScrollView>
+					) : null}
+				</ScrollView>
+				<IosActionSheet
+					actions={[
+						{
+							icon: "delete-outline",
+							key: "delete-saved-connection",
+							label: "Delete",
+							onPress: () => {
+								if (!savedConnectionActionTarget) {
+									return;
+								}
+								void deleteSavedConnection(savedConnectionActionTarget);
+							},
+							testID: "saved-server-delete",
+							tone: "destructive",
+						},
+					]}
+					onClose={() => {
+						setSavedConnectionActionTarget(null);
+					}}
+					testID="saved-server-action-sheet"
+					title={
+						savedConnectionActionTarget
+							? toHost(savedConnectionActionTarget.baseUrl) || savedConnectionActionTarget.baseUrl
+							: "Connection options"
+					}
+					isVisible={savedConnectionActionTarget !== null}
+				/>
 		</KeyboardAvoidingView>
 	);
 };

@@ -21,10 +21,13 @@ import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { useFlowNavigator } from "../../../shared/navigation/use-flow-navigator";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import { useServerHealthQuery } from "../../../shared/api/use-server-health-query";
+import type { ProjectDTO } from "../../../shared/api/types";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { ActiveThreadsFooterCta } from "../../../shared/ui/active-threads-footer-cta";
+import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import { SwipeableThreadItem } from "./swipeable-thread-item";
 import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
+import { WorkspaceRenameModal } from "../../workspaces/ui/workspace-rename-modal";
 import { DesktopFilePickerModal } from "../../chat/ui/desktop-file-picker-modal";
 
 const palette = {
@@ -62,6 +65,7 @@ export const ThreadSelectionScreen = () => {
 		isChatsLoading,
 		isMessagesLoading,
 		projects,
+		renameProject,
 		selectChat,
 		selectProject,
 		selectedChatId,
@@ -82,8 +86,11 @@ export const ThreadSelectionScreen = () => {
 	const [optimisticDeletedThreadIds, setOptimisticDeletedThreadIds] = useState<Set<string>>(new Set());
 	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(new Set());
 	const [toastMessage, setToastMessage] = useState<ToastPayload | null>(null);
-	const [openSwipeRowId, setOpenSwipeRowId] = useState<string | null>(null);
-	const [openWorkspaceSwipeRowId, setOpenWorkspaceSwipeRowId] = useState<string | null>(null);
+	const [threadActionTarget, setThreadActionTarget] = useState<(typeof chats)[number] | null>(null);
+	const [drawerWorkspaceActionTarget, setDrawerWorkspaceActionTarget] = useState<ProjectDTO | null>(null);
+	const [workspaceNameInput, setWorkspaceNameInput] = useState<string>("");
+	const [workspaceToRename, setWorkspaceToRename] = useState<ProjectDTO | null>(null);
+	const [isRenamingWorkspace, setIsRenamingWorkspace] = useState<boolean>(false);
 	const [errorMessage, setErrorMessage] = useState<string>("");
 	const [drawerWorkspaceError, setDrawerWorkspaceError] = useState<string>("");
 	const drawerTranslate = useMemo(() => new Animated.Value(-drawerWidth), []);
@@ -229,7 +236,7 @@ export const ThreadSelectionScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
-			setOpenWorkspaceSwipeRowId(null);
+			setDrawerWorkspaceActionTarget(null);
 		});
 	};
 
@@ -247,7 +254,7 @@ export const ThreadSelectionScreen = () => {
 			}),
 		]).start(() => {
 			setIsDrawerOpen(false);
-			setOpenWorkspaceSwipeRowId(null);
+			setDrawerWorkspaceActionTarget(null);
 			onClosed();
 		});
 	};
@@ -286,6 +293,7 @@ export const ThreadSelectionScreen = () => {
 
 	const openWorkspaceFromDrawer = (project: (typeof projects)[number]) => {
 		setErrorMessage("");
+		setDrawerWorkspaceActionTarget(null);
 		setOpeningWorkspaceId(project.id);
 		selectProject(project);
 		closeDrawer();
@@ -320,6 +328,7 @@ export const ThreadSelectionScreen = () => {
 	};
 
 	const openThread = (chat: (typeof chats)[number]) => {
+		setThreadActionTarget(null);
 		setOpeningThreadId(chat.id);
 		selectChat(chat);
 		push({
@@ -405,7 +414,6 @@ export const ThreadSelectionScreen = () => {
 
 	const deleteThread = async (chat: (typeof chats)[number]) => {
 		const chatId = chat.id;
-		setOpenSwipeRowId((current) => (current === chatId ? null : current));
 		markThreadDeleteOptimistic(chatId);
 
 		try {
@@ -425,7 +433,6 @@ export const ThreadSelectionScreen = () => {
 
 	const deleteWorkspace = async (project: (typeof projects)[number]) => {
 		const projectId = project.id;
-		setOpenWorkspaceSwipeRowId((current) => (current === projectId ? null : current));
 		markWorkspaceDeleteOptimistic(projectId);
 
 		try {
@@ -442,6 +449,55 @@ export const ThreadSelectionScreen = () => {
 			});
 		}
 	};
+
+	const closeRenameWorkspaceModal = useCallback(() => {
+		if (isRenamingWorkspace) {
+			return;
+		}
+
+		setWorkspaceToRename(null);
+		setWorkspaceNameInput("");
+	}, [isRenamingWorkspace]);
+
+	const confirmRenameWorkspace = useCallback(async () => {
+		if (!workspaceToRename) {
+			return;
+		}
+
+		const nextName = workspaceNameInput.trim();
+		if (nextName.length === 0) {
+			showThreadToast({
+				message: "Workspace name cannot be empty.",
+				type: "error",
+			});
+			return;
+		}
+
+		if (nextName === workspaceToRename.name) {
+			setWorkspaceToRename(null);
+			setWorkspaceNameInput("");
+			return;
+		}
+
+		setIsRenamingWorkspace(true);
+		setDrawerWorkspaceError("");
+		try {
+			await renameProject(workspaceToRename.id, nextName);
+			setWorkspaceToRename(null);
+			setWorkspaceNameInput("");
+			showThreadToast({
+				message: `Workspace "${nextName}" renamed.`,
+				type: "success",
+			});
+		} catch (error: unknown) {
+			showThreadToast({
+				message: error instanceof Error ? error.message : "Failed to rename workspace.",
+				type: "error",
+			});
+		} finally {
+			setIsRenamingWorkspace(false);
+		}
+	}, [renameProject, showThreadToast, workspaceNameInput, workspaceToRename]);
 
 	return (
 		<KeyboardAvoidingView
@@ -487,22 +543,14 @@ export const ThreadSelectionScreen = () => {
 								<SwipeableThreadItem
 									isLoading={openingThreadId === chat.id}
 									index={index}
-									isActive={openSwipeRowId === chat.id}
 									isWorking={activeThreadIds.has(chat.id)}
 									isSelected={chat.id === selectedChatId}
 									chat={chat}
 									key={chat.id}
-									onClose={() => {
-										setOpenSwipeRowId((current) => (current === chat.id ? null : current));
+									onLongPress={() => {
+										setThreadActionTarget(chat);
 									}}
-									onDelete={() => {
-										void deleteThread(chat);
-									}}
-									deleteTestID={`thread-item-delete-${String(index)}`}
 									rowTestID={`thread-item-${String(index)}`}
-									onOpen={() => {
-										setOpenSwipeRowId(chat.id);
-									}}
 									onOpenChat={() => {
 										openThread(chat);
 									}}
@@ -630,22 +678,15 @@ export const ThreadSelectionScreen = () => {
 									<SwipeableWorkspaceItem
 										isLoading={openingWorkspaceId === project.id}
 										index={index}
-										isActive={openWorkspaceSwipeRowId === project.id}
 										isSelected={project.id === selectedProjectId}
 										key={project.id}
-										onClose={() => {
-											setOpenWorkspaceSwipeRowId((current) => (current === project.id ? null : current));
-										}}
-										onDelete={() => {
-											void deleteWorkspace(project);
-										}}
-										onOpen={() => {
-											setOpenWorkspaceSwipeRowId(project.id);
+										onLongPress={() => {
+											setDrawerWorkspaceError("");
+											setDrawerWorkspaceActionTarget(project);
 										}}
 										onOpenWorkspace={() => {
 											openWorkspaceFromDrawer(project);
 										}}
-										deleteTestID={`drawer-workspace-delete-${String(index)}`}
 										project={project}
 										rowBackgroundColor="rgba(255,255,255,0.04)"
 										rowBorderColor="rgba(255,255,255,0.2)"
@@ -655,27 +696,27 @@ export const ThreadSelectionScreen = () => {
 									/>
 								))}
 						</ScrollView>
-								<View style={styles.drawerFooter}>
-									<Pressable
-										onPress={() => {
-											openSettingsFromDrawer();
-										}}
-										style={({ pressed }) => [
-											styles.drawerFooterButton,
-											pressed ? styles.drawerFooterButtonPressed : null,
-										]}
-										testID="drawer-settings-button"
-									>
-										<MaterialIcons
-											color={palette.text}
-											name="settings"
-											size={17}
-										/>
-										<Text numberOfLines={1} style={styles.drawerItemTitle}>
-											Settings
-										</Text>
-									</Pressable>
-								</View>
+							<View style={styles.drawerFooter}>
+								<Pressable
+									onPress={() => {
+										openSettingsFromDrawer();
+									}}
+									style={({ pressed }) => [
+										styles.drawerFooterButton,
+										pressed ? styles.drawerFooterButtonPressed : null,
+									]}
+									testID="drawer-settings-button"
+								>
+									<MaterialIcons
+										color={palette.text}
+										name="settings"
+										size={17}
+									/>
+									<Text numberOfLines={1} style={styles.drawerItemTitle}>
+										Settings
+									</Text>
+								</Pressable>
+							</View>
 						</LinearGradient>
 					</Animated.View>
 				</View>
@@ -697,6 +738,75 @@ export const ThreadSelectionScreen = () => {
 				}}
 				selectionMode="single"
 				isAddButtonVisible={false}
+			/>
+			<IosActionSheet
+				actions={[
+					{
+						icon: "delete-outline",
+						key: "delete-thread",
+						label: "Delete thread",
+						onPress: () => {
+							if (!threadActionTarget) {
+								return;
+							}
+							void deleteThread(threadActionTarget);
+						},
+						testID: "thread-item-delete",
+						tone: "destructive",
+					},
+				]}
+				onClose={() => {
+					setThreadActionTarget(null);
+				}}
+				testID="thread-action-sheet"
+				title={threadActionTarget?.title ?? "Thread options"}
+				isVisible={threadActionTarget !== null}
+			/>
+			<IosActionSheet
+				actions={[
+					{
+						icon: "edit",
+						key: "rename-drawer-workspace",
+						label: "Rename",
+						onPress: () => {
+							if (!drawerWorkspaceActionTarget) {
+								return;
+							}
+							setWorkspaceToRename(drawerWorkspaceActionTarget);
+							setWorkspaceNameInput(drawerWorkspaceActionTarget.name);
+						},
+						testID: "drawer-workspace-rename",
+					},
+					{
+						icon: "delete-outline",
+						key: "delete-drawer-workspace",
+						label: "Delete",
+						onPress: () => {
+							if (!drawerWorkspaceActionTarget) {
+								return;
+							}
+							void deleteWorkspace(drawerWorkspaceActionTarget);
+						},
+						testID: "drawer-workspace-delete",
+						tone: "destructive",
+					},
+				]}
+				onClose={() => {
+					setDrawerWorkspaceActionTarget(null);
+				}}
+				testID="drawer-workspace-action-sheet"
+				title={drawerWorkspaceActionTarget?.name ?? "Workspace options"}
+				isVisible={drawerWorkspaceActionTarget !== null}
+			/>
+			<WorkspaceRenameModal
+				isSubmitting={isRenamingWorkspace}
+				isVisible={workspaceToRename !== null}
+				name={workspaceNameInput}
+				onCancel={closeRenameWorkspaceModal}
+				onChangeName={setWorkspaceNameInput}
+				onSubmit={() => {
+					void confirmRenameWorkspace();
+				}}
 			/>
 		</KeyboardAvoidingView>
 	);
