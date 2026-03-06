@@ -293,7 +293,25 @@ export const ChatScreen = () => {
 		() => ["plan", "default", "full"] as const,
 		[],
 	);
-	const permissionLabel = permissionMode?.trim().length ? permissionMode : "default";
+	const normalizedPermissionMode = useMemo(() => {
+		return permissionMode === "plan" || permissionMode === "default" || permissionMode === "full"
+			? permissionMode
+			: "default";
+	}, [permissionMode]);
+	const permissionLabel = normalizedPermissionMode;
+	const permissionDotColor = useMemo(() => {
+		switch (normalizedPermissionMode) {
+			case "full": {
+				return "#F97316";
+			}
+			case "plan": {
+				return "#1D4ED8";
+			}
+			default: {
+				return "#94A3B8";
+			}
+		}
+	}, [normalizedPermissionMode]);
 	const selectedModelName = activeModel?.displayName ?? selectedModel ?? "No model";
 	const selectedReasoningLabel = selectedReasoningEffort ?? activeModel?.defaultReasoningEffort ?? "No reasoning";
 	const selectedBranch = gitCurrentBranch ?? "No branch";
@@ -1245,15 +1263,15 @@ export const ChatScreen = () => {
 				}}
 				right={(
 					<Pressable
-						accessibilityLabel="chat-terminal-open-button"
+						accessibilityLabel="chat-permission-button"
 						accessibilityRole="button"
 						onPress={() => {
-							setIsTerminalOpen(true);
+							setActivePicker("permission");
 						}}
-						style={({ pressed }) => [styles.ghostButton, pressed ? styles.ghostButtonPressed : null]}
-						testID="chat-terminal-open-button"
+						style={({ pressed }) => [styles.permissionIndicatorButton, pressed ? styles.permissionIndicatorButtonPressed : null]}
+						testID="chat-permission-button"
 					>
-						<MaterialIcons color={palette.text} name="terminal" size={20} />
+						<View style={[styles.permissionIndicatorDot, { backgroundColor: permissionDotColor }]} />
 					</Pressable>
 				)}
 				subtitle={selectedProject?.name ?? "No workspace selected"}
@@ -1476,6 +1494,7 @@ export const ChatScreen = () => {
 								styles.selectorButton,
 								pressed ? styles.selectorButtonPressed : null,
 							]}
+							testID="chat-permission-picker-button"
 						>
 							<View style={styles.selectorButtonContent}>
 								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
@@ -1509,7 +1528,7 @@ export const ChatScreen = () => {
 									{selectedBranch}
 								</Text>
 							</View>
-							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+								<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
 						</Pressable>
 						<Pressable
 							disabled={isGitCommitDisabled}
@@ -1532,16 +1551,27 @@ export const ChatScreen = () => {
 								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
 									Git
 								</Text>
-								<Text numberOfLines={1} style={styles.selectorButtonValue}>
-									<Text style={{ color: "#34d399" }}>
-										+{String(isGitRepository ? (gitStatusQuery.data?.added ?? 0) : 0)}
-									</Text>{" "}
-									/{" "}
-									<Text style={{ color: "#fb7185" }}>
-										-{String(isGitRepository ? (gitStatusQuery.data?.removed ?? 0) : 0)}
-									</Text>
+							<Text numberOfLines={1} style={styles.selectorButtonValue}>
+								<Text style={{ color: "#34d399" }}>
+									+{String(isGitRepository ? (gitStatusQuery.data?.added ?? 0) : 0)}
+								</Text>{" "}
+								/{" "}
+								<Text style={{ color: "#fb7185" }}>
+									-{String(isGitRepository ? (gitStatusQuery.data?.removed ?? 0) : 0)}
 								</Text>
+							</Text>
 							</View>
+						</Pressable>
+						<Pressable
+							accessibilityLabel="chat-terminal-open-button"
+							accessibilityRole="button"
+							onPress={() => {
+								setIsTerminalOpen(true);
+							}}
+							style={({ pressed }) => [styles.selectorButton, styles.terminalShortcutButton, pressed ? styles.selectorButtonPressed : null]}
+							testID="chat-terminal-open-button"
+						>
+							<MaterialIcons color={palette.text} name="terminal" size={20} />
 						</Pressable>
 					</ScrollView>
 				) : null}
@@ -2091,6 +2121,15 @@ const styles = StyleSheet.create({
 		lineHeight: 14,
 		marginTop: 0,
 	},
+	terminalShortcutButton: {
+		alignItems: "center",
+		borderRadius: 11,
+		height: 44,
+		justifyContent: "center",
+		width: 44,
+		minWidth: 44,
+		paddingHorizontal: 0,
+	},
 	selectorsRow: {
 		flexDirection: "row",
 		flexGrow: 0,
@@ -2439,6 +2478,21 @@ const styles = StyleSheet.create({
 	},
 	ghostButtonPressed: {
 		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	permissionIndicatorButton: {
+		alignItems: "center",
+		borderRadius: 999,
+		height: 28,
+		justifyContent: "center",
+		width: 28,
+	},
+	permissionIndicatorButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	permissionIndicatorDot: {
+		borderRadius: 999,
+		height: 12,
+		width: 12,
 	},
 	ghostLabel: {
 		color: palette.text,
