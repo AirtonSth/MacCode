@@ -23,7 +23,7 @@ const PUSH_STALE_WINDOW_SECONDS = 180;
 const PUSH_UPDATE_EXPIRATION_SECONDS = 300;
 const PUSH_END_EXPIRATION_SECONDS = 120;
 const PUSH_END_DISMISS_SECONDS = 30;
-const PREVIEW_LIMIT = 30;
+const PREVIEW_LIMIT = 140;
 const TITLE_LIMIT = 80;
 const STATUS_LIMIT = 80;
 const SANITIZE_INPUT_CODEPOINT_LIMIT = 4_096;
@@ -64,6 +64,7 @@ interface ChatRuntimeState {
 	chatTitle: string;
 	phase: LiveActivityPhase;
 	preview: string;
+	previewSource: "default" | "event" | "legacy-response" | "structured-response";
 	startedAtMs: number;
 	statusLine: string;
 	lastSentAtMs: number;
@@ -334,20 +335,6 @@ const toDefaultPreview = (phase: LiveActivityPhase): string => {
 	}
 };
 
-const isDefaultPreview = (value: string): boolean => {
-	const normalized = toNormalizedPreviewText(value);
-	if (normalized.length === 0) {
-		return true;
-	}
-
-	return normalized === toNormalizedPreviewText(toDefaultPreview("running"))
-		|| normalized === toNormalizedPreviewText(toDefaultPreview("background"))
-		|| normalized === toNormalizedPreviewText(toDefaultPreview("finalizing"))
-		|| normalized === toNormalizedPreviewText(toDefaultPreview("completed"))
-		|| normalized === toNormalizedPreviewText(toDefaultPreview("failed"))
-		|| normalized === toNormalizedPreviewText(toDefaultPreview("error"));
-};
-
 const toEventSummary = (event: AssistantStreamEvent): string | undefined => {
 	switch (event.type) {
 		case "item_delta": {
@@ -358,9 +345,32 @@ const toEventSummary = (event: AssistantStreamEvent): string | undefined => {
 			return undefined;
 		}
 		case "item_completed":
-		case "item_started":
 		case "item_state": {
 			return toNormalized(event.summary) || undefined;
+		}
+		case "item_started": {
+			const summary = toNormalized(event.summary);
+			if (summary.length > 0) {
+				return summary;
+			}
+
+			switch (event.itemType) {
+				case "assistant_message": {
+					return "Writing response...";
+				}
+				case "plan": {
+					return "Planning...";
+				}
+				case "reasoning": {
+					return "Thinking...";
+				}
+				case "tool": {
+					return "Running tool...";
+				}
+				default: {
+					return undefined;
+				}
+			}
 		}
 		default: {
 			return undefined;
@@ -377,9 +387,32 @@ const toStatusLineFromEvent = (event: AssistantStreamEvent): string | undefined 
 
 			return undefined;
 		}
-		case "item_completed":
-		case "item_started": {
+		case "item_completed": {
 			return toNormalized(event.summary) || "Working...";
+		}
+		case "item_started": {
+			const summary = toNormalized(event.summary);
+			if (summary.length > 0) {
+				return summary;
+			}
+
+			switch (event.itemType) {
+				case "assistant_message": {
+					return "Writing response...";
+				}
+				case "plan": {
+					return "Planning...";
+				}
+				case "reasoning": {
+					return "Thinking...";
+				}
+				case "tool": {
+					return "Running tool...";
+				}
+				default: {
+					return "Working...";
+				}
+			}
 		}
 		case "item_state": {
 			return toNormalized(event.summary) || `Step ${event.state}`;
@@ -411,6 +444,8 @@ const toPreviewChunk = (preview: string, delta: string): string => {
 	const next = `${base} ${normalizedDelta}`.trim();
 	return toUtf8Head(next, PREVIEW_UTF8_BYTE_LIMIT);
 };
+
+const toLatestPreview = (preview: string): string => toUtf8Head(toNormalizedPreviewText(preview), PREVIEW_UTF8_BYTE_LIMIT);
 
 const toElapsedSeconds = (startedAtMs: number): number => {
 	const started = Number.isFinite(startedAtMs) && startedAtMs > 0 ? startedAtMs : Date.now();
@@ -1107,6 +1142,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			chatTitle: toNormalized(input.chatTitle) || "Thread",
 			phase: "running",
 			preview: toDefaultPreview("running"),
+			previewSource: "default",
 			startedAtMs: Date.now(),
 			statusLine: toDefaultStatusLine("running"),
 			lastSentAtMs: 0,
@@ -1474,6 +1510,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		if (isTerminalPhase(runtime.phase)) {
 			runtime.startedAtMs = Date.now();
 			runtime.preview = toDefaultPreview("running");
+			runtime.previewSource = "default";
 		}
 		runtime.pendingEvent = null;
 		this.clearScheduledFlush(input.chatId);
@@ -1481,6 +1518,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		runtime.statusLine = toDefaultStatusLine("running");
 		if (toNormalized(runtime.preview).length === 0) {
 			runtime.preview = toDefaultPreview("running");
+			runtime.previewSource = "default";
 		}
 		if (alreadyActive) {
 			this.ensureHeartbeat(input.chatId);
@@ -1502,9 +1540,15 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		const normalizedDelta = toNormalizedPreviewText(delta);
-		if (normalizedDelta.length > 0) {
-			const previewBase = isDefaultPreview(runtime.preview) ? "" : runtime.preview;
+		if (
+			normalizedDelta.length > 0
+			&& (runtime.previewSource === "default" || runtime.previewSource === "legacy-response")
+		) {
+			const previewBase = runtime.previewSource === "legacy-response"
+				? runtime.preview
+				: "";
 			runtime.preview = toPreviewChunk(previewBase, normalizedDelta);
+			runtime.previewSource = "legacy-response";
 		}
 		if (runtime.phase !== "finalizing") {
 			runtime.phase = "running";
@@ -1533,14 +1577,14 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			runtime.phase = "running";
 			const deltaText = toNormalizedPreviewText(event.delta);
 			if ((event.target === "body" || event.target === "output") && deltaText.length > 0) {
-				const previewBase = isDefaultPreview(runtime.preview) ? "" : runtime.preview;
+				const previewBase = runtime.previewSource === "structured-response" ? runtime.preview : "";
 				runtime.preview = toPreviewChunk(previewBase, deltaText);
+				runtime.previewSource = "structured-response";
 			}
 			if (event.target === "summary" && deltaText.length > 0) {
 				runtime.statusLine = deltaText;
-				if (toNormalized(runtime.preview).length === 0) {
-					runtime.preview = deltaText;
-				}
+				runtime.preview = toLatestPreview(deltaText);
+				runtime.previewSource = "event";
 			}
 			this.queueFlush(chatId, "update");
 			return;
@@ -1550,8 +1594,8 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		runtime.statusLine = toStatusLineFromEvent(event) ?? toDefaultStatusLine(runtime.phase);
 		const eventSummary = toEventSummary(event);
 		if (eventSummary) {
-			const previewBase = isDefaultPreview(runtime.preview) ? "" : runtime.preview;
-			runtime.preview = toPreviewChunk(previewBase, eventSummary);
+			runtime.preview = toLatestPreview(eventSummary);
+			runtime.previewSource = "event";
 		}
 		this.queueFlush(chatId, "update");
 	}
@@ -1570,6 +1614,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		runtime.statusLine = toDefaultStatusLine(input.outcome);
 		if (toNormalized(runtime.preview).length === 0) {
 			runtime.preview = toDefaultPreview(input.outcome);
+			runtime.previewSource = "default";
 		}
 		logLiveActivityInfo("chat finished (queueing end)", {
 			chatId: input.chatId,

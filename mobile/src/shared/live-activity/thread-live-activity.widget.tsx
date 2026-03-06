@@ -65,6 +65,18 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 	};
 
 	// eslint-disable-next-line unicorn/consistent-function-scoping -- Widget helpers must stay inside this function for runtime serialization.
+	const toTimerInterval = (elapsedSeconds: number): { lower: Date; upper: Date } => {
+		const bounded = Number.isFinite(elapsedSeconds) && elapsedSeconds > 0 ? Math.floor(elapsedSeconds) : 0;
+		const now = Date.now();
+		const lower = new Date(now - bounded * 1_000);
+		const upper = new Date(lower.getTime() + 12 * 60 * 60 * 1_000);
+		return {
+			lower,
+			upper,
+		};
+	};
+
+	// eslint-disable-next-line unicorn/consistent-function-scoping -- Widget helpers must stay inside this function for runtime serialization.
 	const toPreview = (value: string): string => {
 		const trimmed = value.trim();
 		if (trimmed.length === 0) {
@@ -213,6 +225,8 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 	const statusLine = toTrimmed(data.statusLine, visual.defaultStatus);
 	const preview = toPreview(toTrimmed(data.preview, visual.defaultPreview));
 	const elapsed = toElapsed(data.elapsedSeconds);
+	const timerInterval = toTimerInterval(data.elapsedSeconds);
+	const usesLiveTimer = data.phase === "running" || data.phase === "background" || data.phase === "finalizing";
 	const compactGlyph = data.phase === "running" || data.phase === "finalizing"
 		? "RC"
 		: visual.label.slice(0, 1).toUpperCase();
@@ -262,7 +276,10 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		].filter(Boolean),
 	});
 	const elapsedPill = textView({
-		children: elapsed,
+		children: usesLiveTimer ? "" : elapsed,
+		countsDown: false,
+		showsHours: true,
+		timerInterval: usesLiveTimer ? timerInterval : undefined,
 		modifiers: [
 			padding({ horizontal: 8, vertical: 3 }),
 			background ? background(visual.timerBackground) : null,
@@ -301,17 +318,23 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 	const compactLeading = textView({
 		children: compactGlyph,
 		modifiers: [
+			frame ? frame({ width: 14, alignment: "leading" }) : null,
 			font({ size: 11, weight: "bold", design: "rounded" }),
 			foregroundStyle(visual.brandForeground),
 			lineLimit(1),
-		],
+		].filter(Boolean),
 	});
 	const compactTrailing = textView({
-		children: elapsed,
+		children: usesLiveTimer ? "" : elapsed,
+		countsDown: false,
+		showsHours: true,
+		timerInterval: usesLiveTimer ? timerInterval : undefined,
 		modifiers: [
+			frame ? frame({ width: 40, alignment: "trailing" }) : null,
 			font({ size: 11, weight: "semibold", design: "monospaced" }),
 			monospacedDigit ? monospacedDigit() : null,
 			foregroundStyle(visual.timerForeground),
+			lineLimit(1),
 		].filter(Boolean),
 	});
 	const minimal = textView({
@@ -327,6 +350,7 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		alignment: "leading",
 		spacing: 4,
 		modifiers: [
+			frame ? frame({ alignment: "leading", maxWidth: 9_999 }) : null,
 			padding({ horizontal: 10, vertical: 8 }),
 			background ? background(visual.cardBackground) : null,
 			cornerRadius ? cornerRadius(10) : null,
@@ -337,6 +361,7 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		alignment: "leading",
 		spacing: 10,
 		modifiers: [
+			frame ? frame({ alignment: "leading", maxWidth: 9_999 }) : null,
 			padding({ all: 12 }),
 		],
 		children: [

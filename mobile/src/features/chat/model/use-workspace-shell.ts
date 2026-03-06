@@ -23,6 +23,7 @@ import { createRealtimeClient, type ConnectionState } from "../../../shared/api/
 import type {
 	ActiveThreadSummaryDTO,
 	AssistantStreamItemState,
+	AssistantStreamItemType,
 	ChatContextDTO,
 	ChatDTO,
 	ChatStreamEventDTO,
@@ -35,9 +36,12 @@ import type {
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import {
 	clearThreadLiveActivity,
+	finishThreadLiveActivity,
 	isThreadLiveActivityEnabled,
+	onThreadLiveActivityAppStateChanged,
 	startThreadLiveActivity,
 	subscribeThreadLiveActivityPushToken,
+	updateThreadLiveActivity,
 } from "../../../shared/live-activity/thread-live-activity";
 import {
 	ensurePushDeliveryToken,
@@ -123,6 +127,109 @@ const replayAssistantEventsIntoTurns = (events: ChatStreamEventDTO[]): StreamTur
 		turns = applyAssistantEventToHistory(turns, entry.event);
 	}
 	return turns;
+};
+
+const toLiveActivityFallbackText = (itemType: AssistantStreamItemType): string => {
+	switch (itemType) {
+		case "assistant_message": {
+			return "Writing response...";
+		}
+		case "plan": {
+			return "Planning...";
+		}
+		case "reasoning": {
+			return "Thinking...";
+		}
+		case "tool": {
+			return "Running tool...";
+		}
+		default: {
+			return "Working...";
+		}
+	}
+};
+
+const toLiveActivityPreviewFromEvent = (event: AssistantEventPayload): string | undefined => {
+	switch (event.type) {
+		case "item_completed": {
+			return event.summary?.trim() || undefined;
+		}
+		case "item_delta": {
+			const preview = event.delta.trim();
+			return preview.length > 0 ? preview : undefined;
+		}
+		case "item_started": {
+			return event.summary?.trim() || toLiveActivityFallbackText(event.itemType);
+		}
+		case "item_state": {
+			return event.summary?.trim() || undefined;
+		}
+		case "turn_completed": {
+			return undefined;
+		}
+		default: {
+			return undefined;
+		}
+	}
+};
+
+const toLiveActivityPreviewFromTurn = (
+	turn: StreamTurnState | null,
+	event: AssistantEventPayload,
+): string | undefined => {
+	if (event.type === "item_delta" && event.target === "summary") {
+		return toLiveActivityPreviewFromEvent(event);
+	}
+
+	if ("itemId" in event) {
+		const item = turn?.itemsById[event.itemId];
+		if (item) {
+			const body = item.body.trim();
+			if (body.length > 0) {
+				return body;
+			}
+
+			const output = item.output.trim();
+			if (output.length > 0) {
+				return output;
+			}
+
+			const summary = item.summary.trim();
+			if (summary.length > 0) {
+				return summary;
+			}
+		}
+	}
+
+	return toLiveActivityPreviewFromEvent(event);
+};
+
+const toLiveActivityStatusLineFromEvent = (event: AssistantEventPayload): string | undefined => {
+	switch (event.type) {
+		case "item_completed": {
+			return event.summary?.trim() || "Working...";
+		}
+		case "item_delta": {
+			if (event.target === "summary") {
+				const statusLine = event.delta.trim();
+				return statusLine.length > 0 ? statusLine : undefined;
+			}
+
+			return undefined;
+		}
+		case "item_started": {
+			return event.summary?.trim() || toLiveActivityFallbackText(event.itemType);
+		}
+		case "item_state": {
+			return event.summary?.trim() || `Step ${event.state}`;
+		}
+		case "turn_completed": {
+			return "Finalizing response";
+		}
+		default: {
+			return undefined;
+		}
+	}
 };
 
 const isPlaceholderThreadTitle = (title: string): boolean => {
@@ -357,6 +464,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const liveActivityTokenByChatRef = useRef<Record<string, string>>({});
 	const registeredLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
 	const pendingLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
+	const structuredLiveActivityPreviewByChatRef = useRef<Record<string, true>>({});
 	const liveActivitySubscriptionRetryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const flushLiveActivitySubscriptionsRef = useRef<() => void>(() => {
 		// no-op
@@ -516,45 +624,64 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				chatTitle: title,
 				remoteManaged: true,
 				restart: input?.restart,
-				statusLine: input?.statusLine ?? "Running",
+				statusLine: input?.statusLine ?? "Generating response",
 			});
 		},
 		[resolveChatTitle],
 	);
 
-	const updateRunningLiveActivity = useCallback(
-		(input: {
+		const updateRunningLiveActivity = useCallback(
+			(input: {
 			chatId: string;
 			chatTitle?: string;
 			phase?: "running" | "background" | "finalizing";
 			preview?: string;
 			statusLine?: string;
 			force?: boolean;
+			authoritative?: boolean;
 		}) => {
-			void input;
-
-			// Live Activity updates are backend-managed.
+			void updateThreadLiveActivity({
+				authoritative: input.authoritative,
+				chatId: input.chatId,
+				chatTitle: input.chatTitle,
+				force: input.force,
+				phase: input.phase,
+				preview: input.preview,
+				statusLine: input.statusLine,
+			});
 		},
-		[],
-	);
+			[],
+		);
 
-	const finishLiveActivity = useCallback(
-		(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
+		const clearStructuredLiveActivityPreview = useCallback((chatId: string) => {
+			structuredLiveActivityPreviewByChatRef.current = omitRecordKey(
+				structuredLiveActivityPreviewByChatRef.current,
+				chatId,
+			);
+		}, []);
+
+		const finishLiveActivity = useCallback(
+			(chatId: string, input: { outcome: "completed" | "failed" | "error"; statusLine?: string }) => {
+				const chatTitle = resolveChatTitle(chatId);
+			void finishThreadLiveActivity({
+				chatId,
+				chatTitle,
+				outcome: input.outcome,
+				statusLine: input.statusLine,
+			});
 			liveActivityTokenByChatRef.current = omitRecordKey(liveActivityTokenByChatRef.current, chatId);
 			registeredLiveActivitySignatureByChatRef.current = omitRecordKey(
 				registeredLiveActivitySignatureByChatRef.current,
 				chatId,
 			);
-			pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
-				pendingLiveActivitySignatureByChatRef.current,
-				chatId,
-			);
-			void input;
-
-			// Live Activity completion is backend-managed.
-		},
-		[],
-	);
+				pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
+					pendingLiveActivitySignatureByChatRef.current,
+					chatId,
+				);
+				clearStructuredLiveActivityPreview(chatId);
+			},
+			[clearStructuredLiveActivityPreview, resolveChatTitle],
+		);
 
 	const clearLiveActivitySubscriptionRetry = useCallback(() => {
 		if (!liveActivitySubscriptionRetryTimeoutRef.current) {
@@ -565,17 +692,18 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		liveActivitySubscriptionRetryTimeoutRef.current = null;
 	}, []);
 
-	const clearLiveActivitySubscriptionState = useCallback((chatId: string) => {
-		liveActivityTokenByChatRef.current = omitRecordKey(liveActivityTokenByChatRef.current, chatId);
-		registeredLiveActivitySignatureByChatRef.current = omitRecordKey(
-			registeredLiveActivitySignatureByChatRef.current,
-			chatId,
-		);
-		pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
-			pendingLiveActivitySignatureByChatRef.current,
-			chatId,
-		);
-	}, []);
+		const clearLiveActivitySubscriptionState = useCallback((chatId: string) => {
+			liveActivityTokenByChatRef.current = omitRecordKey(liveActivityTokenByChatRef.current, chatId);
+			registeredLiveActivitySignatureByChatRef.current = omitRecordKey(
+				registeredLiveActivitySignatureByChatRef.current,
+				chatId,
+			);
+			pendingLiveActivitySignatureByChatRef.current = omitRecordKey(
+				pendingLiveActivitySignatureByChatRef.current,
+				chatId,
+			);
+			clearStructuredLiveActivityPreview(chatId);
+		}, [clearStructuredLiveActivityPreview]);
 
 	const scheduleLiveActivitySubscriptionRetry = useCallback((input: { chatId?: string; reason: string }) => {
 		if (liveActivitySubscriptionRetryTimeoutRef.current) {
@@ -875,11 +1003,17 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				return await collectEvents(page.nextAfterId, nextEvents);
 			};
 
-			const lastKnownEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
-			try {
-				const events = await collectEvents(lastKnownEventId, []);
-				if (events.length === 0) {
-					return;
+				const lastKnownEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
+				try {
+					const events = await collectEvents(lastKnownEventId, []);
+					if (events.length === 0) {
+						return;
+					}
+					structuredLiveActivityPreviewByChatRef.current[chatId] = true;
+
+					let latestTurn = queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(chatId)) ?? null;
+				for (const entry of events) {
+					latestTurn = applyAssistantEventToTurn(latestTurn, entry.event);
 				}
 
 				setStreamHistoryByChat((current) => {
@@ -911,10 +1045,14 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					};
 				});
 				const isBackgroundAppState = appStateRef.current === "background" || appStateRef.current === "inactive";
+				const latestEvent = events.at(-1)?.event;
+				const latestStatusLine = latestEvent ? toLiveActivityStatusLineFromEvent(latestEvent) : undefined;
 				updateRunningLiveActivity({
+					authoritative: true,
 					chatId,
 					phase: isBackgroundAppState ? "background" : "running",
-					statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
+					preview: latestEvent && latestTurn ? toLiveActivityPreviewFromTurn(latestTurn, latestEvent) : undefined,
+					statusLine: latestStatusLine,
 				});
 			} catch {
 				void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
@@ -939,80 +1077,76 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				}));
 			};
 
-			if (event.event === "assistant_delta") {
-				const chatId = event.data.chatId;
-				setStreamingTextByChat((current) => ({
-					...current,
-					[chatId]: (() => {
-						const nextPreview = `${current[chatId] ?? ""}${event.data.delta}`;
-						updateRunningLiveActivity({
-							chatId,
-							phase: isBackgroundAppState ? "background" : "running",
-							preview: nextPreview,
-							statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
-						});
-						return nextPreview;
-					})(),
-				}));
-				clearSendingForChat(chatId);
-				return;
-			}
-
-			if (event.event === "assistant_snapshot") {
-				setStreamingTextByChat((current) => ({
-					...current,
-					[event.data.chatId]: event.data.partialText,
-				}));
-				updateRunningLiveActivity({
-					chatId: event.data.chatId,
-					phase: isBackgroundAppState ? "background" : "running",
-					preview: event.data.partialText,
-					statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
-				});
-				return;
-			}
-
-			if (event.event === "assistant_event") {
-				const incomingEventId = event.data.eventId;
-				const chatId = event.data.chatId;
-				const lastAppliedEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
-				if (typeof incomingEventId === "number" && incomingEventId <= lastAppliedEventId) {
+				if (event.event === "assistant_delta") {
+					const chatId = event.data.chatId;
+					const prefersStructuredLiveActivityPreview = structuredLiveActivityPreviewByChatRef.current[chatId];
+					setStreamingTextByChat((current) => ({
+						...current,
+						[chatId]: (() => {
+							const nextPreview = `${current[chatId] ?? ""}${event.data.delta}`;
+							if (!prefersStructuredLiveActivityPreview) {
+								updateRunningLiveActivity({
+									authoritative: true,
+									chatId,
+									phase: isBackgroundAppState ? "background" : "running",
+									preview: nextPreview,
+									statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
+								});
+							}
+							return nextPreview;
+						})(),
+					}));
+					clearSendingForChat(chatId);
 					return;
 				}
-				if (typeof incomingEventId === "number") {
-					lastAssistantEventIdByChatRef.current[chatId] = incomingEventId;
+
+				if (event.event === "assistant_snapshot") {
+					const prefersStructuredLiveActivityPreview = structuredLiveActivityPreviewByChatRef.current[event.data.chatId];
+					setStreamingTextByChat((current) => ({
+						...current,
+						[event.data.chatId]: event.data.partialText,
+					}));
+					if (!prefersStructuredLiveActivityPreview) {
+						updateRunningLiveActivity({
+							authoritative: true,
+							chatId: event.data.chatId,
+							phase: isBackgroundAppState ? "background" : "running",
+							preview: event.data.partialText,
+							statusLine: isBackgroundAppState ? "Running in background" : "Generating response",
+						});
+					}
+					return;
 				}
+
+				if (event.event === "assistant_event") {
+					const incomingEventId = event.data.eventId;
+					const chatId = event.data.chatId;
+					structuredLiveActivityPreviewByChatRef.current[chatId] = true;
+					const lastAppliedEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
+					if (typeof incomingEventId === "number" && incomingEventId <= lastAppliedEventId) {
+						return;
+					}
+					if (typeof incomingEventId === "number") {
+						lastAssistantEventIdByChatRef.current[chatId] = incomingEventId;
+					}
+
+					const nextTurn = applyAssistantEventToTurn(
+						queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(chatId)) ?? null,
+						event.data.event,
+					);
+					queryClient.setQueryData<StreamTurnState | null>(
+						queryKeys.streamTurn(chatId),
+						nextTurn,
+					);
 
 				setStreamHistoryByChat((current) => {
 					const nextHistory = applyAssistantEventToHistory(current[chatId], event.data.event);
-					queryClient.setQueryData<StreamTurnState | null>(
-						queryKeys.streamTurn(chatId),
-						nextHistory.at(-1) ?? null,
-					);
 					return {
 						...current,
 						[chatId]: nextHistory,
 					};
 				});
-				const statusLine = (() => {
-					switch (event.data.event.type) {
-						case "item_completed": {
-							return event.data.event.summary ?? "Step completed";
-						}
-						case "item_started": {
-							return event.data.event.summary ?? "Working...";
-						}
-						case "item_state": {
-							return event.data.event.summary ?? `Step ${event.data.event.state}`;
-						}
-						case "turn_completed": {
-							return "Finalizing response";
-						}
-						default: {
-							return undefined;
-						}
-					}
-				})();
+				const statusLine = toLiveActivityStatusLineFromEvent(event.data.event);
 				const activityPhase: "running" | "background" | "finalizing" = (() => {
 					if (event.data.event.type === "turn_completed") {
 						return "finalizing";
@@ -1033,8 +1167,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				};
 				const activityStatusLine = statusLine ?? toFallbackStatusLine(activityPhase);
 				updateRunningLiveActivity({
+					authoritative: true,
 					chatId,
 					phase: activityPhase,
+					preview: toLiveActivityPreviewFromTurn(nextTurn, event.data.event),
 					statusLine: activityStatusLine,
 				});
 				clearSendingForChat(event.data.chatId);
@@ -1120,8 +1256,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			if (event.event === "chat_updated") {
-				invalidateWorkspaceQuery(queryKeys.activeThreads);
-				const activeProjectId = selectedProjectIdRef.current;
+				const previousChatStatus = queryClient.getQueryData<ChatContextDTO>(queryKeys.chatContext(event.data.chatId))?.chat.status ?? null;
+					invalidateWorkspaceQuery(queryKeys.activeThreads);
+					const activeProjectId = selectedProjectIdRef.current;
 				if (activeProjectId && shouldEnableChatsQuery) {
 					invalidateWorkspaceQuery(queryKeys.chats(activeProjectId));
 				}
@@ -1146,14 +1283,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				if (event.data.status !== "running") {
 					clearSendingForChat(event.data.chatId);
 				}
-				const shouldTrackLiveActivity =
-					pendingCompletionNotificationChatIdsRef.current.has(event.data.chatId) ||
-					selectedChatIdRef.current === event.data.chatId;
-				if (event.data.status === "running" && shouldTrackLiveActivity) {
-					const runningStatus = isBackgroundAppState ? "Running in background" : "Running";
-					startRunningLiveActivity(event.data.chatId, {
-						statusLine: runningStatus,
-					});
+					const shouldTrackLiveActivity =
+						pendingCompletionNotificationChatIdsRef.current.has(event.data.chatId) ||
+						selectedChatIdRef.current === event.data.chatId;
+					if (event.data.status === "running" && shouldTrackLiveActivity && previousChatStatus !== "running") {
+						clearStructuredLiveActivityPreview(event.data.chatId);
+						const runningStatus = isBackgroundAppState ? "Running in background" : "Running";
+						startRunningLiveActivity(event.data.chatId, {
+							statusLine: runningStatus,
+						});
 					if (isBackgroundAppState) {
 						updateRunningLiveActivity({
 							chatId: event.data.chatId,
@@ -1317,10 +1455,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				}
 			}
 		},
-		[
-			client,
-			finishLiveActivity,
-			invalidateSelectedProjectGitQueries,
+			[
+				clearStructuredLiveActivityPreview,
+				client,
+				finishLiveActivity,
+				invalidateSelectedProjectGitQueries,
 			notifyMessageCompletion,
 			queryClient,
 			setSendingByChat,
@@ -1380,9 +1519,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			return;
 		}
 
+		void onThreadLiveActivityAppStateChanged(appStateRef.current);
+
 		const subscription = AppState.addEventListener("change", (nextState) => {
 			const previousState = appStateRef.current;
 			appStateRef.current = nextState;
+			void onThreadLiveActivityAppStateChanged(nextState);
 			const isReturningToForeground =
 				(previousState === "background" || previousState === "inactive") && nextState === "active";
 
@@ -1458,15 +1600,18 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			return await collectEvents(page.nextAfterId, nextEvents, nextLastEventId);
 		};
 
-		void (async () => {
-			try {
-				const { events, lastEventId } = await collectEvents(0, [], 0);
+			void (async () => {
+				try {
+					const { events, lastEventId } = await collectEvents(0, [], 0);
 
-				if (canceled) {
-					return;
-				}
+					if (canceled) {
+						return;
+					}
+						if (events.length > 0) {
+							structuredLiveActivityPreviewByChatRef.current[selectedChatId] = true;
+						}
 
-					const turns = replayAssistantEventsIntoTurns(events);
+						const turns = replayAssistantEventsIntoTurns(events);
 					lastAssistantEventIdByChatRef.current[selectedChatId] = lastEventId;
 				setStreamHistoryByChat((current) => ({
 					...current,
@@ -1788,17 +1933,18 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				...current,
 				[activeChatId]: true,
 			}));
-			pendingSendChatIdsRef.current.add(activeChatId);
-			pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
-			invalidateWorkspaceQuery(queryKeys.activeThreads);
-			if (!isThreadLiveActivityEnabled()) {
-				void ensureLocalNotificationPermission();
-			}
-			startRunningLiveActivity(activeChatId, {
-				chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
-				restart: true,
-				statusLine: "Running",
-			});
+				pendingSendChatIdsRef.current.add(activeChatId);
+				pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
+				invalidateWorkspaceQuery(queryKeys.activeThreads);
+				if (!isThreadLiveActivityEnabled()) {
+					void ensureLocalNotificationPermission();
+				}
+				clearStructuredLiveActivityPreview(activeChatId);
+				startRunningLiveActivity(activeChatId, {
+					chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
+					restart: true,
+					statusLine: "Running",
+				});
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {

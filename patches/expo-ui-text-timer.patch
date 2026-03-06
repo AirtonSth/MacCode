@@ -1,0 +1,53 @@
+--- a/node_modules/@expo/ui/ios/ProgressView.swift
++++ b/node_modules/@expo/ui/ios/ProgressView.swift
+@@ -3,9 +3,11 @@
+ import ExpoModulesCore
+ import SwiftUI
+ 
+-final class ClosedRangeDate: Record {
+-  @Field var lower: Date?
+-  @Field var upper: Date?
++public final class ClosedRangeDate: Record {
++  @Field public var lower: Date?
++  @Field public var upper: Date?
++
++  public init() {}
+ }
+ 
+ public final class ProgressViewProps: UIBaseViewProps {
+--- a/node_modules/@expo/ui/ios/TextView.swift
++++ b/node_modules/@expo/ui/ios/TextView.swift
+@@ -6,6 +6,10 @@
+ public final class TextViewProps: UIBaseViewProps {
+   @Field public var text: String = ""
+   @Field public var markdownEnabled: Bool = false
++  @Field public var timerInterval: ClosedRangeDate?
++  @Field public var pauseTime: Date?
++  @Field public var countsDown: Bool?
++  @Field public var showsHours: Bool?
+ 
+   // Override default frame alignment for text views
+   override var defaultFrameAlignment: Alignment { .leading }
+@@ -24,7 +28,21 @@
+   }
+ 
+   internal func buildText(applyModifiers: Bool = true) -> Text {
+-    let text = props.markdownEnabled ? Text(LocalizedStringKey(props.text)) : Text(props.text)
++    let text: Text
++    if let timerInterval = props.timerInterval,
++      let lower = timerInterval.lower,
++      let upper = timerInterval.upper,
++      lower <= upper,
++      #available(iOS 17.0, tvOS 17.0, *) {
++      text = Text(
++        timerInterval: ClosedRange(uncheckedBounds: (lower: lower, upper: upper)),
++        pauseTime: props.pauseTime,
++        countsDown: props.countsDown ?? false,
++        showsHours: props.showsHours ?? true
++      )
++    } else {
++      text = props.markdownEnabled ? Text(LocalizedStringKey(props.text)) : Text(props.text)
++    }
+     var result = applyModifiers
+     ? text.applyTextModifiers(props.modifiers, appContext: props.appContext)
+     : text

@@ -71,8 +71,7 @@ test("LiveActivityPushService aggressively sanitizes payload text and truncates 
 	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
 
 	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview.length).toBeLessThanOrEqual(30);
-	expect(endDelivery?.preview.endsWith("...")).toBe(true);
+	expect(endDelivery?.preview.length).toBeLessThanOrEqual(140);
 	expect(endDelivery?.preview).toMatch(ALLOWED_TEXT_PATTERN);
 	expect(endDelivery?.preview).not.toContain("{");
 	expect(endDelivery?.preview).not.toContain("}");
@@ -112,6 +111,203 @@ test("LiveActivityPushService keeps short previews unchanged", async () => {
 	expect(endDelivery?.preview.endsWith("...")).toBe(false);
 });
 
+test("LiveActivityPushService accumulates legacy deltas across multiple chunks", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-legacy",
+		chatTitle: "Thread",
+	});
+	service.onAssistantDelta("chat-legacy", "Hello");
+	service.onAssistantDelta("chat-legacy", " world");
+	await service.upsertSubscription({
+		chatId: "chat-legacy",
+		chatTitle: "Thread",
+		pushToken: "fcm-token-legacy",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-legacy",
+	});
+	await service.onChatFinished({
+		chatId: "chat-legacy",
+		outcome: "completed",
+	});
+
+	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+
+	expect(endDelivery).toBeDefined();
+	expect(endDelivery?.preview).toBe("Hello world");
+});
+
+test("LiveActivityPushService keeps structured fallback text when legacy deltas arrive before structured content", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-legacy-started",
+		chatTitle: "Thread",
+	});
+	service.onAssistantEvent("chat-legacy-started", {
+		type: "item_started",
+		turnId: "turn-1",
+		itemId: "item-1",
+		itemType: "assistant_message",
+	});
+	service.onAssistantDelta("chat-legacy-started", "Hello");
+	service.onAssistantDelta("chat-legacy-started", " world");
+	await service.upsertSubscription({
+		chatId: "chat-legacy-started",
+		chatTitle: "Thread",
+		pushToken: "fcm-token-legacy-started",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-legacy-started",
+	});
+	await service.onChatFinished({
+		chatId: "chat-legacy-started",
+		outcome: "completed",
+	});
+
+	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+
+	expect(endDelivery).toBeDefined();
+	expect(endDelivery?.preview).toBe("Writing response...");
+});
+
+test("LiveActivityPushService replaces event previews with the latest response text", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-4",
+		chatTitle: "Thread",
+	});
+	service.onAssistantEvent("chat-4", {
+		type: "item_completed",
+		turnId: "turn-1",
+		itemId: "item-1",
+		summary: "Tool finished successfully",
+	});
+	service.onAssistantEvent("chat-4", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-2",
+		target: "body",
+		delta: "Hello",
+	});
+	service.onAssistantEvent("chat-4", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-2",
+		target: "body",
+		delta: " world",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-4",
+		chatTitle: "Thread",
+		pushToken: "fcm-token-4",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-4",
+	});
+	await service.onChatFinished({
+		chatId: "chat-4",
+		outcome: "completed",
+	});
+
+	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+
+	expect(endDelivery).toBeDefined();
+	expect(endDelivery?.preview).toBe("Hello world");
+});
+
+test("LiveActivityPushService ignores duplicated legacy deltas once structured response events take over", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-5",
+		chatTitle: "Thread",
+	});
+	service.onAssistantEvent("chat-5", {
+		type: "item_started",
+		turnId: "turn-1",
+		itemId: "item-1",
+		itemType: "assistant_message",
+	});
+	service.onAssistantEvent("chat-5", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "body",
+		delta: "Hello",
+	});
+	service.onAssistantDelta("chat-5", "Hello");
+	service.onAssistantEvent("chat-5", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "body",
+		delta: " world",
+	});
+	service.onAssistantDelta("chat-5", " world");
+	await service.upsertSubscription({
+		chatId: "chat-5",
+		chatTitle: "Thread",
+		pushToken: "fcm-token-5",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-5",
+	});
+	await service.onChatFinished({
+		chatId: "chat-5",
+		outcome: "completed",
+	});
+
+	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+
+	expect(endDelivery).toBeDefined();
+	expect(endDelivery?.preview).toBe("Hello world");
+});
+
+test("LiveActivityPushService replaces summary preview text instead of appending it", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-summary",
+		chatTitle: "Thread",
+	});
+	service.onAssistantEvent("chat-summary", {
+		type: "item_started",
+		turnId: "turn-1",
+		itemId: "item-1",
+		itemType: "reasoning",
+	});
+	service.onAssistantEvent("chat-summary", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "summary",
+		delta: "Thinking...",
+	});
+	service.onAssistantEvent("chat-summary", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "summary",
+		delta: "Planning response...",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-summary",
+		chatTitle: "Thread",
+		pushToken: "fcm-token-summary",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-summary",
+	});
+	await service.onChatFinished({
+		chatId: "chat-summary",
+		outcome: "completed",
+	});
+
+	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+
+	expect(endDelivery).toBeDefined();
+	expect(endDelivery?.preview).toBe("Planning response...");
+});
+
 test("LiveActivityPushService stays stable with hostile mixed payloads", async () => {
 	const { deliveries, service } = createRecordingHarness();
 	const hostilePayload = [
@@ -143,7 +339,7 @@ test("LiveActivityPushService stays stable with hostile mixed payloads", async (
 	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
 
 	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview.length).toBeLessThanOrEqual(30);
+	expect(endDelivery?.preview.length).toBeLessThanOrEqual(140);
 	expect(endDelivery?.preview).toMatch(ALLOWED_TEXT_PATTERN);
 	expect(endDelivery?.preview).not.toContain("`");
 	expect(endDelivery?.preview).not.toContain("{");
