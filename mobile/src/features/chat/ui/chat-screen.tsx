@@ -165,6 +165,7 @@ export const ChatScreen = () => {
 		activeThreads,
 		availableModels,
 		createProject,
+		clearProjectChats: clearAllProjectChatsRaw,
 		deleteProject,
 		forceStopActiveChat,
 		hasOlderMessages,
@@ -203,6 +204,14 @@ export const ChatScreen = () => {
 		scope: "chat",
 		shouldLoadDrawerWorkspaces: isDrawerOpen,
 	});
+
+	const clearAllProjectChats = useCallback(
+		async (projectId: string): Promise<void> => {
+			const clear = clearAllProjectChatsRaw as (projectId: string) => Promise<void>;
+			await clear(projectId);
+		},
+		[clearAllProjectChatsRaw],
+	);
 	const [input, setInput] = useState<string>("");
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
 	const [activePicker, setActivePicker] = useState<ActivePicker | null>(null);
@@ -871,6 +880,15 @@ export const ChatScreen = () => {
 			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to delete workspace.");
 		}
 	};
+
+	const clearWorkspaceThreads = useCallback(async (project: (typeof projects)[number]) => {
+		try {
+			await clearAllProjectChats(project.id);
+			setDrawerWorkspaceError("");
+		} catch (error: unknown) {
+			setDrawerWorkspaceError(error instanceof Error ? error.message : "Failed to clear workspace threads.");
+		}
+	}, [clearAllProjectChats]);
 
 	const closeRenameWorkspaceModal = useCallback(() => {
 		if (isRenamingWorkspace) {
@@ -1908,6 +1926,19 @@ export const ChatScreen = () => {
 								setWorkspaceNameInput(drawerWorkspaceActionTarget.name);
 							},
 							testID: "drawer-workspace-rename",
+						},
+						{
+							icon: "delete-sweep",
+							key: "clear-all-threads-drawer-workspace",
+							label: "Clear all threads",
+							onPress: () => {
+								if (!drawerWorkspaceActionTarget) {
+									return;
+								}
+								void clearWorkspaceThreads(drawerWorkspaceActionTarget);
+							},
+							testID: "drawer-workspace-clear-all-threads",
+							tone: "destructive",
 						},
 						{
 							icon: "delete-outline",

@@ -1857,6 +1857,56 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		[clearLiveActivitySubscriptionState, client, persistSelection, queryClient, selectedProjectId],
 	);
 
+	const clearAllProjectChats = useCallback(
+		async (projectId: string) => {
+			const normalizedProjectId = projectId.trim();
+			if (!normalizedProjectId) {
+				return;
+			}
+
+			const threads = await client.listThreadSummaries(normalizedProjectId);
+			const threadIds = threads.map((thread) => thread.id).filter((threadId) => threadId.trim().length > 0);
+			let clearError: unknown = null;
+			const deleteResults = await Promise.allSettled(threads.map(async (thread) => { await deleteChat(thread.id); }));
+
+			for (const deleteResult of deleteResults) {
+				if (deleteResult.status === "rejected") {
+					const error = deleteResult.reason;
+					if (!(error instanceof RemoteCodeRequestError && error.status === 404)) {
+						clearError = error;
+					}
+				}
+			}
+
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.chats(normalizedProjectId),
+			});
+			threadIds.forEach((threadId) => {
+				queryClient.removeQueries({ queryKey: queryKeys.chatContext(threadId) });
+				queryClient.removeQueries({ queryKey: queryKeys.messages(threadId) });
+				queryClient.removeQueries({ queryKey: queryKeys.streamTurn(threadId) });
+			});
+
+			if (clearError) {
+				throw clearError;
+			}
+
+			if (selectedProjectIdRef.current === normalizedProjectId) {
+				setSelectedChatId(null);
+				persistSelection({
+					selectedChatId: null,
+					selectedProjectId: normalizedProjectId,
+				});
+			}
+		},
+		[
+			client,
+			deleteChat,
+			persistSelection,
+			queryClient,
+		],
+	);
+
 	const renameProject = useCallback(
 		async (projectId: string, name: string) => {
 			const normalizedName = name.trim();
@@ -2250,10 +2300,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		chats,
 		connectionState,
 		createChat,
-		createProject,
-		deleteProject,
-		deleteChat,
-		hasOlderMessages: shouldEnableMessagesQuery ? messagesQuery.hasOlderMessages : false,
+			createProject,
+			deleteProject,
+			deleteChat,
+			clearProjectChats: clearAllProjectChats,
+			clearAllProjectChats,
+			hasOlderMessages: shouldEnableMessagesQuery ? messagesQuery.hasOlderMessages : false,
 		isLoaded: !isProjectsLoading && hasSelectionSnapshot,
 		isLoadingOlderMessages: shouldEnableMessagesQuery ? messagesQuery.isLoadingOlderMessages : false,
 		isChatsLoading,

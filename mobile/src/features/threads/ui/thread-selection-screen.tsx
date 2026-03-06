@@ -48,6 +48,7 @@ export const ThreadSelectionScreen = () => {
 		chatsErrorMessage,
 		createChat,
 		deleteChat,
+		clearAllProjectChats,
 		isLoaded,
 		isActiveThreadsLoading,
 		isChatsLoading,
@@ -63,6 +64,7 @@ export const ThreadSelectionScreen = () => {
 	const [searchValue, setSearchValue] = useState<string>("");
 	const [isCreating, setIsCreating] = useState<boolean>(false);
 	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
+	const [isClearingAllThreads, setIsClearingAllThreads] = useState<boolean>(false);
 	const [optimisticDeletedThreadIds, setOptimisticDeletedThreadIds] = useState<Set<string>>(new Set());
 	const [toastMessage, setToastMessage] = useState<ToastPayload | null>(null);
 	const [threadActionTarget, setThreadActionTarget] = useState<(typeof chats)[number] | null>(null);
@@ -211,6 +213,40 @@ export const ThreadSelectionScreen = () => {
 		}
 	};
 
+	const clearAllThreads = useCallback(async () => {
+		if (!selectedProjectId) {
+			setErrorMessage("Select a workspace first.");
+			return;
+		}
+		if (chats.length === 0) {
+			showThreadToast({
+				message: "No thread to clear.",
+				type: "success",
+			});
+			return;
+		}
+
+		setIsClearingAllThreads(true);
+		setErrorMessage("");
+		try {
+			await clearAllProjectChats(selectedProjectId);
+			setOptimisticDeletedThreadIds(new Set());
+			showThreadToast({
+				message: "All threads cleared.",
+				type: "success",
+			});
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : "Failed to clear threads.";
+			setErrorMessage(message);
+			showThreadToast({
+				message,
+				type: "error",
+			});
+		} finally {
+			setIsClearingAllThreads(false);
+		}
+	}, [chats.length, clearAllProjectChats, selectedProjectId, showThreadToast]);
+
 	const markThreadDeleteOptimistic = useCallback((chatId: string) => {
 		setOptimisticDeletedThreadIds((current) => {
 			if (current.has(chatId)) {
@@ -262,6 +298,29 @@ export const ThreadSelectionScreen = () => {
 		>
 			<IosStackHeader
 				left={<MaterialIcons color={palette.text} name="chevron-left" size={24} />}
+				right={(
+					<Pressable
+						disabled={!selectedProjectId || chats.length === 0 || isClearingAllThreads}
+						hitSlop={8}
+						onPress={() => {
+							void clearAllThreads();
+						}}
+						style={({ pressed }) => [
+							styles.headerActionButton,
+							pressed ? styles.headerActionButtonPressed : null,
+							!selectedProjectId || chats.length === 0 || isClearingAllThreads
+								? styles.headerActionButtonDisabled
+								: null,
+						]}
+						testID="threads-clear-all-button"
+					>
+						{isClearingAllThreads ? (
+							<ActivityIndicator color={palette.text} size="small" />
+						) : (
+							<MaterialIcons color={palette.text} name="delete-sweep" size={20} />
+						)}
+					</Pressable>
+				)}
 				onBack={() => {
 					goBackOr("/workspaces");
 				}}
@@ -462,6 +521,20 @@ const styles = StyleSheet.create({
 	fabButtonPressed: {
 		backgroundColor: palette.accentPressed,
 		opacity: 0.93,
+	},
+	headerActionButton: {
+		alignItems: "center",
+		borderRadius: 8,
+		height: 32,
+		justifyContent: "center",
+		minWidth: 36,
+		paddingHorizontal: 8,
+	},
+	headerActionButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	headerActionButtonDisabled: {
+		opacity: 0.45,
 	},
 	disabledButton: {
 		opacity: 0.45,

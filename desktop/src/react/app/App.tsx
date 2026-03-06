@@ -2050,6 +2050,57 @@ const App = (): JSX.Element => {
 		],
 	);
 
+	const handleClearProjectThreads = useCallback(
+		async (projectId: string) => {
+			setOpenWorkspaceMenuProjectId(null);
+			const normalizedProjectId = projectId.trim();
+			if (normalizedProjectId.length === 0) {
+				return;
+			}
+
+			let deleteAllThreadsFailed = false;
+			let deletionError: unknown = null;
+			try {
+				const threads = await api.listThreadSummaries(normalizedProjectId);
+				for (const thread of threads) {
+					try {
+						await api.deleteChat(thread.id);
+					} catch (error) {
+						if (formatApiErrorCode(error) !== "HTTP_404") {
+							deleteAllThreadsFailed = true;
+							deletionError = error;
+						}
+					}
+				}
+
+				if (state.selectedProjectId === normalizedProjectId) {
+					await loadChatsForProject(normalizedProjectId, null);
+				}
+				clearRestErrors();
+			} catch (error) {
+				deleteAllThreadsFailed = true;
+				deletionError = error;
+			}
+
+			if (deleteAllThreadsFailed) {
+				addError(
+					formatApiErrorMessage(deletionError, "Unable to clear workspace threads"),
+					"rest",
+					formatApiErrorCode(deletionError),
+				);
+			}
+		},
+		[
+			addError,
+			api,
+			clearRestErrors,
+			formatApiErrorCode,
+			formatApiErrorMessage,
+			loadChatsForProject,
+			state.selectedProjectId,
+		],
+	);
+
 	const handleDeleteChat = useCallback(
 		async (chatId: string) => {
 			try {
@@ -2369,16 +2420,26 @@ const App = (): JSX.Element => {
 																	</Tooltip>
 																	{openWorkspaceMenuProjectId === project.id ? (
 																		<div className="absolute right-0 top-[calc(100%+4px)] z-30 min-w-[9.25rem] overflow-hidden rounded-md border border-white/15 bg-[#1a1f2a] py-1 shadow-[0_14px_30px_rgba(0,0,0,0.5)]">
-																			<button
-																				className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-slate-200 transition hover:bg-white/[0.06] hover:text-slate-100"
-																				onClick={(event) => {
-																					event.stopPropagation();
-																					void handleRenameProject(project);
-																				}}
-																				type="button"
-																			>
-																				Rename workspace
-																			</button>
+													<button
+														className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-rose-100 transition hover:bg-rose-500/12 hover:text-rose-50"
+														onClick={(event) => {
+															event.stopPropagation();
+															void handleClearProjectThreads(project.id);
+														}}
+														type="button"
+													>
+														Clear all threads
+													</button>
+													<button
+														className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-slate-200 transition hover:bg-white/[0.06] hover:text-slate-100"
+														onClick={(event) => {
+															event.stopPropagation();
+															void handleRenameProject(project);
+														}}
+														type="button"
+													>
+														Rename workspace
+													</button>
 																			<button
 																				className="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-rose-200 transition hover:bg-rose-500/12 hover:text-rose-100"
 																				onClick={(event) => {

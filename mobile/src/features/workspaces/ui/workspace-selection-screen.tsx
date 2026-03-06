@@ -45,6 +45,7 @@ export const WorkspaceSelectionScreen = () => {
 		activeThreads,
 		createProject,
 		deleteProject,
+		clearAllProjectChats,
 		isLoaded,
 		isActiveThreadsLoading,
 		isChatsLoading,
@@ -227,6 +228,17 @@ export const WorkspaceSelectionScreen = () => {
 		}
 	}, [renameProject, workspaceNameInput, workspaceToRename]);
 
+	const clearWorkspaceThreads = useCallback(
+		async (project: ProjectDTO) => {
+			try {
+				await clearAllProjectChats(project.id);
+			} catch (error: unknown) {
+				setErrorMessage(error instanceof Error ? error.message : "Failed to clear workspace threads.");
+			}
+		},
+		[clearAllProjectChats],
+	);
+
 	return (
 		<KeyboardAvoidingView
 			behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -342,9 +354,22 @@ export const WorkspaceSelectionScreen = () => {
 			<IosActionSheet
 				actions={[
 					{
+						icon: "delete-sweep",
+						key: "clear-all-threads",
+						label: "Clear all threads",
+						onPress: () => {
+							if (!workspaceActionTarget) {
+								return;
+							}
+							void clearWorkspaceThreads(workspaceActionTarget);
+						},
+						testID: "workspace-item-clear-all-threads",
+						tone: "destructive",
+					},
+					{
 						icon: "edit",
 						key: "rename-workspace",
-						label: "Rename",
+						label: "Rename Workspace",
 						onPress: () => {
 							if (!workspaceActionTarget) {
 								return;
@@ -357,7 +382,7 @@ export const WorkspaceSelectionScreen = () => {
 					{
 						icon: "delete-outline",
 						key: "delete-workspace",
-						label: "Delete",
+						label: "Delete Workspace",
 						onPress: () => {
 							if (!workspaceActionTarget) {
 								return;
