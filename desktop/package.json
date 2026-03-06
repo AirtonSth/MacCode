@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "description": "Electrobun app with React + Vite",
   "scripts": {
-    "start": "vite build && electrobun dev --watch",
+    "start": "vite build && electrobun dev",
     "build:vite": "vite build",
     "dev": "electrobun dev --watch",
-    "dev:hmr": "concurrently \"bun run hmr\" \"bun run start\"",
+    "start:hmr": "concurrently \"bun run hmr\" \"bun start\"",
+    "dev:hmr": "concurrently \"bun run hmr\" \"bun run dev\"",
     "hmr": "bun run scripts/hmr.mjs",
     "build:canary": "vite build && electrobun build --env=canary",
     "e2e:serve": "bunx vite e2e/frontend --host 127.0.0.1 --port 4173 --strictPort",

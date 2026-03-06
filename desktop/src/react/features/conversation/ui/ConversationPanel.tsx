@@ -56,7 +56,6 @@ export const ConversationPanel = ({
 	const [showRunDetails, setShowRunDetails] = useState(false);
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
-	const stickToBottomRef = useRef(true);
 	const bubbleMotion = shouldReduceMotion
 		? {}
 		: {
@@ -78,18 +77,29 @@ export const ConversationPanel = ({
 		},
 		[shouldReduceMotion],
 	);
-	const handleViewportScroll = useCallback(() => {
+	const updateIsAtBottom = useCallback(() => {
 		const viewport = scrollViewportRef.current;
 		if (!viewport) {
 			return;
 		}
 		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-		const nextIsAtBottom = distanceFromBottom <= 24;
-		stickToBottomRef.current = nextIsAtBottom;
-		setIsAtBottom(nextIsAtBottom);
+		setIsAtBottom(distanceFromBottom <= 24);
 	}, []);
+	const forceScrollToBottom = useCallback(() => {
+		scrollToBottom("auto");
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		window.requestAnimationFrame(() => {
+			scrollToBottom("auto");
+			updateIsAtBottom();
+		});
+	}, [scrollToBottom, updateIsAtBottom]);
+	const handleViewportScroll = useCallback(() => {
+		updateIsAtBottom();
+	}, [updateIsAtBottom]);
 	useEffect(() => {
-		stickToBottomRef.current = true;
 		setIsAtBottom(true);
 		setShowRunDetails(false);
 	}, [chat?.id]);
@@ -98,10 +108,8 @@ export const ConversationPanel = ({
 		if (!hasContent) {
 			return;
 		}
-		if (stickToBottomRef.current) {
-			scrollToBottom("auto");
-		}
-	}, [hasContent, historicalTurns, liveTurn, messages, scrollToBottom, streamingText]);
+		forceScrollToBottom();
+	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messages, streamingText]);
 	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
 	const markdownComponents: Components = {
 		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,

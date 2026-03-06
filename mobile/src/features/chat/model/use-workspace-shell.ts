@@ -1317,7 +1317,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			if (event.event === "error") {
-				setLastError(event.data.message);
+				if (!event.data.chatId || selectedChatIdRef.current === event.data.chatId) {
+					setLastError(event.data.message);
+				}
 				if (event.data.chatId) {
 					const chatId = event.data.chatId;
 					queryClient.setQueryData(queryKeys.streamTurn(chatId), null);
@@ -1548,6 +1550,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.chatContext(activeChatId),
+			});
 			void queryClient.invalidateQueries({
 				queryKey: queryKeys.messages(activeChatId),
 			});

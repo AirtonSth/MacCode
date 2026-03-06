@@ -163,8 +163,10 @@ const createStreamItem = (itemId: string, itemType: AssistantStreamItemType): St
 	startedAtMs: Date.now(),
 	finishedAtMs: null,
 	expandedByUser: false,
-	isExpanded: true,
+	isExpanded: false,
 });
+
+const shouldAutoExpandForState = (state: AssistantStreamItemState): boolean => state === "running";
 
 const cloneTurn = (turn: StreamTurnState): StreamTurnState => ({
 	...turn,
@@ -593,6 +595,9 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				if (streamEvent.summary !== undefined) {
 					item.summary = streamEvent.summary;
 				}
+				if (!item.expandedByUser) {
+					item.isExpanded = shouldAutoExpandForState(item.state);
+				}
 				turn.itemsById[streamEvent.itemId] = item;
 				nextStreamTurnsByChat[chatId] = turn;
 				nextStreamHistoryByChat[chatId] = upsertTurnHistory(nextStreamHistoryByChat[chatId], turn);
@@ -632,6 +637,9 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				if (streamEvent.state === "failed" || streamEvent.state === "cancelled") {
 					turn.status = "failed";
 				}
+				if (!item.expandedByUser) {
+					item.isExpanded = shouldAutoExpandForState(item.state);
+				}
 			}
 
 			if (streamEvent.type === "item_completed") {
@@ -643,6 +651,9 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				}
 				if (item.state === "failed" || item.state === "cancelled") {
 					turn.status = "failed";
+				}
+				if (!item.expandedByUser) {
+					item.isExpanded = shouldAutoExpandForState(item.state);
 				}
 			}
 
@@ -705,9 +716,24 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				isExpanded: action.payload.expanded,
 				expandedByUser: action.payload.byUser ? action.payload.expanded : currentItem.expandedByUser,
 			};
+			const nextHistory = (state.streamHistoryByChat[action.payload.chatId] ?? []).map((historyTurn) =>
+				historyTurn.turnId === turn.turnId
+					? {
+						...historyTurn,
+						itemsById: {
+							...historyTurn.itemsById,
+							[action.payload.itemId]: turn.itemsById[action.payload.itemId],
+						},
+					}
+					: historyTurn,
+			);
 
 			return {
 				...state,
+				streamHistoryByChat: {
+					...state.streamHistoryByChat,
+					[action.payload.chatId]: nextHistory,
+				},
 				streamTurnsByChat: {
 					...state.streamTurnsByChat,
 					[action.payload.chatId]: turn,
@@ -737,9 +763,24 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 						? currentItem.finishedAtMs ?? Date.now()
 						: currentItem.finishedAtMs,
 			};
+			const nextHistory = (state.streamHistoryByChat[action.payload.chatId] ?? []).map((historyTurn) =>
+				historyTurn.turnId === turn.turnId
+					? {
+						...historyTurn,
+						itemsById: {
+							...historyTurn.itemsById,
+							[action.payload.itemId]: turn.itemsById[action.payload.itemId],
+						},
+					}
+					: historyTurn,
+			);
 
 			return {
 				...state,
+				streamHistoryByChat: {
+					...state.streamHistoryByChat,
+					[action.payload.chatId]: nextHistory,
+				},
 				streamTurnsByChat: {
 					...state.streamTurnsByChat,
 					[action.payload.chatId]: turn,

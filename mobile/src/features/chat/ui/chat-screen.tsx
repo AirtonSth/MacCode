@@ -442,61 +442,102 @@ export const ChatScreen = () => {
 	}, [selectedChatId]);
 
 	useEffect(() => {
+		let canceled = false;
+
 		if (!isFocused) {
-			return;
+			return () => {
+				canceled = true;
+			};
 		}
 
 		if (!debugProjectId && !debugChatId) {
-			return;
+			return () => {
+				canceled = true;
+			};
 		}
 
 		const selectionSignature = `${debugProjectId ?? ""}:${debugChatId ?? ""}`;
 		if (debugSelectionSignatureRef.current === selectionSignature) {
-			return;
+			return () => {
+				canceled = true;
+			};
 		}
 
 		if (debugChatId) {
-			const resolvedProjectId = debugProjectId ?? selectedProjectId;
-			if (!resolvedProjectId) {
-				console.log("[live-activity-debug] chat selection skipped", {
+			void (async () => {
+				let resolvedProjectId = debugProjectId ?? selectedProjectId;
+				if (!resolvedProjectId) {
+					try {
+						const context = await api.getChatContext(debugChatId);
+						if (canceled) {
+							return;
+						}
+
+						resolvedProjectId = context.project.id;
+					} catch (error: unknown) {
+						if (canceled) {
+							return;
+						}
+
+						console.log("[live-activity-debug] chat selection lookup failed", {
+							chatId: debugChatId,
+							error: error instanceof Error ? error.message : "unknown-error",
+						});
+						return;
+					}
+				}
+
+				if (!resolvedProjectId) {
+					console.log("[live-activity-debug] chat selection skipped", {
+						chatId: debugChatId,
+						reason: "missing-project-id",
+					});
+					return;
+				}
+
+				if (selectedChatId === debugChatId && selectedProjectId === resolvedProjectId) {
+					debugSelectionSignatureRef.current = selectionSignature;
+					return;
+				}
+
+				console.log("[live-activity-debug] selecting chat from route", {
 					chatId: debugChatId,
-					reason: "missing-project-id",
+					projectId: resolvedProjectId,
 				});
-				return;
-			}
-
-			if (selectedChatId === debugChatId && selectedProjectId === resolvedProjectId) {
+				selectChatById({
+					chatId: debugChatId,
+					projectId: resolvedProjectId,
+				});
 				debugSelectionSignatureRef.current = selectionSignature;
-				return;
-			}
-
-			console.log("[live-activity-debug] selecting chat from route", {
-				chatId: debugChatId,
-				projectId: resolvedProjectId,
-			});
-			selectChatById({
-				chatId: debugChatId,
-				projectId: resolvedProjectId,
-			});
-			debugSelectionSignatureRef.current = selectionSignature;
-			return;
+			})();
+			return () => {
+				canceled = true;
+			};
 		}
 
 		if (!debugProjectId) {
-			return;
+			return () => {
+				canceled = true;
+			};
 		}
 
-		if (selectedProjectId === debugProjectId && selectedChatId === null) {
-			debugSelectionSignatureRef.current = selectionSignature;
-			return;
-		}
+			if (selectedProjectId === debugProjectId && selectedChatId === null) {
+				debugSelectionSignatureRef.current = selectionSignature;
+				return () => {
+					canceled = true;
+				};
+			}
 
 		console.log("[live-activity-debug] selecting project from route", {
 			projectId: debugProjectId,
 		});
 		selectProjectById(debugProjectId);
 		debugSelectionSignatureRef.current = selectionSignature;
+		return () => {
+			canceled = true;
+		};
 	}, [
+		api,
 		debugChatId,
 		debugProjectId,
 		isFocused,
