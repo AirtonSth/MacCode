@@ -2,6 +2,7 @@ import type { ChatDTO, ChatStreamSnapshotDTO, ServerWsEvent } from "../../types"
 import type { WorkspaceEventEnvelope } from "../../types";
 import { DEFAULT_CODEX_PERMISSION_MODE } from "../../../../shared/codex-permission-mode";
 import type { ChatRepository } from "../chat/chat.repository";
+import type { ChatTurnSnapshotRepositoryContract } from "../message/chat-turn-snapshot.repository";
 import {
 	type CodexProviderRunnerContract,
 	CodexProviderRunner,
@@ -17,6 +18,7 @@ import type {
 } from "../live-activity/live-activity-push.model";
 import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
+import { buildTurnSnapshotsFromEvents } from "./chat-turn-snapshot";
 import type {
 	StopRunningChatInput,
 	StopRunningChatResult,
@@ -49,7 +51,18 @@ const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
 		event,
 		turnId: event.turnId,
 	}),
+	clearByChatId: () => {
+		// no-op
+	},
+	listAllByChatId: () => [],
 	listByChatId: () => [],
+};
+
+const noopChatTurnSnapshotRepository: ChatTurnSnapshotRepositoryContract = {
+	listByAnchorMessageIds: () => [],
+	upsertByAnchorMessageId: () => {
+		// no-op
+	},
 };
 
 const noopLiveActivityPushService: LiveActivityPushServiceContract = {
@@ -82,6 +95,7 @@ export class WsService implements WsServiceContract {
 		private readonly chatStreamSnapshots: ChatStreamSnapshotRepositoryContract = noopChatStreamSnapshotRepository,
 		private readonly chatStreamEvents: ChatStreamEventRepositoryContract = noopChatStreamEventRepository,
 		private readonly liveActivityPushService: LiveActivityPushServiceContract = noopLiveActivityPushService,
+		private readonly chatTurnSnapshots: ChatTurnSnapshotRepositoryContract = noopChatTurnSnapshotRepository,
 	) {}
 
 	getLiveActivityPushIsEnabled(): boolean {
@@ -253,6 +267,16 @@ export class WsService implements WsServiceContract {
 		return this.chatStreamSnapshots.getByChatId(chatId);
 	}
 
+	private persistTurnSnapshots(chatId: string, anchorMessageId: string): void {
+		const events = this.chatStreamEvents.listAllByChatId(chatId);
+		if (events.length === 0) {
+			return;
+		}
+
+		const turns = buildTurnSnapshotsFromEvents(events);
+		this.chatTurnSnapshots.upsertByAnchorMessageId(chatId, anchorMessageId, turns);
+	}
+
 	async startUserMessage(input: WsServiceInput): Promise<void> {
 		const { chatId, clientId, emit, requestId, text } = input;
 		const chat = await this.chatRepository.findChatById(chatId);
@@ -337,6 +361,7 @@ export class WsService implements WsServiceContract {
 			},
 			event: "chat_updated",
 		});
+		this.chatStreamEvents.clearByChatId(chatId);
 		this.chatStreamSnapshots.reset(chatId);
 		this.startLiveActivity({
 			chatId,
@@ -388,6 +413,7 @@ export class WsService implements WsServiceContract {
 			}
 
 			if (providerResult.status === "failed") {
+				this.persistTurnSnapshots(chatId, userMessage.id);
 				await this.chatRepository.updateChat(chatId, {
 					diffAdded: providerResult.diffAdded,
 					diffRemoved: providerResult.diffRemoved,
@@ -415,6 +441,7 @@ export class WsService implements WsServiceContract {
 			}
 
 			const assistantMessage = await this.messageRepository.createMessage(chatId, "assistant", providerResult.assistantText);
+			this.persistTurnSnapshots(chatId, assistantMessage.id);
 			await this.chatRepository.updateChat(chatId, {
 				diffAdded: providerResult.diffAdded,
 				diffRemoved: providerResult.diffRemoved,
@@ -445,6 +472,7 @@ export class WsService implements WsServiceContract {
 				outcome: "completed",
 			});
 		} catch (error) {
+			this.persistTurnSnapshots(chatId, userMessage.id);
 			await this.chatRepository.updateChat(chatId, {
 				isActive: false,
 				status: "failed",
@@ -469,6 +497,7 @@ export class WsService implements WsServiceContract {
 		} finally {
 			this.runningChats.delete(chatId);
 			this.runningChatAbortControllers.delete(chatId);
+			this.chatStreamEvents.clearByChatId(chatId);
 			this.chatStreamSnapshots.clear(chatId);
 		}
 	}
@@ -478,7 +507,7 @@ export const createWsService = (repositories: {
 	chat: ChatRepository;
 	message: MessageRepository;
 	project: ProjectRepository;
-}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract, chatStreamEvents?: ChatStreamEventRepositoryContract, liveActivityPushService?: LiveActivityPushServiceContract) =>
+}, workspaceEvents?: WorkspaceEventsServiceContract, chatStreamSnapshots?: ChatStreamSnapshotRepositoryContract, chatStreamEvents?: ChatStreamEventRepositoryContract, liveActivityPushService?: LiveActivityPushServiceContract, chatTurnSnapshots?: ChatTurnSnapshotRepositoryContract) =>
 	new WsService(
 		repositories.chat,
 		repositories.message,
@@ -488,6 +517,7 @@ export const createWsService = (repositories: {
 		chatStreamSnapshots,
 		chatStreamEvents,
 		liveActivityPushService,
+		chatTurnSnapshots,
 	);
 
 export const { createClientErrorEvent } = WsService;

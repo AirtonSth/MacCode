@@ -1,5 +1,5 @@
-import { useInfiniteQuery, type InfiniteData } from "@tanstack/react-query";
-import { useCallback, useMemo } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo, useState } from "react";
 
 import { queryKeys } from "../../../shared/api/query-keys";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
@@ -11,6 +11,7 @@ const createEmptyPage = (): MessagePageDTO => ({
 	hasMore: false,
 	messages: [],
 	nextBeforeMessageId: null,
+	turns: [],
 });
 
 const isMessageRecord = (value: unknown): value is Record<string, unknown> => (
@@ -27,140 +28,152 @@ const isMessage = (value: unknown): value is MessageDTO => (
 	&& typeof value.content === "string"
 );
 
-const isMessageArray = (value: unknown): value is MessageDTO[] =>
-	Array.isArray(value) &&
-	value.every(isMessage);
+const sortMessagesAscending = (messages: MessageDTO[]): MessageDTO[] =>
+	Array.from(messages).sort((left, right) => {
+		if (left.createdAt < right.createdAt) {
+			return -1;
+		}
+		if (left.createdAt > right.createdAt) {
+			return 1;
+		}
+		return left.id.localeCompare(right.id);
+	});
 
-const normalizeInfiniteMessageData = (
-	data: InfiniteData<MessagePageDTO> | MessageDTO[] | undefined | null,
-): InfiniteData<MessagePageDTO> | undefined => {
-	if (!data) {
-		return undefined;
+const upsertMessage = (messages: MessageDTO[], message: MessageDTO): MessageDTO[] => {
+	const existingIndex = messages.findIndex((entry) => entry.id === message.id);
+	if (existingIndex === -1) {
+		return sortMessagesAscending([...messages, message]);
 	}
 
-	if (isMessageArray(data)) {
+	const nextMessages = Array.from(messages);
+	nextMessages[existingIndex] = message;
+	return sortMessagesAscending(nextMessages);
+};
+
+const trimMessagePage = (messages: MessageDTO[]): {
+	hasTrimmedOlderMessages: boolean;
+	messages: MessageDTO[];
+} => {
+	if (messages.length <= MESSAGE_PAGE_SIZE) {
 		return {
-			pageParams: [null],
-			pages: [{
-				...createEmptyPage(),
-				messages: data,
-			}],
+			hasTrimmedOlderMessages: false,
+			messages,
 		};
 	}
 
-	return (data.pages === undefined ? undefined : data);
+	return {
+		hasTrimmedOlderMessages: true,
+		messages: messages.slice(-MESSAGE_PAGE_SIZE),
+	};
 };
 
-export const flattenMessagePages = (data: InfiniteData<MessagePageDTO> | undefined): MessageDTO[] =>
-	(data?.pages ?? [])
-		.slice()
-		.reverse()
-		.flatMap((page) => page.messages);
+const normalizeMessagePage = (page: MessagePageDTO | MessageDTO[] | undefined | null): MessagePageDTO => {
+	if (!page) {
+		return createEmptyPage();
+	}
 
-export const appendMessageToMessagePages = (
-	data: InfiniteData<MessagePageDTO> | undefined,
+	if (Array.isArray(page) && page.every(isMessage)) {
+		return {
+			...createEmptyPage(),
+			messages: page,
+		};
+	}
+
+	return page;
+};
+
+export const appendMessageToMessagePage = (
+	page: MessagePageDTO | undefined,
 	message: MessageDTO,
-): InfiniteData<MessagePageDTO> => {
-	const normalizedData = normalizeInfiniteMessageData(data);
-
-	if (!normalizedData || normalizedData.pages.length === 0) {
-		return {
-			pageParams: [null],
-			pages: [{
-				...createEmptyPage(),
-				messages: [message],
-			}],
-		};
-	}
-
-	const pages = Array.from(normalizedData.pages);
-	const newestPage = pages[0] ?? createEmptyPage();
-	pages[0] = {
-		...newestPage,
-		messages: [...newestPage.messages, message],
-	};
+): MessagePageDTO => {
+	const normalizedPage = normalizeMessagePage(page);
+	const nextMessages = upsertMessage(normalizedPage.messages, message);
+	const trimmedPage = trimMessagePage(nextMessages);
+	const oldestVisibleMessageId = trimmedPage.messages[0]?.id ?? null;
 
 	return {
-		...normalizedData,
-		pages,
+		...normalizedPage,
+		hasMore: normalizedPage.hasMore || trimmedPage.hasTrimmedOlderMessages,
+		messages: trimmedPage.messages,
+		nextBeforeMessageId:
+			normalizedPage.hasMore || trimmedPage.hasTrimmedOlderMessages
+				? oldestVisibleMessageId
+				: normalizedPage.nextBeforeMessageId,
 	};
 };
 
-export const replaceNewestMessagePage = (
-	data: InfiniteData<MessagePageDTO> | undefined,
+export const replaceVisibleMessagePage = (
+	current: MessagePageDTO | undefined,
 	page: MessagePageDTO,
-): InfiniteData<MessagePageDTO> => {
-	const normalizedData = normalizeInfiniteMessageData(data);
-
-	if (!normalizedData || normalizedData.pages.length === 0) {
-		return {
-			pageParams: [null],
-			pages: [page],
-		};
-	}
-
-	const pages = [page, ...normalizedData.pages.slice(1)];
-	return {
-		...normalizedData,
-		pages,
-	};
-};
+): MessagePageDTO => normalizeMessagePage(page);
 
 export const useMessagesQuery = (chatId: string | null, options?: { enabled?: boolean }) => {
 	const client = useRemoteCodeClient();
+	const queryClient = useQueryClient();
 	const enabled = options?.enabled ?? true;
+	const [pageLoadKind, setPageLoadKind] = useState<"latest" | "older" | null>(null);
 
-	const query = useInfiniteQuery<MessagePageDTO, Error, InfiniteData<MessagePageDTO>, ReturnType<typeof queryKeys.messages>, string | null>({
+	const query = useQuery<MessagePageDTO>({
 		enabled: Boolean(chatId) && enabled,
-		getNextPageParam: (lastPage) => (
-			lastPage.hasMore && typeof lastPage.nextBeforeMessageId === "string"
-				? lastPage.nextBeforeMessageId
-				: undefined
-		),
-		initialPageParam: null,
-		queryFn: async ({ pageParam }) => {
+		initialData: createEmptyPage(),
+		queryFn: async () => {
 			if (!chatId) {
-				return {
-					hasMore: false,
-					messages: [],
-					nextBeforeMessageId: null,
-				};
+				return createEmptyPage();
 			}
 
 			return await client.listMessagesPage(chatId, {
-				beforeMessageId: pageParam ?? undefined,
 				limit: MESSAGE_PAGE_SIZE,
 			});
 		},
 		queryKey: queryKeys.messages(chatId),
-		select: (data) => normalizeInfiniteMessageData(data) ?? {
-			pageParams: [null],
-			pages: [createEmptyPage()],
-		},
 	});
 
-	const messages = useMemo(
-		() => flattenMessagePages(query.data),
+	const page = useMemo(
+		() => normalizeMessagePage(query.data),
 		[query.data],
 	);
-	const {
-		fetchNextPage,
-		hasNextPage,
-		isFetchingNextPage,
-	} = query;
+
 	const loadOlderMessages = useCallback(async (): Promise<void> => {
-		if (!hasNextPage || isFetchingNextPage) {
+		if (!chatId || !page.hasMore || !page.nextBeforeMessageId || pageLoadKind) {
 			return;
 		}
 
-		await fetchNextPage();
-	}, [fetchNextPage, hasNextPage, isFetchingNextPage]);
+		setPageLoadKind("older");
+		try {
+			const olderPage = await client.listMessagesPage(chatId, {
+				beforeMessageId: page.nextBeforeMessageId,
+				limit: MESSAGE_PAGE_SIZE,
+			});
+			queryClient.setQueryData<MessagePageDTO>(queryKeys.messages(chatId), olderPage);
+		} finally {
+			setPageLoadKind(null);
+		}
+	}, [chatId, client, page.hasMore, page.nextBeforeMessageId, pageLoadKind, queryClient]);
+
+	const loadLatestMessages = useCallback(async (): Promise<void> => {
+		if (!chatId || pageLoadKind) {
+			return;
+		}
+
+		setPageLoadKind("latest");
+		try {
+			const latestPage = await client.listMessagesPage(chatId, {
+				limit: MESSAGE_PAGE_SIZE,
+			});
+			queryClient.setQueryData<MessagePageDTO>(queryKeys.messages(chatId), latestPage);
+		} finally {
+			setPageLoadKind(null);
+		}
+	}, [chatId, client, pageLoadKind, queryClient]);
 
 	return {
 		...query,
-		hasOlderMessages: Boolean(hasNextPage),
-		isLoadingOlderMessages: isFetchingNextPage,
+		hasOlderMessages: page.hasMore,
+		isLoadingLatestMessages: pageLoadKind === "latest",
+		isLoadingOlderMessages: pageLoadKind === "older",
+		loadLatestMessages,
 		loadOlderMessages,
-		messages,
+		messages: page.messages,
+		page,
 	};
 };

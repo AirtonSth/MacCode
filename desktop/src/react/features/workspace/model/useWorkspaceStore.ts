@@ -70,6 +70,16 @@ export interface StreamTurnState {
 	finishedAtMs: number | null;
 }
 
+export interface MessageWindowState {
+	chatId: string | null;
+	messages: MessageDTO[];
+	hasMore: boolean;
+	nextBeforeMessageId: string | null;
+	turns: StreamTurnState[];
+	mode: "latest" | "older";
+	latestDirty: boolean;
+}
+
 export interface WorkspaceState {
 	baseUrl: string;
 	token: string;
@@ -77,7 +87,7 @@ export interface WorkspaceState {
 	selectedProjectId: string | null;
 	chats: ChatDTO[];
 	selectedChatId: string | null;
-	messages: MessageDTO[];
+	messageWindow: MessageWindowState;
 	streamingByChat: Record<string, string>;
 	streamingActiveByChat: Record<string, boolean>;
 	streamTurnsByChat: Record<string, StreamTurnState | undefined>;
@@ -110,9 +120,21 @@ export type WorkspaceAction =
 	| { type: "REMOVE_CHAT"; payload: { chatId: string; nextSelectedChatId: string | null } }
 	| { type: "SET_SELECTED_CHAT"; payload: string | null }
 	| { type: "RESET_SELECTED_CHAT" }
-	| { type: "SET_MESSAGES_LOADING"; payload: boolean }
-	| { type: "SET_MESSAGES"; payload: MessageDTO[] }
-	| { type: "APPEND_MESSAGE"; payload: MessageDTO }
+	| { type: "SET_MESSAGE_WINDOW_LOADING"; payload: boolean }
+	| {
+			type: "SET_MESSAGE_WINDOW";
+			payload: {
+				chatId: string | null;
+				hasMore: boolean;
+				latestDirty?: boolean;
+				messages: MessageDTO[];
+				mode: "latest" | "older";
+				nextBeforeMessageId: string | null;
+				turns: StreamTurnState[];
+			};
+	  }
+	| { type: "UPSERT_MESSAGE_IN_WINDOW"; payload: { chatId: string; message: MessageDTO } }
+	| { type: "MARK_LATEST_WINDOW_DIRTY"; payload: { chatId: string; dirty: boolean } }
 	| { type: "START_STREAMING"; payload: { chatId: string } }
 	| { type: "APPEND_STREAMING"; payload: { chatId: string; delta: string } }
 	| { type: "SET_STREAMING_SNAPSHOT"; payload: { chatId: string; text: string } }
@@ -244,6 +266,60 @@ const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
 	};
 };
 
+const MESSAGE_WINDOW_PAGE_SIZE = 5;
+
+const createEmptyMessageWindow = (chatId: string | null = null): MessageWindowState => ({
+	chatId,
+	messages: [],
+	hasMore: false,
+	nextBeforeMessageId: null,
+	turns: [],
+	mode: "latest",
+	latestDirty: false,
+});
+
+const normalizeTurnHistory = (turns: StreamTurnState[]): StreamTurnState[] =>
+	turns.map((turn) => (turn.status === "running" ? turn : collapseTurnItems(turn)));
+
+const sortMessagesAscending = (messages: MessageDTO[]): MessageDTO[] =>
+	[...messages].sort((left, right) => {
+		if (left.createdAt < right.createdAt) {
+			return -1;
+		}
+		if (left.createdAt > right.createdAt) {
+			return 1;
+		}
+		return left.id.localeCompare(right.id);
+	});
+
+const upsertMessageInList = (messages: MessageDTO[], message: MessageDTO): MessageDTO[] => {
+	const existingIndex = messages.findIndex((entry) => entry.id === message.id);
+	if (existingIndex === -1) {
+		return sortMessagesAscending([...messages, message]);
+	}
+
+	const nextMessages = [...messages];
+	nextMessages[existingIndex] = message;
+	return sortMessagesAscending(nextMessages);
+};
+
+const trimMessageWindow = (messages: MessageDTO[]): {
+	hasTrimmedOlderMessages: boolean;
+	messages: MessageDTO[];
+} => {
+	if (messages.length <= MESSAGE_WINDOW_PAGE_SIZE) {
+		return {
+			hasTrimmedOlderMessages: false,
+			messages,
+		};
+	}
+
+	return {
+		hasTrimmedOlderMessages: true,
+		messages: messages.slice(-MESSAGE_WINDOW_PAGE_SIZE),
+	};
+};
+
 const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): WorkspaceState => {
 	switch (action.type) {
 		case "BOOTSTRAP_CONFIG":
@@ -296,7 +372,7 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 					selectedProjectId: null,
 					chats: [],
 					selectedChatId: null,
-					messages: [],
+					messageWindow: createEmptyMessageWindow(),
 					streamingByChat: {},
 					streamingActiveByChat: {},
 					streamTurnsByChat: {},
@@ -315,7 +391,7 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				selectedProjectId: action.payload,
 				chats: [],
 				selectedChatId: null,
-				messages: [],
+				messageWindow: createEmptyMessageWindow(),
 				streamingByChat: {},
 				streamingActiveByChat: {},
 				streamTurnsByChat: {},
@@ -330,7 +406,7 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				selectedProjectId: null,
 				chats: [],
 				selectedChatId: null,
-				messages: [],
+				messageWindow: createEmptyMessageWindow(),
 				streamingByChat: {},
 				streamingActiveByChat: {},
 				streamTurnsByChat: {},
@@ -352,7 +428,7 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				chats: sortedChats,
 				chatsLoading: false,
 				selectedChatId: sortedChats[0]?.id ?? null,
-				messages: [],
+				messageWindow: createEmptyMessageWindow(sortedChats[0]?.id ?? null),
 			};
 		}
 
@@ -364,7 +440,7 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 					action.payload,
 				]),
 				selectedChatId: action.payload.id,
-				messages: [],
+				messageWindow: createEmptyMessageWindow(action.payload.id),
 			};
 
 		case "UPDATE_CHAT":
@@ -395,7 +471,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				...state,
 				chats: state.chats.filter((chat) => chat.id !== action.payload.chatId),
 				selectedChatId: action.payload.nextSelectedChatId,
-				messages: state.selectedChatId === action.payload.chatId ? [] : state.messages,
+				messageWindow:
+					state.selectedChatId === action.payload.chatId
+						? createEmptyMessageWindow(action.payload.nextSelectedChatId)
+						: state.messageWindow,
 				streamingByChat: nextStreamingByChat,
 				streamingActiveByChat: nextStreamingActiveByChat,
 				streamTurnsByChat: nextStreamTurnsByChat,
@@ -410,20 +489,20 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 			return {
 				...state,
 				selectedChatId: action.payload,
-				messages: [],
-				streamingActiveByChat: {
-					...state.streamingActiveByChat,
-					...(!action.payload
-						? {}
-						: { [action.payload]: state.streamingActiveByChat[action.payload] ?? false }),
-				},
+				messageWindow: createEmptyMessageWindow(action.payload),
+				streamingByChat: {},
+				streamingActiveByChat: action.payload ? { [action.payload]: false } : {},
+				streamTurnsByChat: {},
+				streamHistoryByChat: {},
+				lastAssistantEventIdByChat: {},
+				sendingByChat: {},
 			};
 
 		case "RESET_SELECTED_CHAT":
 			return {
 				...state,
 				selectedChatId: null,
-				messages: [],
+				messageWindow: createEmptyMessageWindow(),
 				streamingByChat: {},
 				streamingActiveByChat: {},
 				streamTurnsByChat: {},
@@ -432,18 +511,35 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				sendingByChat: {},
 			};
 
-		case "SET_MESSAGES_LOADING":
+		case "SET_MESSAGE_WINDOW_LOADING":
 			return {
 				...state,
 				messagesLoading: action.payload,
 			};
 
-		case "SET_MESSAGES":
+		case "SET_MESSAGE_WINDOW": {
+			const turns = normalizeTurnHistory(action.payload.turns);
 			return {
 				...state,
-				messages: action.payload,
+				messageWindow: {
+					chatId: action.payload.chatId,
+					hasMore: action.payload.hasMore,
+					latestDirty: action.payload.latestDirty ?? false,
+					messages: action.payload.messages,
+					mode: action.payload.mode,
+					nextBeforeMessageId: action.payload.nextBeforeMessageId,
+					turns,
+				},
 				messagesLoading: false,
+				streamHistoryByChat: action.payload.chatId ? { [action.payload.chatId]: turns } : {},
+				streamTurnsByChat: action.payload.chatId
+					? { [action.payload.chatId]: turns.at(-1)?.status === "running" ? turns.at(-1) : undefined }
+					: {},
+				lastAssistantEventIdByChat: action.payload.chatId
+					? { [action.payload.chatId]: state.lastAssistantEventIdByChat[action.payload.chatId] ?? 0 }
+					: {},
 			};
+		}
 
 		case "START_STREAMING":
 			return {
@@ -458,10 +554,56 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				},
 			};
 
-		case "APPEND_MESSAGE":
+		case "UPSERT_MESSAGE_IN_WINDOW": {
+			if (
+				state.selectedChatId !== action.payload.chatId ||
+				state.messageWindow.chatId !== action.payload.chatId
+			) {
+				return state;
+			}
+
+			if (state.messageWindow.mode !== "latest") {
+				return {
+					...state,
+					messageWindow: {
+						...state.messageWindow,
+						latestDirty: true,
+					},
+				};
+			}
+
+			const nextMessages = upsertMessageInList(state.messageWindow.messages, action.payload.message);
+			const trimmedWindow = trimMessageWindow(nextMessages);
+			const oldestVisibleMessageId = trimmedWindow.messages[0]?.id ?? null;
 			return {
 				...state,
-				messages: [...state.messages, action.payload],
+				messageWindow: {
+					...state.messageWindow,
+					hasMore: state.messageWindow.hasMore || trimmedWindow.hasTrimmedOlderMessages,
+					latestDirty: false,
+					messages: trimmedWindow.messages,
+					nextBeforeMessageId:
+						state.messageWindow.hasMore || trimmedWindow.hasTrimmedOlderMessages
+							? oldestVisibleMessageId
+							: state.messageWindow.nextBeforeMessageId,
+				},
+			};
+		}
+
+		case "MARK_LATEST_WINDOW_DIRTY":
+			if (
+				state.selectedChatId !== action.payload.chatId ||
+				state.messageWindow.chatId !== action.payload.chatId
+			) {
+				return state;
+			}
+
+			return {
+				...state,
+				messageWindow: {
+					...state.messageWindow,
+					latestDirty: action.payload.dirty,
+				},
 			};
 
 		case "APPEND_STREAMING":
@@ -532,6 +674,20 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 
 		case "APPLY_ASSISTANT_EVENT": {
 			const chatId = action.payload.chatId;
+			if (state.selectedChatId !== chatId || state.messageWindow.chatId !== chatId) {
+				return state;
+			}
+
+			if (state.messageWindow.mode !== "latest") {
+				return {
+					...state,
+					messageWindow: {
+						...state.messageWindow,
+						latestDirty: true,
+					},
+				};
+			}
+
 			const streamEvent = action.payload.event;
 			const incomingEventId = action.payload.eventId;
 			const lastAppliedEventId = state.lastAssistantEventIdByChat[chatId] ?? 0;
@@ -554,6 +710,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 
 				return {
 					...state,
+					messageWindow: {
+						...state.messageWindow,
+						turns: nextStreamHistoryByChat[chatId] ?? state.messageWindow.turns,
+					},
 					streamTurnsByChat: nextStreamTurnsByChat,
 					streamHistoryByChat: nextStreamHistoryByChat,
 					streamingActiveByChat: nextStreamingActiveByChat,
@@ -578,6 +738,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 
 				return {
 					...state,
+					messageWindow: {
+						...state.messageWindow,
+						turns: nextStreamHistoryByChat[chatId] ?? state.messageWindow.turns,
+					},
 					streamTurnsByChat: nextStreamTurnsByChat,
 					streamHistoryByChat: nextStreamHistoryByChat,
 					streamingActiveByChat: nextStreamingActiveByChat,
@@ -603,6 +767,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 				nextStreamHistoryByChat[chatId] = upsertTurnHistory(nextStreamHistoryByChat[chatId], turn);
 				return {
 					...state,
+					messageWindow: {
+						...state.messageWindow,
+						turns: nextStreamHistoryByChat[chatId] ?? state.messageWindow.turns,
+					},
 					streamTurnsByChat: nextStreamTurnsByChat,
 					streamHistoryByChat: nextStreamHistoryByChat,
 					streamingActiveByChat: nextStreamingActiveByChat,
@@ -672,6 +840,10 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 
 			return {
 				...state,
+				messageWindow: {
+					...state.messageWindow,
+					turns: nextStreamHistoryByChat[chatId] ?? state.messageWindow.turns,
+				},
 				streamTurnsByChat: nextStreamTurnsByChat,
 				streamHistoryByChat: nextStreamHistoryByChat,
 				streamingActiveByChat: nextStreamingActiveByChat,
@@ -680,18 +852,23 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 		}
 
 		case "SET_STREAM_HISTORY":
-			const normalizedTurns = action.payload.turns.map((turn) =>
-				turn.status === "running" ? turn : collapseTurnItems(turn),
-			);
+			const normalizedTurns = normalizeTurnHistory(action.payload.turns);
 			return {
 				...state,
+				messageWindow:
+					state.messageWindow.chatId === action.payload.chatId
+						? {
+							...state.messageWindow,
+							turns: normalizedTurns,
+						}
+						: state.messageWindow,
 				streamHistoryByChat: {
 					...state.streamHistoryByChat,
 					[action.payload.chatId]: normalizedTurns,
 				},
 				streamTurnsByChat: {
 					...state.streamTurnsByChat,
-					[action.payload.chatId]: normalizedTurns.at(-1),
+					[action.payload.chatId]: normalizedTurns.at(-1)?.status === "running" ? normalizedTurns.at(-1) : undefined,
 				},
 				lastAssistantEventIdByChat: {
 					...state.lastAssistantEventIdByChat,
@@ -730,6 +907,13 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 
 			return {
 				...state,
+				messageWindow:
+					state.messageWindow.chatId === action.payload.chatId
+						? {
+							...state.messageWindow,
+							turns: nextHistory,
+						}
+						: state.messageWindow,
 				streamHistoryByChat: {
 					...state.streamHistoryByChat,
 					[action.payload.chatId]: nextHistory,
@@ -777,6 +961,13 @@ const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): Works
 
 			return {
 				...state,
+				messageWindow:
+					state.messageWindow.chatId === action.payload.chatId
+						? {
+							...state.messageWindow,
+							turns: nextHistory,
+						}
+						: state.messageWindow,
 				streamHistoryByChat: {
 					...state.streamHistoryByChat,
 					[action.payload.chatId]: nextHistory,
@@ -905,7 +1096,7 @@ export const useWorkspaceStore = () => {
 		selectedProjectId: null,
 		chats: [],
 		selectedChatId: null,
-		messages: [],
+		messageWindow: createEmptyMessageWindow(),
 		streamingByChat: {},
 		streamingActiveByChat: {},
 		streamTurnsByChat: {},

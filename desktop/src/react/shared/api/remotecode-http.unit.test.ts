@@ -190,6 +190,83 @@ test("RemoteCodeApi returns chat context from GET /v1/chats/:id/context", async 
 	}
 });
 
+test("RemoteCodeApi requests paged chat messages with the mobile-aligned query string and headers", async () => {
+	let method = "";
+	let path = "";
+	let search = "";
+	let headers: HeadersInit | undefined;
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		search = url.search;
+		headers = init?.headers;
+		return jsonResponse({
+			data: {
+				hasMore: true,
+				messages: [],
+				nextBeforeMessageId: "message-08",
+				turns: [],
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001/",
+			token: "unit-token",
+		});
+		await client.listMessagesPage("chat-1", {
+			limit: 5,
+		});
+
+		const normalizedHeaders = new Headers(headers);
+		expect(method).toBe("GET");
+		expect(path).toBe("/v1/chats/chat-1/messages");
+		expect(search).toBe("?limit=5");
+		expect(normalizedHeaders.get("authorization")).toBe("Bearer unit-token");
+		expect(normalizedHeaders.get("accept-encoding")).toBe("gzip");
+		expect(normalizedHeaders.get("x-remotecode-client-id")).toBeTruthy();
+		expect(normalizedHeaders.get("x-remotecode-request-id")).toBeTruthy();
+	} finally {
+		restore();
+	}
+});
+
+test("RemoteCodeApi requests chat stream catch-up with bounded afterId and limit", async () => {
+	let method = "";
+	let path = "";
+	let search = "";
+	const restore = createMockFetch((url, init) => {
+		method = (init?.method ?? "GET").toUpperCase();
+		path = url.pathname;
+		search = url.search;
+		return jsonResponse({
+			data: {
+				events: [],
+				hasMore: false,
+				nextAfterId: null,
+			},
+		});
+	});
+
+	try {
+		const client = RemoteCodeApi.createClient({
+			baseUrl: "http://127.0.0.1:3001/",
+			token: "unit-token",
+		});
+		await client.listChatStreamEvents("chat-1", {
+			afterId: 0,
+			limit: 500,
+		});
+
+		expect(method).toBe("GET");
+		expect(path).toBe("/v1/chats/chat-1/stream-events");
+		expect(search).toBe("?limit=500");
+	} finally {
+		restore();
+	}
+});
+
 test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", async () => {
 	let receivedBody = "";
 	let method = "";

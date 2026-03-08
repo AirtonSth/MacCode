@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { RemoteCodeApi } from "../../../shared/api/remotecode-http";
+import type { MessagePageDTO } from "../../../shared/api/remotecode-http";
 import {
 	RemoteCodeRealtime,
 	type ConnectionState,
@@ -28,6 +29,10 @@ type RuntimeRoutes = {
 	createProject: (input: { name?: string; path: string }) => ProjectDTO;
 	createChat: (projectId: string, input: { title?: string }) => RuntimeChat;
 	listMessages: (chatId: string) => MessageDTO[];
+	listMessagesPage?: (
+		chatId: string,
+		options: { beforeMessageId?: string; limit?: number },
+	) => MessagePageDTO;
 	listChats?: (projectId: string) => RuntimeChat[];
 	getWorkspaceSelection?: () => { selectedChatId: string | null; selectedProjectId: string | null };
 	updateWorkspaceSelection?: (
@@ -125,7 +130,21 @@ const setupMockFetch = (routes: RuntimeRoutes) => {
 		const listMessagesMatch = /^\/v1\/chats\/([^/]+)\/messages$/.exec(path);
 		if (method === "GET" && listMessagesMatch) {
 			const chatId = listMessagesMatch[1];
-			return json({ messages: routes.listMessages(chatId) });
+			const beforeMessageId = url.searchParams.get("beforeMessageId") ?? undefined;
+			const limitValue = url.searchParams.get("limit");
+			const limit = typeof limitValue === "string" && limitValue.length > 0
+				? Number.parseInt(limitValue, 10)
+				: undefined;
+			const page = routes.listMessagesPage?.(chatId, { beforeMessageId, limit });
+			if (page) {
+				return json(page);
+			}
+			return json({
+				hasMore: false,
+				messages: routes.listMessages(chatId),
+				nextBeforeMessageId: null,
+				turns: [],
+			});
 		}
 
 		return json({ error: "route not mocked" }, 501);
@@ -219,7 +238,15 @@ const createInitialWorkspaceState = (): WorkspaceState => ({
 	selectedProjectId: null,
 	chats: [],
 	selectedChatId: null,
-	messages: [],
+	messageWindow: {
+		chatId: null,
+		hasMore: false,
+		latestDirty: false,
+		messages: [],
+		mode: "latest",
+		nextBeforeMessageId: null,
+		turns: [],
+	},
 	streamingByChat: {},
 	streamingActiveByChat: {},
 	streamTurnsByChat: {},
@@ -273,7 +300,7 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 						selectedProjectId: null,
 						chats: [],
 						selectedChatId: null,
-						messages: [],
+						messageWindow: createInitialWorkspaceState().messageWindow,
 						streamingByChat: {},
 						streamingActiveByChat: {},
 						streamTurnsByChat: {},
@@ -290,7 +317,7 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 					selectedProjectId: action.payload,
 					chats: [],
 					selectedChatId: null,
-					messages: [],
+					messageWindow: createInitialWorkspaceState().messageWindow,
 					streamingByChat: {},
 					streamingActiveByChat: {},
 					streamTurnsByChat: {},
@@ -304,7 +331,10 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 				chats: action.payload,
 				chatsLoading: false,
 				selectedChatId: action.payload[0]?.id ?? null,
-				messages: [],
+				messageWindow: {
+					...createInitialWorkspaceState().messageWindow,
+					chatId: action.payload[0]?.id ?? null,
+				},
 			};
 		case "UPSERT_CHAT":
 			return {
@@ -314,7 +344,10 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 					action.payload,
 				].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : a.updatedAt < b.updatedAt ? 1 : 0)),
 				selectedChatId: action.payload.id,
-				messages: [],
+				messageWindow: {
+					...createInitialWorkspaceState().messageWindow,
+					chatId: action.payload.id,
+				},
 			};
 		case "UPDATE_CHAT":
 			return {
@@ -327,26 +360,41 @@ const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slic
 			return {
 				...state,
 				selectedChatId: action.payload,
-				messages: [],
+				messageWindow: {
+					...createInitialWorkspaceState().messageWindow,
+					chatId: action.payload,
+				},
 				streamingActiveByChat: {
 					...state.streamingActiveByChat,
 					...(!action.payload ? {} : { [action.payload]: state.streamingActiveByChat[action.payload] ?? false }),
 				},
 			};
-		case "SET_MESSAGES_LOADING":
+		case "SET_MESSAGE_WINDOW_LOADING":
 			return {
 				...state,
 				messagesLoading: action.payload,
 			};
-		case "SET_MESSAGES":
+		case "SET_MESSAGE_WINDOW":
 			return {
 				...state,
-				messages: action.payload,
+				messageWindow: {
+					chatId: action.payload.chatId,
+					hasMore: action.payload.hasMore,
+					latestDirty: action.payload.latestDirty ?? false,
+					messages: action.payload.messages,
+					mode: action.payload.mode,
+					nextBeforeMessageId: action.payload.nextBeforeMessageId,
+					turns: action.payload.turns,
+				},
 			};
-		case "APPEND_MESSAGE":
+		case "UPSERT_MESSAGE_IN_WINDOW":
 			return {
 				...state,
-				messages: [...state.messages, action.payload],
+				messageWindow: {
+					...state.messageWindow,
+					chatId: action.payload.chatId,
+					messages: [...state.messageWindow.messages, action.payload.message],
+				},
 			};
 		case "APPEND_STREAMING":
 			return {
@@ -460,19 +508,39 @@ const createWorkspaceFlowHarness = () => {
 
 	const loadMessagesForChat = async (chatId: string | null) => {
 		if (!chatId) {
-			dispatch({ type: "SET_MESSAGES", payload: [] });
-			dispatch({ type: "SET_MESSAGES_LOADING", payload: false });
+			dispatch({
+				type: "SET_MESSAGE_WINDOW",
+				payload: {
+					chatId: null,
+					hasMore: false,
+					messages: [],
+					mode: "latest",
+					nextBeforeMessageId: null,
+					turns: [],
+				},
+			});
+			dispatch({ type: "SET_MESSAGE_WINDOW_LOADING", payload: false });
 			return;
 		}
 
-		dispatch({ type: "SET_MESSAGES_LOADING", payload: true });
+		dispatch({ type: "SET_MESSAGE_WINDOW_LOADING", payload: true });
 		try {
-			const messages = await api.listMessages(chatId);
-			dispatch({ type: "SET_MESSAGES", payload: messages });
+			const messagePage = await api.listMessagesPage(chatId, { limit: 5 });
+			dispatch({
+				type: "SET_MESSAGE_WINDOW",
+				payload: {
+					chatId,
+					hasMore: messagePage.hasMore,
+					messages: messagePage.messages,
+					mode: "latest",
+					nextBeforeMessageId: messagePage.nextBeforeMessageId,
+					turns: messagePage.turns,
+				},
+			});
 		} catch {
 			addError("Unable to fetch messages from chat", "rest", "NETWORK");
 		} finally {
-			dispatch({ type: "SET_MESSAGES_LOADING", payload: false });
+			dispatch({ type: "SET_MESSAGE_WINDOW_LOADING", payload: false });
 		}
 	};
 
@@ -763,7 +831,13 @@ const createWorkspaceFlowHarness = () => {
 			generateMessageId: () => `local-${Date.now()}`,
 			hasOpenWebSocket: Boolean(wsRef),
 			onAppendMessage: (message) => {
-				dispatch({ type: "APPEND_MESSAGE", payload: message });
+				dispatch({
+					type: "UPSERT_MESSAGE_IN_WINDOW",
+					payload: {
+						chatId: message.chatId,
+						message,
+					},
+				});
 			},
 			onClearStreaming: (chatId) => {
 				dispatch({ type: "CLEAR_STREAMING", payload: { chatId } });
@@ -885,7 +959,7 @@ describe("workspace frontend flow coverage", () => {
 
 			expect(state.selectedProjectId).toBe("project-1");
 			expect(state.selectedChatId).toBe("chat-1");
-			expect(state.messages.at(-1)?.content).toBe("Start my thread");
+			expect(state.messageWindow.messages.at(-1)?.content).toBe("Start my thread");
 			expect(fetchMock.requests).toContainEqual(
 				expect.objectContaining({
 					method: "POST",
@@ -984,7 +1058,7 @@ describe("workspace frontend flow coverage", () => {
 			expect(chat?.id).toBe("chat-1");
 			expect(state.selectedProjectId).toBe(project.id);
 			expect(state.selectedChatId).toBe(chat?.id ?? null);
-			expect(state.messages.at(-1)?.role).toBe("assistant");
+			expect(state.messageWindow.messages.at(-1)?.role).toBe("assistant");
 			expect(state.streamingByChat["chat-1"]).toBe("");
 			expect(state.isSendingMessage).toBe(false);
 			expect(MockWebSocket.instances[0].sent).toEqual(

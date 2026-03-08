@@ -31,6 +31,7 @@ test("MessageService.listByChatId returns empty for missing chat", async () => {
 	expect(result.hasMore).toBe(false);
 	expect(result.messages).toEqual([]);
 	expect(result.nextBeforeMessageId).toBeNull();
+	expect(result.turns).toEqual([]);
 });
 
 test("MessageService.listByChatId returns messages for existing chat", async () => {
@@ -65,4 +66,5 @@ test("MessageService.listByChatId returns messages for existing chat", async () 
 	expect(result.hasMore).toBe(false);
 	expect(result.messages).toEqual(messages);
 	expect(result.nextBeforeMessageId).toBeNull();
+	expect(result.turns).toEqual([]);
 });

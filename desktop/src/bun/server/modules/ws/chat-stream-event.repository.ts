@@ -35,6 +35,8 @@ const toEventDto = (row: typeof chatStreamEvents.$inferSelect): ChatStreamEventD
 
 export interface ChatStreamEventRepositoryContract {
 	append: (chatId: string, event: AssistantStreamEvent) => ChatStreamEventDTO;
+	clearByChatId: (chatId: string) => void;
+	listAllByChatId: (chatId: string) => ChatStreamEventDTO[];
 	listByChatId: (chatId: string, options?: { afterId?: number; limit?: number }) => ChatStreamEventDTO[];
 }
 
@@ -75,6 +77,24 @@ export class ChatStreamEventRepository implements ChatStreamEventRepositoryContr
 		}
 
 		return dto;
+	}
+
+	clearByChatId(chatId: string): void {
+		this.database
+			.delete(chatStreamEvents)
+			.where(eq(chatStreamEvents.chatId, chatId))
+			.run();
+	}
+
+	listAllByChatId(chatId: string): ChatStreamEventDTO[] {
+		const rows = this.database
+			.select()
+			.from(chatStreamEvents)
+			.where(eq(chatStreamEvents.chatId, chatId))
+			.orderBy(asc(chatStreamEvents.id))
+			.all() as typeof chatStreamEvents.$inferSelect[];
+
+		return rows.map((row) => toEventDto(row)).filter((row): row is ChatStreamEventDTO => row !== null);
 	}
 
 	listByChatId(chatId: string, options?: { afterId?: number; limit?: number }): ChatStreamEventDTO[] {

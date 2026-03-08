@@ -11,6 +11,7 @@ import { FsController } from "./modules/fs/fs.controller";
 import { createFsService } from "./modules/fs/fs.service";
 import { MessageController } from "./modules/message/message.controller";
 import { MessageRepository } from "./modules/message/message.repository";
+import { createChatTurnSnapshotRepository } from "./modules/message/chat-turn-snapshot.repository";
 import { MessageService } from "./modules/message/message.service";
 import { createLiveActivitySubscriptionRepository } from "./modules/live-activity/live-activity-subscription.repository";
 import {
@@ -142,6 +143,7 @@ export const ServerBootstrap = {
 		const projectRepository = new ProjectRepository(databaseClient.orm);
 		const chatRepository = new ChatRepository(databaseClient.orm);
 		const messageRepository = new MessageRepository(databaseClient.orm);
+		const chatTurnSnapshotRepository = createChatTurnSnapshotRepository(databaseClient.orm);
 		chatRepository.resetRuntimeActivityState();
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 		const terminalRepository = createTerminalRepository(databaseClient.orm);
@@ -153,7 +155,12 @@ export const ServerBootstrap = {
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
-		const messageService = new MessageService(chatRepository, messageRepository, chatStreamEventRepository);
+		const messageService = new MessageService(
+			chatRepository,
+			messageRepository,
+			chatStreamEventRepository,
+			chatTurnSnapshotRepository,
+		);
 		const gitService = new GitService(projectService);
 		const fsService = createFsService();
 		const workspaceSelectionService = createSelectionService(workspaceSelectionRepository);
@@ -185,6 +192,7 @@ export const ServerBootstrap = {
 			chatStreamSnapshotRepository,
 			chatStreamEventRepository,
 			liveActivityPushService,
+			chatTurnSnapshotRepository,
 		);
 		const codexModelsService = new CodexModelsService();
 

@@ -406,6 +406,7 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 				hasMore: payload.hasMore,
 				messages: payload.messages,
 				nextBeforeMessageId: payload.nextBeforeMessageId,
+				turns: payload.turns,
 			};
 		},
 

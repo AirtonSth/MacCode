@@ -42,6 +42,7 @@ export class MessageController {
 					hasMore: result.hasMore,
 					messages: result.messages,
 					nextBeforeMessageId: result.nextBeforeMessageId,
+					turns: result.turns,
 				};
 			})
 			.get("/chats/:id/stream-events", async ({ params: parameters, query, set }) => {

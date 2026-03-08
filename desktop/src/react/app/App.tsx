@@ -31,7 +31,7 @@ import {
 } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
 import { cn } from "../lib/utils";
-import type { AssistantStreamEvent, AssistantStreamItemState, AssistantStreamItemType } from "../../shared/assistant-stream-event";
+import type { AssistantStreamEvent } from "../../shared/assistant-stream-event";
 import {
 	DEFAULT_CODEX_PERMISSION_MODE,
 	parseCodexPermissionMode,
@@ -42,7 +42,11 @@ import {
 	type CodexModelDescriptor,
 	type CodexReasoningEffort,
 } from "../../shared/codex-model-config";
-import { RemoteCodeApi, RemoteCodeApiError } from "../shared/api/remotecode-http";
+import {
+	RemoteCodeApi,
+	RemoteCodeApiError,
+	type ChatTurnDTO,
+} from "../shared/api/remotecode-http";
 import {
 	RemoteCodeRealtime,
 	type ConnectionState,
@@ -50,6 +54,11 @@ import {
 } from "../shared/realtime/remotecode-ws";
 
 const FALLBACK_TIMESTAMP = "1970-01-01T00:00:00.000Z";
+const MESSAGE_PAGE_SIZE = 5;
+
+type MessageWindowLoadRequest =
+	| { kind: "latest" }
+	| { kind: "older"; beforeMessageId: string };
 
 const formatRelativeTime = (dateString: string): string => {
 	const timestamp = new Date(dateString).getTime();
@@ -198,121 +207,19 @@ const toChatDtoFromThreadSummary = (
 });
 const SIDEBAR_MAX_VISIBLE_THREADS = 3;
 
-const createStreamTurnState = (turnId: string): StreamTurnState => ({
-	turnId,
-	status: "running",
-	itemsById: {},
-	itemOrder: [],
-	startedAtMs: Date.now(),
-	finishedAtMs: null,
-});
-
-const createStreamItem = (itemId: string, itemType: AssistantStreamItemType) => ({
-	id: itemId,
-	type: itemType,
-	state: "running" as AssistantStreamItemState,
-	summary: "",
-	body: "",
-	output: "",
-	startedAtMs: Date.now(),
-	finishedAtMs: null as number | null,
-	expandedByUser: false,
-	isExpanded: true,
-});
-
-const replayAssistantEventsIntoTurns = (events: AssistantStreamEvent[]): StreamTurnState[] => {
-	const turnIdsInOrder: string[] = [];
-	const turnsById = new Map<string, StreamTurnState>();
-
-	for (const event of events) {
-		const currentTurn = turnsById.get(event.turnId) ?? createStreamTurnState(event.turnId);
-		if (!turnsById.has(event.turnId)) {
-			turnIdsInOrder.push(event.turnId);
-		}
-
-		const nextTurn: StreamTurnState = {
-			...currentTurn,
-			itemsById: { ...currentTurn.itemsById },
-			itemOrder: [...currentTurn.itemOrder],
-		};
-		const existingItem = "itemId" in event ? nextTurn.itemsById[event.itemId] : undefined;
-		const inferredItemType: AssistantStreamItemType =
-			"itemType" in event
-				? event.itemType
-				: event.type === "item_delta" && event.target === "output"
-					? "tool"
-					: existingItem?.type ?? "reasoning";
-		const getItem = (itemId: string) => {
-			const candidate = nextTurn.itemsById[itemId] ?? createStreamItem(itemId, inferredItemType);
-			if (!nextTurn.itemOrder.includes(itemId)) {
-				nextTurn.itemOrder.push(itemId);
-			}
-			return candidate;
-		};
-
-		switch (event.type) {
-			case "turn_started":
-				break;
-			case "turn_completed":
-				nextTurn.status = nextTurn.status === "failed" ? "failed" : "completed";
-				nextTurn.finishedAtMs = nextTurn.finishedAtMs ?? Date.now();
-				break;
-			case "item_started": {
-				const item = getItem(event.itemId);
-				item.type = event.itemType;
-				item.state = event.state ?? "running";
-				if (event.summary !== undefined) {
-					item.summary = event.summary;
-				}
-				nextTurn.itemsById[event.itemId] = item;
-				break;
-			}
-			case "item_delta": {
-				const item = getItem(event.itemId);
-				if (event.target === "summary") {
-					item.summary = `${item.summary}${event.delta}`;
-				}
-				if (event.target === "body") {
-					item.body = `${item.body}${event.delta}`;
-				}
-				if (event.target === "output") {
-					item.output = `${item.output}${event.delta}`;
-				}
-				nextTurn.itemsById[event.itemId] = item;
-				break;
-			}
-			case "item_state": {
-				const item = getItem(event.itemId);
-				item.state = event.state;
-				if (event.summary !== undefined) {
-					item.summary = event.summary;
-				}
-				if (event.state === "failed" || event.state === "cancelled") {
-					nextTurn.status = "failed";
-				}
-				nextTurn.itemsById[event.itemId] = item;
-				break;
-			}
-			case "item_completed": {
-				const item = getItem(event.itemId);
-				item.state = event.state ?? (item.state === "failed" || item.state === "cancelled" ? item.state : "completed");
-				item.finishedAtMs = item.finishedAtMs ?? Date.now();
-				if (event.summary !== undefined) {
-					item.summary = event.summary;
-				}
-				if (item.state === "failed" || item.state === "cancelled") {
-					nextTurn.status = "failed";
-				}
-				nextTurn.itemsById[event.itemId] = item;
-				break;
-			}
-		}
-
-		turnsById.set(event.turnId, nextTurn);
-	}
-
-	return turnIdsInOrder.map((turnId) => turnsById.get(turnId)).filter((turn): turn is StreamTurnState => Boolean(turn));
-};
+const cloneChatTurnSnapshots = (turns: ChatTurnDTO[]): StreamTurnState[] =>
+	turns.map((turn) => ({
+		...turn,
+		itemOrder: [...turn.itemOrder],
+		itemsById: Object.fromEntries(
+			Object.entries(turn.itemsById).map(([itemId, item]) => [
+				itemId,
+				{
+					...item,
+				},
+			]),
+		),
+	}));
 
 const clampSidebarWidth = (width: number): number => {
 	const bounded = Number.isFinite(width) ? width : DEFAULT_SIDEBAR_WIDTH;
@@ -453,12 +360,13 @@ const App = (): JSX.Element => {
 	const workspaceClientIdRef = useRef<string>(resolveWebSocketClientId());
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
+	const activeChatIdsRef = useRef<Set<string>>(new Set());
 	const projectsLoadInFlightRef = useRef<Promise<void> | null>(null);
 	const projectsLoadQueuedRef = useRef<boolean>(false);
 	const chatsLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	const chatsLoadQueuedRef = useRef<Map<string, string | null>>(new Map());
-	const messagesLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
-	const messagesLoadQueuedRef = useRef<Set<string>>(new Set());
+	const messageWindowLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+	const messageWindowLoadQueuedRef = useRef<Map<string, MessageWindowLoadRequest>>(new Map());
 	const chatContextLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	const workspaceMenuRef = useRef<HTMLDivElement | null>(null);
 	const [stoppingByChat, setStoppingByChat] = useState<Record<string, boolean>>({});
@@ -489,6 +397,22 @@ const App = (): JSX.Element => {
 	const activeThreadChat = selectedChat ?? draftThreadChat;
 
 	const selectedChatId = state.selectedChatId;
+	const selectedMessageWindow =
+		selectedChatId && state.messageWindow.chatId === selectedChatId
+			? state.messageWindow
+			: {
+				chatId: selectedChatId,
+				hasMore: false,
+				latestDirty: false,
+				messages: [],
+				mode: "latest" as const,
+				nextBeforeMessageId: null,
+				turns: [],
+			};
+	const messageWindowMode = selectedMessageWindow.mode;
+	const hasOlderMessages = selectedMessageWindow.hasMore;
+	const latestMessageWindowDirty = selectedMessageWindow.latestDirty;
+	const visibleMessages = selectedMessageWindow.messages;
 	const streamingText = selectedChatId
 		? state.streamingByChat[selectedChatId] ?? ""
 		: "";
@@ -496,22 +420,15 @@ const App = (): JSX.Element => {
 		? state.streamTurnsByChat[selectedChatId] ?? null
 		: null;
 	const streamHistoryTurns: StreamTurnState[] = selectedChatId
-		? state.streamHistoryByChat[selectedChatId] ?? []
+		? state.streamHistoryByChat[selectedChatId] ?? selectedMessageWindow.turns
 		: [];
 	const selectedChatSending = selectedChatId
 		? Boolean(state.sendingByChat[selectedChatId])
 		: false;
 	const selectedChatStopping = selectedChatId ? Boolean(stoppingByChat[selectedChatId]) : false;
 	const isChatActive = useCallback(
-		(chatId: string): boolean => {
-			const chat = state.chats.find((item) => item.id === chatId);
-			return Boolean(
-				chat?.isActive ||
-				state.sendingByChat[chatId] ||
-				state.streamingActiveByChat[chatId],
-			);
-		},
-		[state.chats, state.sendingByChat, state.streamingActiveByChat],
+		(chatId: string): boolean => activeChatIdsRef.current.has(chatId),
+		[],
 	);
 	const isSelectedThreadWorking = activeThreadChat ? isChatActive(activeThreadChat.id) : false;
 
@@ -559,6 +476,7 @@ const App = (): JSX.Element => {
 	const permissionModeRef = useRef<CodexPermissionMode>(permissionMode);
 	const selectedModelRef = useRef<string | null>(selectedModel);
 	const selectedReasoningEffortRef = useRef<CodexReasoningEffort | null>(selectedReasoningEffort);
+	const messageWindowRef = useRef(state.messageWindow);
 
 	const selectedModelDescriptor = useMemo(
 		() => getModelDescriptorByName(availableModels, selectedModel),
@@ -619,6 +537,30 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		selectedReasoningEffortRef.current = selectedReasoningEffort;
 	}, [selectedReasoningEffort]);
+
+	useEffect(() => {
+		messageWindowRef.current = state.messageWindow;
+	}, [state.messageWindow]);
+
+	useEffect(() => {
+		const nextActiveChatIds = new Set<string>();
+		for (const chat of state.chats) {
+			if (chat.isActive) {
+				nextActiveChatIds.add(chat.id);
+			}
+		}
+		for (const [chatId, sending] of Object.entries(state.sendingByChat)) {
+			if (sending) {
+				nextActiveChatIds.add(chatId);
+			}
+		}
+		for (const [chatId, streamingActive] of Object.entries(state.streamingActiveByChat)) {
+			if (streamingActive) {
+				nextActiveChatIds.add(chatId);
+			}
+		}
+		activeChatIdsRef.current = nextActiveChatIds;
+	}, [state.chats, state.sendingByChat, state.streamingActiveByChat]);
 
 	useEffect(() => {
 		if (typeof window === "undefined") {
@@ -855,61 +797,131 @@ const App = (): JSX.Element => {
 		);
 
 	const loadMessagesForChatCore = useCallback(
-		async (chatId: string | null) => {
+		async (chatId: string | null, request: MessageWindowLoadRequest = { kind: "latest" }) => {
 			if (!chatId) {
-				dispatch({ payload: [], type: "SET_MESSAGES" });
-				dispatch({ payload: false, type: "SET_MESSAGES_LOADING" });
+				dispatch({
+					payload: {
+						chatId: null,
+						hasMore: false,
+						messages: [],
+						mode: "latest",
+						nextBeforeMessageId: null,
+						turns: [],
+					},
+					type: "SET_MESSAGE_WINDOW",
+				});
+				dispatch({ payload: false, type: "SET_MESSAGE_WINDOW_LOADING" });
 				return;
 			}
 
-			dispatch({ payload: true, type: "SET_MESSAGES_LOADING" });
+			dispatch({ payload: true, type: "SET_MESSAGE_WINDOW_LOADING" });
 			try {
-				const messages = await api.listMessages(chatId);
-				let afterId = 0;
-				const streamEvents: AssistantStreamEvent[] = [];
-				let lastEventId = 0;
-				while (true) {
-					const page = await api.listChatStreamEvents(chatId, {
-						afterId,
-						limit: 500,
-					});
-					for (const entry of page.events) {
-						streamEvents.push(entry.event);
-						lastEventId = Math.max(lastEventId, entry.id);
-					}
+				const messagePage = await api.listMessagesPage(chatId, {
+					beforeMessageId: request.kind === "older" ? request.beforeMessageId : undefined,
+					limit: MESSAGE_PAGE_SIZE,
+				});
+				const pageTurns = cloneChatTurnSnapshots(messagePage.turns);
+				const isLatestRequest = request.kind === "latest";
+				const currentMessageWindow = messageWindowRef.current;
+				const keepLatestDirty =
+					!isLatestRequest &&
+					currentMessageWindow.chatId === chatId &&
+					currentMessageWindow.latestDirty;
 
-					if (!page.hasMore || page.nextAfterId === null) {
-						break;
-					}
-
-					afterId = page.nextAfterId;
+				if (selectedChatIdRef.current !== chatId) {
+					return;
 				}
 
-					if (selectedChatIdRef.current === chatId) {
-						dispatch({ payload: messages, type: "SET_MESSAGES" });
-					}
-					dispatch({
-						payload: {
-							chatId,
-							turns: replayAssistantEventsIntoTurns(streamEvents),
-							lastEventId,
-						},
-						type: "SET_STREAM_HISTORY",
-					});
-					clearRestErrors();
-				} catch (error) {
-					if (formatApiErrorCode(error) === "HTTP_404") {
-						if (selectedChatIdRef.current === chatId) {
-							dispatch({ payload: [], type: "SET_MESSAGES" });
+				dispatch({
+					payload: {
+						chatId,
+						hasMore: messagePage.hasMore,
+						latestDirty: keepLatestDirty,
+						messages: messagePage.messages,
+						mode: isLatestRequest ? "latest" : "older",
+						nextBeforeMessageId: messagePage.nextBeforeMessageId,
+						turns: pageTurns,
+					},
+					type: "SET_MESSAGE_WINDOW",
+				});
+				dispatch({
+					payload: {
+						chatId,
+						lastEventId: 0,
+						turns: pageTurns,
+					},
+					type: "SET_STREAM_HISTORY",
+				});
+				dispatch({
+					payload: { chatId },
+					type: "RESET_STREAMING",
+				});
+
+				const shouldLoadActiveStream = isLatestRequest && activeChatIdsRef.current.has(chatId);
+				if (shouldLoadActiveStream) {
+					let afterId = 0;
+					const streamEvents: Array<{ event: AssistantStreamEvent; eventId: number }> = [];
+					while (true) {
+						const page = await api.listChatStreamEvents(chatId, {
+							afterId,
+							limit: 500,
+						});
+						for (const entry of page.events) {
+							streamEvents.push({
+								event: entry.event,
+								eventId: entry.id,
+							});
 						}
-					dispatch({
-						payload: {
-							chatId,
-							lastEventId: 0,
-							turns: [],
-						},
-						type: "SET_STREAM_HISTORY",
-					});
+
+						if (!page.hasMore || page.nextAfterId === null) {
+							break;
+						}
+
+						afterId = page.nextAfterId;
+					}
+
+					if (selectedChatIdRef.current === chatId) {
+						for (const streamEvent of streamEvents) {
+							dispatch({
+								payload: {
+									chatId,
+									event: streamEvent.event,
+									eventId: streamEvent.eventId,
+								},
+								type: "APPLY_ASSISTANT_EVENT",
+							});
+						}
+					}
+				}
+
+				clearRestErrors();
+			} catch (error) {
+				if (formatApiErrorCode(error) === "HTTP_404") {
+					if (selectedChatIdRef.current === chatId) {
+						dispatch({
+							payload: {
+								chatId,
+								hasMore: false,
+								messages: [],
+								mode: request.kind === "latest" ? "latest" : "older",
+								nextBeforeMessageId: null,
+								turns: [],
+							},
+							type: "SET_MESSAGE_WINDOW",
+						});
+						dispatch({
+							payload: {
+								chatId,
+								lastEventId: 0,
+								turns: [],
+							},
+							type: "SET_STREAM_HISTORY",
+						});
+						dispatch({
+							payload: { chatId },
+							type: "RESET_STREAMING",
+						});
+					}
 					clearRestErrors();
 					return;
 				}
@@ -920,38 +932,40 @@ const App = (): JSX.Element => {
 				);
 			} finally {
 				if (selectedChatIdRef.current === chatId) {
-					dispatch({ payload: false, type: "SET_MESSAGES_LOADING" });
+					dispatch({ payload: false, type: "SET_MESSAGE_WINDOW_LOADING" });
 				}
 			}
 		},
-			[addError, api, clearRestErrors, dispatch, formatApiErrorCode, formatApiErrorMessage],
+		[addError, api, clearRestErrors, dispatch, formatApiErrorCode, formatApiErrorMessage],
 	);
 
 	const loadMessagesForChat = useCallback(
-		async (chatId: string | null) => {
+		async (chatId: string | null, request: MessageWindowLoadRequest = { kind: "latest" }) => {
 			if (!chatId) {
-				await loadMessagesForChatCore(chatId);
+				await loadMessagesForChatCore(chatId, request);
 				return;
 			}
 
-			const inFlight = messagesLoadInFlightRef.current.get(chatId);
+			const inFlight = messageWindowLoadInFlightRef.current.get(chatId);
 			if (inFlight) {
-				messagesLoadQueuedRef.current.add(chatId);
+				messageWindowLoadQueuedRef.current.set(chatId, request);
 				await inFlight;
 				return;
 			}
 
 			const task = (async () => {
-				do {
-					messagesLoadQueuedRef.current.delete(chatId);
-					await loadMessagesForChatCore(chatId);
-				} while (messagesLoadQueuedRef.current.has(chatId));
+				let nextRequest: MessageWindowLoadRequest | null = request;
+				while (nextRequest) {
+					messageWindowLoadQueuedRef.current.delete(chatId);
+					await loadMessagesForChatCore(chatId, nextRequest);
+					nextRequest = messageWindowLoadQueuedRef.current.get(chatId) ?? null;
+				}
 			})().finally(() => {
-				messagesLoadInFlightRef.current.delete(chatId);
-				messagesLoadQueuedRef.current.delete(chatId);
+				messageWindowLoadInFlightRef.current.delete(chatId);
+				messageWindowLoadQueuedRef.current.delete(chatId);
 			});
 
-			messagesLoadInFlightRef.current.set(chatId, task);
+			messageWindowLoadInFlightRef.current.set(chatId, task);
 			await task;
 		},
 		[loadMessagesForChatCore],
@@ -966,15 +980,51 @@ const App = (): JSX.Element => {
 					return;
 				}
 
+				const currentMessageWindow = messageWindowRef.current;
+				const isViewingLatestWindow =
+					currentMessageWindow.chatId === chatId && currentMessageWindow.mode === "latest";
+				if (!isViewingLatestWindow) {
+					dispatch({
+						payload: {
+							chatId,
+							dirty: true,
+						},
+						type: "MARK_LATEST_WINDOW_DIRTY",
+					});
+					return;
+				}
+
 				try {
-					const latestMessages = await api.listMessages(chatId);
+					const latestPage = await api.listMessagesPage(chatId, {
+						limit: MESSAGE_PAGE_SIZE,
+					});
 					if (selectedChatIdRef.current !== chatId) {
 						return;
 					}
 
-					dispatch({ payload: latestMessages, type: "SET_MESSAGES" });
+					const turns = cloneChatTurnSnapshots(latestPage.turns);
+					dispatch({
+						payload: {
+							chatId,
+							hasMore: latestPage.hasMore,
+							latestDirty: false,
+							messages: latestPage.messages,
+							mode: "latest",
+							nextBeforeMessageId: latestPage.nextBeforeMessageId,
+							turns,
+						},
+						type: "SET_MESSAGE_WINDOW",
+					});
+					dispatch({
+						payload: {
+							chatId,
+							lastEventId: 0,
+							turns,
+						},
+						type: "SET_STREAM_HISTORY",
+					});
 					clearRestErrors();
-					if (latestMessages.at(-1)?.role === "assistant") {
+					if (latestPage.messages.at(-1)?.role === "assistant") {
 						return;
 					}
 				} catch {
@@ -983,7 +1033,7 @@ const App = (): JSX.Element => {
 
 				if (attempt >= maxAttempts) {
 					if (selectedChatIdRef.current === chatId) {
-						await loadMessagesForChat(chatId);
+						await loadMessagesForChat(chatId, { kind: "latest" });
 					}
 					return;
 				}
@@ -1119,11 +1169,12 @@ const App = (): JSX.Element => {
 								id: context.chat.id,
 								projectId: context.chat.projectId,
 								provider: context.chat.provider,
-							title: context.chat.title,
-							status: context.chat.status,
-							diffAdded: context.chat.diffAdded,
-							diffRemoved: context.chat.diffRemoved,
-							updatedAt: context.chat.updatedAt,
+								isActive: context.chat.isActive,
+								title: context.chat.title,
+								status: context.chat.status,
+								diffAdded: context.chat.diffAdded,
+								diffRemoved: context.chat.diffRemoved,
+								updatedAt: context.chat.updatedAt,
 							},
 							type: "UPDATE_CHAT",
 						});
@@ -1271,9 +1322,33 @@ const App = (): JSX.Element => {
 					type: "SET_CHAT_SENDING",
 				});
 			};
+			const isShowingLatestWindowForChat = (chatId: string): boolean => {
+				const currentMessageWindow = messageWindowRef.current;
+				return currentMessageWindow.chatId === chatId && currentMessageWindow.mode === "latest";
+			};
+			const markLatestWindowDirty = (chatId: string) => {
+				dispatch({
+					payload: {
+						chatId,
+						dirty: true,
+					},
+					type: "MARK_LATEST_WINDOW_DIRTY",
+				});
+			};
 
-			switch (event.event) {
-				case "assistant_delta":
+				switch (event.event) {
+					case "assistant_delta":
+						if (selectedChatIdRef.current !== event.data.chatId) {
+							clearChatSending(event.data.chatId);
+							break;
+						}
+						if (
+							!isShowingLatestWindowForChat(event.data.chatId)
+						) {
+							markLatestWindowDirty(event.data.chatId);
+							clearChatSending(event.data.chatId);
+						break;
+					}
 					dispatch({
 						payload: {
 							chatId: event.data.chatId,
@@ -1281,18 +1356,38 @@ const App = (): JSX.Element => {
 						},
 						type: "APPEND_STREAMING",
 					});
-					clearChatSending(event.data.chatId);
-					break;
-				case "assistant_snapshot":
+						clearChatSending(event.data.chatId);
+						break;
+					case "assistant_snapshot":
+						if (selectedChatIdRef.current !== event.data.chatId) {
+							break;
+						}
+						if (
+							!isShowingLatestWindowForChat(event.data.chatId)
+						) {
+							markLatestWindowDirty(event.data.chatId);
+							break;
+					}
 					dispatch({
 						payload: {
 							chatId: event.data.chatId,
 							text: event.data.partialText,
 						},
 						type: "SET_STREAMING_SNAPSHOT",
-					});
-					break;
-				case "assistant_event":
+						});
+						break;
+					case "assistant_event":
+						if (selectedChatIdRef.current !== event.data.chatId) {
+							clearChatSending(event.data.chatId);
+							break;
+						}
+						if (
+							!isShowingLatestWindowForChat(event.data.chatId)
+						) {
+							markLatestWindowDirty(event.data.chatId);
+							clearChatSending(event.data.chatId);
+						break;
+					}
 					dispatch({
 						payload: {
 							chatId: event.data.chatId,
@@ -1301,19 +1396,27 @@ const App = (): JSX.Element => {
 						},
 						type: "APPLY_ASSISTANT_EVENT",
 					});
-					clearChatSending(event.data.chatId);
-					break;
+						clearChatSending(event.data.chatId);
+						break;
 					case "assistant_done":
 						dispatch({
 							payload: { chatId: event.data.chatId },
 							type: "CLEAR_STREAMING",
 						});
+						dispatch({
+							payload: { chatId: event.data.chatId },
+							type: "CLEAR_STREAM_TURN",
+						});
 						if (selectedChatIdRef.current === event.data.chatId) {
-							await syncFinalMessagesAfterDone(event.data.chatId);
+							if (isShowingLatestWindowForChat(event.data.chatId)) {
+								await syncFinalMessagesAfterDone(event.data.chatId);
 							void refreshProjectGit();
+						} else {
+							markLatestWindowDirty(event.data.chatId);
 						}
-						clearChatSending(event.data.chatId);
-						break;
+					}
+					clearChatSending(event.data.chatId);
+					break;
 				case "chat_updated":
 					dispatch({
 						payload: {
@@ -1337,15 +1440,19 @@ const App = (): JSX.Element => {
 						}
 						break;
 				case "error":
-					addError(event.data.message, "ws", event.data.code);
-					if (event.data.chatId) {
-						dispatch({
-							payload: { chatId: event.data.chatId },
-							type: "CLEAR_STREAMING",
-						});
-						clearChatSending(event.data.chatId);
-					}
-					break;
+						addError(event.data.message, "ws", event.data.code);
+						if (event.data.chatId) {
+							dispatch({
+								payload: { chatId: event.data.chatId },
+								type: "CLEAR_STREAMING",
+							});
+							dispatch({
+								payload: { chatId: event.data.chatId },
+								type: "CLEAR_STREAM_TURN",
+							});
+							clearChatSending(event.data.chatId);
+						}
+						break;
 				case "workspace_event": {
 					const envelope = event.data;
 					lastWorkspaceSeqRef.current = Math.max(lastWorkspaceSeqRef.current, envelope.seq);
@@ -1458,15 +1565,26 @@ const App = (): JSX.Element => {
 							}
 							if (isMessagePayload(messagePayload)) {
 								if (messagePayload.chatId === selectedChatIdRef.current) {
-									dispatch({
-										payload: messagePayload,
-										type: "APPEND_MESSAGE",
-									});
+									if (isShowingLatestWindowForChat(messagePayload.chatId)) {
+										dispatch({
+											payload: {
+												chatId: messagePayload.chatId,
+												message: messagePayload,
+											},
+											type: "UPSERT_MESSAGE_IN_WINDOW",
+										});
+									} else {
+										markLatestWindowDirty(messagePayload.chatId);
+									}
 								}
 								break;
 							}
 							if (chatId && chatId === selectedChatIdRef.current) {
-								await loadMessagesForChat(chatId);
+								if (isShowingLatestWindowForChat(chatId)) {
+									await loadMessagesForChat(chatId, { kind: "latest" });
+								} else {
+									markLatestWindowDirty(chatId);
+								}
 							}
 							break;
 						case "selection_updated":
@@ -1544,7 +1662,7 @@ const App = (): JSX.Element => {
 	}, [loadChatsForProject, state.selectedProjectId]);
 
 	useEffect(() => {
-		void loadMessagesForChat(state.selectedChatId);
+		void loadMessagesForChat(state.selectedChatId, { kind: "latest" });
 	}, [loadMessagesForChat, state.selectedChatId]);
 
 	useEffect(() => {
@@ -1649,6 +1767,14 @@ const App = (): JSX.Element => {
 				return;
 			}
 
+			if (
+				state.selectedChatId &&
+				state.messageWindow.chatId === state.selectedChatId &&
+				state.messageWindow.mode !== "latest"
+			) {
+				await loadMessagesForChat(state.selectedChatId, { kind: "latest" });
+			}
+
 			const result = await sendWorkspaceMessage({
 				createChatId: async () => {
 					const chat = await handleCreateChat("New thread");
@@ -1659,8 +1785,11 @@ const App = (): JSX.Element => {
 				hasOpenWebSocket: Boolean(wsRef.current),
 				onAppendMessage: (message) => {
 					dispatch({
-						payload: message,
-						type: "APPEND_MESSAGE",
+						payload: {
+							chatId: message.chatId,
+							message,
+						},
+						type: "UPSERT_MESSAGE_IN_WINDOW",
 					});
 				},
 				onClearStreaming: (chatId) => {
@@ -1720,14 +1849,17 @@ const App = (): JSX.Element => {
 				pendingSendChatIdsRef.current.delete(result.chatId);
 			}
 		},
-		[
-			addError,
-			dispatch,
-			handleCreateChat,
-			permissionMode,
-			selectedModel,
-			selectedReasoningEffort,
-			selectedChat?.status,
+			[
+				addError,
+				dispatch,
+				handleCreateChat,
+				loadMessagesForChat,
+				permissionMode,
+				state.messageWindow.chatId,
+				state.messageWindow.mode,
+				selectedModel,
+				selectedReasoningEffort,
+				selectedChat?.status,
 			selectedChat?.provider,
 			state.selectedChatId,
 			state.selectedProjectId,
@@ -1922,7 +2054,7 @@ const App = (): JSX.Element => {
 		[dispatch, persistWorkspaceSelection, state.selectedProjectId],
 	);
 
-		const handleSelectChat = useCallback(
+	const handleSelectChat = useCallback(
 		async (chatId: string) => {
 			if (chatId === state.selectedChatId) {
 				return;
@@ -1936,6 +2068,28 @@ const App = (): JSX.Element => {
 		},
 		[dispatch, persistWorkspaceSelection, state.selectedChatId, state.selectedProjectId],
 	);
+
+	const handleLoadOlderMessages = useCallback(async () => {
+		const chatId = selectedChatIdRef.current;
+		const beforeMessageId = state.messageWindow.nextBeforeMessageId;
+		if (!chatId || !beforeMessageId || !state.messageWindow.hasMore || state.messagesLoading) {
+			return;
+		}
+
+		await loadMessagesForChat(chatId, {
+			beforeMessageId,
+			kind: "older",
+		});
+	}, [loadMessagesForChat, state.messageWindow.hasMore, state.messageWindow.nextBeforeMessageId, state.messagesLoading]);
+
+	const handleLoadLatestMessages = useCallback(async () => {
+		const chatId = selectedChatIdRef.current;
+		if (!chatId || state.messagesLoading) {
+			return;
+		}
+
+		await loadMessagesForChat(chatId, { kind: "latest" });
+	}, [loadMessagesForChat, state.messagesLoading]);
 
 	useEffect(() => {
 		if (!openingProjectId) {
@@ -2662,10 +2816,15 @@ const App = (): JSX.Element => {
 													<ConversationPanel
 														chat={activeThreadChat}
 														focusMode
+														hasOlderMessages={hasOlderMessages}
 														hasRestError={state.errors.some((error) => error.source === "rest")}
 														isWorking={isSelectedThreadWorking}
+														isLatestDirty={latestMessageWindowDirty}
 														loading={state.messagesLoading}
-														messages={state.messages}
+														messageWindowMode={messageWindowMode}
+														messages={visibleMessages}
+														onLoadLatestMessages={handleLoadLatestMessages}
+														onLoadOlderMessages={handleLoadOlderMessages}
 														onSetStreamItemExpanded={handleSetStreamItemExpanded}
 														onSetStreamItemState={handleSetStreamItemState}
 														streamHistoryTurns={streamHistoryTurns}

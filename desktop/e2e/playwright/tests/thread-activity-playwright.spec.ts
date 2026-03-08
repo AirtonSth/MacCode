@@ -211,7 +211,12 @@ const createApiMock = (options: {
 
 		const messagesMatch = /^\/v1\/chats\/([^/]+)\/messages$/.exec(path);
 		if (method === "GET" && messagesMatch) {
-			await intercept.fulfill(json({ messages: [] }));
+			await intercept.fulfill(json({
+				hasMore: false,
+				messages: [],
+				nextBeforeMessageId: null,
+				turns: [],
+			}));
 			return;
 		}
 

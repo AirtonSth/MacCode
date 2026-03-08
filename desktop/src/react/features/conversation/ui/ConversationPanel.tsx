@@ -13,6 +13,9 @@ import { StreamingTimeline } from "./StreamingTimeline";
 
 interface ConversationPanelProps {
 	chat: ChatDTO | null;
+	hasOlderMessages: boolean;
+	isLatestDirty?: boolean;
+	messageWindowMode?: "latest" | "older";
 	messages: MessageDTO[];
 	streamHistoryTurns: StreamTurnState[];
 	streamingText: string;
@@ -20,6 +23,8 @@ interface ConversationPanelProps {
 	isWorking: boolean;
 	loading: boolean;
 	hasRestError: boolean;
+	onLoadLatestMessages?: () => void;
+	onLoadOlderMessages?: () => void;
 	onSetStreamItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void;
 	onSetStreamItemState: (itemId: string, state: AssistantStreamItemState) => void;
 	focusMode?: boolean;
@@ -27,6 +32,9 @@ interface ConversationPanelProps {
 
 export const ConversationPanel = ({
 	chat,
+	hasOlderMessages,
+	isLatestDirty = false,
+	messageWindowMode = "latest",
 	messages,
 	streamHistoryTurns,
 	streamingText,
@@ -34,6 +42,8 @@ export const ConversationPanel = ({
 	isWorking,
 	loading,
 	hasRestError,
+	onLoadLatestMessages,
+	onLoadOlderMessages,
 	onSetStreamItemExpanded,
 	onSetStreamItemState,
 	focusMode = false,
@@ -56,6 +66,9 @@ export const ConversationPanel = ({
 	const [showRunDetails, setShowRunDetails] = useState(false);
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
+	const topPaginationTriggeredRef = useRef(false);
+	const latestReloadTriggeredRef = useRef(false);
+	const olderWindowBottomArmRef = useRef(false);
 	const bubbleMotion = shouldReduceMotion
 		? {}
 		: {
@@ -97,19 +110,71 @@ export const ConversationPanel = ({
 		});
 	}, [scrollToBottom, updateIsAtBottom]);
 	const handleViewportScroll = useCallback(() => {
+		const viewport = scrollViewportRef.current;
+		if (!viewport) {
+			return;
+		}
+
 		updateIsAtBottom();
-	}, [updateIsAtBottom]);
+
+		if (
+			hasOlderMessages &&
+			messageWindowMode === "latest" &&
+			viewport.scrollTop <= 32 &&
+			!loading &&
+			!topPaginationTriggeredRef.current
+		) {
+			topPaginationTriggeredRef.current = true;
+			void onLoadOlderMessages?.();
+		}
+
+		if (messageWindowMode === "older" && viewport.scrollTop > 32) {
+			olderWindowBottomArmRef.current = true;
+		}
+
+		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+		if (
+			messageWindowMode === "older" &&
+			olderWindowBottomArmRef.current &&
+			distanceFromBottom <= 24 &&
+			!loading &&
+			!latestReloadTriggeredRef.current
+		) {
+			latestReloadTriggeredRef.current = true;
+			void onLoadLatestMessages?.();
+		}
+	}, [hasOlderMessages, loading, messageWindowMode, onLoadLatestMessages, onLoadOlderMessages, updateIsAtBottom]);
 	useEffect(() => {
 		setIsAtBottom(true);
 		setShowRunDetails(false);
+		topPaginationTriggeredRef.current = false;
+		latestReloadTriggeredRef.current = false;
+		olderWindowBottomArmRef.current = false;
 	}, [chat?.id]);
+
+	useEffect(() => {
+		topPaginationTriggeredRef.current = false;
+		latestReloadTriggeredRef.current = false;
+		olderWindowBottomArmRef.current = false;
+	}, [loading, messageWindowMode, messages]);
 
 	useLayoutEffect(() => {
 		if (!hasContent) {
 			return;
 		}
+		if (messageWindowMode === "older") {
+			const viewport = scrollViewportRef.current;
+			if (viewport) {
+				viewport.scrollTo({
+					top: 0,
+					behavior: "auto",
+				});
+				updateIsAtBottom();
+			}
+			return;
+		}
 		forceScrollToBottom();
-	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messages, streamingText]);
+	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messageWindowMode, messages, streamingText, updateIsAtBottom]);
 	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
 	const markdownComponents: Components = {
 		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,
@@ -266,22 +331,34 @@ export const ConversationPanel = ({
 
 				{hasContent ? (
 					<>
-						{hasHistoricalRunDetails ? (
+						{hasHistoricalRunDetails || (messageWindowMode === "older" && isLatestDirty) ? (
 							<div className={cn("px-5 pt-3", focusMode ? "sm:px-6" : "")}>
-								<button
-									className={cn(
-										"rounded-lg border px-2.5 py-1 text-xs transition",
-										showRunDetails
-											? "border-sky-300/40 bg-sky-400/12 text-sky-100"
-											: "border-white/15 bg-white/[0.03] text-slate-300 hover:text-slate-100",
-									)}
-									onClick={() => {
-										setShowRunDetails((value) => !value);
-									}}
-									type="button"
-								>
-									{showRunDetails ? "Hide run details" : "Show run details"}
-								</button>
+								<div className="flex flex-wrap items-center gap-2">
+									{hasHistoricalRunDetails ? (
+										<button
+											className={cn(
+												"rounded-lg border px-2.5 py-1 text-xs transition",
+												showRunDetails
+													? "border-sky-300/40 bg-sky-400/12 text-sky-100"
+													: "border-white/15 bg-white/[0.03] text-slate-300 hover:text-slate-100",
+											)}
+											onClick={() => {
+												setShowRunDetails((value) => !value);
+											}}
+											type="button"
+										>
+											{showRunDetails ? "Hide run details" : "Show run details"}
+										</button>
+									) : null}
+									{messageWindowMode === "older" && isLatestDirty ? (
+										<span
+											className="text-[11px] uppercase tracking-[0.18em] text-amber-200/90"
+											data-testid="conversation-latest-dirty-indicator"
+										>
+											Newer messages available
+										</span>
+									) : null}
+								</div>
 							</div>
 						) : null}
 						<ScrollArea className="relative h-full" onViewportScroll={handleViewportScroll} viewportRef={scrollViewportRef}>
@@ -292,6 +369,9 @@ export const ConversationPanel = ({
 									focusMode ? "space-y-2 px-4 pb-8 pt-5 sm:px-6" : "space-y-3 px-5 pb-5 pt-4",
 								)}
 							>
+								<span className="sr-only" data-testid="conversation-window-mode">
+									{messageWindowMode}
+								</span>
 								<AnimatePresence initial={false}>
 									{messages.map((message) => (
 										<motion.article
@@ -307,6 +387,7 @@ export const ConversationPanel = ({
 																: "mr-auto border-white/10 bg-slate-900/85 text-slate-100",
 														),
 											)}
+											data-testid={`conversation-message-row-${message.id}`}
 											key={message.id}
 											{...bubbleMotion}
 										>
@@ -402,6 +483,10 @@ export const ConversationPanel = ({
 									focusMode ? "bg-slate-950/80" : "",
 								)}
 								onClick={() => {
+									if (messageWindowMode === "older") {
+										void onLoadLatestMessages?.();
+										return;
+									}
 									scrollToBottom();
 								}}
 								type="button"

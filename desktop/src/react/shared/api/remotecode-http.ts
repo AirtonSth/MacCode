@@ -1,6 +1,10 @@
 import type { CodexModelsCatalog, CodexReasoningEffort } from "../../../shared/codex-model-config";
 import type { CodexPermissionMode } from "../../../shared/codex-permission-mode";
-import type { AssistantStreamEvent } from "../../../shared/assistant-stream-event";
+import type {
+	AssistantStreamEvent,
+	AssistantStreamItemState,
+	AssistantStreamItemType,
+} from "../../../shared/assistant-stream-event";
 
 export interface ApiConfig {
 	baseUrl: string;
@@ -66,6 +70,35 @@ export interface MessageDTO {
 	role: "user" | "assistant";
 	content: string;
 	createdAt: string;
+}
+
+export interface ChatTurnItemDTO {
+	body: string;
+	expandedByUser: boolean;
+	finishedAtMs: number | null;
+	id: string;
+	isExpanded: boolean;
+	output: string;
+	startedAtMs: number;
+	state: AssistantStreamItemState;
+	summary: string;
+	type: AssistantStreamItemType;
+}
+
+export interface ChatTurnDTO {
+	finishedAtMs: number | null;
+	itemOrder: string[];
+	itemsById: Record<string, ChatTurnItemDTO>;
+	startedAtMs: number;
+	status: "running" | "completed" | "failed";
+	turnId: string;
+}
+
+export interface MessagePageDTO {
+	hasMore: boolean;
+	messages: MessageDTO[];
+	nextBeforeMessageId: string | null;
+	turns: ChatTurnDTO[];
 }
 
 export interface ChatStreamEventDTO {
@@ -256,9 +289,7 @@ interface RestCreateChatResponse {
 
 type RestChatContextResponse = ChatContextDTO;
 
-interface RestListMessagesResponse {
-	messages: MessageDTO[];
-}
+type RestListMessagesResponse = MessagePageDTO;
 
 interface RestListChatStreamEventsResponse {
 	events: ChatStreamEventDTO[];
@@ -352,9 +383,6 @@ const resolveHttpClientId = (): string => {
 	}
 };
 
-const isMutatingMethod = (method: RequestInput["method"]): boolean =>
-	method === "POST" || method === "PATCH" || method === "DELETE";
-
 const readBody = async (response: Response): Promise<unknown> => {
 	try {
 		return await response.json();
@@ -391,19 +419,18 @@ export const RemoteCodeApi = {
 
 		const request = async <T>(input: RequestInput): Promise<T> => {
 			const url = `${baseUrl}/v1${parsePath(input.path)}`;
-			const requestId = isMutatingMethod(input.method)
-				? (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-						? crypto.randomUUID()
-						: `req-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`)
-				: null;
+			const requestId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+				? crypto.randomUUID()
+				: `req-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
 			const response = await fetch(url, {
 				body: input.body === undefined ? undefined : JSON.stringify(input.body),
 				headers: {
+					"accept-encoding": "gzip",
 					authorization: `Bearer ${token}`,
 					"content-type": "application/json",
 					"x-remotecode-client-id": clientId,
-					...(requestId ? { "x-remotecode-request-id": requestId } : {}),
+					"x-remotecode-request-id": requestId,
 				},
 				method: input.method,
 			});
@@ -520,6 +547,31 @@ export const RemoteCodeApi = {
 					method: "GET",
 					path: "/providers/codex/models",
 				});
+			},
+
+			listMessagesPage: async (
+				chatId: string,
+				options?: { beforeMessageId?: string; limit?: number },
+			): Promise<MessagePageDTO> => {
+				const query = new URLSearchParams();
+				if (typeof options?.beforeMessageId === "string" && options.beforeMessageId.trim().length > 0) {
+					query.set("beforeMessageId", options.beforeMessageId.trim());
+				}
+				if (typeof options?.limit === "number" && Number.isFinite(options.limit) && options.limit > 0) {
+					query.set("limit", String(Math.floor(options.limit)));
+				}
+				const suffix = query.toString();
+				const payload = await request<RestListMessagesResponse>({
+					method: "GET",
+					path: suffix ? `/chats/${chatId}/messages?${suffix}` : `/chats/${chatId}/messages`,
+				});
+
+				return {
+					hasMore: payload.hasMore,
+					messages: payload.messages,
+					nextBeforeMessageId: payload.nextBeforeMessageId,
+					turns: payload.turns,
+				};
 			},
 
 			listMessages: async (chatId: string): Promise<MessageDTO[]> => {

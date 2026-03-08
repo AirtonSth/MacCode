@@ -1,7 +1,8 @@
-import type { ChatStreamEventPageDTO } from "../../types";
+import type { ChatStreamEventPageDTO, MessagePageDTO } from "../../types";
 import type { ChatRepository } from "../chat/chat.repository";
-import type { MessageListPage, MessageRepository } from "./message.repository";
+import type { MessageRepository } from "./message.repository";
 import type { ChatStreamEventRepositoryContract } from "../ws/chat-stream-event.repository";
+import type { ChatTurnSnapshotRepositoryContract } from "./chat-turn-snapshot.repository";
 
 const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
 	append: (chatId, event) => ({
@@ -11,14 +12,25 @@ const noopChatStreamEventRepository: ChatStreamEventRepositoryContract = {
 		event,
 		turnId: event.turnId,
 	}),
+	clearByChatId: () => {
+		// no-op
+	},
+	listAllByChatId: () => [],
 	listByChatId: () => [],
+};
+
+const noopChatTurnSnapshotRepository: ChatTurnSnapshotRepositoryContract = {
+	listByAnchorMessageIds: () => [],
+	upsertByAnchorMessageId: () => {
+		// no-op
+	},
 };
 
 export interface MessageServiceContract {
 	listByChatId: (
 		chatId: string,
 		options?: { beforeMessageId?: string; limit?: number },
-	) => Promise<{ chatExists: boolean } & MessageListPage>;
+	) => Promise<{ chatExists: boolean } & MessagePageDTO>;
 	listStreamEventsByChatId: (
 		chatId: string,
 		options?: { afterId?: number; limit?: number },
@@ -30,12 +42,13 @@ export class MessageService implements MessageServiceContract {
 		private readonly chatRepository: ChatRepository,
 		private readonly messageRepository: MessageRepository,
 		private readonly chatStreamEventRepository: ChatStreamEventRepositoryContract = noopChatStreamEventRepository,
+		private readonly chatTurnSnapshotRepository: ChatTurnSnapshotRepositoryContract = noopChatTurnSnapshotRepository,
 	) {}
 
 	async listByChatId(
 		chatId: string,
 		options?: { beforeMessageId?: string; limit?: number },
-	): Promise<{ chatExists: boolean } & MessageListPage> {
+	): Promise<{ chatExists: boolean } & MessagePageDTO> {
 		const chat = await this.chatRepository.findChatById(chatId);
 
 		if (!chat) {
@@ -44,14 +57,20 @@ export class MessageService implements MessageServiceContract {
 				hasMore: false,
 				messages: [],
 				nextBeforeMessageId: null,
+				turns: [],
 			};
 		}
 
 		const page = await this.messageRepository.listMessagesByChatId(chatId, options);
+		const turns = this.chatTurnSnapshotRepository.listByAnchorMessageIds(
+			chatId,
+			page.messages.map((message) => message.id),
+		);
 
 		return {
 			chatExists: true,
 			...page,
+			turns,
 		};
 	}
 
@@ -95,6 +114,12 @@ export const createMessageService = (repositories: {
 	chat: ChatRepository;
 	message: MessageRepository;
 	streamEvent?: ChatStreamEventRepositoryContract;
-}) => new MessageService(repositories.chat, repositories.message, repositories.streamEvent);
+	turnSnapshot?: ChatTurnSnapshotRepositoryContract;
+}) => new MessageService(
+	repositories.chat,
+	repositories.message,
+	repositories.streamEvent,
+	repositories.turnSnapshot,
+);
 
 export const createMessageServiceFromRepositories = createMessageService;

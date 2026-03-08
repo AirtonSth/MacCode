@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import type { ChatDTO, ServerWsEvent } from "../../types";
 import type { ChatRepository } from "../chat/chat.repository";
 import type { LiveActivityPushServiceContract } from "../live-activity/live-activity-push.model";
+import type { ChatTurnSnapshotRepositoryContract } from "../message/chat-turn-snapshot.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { CodexProviderRunnerContract } from "../provider/codex-provider-runner";
 import type { ProjectRepository } from "../project/project.repository";
@@ -958,6 +959,10 @@ test("WsService.startUserMessage forwards structured assistant_event payloads", 
 			event,
 			turnId: event.turnId,
 		}),
+		clearByChatId: () => {
+			// no-op
+		},
+		listAllByChatId: () => [],
 		listByChatId: () => [],
 	};
 
@@ -1090,6 +1095,289 @@ test("WsService.startUserMessage updates and clears persisted stream snapshots",
 		{ chatId: "chat-id", delta: "partial-2" },
 	]);
 	expect(snapshotCalls.clear).toEqual(["chat-id"]);
+});
+
+test("WsService.startUserMessage persists completed turn snapshots and clears raw stream events", async () => {
+	const chat = createChat();
+	const createdMessages: string[] = [];
+	const chatRepository = {
+		findChatById: () => chat,
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
+			...chat,
+			...update,
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (chatId: string, role: "user" | "assistant", content: string) => {
+			const id = role === "user" ? "message-user" : "message-assistant";
+			createdMessages.push(id);
+			return {
+				chatId,
+				content,
+				createdAt: new Date().toISOString(),
+				id,
+				role,
+			};
+		},
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({
+			onEvent,
+		}: {
+			onEvent: (event: ServerWsEvent["event"] extends never ? never : {
+				type: "turn_started" | "item_started" | "item_delta" | "item_completed" | "turn_completed";
+				turnId: string;
+				itemId?: string;
+				itemType?: "assistant_message" | "tool";
+				target?: "summary" | "body" | "output";
+				delta?: string;
+				summary?: string;
+				state?: "running" | "completed";
+			}) => void;
+		}) => {
+			onEvent({
+				type: "turn_started",
+				turnId: "turn-1",
+			});
+			onEvent({
+				type: "item_started",
+				turnId: "turn-1",
+				itemId: "assistant-item-1",
+				itemType: "assistant_message",
+				state: "running",
+				summary: "Writing response",
+			});
+			onEvent({
+				type: "item_delta",
+				turnId: "turn-1",
+				itemId: "assistant-item-1",
+				target: "body",
+				delta: "done",
+			});
+			onEvent({
+				type: "item_completed",
+				turnId: "turn-1",
+				itemId: "assistant-item-1",
+				summary: "Response completed",
+				state: "completed",
+			});
+			onEvent({
+				type: "turn_completed",
+				turnId: "turn-1",
+			});
+			return {
+				assistantText: "done",
+				diffAdded: 1,
+				diffRemoved: 0,
+				status: "completed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const persistedEvents: Array<{ chatId: string; event: Parameters<ChatStreamEventRepositoryContract["append"]>[1] }> = [];
+	const clearCalls: string[] = [];
+	const streamEvents: ChatStreamEventRepositoryContract = {
+		append: (chatId, event) => {
+			persistedEvents.push({ chatId, event });
+			return {
+				chatId,
+				createdAt: new Date().toISOString(),
+				event,
+				id: persistedEvents.length,
+				turnId: event.turnId,
+			};
+		},
+		clearByChatId: (chatId) => {
+			clearCalls.push(chatId);
+			for (let index = persistedEvents.length - 1; index >= 0; index -= 1) {
+				if (persistedEvents[index]?.chatId === chatId) {
+					persistedEvents.splice(index, 1);
+				}
+			}
+		},
+		listAllByChatId: (chatId) => persistedEvents
+			.filter((entry) => entry.chatId === chatId)
+			.map((entry, index) => ({
+				chatId,
+				createdAt: new Date(Date.now() + index).toISOString(),
+				event: entry.event,
+				id: index + 1,
+				turnId: entry.event.turnId,
+			})),
+		listByChatId: () => [],
+	};
+	const snapshotCalls: Array<{ anchorMessageId: string; chatId: string; turns: ReturnType<ChatTurnSnapshotRepositoryContract["listByAnchorMessageIds"]> }> = [];
+	const chatTurnSnapshots: ChatTurnSnapshotRepositoryContract = {
+		listByAnchorMessageIds: () => [],
+		upsertByAnchorMessageId: (chatId, anchorMessageId, turns) => {
+			snapshotCalls.push({ anchorMessageId, chatId, turns });
+		},
+	};
+
+	const service = new WsService(
+		chatRepository,
+		messageRepository,
+		projectRepository,
+		runner,
+		undefined,
+		undefined,
+		streamEvents,
+		undefined,
+		chatTurnSnapshots,
+	);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(createdMessages).toEqual(["message-user", "message-assistant"]);
+	expect(snapshotCalls).toHaveLength(1);
+	expect(snapshotCalls[0]?.chatId).toBe("chat-id");
+	expect(snapshotCalls[0]?.anchorMessageId).toBe("message-assistant");
+	expect(snapshotCalls[0]?.turns.map((turn) => turn.turnId)).toEqual(["turn-1"]);
+	expect(clearCalls).toEqual(["chat-id", "chat-id"]);
+	expect(persistedEvents).toEqual([]);
+});
+
+test("WsService.startUserMessage persists cancelled turn snapshots against the user message and clears raw stream events", async () => {
+	const chat = createChat();
+	const chatRepository = {
+		findChatById: () => chat,
+		findProviderThreadIdByChatId: () => null,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
+			...chat,
+			...update,
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: (chatId: string, role: "user" | "assistant", content: string) => ({
+			chatId,
+			content,
+			createdAt: new Date().toISOString(),
+			id: role === "user" ? "message-user" : "message-assistant",
+			role,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({ createdAt: "", id: "project-id", isFavorite: false, name: "p", path: "/tmp", updatedAt: "" }),
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async ({
+			onEvent,
+		}: {
+			onEvent: (event: {
+				type: "turn_started" | "item_started";
+				turnId: string;
+				itemId?: string;
+				itemType?: "tool";
+				summary?: string;
+				state?: "running";
+			}) => void;
+		}) => {
+			onEvent({
+				type: "turn_started",
+				turnId: "turn-cancelled",
+			});
+			onEvent({
+				type: "item_started",
+				turnId: "turn-cancelled",
+				itemId: "tool-cancelled",
+				itemType: "tool",
+				state: "running",
+				summary: "Stopping run",
+			});
+			return {
+				assistantText: "",
+				cancelled: true,
+				diffAdded: 0,
+				diffRemoved: 0,
+				error: "cancelled",
+				status: "failed" as const,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const persistedEvents: Array<{ chatId: string; event: Parameters<ChatStreamEventRepositoryContract["append"]>[1] }> = [];
+	const clearCalls: string[] = [];
+	const streamEvents: ChatStreamEventRepositoryContract = {
+		append: (chatId, event) => {
+			persistedEvents.push({ chatId, event });
+			return {
+				chatId,
+				createdAt: new Date().toISOString(),
+				event,
+				id: persistedEvents.length,
+				turnId: event.turnId,
+			};
+		},
+		clearByChatId: (chatId) => {
+			clearCalls.push(chatId);
+			for (let index = persistedEvents.length - 1; index >= 0; index -= 1) {
+				if (persistedEvents[index]?.chatId === chatId) {
+					persistedEvents.splice(index, 1);
+				}
+			}
+		},
+		listAllByChatId: (chatId) => persistedEvents
+			.filter((entry) => entry.chatId === chatId)
+			.map((entry, index) => ({
+				chatId,
+				createdAt: new Date(Date.now() + index).toISOString(),
+				event: entry.event,
+				id: index + 1,
+				turnId: entry.event.turnId,
+			})),
+		listByChatId: () => [],
+	};
+	const snapshotCalls: Array<{ anchorMessageId: string; chatId: string; turns: ReturnType<ChatTurnSnapshotRepositoryContract["listByAnchorMessageIds"]> }> = [];
+	const chatTurnSnapshots: ChatTurnSnapshotRepositoryContract = {
+		listByAnchorMessageIds: () => [],
+		upsertByAnchorMessageId: (chatId, anchorMessageId, turns) => {
+			snapshotCalls.push({ anchorMessageId, chatId, turns });
+		},
+	};
+
+	const service = new WsService(
+		chatRepository,
+		messageRepository,
+		projectRepository,
+		runner,
+		undefined,
+		undefined,
+		streamEvents,
+		undefined,
+		chatTurnSnapshots,
+	);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(snapshotCalls).toHaveLength(1);
+	expect(snapshotCalls[0]?.anchorMessageId).toBe("message-user");
+	expect(snapshotCalls[0]?.turns.map((turn) => turn.turnId)).toEqual(["turn-cancelled"]);
+	expect(clearCalls).toEqual(["chat-id", "chat-id"]);
+	expect(persistedEvents).toEqual([]);
+	expect(collector.events).toContainEqual({
+		data: {
+			chatId: "chat-id",
+			code: "chat_cancelled",
+			message: "chat run cancelled",
+		},
+		event: "error",
+	});
 });
 
 test("WsService.stopRunningChat clears stale active state when chat is not running in runtime", async () => {

@@ -172,10 +172,13 @@ export const ChatScreen = () => {
 		isLoaded,
 		isChatsLoading,
 		isLoadingOlderMessages,
+		latestMessagesDirty,
 		isMessagesLoading,
 		isSending,
 		isStopping,
+		isViewingOlderMessages,
 		lastError,
+		loadLatestMessages,
 		loadOlderMessages,
 		selectedModel,
 		messages,
@@ -450,6 +453,11 @@ export const ChatScreen = () => {
 	}, [activeModel, availableReasoningEfforts, selectedReasoningEffort, setSelectedReasoningEffort]);
 
 	useEffect(() => {
+		if (isViewingOlderMessages) {
+			previousLastMessageIdRef.current = messages.at(-1)?.id ?? null;
+			return;
+		}
+
 		const nextLastMessageId = messages.at(-1)?.id ?? null;
 		const previousLastMessageId = previousLastMessageIdRef.current;
 		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
@@ -458,7 +466,7 @@ export const ChatScreen = () => {
 			messageScrollRef.current?.scrollToEnd({ animated: true });
 		}
 		previousLastMessageIdRef.current = nextLastMessageId;
-	}, [hasStreamingText, messages, streamingTurn]);
+	}, [hasStreamingText, isViewingOlderMessages, messages, streamingTurn]);
 
 	useEffect(() => {
 		setShowRunDetails(false);
@@ -641,15 +649,22 @@ export const ChatScreen = () => {
 	]);
 
 	const handleMessageScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
-		if (!hasOlderMessages || isLoadingOlderMessages) {
+		const threshold = 32;
+		if (hasOlderMessages && !isLoadingOlderMessages && event.nativeEvent.contentOffset.y <= threshold) {
+			void loadOlderMessages();
 			return;
 		}
 
-		const threshold = 32;
-		if (event.nativeEvent.contentOffset.y <= threshold) {
-			void loadOlderMessages();
+		const {
+			contentOffset,
+			contentSize,
+			layoutMeasurement,
+		} = event.nativeEvent;
+		const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+		if (isViewingOlderMessages && distanceFromBottom <= threshold) {
+			void loadLatestMessages();
 		}
-	}, [hasOlderMessages, isLoadingOlderMessages, loadOlderMessages]);
+	}, [hasOlderMessages, isLoadingOlderMessages, isViewingOlderMessages, loadLatestMessages, loadOlderMessages]);
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1127,6 +1142,7 @@ export const ChatScreen = () => {
 				<View
 					key={message.id}
 					style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAssistant]}
+					testID={`chat-message-row-${message.id}`}
 				>
 					{isUser ? (
 						<View style={[styles.messageBubble, styles.userBubble]}>
@@ -1300,7 +1316,7 @@ export const ChatScreen = () => {
 					<ScrollView
 						contentContainerStyle={styles.messagesContent}
 						contentInsetAdjustmentBehavior="automatic"
-						maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+						maintainVisibleContentPosition={isViewingOlderMessages ? undefined : { minIndexForVisible: 0 }}
 						onScroll={handleMessageScroll}
 						ref={messageScrollRef}
 						scrollEventThrottle={16}
@@ -1308,6 +1324,9 @@ export const ChatScreen = () => {
 						style={styles.messages}
 						testID="chat-message-list"
 					>
+						<View testID="chat-message-window-mode">
+							<Text style={styles.visuallyHidden}>{isViewingOlderMessages ? "older" : "latest"}</Text>
+						</View>
 						{shouldShowMessagesLoading ? (
 							<View style={styles.messagesLoading} testID="chat-messages-loading">
 								<ActivityIndicator color={palette.accent} size="small" />
@@ -1322,8 +1341,14 @@ export const ChatScreen = () => {
 						) : null}
 
 						{isLoadingOlderMessages ? (
-							<View style={styles.olderMessagesLoading}>
+							<View style={styles.olderMessagesLoading} testID="chat-older-messages-loading">
 								<ActivityIndicator color={palette.accent} size="small" />
+							</View>
+						) : null}
+
+						{isViewingOlderMessages && latestMessagesDirty ? (
+							<View style={styles.latestDirtyBanner} testID="chat-latest-dirty-indicator">
+								<Text style={styles.latestDirtyBannerText}>Newer messages available</Text>
 							</View>
 						) : null}
 
@@ -1423,6 +1448,8 @@ export const ChatScreen = () => {
 					/>
 
 						<Pressable
+							accessibilityLabel={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
+							accessibilityRole="button"
 							disabled={selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled}
 							onPress={() => {
 								if (selectedChatIsRunning) {
@@ -2567,6 +2594,21 @@ const styles = StyleSheet.create({
 		paddingBottom: 6,
 		paddingTop: 2,
 	},
+	latestDirtyBanner: {
+		alignSelf: "flex-start",
+		backgroundColor: "rgba(99,200,255,0.12)",
+		borderColor: "rgba(99,200,255,0.4)",
+		borderRadius: 999,
+		borderWidth: 1,
+		marginBottom: 2,
+		paddingHorizontal: 10,
+		paddingVertical: 5,
+	},
+	latestDirtyBannerText: {
+		color: palette.accent,
+		fontSize: 12,
+		fontWeight: "600",
+	},
 	messagesLoadingLabel: {
 		color: palette.muted,
 		fontSize: 13,
@@ -2626,6 +2668,14 @@ const styles = StyleSheet.create({
 	root: {
 		backgroundColor: palette.background,
 		flex: 1,
+	},
+	visuallyHidden: {
+		height: 1,
+		left: -10_000,
+		opacity: 0,
+		position: "absolute",
+		top: 0,
+		width: 1,
 	},
 	secondaryAction: {
 		alignItems: "center",

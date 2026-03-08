@@ -42,6 +42,7 @@ test("message service preserves ascending order by createdAt", async () => {
 		expect(result.messages).toHaveLength(2);
 		expect(result.messages[0].content).toBe("a");
 		expect(result.messages[1].content).toBe("b");
+		expect(result.turns).toEqual([]);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

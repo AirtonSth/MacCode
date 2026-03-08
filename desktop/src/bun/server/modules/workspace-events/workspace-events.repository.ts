@@ -1,4 +1,4 @@
-import { asc, desc, gt } from "drizzle-orm";
+import { asc, desc, gt, lt } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { workspaceEvents } from "../../shared/db/db.schema";
@@ -11,6 +11,7 @@ import type {
 
 const DEFAULT_LIST_LIMIT = 500;
 const MAX_LIST_LIMIT = 5_000;
+const WORKSPACE_EVENT_RETENTION_LIMIT = 2_000;
 
 const normalizeLimit = (limit: number | undefined): number => {
 	if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) {
@@ -73,6 +74,14 @@ export class WorkspaceEventsRepository implements WorkspaceEventRepositoryContra
 
 		if (!insertResult) {
 			throw new Error("failed to persist workspace event");
+		}
+
+		if (insertResult.seq > WORKSPACE_EVENT_RETENTION_LIMIT) {
+			const firstRetainedSeq = insertResult.seq - WORKSPACE_EVENT_RETENTION_LIMIT + 1;
+			this.database
+				.delete(workspaceEvents)
+				.where(lt(workspaceEvents.seq, firstRetainedSeq))
+				.run();
 		}
 
 		return WorkspaceEventsRepository.toEnvelope(insertResult);

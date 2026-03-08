@@ -102,6 +102,19 @@ export const chatStreamEvents = sqliteTable("chat_stream_events", {
 	createdAt: text("createdAt").notNull(),
 });
 
+export const chatTurnSnapshots = sqliteTable("chat_turn_snapshots", {
+	turnId: text("turnId").primaryKey(),
+	chatId: text("chatId")
+		.notNull()
+		.references(() => chats.id, { onDelete: "cascade" }),
+	anchorMessageId: text("anchorMessageId")
+		.notNull()
+		.references(() => messages.id, { onDelete: "cascade" }),
+	payloadJson: text("payloadJson").notNull(),
+	createdAt: text("createdAt").notNull(),
+	updatedAt: text("updatedAt").notNull(),
+});
+
 export const serverMetadata = sqliteTable("server_metadata", {
 	key: text("key").primaryKey(),
 	value: text("value").notNull(),
@@ -143,6 +156,7 @@ export type TerminalEntryRow = typeof terminalEntries.$inferSelect;
 export type WorkspaceEventRow = typeof workspaceEvents.$inferSelect;
 export type ChatStreamSnapshotRow = typeof chatStreamSnapshots.$inferSelect;
 export type ChatStreamEventRow = typeof chatStreamEvents.$inferSelect;
+export type ChatTurnSnapshotRow = typeof chatTurnSnapshots.$inferSelect;
 export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
 export type LiveActivitySubscriptionRow = typeof liveActivitySubscriptions.$inferSelect;
 
@@ -164,6 +178,8 @@ export class DatabaseSchema {
 	static readonly chatStreamSnapshots = chatStreamSnapshots;
 
 	static readonly chatStreamEvents = chatStreamEvents;
+
+	static readonly chatTurnSnapshots = chatTurnSnapshots;
 
 	static readonly serverMetadata = serverMetadata;
 

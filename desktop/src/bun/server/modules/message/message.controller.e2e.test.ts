@@ -203,6 +203,112 @@ test("GET /v1/chats/:id/messages supports cursor pagination keeping ascending or
 	}
 });
 
+test("GET /v1/chats/:id/messages returns turn snapshots for only the visible page", async () => {
+	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
+	const database = new Database(databasePath);
+	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-message-turn-page-"));
+
+	const createTurnPayload = (turnId: string, summary: string) => ({
+		finishedAtMs: 2,
+		itemOrder: ["item-1"],
+		itemsById: {
+			"item-1": {
+				body: "",
+				expandedByUser: false,
+				finishedAtMs: 2,
+				id: "item-1",
+				isExpanded: false,
+				output: "",
+				startedAtMs: 1,
+				state: "collapsed",
+				summary,
+				type: "tool",
+			},
+		},
+		startedAtMs: 1,
+		status: "completed",
+		turnId,
+	});
+
+	try {
+		const project = await client.v1.projects.post({ path: workspaceRoot });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "message-turn-page" });
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		for (let index = 1; index <= 12; index += 1) {
+			const messageId = `message-${String(index).padStart(2, "0")}`;
+			const createdAt = `2026-01-01T00:00:${String(index).padStart(2, "0")}.000Z`;
+			database
+				.prepare("INSERT INTO messages (id, chatId, role, content, createdAt) VALUES (?, ?, ?, ?, ?)")
+				.run(messageId, chatId, index % 2 === 0 ? "assistant" : "user", `content-${String(index)}`, createdAt);
+		}
+
+		database
+			.prepare(
+				"INSERT INTO chat_turn_snapshots (turnId, chatId, anchorMessageId, payloadJson, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				"turn-01",
+				chatId,
+				"message-01",
+				JSON.stringify(createTurnPayload("turn-01", "oldest page")),
+				"2026-01-01T00:00:01.000Z",
+				"2026-01-01T00:00:01.000Z",
+			);
+		database
+			.prepare(
+				"INSERT INTO chat_turn_snapshots (turnId, chatId, anchorMessageId, payloadJson, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				"turn-09",
+				chatId,
+				"message-09",
+				JSON.stringify(createTurnPayload("turn-09", "visible page first")),
+				"2026-01-01T00:00:09.000Z",
+				"2026-01-01T00:00:09.000Z",
+			);
+		database
+			.prepare(
+				"INSERT INTO chat_turn_snapshots (turnId, chatId, anchorMessageId, payloadJson, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				"turn-12",
+				chatId,
+				"message-12",
+				JSON.stringify(createTurnPayload("turn-12", "visible page last")),
+				"2026-01-01T00:00:12.000Z",
+				"2026-01-01T00:00:12.000Z",
+			);
+
+		const response = await fetch(`${baseUrl}/v1/chats/${chatId}/messages?limit=5`, {
+			headers: {
+				authorization: "Bearer local-dev-token",
+			},
+		});
+		const payload = await response.json() as {
+			messages: Array<{ id: string }>;
+			turns: Array<{ turnId: string; itemsById: Record<string, { summary: string }> }>;
+		};
+
+		expect(response.status).toBe(200);
+		expect(payload.messages.map((message) => message.id)).toEqual([
+			"message-08",
+			"message-09",
+			"message-10",
+			"message-11",
+			"message-12",
+		]);
+		expect(payload.turns.map((turn) => turn.turnId)).toEqual(["turn-09", "turn-12"]);
+		expect(payload.turns[0]?.itemsById["item-1"]?.summary).toBe("visible page first");
+		expect(payload.turns[1]?.itemsById["item-1"]?.summary).toBe("visible page last");
+	} finally {
+		database.close();
+		rmSync(workspaceRoot, { force: true, recursive: true });
+		await cleanup();
+	}
+});
+
 test("GET /v1/chats/:id/messages responds with gzip when accepted by client", async () => {
 	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
 	const database = new Database(databasePath);

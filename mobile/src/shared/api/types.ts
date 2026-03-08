@@ -61,10 +61,33 @@ export interface MessageDTO {
 	createdAt: string;
 }
 
+export interface ChatTurnItemDTO {
+	body: string;
+	expandedByUser: boolean;
+	finishedAtMs: number | null;
+	id: string;
+	isExpanded: boolean;
+	output: string;
+	startedAtMs: number;
+	state: AssistantStreamItemState;
+	summary: string;
+	type: AssistantStreamItemType;
+}
+
+export interface ChatTurnDTO {
+	finishedAtMs: number | null;
+	itemOrder: string[];
+	itemsById: Record<string, ChatTurnItemDTO>;
+	startedAtMs: number;
+	status: "running" | "completed" | "failed";
+	turnId: string;
+}
+
 export interface MessagePageDTO {
-	messages: MessageDTO[];
 	hasMore: boolean;
+	messages: MessageDTO[];
 	nextBeforeMessageId: string | null;
+	turns: ChatTurnDTO[];
 }
 
 export interface ChatStreamEventDTO {

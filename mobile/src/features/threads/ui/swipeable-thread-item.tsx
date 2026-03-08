@@ -75,9 +75,9 @@ export const SwipeableThreadItem = ({
 				isWorking ? styles.listRowWorking : null,
 				pressed ? styles.listRowPressed : null,
 			]}
-			testID={rowTestID}
+			testID={`thread-item-chat-${chat.id}`}
 		>
-			<View style={styles.rowContent}>
+			<View style={styles.rowContent} testID={rowTestID}>
 				<View style={styles.rowMain}>
 					{isWorking ? (
 						<View style={styles.rowLeading} testID={`thread-item-status-${String(index)}`}>

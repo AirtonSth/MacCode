@@ -51,7 +51,10 @@ export const WorkspaceScreen = () => {
 		isLoadingOlderMessages,
 		isLoaded,
 		isSending,
+		isViewingOlderMessages,
+		latestMessagesDirty,
 		lastError,
+		loadLatestMessages,
 		loadOlderMessages,
 		messages,
 		permissionMode,
@@ -110,6 +113,11 @@ export const WorkspaceScreen = () => {
 	}, [isWide]);
 
 	useEffect(() => {
+		if (isViewingOlderMessages) {
+			previousLastMessageIdRef.current = messages.at(-1)?.id ?? null;
+			return;
+		}
+
 		const nextLastMessageId = messages.at(-1)?.id ?? null;
 		const previousLastMessageId = previousLastMessageIdRef.current;
 		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
@@ -118,21 +126,29 @@ export const WorkspaceScreen = () => {
 			messagesScrollRef.current?.scrollToEnd({ animated: true });
 		}
 		previousLastMessageIdRef.current = nextLastMessageId;
-	}, [messages, streamingText, streamingTurn]);
+	}, [isViewingOlderMessages, messages, streamingText, streamingTurn]);
 
 	useEffect(() => {
 		previousLastMessageIdRef.current = null;
 	}, [selectedChatId]);
 
 	const handleMessagesScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
-		if (!hasOlderMessages || isLoadingOlderMessages) {
+		const threshold = 32;
+		if (hasOlderMessages && !isLoadingOlderMessages && event.nativeEvent.contentOffset.y <= threshold) {
+			void loadOlderMessages();
 			return;
 		}
 
-		if (event.nativeEvent.contentOffset.y <= 32) {
-			void loadOlderMessages();
+		const {
+			contentOffset,
+			contentSize,
+			layoutMeasurement,
+		} = event.nativeEvent;
+		const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+		if (isViewingOlderMessages && distanceFromBottom <= threshold) {
+			void loadLatestMessages();
 		}
-	}, [hasOlderMessages, isLoadingOlderMessages, loadOlderMessages]);
+	}, [hasOlderMessages, isLoadingOlderMessages, isViewingOlderMessages, loadLatestMessages, loadOlderMessages]);
 
 	const handleSend = async () => {
 		const text = input.trim();
@@ -766,18 +782,52 @@ export const WorkspaceScreen = () => {
 
 						<ScrollView
 							contentInsetAdjustmentBehavior="automatic"
-							maintainVisibleContentPosition={{ minIndexForVisible: 0 }}
+							maintainVisibleContentPosition={isViewingOlderMessages ? undefined : { minIndexForVisible: 0 }}
 							onScroll={handleMessagesScroll}
 							ref={messagesScrollRef}
 							scrollEventThrottle={16}
 							style={{ flex: 1 }}
+							testID="workspace-chat-message-list"
 						>
+							<View testID="workspace-chat-message-window-mode">
+								<Text
+									style={{
+										height: 1,
+										left: -10_000,
+										opacity: 0,
+										position: "absolute",
+										top: 0,
+										width: 1,
+									}}
+								>
+									{isViewingOlderMessages ? "older" : "latest"}
+								</Text>
+							</View>
 							{!isLoaded ? (
 								<Text style={{ color: theme.colors.textSecondary }}>Loading workspace...</Text>
 							) : null}
 							{isLoadingOlderMessages ? (
-								<View style={{ alignItems: "center", paddingVertical: 6 }}>
+								<View style={{ alignItems: "center", paddingVertical: 6 }} testID="workspace-chat-older-messages-loading">
 									<ActivityIndicator color={theme.colors.accent} size="small" />
+								</View>
+							) : null}
+							{isViewingOlderMessages && latestMessagesDirty ? (
+								<View
+									style={{
+										alignSelf: "flex-start",
+										backgroundColor: "rgba(76,154,255,0.12)",
+										borderColor: "rgba(76,154,255,0.38)",
+										borderRadius: theme.borderRadius.chip,
+										borderWidth: 1,
+										marginBottom: 8,
+										paddingHorizontal: 10,
+										paddingVertical: 5,
+									}}
+									testID="workspace-chat-latest-dirty-indicator"
+								>
+									<Text style={{ color: theme.colors.accent, fontSize: 12, fontWeight: "600" }}>
+										Newer messages available
+									</Text>
 								</View>
 							) : null}
 							{messages.map((message) => (
@@ -787,6 +837,7 @@ export const WorkspaceScreen = () => {
 										alignItems: message.role === "user" ? "flex-end" : "flex-start",
 										marginBottom: 10,
 									}}
+									testID={`workspace-chat-message-row-${message.id}`}
 								>
 									<View
 										style={{

@@ -2,6 +2,7 @@ import type {
 	AssistantStreamEvent,
 	AssistantStreamItemState,
 	AssistantStreamItemType,
+	ChatTurnDTO,
 } from "../../../shared/api/types";
 
 export interface StreamItem {
@@ -55,6 +56,22 @@ export const cloneTurn = (turn: StreamTurnState): StreamTurnState => ({
 	itemsById: { ...turn.itemsById },
 	itemOrder: Array.from(turn.itemOrder),
 });
+
+export const mapChatTurnToStreamTurn = (turn: ChatTurnDTO): StreamTurnState => ({
+	...turn,
+	itemOrder: Array.from(turn.itemOrder),
+	itemsById: Object.fromEntries(
+		Object.entries(turn.itemsById).map(([itemId, item]) => [
+			itemId,
+			{
+				...item,
+			},
+		]),
+	),
+});
+
+export const mapChatTurnsToStreamTurns = (turns: ChatTurnDTO[]): StreamTurnState[] =>
+	turns.map(mapChatTurnToStreamTurn);
 
 const ensureTurnForEvent = (
 	currentTurn: StreamTurnState | null,

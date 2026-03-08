@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
@@ -7,9 +7,8 @@ import { useChatContextQuery } from "../api/use-chat-context-query";
 import { useCreateChatMutation } from "../api/use-create-chat-mutation";
 import { useDeleteChatMutation } from "../api/use-delete-chat-mutation";
 import {
-	appendMessageToMessagePages,
+	appendMessageToMessagePage,
 	MESSAGE_PAGE_SIZE,
-	replaceNewestMessagePage,
 	useMessagesQuery,
 } from "../api/use-messages-query";
 import { useUpdateWorkspaceSelectionMutation } from "../../settings/api/use-update-workspace-selection-mutation";
@@ -54,7 +53,7 @@ import {
 } from "../../../shared/notifications/local-notifications";
 import {
 	applyAssistantEventToTurn,
-	cloneTurn,
+	mapChatTurnsToStreamTurns,
 	setStreamItemExpanded as updateStreamItemExpanded,
 	setStreamItemState as updateStreamItemState,
 	type StreamTurnState,
@@ -69,65 +68,6 @@ interface UseWorkspaceShellOptions {
 }
 
 type AssistantEventPayload = Extract<ServerWsEvent, { event: "assistant_event" }>["data"]["event"];
-
-const upsertTurnHistory = (turns: StreamTurnState[] | undefined, turn: StreamTurnState): StreamTurnState[] => {
-	const current = turns ?? [];
-	const index = current.findIndex((item) => item.turnId === turn.turnId);
-	if (index === -1) {
-		return [...current, turn];
-	}
-
-	const next = Array.from(current);
-	next[index] = turn;
-	return next;
-};
-
-const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
-	const nextTurn = cloneTurn(turn);
-	for (const itemId of nextTurn.itemOrder) {
-		const item = nextTurn.itemsById[itemId];
-		if (!item) {
-			continue;
-		}
-		nextTurn.itemsById[itemId] = {
-			...item,
-			state: item.state === "failed" || item.state === "cancelled" ? item.state : "collapsed",
-			isExpanded: false,
-			expandedByUser: false,
-		};
-	}
-
-	return nextTurn;
-};
-
-const applyAssistantEventToHistory = (
-	turns: StreamTurnState[] | undefined,
-	event: AssistantEventPayload,
-): StreamTurnState[] => {
-	const current = turns ?? [];
-	const existingTurn = current.find((item) => item.turnId === event.turnId) ?? null;
-	let nextTurn = applyAssistantEventToTurn(existingTurn, event);
-	if (event.type === "item_completed") {
-		const completedItem = nextTurn.itemsById[event.itemId];
-		const isResponseCompletedSummary =
-			typeof event.summary === "string" && event.summary.toLowerCase().includes("response completed");
-		if (completedItem?.type === "assistant_message" || isResponseCompletedSummary) {
-			nextTurn = collapseTurnItems(nextTurn);
-		}
-	}
-	if (event.type === "turn_completed") {
-		nextTurn = collapseTurnItems(nextTurn);
-	}
-	return upsertTurnHistory(current, nextTurn);
-};
-
-const replayAssistantEventsIntoTurns = (events: ChatStreamEventDTO[]): StreamTurnState[] => {
-	let turns: StreamTurnState[] = [];
-	for (const entry of events) {
-		turns = applyAssistantEventToHistory(turns, entry.event);
-	}
-	return turns;
-};
 
 const toLiveActivityFallbackText = (itemType: AssistantStreamItemType): string => {
 	switch (itemType) {
@@ -417,6 +357,55 @@ const toChatDtoFromThreadSummary = (
 	updatedAt: chat.updatedAt,
 });
 
+type ThreadListChatEntry =
+	| ChatDTO
+	| { id: string; isActive?: boolean; title: string; updatedAt: string };
+
+const sortThreadListChatEntries = <T extends ThreadListChatEntry>(entries: T[]): T[] => (
+	Array.from(entries).sort(
+		(left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+	)
+);
+
+const moveChatToFrontOfThreadList = (
+	currentEntries: ThreadListChatEntry[] | undefined,
+	nextChat: { id: string; isActive: boolean; title: string; updatedAt: string },
+	projectId: string | null,
+): ThreadListChatEntry[] | undefined => {
+	if (!currentEntries) {
+		return currentEntries;
+	}
+
+	const existingEntry = currentEntries.find((entry) => entry.id === nextChat.id);
+	const updatedEntry: ThreadListChatEntry = (() => {
+		if (existingEntry) {
+			if ("projectId" in existingEntry) {
+				return {
+					...existingEntry,
+					isActive: nextChat.isActive,
+					status: nextChat.isActive ? "running" : existingEntry.status,
+					title: nextChat.title,
+					updatedAt: nextChat.updatedAt,
+				};
+			}
+
+			return {
+				...existingEntry,
+				isActive: nextChat.isActive,
+				title: nextChat.title,
+				updatedAt: nextChat.updatedAt,
+			};
+		}
+
+		return projectId ? toChatDtoFromThreadSummary(nextChat, projectId) : nextChat;
+	})();
+
+	return sortThreadListChatEntries([
+		updatedEntry,
+		...currentEntries.filter((entry) => entry.id !== nextChat.id),
+	]);
+};
+
 export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const queryClient = useQueryClient();
 	const { config } = useApiConfig();
@@ -446,7 +435,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(initialSelection.selectedProjectId);
 	const [selectedChatId, setSelectedChatId] = useState<string | null>(initialSelection.selectedChatId);
 	const [streamingTextByChat, setStreamingTextByChat] = useState<Record<string, string>>({});
-	const [streamHistoryByChat, setStreamHistoryByChat] = useState<Record<string, StreamTurnState[]>>({});
+	const [messageWindowModeByChat, setMessageWindowModeByChat] = useState<Record<string, "latest" | "older">>({});
+	const [latestDirtyByChat, setLatestDirtyByChat] = useState<Record<string, boolean>>({});
 	const [stoppingByChat, setStoppingByChat] = useState<Record<string, boolean>>({});
 	const [permissionMode, setPermissionMode] = useState<string>(initialSelection.permissionMode);
 	const [selectedModel, setSelectedModel] = useState<string | null>(initialSelection.selectedModel);
@@ -457,6 +447,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
 	const selectedChatIdRef = useRef<string | null>(selectedChatId);
+	const previousSelectedChatIdRef = useRef<string | null>(selectedChatId);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const pendingCompletionNotificationChatIdsRef = useRef<Set<string>>(new Set());
 	const lastSendAttemptChatIdRef = useRef<string | null>(null);
@@ -489,6 +480,37 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const messagesQuery = useMessagesQuery(shouldEnableMessagesQuery ? selectedChatId : null, {
 		enabled: shouldEnableMessagesQuery,
 	});
+	const loadOlderMessages = useCallback(async (): Promise<void> => {
+		if (!selectedChatId) {
+			return;
+		}
+
+		await messagesQuery.loadOlderMessages();
+		setMessageWindowModeByChat((current) => ({
+			...current,
+			[selectedChatId]: "older",
+		}));
+		queryClient.setQueryData<StreamTurnState | null>(queryKeys.streamTurn(selectedChatId), null);
+		setStreamingTextByChat((current) => ({
+			...current,
+			[selectedChatId]: "",
+		}));
+	}, [messagesQuery, queryClient, selectedChatId]);
+	const loadLatestMessages = useCallback(async (): Promise<void> => {
+		if (!selectedChatId) {
+			return;
+		}
+
+		await messagesQuery.loadLatestMessages();
+		setMessageWindowModeByChat((current) => ({
+			...current,
+			[selectedChatId]: "latest",
+		}));
+		setLatestDirtyByChat((current) => ({
+			...current,
+			[selectedChatId]: false,
+		}));
+	}, [messagesQuery, selectedChatId]);
 	const selectionQuery = useWorkspaceSelectionQuery({
 		enabled: shouldEnableSelectionQuery,
 	});
@@ -601,6 +623,98 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	useEffect(() => {
 		selectedChatIdRef.current = selectedChatId;
 	}, [selectedChatId]);
+
+	useEffect(() => {
+		const previousChatId = previousSelectedChatIdRef.current;
+			if (previousChatId && previousChatId !== selectedChatId) {
+				queryClient.removeQueries({
+					exact: true,
+					queryKey: queryKeys.messages(previousChatId),
+				});
+				queryClient.removeQueries({
+					exact: true,
+					queryKey: queryKeys.streamTurn(previousChatId),
+				});
+				lastAssistantEventIdByChatRef.current = omitRecordKey(
+					lastAssistantEventIdByChatRef.current,
+					previousChatId,
+				);
+				structuredLiveActivityPreviewByChatRef.current = omitRecordKey(
+					structuredLiveActivityPreviewByChatRef.current,
+					previousChatId,
+				);
+				setStreamingTextByChat((current) => {
+					if (!(previousChatId in current)) {
+						return current;
+				}
+
+				const { [previousChatId]: ignored, ...next } = current;
+				void ignored;
+				return next;
+			});
+			setSendingByChat((current) => {
+				if (!(previousChatId in current)) {
+					return current;
+				}
+
+				const { [previousChatId]: ignored, ...next } = current;
+				void ignored;
+				return next;
+			});
+			setStoppingByChat((current) => {
+				if (!(previousChatId in current)) {
+					return current;
+				}
+
+				const { [previousChatId]: ignored, ...next } = current;
+				void ignored;
+				return next;
+			});
+			setMessageWindowModeByChat((current) => {
+				if (!(previousChatId in current)) {
+					return current;
+				}
+
+				const { [previousChatId]: ignored, ...next } = current;
+				void ignored;
+				return next;
+			});
+			setLatestDirtyByChat((current) => {
+				if (!(previousChatId in current)) {
+					return current;
+				}
+
+				const { [previousChatId]: ignored, ...next } = current;
+				void ignored;
+				return next;
+			});
+		}
+
+		if (selectedChatId) {
+			setMessageWindowModeByChat((current) => ({
+				...current,
+				[selectedChatId]: current[selectedChatId] ?? "latest",
+			}));
+			setLatestDirtyByChat((current) => ({
+				...current,
+				[selectedChatId]: current[selectedChatId] ?? false,
+			}));
+		}
+
+		previousSelectedChatIdRef.current = selectedChatId;
+	}, [queryClient, selectedChatId]);
+
+	const isViewingLatestMessages = useCallback(
+		(chatId: string): boolean => (messageWindowModeByChat[chatId] ?? "latest") === "latest",
+		[messageWindowModeByChat],
+	);
+
+	const markLatestMessagesDirty = useCallback((chatId: string) => {
+		setLatestDirtyByChat((current) => ({
+			...current,
+			[chatId]: true,
+		}));
+	}, []);
 
 	const resolveChatTitle = useCallback(
 		(chatId: string): string | undefined => {
@@ -986,6 +1100,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const syncMissedAssistantEventsForChat = useCallback(
 		async (chatId: string) => {
+			if (!isViewingLatestMessages(chatId)) {
+				markLatestMessagesDirty(chatId);
+				return;
+			}
+
 			const collectEvents = async (
 				afterId: number,
 				accumulator: ChatStreamEventDTO[],
@@ -1012,38 +1131,26 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					structuredLiveActivityPreviewByChatRef.current[chatId] = true;
 
 					let latestTurn = queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(chatId)) ?? null;
-				for (const entry of events) {
-					latestTurn = applyAssistantEventToTurn(latestTurn, entry.event);
-				}
-
-				setStreamHistoryByChat((current) => {
-					let nextTurns = current[chatId] ?? [];
 					let appliedAnyEvent = false;
-
 					for (const entry of events) {
 						const lastAppliedEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
 						if (entry.id <= lastAppliedEventId) {
 							continue;
 						}
 
-						nextTurns = applyAssistantEventToHistory(nextTurns, entry.event);
+						latestTurn = applyAssistantEventToTurn(latestTurn, entry.event);
 						lastAssistantEventIdByChatRef.current[chatId] = entry.id;
 						appliedAnyEvent = true;
 					}
 
 					if (!appliedAnyEvent) {
-						return current;
+						return;
 					}
 
 					queryClient.setQueryData<StreamTurnState | null>(
 						queryKeys.streamTurn(chatId),
-						nextTurns.at(-1) ?? null,
+						latestTurn,
 					);
-					return {
-						...current,
-						[chatId]: nextTurns,
-					};
-				});
 				const isBackgroundAppState = appStateRef.current === "background" || appStateRef.current === "inactive";
 				const latestEvent = events.at(-1)?.event;
 				const latestStatusLine = latestEvent ? toLiveActivityStatusLineFromEvent(latestEvent) : undefined;
@@ -1058,7 +1165,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
 			}
 		},
-		[client, queryClient, updateRunningLiveActivity],
+		[client, isViewingLatestMessages, markLatestMessagesDirty, queryClient, updateRunningLiveActivity],
 	);
 
 	const handleServerEvent = useCallback(
@@ -1076,9 +1183,19 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					[chatId]: false,
 				}));
 			};
+			const isSelectedChat = (chatId: string): boolean => selectedChatIdRef.current === chatId;
 
 				if (event.event === "assistant_delta") {
 					const chatId = event.data.chatId;
+					if (!isSelectedChat(chatId)) {
+						clearSendingForChat(chatId);
+						return;
+					}
+					if (!isViewingLatestMessages(chatId)) {
+						markLatestMessagesDirty(chatId);
+						clearSendingForChat(chatId);
+						return;
+					}
 					const prefersStructuredLiveActivityPreview = structuredLiveActivityPreviewByChatRef.current[chatId];
 					setStreamingTextByChat((current) => ({
 						...current,
@@ -1101,6 +1218,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				}
 
 				if (event.event === "assistant_snapshot") {
+					if (!isSelectedChat(event.data.chatId)) {
+						return;
+					}
+					if (!isViewingLatestMessages(event.data.chatId)) {
+						markLatestMessagesDirty(event.data.chatId);
+						return;
+					}
 					const prefersStructuredLiveActivityPreview = structuredLiveActivityPreviewByChatRef.current[event.data.chatId];
 					setStreamingTextByChat((current) => ({
 						...current,
@@ -1121,6 +1245,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				if (event.event === "assistant_event") {
 					const incomingEventId = event.data.eventId;
 					const chatId = event.data.chatId;
+					if (!isSelectedChat(chatId)) {
+						clearSendingForChat(chatId);
+						return;
+					}
+					if (!isViewingLatestMessages(chatId)) {
+						markLatestMessagesDirty(chatId);
+						clearSendingForChat(chatId);
+						return;
+					}
 					structuredLiveActivityPreviewByChatRef.current[chatId] = true;
 					const lastAppliedEventId = lastAssistantEventIdByChatRef.current[chatId] ?? 0;
 					if (typeof incomingEventId === "number" && incomingEventId <= lastAppliedEventId) {
@@ -1138,14 +1271,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						queryKeys.streamTurn(chatId),
 						nextTurn,
 					);
-
-				setStreamHistoryByChat((current) => {
-					const nextHistory = applyAssistantEventToHistory(current[chatId], event.data.event);
-					return {
-						...current,
-						[chatId]: nextHistory,
-					};
-				});
 				const statusLine = toLiveActivityStatusLineFromEvent(event.data.event);
 				const activityPhase: "running" | "background" | "finalizing" = (() => {
 					if (event.data.event.type === "turn_completed") {
@@ -1179,47 +1304,37 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 			if (event.event === "assistant_done") {
 				const chatId = event.data.chatId;
+				if (!isSelectedChat(chatId)) {
+					clearSendingForChat(chatId);
+					return;
+				}
 				queryClient.setQueryData<StreamTurnState | null>(
 					queryKeys.streamTurn(chatId),
-					(current) => (current ? collapseTurnItems(current) : current),
+					null,
 				);
-				setStreamHistoryByChat((current) => {
-					const turns = current[chatId] ?? [];
-					if (turns.length === 0) {
-						return current;
-					}
-
-					const nextTurns = turns.map((turn, index) => (
-						index === turns.length - 1 ? collapseTurnItems(turn) : turn
-					));
-					queryClient.setQueryData<StreamTurnState | null>(
-						queryKeys.streamTurn(chatId),
-						nextTurns.at(-1) ?? null,
-					);
-					return {
-						...current,
-						[chatId]: nextTurns,
-					};
-				});
 
 				void (async () => {
 					const maxAttempts = 5;
 					const retryDelayMs = 250;
 					const trySyncMessages = async (attempt: number): Promise<void> => {
+						if (!isViewingLatestMessages(chatId)) {
+							markLatestMessagesDirty(chatId);
+							return;
+						}
+
 						try {
 							const latestPage = await client.listMessagesPage(chatId, {
 								limit: MESSAGE_PAGE_SIZE,
 							});
 							if (latestPage.messages.at(-1)?.role === "assistant") {
-								const currentPages = queryClient.getQueryData<InfiniteData<MessagePageDTO>>(queryKeys.messages(chatId));
-								if ((currentPages?.pages.length ?? 0) > 1) {
-									void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
-								} else {
-									queryClient.setQueryData<InfiniteData<MessagePageDTO>>(
-										queryKeys.messages(chatId),
-										(current) => replaceNewestMessagePage(current, latestPage),
-									);
-								}
+								queryClient.setQueryData<MessagePageDTO>(
+									queryKeys.messages(chatId),
+									latestPage,
+								);
+								setLatestDirtyByChat((current) => ({
+									...current,
+									[chatId]: false,
+								}));
 								return;
 							}
 						} catch {
@@ -1227,7 +1342,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						}
 
 						if (attempt >= maxAttempts) {
-							void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
+							if (isViewingLatestMessages(chatId)) {
+								void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
+							} else {
+								markLatestMessagesDirty(chatId);
+							}
 							return;
 						}
 
@@ -1243,10 +1362,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					[chatId]: "",
 				}));
 				clearSendingForChat(chatId);
-				if (selectedChatIdRef.current === chatId) {
-					invalidateSelectedProjectGitQueries();
-					invalidateWorkspaceQuery(queryKeys.chatContext(chatId));
-				}
+				invalidateSelectedProjectGitQueries();
+				invalidateWorkspaceQuery(queryKeys.chatContext(chatId));
 				finishLiveActivity(chatId, {
 					outcome: "completed",
 					statusLine: "Response is ready",
@@ -1408,31 +1525,30 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 						if (workspaceMessage && workspaceMessage.chatId === activeChatId) {
 							const messagesQueryKey = queryKeys.messages(activeChatId);
-							const currentPages = queryClient.getQueryData<InfiniteData<MessagePageDTO>>(
+							const currentPage = queryClient.getQueryData<MessagePageDTO>(
 								messagesQueryKey,
 							);
-							if (!currentPages) {
+							if (!currentPage) {
 								invalidateWorkspaceQuery(messagesQueryKey);
 								break;
 							}
 
-							queryClient.setQueryData<InfiniteData<MessagePageDTO>>(
-								messagesQueryKey,
-								(current) => {
-									const hasMessage = (current?.pages ?? []).some((page) =>
-										page.messages.some((message) => message.id === workspaceMessage.id)
-									);
-									if (hasMessage) {
-										return current;
-									}
-
-									return appendMessageToMessagePages(current, workspaceMessage);
-								},
-							);
+							if (isViewingLatestMessages(activeChatId)) {
+								queryClient.setQueryData<MessagePageDTO>(
+									messagesQueryKey,
+									(current) => appendMessageToMessagePage(current, workspaceMessage),
+								);
+							} else {
+								markLatestMessagesDirty(activeChatId);
+							}
 							break;
 						}
 
-						invalidateWorkspaceQuery(queryKeys.messages(activeChatId));
+						if (isViewingLatestMessages(activeChatId)) {
+							invalidateWorkspaceQuery(queryKeys.messages(activeChatId));
+						} else {
+							markLatestMessagesDirty(activeChatId);
+						}
 						break;
 					}
 					case "project_created":
@@ -1461,15 +1577,17 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				clearStructuredLiveActivityPreview,
 				client,
 				finishLiveActivity,
+				isViewingLatestMessages,
 				invalidateSelectedProjectGitQueries,
-			notifyMessageCompletion,
-			queryClient,
-			setSendingByChat,
-			shouldEnableChatsQuery,
-			startRunningLiveActivity,
-			invalidateWorkspaceQuery,
-			updateRunningLiveActivity,
-		],
+				invalidateWorkspaceQuery,
+				markLatestMessagesDirty,
+				notifyMessageCompletion,
+				queryClient,
+				setSendingByChat,
+				shouldEnableChatsQuery,
+				startRunningLiveActivity,
+				updateRunningLiveActivity,
+			],
 	);
 
 	const handleConnectionStateChange = useCallback((state: ConnectionState) => {
@@ -1573,79 +1691,34 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	]);
 
 	useEffect(() => {
-		let canceled = false;
 		if (!shouldEnableMessagesQuery || !selectedChatId) {
-			return () => {
-				canceled = true;
-			};
+			return;
 		}
 
-		const collectEvents = async (
-			afterId: number,
-			accumulator: ChatStreamEventDTO[],
-			lastEventId: number,
-		): Promise<{ events: ChatStreamEventDTO[]; lastEventId: number }> => {
-			const page = await client.listChatStreamEvents(selectedChatId, {
-				afterId,
-				limit: 500,
-			});
-			const nextEvents = [...accumulator, ...page.events];
-			const nextLastEventId = page.events.reduce(
-				(currentMax, item) => Math.max(currentMax, item.id),
-				lastEventId,
-			);
+		mapChatTurnsToStreamTurns(messagesQuery.page.turns ?? []);
+		lastAssistantEventIdByChatRef.current[selectedChatId] = 0;
+		queryClient.setQueryData<StreamTurnState | null>(
+			queryKeys.streamTurn(selectedChatId),
+			null,
+		);
 
-			if (!page.hasMore || page.nextAfterId === null) {
-				return {
-					events: nextEvents,
-					lastEventId: nextLastEventId,
-				};
-			}
-
-			return await collectEvents(page.nextAfterId, nextEvents, nextLastEventId);
-		};
-
-			void (async () => {
-				try {
-					const { events, lastEventId } = await collectEvents(0, [], 0);
-
-					if (canceled) {
-						return;
-					}
-						if (events.length > 0) {
-							structuredLiveActivityPreviewByChatRef.current[selectedChatId] = true;
-						}
-
-						const turns = replayAssistantEventsIntoTurns(events);
-					lastAssistantEventIdByChatRef.current[selectedChatId] = lastEventId;
-				setStreamHistoryByChat((current) => ({
-					...current,
-					[selectedChatId]: turns,
-				}));
-				queryClient.setQueryData<StreamTurnState | null>(
-					queryKeys.streamTurn(selectedChatId),
-					turns.at(-1) ?? null,
-				);
-			} catch {
-				if (canceled) {
-					return;
-				}
-				lastAssistantEventIdByChatRef.current[selectedChatId] = 0;
-				setStreamHistoryByChat((current) => ({
-					...current,
-					[selectedChatId]: [],
-				}));
-				queryClient.setQueryData<StreamTurnState | null>(
-					queryKeys.streamTurn(selectedChatId),
-					null,
-				);
-			}
-		})();
-
-		return () => {
-			canceled = true;
-		};
-	}, [client, queryClient, selectedChatId, shouldEnableMessagesQuery]);
+		const isViewingLatestWindow = (messageWindowModeByChat[selectedChatId] ?? "latest") === "latest";
+		const chatIsActive =
+			Boolean(chats.find((chat) => chat.id === selectedChatId)?.isActive) ||
+			Boolean(chatContextQuery.data?.chat.isActive);
+		if (isViewingLatestWindow && chatIsActive) {
+			void syncMissedAssistantEventsForChat(selectedChatId);
+		}
+	}, [
+		chatContextQuery.data?.chat.isActive,
+		chats,
+		messageWindowModeByChat,
+			messagesQuery.page.turns,
+			queryClient,
+			selectedChatId,
+			shouldEnableMessagesQuery,
+		syncMissedAssistantEventsForChat,
+	]);
 
 	const persistSelection = useCallback(
 		(input: {
@@ -1944,6 +2017,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				setLastError("This thread is currently running. Wait until it finishes.");
 				return false;
 			}
+			if (activeSelectedChatId && !isViewingLatestMessages(activeSelectedChatId)) {
+				await loadLatestMessages();
+			}
 			const selectedChatHasNoMessages = messagesQuery.messages.length === 0;
 			const replacementChat =
 				selectedChat &&
@@ -1974,10 +2050,31 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				role: "user",
 			};
 
-			queryClient.setQueryData<InfiniteData<MessagePageDTO>>(
+			queryClient.setQueryData<MessagePageDTO>(
 				queryKeys.messages(activeChatId),
-				(current) => appendMessageToMessagePages(current, nextMessage),
+				(current) => appendMessageToMessagePage(current, nextMessage),
 			);
+			queryClient.setQueryData<ThreadListChatEntry[]>(
+				queryKeys.chats(activeProjectId),
+				(current) => moveChatToFrontOfThreadList(
+					current,
+					{
+						id: activeChatId,
+						isActive: false,
+						title: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title ?? "New Thread",
+						updatedAt: nextMessage.createdAt,
+					},
+					activeProjectId,
+				),
+			);
+			setMessageWindowModeByChat((current) => ({
+				...current,
+				[activeChatId]: "latest",
+			}));
+			setLatestDirtyByChat((current) => ({
+				...current,
+				[activeChatId]: false,
+			}));
 			queryClient.setQueryData(queryKeys.streamTurn(activeChatId), null);
 			setStreamingTextByChat((current) => ({
 				...current,
@@ -2182,21 +2279,24 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						})
 						: current ?? null,
 			);
-			setStreamHistoryByChat((current) => {
-				const turns = current[selectedChatId] ?? [];
-				const nextTurns = turns.map((turn) => (
-					turn.turnId === (queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(selectedChatId))?.turnId ?? "")
-						? updateStreamItemExpanded(turn, itemId, {
-							expanded,
-							byUser,
-						})
-						: turn
-				));
-				return {
-					...current,
-					[selectedChatId]: nextTurns,
-				};
-			});
+			queryClient.setQueryData<MessagePageDTO>(
+				queryKeys.messages(selectedChatId),
+				(current) => (
+					current
+						? {
+							...current,
+							turns: current.turns.map((turn) => (
+								turn.itemsById[itemId]
+									? updateStreamItemExpanded(turn as StreamTurnState, itemId, {
+										expanded,
+										byUser,
+									})
+									: turn
+							)),
+						}
+						: current
+				),
+			);
 		},
 		[queryClient, selectedChatId],
 	);
@@ -2211,18 +2311,21 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				queryKeys.streamTurn(selectedChatId),
 				(current) => (current ? updateStreamItemState(current, itemId, state) : current ?? null),
 			);
-			setStreamHistoryByChat((current) => {
-				const turns = current[selectedChatId] ?? [];
-				const nextTurns = turns.map((turn) => (
-					turn.turnId === (queryClient.getQueryData<StreamTurnState | null>(queryKeys.streamTurn(selectedChatId))?.turnId ?? "")
-						? updateStreamItemState(turn, itemId, state)
-						: turn
-				));
-				return {
-					...current,
-					[selectedChatId]: nextTurns,
-				};
-			});
+			queryClient.setQueryData<MessagePageDTO>(
+				queryKeys.messages(selectedChatId),
+				(current) => (
+					current
+						? {
+							...current,
+							turns: current.turns.map((turn) => (
+								turn.itemsById[itemId]
+									? updateStreamItemState(turn as StreamTurnState, itemId, state)
+									: turn
+							)),
+						}
+						: current
+				),
+			);
 		},
 		[queryClient, selectedChatId],
 	);
@@ -2266,7 +2369,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	}, [finishLiveActivity, notifyMessageCompletion, selectedChat, selectedChatId]);
 
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
-	const streamHistoryTurns = selectedChatId ? streamHistoryByChat[selectedChatId] ?? [] : [];
+	const streamHistoryTurns = useMemo(
+		() => mapChatTurnsToStreamTurns(messagesQuery.page.turns ?? []),
+		[messagesQuery.page.turns],
+	);
+	const messageWindowMode = selectedChatId ? messageWindowModeByChat[selectedChatId] ?? "latest" : "latest";
+	const latestMessagesDirty = selectedChatId ? latestDirtyByChat[selectedChatId] ?? false : false;
 	const isSending = selectedChatId ? Boolean(sendingByChat[selectedChatId]) : false;
 	const isStopping = selectedChatId ? Boolean(stoppingByChat[selectedChatId]) : false;
 	const hasChatsData = Array.isArray(chatsQuery.data);
@@ -2308,13 +2416,16 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			hasOlderMessages: shouldEnableMessagesQuery ? messagesQuery.hasOlderMessages : false,
 		isLoaded: !isProjectsLoading && hasSelectionSnapshot,
 		isLoadingOlderMessages: shouldEnableMessagesQuery ? messagesQuery.isLoadingOlderMessages : false,
+		isViewingOlderMessages: messageWindowMode === "older",
 		isChatsLoading,
 		isMessagesLoading,
 		isActiveThreadsLoading,
 		isSending,
 		isStopping,
 		lastError,
-		loadOlderMessages: shouldEnableMessagesQuery ? messagesQuery.loadOlderMessages : async () => undefined,
+		latestMessagesDirty,
+		loadLatestMessages: shouldEnableMessagesQuery ? loadLatestMessages : async () => undefined,
+		loadOlderMessages: shouldEnableMessagesQuery ? loadOlderMessages : async () => undefined,
 		messages,
 		permissionMode,
 		projects,
