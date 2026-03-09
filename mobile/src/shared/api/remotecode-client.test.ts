@@ -71,4 +71,90 @@ describe("createRemoteCodeClient live activity subscription contract", () => {
 
 		expect(caughtError).toBeInstanceOf(RemoteCodeRequestError);
 	});
+
+	test("adds the connector header for private proxied requests", async () => {
+		let connectorIdHeader = "";
+		let authorizationHeader = "";
+
+		globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+			void input;
+			const headers = new Headers(init?.headers);
+			connectorIdHeader = headers.get("x-remotecode-connector-id") ?? "";
+			authorizationHeader = headers.get("authorization") ?? "";
+			return new Response(JSON.stringify({
+				projects: [],
+			}), {
+				headers: {
+					"content-type": "application/json",
+				},
+				status: 200,
+			});
+		}) as unknown as typeof fetch;
+
+		const client = createRemoteCodeClient({
+			activeTarget: {
+				accessToken: "private-access-token",
+				backendUrl: "https://private.remotecode.dev",
+				connectorId: "con_1",
+				kind: "private",
+			},
+			baseUrl: "https://private.remotecode.dev",
+			token: "private-access-token",
+		});
+
+		await client.listProjects();
+
+		expect(connectorIdHeader).toBe("con_1");
+		expect(authorizationHeader).toBe("Bearer private-access-token");
+	});
+
+	test("retries once with a refreshed private access token after a 401", async () => {
+		const seenAuthorizations: string[] = [];
+		globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+			void input;
+			const headers = new Headers(init?.headers);
+			seenAuthorizations.push(headers.get("authorization") ?? "");
+
+			if (seenAuthorizations.length === 1) {
+				return new Response(JSON.stringify({
+					error: "expired",
+				}), {
+					headers: {
+						"content-type": "application/json",
+					},
+					status: 401,
+					statusText: "Unauthorized",
+				});
+			}
+
+			return new Response(JSON.stringify({
+				projects: [],
+			}), {
+				headers: {
+					"content-type": "application/json",
+				},
+				status: 200,
+			});
+		}) as unknown as typeof fetch;
+
+		const client = createRemoteCodeClient({
+			activeTarget: {
+				accessToken: "expired-access-token",
+				backendUrl: "https://private.remotecode.dev",
+				connectorId: "con_1",
+				kind: "private",
+			},
+			baseUrl: "https://private.remotecode.dev",
+			token: "expired-access-token",
+		}, {
+			refreshPrivateAccessToken: async () => "fresh-access-token",
+		});
+
+		await client.listProjects();
+
+		expect(seenAuthorizations).toEqual([
+			"Bearer expired-access-token",
+			"Bearer fresh-access-token",
+		]);
+	});
 });

@@ -34,6 +34,13 @@ mock.module("./api-config-store", () => ({
 		read: async () => storeState.config,
 		readSavedConnections: async () => storeState.savedConnections,
 	},
+	resetSecureStoreAdapterForTests: () => undefined,
+	setSecureStoreAdapterForTests: () => undefined,
+	toApiConfig: (activeTarget: { accessToken?: string; backendUrl?: string; baseUrl?: string; connectorId?: string; kind: "local" | "private"; token?: string }) => ({
+		activeTarget,
+		baseUrl: activeTarget.kind === "local" ? activeTarget.baseUrl ?? "" : activeTarget.backendUrl ?? "",
+		token: activeTarget.kind === "local" ? activeTarget.token ?? "" : activeTarget.accessToken ?? "",
+	}),
 }));
 
 const { DiscoveryManager } = await import("./discovery-manager");

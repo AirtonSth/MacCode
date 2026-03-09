@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, test } from "node:test";
 
-import { createRealtimeClient } from "./ws-client";
+import { buildRealtimeWebSocketHeaders, buildRealtimeWebSocketUrl, createRealtimeClient } from "./ws-client";
 
 interface SentPayload {
 	data: Record<string, unknown>;
@@ -16,6 +16,7 @@ interface MockSocketInstance {
 	onopen: (() => void) | null;
 	openConnection: () => void;
 	url: string;
+	options?: { headers?: Record<string, string> };
 	close: () => void;
 	readyState: number;
 	send: (payload: string) => void;
@@ -35,8 +36,13 @@ interface MockSocketConstructor {
 
 const createMockWebSocket = (): MockSocketConstructor => {
 	const instances: MockSocketInstance[] = [];
-	const MockSocket = function MockSocketConstructorFn(this: MockSocketInstance, url: string) {
+	const MockSocket = function MockSocketConstructorFn(
+		this: MockSocketInstance,
+		url: string,
+		options?: { headers?: Record<string, string> },
+	) {
 		this.url = url;
+		this.options = options;
 		this.sentPayloads = [];
 		this.readyState = MockSocket.CONNECTING;
 		this.onopen = null;
@@ -97,11 +103,14 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 
 	test("queues only the latest join_workspace while socket is connecting", () => {
 		const realtime = createRealtimeClient({
-			baseUrl: "http://127.0.0.1:8835",
 			onEvent: () => {
 				// no-op
 			},
-			token: "token",
+			target: {
+				baseUrl: "http://127.0.0.1:8835",
+				kind: "local",
+				token: "token",
+			},
 		});
 
 		realtime.connect();
@@ -120,11 +129,14 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 
 	test("re-subscribes workspace after reconnect", async () => {
 		const realtime = createRealtimeClient({
-			baseUrl: "http://127.0.0.1:8835",
 			onEvent: () => {
 				// no-op
 			},
-			token: "token",
+			target: {
+				baseUrl: "http://127.0.0.1:8835",
+				kind: "local",
+				token: "token",
+			},
 		});
 
 		realtime.connect();
@@ -149,11 +161,14 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 
 	test("sends only the latest queued join_workspace after reconnect", async () => {
 		const realtime = createRealtimeClient({
-			baseUrl: "http://127.0.0.1:8835",
 			onEvent: () => {
 				// no-op
 			},
-			token: "token",
+			target: {
+				baseUrl: "http://127.0.0.1:8835",
+				kind: "local",
+				token: "token",
+			},
 		});
 
 		realtime.connect();
@@ -175,5 +190,23 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 		assert.equal(workspaceMessages.length, 1);
 		assert.equal(workspaceMessages[0]?.data.lastSeq, 15);
 		assert.equal(workspaceMessages[0]?.data.clientId, "client-c");
+	});
+
+	test("builds private websocket url and headers for relay mode", () => {
+		assert.equal(buildRealtimeWebSocketUrl({
+			accessToken: "private-access-token",
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			kind: "private",
+		}), "wss://private.remotecode.dev/v1/ws");
+		assert.deepEqual(buildRealtimeWebSocketHeaders({
+			accessToken: "private-access-token",
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			kind: "private",
+		}), {
+			authorization: "Bearer private-access-token",
+			"x-remotecode-connector-id": "con_1",
+		});
 	});
 });

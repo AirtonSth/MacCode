@@ -1610,10 +1610,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const realtime = createRealtimeClient({
-			baseUrl: config.baseUrl,
 			onConnectionStateChange: handleConnectionStateChange,
 			onEvent: handleServerEvent,
-			token: config.token,
+			target: config.activeTarget,
 		});
 
 		realtime.connect();
@@ -1624,7 +1623,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			realtime.disconnect();
 			realtimeRef.current = null;
 		};
-	}, [config.baseUrl, config.token, handleConnectionStateChange, handleServerEvent, isActive]);
+	}, [config.activeTarget, handleConnectionStateChange, handleServerEvent, isActive]);
 
 	useEffect(() => {
 		if (!shouldEnableMessagesQuery || !selectedChatId || !realtimeRef.current) {

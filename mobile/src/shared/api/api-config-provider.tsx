@@ -1,12 +1,18 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 
-import { ApiConfigStore, type ApiConfig } from "./api-config-store";
+import { ApiConfigStore, toApiConfig, type ApiConfig } from "./api-config-store";
+
+type ApiConfigInput = ApiConfig | {
+	activeTarget?: ApiConfig["activeTarget"];
+	baseUrl: string;
+	token: string;
+};
 
 interface ApiConfigContextValue {
 	config: ApiConfig;
 	isLoaded: boolean;
 	reload: () => Promise<void>;
-	update: (config: ApiConfig) => Promise<void>;
+	update: (config: ApiConfigInput) => Promise<void>;
 }
 
 const ApiConfigContext = createContext<ApiConfigContextValue | null>(null);
@@ -29,8 +35,19 @@ export const ApiConfigProvider = ({
 		void reload();
 	}, []);
 
-	const update = async (nextConfig: ApiConfig) => {
-		const persisted = await ApiConfigStore.save(nextConfig);
+	const update = async (nextConfig: ApiConfigInput) => {
+		const normalized: ApiConfig = "activeTarget" in nextConfig && nextConfig.activeTarget
+			? {
+				activeTarget: nextConfig.activeTarget,
+				baseUrl: nextConfig.baseUrl,
+				token: nextConfig.token,
+			}
+			: toApiConfig({
+				baseUrl: nextConfig.baseUrl,
+				kind: "local",
+				token: nextConfig.token,
+			});
+		const persisted = await ApiConfigStore.save(normalized);
 		setConfig(persisted);
 	};
 

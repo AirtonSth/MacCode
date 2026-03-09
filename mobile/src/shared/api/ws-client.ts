@@ -6,14 +6,15 @@ import type {
 	ClientWsEvent,
 	ServerWsEvent,
 } from "./types";
+import type { ActiveConnectionTarget } from "./api-config-store";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
 interface RealtimeOptions {
-	baseUrl: string;
+	createSocket?: (url: string, options?: { headers?: Record<string, string> }) => WebSocket;
 	onConnectionStateChange?: (state: ConnectionState) => void;
 	onEvent: (event: ServerWsEvent) => void;
-	token: string;
+	target: ActiveConnectionTarget;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -270,14 +271,29 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 	return null;
 };
 
-const buildWsUrl = (baseUrl: string, token: string): string => {
-	const normalized = baseUrl.replace(/\/+$/, "");
+export const buildRealtimeWebSocketUrl = (target: ActiveConnectionTarget): string => {
+	const normalized = (target.kind === "local" ? target.baseUrl : target.backendUrl).replace(/\/+$/, "");
 	const wsBase =
 		normalized.startsWith("https://")
 			? normalized.replace(/^https:\/\//, "wss://")
 			: normalized.replace(/^http:\/\//, "ws://");
 
-	return `${wsBase}/v1/ws?token=${encodeURIComponent(token)}`;
+	if (target.kind === "private") {
+		return `${wsBase}/v1/ws`;
+	}
+
+	return `${wsBase}/v1/ws?token=${encodeURIComponent(target.token)}`;
+};
+
+export const buildRealtimeWebSocketHeaders = (target: ActiveConnectionTarget): Record<string, string> | undefined => {
+	if (target.kind !== "private") {
+		return undefined;
+	}
+
+	return {
+		authorization: `Bearer ${target.accessToken}`,
+		"x-remotecode-connector-id": target.connectorId,
+	};
 };
 
 export const createRealtimeClient = (options: RealtimeOptions) => {
@@ -431,7 +447,12 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		notifyState("connecting");
 		closeSocket();
 
-		socket = new WebSocket(buildWsUrl(options.baseUrl, options.token));
+		const url = buildRealtimeWebSocketUrl(options.target);
+		const headers = buildRealtimeWebSocketHeaders(options.target);
+		const socketFactory = options.createSocket
+			?? ((socketUrl: string, socketOptions?: { headers?: Record<string, string> }) =>
+				new (WebSocket as unknown as new(url: string, protocols?: string | string[], options?: { headers?: Record<string, string> }) => WebSocket)(socketUrl, undefined, socketOptions));
+		socket = socketFactory(url, headers ? { headers } : undefined);
 
 		socket.onopen = () => {
 			isConnected = true;

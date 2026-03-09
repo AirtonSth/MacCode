@@ -20,6 +20,7 @@ import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
 import { GitQuickControl } from "../features/git/ui/GitQuickControl";
 import { useProjectGit } from "../features/git/model/useProjectGit";
+import { PrivateAccountSidebarFooter } from "../features/private-account/ui/private-account-sidebar-footer";
 import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
 import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
 import {
@@ -2703,6 +2704,7 @@ const App = (): JSX.Element => {
 											)}
 										</div>
 									</ScrollArea>
+									<PrivateAccountSidebarFooter />
 								</aside>
 
 								<button

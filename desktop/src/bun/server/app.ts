@@ -30,6 +30,9 @@ import { createServerMetadataService } from "./modules/server-metadata/server-me
 import { SelectionController } from "./modules/selection/selection.controller";
 import { createSelectionRepository } from "./modules/selection/selection.repository";
 import { createSelectionService } from "./modules/selection/selection.service";
+import { PrivateAccountController } from "./modules/private-account/private-account.controller";
+import { createPrivateAccountRepository } from "./modules/private-account/private-account.repository";
+import { createPrivateAccountService } from "./modules/private-account/private-account.service";
 import { TerminalController } from "./modules/terminal/terminal.controller";
 import { createTerminalRepository } from "./modules/terminal/terminal.repository";
 import { createTerminalService } from "./modules/terminal/terminal.service";
@@ -134,7 +137,12 @@ const createGzipResponse = (
 };
 
 export const ServerBootstrap = {
-	async buildServerApp(options?: { databasePath?: string; disableLiveActivityPush?: boolean; port?: number }) {
+	async buildServerApp(options?: {
+		databasePath?: string;
+		disableLiveActivityPush?: boolean;
+		port?: number;
+		privateBackendUrl?: string;
+	}) {
 		const listenPort = options?.port ?? serverConfig.port;
 		const databaseClient = await DatabaseClientFactory.create(options?.databasePath);
 
@@ -151,6 +159,7 @@ export const ServerBootstrap = {
 		const chatStreamEventRepository = createChatStreamEventRepository(databaseClient.orm);
 		const chatStreamSnapshotRepository = createChatStreamSnapshotRepository(databaseClient.orm);
 		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
+		const privateAccountRepository = createPrivateAccountRepository(serverMetadataRepository);
 		const liveActivitySubscriptionRepository = createLiveActivitySubscriptionRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
@@ -182,7 +191,11 @@ export const ServerBootstrap = {
 				firebaseProjectId: serverConfig.liveActivityFirebaseProjectId,
 				serviceAccountPath: serverConfig.liveActivityServiceAccountPath,
 				subscriptionStore: liveActivitySubscriptionRepository,
-			});
+		});
+		const privateAccountService = createPrivateAccountService(privateAccountRepository, {
+			backendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
+			localServerToken: serverConfig.token,
+		});
 		const wsService = new WsService(
 			chatRepository,
 			messageRepository,
@@ -259,6 +272,7 @@ export const ServerBootstrap = {
 					.use(GitController.build(gitService, workspaceEventsService))
 					.use(ProviderController.build(codexModelsService))
 					.use(SelectionController.build(workspaceSelectionService, workspaceEventsService))
+					.use(PrivateAccountController.build(privateAccountService))
 					.use(TerminalController.build(terminalService, workspaceEventsService))
 					.use(FsController.build(fsService)),
 			)
@@ -266,6 +280,7 @@ export const ServerBootstrap = {
 
 		return {
 			app,
+			privateAccountService,
 
 			db: {
 				close: () => {
@@ -275,12 +290,18 @@ export const ServerBootstrap = {
 		};
 	},
 
-	async createBackendServer(options?: { databasePath?: string; disableLiveActivityPush?: boolean; port?: number }): Promise<BackendHandle> {
+	async createBackendServer(options?: {
+		databasePath?: string;
+		disableLiveActivityPush?: boolean;
+		port?: number;
+		privateBackendUrl?: string;
+	}): Promise<BackendHandle> {
 		const listenPort = options?.port ?? serverConfig.port;
 		const handle = await ServerBootstrap.buildServerApp({
 			databasePath: options?.databasePath,
 			disableLiveActivityPush: options?.disableLiveActivityPush,
 			port: listenPort,
+			privateBackendUrl: options?.privateBackendUrl,
 		});
 
 		let serverReference: unknown;
@@ -298,6 +319,12 @@ export const ServerBootstrap = {
 			);
 		});
 
+		const actualPort = (serverReference as { port?: number } | undefined)?.port ?? listenPort;
+		await handle.privateAccountService.attachRuntime({
+			app: handle.app,
+			baseUrl: `http://127.0.0.1:${actualPort}`,
+		});
+
 		return {
 			...handle,
 			server: serverReference as { port: number },
@@ -313,11 +340,17 @@ export interface BackendHandle {
 	db: {
 		close: () => void;
 	};
+	privateAccountService: Awaited<ReturnType<typeof buildServerApp>>["privateAccountService"];
 	server: unknown;
 }
 
 export const createBackendServer = async (
-	options?: { databasePath?: string; disableLiveActivityPush?: boolean; port?: number },
+	options?: {
+		databasePath?: string;
+		disableLiveActivityPush?: boolean;
+		port?: number;
+		privateBackendUrl?: string;
+	},
 ): Promise<BackendHandle> =>
 	await ServerBootstrap.createBackendServer(options);
 

@@ -12,6 +12,7 @@ export interface ServerConfigValues {
 	liveActivityFirebaseProjectId?: string;
 	liveActivityServiceAccountPath?: string;
 	port: number;
+	privateBackendUrl: string;
 	token: string;
 }
 
@@ -45,8 +46,14 @@ export class ServerConfig {
 				process.env.REMOTECODE_FIREBASE_SERVICE_ACCOUNT_PATH,
 			),
 			port: ServerConfig.parsePort(process.env.REMOTECODE_SERVER_PORT),
+			privateBackendUrl: ServerConfig.parsePrivateBackendUrl(process.env.REMOTECODE_PRIVATE_BACKEND_URL),
 			token: process.env.REMOTECODE_LOCAL_TOKEN?.trim() || DEFAULT_TOKEN,
 		};
+	}
+
+	private static parsePrivateBackendUrl(raw: string | undefined): string {
+		const normalized = raw?.trim().replace(/\/+$/u, "");
+		return normalized && normalized.length > 0 ? normalized : "http://127.0.0.1:8787";
 	}
 
 	private static parseOptional(raw: string | undefined): string | undefined {

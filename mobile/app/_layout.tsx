@@ -6,6 +6,7 @@ import { Stack } from "expo-router";
 import { useEffect, useState } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
+import { PrivateSessionProvider } from "@/shared/api/private-session-provider";
 import { queryClient } from "@/shared/api/query-client";
 import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
 import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
@@ -50,34 +51,36 @@ export default function RootLayout() {
 
 	return (
 		<ApiConfigProvider>
-			<QueryClientProvider client={queryClient}>
-				<ForegroundInsomniaMode />
-				<Stack
-					screenOptions={{
-						contentStyle: {
-							backgroundColor: theme.colors.background,
-						},
-						headerStyle: {
-							backgroundColor: theme.colors.panelBackground,
-						},
-						headerTintColor: theme.colors.textPrimary,
-					}}
-				>
-					<Stack.Screen name="index" options={{ headerShown: false }} />
-					<Stack.Screen name="workspaces" options={{ headerShown: false }} />
-					<Stack.Screen name="threads" options={{ headerShown: false }} />
-					<Stack.Screen name="active-threads" options={{ headerShown: false }} />
-					<Stack.Screen name="chat" options={{ headerShown: false }} />
-					<Stack.Screen name="settings" options={{ headerShown: false }} />
-				</Stack>
-				{isLaunchSplashVisible ? (
-					<AnimatedLaunchSplash
-						onFinish={() => {
-							setIsLaunchSplashVisible(false);
+			<PrivateSessionProvider>
+				<QueryClientProvider client={queryClient}>
+					<ForegroundInsomniaMode />
+					<Stack
+						screenOptions={{
+							contentStyle: {
+								backgroundColor: theme.colors.background,
+							},
+							headerStyle: {
+								backgroundColor: theme.colors.panelBackground,
+							},
+							headerTintColor: theme.colors.textPrimary,
 						}}
-					/>
-				) : null}
-			</QueryClientProvider>
+					>
+						<Stack.Screen name="index" options={{ headerShown: false }} />
+						<Stack.Screen name="workspaces" options={{ headerShown: false }} />
+						<Stack.Screen name="threads" options={{ headerShown: false }} />
+						<Stack.Screen name="active-threads" options={{ headerShown: false }} />
+						<Stack.Screen name="chat" options={{ headerShown: false }} />
+						<Stack.Screen name="settings" options={{ headerShown: false }} />
+					</Stack>
+					{isLaunchSplashVisible ? (
+						<AnimatedLaunchSplash
+							onFinish={() => {
+								setIsLaunchSplashVisible(false);
+							}}
+						/>
+					) : null}
+				</QueryClientProvider>
+			</PrivateSessionProvider>
 		</ApiConfigProvider>
 	);
 }

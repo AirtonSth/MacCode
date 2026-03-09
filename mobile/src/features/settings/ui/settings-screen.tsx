@@ -20,6 +20,7 @@ import { DiscoveryManager, type DiscoveredServer } from "../../../shared/api/dis
 import { createRemoteCodeClient, isRemoteCodeUnauthorizedError } from "../../../shared/api/remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
+import { PrivateAccountSection } from "./private-account-section";
 
 type StatusTone = "error" | "neutral" | "success";
 type SettingsScreenSearchParam = string | string[] | undefined;
@@ -556,6 +557,11 @@ export const SettingsScreen = () => {
 				keyboardShouldPersistTaps="handled"
 				showsVerticalScrollIndicator={false}
 			>
+				<PrivateAccountSection
+					onConnected={() => {
+						goNext();
+					}}
+				/>
 				<View style={styles.section}>
 					<View style={styles.sectionHeader}>
 						<Text style={styles.sectionTitle}>Saved Connections</Text>

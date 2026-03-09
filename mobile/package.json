@@ -9,7 +9,7 @@
     "web": "expo start --web",
     "lint": "bunx eslint .",
     "typecheck": "bun run tsc --noEmit",
-    "test": "bun test src/shared/api/ws-client.test.ts src/shared/api/discovery-manager.test.ts src/shared/api/remotecode-client.test.ts src/shared/notifications/local-notifications.test.ts",
+    "test": "bun test src/shared/api/ws-client.test.ts src/shared/api/ws-client.e2e.test.ts src/shared/api/remotecode-client.test.ts src/shared/api/remotecode-client.e2e.test.ts src/shared/api/api-config-store.test.ts src/shared/api/api-config-store.e2e.test.ts src/shared/api/private-session-store.test.ts src/shared/api/private-session-store.e2e.test.ts src/shared/api/private-session-provider.test.ts src/shared/api/private-session-provider.e2e.test.ts src/shared/api/use-server-health-query.test.ts src/shared/api/use-server-health-query.e2e.test.ts src/shared/notifications/local-notifications.test.ts src/features/settings/ui/private-account-section.model.test.ts src/features/settings/ui/private-account-section.model.e2e.test.ts && bun test src/shared/api/discovery-manager.test.ts",
     "test:e2e:ios": "bash ./e2e/run-ios-e2e.sh",
     "test:e2e:ios:navigation": "bash ./e2e/ios-navigation-flow.sh",
     "test:e2e:ios:terminal": "bash ./e2e/ios-terminal-flow.sh"
@@ -22,6 +22,7 @@
     "@tanstack/react-query": "^5.90.1",
     "expo": "~55.0.4",
     "expo-background-task": "~55.0.9",
+    "expo-camera": "^17.0.8",
     "expo-constants": "~55.0.7",
     "expo-font": "~55.0.4",
     "expo-haptics": "~15.0.7",
@@ -52,6 +53,7 @@
     "@types/react": "~19.2.2",
     "eslint": "8.57.1",
     "eslint-config-hardcore": "^49.0.0",
+    "react-test-renderer": "19.2.0",
     "typescript": "~5.9.2"
   },
   "private": true

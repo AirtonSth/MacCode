@@ -1,4 +1,4 @@
-import type { ApiConfig } from "./api-config-store";
+import type { ApiConfig, ActiveConnectionTarget } from "./api-config-store";
 import type {
 	ActiveThreadSummaryDTO,
 	AuthVerifyResponseDTO,
@@ -188,9 +188,35 @@ export const isRemoteCodeUnauthorizedError = (error: unknown): boolean => {
 	return false;
 };
 
-export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
-	const baseUrl = toNormalizedBaseUrl(config.baseUrl);
-	const token = config.token.trim();
+type RemoteCodeClientConfigInput = ApiConfig | {
+	activeTarget?: ActiveConnectionTarget;
+	baseUrl: string;
+	token: string;
+};
+
+const toActiveTarget = (config: RemoteCodeClientConfigInput): ActiveConnectionTarget => {
+	if ("activeTarget" in config && config.activeTarget) {
+		return config.activeTarget;
+	}
+
+	return {
+		baseUrl: toNormalizedBaseUrl(config.baseUrl),
+		kind: "local",
+		token: config.token.trim(),
+	};
+};
+
+export const createRemoteCodeClient = (
+	config: RemoteCodeClientConfigInput,
+	options?: {
+		refreshPrivateAccessToken?: () => Promise<string | null>;
+	},
+): RemoteCodeClient => {
+	const activeTarget = toActiveTarget(config);
+	const baseUrl = activeTarget.kind === "local"
+		? toNormalizedBaseUrl(activeTarget.baseUrl)
+		: toNormalizedBaseUrl(activeTarget.backendUrl);
+	const token = activeTarget.kind === "local" ? activeTarget.token.trim() : activeTarget.accessToken.trim();
 	const clientId = `mobile-${Math.random().toString(16).slice(2, 10)}`;
 
 	const request = async <T>(input: {
@@ -202,17 +228,22 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 	}): Promise<T> => {
 		const resolvedBaseUrl = toNormalizedBaseUrl(input.baseUrlOverride ?? baseUrl);
 		const resolvedToken = (input.tokenOverride ?? token).trim();
-		const response = await fetch(`${resolvedBaseUrl}/v1${input.path}`, {
-			method: input.method,
-			headers: {
-				"accept-encoding": "gzip",
-				authorization: `Bearer ${resolvedToken}`,
-				"content-type": "application/json",
-				"x-remotecode-client-id": clientId,
-				"x-remotecode-request-id": toRequestId(),
-			},
-			body: input.body === undefined ? undefined : JSON.stringify(input.body),
-		});
+		const isPrivateRequest = activeTarget.kind === "private" && input.baseUrlOverride === undefined && input.tokenOverride === undefined;
+		const executeRequest = async (requestToken: string) =>
+			await fetch(`${resolvedBaseUrl}/v1${input.path}`, {
+				body: input.body === undefined ? undefined : JSON.stringify(input.body),
+				headers: {
+					"accept-encoding": "gzip",
+					authorization: `Bearer ${requestToken}`,
+					"content-type": "application/json",
+					"x-remotecode-client-id": clientId,
+					"x-remotecode-request-id": toRequestId(),
+					...(isPrivateRequest ? { "x-remotecode-connector-id": activeTarget.connectorId } : {}),
+				},
+				method: input.method,
+			});
+
+		let response = await executeRequest(resolvedToken);
 
 		let payload: (Record<string, unknown> & { error?: unknown }) | null = null;
 		try {
@@ -226,6 +257,21 @@ export const createRemoteCodeClient = (config: ApiConfig): RemoteCodeClient => {
 				typeof payload?.error === "string" && payload.error.trim().length > 0
 					? payload.error
 					: response.statusText || "Request failed";
+			if (response.status === 401 && isPrivateRequest && options?.refreshPrivateAccessToken) {
+				const refreshedToken = await options.refreshPrivateAccessToken();
+				if (refreshedToken) {
+					response = await executeRequest(refreshedToken);
+					try {
+						payload = (await response.json()) as Record<string, unknown> & { error?: unknown };
+					} catch {
+						payload = null;
+					}
+
+					if (response.ok) {
+						return payload as T;
+					}
+				}
+			}
 			throw new RemoteCodeRequestError(response.status, message);
 		}
 

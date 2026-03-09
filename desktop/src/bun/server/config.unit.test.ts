@@ -13,6 +13,7 @@ const LIVE_ACTIVITY_ENV_KEYS = [
 	"REMOTECODE_FIREBASE_PROJECT_ID",
 	"REMOTECODE_LIVE_ACTIVITY_SERVICE_ACCOUNT_PATH",
 	"REMOTECODE_FIREBASE_SERVICE_ACCOUNT_PATH",
+	"REMOTECODE_PRIVATE_BACKEND_URL",
 ] as const;
 
 const originalEnv = new Map<string, string | undefined>(
@@ -96,4 +97,21 @@ test("ServerConfig.load parses apns live activity environment values", () => {
 	expect(config.liveActivityApnsTeamId).toBe("TEAM1234");
 	expect(config.liveActivityApnsPrivateKeyPath).toBe("/tmp/AuthKey_ABCD1234.p8");
 	expect(config.liveActivityApnsUseSandbox).toBe(true);
+});
+
+test("ServerConfig.load uses a private backend URL override when configured", () => {
+	clearLiveActivityEnv();
+	process.env.REMOTECODE_PRIVATE_BACKEND_URL = "https://private.remotecode.io/";
+
+	const config = ServerConfig.load();
+
+	expect(config.privateBackendUrl).toBe("https://private.remotecode.io");
+});
+
+test("ServerConfig.load falls back to the local private backend URL", () => {
+	clearLiveActivityEnv();
+
+	const config = ServerConfig.load();
+
+	expect(config.privateBackendUrl).toBe("http://127.0.0.1:8787");
 });

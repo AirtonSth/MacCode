@@ -29,4 +29,27 @@ export type {
 	WorkspaceServerEvent,
 	WsErrorServerEvent,
 } from "./protocol";
+export { createPrivateClient, PrivateApiError } from "./private-client";
+export type {
+	DesktopMobileConnectQrPayloadDto,
+	PrivateAccountStateDto,
+	PrivateAuthUserDto,
+	PrivateBootstrapQrPayloadDto,
+	PrivateBootstrapResponseDto,
+	PrivateBootstrapStatusDto,
+	PrivateConnectorDto,
+	PrivateConnectorsResponseDto,
+	PrivateLoginRequestDto,
+	PrivateLogoutRequestDto,
+	PrivateMeResponseDto,
+	PrivatePairingClaimRequestDto,
+	PrivatePairingClaimResponseDto,
+	PrivateRefreshRequestDto,
+	PrivateRegisterRequestDto,
+	PrivateSessionDto,
+} from "./private-protocol";
+export {
+	isDesktopMobileConnectQrPayload,
+	parseDesktopMobileConnectQrPayload,
+} from "./private-protocol";
 export type { ServerApp } from "./server-app";

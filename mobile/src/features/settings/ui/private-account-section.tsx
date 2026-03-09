@@ -1,0 +1,602 @@
+import {
+	createPrivateClient,
+	parseDesktopMobileConnectQrPayload,
+	type PrivateConnectorDto,
+	type PrivateSessionDto,
+} from "@remotecode/contracts";
+import { CameraView } from "expo-camera";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+	ActivityIndicator,
+	Pressable,
+	StyleSheet,
+	Text,
+	TextInput,
+	View,
+} from "react-native";
+
+import { usePrivateSession } from "../../../shared/api/private-session-provider";
+import {
+	authenticatePrivateAccount,
+	loadPrivateConnectorsSafely,
+	resolvePendingPrivateConnector,
+	sortPrivateConnectors,
+} from "./private-account-section.model";
+
+const DEFAULT_PRIVATE_BACKEND_URL = "https://private.remotecode.dev";
+
+const palette = {
+	accent: "#63C8FF",
+	accentPressed: "#4EAAD9",
+	border: "rgba(255,255,255,0.11)",
+	muted: "#98A0AF",
+	soft: "rgba(255,255,255,0.05)",
+	text: "#F1F4FA",
+};
+
+export const PrivateAccountSection = ({
+	onConnected,
+}: {
+	onConnected: () => void;
+}) => {
+	const {
+		activateConnector,
+		clearPendingQrPayload,
+		clearSessionRecord,
+		pendingQrPayload,
+		refreshSession,
+		sessionRecord,
+		setPendingQrPayload,
+		setSessionRecord,
+	} = usePrivateSession();
+	const [backendUrl, setBackendUrl] = useState(sessionRecord?.backendUrl ?? pendingQrPayload?.backendUrl ?? DEFAULT_PRIVATE_BACKEND_URL);
+	const [connectors, setConnectors] = useState<PrivateConnectorDto[]>([]);
+	const [email, setEmail] = useState("");
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
+	const [isAuthenticating, setIsAuthenticating] = useState(false);
+	const [isLoadingConnectors, setIsLoadingConnectors] = useState(false);
+	const [isScannerOpen, setIsScannerOpen] = useState(false);
+	const [mode, setMode] = useState<"login" | "register">("login");
+	const [password, setPassword] = useState("");
+	const pendingConnectorId = pendingQrPayload?.connectorId ?? null;
+
+	const loadConnectors = useCallback(async (record = sessionRecord) => {
+		if (!record) {
+			setConnectors([]);
+			return [];
+		}
+
+		setIsLoadingConnectors(true);
+		try {
+			const createClient = (accessToken: string) => createPrivateClient({
+				baseUrl: record.backendUrl,
+				getAccessToken: () => accessToken,
+			});
+
+			try {
+				const response = await createClient(record.session.accessToken).listConnectors();
+				const next = sortPrivateConnectors(response.connectors);
+				setConnectors(next);
+				return next;
+			} catch (error) {
+				if (!(error instanceof Error)) {
+					throw error;
+				}
+
+				const refreshed = await refreshSession();
+				if (!refreshed) {
+					throw error;
+				}
+
+				const response = await createClient(refreshed.accessToken).listConnectors();
+				const next = sortPrivateConnectors(response.connectors);
+				setConnectors(next);
+				return next;
+			}
+		} finally {
+			setIsLoadingConnectors(false);
+		}
+	}, [refreshSession, sessionRecord]);
+
+	const connectConnector = useCallback(async (
+		connectorId: string,
+		options?: {
+			sessionRecordOverride?: {
+				backendUrl: string;
+				session: PrivateSessionDto;
+			};
+			targetBackendUrl?: string;
+		},
+	) => {
+		await activateConnector({
+			backendUrl: options?.targetBackendUrl ?? sessionRecord?.backendUrl ?? backendUrl,
+			connectorId,
+			sessionRecordOverride: options?.sessionRecordOverride,
+		});
+		setErrorMessage(null);
+		await clearPendingQrPayload();
+		onConnected();
+	}, [activateConnector, backendUrl, clearPendingQrPayload, onConnected, sessionRecord?.backendUrl]);
+
+	const resumePendingQrConnection = useCallback(async (candidateConnectors: PrivateConnectorDto[]) => {
+		if (!pendingQrPayload || !sessionRecord || pendingQrPayload.backendUrl !== sessionRecord.backendUrl) {
+			return;
+		}
+
+		const connector = resolvePendingPrivateConnector({
+			connectors: candidateConnectors,
+			pendingConnectorId,
+		});
+		if (!connector) {
+			setErrorMessage("Scanned connector is not available on this account.");
+			return;
+		}
+
+		await connectConnector(connector.id, {
+			targetBackendUrl: pendingQrPayload.backendUrl,
+		});
+	}, [connectConnector, pendingConnectorId, pendingQrPayload, sessionRecord]);
+
+	useEffect(() => {
+		void loadPrivateConnectorsSafely({
+			loadConnectors,
+			onError: (message) => {
+				setErrorMessage(message);
+			},
+			resumePendingQrConnection,
+		});
+	}, [loadConnectors, resumePendingQrConnection]);
+
+	const handleAuthenticate = useCallback(async () => {
+		setIsAuthenticating(true);
+		setErrorMessage(null);
+		try {
+			const session = await authenticatePrivateAccount({
+				baseUrl: backendUrl,
+				email,
+				mode,
+				password,
+			});
+			await setSessionRecord({
+				backendUrl,
+				session,
+			});
+			const nextConnectors = await loadConnectors({
+				backendUrl,
+				session,
+			});
+			if (pendingQrPayload && pendingQrPayload.backendUrl === backendUrl) {
+				const connector = resolvePendingPrivateConnector({
+					connectors: nextConnectors,
+					pendingConnectorId,
+				});
+				if (connector) {
+					await connectConnector(connector.id, {
+						sessionRecordOverride: {
+							backendUrl,
+							session,
+						},
+						targetBackendUrl: backendUrl,
+					});
+					return;
+				}
+			}
+			await resumePendingQrConnection(nextConnectors);
+		} catch (error) {
+			setErrorMessage(error instanceof Error ? error.message : "Unable to authenticate private account.");
+		} finally {
+			setIsAuthenticating(false);
+		}
+	}, [
+		backendUrl,
+		connectConnector,
+		email,
+		loadConnectors,
+		mode,
+		password,
+		pendingConnectorId,
+		pendingQrPayload,
+		resumePendingQrConnection,
+		setSessionRecord,
+	]);
+
+	const handleLogout = useCallback(async () => {
+		setErrorMessage(null);
+		try {
+			if (sessionRecord) {
+				const client = createPrivateClient({
+					baseUrl: sessionRecord.backendUrl,
+					getAccessToken: () => sessionRecord.session.accessToken,
+				});
+				await client.logout({
+					refreshToken: sessionRecord.session.refreshToken,
+				});
+			}
+		} catch {
+			// best effort
+		} finally {
+			await clearPendingQrPayload();
+			await clearSessionRecord();
+			setConnectors([]);
+		}
+	}, [clearPendingQrPayload, clearSessionRecord, sessionRecord]);
+
+	const scannerHelpText = useMemo(() => {
+		if (pendingQrPayload) {
+			return `Pending QR: ${pendingQrPayload.connectorName}`;
+		}
+
+		return "Scan the QR shown on desktop to connect instantly.";
+	}, [pendingQrPayload]);
+	const authenticateButtonLabel = useMemo(() => {
+		if (isAuthenticating) {
+			return "Working...";
+		}
+
+		return mode === "login" ? "Log in" : "Register";
+	}, [isAuthenticating, mode]);
+
+	return (
+		<View style={styles.section}>
+			<View style={styles.sectionHeader}>
+				<View>
+					<Text style={styles.sectionTitle}>Private Account</Text>
+					<Text selectable style={styles.supportText}>
+						{sessionRecord?.session.user.email ?? "Sign in to sync desktop and mobile."}
+					</Text>
+				</View>
+				{sessionRecord ? (
+					<Pressable
+						onPress={() => {
+							void handleLogout();
+						}}
+						style={({ pressed }) => [styles.secondaryButton, pressed ? styles.secondaryButtonPressed : null]}
+						testID="private-account-logout"
+					>
+						<Text style={styles.secondaryLabel}>Logout</Text>
+					</Pressable>
+				) : null}
+			</View>
+
+			{sessionRecord ? (
+				<View style={styles.formBody}>
+					<View style={styles.accountSummary}>
+						<Text style={styles.summaryLabel}>Backend</Text>
+						<Text selectable style={styles.summaryValue}>{sessionRecord.backendUrl}</Text>
+					</View>
+					<View style={styles.inlineActions}>
+						<Pressable
+							onPress={() => {
+								setIsScannerOpen((current) => !current);
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
+							testID="private-account-scan-qr"
+						>
+							<Text style={styles.secondaryLabel}>{isScannerOpen ? "Close Scanner" : "Scan QR"}</Text>
+						</Pressable>
+					</View>
+
+					{isScannerOpen ? (
+						<View style={styles.scannerCard} testID="private-account-qr-scanner">
+							<CameraView
+								barcodeScannerSettings={{
+									barcodeTypes: ["qr"],
+								}}
+								onBarcodeScanned={(event) => {
+									try {
+										const payload = parseDesktopMobileConnectQrPayload(event.data);
+										setBackendUrl(payload.backendUrl);
+										void setPendingQrPayload(payload);
+										setIsScannerOpen(false);
+										setErrorMessage("QR captured. Finish sign-in or choose the connector below.");
+									} catch (error) {
+										setErrorMessage(error instanceof Error ? error.message : "Invalid QR code.");
+									}
+								}}
+								style={styles.camera}
+							/>
+							<Text style={styles.supportText}>{scannerHelpText}</Text>
+						</View>
+					) : null}
+
+					<View style={styles.connectorList}>
+						<Text style={styles.summaryLabel}>Your Servers</Text>
+						{isLoadingConnectors ? <ActivityIndicator color={palette.accent} size="small" /> : null}
+						{connectors.length === 0 && !isLoadingConnectors ? (
+							<Text style={styles.supportText}>No private connectors found for this account yet.</Text>
+						) : null}
+						{connectors.map((connector, index) => (
+							<Pressable
+								key={connector.id}
+								onPress={() => {
+									void connectConnector(connector.id);
+								}}
+								style={({ pressed }) => [
+									styles.connectorRow,
+									pressed ? styles.connectorRowPressed : null,
+								]}
+								testID={`private-account-connector-${String(index)}`}
+							>
+								<View style={styles.rowTextGroup}>
+									<Text style={styles.rowTitle}>{connector.name}</Text>
+									<Text selectable style={styles.rowMeta}>
+										{connector.hostname} · {connector.status}
+									</Text>
+								</View>
+								<Text style={styles.secondaryLabel}>Connect</Text>
+							</Pressable>
+						))}
+					</View>
+				</View>
+			) : (
+				<View style={styles.formBody}>
+					<View style={styles.modeToggle}>
+						<Pressable
+							onPress={() => {
+								setMode("login");
+							}}
+							style={({ pressed }) => [
+								styles.modeButton,
+								mode === "login" ? styles.modeButtonActive : null,
+								pressed ? styles.modeButtonPressed : null,
+							]}
+						>
+							<Text style={mode === "login" ? styles.modeButtonActiveLabel : styles.modeButtonLabel}>Log in</Text>
+						</Pressable>
+						<Pressable
+							onPress={() => {
+								setMode("register");
+							}}
+							style={({ pressed }) => [
+								styles.modeButton,
+								mode === "register" ? styles.modeButtonActive : null,
+								pressed ? styles.modeButtonPressed : null,
+							]}
+						>
+							<Text style={mode === "register" ? styles.modeButtonActiveLabel : styles.modeButtonLabel}>Register</Text>
+						</Pressable>
+					</View>
+					<TextInput
+						autoCapitalize="none"
+						onChangeText={setBackendUrl}
+						placeholder="https://private.remotecode.dev"
+						placeholderTextColor={palette.muted}
+						style={styles.input}
+						testID="private-account-backend-url"
+						value={backendUrl}
+					/>
+					<TextInput
+						autoCapitalize="none"
+						keyboardType="email-address"
+						onChangeText={setEmail}
+						placeholder="dev@example.com"
+						placeholderTextColor={palette.muted}
+						style={styles.input}
+						testID="private-account-email"
+						value={email}
+					/>
+					<TextInput
+						onChangeText={setPassword}
+						placeholder="Password"
+						placeholderTextColor={palette.muted}
+						secureTextEntry
+						style={styles.input}
+						testID="private-account-password"
+						value={password}
+					/>
+					<Pressable
+						disabled={isAuthenticating || backendUrl.trim().length === 0 || email.trim().length === 0 || password.trim().length === 0}
+						onPress={() => {
+							void handleAuthenticate();
+						}}
+						style={({ pressed }) => [
+							styles.primaryButton,
+							pressed ? styles.primaryButtonPressed : null,
+							isAuthenticating ? styles.disabledButton : null,
+						]}
+						testID="private-account-authenticate"
+					>
+						<Text style={styles.primaryLabel}>{authenticateButtonLabel}</Text>
+					</Pressable>
+				</View>
+			)}
+
+			{errorMessage ? (
+				<View style={styles.statusBox}>
+					<Text selectable style={styles.statusText}>{errorMessage}</Text>
+				</View>
+			) : null}
+		</View>
+	);
+};
+
+const styles = StyleSheet.create({
+	accountSummary: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		gap: 6,
+		padding: 12,
+	},
+	camera: {
+		borderRadius: 12,
+		height: 180,
+		overflow: "hidden",
+		width: "100%",
+	},
+	connectorList: {
+		gap: 8,
+	},
+	connectorRow: {
+		alignItems: "center",
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		flexDirection: "row",
+		gap: 10,
+		padding: 12,
+	},
+	connectorRowPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	disabledButton: {
+		opacity: 0.45,
+	},
+	formBody: {
+		gap: 10,
+	},
+	inlineActions: {
+		flexDirection: "row",
+		gap: 8,
+	},
+	inlineButton: {
+		flex: 1,
+	},
+	input: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		color: palette.text,
+		fontSize: 15,
+		minHeight: 42,
+		paddingHorizontal: 12,
+		paddingVertical: 8,
+	},
+	modeButton: {
+		alignItems: "center",
+		borderRadius: 10,
+		flex: 1,
+		justifyContent: "center",
+		paddingHorizontal: 12,
+		paddingVertical: 10,
+	},
+	modeButtonActive: {
+		backgroundColor: palette.accent,
+	},
+	modeButtonActiveLabel: {
+		color: "#0A1D2B",
+		fontSize: 13,
+		fontWeight: "700",
+	},
+	modeButtonLabel: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "600",
+	},
+	modeButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	modeToggle: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		flexDirection: "row",
+		padding: 4,
+	},
+	primaryButton: {
+		alignItems: "center",
+		backgroundColor: palette.accent,
+		borderRadius: 11,
+		height: 40,
+		justifyContent: "center",
+		paddingHorizontal: 12,
+	},
+	primaryButtonPressed: {
+		backgroundColor: palette.accentPressed,
+	},
+	primaryLabel: {
+		color: "#0A1D2B",
+		fontSize: 13,
+		fontWeight: "700",
+	},
+	rowMeta: {
+		color: palette.muted,
+		fontSize: 12,
+	},
+	rowTextGroup: {
+		flex: 1,
+		gap: 4,
+	},
+	rowTitle: {
+		color: palette.text,
+		fontSize: 15,
+		fontWeight: "600",
+	},
+	scannerCard: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		gap: 8,
+		padding: 10,
+	},
+	secondaryButton: {
+		alignItems: "center",
+		borderColor: palette.border,
+		borderRadius: 10,
+		borderWidth: 1,
+		height: 34,
+		justifyContent: "center",
+		paddingHorizontal: 12,
+	},
+	secondaryButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	secondaryLabel: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "600",
+	},
+	section: {
+		backgroundColor: "#12161E",
+		borderColor: palette.border,
+		borderRadius: 14,
+		borderWidth: 1,
+		gap: 10,
+		padding: 12,
+	},
+	sectionHeader: {
+		alignItems: "center",
+		flexDirection: "row",
+		justifyContent: "space-between",
+	},
+	sectionTitle: {
+		color: palette.text,
+		fontSize: 15,
+		fontWeight: "700",
+	},
+	statusBox: {
+		backgroundColor: "rgba(255,107,133,0.16)",
+		borderColor: "rgba(255,107,133,0.38)",
+		borderRadius: 12,
+		borderWidth: 1,
+		padding: 12,
+	},
+	statusText: {
+		color: palette.text,
+		fontSize: 13,
+		lineHeight: 19,
+	},
+	summaryLabel: {
+		color: palette.muted,
+		fontSize: 12,
+		fontWeight: "600",
+	},
+	summaryValue: {
+		color: palette.text,
+		fontSize: 14,
+	},
+	supportText: {
+		color: palette.muted,
+		fontSize: 13,
+		lineHeight: 18,
+	},
+});
