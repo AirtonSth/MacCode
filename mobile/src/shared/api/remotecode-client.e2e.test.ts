@@ -3,6 +3,11 @@ import { expect, test } from "bun:test";
 
 import { createRemoteCodeClient } from "./remotecode-client";
 
+interface BunServerLike {
+	port: number;
+	stop: (closeActiveConnections?: boolean) => void;
+}
+
 test("createRemoteCodeClient reaches a private proxied endpoint with connector routing", async () => {
 	const server = Bun.serve({
 		fetch: (request) => {
@@ -25,7 +30,7 @@ test("createRemoteCodeClient reaches a private proxied endpoint with connector r
 			});
 		},
 		port: 0,
-	});
+	}) as BunServerLike;
 
 	try {
 		const port = String(server.port ?? 0);
