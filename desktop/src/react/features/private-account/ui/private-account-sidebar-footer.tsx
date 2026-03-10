@@ -1,6 +1,7 @@
 import type { PrivateAccountStateDto } from "@remotecode/contracts";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 
 import {
 	createPrivateAccountApiClient,
@@ -239,14 +240,15 @@ export const PrivateAccountSidebarFooter = ({
 				</p>
 			) : null}
 
-			{isModalOpen ? (
-				<div
-					aria-label="Private account modal"
-					aria-modal="true"
-					className="absolute inset-0 z-40 flex items-end justify-center bg-black/55 p-4"
-					role="dialog"
-				>
-					<div className="w-full max-w-md rounded-3xl border border-white/10 bg-[#141824] p-4 shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
+			{isModalOpen && typeof document !== "undefined"
+				? createPortal(
+					<div
+						aria-label="Private account modal"
+						aria-modal="true"
+						className="fixed inset-0 z-40 flex items-end justify-center bg-black/55 p-4"
+						role="dialog"
+					>
+						<div className="w-full max-w-md rounded-3xl border border-white/10 bg-[#141824] p-4 shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
 						<div className="mb-4 flex items-center justify-between gap-3">
 							<div>
 								<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Private Account</p>
@@ -345,9 +347,11 @@ export const PrivateAccountSidebarFooter = ({
 								</button>
 							</div>
 						)}
-					</div>
-				</div>
-			) : null}
+						</div>
+					</div>,
+					document.body,
+				)
+				: null}
 		</div>
 	);
 };
