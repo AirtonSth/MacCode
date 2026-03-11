@@ -1,6 +1,6 @@
 import type { PrivateAccountStateDto } from "@remotecode/contracts";
 import QRCode from "qrcode";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
 import {
@@ -14,7 +14,7 @@ export const serializePrivateAccountQrPayload = (state: PrivateAccountStateDto):
 		return null;
 	}
 
-	return JSON.stringify(state.qrPayload);
+	return state.qrPayload.linkUrl ?? JSON.stringify(state.qrPayload);
 };
 
 export const getPrivateAccountStatusLabel = (state: PrivateAccountStateDto | null): string => {
@@ -92,7 +92,6 @@ export const PrivateAccountSidebarFooter = ({
 	const [state, setState] = useState<PrivateAccountStateDto>(defaultState);
 	const [email, setEmail] = useState("");
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
-	const [isLoading, setIsLoading] = useState(true);
 	const [isModalOpen, setIsModalOpen] = useState(false);
 	const [isSubmitting, setIsSubmitting] = useState(false);
 	const [mode, setMode] = useState<"login" | "register">("login");
@@ -100,30 +99,39 @@ export const PrivateAccountSidebarFooter = ({
 	const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
 	const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+	const refreshState = useCallback(async (): Promise<void> => {
+		const nextState = await loadPrivateAccountState(client);
+		setState(nextState);
+		setErrorMessage(nextState.errorMessage);
+	}, [client]);
+
 	useEffect(() => {
 		let cancelled = false;
-		void (async () => {
-			try {
-				const nextState = await loadPrivateAccountState(client);
-				if (!cancelled) {
-					setState(nextState);
-					setErrorMessage(nextState.errorMessage);
-				}
-			} catch (error) {
-				if (!cancelled) {
-					setErrorMessage(error instanceof Error ? error.message : "Unable to load private account.");
-				}
-			} finally {
-				if (!cancelled) {
-					setIsLoading(false);
-				}
+		void refreshState().catch((error) => {
+			if (!cancelled) {
+				setErrorMessage(error instanceof Error ? error.message : "Unable to load private account.");
 			}
-		})();
+		});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [client]);
+	}, [refreshState]);
+
+	useEffect(() => {
+		if (!state.authenticated) {
+			return;
+		}
+
+		const refreshIntervalMs = isModalOpen ? 5_000 : 60_000;
+		const interval = globalThis.setInterval(() => {
+			void refreshState().catch(() => undefined);
+		}, refreshIntervalMs);
+
+		return () => {
+			globalThis.clearInterval(interval);
+		};
+	}, [isModalOpen, refreshState, state.authenticated]);
 
 	useEffect(() => {
 		if (!errorMessage) {
@@ -172,6 +180,11 @@ export const PrivateAccountSidebarFooter = ({
 
 	const statusLabel = useMemo(() => getPrivateAccountStatusLabel(state), [state]);
 
+	const openModal = useCallback(() => {
+		setIsModalOpen(true);
+		void refreshState().catch(() => undefined);
+	}, [refreshState]);
+
 	const submit = async () => {
 		setIsSubmitting(true);
 		setErrorMessage(null);
@@ -216,7 +229,12 @@ export const PrivateAccountSidebarFooter = ({
 	return (
 		<div className="mt-3 border-t border-white/10 pt-3" data-testid="private-account-sidebar-footer">
 			{state.authenticated ? (
-				<div className="mb-3 rounded-2xl border border-white/10 bg-black/20 p-3 text-slate-100" data-testid="private-account-connector-card">
+				<button
+					className="mb-3 block w-full rounded-2xl border border-white/10 bg-black/20 p-3 text-left text-slate-100 transition hover:border-white/20 hover:bg-black/30"
+					data-testid="private-account-connector-card"
+					onClick={openModal}
+					type="button"
+				>
 					<div className="flex items-start justify-between gap-3">
 						<div className="min-w-0">
 							<p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Private Connector</p>
@@ -237,14 +255,12 @@ export const PrivateAccountSidebarFooter = ({
 							</div>
 						)}
 					</div>
-				</div>
+				</button>
 			) : null}
 
 			<button
 				className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left transition hover:bg-white/[0.08]"
-				onClick={() => {
-					setIsModalOpen(true);
-				}}
+				onClick={openModal}
 				type="button"
 			>
 				<span>
@@ -253,7 +269,6 @@ export const PrivateAccountSidebarFooter = ({
 						{state.user?.email ?? "Log in or register"}
 					</span>
 				</span>
-				<span className="text-xs text-slate-300">{isLoading ? "Loading..." : statusLabel}</span>
 			</button>
 
 			{errorMessage ? (
@@ -303,7 +318,7 @@ export const PrivateAccountSidebarFooter = ({
 						className="fixed inset-0 z-40 flex items-end justify-center bg-black/55 p-4"
 						role="dialog"
 					>
-						<div className="w-full max-w-md rounded-3xl border border-white/10 bg-[#141824] p-4 shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
+						<div className="w-full max-w-lg rounded-3xl border border-white/10 bg-[#141824] p-4 shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
 						<div className="mb-4 flex items-center justify-between gap-3">
 							<div>
 								<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Private Account</p>
@@ -328,6 +343,30 @@ export const PrivateAccountSidebarFooter = ({
 									<p className="text-xs text-slate-400">Signed in as</p>
 									<p className="text-sm font-semibold text-slate-100">{state.user?.email}</p>
 									<p className="mt-1 text-xs text-slate-300">{statusLabel}</p>
+								</div>
+								<div className="rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))] p-4">
+									<div className="mb-3 flex items-center justify-between gap-3">
+										<div>
+											<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Connector QR</p>
+											<p className="text-sm text-slate-200">Scan on mobile with a larger code.</p>
+										</div>
+									</div>
+									{qrDataUrl ? (
+										<div className="mx-auto flex w-fit flex-col items-center gap-3">
+											<img
+												alt="Private connect QR enlarged"
+												className="h-64 w-64 rounded-2xl border border-white/10 bg-white p-3 shadow-[0_12px_30px_rgba(0,0,0,0.28)]"
+												src={qrDataUrl}
+											/>
+											<p className="text-center text-xs text-slate-400">
+												Open the mobile app and scan this code to pair the connector.
+											</p>
+										</div>
+									) : (
+										<div className="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-white/15 text-sm text-slate-400">
+											QR code unavailable
+										</div>
+									)}
 								</div>
 								<button
 									className="w-full rounded-2xl bg-rose-400 px-3 py-2.5 text-sm font-semibold text-[#24080f] transition hover:bg-rose-300 disabled:opacity-60"

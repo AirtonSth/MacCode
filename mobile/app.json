@@ -5,7 +5,10 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "remotecode-mobile",
+    "scheme": [
+      "remotecode",
+      "remotecode-mobile"
+    ],
     "userInterfaceStyle": "dark",
     "splash": {
       "image": "./assets/images/splash-icon.png",
@@ -15,6 +18,9 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "io.remotecode",
+      "associatedDomains": [
+        "applinks:qr.remotecode.dev"
+      ],
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "NSAppTransportSecurity": {
@@ -36,6 +42,22 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ],
+          "data": [
+            {
+              "host": "qr.remotecode.dev",
+              "pathPrefix": "/connect",
+              "scheme": "https"
+            }
+          ]
+        }
+      ],
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "POST_NOTIFICATIONS"

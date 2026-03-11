@@ -1,5 +1,3 @@
-import * as SecureStore from "expo-secure-store";
-
 export type ActiveConnectionTarget =
 	| {
 		baseUrl: string;
@@ -41,13 +39,24 @@ const LEGACY_DEFAULT_TOKEN = "local-dev-token";
 const MAX_SAVED_CONNECTIONS = 24;
 
 let secureStoreOverride: SecureStoreLike | null = null;
+let secureStorePromise: Promise<SecureStoreLike> | null = null;
 
-const getSecureStore = (): SecureStoreLike => {
+const loadSecureStore = async (): Promise<SecureStoreLike> => {
+	const module = await import("expo-secure-store");
+	return {
+		deleteItemAsync: module.deleteItemAsync,
+		getItemAsync: module.getItemAsync,
+		setItemAsync: module.setItemAsync,
+	};
+};
+
+const getSecureStore = async (): Promise<SecureStoreLike> => {
 	if (secureStoreOverride) {
 		return secureStoreOverride;
 	}
 
-	return SecureStore;
+	secureStorePromise ??= loadSecureStore();
+	return await secureStorePromise;
 };
 
 const defaultLocalTarget: ActiveConnectionTarget = {
@@ -179,23 +188,25 @@ const parseActiveTarget = (raw: string | null, fallback: { baseUrl: string; toke
 
 const writeSavedConnections = async (connections: SavedConnection[]): Promise<SavedConnection[]> => {
 	const normalized = connections.slice(0, MAX_SAVED_CONNECTIONS);
+	const secureStore = await getSecureStore();
 
 	if (normalized.length === 0) {
-		await getSecureStore().deleteItemAsync(SAVED_CONNECTIONS_KEY);
+		await secureStore.deleteItemAsync(SAVED_CONNECTIONS_KEY);
 		return [];
 	}
 
-	await getSecureStore().setItemAsync(SAVED_CONNECTIONS_KEY, JSON.stringify(normalized));
+	await secureStore.setItemAsync(SAVED_CONNECTIONS_KEY, JSON.stringify(normalized));
 	return normalized;
 };
 
 export const ApiConfigStore = {
 	defaultConfig: toApiConfig(defaultLocalTarget),
 	async read(): Promise<ApiConfig> {
+		const secureStore = await getSecureStore();
 		const [baseUrl, token, rawActiveTarget] = await Promise.all([
-			getSecureStore().getItemAsync(BASE_URL_KEY),
-			getSecureStore().getItemAsync(TOKEN_KEY),
-			getSecureStore().getItemAsync(ACTIVE_TARGET_KEY),
+			secureStore.getItemAsync(BASE_URL_KEY),
+			secureStore.getItemAsync(TOKEN_KEY),
+			secureStore.getItemAsync(ACTIVE_TARGET_KEY),
 		]);
 
 		const activeTarget = parseActiveTarget(rawActiveTarget, {
@@ -205,9 +216,9 @@ export const ApiConfigStore = {
 		const normalized = toApiConfig(activeTarget);
 
 		await Promise.all([
-			getSecureStore().setItemAsync(BASE_URL_KEY, normalized.baseUrl),
-			getSecureStore().setItemAsync(TOKEN_KEY, normalized.token),
-			getSecureStore().setItemAsync(ACTIVE_TARGET_KEY, JSON.stringify(activeTarget)),
+			secureStore.setItemAsync(BASE_URL_KEY, normalized.baseUrl),
+			secureStore.setItemAsync(TOKEN_KEY, normalized.token),
+			secureStore.setItemAsync(ACTIVE_TARGET_KEY, JSON.stringify(activeTarget)),
 		]);
 
 		return normalized;
@@ -215,11 +226,12 @@ export const ApiConfigStore = {
 	async save(config: ApiConfig): Promise<ApiConfig> {
 		const activeTarget = normalizeActiveTarget(config.activeTarget);
 		const normalized = toApiConfig(activeTarget);
+		const secureStore = await getSecureStore();
 
 		await Promise.all([
-			getSecureStore().setItemAsync(BASE_URL_KEY, normalized.baseUrl),
-			getSecureStore().setItemAsync(TOKEN_KEY, normalized.token),
-			getSecureStore().setItemAsync(ACTIVE_TARGET_KEY, JSON.stringify(activeTarget)),
+			secureStore.setItemAsync(BASE_URL_KEY, normalized.baseUrl),
+			secureStore.setItemAsync(TOKEN_KEY, normalized.token),
+			secureStore.setItemAsync(ACTIVE_TARGET_KEY, JSON.stringify(activeTarget)),
 		]);
 
 		return normalized;
@@ -232,33 +244,36 @@ export const ApiConfigStore = {
 			token: input.token,
 		});
 		const normalized = toApiConfig(activeTarget);
+		const secureStore = await getSecureStore();
 
 		await Promise.all([
-			getSecureStore().setItemAsync(`${SERVER_TOKEN_PREFIX}${serverId}`, normalized.token),
-			getSecureStore().setItemAsync(`${SERVER_BASE_URL_PREFIX}${serverId}`, normalized.baseUrl),
-			getSecureStore().setItemAsync(BASE_URL_KEY, normalized.baseUrl),
-			getSecureStore().setItemAsync(TOKEN_KEY, normalized.token),
-			getSecureStore().setItemAsync(ACTIVE_TARGET_KEY, JSON.stringify(activeTarget)),
+			secureStore.setItemAsync(`${SERVER_TOKEN_PREFIX}${serverId}`, normalized.token),
+			secureStore.setItemAsync(`${SERVER_BASE_URL_PREFIX}${serverId}`, normalized.baseUrl),
+			secureStore.setItemAsync(BASE_URL_KEY, normalized.baseUrl),
+			secureStore.setItemAsync(TOKEN_KEY, normalized.token),
+			secureStore.setItemAsync(ACTIVE_TARGET_KEY, JSON.stringify(activeTarget)),
 		]);
 
 		return normalized;
 	},
 	async readTokenForServer(serverId: string): Promise<string | null> {
 		const key = `${SERVER_TOKEN_PREFIX}${serverId}`;
-		const token = await getSecureStore().getItemAsync(key);
+		const secureStore = await getSecureStore();
+		const token = await secureStore.getItemAsync(key);
 		if (!token) {
 			return null;
 		}
 
 		const normalized = normalizeToken(token);
 		if (token.trim() !== normalized) {
-			await getSecureStore().setItemAsync(key, normalized);
+			await secureStore.setItemAsync(key, normalized);
 		}
 		return normalized.length > 0 ? normalized : null;
 	},
 	async readBaseUrlForServer(serverId: string): Promise<string | null> {
 		const key = `${SERVER_BASE_URL_PREFIX}${serverId}`;
-		const baseUrl = await getSecureStore().getItemAsync(key);
+		const secureStore = await getSecureStore();
+		const baseUrl = await secureStore.getItemAsync(key);
 		if (!baseUrl) {
 			return null;
 		}
@@ -267,7 +282,8 @@ export const ApiConfigStore = {
 		return normalized.length > 0 ? normalized : null;
 	},
 	async readSavedConnections(): Promise<SavedConnection[]> {
-		const raw = await getSecureStore().getItemAsync(SAVED_CONNECTIONS_KEY);
+		const secureStore = await getSecureStore();
+		const raw = await secureStore.getItemAsync(SAVED_CONNECTIONS_KEY);
 		return parseSavedConnections(raw);
 	},
 	async saveSavedConnection(input: { baseUrl: string; token: string }): Promise<SavedConnection[]> {
@@ -295,4 +311,5 @@ export const setSecureStoreAdapterForTests = (adapter: SecureStoreLike) => {
 
 export const resetSecureStoreAdapterForTests = () => {
 	secureStoreOverride = null;
+	secureStorePromise = null;
 };

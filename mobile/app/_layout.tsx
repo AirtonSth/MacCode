@@ -1,11 +1,13 @@
 import "react-native-reanimated";
 
 import { QueryClientProvider } from "@tanstack/react-query";
+import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
-import { Stack } from "expo-router";
-import { useEffect, useState } from "react";
+import { Stack, usePathname, useRouter } from "expo-router";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
+import { parsePrivateConnectInput } from "@/shared/api/private-mobile-connect";
 import { PrivateSessionProvider } from "@/shared/api/private-session-provider";
 import { queryClient } from "@/shared/api/query-client";
 import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
@@ -22,6 +24,33 @@ SplashScreen.preventAutoHideAsync();
 
 export default function RootLayout() {
 	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);
+	const lastHandledPrivateUrlRef = useRef<string | null>(null);
+	const pathname = usePathname();
+	const router = useRouter();
+
+	const routePrivateConnectUrl = useCallback((rawUrl: string | null) => {
+		if (!rawUrl) {
+			return;
+		}
+
+		try {
+			parsePrivateConnectInput(rawUrl);
+		} catch {
+			return;
+		}
+
+		if (lastHandledPrivateUrlRef.current === rawUrl && pathname === "/connect") {
+			return;
+		}
+
+		lastHandledPrivateUrlRef.current = rawUrl;
+		router.replace({
+			params: {
+				url: rawUrl,
+			},
+			pathname: "/connect" as never,
+		});
+	}, [pathname, router]);
 
 	useEffect(() => {
 		void (async () => {
@@ -49,6 +78,29 @@ export default function RootLayout() {
 		})();
 	}, []);
 
+	useEffect(() => {
+		let isActive = true;
+		void (async () => {
+			try {
+				const initialUrl = await Linking.getInitialURL();
+				if (isActive) {
+					routePrivateConnectUrl(initialUrl);
+				}
+			} catch {
+				// Ignore malformed startup URLs.
+			}
+		})();
+
+		const subscription = Linking.addEventListener("url", (event) => {
+			routePrivateConnectUrl(event.url);
+		});
+
+		return () => {
+			isActive = false;
+			subscription.remove();
+		};
+	}, [routePrivateConnectUrl]);
+
 	return (
 		<ApiConfigProvider>
 			<PrivateSessionProvider>
@@ -66,6 +118,7 @@ export default function RootLayout() {
 						}}
 					>
 						<Stack.Screen name="index" options={{ headerShown: false }} />
+						<Stack.Screen name="connect" options={{ headerShown: false }} />
 						<Stack.Screen name="workspaces" options={{ headerShown: false }} />
 						<Stack.Screen name="threads" options={{ headerShown: false }} />
 						<Stack.Screen name="active-threads" options={{ headerShown: false }} />

@@ -23,7 +23,7 @@ test("getPrivateAccountStatusLabel reflects relay state for authenticated users"
 	})).toBe("Relay online");
 });
 
-test("serializePrivateAccountQrPayload returns stable JSON for QR generation", () => {
+test("serializePrivateAccountQrPayload prefers universal link payloads for QR generation", () => {
 	expect(serializePrivateAccountQrPayload({
 		authenticated: true,
 		connector: null,
@@ -33,6 +33,7 @@ test("serializePrivateAccountQrPayload returns stable JSON for QR generation", (
 			backendUrl: "http://127.0.0.1:8787",
 			connectorId: "con_1",
 			connectorName: "Desktop Connector",
+			linkUrl: "https://qr.remotecode.dev/connect/mcs_1/secret",
 			type: "remotecode_private_mobile_connect",
 			version: 1,
 		},
@@ -40,6 +41,5 @@ test("serializePrivateAccountQrPayload returns stable JSON for QR generation", (
 			email: "dev@example.com",
 			id: "usr_1",
 		},
-	})).toContain("\"connectorId\":\"con_1\"");
+	})).toBe("https://qr.remotecode.dev/connect/mcs_1/secret");
 });
-

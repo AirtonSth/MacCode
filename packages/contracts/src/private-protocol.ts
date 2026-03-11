@@ -93,8 +93,36 @@ export interface DesktopMobileConnectQrPayloadDto {
 	backendUrl: string;
 	connectorId: string;
 	connectorName: string;
+	linkUrl?: string | null;
 	type: "remotecode_private_mobile_connect";
 	version: 1;
+}
+
+export interface PrivateMobileConnectBootstrapRequestDto {
+	connectorId: string;
+}
+
+export interface PrivateMobileConnectBootstrapResponseDto {
+	connector: {
+		id: string;
+		name: string;
+	};
+	expiresAt: string;
+	linkUrl: string;
+}
+
+export interface PrivateMobileConnectClaimRequestDto {
+	code: string;
+	sessionId: string;
+}
+
+export interface PrivateMobileConnectClaimResponseDto {
+	connector: {
+		id: string;
+		name: string;
+	};
+	backendUrl: string;
+	session: PrivateSessionDto;
 }
 
 export interface PrivateAccountStateDto {

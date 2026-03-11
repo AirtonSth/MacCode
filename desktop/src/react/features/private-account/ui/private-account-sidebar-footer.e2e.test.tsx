@@ -35,6 +35,7 @@ test("private account sidebar helpers hydrate state, authenticate, and build the
 				backendUrl: "http://127.0.0.1:8787",
 				connectorId: "con_1",
 				connectorName: "Desktop Connector",
+				linkUrl: "https://qr.remotecode.dev/connect/mcs_1/secret",
 				type: "remotecode_private_mobile_connect" as const,
 				version: 1 as const,
 			},
@@ -60,6 +61,7 @@ test("private account sidebar helpers hydrate state, authenticate, and build the
 				backendUrl: "http://127.0.0.1:8787",
 				connectorId: "con_2",
 				connectorName: "Desktop Connector",
+				linkUrl: "https://qr.remotecode.dev/connect/mcs_2/secret",
 				type: "remotecode_private_mobile_connect" as const,
 				version: 1 as const,
 			},
@@ -86,5 +88,7 @@ test("private account sidebar helpers hydrate state, authenticate, and build the
 		state: loggedInState,
 	});
 	expect(qrDataUrl).toContain("data:image/png;base64,");
-	expect(Buffer.from(qrDataUrl!.split(",", 2)[1] ?? "", "base64").toString("utf8")).toContain("\"connectorId\":\"con_1\"");
+	expect(Buffer.from(qrDataUrl!.split(",", 2)[1] ?? "", "base64").toString("utf8")).toContain(
+		"https://qr.remotecode.dev/connect/mcs_1/secret",
+	);
 });

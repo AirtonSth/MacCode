@@ -30,6 +30,7 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 	const loginRefreshToken = "refresh-token";
 	const registerAccessToken = "register-access-token";
 	const registerRefreshToken = "register-refresh-token";
+	let mobileConnectBootstrapCount = 0;
 	const privateApp = new Elysia()
 		.post("/v1/private/auth/login", ({ body }) => {
 			expect(body).toEqual({
@@ -136,6 +137,21 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 				status: "claimed",
 			};
 		})
+		.post("/v1/private/mobile-connect/bootstrap", ({ body, request }) => {
+			expect([loginAccessToken, registerAccessToken]).toContain(readBearer(request.headers.get("authorization")));
+			expect(body).toEqual({
+				connectorId: "con_1",
+			});
+			mobileConnectBootstrapCount += 1;
+			return {
+				connector: {
+					id: "con_1",
+					name: "Desktop Connector",
+				},
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+				linkUrl: `https://qr.remotecode.dev/connect/mcs_${mobileConnectBootstrapCount}/secret_${mobileConnectBootstrapCount}`,
+			};
+		})
 		.get("/v1/private/connectors/bootstrap/:pairingId/status", () => ({
 			connector: {
 				accessToken: "connector-token",
@@ -166,6 +182,7 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			databasePath,
 			disableLiveActivityPush: true,
 			port: 0,
+			privateMobileConnectRefreshIntervalMs: 5,
 			privateBackendUrl: `http://127.0.0.1:${privatePort}`,
 		});
 		const baseUrl = `http://127.0.0.1:${requirePort(server.server)}`;
@@ -187,6 +204,7 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			authenticated: boolean;
 			qrPayload: {
 				connectorId: string;
+				linkUrl?: string | null;
 				type: string;
 			} | null;
 			user: {
@@ -196,7 +214,10 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 		expect(loginPayload.authenticated).toBe(true);
 		expect(loginPayload.user?.email).toBe("dev@example.com");
 		expect(loginPayload.qrPayload?.connectorId).toBe("con_1");
+		expect(loginPayload.qrPayload?.linkUrl).toContain("https://qr.remotecode.dev/connect/");
 		expect(loginPayload.qrPayload?.type).toBe("remotecode_private_mobile_connect");
+
+		await Bun.sleep(20);
 
 		const stateResponse = await fetch(`${baseUrl}/v1/private-account/state`, {
 			headers: {
@@ -208,10 +229,12 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			authenticated: boolean;
 			connector: { id: string } | null;
 			connectorRelayState: string;
+			qrPayload: { linkUrl?: string | null } | null;
 		};
 		expect(statePayload.authenticated).toBe(true);
 		expect(statePayload.connector?.id).toBe("con_1");
 		expect(["connecting", "connected"]).toContain(statePayload.connectorRelayState);
+		expect(statePayload.qrPayload?.linkUrl).toContain("mcs_2");
 
 		const logoutResponse = await fetch(`${baseUrl}/v1/private-account/logout`, {
 			headers: {
@@ -245,12 +268,13 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 		expect(registerResponse.status).toBe(200);
 		const registerPayload = await registerResponse.json() as {
 			authenticated: boolean;
-			qrPayload: { connectorId: string; type: string } | null;
+			qrPayload: { connectorId: string; linkUrl?: string | null; type: string } | null;
 			user: { email: string } | null;
 		};
 		expect(registerPayload.authenticated).toBe(true);
 		expect(registerPayload.user?.email).toBe("founder@example.com");
 		expect(registerPayload.qrPayload?.connectorId).toBe("con_1");
+		expect(registerPayload.qrPayload?.linkUrl).toContain("https://qr.remotecode.dev/connect/");
 		expect(registerPayload.qrPayload?.type).toBe("remotecode_private_mobile_connect");
 	} finally {
 		if (server) {

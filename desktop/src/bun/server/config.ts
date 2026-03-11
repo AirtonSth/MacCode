@@ -53,7 +53,7 @@ export class ServerConfig {
 
 	private static parsePrivateBackendUrl(raw: string | undefined): string {
 		const normalized = raw?.trim().replace(/\/+$/u, "");
-		return normalized && normalized.length > 0 ? normalized : "http://127.0.0.1:8787";
+		return normalized && normalized.length > 0 ? normalized : "https://private.remotecode.dev";
 	}
 
 	private static parseOptional(raw: string | undefined): string | undefined {

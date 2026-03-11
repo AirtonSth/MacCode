@@ -24,8 +24,18 @@ interface PrivateAccountServiceOptions {
 	connectorName?: string;
 	heartbeatIntervalMs?: number;
 	localServerToken: string;
+	mobileConnectRefreshIntervalMs?: number;
 	reconnectDelayMs?: number;
 }
+
+interface MobileConnectQrLink {
+	connectorId: string;
+	expiresAt: string;
+	generatedAtMs: number;
+	linkUrl: string;
+}
+
+const DEFAULT_MOBILE_CONNECT_REFRESH_INTERVAL_MS = 5_000;
 
 const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
 	missing_private_refresh_token: "Your session has expired. Please sign in again.",
@@ -52,6 +62,7 @@ export class PrivateAccountService {
 	private errorMessage: string | null = null;
 	private localApp: ServerApp | null = null;
 	private localServerBaseUrl: string | null = null;
+	private mobileConnectLink: MobileConnectQrLink | null = null;
 	private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 	private relayClient: RelayConnectorClient;
 	private session: PrivateSessionDto | null;
@@ -89,11 +100,13 @@ export class PrivateAccountService {
 			try {
 				const connectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
 				this.connectorDto = connectors.connectors.find((item) => item.id === this.connector?.connectorId) ?? null;
+				await this.ensureMobileConnectLink();
 			} catch (error) {
 				this.errorMessage = toPrivateAccountErrorMessage(error, "private_state_refresh_failed");
 			}
 		} else {
 			this.connectorDto = null;
+			this.mobileConnectLink = null;
 		}
 
 		const snapshot = this.snapshot();
@@ -161,6 +174,7 @@ export class PrivateAccountService {
 		this.connectorDto = null;
 		this.connectorRelayState = "idle";
 		this.errorMessage = null;
+		this.mobileConnectLink = null;
 		this.session = null;
 		this.repository.clearConnector();
 		this.repository.clearSession();
@@ -271,6 +285,42 @@ export class PrivateAccountService {
 		};
 	}
 
+	private async ensureMobileConnectLink(): Promise<void> {
+		if (!this.session || !this.connector) {
+			this.mobileConnectLink = null;
+			return;
+		}
+
+		const now = Date.now();
+		const expiresAt = this.mobileConnectLink?.expiresAt
+			? new Date(this.mobileConnectLink.expiresAt).getTime()
+			: Number.NaN;
+		const needsRefresh = (
+			!this.mobileConnectLink
+			|| this.mobileConnectLink.connectorId !== this.connector.connectorId
+			|| now - this.mobileConnectLink.generatedAtMs >= (this.options.mobileConnectRefreshIntervalMs ?? DEFAULT_MOBILE_CONNECT_REFRESH_INTERVAL_MS)
+			|| !Number.isFinite(expiresAt)
+			|| expiresAt <= now
+		);
+		if (!needsRefresh) {
+			return;
+		}
+
+		const connectorId = this.connector.connectorId;
+		const bootstrap = await this.withPrivateAuth(async (client) =>
+			await client.createMobileConnectBootstrap({
+				connectorId,
+			}),
+		);
+
+		this.mobileConnectLink = {
+			connectorId: bootstrap.connector.id,
+			expiresAt: bootstrap.expiresAt,
+			generatedAtMs: now,
+			linkUrl: bootstrap.linkUrl,
+		};
+	}
+
 	private async refreshSession(): Promise<void> {
 		if (!this.session?.refreshToken) {
 			throw new PrivateApiError(401, null, "missing_private_refresh_token");
@@ -298,11 +348,12 @@ export class PrivateAccountService {
 	}
 
 	private snapshot(): PrivateAccountStateSnapshot {
-		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector
+		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector && this.mobileConnectLink
 			? {
 				backendUrl: this.connector.backendUrl,
 				connectorId: this.connector.connectorId,
 				connectorName: this.connector.connectorName,
+				linkUrl: this.mobileConnectLink.linkUrl,
 				type: "remotecode_private_mobile_connect",
 				version: 1,
 			}

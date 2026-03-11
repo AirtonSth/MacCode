@@ -8,6 +8,10 @@ import type {
 	PrivateLoginRequestDto,
 	PrivateLogoutRequestDto,
 	PrivateMeResponseDto,
+	PrivateMobileConnectBootstrapRequestDto,
+	PrivateMobileConnectBootstrapResponseDto,
+	PrivateMobileConnectClaimRequestDto,
+	PrivateMobileConnectClaimResponseDto,
 	PrivatePairingClaimRequestDto,
 	PrivatePairingClaimResponseDto,
 	PrivateRefreshRequestDto,
@@ -147,11 +151,30 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				path: "/v1/private/connectors/bootstrap",
 			}),
 
+		claimMobileConnect: async (
+			input: PrivateMobileConnectClaimRequestDto,
+		): Promise<PrivateMobileConnectClaimResponseDto> =>
+			await request<PrivateMobileConnectClaimResponseDto>({
+				authenticated: false,
+				body: input,
+				method: "POST",
+				path: "/v1/private/mobile-connect/claim",
+			}),
+
 		claimPairing: async (input: PrivatePairingClaimRequestDto): Promise<PrivatePairingClaimResponseDto> =>
 			await request<PrivatePairingClaimResponseDto>({
 				body: input,
 				method: "POST",
 				path: "/v1/private/pairing/claim",
+			}),
+
+		createMobileConnectBootstrap: async (
+			input: PrivateMobileConnectBootstrapRequestDto,
+		): Promise<PrivateMobileConnectBootstrapResponseDto> =>
+			await request<PrivateMobileConnectBootstrapResponseDto>({
+				body: input,
+				method: "POST",
+				path: "/v1/private/mobile-connect/bootstrap",
 			}),
 
 			getBootstrapStatus: async (

@@ -1,10 +1,10 @@
 import {
 	createPrivateClient,
-	parseDesktopMobileConnectQrPayload,
 	type PrivateConnectorDto,
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
 import { CameraView } from "expo-camera";
+import { useGlobalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
 	ActivityIndicator,
@@ -17,13 +17,16 @@ import {
 
 import { usePrivateSession } from "../../../shared/api/private-session-provider";
 import {
+	DEFAULT_PRIVATE_BACKEND_URL,
+	parsePrivateConnectInput,
+	toPrivateConnectErrorMessage,
+} from "../../../shared/api/private-mobile-connect";
+import {
 	authenticatePrivateAccount,
 	loadPrivateConnectorsSafely,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
 } from "./private-account-section.model";
-
-const DEFAULT_PRIVATE_BACKEND_URL = "https://private.remotecode.dev";
 
 const palette = {
 	accent: "#63C8FF",
@@ -39,6 +42,10 @@ export const PrivateAccountSection = ({
 }: {
 	onConnected: () => void;
 }) => {
+	const routeParams = useGlobalSearchParams<{
+		privateConnectError?: string | string[];
+	}>();
+	const router = useRouter();
 	const {
 		activateConnector,
 		clearPendingQrPayload,
@@ -59,6 +66,16 @@ export const PrivateAccountSection = ({
 	const [mode, setMode] = useState<"login" | "register">("login");
 	const [password, setPassword] = useState("");
 	const pendingConnectorId = pendingQrPayload?.connectorId ?? null;
+	const privateConnectError = useMemo(() => {
+		const value = routeParams.privateConnectError;
+		const rawValue = Array.isArray(value) ? value[0] : value;
+		if (typeof rawValue !== "string") {
+			return null;
+		}
+
+		const trimmed = rawValue.trim();
+		return trimmed.length > 0 ? trimmed : null;
+	}, [routeParams.privateConnectError]);
 
 	const loadConnectors = useCallback(async (record = sessionRecord) => {
 		if (!record) {
@@ -146,6 +163,12 @@ export const PrivateAccountSection = ({
 			resumePendingQrConnection,
 		});
 	}, [loadConnectors, resumePendingQrConnection]);
+
+	useEffect(() => {
+		if (privateConnectError) {
+			setErrorMessage(privateConnectError);
+		}
+	}, [privateConnectError]);
 
 	const handleAuthenticate = useCallback(async () => {
 		setIsAuthenticating(true);
@@ -235,6 +258,29 @@ export const PrivateAccountSection = ({
 
 		return mode === "login" ? "Log in" : "Register";
 	}, [isAuthenticating, mode]);
+	const handleScannedQr = useCallback((rawValue: string) => {
+		try {
+			const intent = parsePrivateConnectInput(rawValue);
+			if (intent.kind === "claim") {
+				setIsScannerOpen(false);
+				setErrorMessage(null);
+				router.push({
+					params: {
+						url: intent.rawValue,
+					},
+					pathname: "/connect" as never,
+				});
+				return;
+			}
+
+			setBackendUrl(intent.payload.backendUrl);
+			void setPendingQrPayload(intent.payload);
+			setIsScannerOpen(false);
+			setErrorMessage("QR captured. Finish sign-in or choose the connector below.");
+		} catch (error) {
+			setErrorMessage(toPrivateConnectErrorMessage(error));
+		}
+	}, [router, setPendingQrPayload]);
 
 	return (
 		<View style={styles.section}>
@@ -287,15 +333,7 @@ export const PrivateAccountSection = ({
 									barcodeTypes: ["qr"],
 								}}
 								onBarcodeScanned={(event) => {
-									try {
-										const payload = parseDesktopMobileConnectQrPayload(event.data);
-										setBackendUrl(payload.backendUrl);
-										void setPendingQrPayload(payload);
-										setIsScannerOpen(false);
-										setErrorMessage("QR captured. Finish sign-in or choose the connector below.");
-									} catch (error) {
-										setErrorMessage(error instanceof Error ? error.message : "Invalid QR code.");
-									}
+									handleScannedQr(event.data);
 								}}
 								style={styles.camera}
 							/>
@@ -334,6 +372,35 @@ export const PrivateAccountSection = ({
 				</View>
 			) : (
 				<View style={styles.formBody}>
+					<View style={styles.inlineActions}>
+						<Pressable
+							onPress={() => {
+								setIsScannerOpen((current) => !current);
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
+							testID="private-account-scan-qr"
+						>
+							<Text style={styles.secondaryLabel}>{isScannerOpen ? "Close Scanner" : "Scan QR"}</Text>
+						</Pressable>
+					</View>
+					{isScannerOpen ? (
+						<View style={styles.scannerCard} testID="private-account-qr-scanner">
+							<CameraView
+								barcodeScannerSettings={{
+									barcodeTypes: ["qr"],
+								}}
+								onBarcodeScanned={(event) => {
+									handleScannedQr(event.data);
+								}}
+								style={styles.camera}
+							/>
+							<Text style={styles.supportText}>{scannerHelpText}</Text>
+						</View>
+					) : null}
 					<View style={styles.modeToggle}>
 						<Pressable
 							onPress={() => {

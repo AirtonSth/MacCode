@@ -1,5 +1,3 @@
-import * as SecureStore from "expo-secure-store";
-
 import type {
 	DesktopMobileConnectQrPayloadDto,
 	PrivateSessionDto,
@@ -24,13 +22,24 @@ interface PersistedPrivateState {
 const PRIVATE_STATE_KEY = "remotecode.private_session_state";
 
 let secureStoreOverride: SecureStoreLike | null = null;
+let secureStorePromise: Promise<SecureStoreLike> | null = null;
 
-const getSecureStore = (): SecureStoreLike => {
+const loadSecureStore = async (): Promise<SecureStoreLike> => {
+	const module = await import("expo-secure-store");
+	return {
+		deleteItemAsync: module.deleteItemAsync,
+		getItemAsync: module.getItemAsync,
+		setItemAsync: module.setItemAsync,
+	};
+};
+
+const getSecureStore = async (): Promise<SecureStoreLike> => {
 	if (secureStoreOverride) {
 		return secureStoreOverride;
 	}
 
-	return SecureStore;
+	secureStorePromise ??= loadSecureStore();
+	return await secureStorePromise;
 };
 
 const normalizeBackendUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
@@ -72,13 +81,13 @@ const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 			};
 		}
 
-			return {
-				pendingQrPayload,
-				sessionRecord: {
-					backendUrl: normalizeBackendUrl(sessionRecord.backendUrl),
-					session: sessionRecord.session,
-				},
-			};
+		return {
+			pendingQrPayload,
+			sessionRecord: {
+				backendUrl: normalizeBackendUrl(sessionRecord.backendUrl),
+				session: sessionRecord.session,
+			},
+		};
 	} catch {
 		return {
 			pendingQrPayload: null,
@@ -88,38 +97,43 @@ const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 };
 
 const writePrivateState = async (state: PersistedPrivateState): Promise<PersistedPrivateState> => {
+	const secureStore = await getSecureStore();
 	if (!state.sessionRecord && !state.pendingQrPayload) {
-		await getSecureStore().deleteItemAsync(PRIVATE_STATE_KEY);
+		await secureStore.deleteItemAsync(PRIVATE_STATE_KEY);
 		return {
 			pendingQrPayload: null,
 			sessionRecord: null,
 		};
 	}
 
-	await getSecureStore().setItemAsync(PRIVATE_STATE_KEY, JSON.stringify(state));
+	await secureStore.setItemAsync(PRIVATE_STATE_KEY, JSON.stringify(state));
 	return state;
 };
 
 export const PrivateSessionStore = {
 	async clearPendingQrPayload(): Promise<void> {
-		const current = parsePrivateState(await getSecureStore().getItemAsync(PRIVATE_STATE_KEY));
+		const secureStore = await getSecureStore();
+		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 		await writePrivateState({
 			...current,
 			pendingQrPayload: null,
 		});
 	},
 	async clearSessionRecord(): Promise<void> {
-		const current = parsePrivateState(await getSecureStore().getItemAsync(PRIVATE_STATE_KEY));
+		const secureStore = await getSecureStore();
+		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 		await writePrivateState({
 			...current,
 			sessionRecord: null,
 		});
 	},
 	async read(): Promise<PersistedPrivateState> {
-		return parsePrivateState(await getSecureStore().getItemAsync(PRIVATE_STATE_KEY));
+		const secureStore = await getSecureStore();
+		return parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 	},
 	async savePendingQrPayload(payload: DesktopMobileConnectQrPayloadDto): Promise<DesktopMobileConnectQrPayloadDto> {
-		const current = parsePrivateState(await getSecureStore().getItemAsync(PRIVATE_STATE_KEY));
+		const secureStore = await getSecureStore();
+		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 		const normalized = normalizePendingQrPayload(payload);
 		await writePrivateState({
 			...current,
@@ -128,7 +142,8 @@ export const PrivateSessionStore = {
 		return normalized!;
 	},
 	async saveSessionRecord(input: PersistedPrivateSessionRecord): Promise<PersistedPrivateSessionRecord> {
-		const current = parsePrivateState(await getSecureStore().getItemAsync(PRIVATE_STATE_KEY));
+		const secureStore = await getSecureStore();
+		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 		const normalized = {
 			backendUrl: normalizeBackendUrl(input.backendUrl),
 			session: input.session,
@@ -147,4 +162,5 @@ export const setPrivateSessionSecureStoreForTests = (adapter: SecureStoreLike) =
 
 export const resetPrivateSessionSecureStoreForTests = () => {
 	secureStoreOverride = null;
+	secureStorePromise = null;
 };
