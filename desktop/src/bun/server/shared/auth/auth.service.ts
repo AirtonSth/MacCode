@@ -115,7 +115,10 @@ export const AuthService = {
 				set.status = 401;
 				set.headers["content-type"] = "application/json";
 
-				return { error: "unauthorized" };
+				return {
+					code: "unauthorized",
+					error: "You are not authorized to access this desktop server.",
+				};
 			}
 		});
 	},

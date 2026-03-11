@@ -27,6 +27,24 @@ interface PrivateAccountServiceOptions {
 	reconnectDelayMs?: number;
 }
 
+const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
+	missing_private_refresh_token: "Your session has expired. Please sign in again.",
+	private_connector_token_missing: "Desktop pairing could not be completed. Please try again.",
+	private_local_app_unavailable: "The local desktop service is unavailable. Please restart the app.",
+	private_relay_connect_failed: "The desktop relay could not connect. Please try again.",
+	private_relay_socket_error: "The desktop relay connection failed. Please try again.",
+	private_state_refresh_failed: "We couldn't refresh your private account state. Please try again.",
+};
+
+const toPrivateAccountErrorMessage = (error: unknown, fallbackCode: string): string => {
+	const message = error instanceof Error ? error.message : fallbackCode;
+	if (PRIVATE_ACCOUNT_ERROR_MESSAGES[message]) {
+		return PRIVATE_ACCOUNT_ERROR_MESSAGES[message];
+	}
+
+	return message.includes("_") ? "Something went wrong. Please try again." : message;
+};
+
 export class PrivateAccountService {
 	private connector: PersistedPrivateConnector | null;
 	private connectorDto: PrivateConnectorDto | null = null;
@@ -49,7 +67,7 @@ export class PrivateAccountService {
 			localRequestHandler: async (input) => await this.handleLocalRequest(input),
 			localServerToken: options.localServerToken,
 			onError: (message) => {
-				this.errorMessage = message;
+				this.errorMessage = toPrivateAccountErrorMessage(new Error(message), message);
 			},
 			onStateChange: (state) => {
 				this.connectorRelayState = state;
@@ -72,7 +90,7 @@ export class PrivateAccountService {
 				const connectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
 				this.connectorDto = connectors.connectors.find((item) => item.id === this.connector?.connectorId) ?? null;
 			} catch (error) {
-				this.errorMessage = error instanceof Error ? error.message : "private_state_refresh_failed";
+				this.errorMessage = toPrivateAccountErrorMessage(error, "private_state_refresh_failed");
 			}
 		} else {
 			this.connectorDto = null;
@@ -181,7 +199,7 @@ export class PrivateAccountService {
 				await this.connectRelay();
 				return;
 			} catch (error) {
-				this.errorMessage = error instanceof Error ? error.message : "private_relay_connect_failed";
+				this.errorMessage = toPrivateAccountErrorMessage(error, "private_relay_connect_failed");
 				if (!allowRebootstrap) {
 					return;
 				}
@@ -329,4 +347,3 @@ export const createPrivateAccountService = (
 	repository: PrivateAccountRepository,
 	options: PrivateAccountServiceOptions,
 ) => new PrivateAccountService(repository, options);
-

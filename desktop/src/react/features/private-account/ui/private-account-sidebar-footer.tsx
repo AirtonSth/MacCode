@@ -77,9 +77,14 @@ const defaultState: PrivateAccountStateDto = {
 	user: null,
 };
 
+const defaultClient = createPrivateAccountApiClient();
+
+const defaultCreateQrDataUrl = async (value: string): Promise<string> =>
+	await QRCode.toDataURL(value, { margin: 1, width: 256 });
+
 export const PrivateAccountSidebarFooter = ({
-	client = createPrivateAccountApiClient(),
-	createQrDataUrl = async (value: string) => await QRCode.toDataURL(value, { margin: 1, width: 256 }),
+	client = defaultClient,
+	createQrDataUrl = defaultCreateQrDataUrl,
 }: {
 	client?: PrivateAccountApiClient;
 	createQrDataUrl?: (value: string) => Promise<string>;
@@ -93,6 +98,7 @@ export const PrivateAccountSidebarFooter = ({
 	const [mode, setMode] = useState<"login" | "register">("login");
 	const [password, setPassword] = useState("");
 	const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+	const [toastMessage, setToastMessage] = useState<string | null>(null);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -118,6 +124,22 @@ export const PrivateAccountSidebarFooter = ({
 			cancelled = true;
 		};
 	}, [client]);
+
+	useEffect(() => {
+		if (!errorMessage) {
+			setToastMessage(null);
+			return;
+		}
+
+		setToastMessage(errorMessage);
+		const timeout = globalThis.setTimeout(() => {
+			setToastMessage((current) => (current === errorMessage ? null : current));
+		}, 4500);
+
+		return () => {
+			globalThis.clearTimeout(timeout);
+		};
+	}, [errorMessage]);
 
 	useEffect(() => {
 		const payload = serializePrivateAccountQrPayload(state);
@@ -235,10 +257,43 @@ export const PrivateAccountSidebarFooter = ({
 			</button>
 
 			{errorMessage ? (
-				<p className="mt-2 text-xs text-rose-200" data-testid="private-account-error">
+				<p
+					aria-live="polite"
+					className="mt-2 text-xs text-rose-200"
+					data-testid="private-account-error"
+					role="alert"
+				>
 					{errorMessage}
 				</p>
 			) : null}
+
+			{toastMessage && typeof document !== "undefined"
+				? createPortal(
+					<div
+						aria-live="assertive"
+						className="fixed bottom-4 right-4 z-50 max-w-sm rounded-2xl border border-rose-300/30 bg-[#30131a] px-4 py-3 text-sm text-rose-100 shadow-[0_18px_50px_rgba(0,0,0,0.35)]"
+						data-testid="private-account-toast"
+						role="alert"
+					>
+						<div className="flex items-start gap-3">
+							<div className="min-w-0 flex-1">
+								<p className="font-semibold text-rose-50">Private account</p>
+								<p className="mt-1 text-rose-100/90">{toastMessage}</p>
+							</div>
+							<button
+								className="rounded-full border border-rose-200/20 px-2 py-0.5 text-xs text-rose-100/80 transition hover:bg-white/10"
+								onClick={() => {
+									setToastMessage(null);
+								}}
+								type="button"
+							>
+								Close
+							</button>
+						</div>
+					</div>,
+					document.body,
+				)
+				: null}
 
 			{isModalOpen && typeof document !== "undefined"
 				? createPortal(

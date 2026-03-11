@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention, functional/no-classes */
 /* eslint-disable @typescript-eslint/parameter-properties, max-statements */
-/* eslint-disable @typescript-eslint/no-magic-numbers, functional/no-let */
+/* eslint-disable @typescript-eslint/no-magic-numbers */
 import type {
 	PrivateBootstrapResponseDto,
 	PrivateBootstrapStatusDto,
@@ -67,6 +67,28 @@ const toMessage = (payload: unknown, fallback: string): string => {
 	return fallback;
 };
 
+const parseErrorPayload = async (response: Response): Promise<{ message: string | null; payload: unknown }> => {
+	const rawText = await response.text();
+
+	if (!rawText.trim()) {
+		return { message: null, payload: null };
+	}
+
+	try {
+		const payload = JSON.parse(rawText) as unknown;
+
+		return {
+			message: toMessage(payload, rawText),
+			payload,
+		};
+	} catch {
+		return {
+			message: rawText,
+			payload: rawText,
+		};
+	}
+};
+
 export const createPrivateClient = (config: PrivateClientConfig) => {
 	const baseUrl = normalizeBaseUrl(config.baseUrl);
 	const requestFetch = config.fetch ?? fetch;
@@ -94,13 +116,7 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 			method: options.method,
 		});
 
-		let payload: unknown = null;
-
-		try {
-			payload = await response.json();
-		} catch {
-			payload = null;
-		}
+		const { message, payload } = await parseErrorPayload(response.clone());
 
 		if (!response.ok) {
 			if (response.status === 401) {
@@ -110,11 +126,11 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 			throw new PrivateApiError(
 				response.status,
 				payload,
-				toMessage(payload, response.statusText || "private_request_failed"),
+				message ?? response.statusText ?? "private_request_failed",
 			);
 		}
 
-		return payload as T;
+		return (await response.json()) as T;
 	};
 
 	return {

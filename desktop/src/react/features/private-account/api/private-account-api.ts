@@ -55,22 +55,27 @@ export const createPrivateAccountApiClient = (config?: {
 			return null as T;
 		}
 
-		let payload: Record<string, unknown> | null = null;
-		try {
-			payload = await response.json() as Record<string, unknown>;
-		} catch {
-			payload = null;
-		}
-
 		if (!response.ok) {
+			const rawText = await response.text();
+			let payload: Record<string, unknown> | null = null;
+			if (rawText.trim().length > 0) {
+				try {
+					payload = JSON.parse(rawText) as Record<string, unknown>;
+				} catch {
+					payload = null;
+				}
+			}
+
 			const message =
 				typeof payload?.error === "string" && payload.error.trim().length > 0
 					? payload.error
+					: rawText.trim().length > 0
+						? rawText
 					: response.statusText || "private_account_request_failed";
 			throw new PrivateAccountApiError(response.status, message);
 		}
 
-		return payload as T;
+		return await response.json() as T;
 	};
 
 	return {
@@ -94,4 +99,3 @@ export const createPrivateAccountApiClient = (config?: {
 		}),
 	};
 };
-

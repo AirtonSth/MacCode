@@ -104,7 +104,8 @@ describe("createPrivateAccountApiClient", () => {
 
 	test("throws PrivateAccountApiError on request failure", async () => {
 		globalThis.fetch = mock(async () => new Response(JSON.stringify({
-			error: "Unauthorized",
+			code: "unauthorized",
+			error: "You are not authorized to access this desktop server.",
 		}), {
 			headers: {
 				"content-type": "application/json",
@@ -115,6 +116,26 @@ describe("createPrivateAccountApiClient", () => {
 
 		const client = createPrivateAccountApiClient();
 
-		await expect(client.getState()).rejects.toBeInstanceOf(PrivateAccountApiError);
+		await expect(client.getState()).rejects.toMatchObject({
+			message: "You are not authorized to access this desktop server.",
+			status: 401,
+		} satisfies Partial<PrivateAccountApiError>);
+	});
+
+	test("uses plain-text server errors when the response is not JSON", async () => {
+		globalThis.fetch = mock(async () => new Response("Password must be at least 8 characters long.", {
+			status: 400,
+			statusText: "Bad Request",
+		})) as unknown as typeof fetch;
+
+		const client = createPrivateAccountApiClient();
+
+		await expect(client.register({
+			email: "dev@example.com",
+			password: "short",
+		})).rejects.toMatchObject({
+			message: "Password must be at least 8 characters long.",
+			status: 400,
+		} satisfies Partial<PrivateAccountApiError>);
 	});
 });
