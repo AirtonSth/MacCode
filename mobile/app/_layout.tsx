@@ -7,8 +7,12 @@ import { Stack, usePathname, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ApiConfigProvider } from "@/shared/api/api-config-provider";
+import {
+	exchangePrivateAuthCompletion,
+	parsePrivateAuthCompletionInput,
+} from "@/shared/api/private-auth-completion";
 import { parsePrivateConnectInput } from "@/shared/api/private-mobile-connect";
-import { PrivateSessionProvider } from "@/shared/api/private-session-provider";
+import { PrivateSessionProvider, usePrivateSession } from "@/shared/api/private-session-provider";
 import { queryClient } from "@/shared/api/query-client";
 import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
 import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
@@ -22,14 +26,59 @@ export {
 
 SplashScreen.preventAutoHideAsync();
 
-export default function RootLayout() {
+const RootLayoutContent = () => {
 	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);
 	const lastHandledPrivateUrlRef = useRef<string | null>(null);
 	const pathname = usePathname();
 	const router = useRouter();
+	const { pendingQrPayload, setSessionRecord } = usePrivateSession();
+
+	const routePrivateAuthCompletionUrl = useCallback((rawUrl: string | null): boolean => {
+		if (!rawUrl) {
+			return false;
+		}
+
+		let completion: ReturnType<typeof parsePrivateAuthCompletionInput>;
+		try {
+			completion = parsePrivateAuthCompletionInput(rawUrl);
+		} catch {
+			return false;
+		}
+
+		if (lastHandledPrivateUrlRef.current === rawUrl) {
+			return true;
+		}
+
+		lastHandledPrivateUrlRef.current = rawUrl;
+		void (async () => {
+			try {
+				const sessionRecord = await exchangePrivateAuthCompletion({
+					completion,
+				});
+				await setSessionRecord(sessionRecord);
+				router.replace(pendingQrPayload ? "/settings" : "/workspaces");
+			} catch (error) {
+				if (lastHandledPrivateUrlRef.current === rawUrl) {
+					lastHandledPrivateUrlRef.current = null;
+				}
+				router.replace({
+					params: {
+						privateConnectError: error instanceof Error ? error.message : "Unable to finish sign-in.",
+					},
+					pathname: "/settings" as never,
+				});
+			}
+		})();
+
+		return true;
+	}, [pendingQrPayload, router, setSessionRecord]);
 
 	const routePrivateConnectUrl = useCallback((rawUrl: string | null) => {
 		if (!rawUrl) {
+			return;
+		}
+
+		if (routePrivateAuthCompletionUrl(rawUrl)) {
 			return;
 		}
 
@@ -50,7 +99,7 @@ export default function RootLayout() {
 			},
 			pathname: "/connect" as never,
 		});
-	}, [pathname, router]);
+	}, [pathname, routePrivateAuthCompletionUrl, router]);
 
 	useEffect(() => {
 		void (async () => {
@@ -102,37 +151,43 @@ export default function RootLayout() {
 	}, [routePrivateConnectUrl]);
 
 	return (
+		<QueryClientProvider client={queryClient}>
+			<ForegroundInsomniaMode />
+			<Stack
+				screenOptions={{
+					contentStyle: {
+						backgroundColor: theme.colors.background,
+					},
+					headerStyle: {
+						backgroundColor: theme.colors.panelBackground,
+					},
+					headerTintColor: theme.colors.textPrimary,
+				}}
+			>
+				<Stack.Screen name="index" options={{ headerShown: false }} />
+				<Stack.Screen name="connect" options={{ headerShown: false }} />
+				<Stack.Screen name="workspaces" options={{ headerShown: false }} />
+				<Stack.Screen name="threads" options={{ headerShown: false }} />
+				<Stack.Screen name="active-threads" options={{ headerShown: false }} />
+				<Stack.Screen name="chat" options={{ headerShown: false }} />
+				<Stack.Screen name="settings" options={{ headerShown: false }} />
+			</Stack>
+			{isLaunchSplashVisible ? (
+				<AnimatedLaunchSplash
+					onFinish={() => {
+						setIsLaunchSplashVisible(false);
+					}}
+				/>
+			) : null}
+		</QueryClientProvider>
+	);
+};
+
+export default function RootLayout() {
+	return (
 		<ApiConfigProvider>
 			<PrivateSessionProvider>
-				<QueryClientProvider client={queryClient}>
-					<ForegroundInsomniaMode />
-					<Stack
-						screenOptions={{
-							contentStyle: {
-								backgroundColor: theme.colors.background,
-							},
-							headerStyle: {
-								backgroundColor: theme.colors.panelBackground,
-							},
-							headerTintColor: theme.colors.textPrimary,
-						}}
-					>
-						<Stack.Screen name="index" options={{ headerShown: false }} />
-						<Stack.Screen name="connect" options={{ headerShown: false }} />
-						<Stack.Screen name="workspaces" options={{ headerShown: false }} />
-						<Stack.Screen name="threads" options={{ headerShown: false }} />
-						<Stack.Screen name="active-threads" options={{ headerShown: false }} />
-						<Stack.Screen name="chat" options={{ headerShown: false }} />
-						<Stack.Screen name="settings" options={{ headerShown: false }} />
-					</Stack>
-					{isLaunchSplashVisible ? (
-						<AnimatedLaunchSplash
-							onFinish={() => {
-								setIsLaunchSplashVisible(false);
-							}}
-						/>
-					) : null}
-				</QueryClientProvider>
+				<RootLayoutContent />
 			</PrivateSessionProvider>
 		</ApiConfigProvider>
 	);

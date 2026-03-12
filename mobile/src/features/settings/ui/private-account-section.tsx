@@ -9,6 +9,7 @@ import { useGlobalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
 	ActivityIndicator,
+	Platform,
 	Pressable,
 	StyleSheet,
 	Text,
@@ -23,9 +24,11 @@ import {
 	toPrivateConnectErrorMessage,
 } from "../../../shared/api/private-mobile-connect";
 import {
-	authenticatePrivateAccount,
-	buildPrivateSubscribeUrl,
+	buildPrivateForgotPasswordUrl,
+	buildPrivateManageSubscriptionUrl,
+	buildPrivateRegisterUrl,
 	getPrivateSubscriptionSnapshot,
+	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
@@ -66,16 +69,31 @@ export const PrivateAccountSection = ({
 	const [isAuthenticating, setIsAuthenticating] = useState(false);
 	const [isLoadingConnectors, setIsLoadingConnectors] = useState(false);
 	const [isScannerOpen, setIsScannerOpen] = useState(false);
-	const [mode, setMode] = useState<"login" | "register">("login");
 	const [password, setPassword] = useState("");
 	const pendingConnectorId = pendingQrPayload?.connectorId ?? null;
 	const subscriptionSnapshot = useMemo(
 		() => getPrivateSubscriptionSnapshot(sessionRecord?.session),
 		[sessionRecord?.session],
 	);
-	const subscribeUrl = useMemo(
-		() => buildPrivateSubscribeUrl(sessionRecord?.session.user.email ?? email),
-		[email, sessionRecord?.session.user.email],
+	const mobilePlatform = Platform.OS === "android" ? "android" : "ios";
+	const registerUrl = useMemo(
+		() => buildPrivateRegisterUrl({
+			backendUrl,
+			email,
+			platform: mobilePlatform,
+		}),
+		[backendUrl, email, mobilePlatform],
+	);
+	const forgotPasswordUrl = useMemo(
+		() => buildPrivateForgotPasswordUrl({
+			backendUrl,
+			email,
+		}),
+		[backendUrl, email],
+	);
+	const manageSubscriptionUrl = useMemo(
+		() => buildPrivateManageSubscriptionUrl(),
+		[],
 	);
 	const privateConnectError = useMemo(() => {
 		const value = routeParams.privateConnectError;
@@ -190,10 +208,9 @@ export const PrivateAccountSection = ({
 		setIsAuthenticating(true);
 		setErrorMessage(null);
 		try {
-			const session = await authenticatePrivateAccount({
+			const session = await loginPrivateAccount({
 				baseUrl: backendUrl,
 				email,
-				mode,
 				password,
 			});
 			await setSessionRecord({
@@ -235,7 +252,6 @@ export const PrivateAccountSection = ({
 		connectConnector,
 		email,
 		loadConnectors,
-		mode,
 		password,
 		pendingConnectorId,
 		pendingQrPayload,
@@ -276,8 +292,8 @@ export const PrivateAccountSection = ({
 			return "Working...";
 		}
 
-		return mode === "login" ? "Log in" : "Register";
-	}, [isAuthenticating, mode]);
+		return "Log in";
+	}, [isAuthenticating]);
 	const handleScannedQr = useCallback((rawValue: string) => {
 		try {
 			const intent = parsePrivateConnectInput(rawValue);
@@ -351,6 +367,21 @@ export const PrivateAccountSection = ({
 						<Text style={styles.summaryLabel}>Backend</Text>
 						<Text selectable style={styles.summaryValue}>{sessionRecord.backendUrl}</Text>
 					</View>
+					<View style={styles.inlineActions}>
+						<Pressable
+							onPress={() => {
+								void Linking.openURL(manageSubscriptionUrl);
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
+							testID="private-account-manage-subscription"
+						>
+							<Text style={styles.secondaryLabel}>Manage subscription</Text>
+						</Pressable>
+					</View>
 					{subscriptionSnapshot.isSubscribed ? (
 						<>
 							<View style={styles.inlineActions}>
@@ -422,7 +453,7 @@ export const PrivateAccountSection = ({
 							</Text>
 							<Pressable
 								onPress={() => {
-									void Linking.openURL(subscribeUrl);
+									void Linking.openURL(manageSubscriptionUrl);
 								}}
 								style={({ pressed }) => [
 									styles.primaryButton,
@@ -430,7 +461,7 @@ export const PrivateAccountSection = ({
 								]}
 								testID="private-account-subscribe-link"
 							>
-								<Text style={styles.primaryLabel}>Open subscription</Text>
+								<Text style={styles.primaryLabel}>Manage subscription</Text>
 							</Pressable>
 						</View>
 					)}
@@ -466,32 +497,6 @@ export const PrivateAccountSection = ({
 							<Text style={styles.supportText}>{scannerHelpText}</Text>
 						</View>
 					) : null}
-					<View style={styles.modeToggle}>
-						<Pressable
-							onPress={() => {
-								setMode("login");
-							}}
-							style={({ pressed }) => [
-								styles.modeButton,
-								mode === "login" ? styles.modeButtonActive : null,
-								pressed ? styles.modeButtonPressed : null,
-							]}
-						>
-							<Text style={mode === "login" ? styles.modeButtonActiveLabel : styles.modeButtonLabel}>Log in</Text>
-						</Pressable>
-						<Pressable
-							onPress={() => {
-								setMode("register");
-							}}
-							style={({ pressed }) => [
-								styles.modeButton,
-								mode === "register" ? styles.modeButtonActive : null,
-								pressed ? styles.modeButtonPressed : null,
-							]}
-						>
-							<Text style={mode === "register" ? styles.modeButtonActiveLabel : styles.modeButtonLabel}>Register</Text>
-						</Pressable>
-					</View>
 					<TextInput
 						autoCapitalize="none"
 						onChangeText={setBackendUrl}
@@ -534,6 +539,34 @@ export const PrivateAccountSection = ({
 					>
 						<Text style={styles.primaryLabel}>{authenticateButtonLabel}</Text>
 					</Pressable>
+					<View style={styles.inlineActions}>
+						<Pressable
+							onPress={() => {
+								void Linking.openURL(forgotPasswordUrl);
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
+							testID="private-account-forgot-password"
+						>
+							<Text style={styles.secondaryLabel}>Forgot password</Text>
+						</Pressable>
+						<Pressable
+							onPress={() => {
+								void Linking.openURL(registerUrl);
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
+							testID="private-account-register-browser"
+						>
+							<Text style={styles.secondaryLabel}>Register in browser</Text>
+						</Pressable>
+					</View>
 				</View>
 			)}
 

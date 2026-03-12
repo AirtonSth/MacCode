@@ -4,13 +4,14 @@ import { expect, test } from "bun:test";
 import { parseDesktopMobileConnectQrPayload } from "@remotecode/contracts";
 
 import {
-	authenticatePrivateAccount,
+	buildPrivateRegisterUrl,
+	loginPrivateAccount,
 	resolvePendingPrivateConnector,
 } from "./private-account-section.model";
 
-test("private account section flow authenticates and resolves a scanned desktop connector", async () => {
+test("private account section flow logs in and resolves a scanned desktop connector", async () => {
 	const password = ["super", "secret"].join("");
-	const session = await authenticatePrivateAccount({
+	const session = await loginPrivateAccount({
 		baseUrl: "https://private.remotecode.dev",
 		createClient: () => ({
 			login: async () => ({
@@ -26,7 +27,6 @@ test("private account section flow authenticates and resolves a scanned desktop 
 			}),
 		}) as never,
 		email: "dev@example.com",
-		mode: "login",
 		password,
 	});
 	const payload = parseDesktopMobileConnectQrPayload(JSON.stringify({
@@ -55,4 +55,12 @@ test("private account section flow authenticates and resolves a scanned desktop 
 
 	expect(session.user.email).toBe("dev@example.com");
 	expect(connector?.id).toBe("con_1");
+});
+
+test("private account section builds the browser registration URL with a native return target", () => {
+	expect(buildPrivateRegisterUrl({
+		backendUrl: "https://private.remotecode.dev",
+		email: "founder@remotecode.io",
+		platform: "android",
+	})).toContain("returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete");
 });

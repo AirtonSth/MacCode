@@ -4,12 +4,44 @@ import {
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
 
-export const buildPrivateSubscribeUrl = (email: string | null | undefined): string => {
-	const normalized = email?.trim() ?? "";
-	return normalized.length > 0
-		? `https://remotecode.io/subscribe/${encodeURIComponent(normalized)}`
-		: "https://remotecode.io/subscribe";
+const REMOTECODE_WEB_URL = "https://remotecode.io";
+
+const trimBaseUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
+const buildRemoteCodeWebUrl = (path: string, params: Record<string, string>): string => {
+	const searchParams = new URLSearchParams();
+	for (const [key, value] of Object.entries(params)) {
+		searchParams.set(key, value);
+	}
+
+	return `${REMOTECODE_WEB_URL}${path}?${searchParams.toString()}`;
 };
+
+export const buildPrivateRegisterUrl = (input: {
+	backendUrl: string;
+	email?: string | null;
+	platform: "android" | "ios";
+}): string => {
+	return buildRemoteCodeWebUrl("/register", {
+		backendUrl: trimBaseUrl(input.backendUrl),
+		...(input.email?.trim() ? { email: input.email.trim() } : {}),
+		platform: input.platform,
+		returnUrl: "remotecode://auth/complete",
+		target: "mobile",
+	});
+};
+
+export const buildPrivateForgotPasswordUrl = (input: {
+	backendUrl: string;
+	email?: string | null;
+}): string => {
+	return buildRemoteCodeWebUrl("/forgot-password", {
+		backendUrl: trimBaseUrl(input.backendUrl),
+		...(input.email?.trim() ? { email: input.email.trim() } : {}),
+	});
+};
+
+export const buildPrivateManageSubscriptionUrl = (): string =>
+	`${REMOTECODE_WEB_URL}/app`;
 
 export const getPrivateSubscriptionSnapshot = (session: PrivateSessionDto | null | undefined) => ({
 	daysRemaining: session?.user.daysRemaining ?? session?.user.daysRemaing ?? 0,
@@ -25,26 +57,20 @@ export const sortPrivateConnectors = (connectors: PrivateConnectorDto[]): Privat
 		return left.status === "online" ? -1 : 1;
 	});
 
-export const authenticatePrivateAccount = async (input: {
+export const loginPrivateAccount = async (input: {
 	baseUrl: string;
 	createClient?: typeof createPrivateClient;
 	email: string;
-	mode: "login" | "register";
 	password: string;
 }): Promise<PrivateSessionDto> => {
 	const client = (input.createClient ?? createPrivateClient)({
 		baseUrl: input.baseUrl,
 	});
 
-	return input.mode === "login"
-		? await client.login({
-			email: input.email,
-			password: input.password,
-		})
-		: await client.register({
-			email: input.email,
-			password: input.password,
-		});
+	return await client.login({
+		email: input.email,
+		password: input.password,
+	});
 };
 
 export const resolvePendingPrivateConnector = (input: {

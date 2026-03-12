@@ -23,89 +23,41 @@ const readBearer = (value: string | null): string | null => {
 	return value.startsWith("Bearer ") ? value.slice(7).trim() || null : value.trim() || null;
 };
 
-test("desktop private-account routes authenticate, expose QR state, and logout cleanly", async () => {
-	const root = mkdtempSync(join(tmpdir(), "remotecode-private-account-controller-"));
+const resolveExpectedDesktopPlatform = (): "linux" | "macos" | "windows" => {
+	switch (process.platform) {
+		case "darwin":
+			return "macos";
+		case "win32":
+			return "windows";
+		default:
+			return "linux";
+	}
+};
+
+test("desktop private-account browser routes hand off to the web flow and localhost callback completes auth", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-private-account-browser-"));
 	const databasePath = join(root, "remotecode.sqlite");
-	const loginAccessToken = "access-token";
-	const loginRefreshToken = "refresh-token";
-	const registerAccessToken = "register-access-token";
-	const registerRefreshToken = "register-refresh-token";
-	let mobileConnectBootstrapCount = 0;
+	const expectedDesktopPlatform = resolveExpectedDesktopPlatform();
 	const privateApp = new Elysia()
-		.post("/v1/private/auth/login", ({ body }) => {
+		.post("/v1/private/auth/completion/exchange", ({ body }) => {
 			expect(body).toEqual({
-				email: "dev@example.com",
-				password: "supersecret",
+				completionToken: "token_123",
 			});
 
 			return {
-				accessToken: loginAccessToken,
-				refreshToken: loginRefreshToken,
+				accessToken: "access-token",
+				refreshToken: "refresh-token",
 				user: {
 					daysRemaing: 30,
 					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
-					subscribed: true,
-				},
-			};
-		})
-		.post("/v1/private/auth/register", ({ body }) => {
-			expect(body).toEqual({
-				email: "founder@example.com",
-				password: "supersecret",
-			});
-
-			return {
-				accessToken: registerAccessToken,
-				refreshToken: registerRefreshToken,
-				user: {
-					daysRemaing: 30,
-					daysRemaining: 30,
-					email: "founder@example.com",
-					id: "usr_2",
-					subscribed: true,
-				},
-			};
-		})
-		.post("/v1/private/auth/refresh", ({ body }) => {
-			expect(body).toEqual({
-				refreshToken: loginRefreshToken,
-			});
-
-			return {
-				accessToken: loginAccessToken,
-				refreshToken: loginRefreshToken,
-				user: {
-					daysRemaing: 30,
-					daysRemaining: 30,
-					email: "dev@example.com",
-					id: "usr_1",
-					subscribed: true,
-				},
-			};
-		})
-		.post("/v1/private/auth/logout", ({ body, set }) => {
-			expect(body).toEqual({
-				refreshToken: loginRefreshToken,
-			});
-			set.status = 204;
-			return null;
-		})
-		.get("/v1/private/me", ({ request }) => {
-			expect(readBearer(request.headers.get("authorization"))).toBe(loginAccessToken);
-			return {
-				user: {
-					daysRemaing: 30,
-					daysRemaining: 30,
-					email: "dev@example.com",
-					id: "usr_1",
-					subscribed: true,
+					subscribed: false,
 				},
 			};
 		})
 		.get("/v1/private/connectors", ({ request }) => {
-			expect([loginAccessToken, registerAccessToken]).toContain(readBearer(request.headers.get("authorization")));
+			expect(readBearer(request.headers.get("authorization"))).toBe("access-token");
 			return {
 				connectors: [
 					{
@@ -142,26 +94,11 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			},
 		}))
 		.post("/v1/private/pairing/claim", ({ request }) => {
-			expect([loginAccessToken, registerAccessToken]).toContain(readBearer(request.headers.get("authorization")));
+			expect(readBearer(request.headers.get("authorization"))).toBe("access-token");
 			return {
 				claimedAt: new Date().toISOString(),
 				connectorId: "con_1",
 				status: "claimed",
-			};
-		})
-		.post("/v1/private/mobile-connect/bootstrap", ({ body, request }) => {
-			expect([loginAccessToken, registerAccessToken]).toContain(readBearer(request.headers.get("authorization")));
-			expect(body).toEqual({
-				connectorId: "con_1",
-			});
-			mobileConnectBootstrapCount += 1;
-			return {
-				connector: {
-					id: "con_1",
-					name: "Desktop Connector",
-				},
-				expiresAt: new Date(Date.now() + 60_000).toISOString(),
-				linkUrl: `https://qr.remotecode.dev/connect/mcs_${mobileConnectBootstrapCount}/secret_${mobileConnectBootstrapCount}`,
 			};
 		})
 		.get("/v1/private/connectors/bootstrap/:pairingId/status", () => ({
@@ -183,26 +120,21 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 		});
 
 	await privateApp.listen(0);
-	const privatePort = requirePort(privateApp.server);
-
-	let server:
-		| Awaited<ReturnType<typeof createBackendServer>>
-		| undefined;
+	let backendHandle: Awaited<ReturnType<typeof createBackendServer>> | undefined;
 
 	try {
-		server = await createBackendServer({
+		const privatePort = requirePort(privateApp.server);
+		backendHandle = await createBackendServer({
 			databasePath,
 			disableLiveActivityPush: true,
 			port: 0,
-			privateMobileConnectRefreshIntervalMs: 5,
 			privateBackendUrl: `http://127.0.0.1:${privatePort}`,
 		});
-		const baseUrl = `http://127.0.0.1:${requirePort(server.server)}`;
+		const baseUrl = `http://127.0.0.1:${requirePort(backendHandle.server)}`;
 
-		const loginResponse = await fetch(`${baseUrl}/v1/private-account/login`, {
+		const registerResponse = await fetch(`${baseUrl}/v1/private-account/browser/register`, {
 			body: JSON.stringify({
 				email: "dev@example.com",
-				password: "supersecret",
 			}),
 			headers: {
 				authorization: "Bearer remotecode.io-token",
@@ -210,26 +142,44 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			},
 			method: "POST",
 		});
+		expect(registerResponse.status).toBe(200);
+		const registerPayload = await registerResponse.json() as { url: string };
+		const registerUrl = new URL(registerPayload.url);
+		expect(registerUrl.origin).toBe("https://remotecode.io");
+		expect(registerUrl.pathname).toBe("/register");
+		expect(registerUrl.searchParams.get("target")).toBe("desktop");
+		expect(registerUrl.searchParams.get("platform")).toBe(expectedDesktopPlatform);
+		expect(registerUrl.searchParams.get("email")).toBe("dev@example.com");
 
-		expect(loginResponse.status).toBe(200);
-		const loginPayload = await loginResponse.json() as {
-			authenticated: boolean;
-			qrPayload: {
-				connectorId: string;
-				linkUrl?: string | null;
-				type: string;
-			} | null;
-			user: {
-				email: string;
-			} | null;
-		};
-		expect(loginPayload.authenticated).toBe(true);
-		expect(loginPayload.user?.email).toBe("dev@example.com");
-		expect(loginPayload.qrPayload?.connectorId).toBe("con_1");
-		expect(loginPayload.qrPayload?.linkUrl).toContain("https://qr.remotecode.dev/connect/");
-		expect(loginPayload.qrPayload?.type).toBe("remotecode_private_mobile_connect");
+		const forgotResponse = await fetch(`${baseUrl}/v1/private-account/browser/forgot-password`, {
+			body: JSON.stringify({
+				email: "dev@example.com",
+			}),
+			headers: {
+				authorization: "Bearer remotecode.io-token",
+				"content-type": "application/json",
+			},
+			method: "POST",
+		});
+		expect(forgotResponse.status).toBe(200);
+		const forgotPayload = await forgotResponse.json() as { url: string };
+		expect(forgotPayload.url).toContain("https://remotecode.io/forgot-password");
+		expect(forgotPayload.url).toContain("email=dev%40example.com");
 
-		await Bun.sleep(20);
+		const manageResponse = await fetch(`${baseUrl}/v1/private-account/browser/manage-subscription`, {
+			headers: {
+				authorization: "Bearer remotecode.io-token",
+			},
+		});
+		expect(manageResponse.status).toBe(200);
+		const managePayload = await manageResponse.json() as { url: string };
+		expect(managePayload.url).toBe("https://remotecode.io/app");
+
+		const callbackResponse = await fetch(
+			`${baseUrl}/v1/private-account/browser-return?backendUrl=http%3A%2F%2F127.0.0.1%3A${privatePort}&completionToken=token_123`,
+		);
+		expect(callbackResponse.status).toBe(200);
+		expect(await callbackResponse.text()).toContain("RemoteCode desktop is ready");
 
 		const stateResponse = await fetch(`${baseUrl}/v1/private-account/state`, {
 			headers: {
@@ -239,103 +189,21 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 		expect(stateResponse.status).toBe(200);
 		const statePayload = await stateResponse.json() as {
 			authenticated: boolean;
-			connector: { id: string } | null;
-			connectorRelayState: string;
-			qrPayload: { linkUrl?: string | null } | null;
+			user: {
+				email: string;
+				subscribed: boolean;
+			} | null;
 		};
 		expect(statePayload.authenticated).toBe(true);
-		expect(statePayload.connector?.id).toBe("con_1");
-		expect(["connecting", "connected"]).toContain(statePayload.connectorRelayState);
-		expect(statePayload.qrPayload?.linkUrl).toContain("mcs_2");
-
-		const logoutResponse = await fetch(`${baseUrl}/v1/private-account/logout`, {
-			headers: {
-				authorization: "Bearer remotecode.io-token",
-			},
-			method: "POST",
-		});
-		expect(logoutResponse.status).toBe(200);
-		const logoutPayload = await logoutResponse.json() as {
-			authenticated: boolean;
-			connector: { id: string } | null;
-			qrPayload: { connectorId: string } | null;
-			user: { email: string } | null;
-		};
-		expect(logoutPayload.authenticated).toBe(false);
-		expect(logoutPayload.connector).toBeNull();
-		expect(logoutPayload.qrPayload).toBeNull();
-		expect(logoutPayload.user).toBeNull();
-
-		const registerResponse = await fetch(`${baseUrl}/v1/private-account/register`, {
-			body: JSON.stringify({
-				email: "founder@example.com",
-				password: "supersecret",
-			}),
-			headers: {
-				authorization: "Bearer remotecode.io-token",
-				"content-type": "application/json",
-			},
-			method: "POST",
-		});
-		expect(registerResponse.status).toBe(200);
-		const registerPayload = await registerResponse.json() as {
-			authenticated: boolean;
-			qrPayload: { connectorId: string; linkUrl?: string | null; type: string } | null;
-			user: { email: string } | null;
-		};
-		expect(registerPayload.authenticated).toBe(true);
-		expect(registerPayload.user?.email).toBe("founder@example.com");
-		expect(registerPayload.qrPayload?.connectorId).toBe("con_1");
-		expect(registerPayload.qrPayload?.linkUrl).toContain("https://qr.remotecode.dev/connect/");
-		expect(registerPayload.qrPayload?.type).toBe("remotecode_private_mobile_connect");
+		expect(statePayload.user?.email).toBe("dev@example.com");
+		expect(statePayload.user?.subscribed).toBe(false);
 	} finally {
-		if (server) {
-			await server.app.stop(true);
-			server.db.close();
+		if (backendHandle) {
+			await backendHandle.privateAccountService.logout();
+			await backendHandle.app.stop(true);
+			backendHandle.db.close();
 		}
 		await privateApp.stop(true);
-		rmSync(root, { force: true, recursive: true });
-	}
-});
-
-test("desktop private-account login returns 503 when the private backend is unreachable", async () => {
-	const root = mkdtempSync(join(tmpdir(), "remotecode-private-account-controller-unreachable-"));
-	const databasePath = join(root, "remotecode.sqlite");
-	let server:
-		| Awaited<ReturnType<typeof createBackendServer>>
-		| undefined;
-
-	try {
-		server = await createBackendServer({
-			databasePath,
-			disableLiveActivityPush: true,
-			port: 0,
-			privateBackendUrl: "http://127.0.0.1:1",
-		});
-		const baseUrl = `http://127.0.0.1:${requirePort(server.server)}`;
-
-		const loginResponse = await fetch(`${baseUrl}/v1/private-account/login`, {
-			body: JSON.stringify({
-				email: "dev@example.com",
-				password: "supersecret",
-			}),
-			headers: {
-				authorization: "Bearer remotecode.io-token",
-				"content-type": "application/json",
-			},
-			method: "POST",
-		});
-
-		expect(loginResponse.status).toBe(503);
-		expect(await loginResponse.json()).toEqual({
-			code: "private_backend_unreachable",
-			error: "Unable to connect. Is the computer able to access the url?",
-		});
-	} finally {
-		if (server) {
-			await server.app.stop(true);
-			server.db.close();
-		}
 		rmSync(root, { force: true, recursive: true });
 	}
 });

@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/consistent-type-assertions, @typescript-eslint/no-explicit-any, @typescript-eslint/prefer-readonly-parameter-types, compat/compat, functional/immutable-data, max-lines, max-statements */
 import { expect, type Page, type Route, test } from "@playwright/test";
-import type { PrivateAccountStateDto, PrivateLoginRequestDto, PrivateRegisterRequestDto } from "@remotecode/contracts";
+import type { PrivateAccountStateDto, PrivateLoginRequestDto } from "@remotecode/contracts";
 
 type PrivateAccountState = PrivateAccountStateDto;
 
@@ -10,19 +10,14 @@ interface RequestLogEntry {
 }
 
 interface ApiMockOptions {
+	browserForgotPasswordUrl?: string;
+	browserManageSubscriptionUrl?: string;
+	browserRegisterUrl?: string;
 	initialState: PrivateAccountState;
+	loginError?: string;
 	loginState?: PrivateAccountState;
 	loginStatus?: number;
-	loginError?: string;
 	logoutState?: PrivateAccountState;
-	registerResponses?: Array<{
-		error?: string;
-		state?: PrivateAccountState;
-		status?: number;
-	}>;
-	registerState?: PrivateAccountState;
-	registerStatus?: number;
-	registerError?: string;
 }
 
 const unauthenticatedState: PrivateAccountState = {
@@ -125,7 +120,23 @@ const installMockWebSocket = async (page: Page) => {
 	`);
 };
 
-const parseAuthRequest = (request: Route["request"]): PrivateLoginRequestDto | PrivateRegisterRequestDto => {
+const installWindowOpenSpy = async (page: Page) => {
+	await page.addInitScript(() => {
+		(window as typeof window & { __openedUrls?: string[] }).__openedUrls = [];
+		window.open = (url?: string | URL | undefined) => {
+			(window as typeof window & { __openedUrls: string[] }).__openedUrls.push(String(url ?? ""));
+			return null;
+		};
+	});
+};
+
+const readOpenedUrls = async (page: Page): Promise<string[]> =>
+	await page.evaluate(() => (window as typeof window & { __openedUrls: string[] }).__openedUrls);
+
+const getSidebarAccountButton = (page: Page) =>
+	page.getByTestId("private-account-sidebar-footer").locator(":scope > button").last();
+
+const parseAuthRequest = (request: Route["request"]): PrivateLoginRequestDto => {
 	const payload = request.postDataJSON() as Partial<PrivateLoginRequestDto> | null;
 	if (!payload || typeof payload.email !== "string" || typeof payload.password !== "string") {
 		throw new Error("private_account_auth_payload_invalid");
@@ -144,7 +155,6 @@ const parseAuthRequest = (request: Route["request"]): PrivateLoginRequestDto | P
 const createApiMock = (options: ApiMockOptions) => {
 	const requests: RequestLogEntry[] = [];
 	let privateAccountState = structuredClone(options.initialState);
-	let registerRequestCount = 0;
 
 	const json = (body: unknown, status = 200) => ({
 		body: JSON.stringify(body),
@@ -262,25 +272,24 @@ const createApiMock = (options: ApiMockOptions) => {
 			return;
 		}
 
-		if (method === "POST" && path === "/v1/private-account/register") {
-			parseAuthRequest(request);
+		if (method === "POST" && path === "/v1/private-account/browser/register") {
+			await intercept.fulfill(json({
+				url: options.browserRegisterUrl ?? "https://remotecode.io/register?target=desktop",
+			}));
+			return;
+		}
 
-			const registerResponse = options.registerResponses?.[registerRequestCount] ?? {
-				error: options.registerError,
-				state: options.registerState,
-				status: options.registerStatus,
-			};
-			registerRequestCount += 1;
+		if (method === "POST" && path === "/v1/private-account/browser/forgot-password") {
+			await intercept.fulfill(json({
+				url: options.browserForgotPasswordUrl ?? "https://remotecode.io/forgot-password",
+			}));
+			return;
+		}
 
-			if ((registerResponse.status ?? 200) >= 400) {
-				await intercept.fulfill(
-					json({ error: registerResponse.error ?? "email_already_registered" }, registerResponse.status),
-				);
-				return;
-			}
-
-			privateAccountState = structuredClone(registerResponse.state ?? options.registerState ?? connectedState("founder@example.com"));
-			await intercept.fulfill(json(privateAccountState));
+		if (method === "GET" && path === "/v1/private-account/browser/manage-subscription") {
+			await intercept.fulfill(json({
+				url: options.browserManageSubscriptionUrl ?? "https://remotecode.io/app",
+			}));
 			return;
 		}
 
@@ -304,13 +313,14 @@ test("private account login renders connector state and logout resets the footer
 	});
 
 	await installMockWebSocket(page);
+	await installWindowOpenSpy(page);
 	await page.route("**/v1/**", apiMock.route);
 	await page.goto("/");
 
 	await expect(page.getByTestId("private-account-sidebar-footer")).toBeVisible();
-	await expect(page.getByText("Log in or register")).toBeVisible();
+	await expect(page.getByText("Log in")).toBeVisible();
 
-	await page.getByRole("button", { name: /Log in or register/i }).click();
+	await getSidebarAccountButton(page).click();
 	const dialog = page.getByRole("dialog", { name: "Private account modal" });
 	await expect(dialog).toBeVisible();
 
@@ -330,8 +340,7 @@ test("private account login renders connector state and logout resets the footer
 	await connectedDialog.getByRole("button", { name: "Log out" }).click();
 
 	await expect(page.getByTestId("private-account-connector-card")).toHaveCount(0);
-	await expect(page.getByText("Log in or register")).toBeVisible();
-
+	await expect(page.getByText("Log in")).toBeVisible();
 	await expect
 		.poll(() =>
 			apiMock.requests.filter((entry) => entry.method === "POST" && entry.path === "/v1/private-account/logout").length,
@@ -339,33 +348,34 @@ test("private account login renders connector state and logout resets the footer
 		.toBe(1);
 });
 
-test("private account login without subscription shows subscribe CTA instead of QR", async ({ page }) => {
+test("private account login without subscription opens subscription management in the browser", async ({ page }) => {
 	const apiMock = createApiMock({
+		browserManageSubscriptionUrl: "https://remotecode.io/app",
 		initialState: unauthenticatedState,
 		loginState: unsubscribedState("maker@remotecode.io"),
 	});
 
 	await installMockWebSocket(page);
+	await installWindowOpenSpy(page);
 	await page.route("**/v1/**", apiMock.route);
 	await page.goto("/");
 
-	await page.getByRole("button", { name: /Log in or register/i }).click();
+	await getSidebarAccountButton(page).click();
 	const dialog = page.getByRole("dialog", { name: "Private account modal" });
 	await dialog.getByLabel("Email").fill("maker@remotecode.io");
 	await dialog.getByLabel("Password").fill("supersecret");
 	await dialog.getByRole("button", { name: "Log in", exact: true }).last().click();
 
 	await expect(page.getByTestId("private-account-subscribe-card")).toBeVisible();
-	await expect(page.getByTestId("private-account-subscribe-link")).toHaveAttribute(
-		"href",
-		"https://remotecode.io/subscribe/maker%40remotecode.io",
-	);
+	await page.getByTestId("private-account-subscribe-link").click();
+	await expect.poll(async () => await readOpenedUrls(page)).toContain("https://remotecode.io/app");
 	await expect(page.getByAltText("Private connect QR")).toHaveCount(0);
 
 	await page.getByRole("button", { name: /maker@remotecode.io/i }).click();
 	const connectedDialog = page.getByRole("dialog", { name: "Private account modal" });
 	await expect(connectedDialog.getByText("Subscription inactive")).toBeVisible();
-	await expect(connectedDialog.getByText("Go to subscription")).toBeVisible();
+	await connectedDialog.getByRole("link", { name: "Manage subscription" }).click();
+	await expect.poll(async () => await readOpenedUrls(page)).toContain("https://remotecode.io/app");
 	await expect(connectedDialog.getByAltText("Private connect QR enlarged")).toHaveCount(0);
 });
 
@@ -380,7 +390,7 @@ test("private account login shows a friendly alert when credentials are invalid"
 	await page.route("**/v1/**", apiMock.route);
 	await page.goto("/");
 
-	await page.getByRole("button", { name: /Log in or register/i }).click();
+	await getSidebarAccountButton(page).click();
 	const dialog = page.getByRole("dialog", { name: "Private account modal" });
 	await dialog.getByLabel("Email").fill("dev@example.com");
 	await dialog.getByLabel("Password").fill("wrong-password");
@@ -392,51 +402,41 @@ test("private account login shows a friendly alert when credentials are invalid"
 	await expect(page.getByTestId("private-account-connector-card")).toHaveCount(0);
 });
 
-test("private account register flow surfaces backend errors and can recover", async ({ page }) => {
+test("private account opens browser registration and forgot-password handoff urls", async ({ page }) => {
 	const apiMock = createApiMock({
+		browserForgotPasswordUrl: "https://remotecode.io/forgot-password?email=founder%40remotecode.io",
+		browserRegisterUrl: "https://remotecode.io/register?target=desktop&email=founder%40remotecode.io",
 		initialState: unauthenticatedState,
-		registerResponses: [
-			{
-				error: "An account with this email already exists.",
-				status: 409,
-			},
-			{
-				state: connectedState("founder@remotecode.io"),
-				status: 200,
-			},
-		],
 	});
 
 	await installMockWebSocket(page);
+	await installWindowOpenSpy(page);
 	await page.route("**/v1/**", apiMock.route);
 	await page.goto("/");
 
-	await page.getByRole("button", { name: /Log in or register/i }).click();
+	await getSidebarAccountButton(page).click();
 	const dialog = page.getByRole("dialog", { name: "Private account modal" });
-	await dialog.getByRole("button", { name: "Register", exact: true }).first().click();
 	await dialog.getByLabel("Email").fill("founder@remotecode.io");
-	await dialog.getByLabel("Password").fill("supersecret");
-	await dialog.getByRole("button", { name: "Register", exact: true }).last().click();
+	await dialog.getByRole("button", { name: "Register in browser" }).click();
 
 	await expect
 		.poll(() =>
-			apiMock.requests.filter((entry) => entry.method === "POST" && entry.path === "/v1/private-account/register").length,
+			apiMock.requests.filter((entry) => entry.method === "POST" && entry.path === "/v1/private-account/browser/register").length,
 		)
 		.toBe(1);
-	await expect(dialog).toBeVisible();
-	await expect(page.getByTestId("private-account-error")).toContainText("An account with this email already exists.");
-	await expect(page.getByTestId("private-account-toast")).toContainText("An account with this email already exists.");
-	await expect(page.getByTestId("private-account-connector-card")).toHaveCount(0);
+	await expect.poll(async () => await readOpenedUrls(page))
+		.toContain("https://remotecode.io/register?target=desktop&email=founder%40remotecode.io");
 
-	await dialog.getByRole("button", { name: "Register", exact: true }).last().click();
+	await getSidebarAccountButton(page).click();
+	const forgotDialog = page.getByRole("dialog", { name: "Private account modal" });
+	await forgotDialog.getByLabel("Email").fill("founder@remotecode.io");
+	await forgotDialog.getByRole("button", { name: "Forgot password" }).click();
 
-	await expect(dialog).toHaveCount(0);
-	await expect(page.getByText("founder@remotecode.io")).toBeVisible();
-	await expect(page.getByTestId("private-account-connector-card").getByText("Relay online")).toBeVisible();
-	await expect(page.getByAltText("Private connect QR")).toBeVisible();
 	await expect
 		.poll(() =>
-			apiMock.requests.filter((entry) => entry.method === "POST" && entry.path === "/v1/private-account/register").length,
+			apiMock.requests.filter((entry) => entry.method === "POST" && entry.path === "/v1/private-account/browser/forgot-password").length,
 		)
-		.toBe(2);
+		.toBe(1);
+	await expect.poll(async () => await readOpenedUrls(page))
+		.toContain("https://remotecode.io/forgot-password?email=founder%40remotecode.io");
 });

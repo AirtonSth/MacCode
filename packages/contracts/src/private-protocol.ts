@@ -88,6 +88,64 @@ export interface PrivateLoginRequestDto {
 	password: string;
 }
 
+export interface PrivateSignupIntentRequestDto {
+	email: string;
+	password: string;
+	platform: "web" | "ios" | "android" | "macos" | "windows" | "linux";
+	returnUrl?: string | null;
+	target: "web" | "mobile" | "desktop";
+}
+
+export interface PrivateSignupIntentDto {
+	email: string;
+	id: string;
+	platform: "web" | "ios" | "android" | "macos" | "windows" | "linux";
+	returnUrl: string | null;
+	status: "pending_checkout" | "checkout_created" | "billing_active" | "completed" | "expired" | "canceled";
+	subscriptionStatus: "inactive" | "trialing" | "active" | "past_due" | "canceled" | "expired";
+	target: "web" | "mobile" | "desktop";
+	trialEndsAt: string | null;
+}
+
+export interface PrivateSignupIntentResponseDto {
+	signupIntent: PrivateSignupIntentDto;
+}
+
+export interface PrivateSignupIntentCheckoutResponseDto {
+	checkoutUrl: string;
+}
+
+export interface PrivateSignupIntentCompletionResponseDto {
+	redirectUrl: string;
+	session: PrivateSessionDto;
+	signupIntent: PrivateSignupIntentDto;
+}
+
+export interface PrivateAuthCompletionExchangeRequestDto {
+	completionToken: string;
+}
+
+export interface PrivateForgotPasswordRequestDto {
+	email: string;
+}
+
+export interface PrivateForgotPasswordResponseDto {
+	sent: true;
+}
+
+export interface PrivateResetPasswordRequestDto {
+	password: string;
+	token: string;
+}
+
+export interface PrivateResetPasswordResponseDto {
+	reset: true;
+}
+
+export interface PrivateResetPasswordValidateResponseDto {
+	valid: true;
+}
+
 export interface PrivatePairingClaimRequestDto {
 	pairingCode: string;
 }

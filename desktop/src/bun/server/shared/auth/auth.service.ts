@@ -54,7 +54,7 @@ export const AuthService = {
 
 	isPublicRestRoute(request: Request): boolean {
 		const pathname = AuthService.readPathname(request);
-		return pathname === "/v1/discovery";
+		return pathname === "/v1/discovery" || pathname === "/v1/private-account/browser-return";
 	},
 
 	readHeaderToken(request: Request): string | null {

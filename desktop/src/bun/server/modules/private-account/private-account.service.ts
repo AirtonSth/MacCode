@@ -17,11 +17,7 @@ import {
 	toLogErrorDetails,
 } from "../../shared/core/server-logger";
 import { RelayConnectorClient } from "./relay-connector.client";
-import type {
-	PersistedPrivateConnector,
-	PrivateAccountAuthInput,
-	PrivateAccountStateSnapshot,
-} from "./private-account.model";
+import type { PersistedPrivateConnector, PrivateAccountAuthInput, PrivateAccountStateSnapshot } from "./private-account.model";
 import { PrivateAccountRepository } from "./private-account.repository";
 
 interface PrivateAccountServiceOptions {
@@ -31,6 +27,8 @@ interface PrivateAccountServiceOptions {
 	heartbeatIntervalMs?: number;
 	localServerToken: string;
 	mobileConnectRefreshIntervalMs?: number;
+	platform?: NodeJS.Platform;
+	publicWebUrl?: string;
 	reconnectDelayMs?: number;
 }
 
@@ -42,6 +40,7 @@ interface MobileConnectQrLink {
 }
 
 const DEFAULT_MOBILE_CONNECT_REFRESH_INTERVAL_MS = 5_000;
+const DEFAULT_PUBLIC_WEB_URL = "https://remotecode.io";
 
 const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
 	private_backend_unreachable: "Unable to connect. Is the computer able to access the url?",
@@ -226,36 +225,52 @@ export class PrivateAccountService {
 		return await this.getState();
 	}
 
-	public async register(input: PrivateAccountAuthInput): Promise<PrivateAccountStateDto> {
-		const startedAt = Date.now();
-		serverLogger.info("private-account", "Register started", {
-			email: maskEmailForLogs(input.email),
-			privateBackendUrl: this.options.backendUrl,
-		});
-		try {
-			const client = createPrivateClient({
-				baseUrl: this.options.backendUrl,
-			});
-			this.session = await client.register(input);
-			serverLogger.success("private-account", "Register upstream accepted", {
-				durationMs: serverLogger.traceDurationMs(startedAt),
-				email: maskEmailForLogs(this.session.user.email),
-				refreshToken: maskTokenForLogs(this.session.refreshToken),
-				userId: this.session.user.id,
-			});
-			this.repository.saveSession(this.session);
-			this.errorMessage = null;
-			await this.ensureConnector(true);
-			return await this.getState();
-		} catch (error) {
-			serverLogger.error("private-account", "Register failed", {
-				durationMs: serverLogger.traceDurationMs(startedAt),
-				email: maskEmailForLogs(input.email),
-				privateBackendUrl: this.options.backendUrl,
-				...toLogErrorDetails(error),
-			});
-			throw toPrivateBackendServiceError(error);
+	public async buildBrowserRegisterUrl(input?: { email?: string }): Promise<{ url: string }> {
+		return {
+			url: this.buildPublicWebUrl("/register", {
+				...(input?.email?.trim() ? { email: input.email.trim() } : {}),
+				backendUrl: this.options.backendUrl,
+				platform: this.resolveDesktopPlatform(),
+				returnUrl: this.resolveDesktopReturnUrl(),
+				target: "desktop",
+			}),
+		};
+	}
+
+	public async buildBrowserForgotPasswordUrl(input?: { email?: string }): Promise<{ url: string }> {
+		return {
+			url: this.buildPublicWebUrl("/forgot-password", {
+				...(input?.email?.trim() ? { email: input.email.trim() } : {}),
+				backendUrl: this.options.backendUrl,
+			}),
+		};
+	}
+
+	public async buildBrowserManageSubscriptionUrl(): Promise<{ url: string }> {
+		return {
+			url: this.buildPublicWebUrl("/app"),
+		};
+	}
+
+	public async completeBrowserReturn(input: {
+		backendUrl?: string;
+		completionToken: string;
+	}): Promise<PrivateAccountStateDto> {
+		const completionToken = input.completionToken.trim();
+		if (completionToken.length === 0) {
+			throw createStatusError("auth_completion_token_required", 400);
 		}
+
+		const client = createPrivateClient({
+			baseUrl: (input.backendUrl?.trim().replace(/\/+$/u, "") || this.options.backendUrl),
+		});
+		this.session = await client.exchangeCompletionToken({
+			completionToken,
+		});
+		this.repository.saveSession(this.session);
+		this.errorMessage = null;
+		await this.ensureConnector(true);
+		return await this.getState();
 	}
 
 	public async resume(): Promise<void> {
@@ -376,6 +391,40 @@ export class PrivateAccountService {
 		});
 		this.repository.saveConnector(this.connector);
 		await this.connectRelay();
+	}
+
+	private buildPublicWebUrl(path: string, params?: Record<string, string>): string {
+		const url = new URL(path, `${(this.options.publicWebUrl ?? DEFAULT_PUBLIC_WEB_URL).replace(/\/+$/u, "")}/`);
+		for (const [key, value] of Object.entries(params ?? {})) {
+			url.searchParams.set(key, value);
+		}
+
+		return url.toString();
+	}
+
+	private resolveDesktopPlatform(): "linux" | "macos" | "windows" {
+		const platform = this.options.platform ?? process.platform;
+		if (platform === "win32") {
+			return "windows";
+		}
+
+		if (platform === "darwin") {
+			return "macos";
+		}
+
+		return "linux";
+	}
+
+	private resolveDesktopReturnUrl(): string {
+		if (this.resolveDesktopPlatform() === "macos") {
+			return "remotecode://auth/complete";
+		}
+
+		if (!this.localServerBaseUrl) {
+			throw createStatusError("private_local_app_unavailable", 503);
+		}
+
+		return `${this.localServerBaseUrl}/v1/private-account/browser-return`;
 	}
 
 	private async handleLocalRequest(input: {

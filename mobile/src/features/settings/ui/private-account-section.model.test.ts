@@ -2,9 +2,11 @@
 import { expect, test } from "bun:test";
 
 import {
-	authenticatePrivateAccount,
-	buildPrivateSubscribeUrl,
+	buildPrivateForgotPasswordUrl,
+	buildPrivateManageSubscriptionUrl,
+	buildPrivateRegisterUrl,
 	getPrivateSubscriptionSnapshot,
+	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
@@ -60,9 +62,9 @@ test("resolvePendingPrivateConnector finds the scanned desktop connector in the 
 	expect(connector?.hostname).toBe("online.local");
 });
 
-test("authenticatePrivateAccount delegates login to the shared contracts client", async () => {
+test("loginPrivateAccount delegates login to the shared contracts client", async () => {
 	const password = ["super", "secret"].join("");
-	const session = await authenticatePrivateAccount({
+	const session = await loginPrivateAccount({
 		baseUrl: "https://private.remotecode.dev",
 		createClient: () => ({
 			login: async () => ({
@@ -78,7 +80,6 @@ test("authenticatePrivateAccount delegates login to the shared contracts client"
 			}),
 		}) as never,
 		email: "dev@example.com",
-		mode: "login",
 		password,
 	});
 
@@ -101,8 +102,27 @@ test("loadPrivateConnectorsSafely reports load failures instead of rejecting", a
 	expect(seenMessage).toBe("connector_load_failed");
 });
 
-test("buildPrivateSubscribeUrl encodes the account email into the subscribe path", () => {
-	expect(buildPrivateSubscribeUrl("dev@example.com")).toBe("https://remotecode.io/subscribe/dev%40example.com");
+test("buildPrivateRegisterUrl sends mobile users to the browser registration flow", () => {
+	expect(buildPrivateRegisterUrl({
+		backendUrl: "https://private.remotecode.dev/",
+		email: "dev@example.com",
+		platform: "ios",
+	})).toBe(
+		"https://remotecode.io/register?backendUrl=https%3A%2F%2Fprivate.remotecode.dev&platform=ios&returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete&target=mobile&email=dev%40example.com",
+	);
+});
+
+test("buildPrivateForgotPasswordUrl preserves the backend and optional email", () => {
+	expect(buildPrivateForgotPasswordUrl({
+		backendUrl: "https://private.remotecode.dev/",
+		email: "dev@example.com",
+	})).toBe(
+		"https://remotecode.io/forgot-password?backendUrl=https%3A%2F%2Fprivate.remotecode.dev&email=dev%40example.com",
+	);
+});
+
+test("buildPrivateManageSubscriptionUrl points to the private web app", () => {
+	expect(buildPrivateManageSubscriptionUrl()).toBe("https://remotecode.io/app");
 });
 
 test("getPrivateSubscriptionSnapshot reads the subscription flags from the session", () => {

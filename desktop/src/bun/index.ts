@@ -1,4 +1,4 @@
-import { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
+import Electrobun, { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
 
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
@@ -6,6 +6,69 @@ import { maskTokenForLogs, serverLogger } from "./server/shared/core/server-logg
 import { startMdnsBroadcast } from "./network/mdns";
 
 let mainWindowRef: BrowserWindow | null = null;
+let privateAccountServiceRef:
+	| Awaited<ReturnType<typeof createBackendServer>>["privateAccountService"]
+	| null = null;
+const electrobunEvents = (Electrobun as unknown as {
+	events?: {
+		on: (event: string, handler: (payload: { url: string }) => void | Promise<void>) => void;
+	};
+}).events;
+
+const AUTH_COMPLETE_PATH = "/auth/complete";
+
+const focusMainWindow = (): void => {
+	const mainWindow = mainWindowRef;
+	if (!mainWindow) {
+		return;
+	}
+
+	mainWindow.show?.();
+	mainWindow.focus?.();
+};
+
+const handleOpenUrl = async (rawUrl: string): Promise<void> => {
+	const privateAccountService = privateAccountServiceRef;
+	if (!privateAccountService) {
+		return;
+	}
+
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return;
+	}
+
+	const pathname = parsed.pathname.length > 0 ? parsed.pathname : `/${parsed.host}`;
+	if (pathname !== AUTH_COMPLETE_PATH) {
+		return;
+	}
+
+	const completionToken = parsed.searchParams.get("completionToken")?.trim() ?? "";
+	if (completionToken.length === 0) {
+		serverLogger.warn("desktop-bootstrap", "Ignored auth completion without token", { rawUrl });
+		return;
+	}
+
+	try {
+		await privateAccountService.completeBrowserReturn({
+			...(parsed.searchParams.get("backendUrl")?.trim()
+				? { backendUrl: parsed.searchParams.get("backendUrl")!.trim() }
+				: {}),
+			completionToken,
+		});
+		focusMainWindow();
+		serverLogger.success("desktop-bootstrap", "Applied auth completion deeplink", {
+			rawUrl,
+		});
+	} catch (error) {
+		serverLogger.error("desktop-bootstrap", "Failed to apply auth completion deeplink", {
+			rawUrl,
+			...(error instanceof Error ? { message: error.message } : {}),
+		});
+	}
+};
 
 const isExternalHttpUrl = (value: string): boolean => {
 	try {
@@ -222,8 +285,13 @@ serverLogger.banner("Desktop Server Boot", {
 	port: serverConfig.port,
 });
 
-await createBackendServer({ port: serverConfig.port });
+const backendHandle = await createBackendServer({ port: serverConfig.port });
+privateAccountServiceRef = backendHandle.privateAccountService;
 await waitForBackendReady();
+
+electrobunEvents?.on("open-url", async ({ url }: { url: string }) => {
+	await handleOpenUrl(url);
+});
 
 let stopMdns = () => {
 	// no-op

@@ -133,12 +133,33 @@ describe("createPrivateAccountApiClient", () => {
 
 		const client = createPrivateAccountApiClient();
 
-		await expect(client.register({
+		await expect(client.browserRegister({
 			email: "dev@example.com",
-			password: "short",
 		})).rejects.toMatchObject({
 			message: "Password must be at least 8 characters long.",
 			status: 400,
 		} satisfies Partial<PrivateAccountApiError>);
+	});
+
+	test("requests the browser subscription management url from the local desktop server", async () => {
+		let requestedUrl = "";
+
+		globalThis.fetch = mock(async (input: RequestInfo | URL) => {
+			requestedUrl = String(input);
+			return new Response(JSON.stringify({
+				url: "https://remotecode.io/app",
+			}), {
+				headers: {
+					"content-type": "application/json",
+				},
+				status: 200,
+			});
+		}) as unknown as typeof fetch;
+
+		const client = createPrivateAccountApiClient();
+		const response = await client.browserManageSubscription();
+
+		expect(requestedUrl).toBe("http://127.0.0.1:8835/v1/private-account/browser/manage-subscription");
+		expect(response.url).toBe("https://remotecode.io/app");
 	});
 });

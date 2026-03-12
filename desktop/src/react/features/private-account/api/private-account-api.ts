@@ -1,7 +1,6 @@
 import type {
 	PrivateAccountStateDto,
 	PrivateLoginRequestDto,
-	PrivateRegisterRequestDto,
 } from "@remotecode/contracts";
 
 const toBaseUrl = (value?: string): string => {
@@ -24,10 +23,12 @@ export class PrivateAccountApiError extends Error {
 }
 
 export interface PrivateAccountApiClient {
+	browserForgotPassword: (input?: { email?: string }) => Promise<{ url: string }>;
+	browserManageSubscription: () => Promise<{ url: string }>;
+	browserRegister: (input?: { email?: string }) => Promise<{ url: string }>;
 	getState: () => Promise<PrivateAccountStateDto>;
 	login: (input: PrivateLoginRequestDto) => Promise<PrivateAccountStateDto>;
 	logout: () => Promise<PrivateAccountStateDto>;
-	register: (input: PrivateRegisterRequestDto) => Promise<PrivateAccountStateDto>;
 }
 
 export const createPrivateAccountApiClient = (config?: {
@@ -79,6 +80,20 @@ export const createPrivateAccountApiClient = (config?: {
 	};
 
 	return {
+		browserForgotPassword: async (input) => await request<{ url: string }>({
+			body: input,
+			method: "POST",
+			path: "/private-account/browser/forgot-password",
+		}),
+		browserManageSubscription: async () => await request<{ url: string }>({
+			method: "GET",
+			path: "/private-account/browser/manage-subscription",
+		}),
+		browserRegister: async (input) => await request<{ url: string }>({
+			body: input,
+			method: "POST",
+			path: "/private-account/browser/register",
+		}),
 		getState: async () => await request<PrivateAccountStateDto>({
 			method: "GET",
 			path: "/private-account/state",
@@ -91,11 +106,6 @@ export const createPrivateAccountApiClient = (config?: {
 		logout: async () => await request<PrivateAccountStateDto>({
 			method: "POST",
 			path: "/private-account/logout",
-		}),
-		register: async (input) => await request<PrivateAccountStateDto>({
-			body: input,
-			method: "POST",
-			path: "/private-account/register",
 		}),
 	};
 };

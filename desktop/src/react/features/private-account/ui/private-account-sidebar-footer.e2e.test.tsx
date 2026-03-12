@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import {
 	buildPrivateAccountQrDataUrl,
 	loadPrivateAccountState,
-	runPrivateAccountAuthAction,
+	runPrivateAccountLoginAction,
 } from "./private-account-sidebar-footer";
 
 test("private account sidebar helpers hydrate state, authenticate, and build the QR payload", async () => {
@@ -55,36 +55,17 @@ test("private account sidebar helpers hydrate state, authenticate, and build the
 			qrPayload: null,
 			user: null,
 		}),
-		register: async () => ({
-			authenticated: true,
-			connector: null,
-			connectorRelayState: "connecting" as const,
-			errorMessage: null,
-			qrPayload: {
-				backendUrl: "http://127.0.0.1:8787",
-				connectorId: "con_2",
-				connectorName: "Desktop Connector",
-				linkUrl: "https://qr.remotecode.dev/connect/mcs_2/secret",
-				type: "remotecode_private_mobile_connect" as const,
-				version: 1 as const,
-			},
-			user: {
-				daysRemaing: 30,
-				daysRemaining: 30,
-				email: "new@example.com",
-				id: "usr_2",
-				subscribed: true,
-			},
-		}),
+		browserForgotPassword: async () => ({ url: "https://remotecode.io/forgot-password" }),
+		browserManageSubscription: async () => ({ url: "https://remotecode.io/app" }),
+		browserRegister: async () => ({ url: "https://remotecode.io/register" }),
 	};
 
 	const initialState = await loadPrivateAccountState(client);
 	expect(initialState.authenticated).toBe(false);
 
-	const loggedInState = await runPrivateAccountAuthAction({
+	const loggedInState = await runPrivateAccountLoginAction({
 		client,
 		email: "dev@example.com",
-		mode: "login",
 		password: "supersecret",
 	});
 	expect(loggedInState.user?.email).toBe("dev@example.com");

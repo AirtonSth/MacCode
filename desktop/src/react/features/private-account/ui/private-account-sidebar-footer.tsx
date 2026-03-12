@@ -9,13 +9,6 @@ import {
 	PrivateAccountApiError,
 } from "../api/private-account-api";
 
-export const buildPrivateSubscribeUrl = (email: string | null | undefined): string => {
-	const normalized = email?.trim() ?? "";
-	return normalized.length > 0
-		? `https://remotecode.io/subscribe/${encodeURIComponent(normalized)}`
-		: "https://remotecode.io/subscribe";
-};
-
 export const isPrivateAccountSubscribed = (state: PrivateAccountStateDto | null): boolean =>
 	Boolean(state?.user?.subscribed);
 
@@ -54,21 +47,15 @@ export const loadPrivateAccountState = async (
 	client: PrivateAccountApiClient,
 ): Promise<PrivateAccountStateDto> => await client.getState();
 
-export const runPrivateAccountAuthAction = async (input: {
+export const runPrivateAccountLoginAction = async (input: {
 	client: PrivateAccountApiClient;
 	email: string;
-	mode: "login" | "register";
 	password: string;
 }): Promise<PrivateAccountStateDto> =>
-	input.mode === "login"
-		? await input.client.login({
-			email: input.email,
-			password: input.password,
-		})
-		: await input.client.register({
-			email: input.email,
-			password: input.password,
-		});
+	await input.client.login({
+		email: input.email,
+		password: input.password,
+	});
 
 export const buildPrivateAccountQrDataUrl = async (input: {
 	createQrDataUrl: (value: string) => Promise<string>;
@@ -112,7 +99,6 @@ export const PrivateAccountSidebarFooter = ({
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const [isModalOpen, setIsModalOpen] = useState(false);
 	const [isSubmitting, setIsSubmitting] = useState(false);
-	const [mode, setMode] = useState<"login" | "register">("login");
 	const [password, setPassword] = useState("");
 	const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
 	const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -198,7 +184,6 @@ export const PrivateAccountSidebarFooter = ({
 
 	const statusLabel = useMemo(() => getPrivateAccountStatusLabel(state), [state]);
 	const isSubscribed = useMemo(() => isPrivateAccountSubscribed(state), [state]);
-	const subscribeUrl = useMemo(() => buildPrivateSubscribeUrl(state.user?.email), [state.user?.email]);
 	const daysRemaining = state.user?.daysRemaining ?? state.user?.daysRemaing ?? 0;
 
 	const openModal = useCallback(() => {
@@ -206,19 +191,59 @@ export const PrivateAccountSidebarFooter = ({
 		void refreshState().catch(() => undefined);
 	}, [refreshState]);
 
-	const openSubscribeUrl = useCallback(async (): Promise<void> => {
-		await openExternalUrl(subscribeUrl);
-	}, [openExternalUrl, subscribeUrl]);
+	const openBrowserRegister = useCallback(async (): Promise<void> => {
+		setIsSubmitting(true);
+		setErrorMessage(null);
+		try {
+			const response = await client.browserRegister({
+				...(email.trim() ? { email: email.trim() } : {}),
+			});
+			await openExternalUrl(response.url);
+			setIsModalOpen(false);
+		} catch (error) {
+			setErrorMessage(error instanceof Error ? error.message : "Unable to open registration.");
+		} finally {
+			setIsSubmitting(false);
+		}
+	}, [client, email, openExternalUrl]);
+
+	const openBrowserForgotPassword = useCallback(async (): Promise<void> => {
+		setIsSubmitting(true);
+		setErrorMessage(null);
+		try {
+			const response = await client.browserForgotPassword({
+				...(email.trim() ? { email: email.trim() } : {}),
+			});
+			await openExternalUrl(response.url);
+			setIsModalOpen(false);
+		} catch (error) {
+			setErrorMessage(error instanceof Error ? error.message : "Unable to open password recovery.");
+		} finally {
+			setIsSubmitting(false);
+		}
+	}, [client, email, openExternalUrl]);
+
+	const openBrowserManageSubscription = useCallback(async (): Promise<void> => {
+		setIsSubmitting(true);
+		setErrorMessage(null);
+		try {
+			const response = await client.browserManageSubscription();
+			await openExternalUrl(response.url);
+		} catch (error) {
+			setErrorMessage(error instanceof Error ? error.message : "Unable to open subscription management.");
+		} finally {
+			setIsSubmitting(false);
+		}
+	}, [client, openExternalUrl]);
 
 	const submit = async () => {
 		setIsSubmitting(true);
 		setErrorMessage(null);
 
 		try {
-			const nextState = await runPrivateAccountAuthAction({
+			const nextState = await runPrivateAccountLoginAction({
 				client,
 				email,
-				mode,
 				password,
 			});
 			setState(nextState);
@@ -298,15 +323,15 @@ export const PrivateAccountSidebarFooter = ({
 						<a
 							className="mt-3 inline-flex rounded-full bg-amber-200 px-3 py-1.5 text-xs font-semibold text-[#2b1906] transition hover:bg-amber-100"
 							data-testid="private-account-subscribe-link"
-							href={subscribeUrl}
+							href="#manage-subscription"
 							onClick={(event) => {
 								event.preventDefault();
-								void openSubscribeUrl();
+								void openBrowserManageSubscription();
 							}}
 							rel="noreferrer"
 							target="_blank"
 						>
-							Subscribe now
+							Manage subscription
 						</a>
 					</div>
 				)
@@ -320,7 +345,7 @@ export const PrivateAccountSidebarFooter = ({
 				<span>
 					<span className="block text-[11px] uppercase tracking-[0.14em] text-slate-400">Account</span>
 					<span className="block text-sm font-semibold text-slate-100">
-						{state.user?.email ?? "Log in or register"}
+						{state.user?.email ?? "Log in"}
 					</span>
 				</span>
 			</button>
@@ -377,7 +402,7 @@ export const PrivateAccountSidebarFooter = ({
 							<div>
 								<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Private Account</p>
 								<h3 className="text-lg font-semibold text-slate-100">
-									{state.authenticated ? "Account connected" : mode === "login" ? "Log in" : "Register"}
+									{state.authenticated ? "Account connected" : "Log in"}
 								</h3>
 							</div>
 							<button
@@ -446,15 +471,15 @@ export const PrivateAccountSidebarFooter = ({
 										</p>
 										<a
 											className="mt-4 inline-flex rounded-full bg-amber-200 px-3 py-2 text-sm font-semibold text-[#2b1906] transition hover:bg-amber-100"
-											href={subscribeUrl}
+											href="#manage-subscription"
 											onClick={(event) => {
 												event.preventDefault();
-												void openSubscribeUrl();
+												void openBrowserManageSubscription();
 											}}
 											rel="noreferrer"
 											target="_blank"
 										>
-											Go to subscription
+											Manage subscription
 										</a>
 									</div>
 								)}
@@ -471,30 +496,6 @@ export const PrivateAccountSidebarFooter = ({
 							</div>
 						) : (
 							<div className="space-y-3">
-								<div className="flex gap-2 rounded-2xl border border-white/10 bg-white/[0.03] p-1">
-									<button
-										className={`flex-1 rounded-xl px-3 py-2 text-sm font-medium transition ${
-											mode === "login" ? "bg-sky-300 text-slate-950" : "text-slate-300 hover:bg-white/[0.06]"
-										}`}
-										onClick={() => {
-											setMode("login");
-										}}
-										type="button"
-									>
-										Log in
-									</button>
-									<button
-										className={`flex-1 rounded-xl px-3 py-2 text-sm font-medium transition ${
-											mode === "register" ? "bg-sky-300 text-slate-950" : "text-slate-300 hover:bg-white/[0.06]"
-										}`}
-										onClick={() => {
-											setMode("register");
-										}}
-										type="button"
-									>
-										Register
-									</button>
-								</div>
 								<label className="block text-xs text-slate-300">
 									Email
 									<input
@@ -527,8 +528,30 @@ export const PrivateAccountSidebarFooter = ({
 									}}
 									type="button"
 								>
-									{isSubmitting ? "Working..." : mode === "login" ? "Log in" : "Register"}
+									{isSubmitting ? "Working..." : "Log in"}
 								</button>
+								<div className="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-300">
+									<button
+										className="rounded-full border border-white/10 px-3 py-1.5 transition hover:bg-white/[0.06]"
+										disabled={isSubmitting}
+										onClick={() => {
+											void openBrowserForgotPassword();
+										}}
+										type="button"
+									>
+										Forgot password
+									</button>
+									<button
+										className="rounded-full border border-white/10 px-3 py-1.5 transition hover:bg-white/[0.06]"
+										disabled={isSubmitting}
+										onClick={() => {
+											void openBrowserRegister();
+										}}
+										type="button"
+									>
+										Register in browser
+									</button>
+								</div>
 							</div>
 						)}
 						</div>

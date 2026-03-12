@@ -24,6 +24,7 @@ const config: ElectrobunConfig = {
 	app: {
 		identifier: "remotecode-electrobun.local",
 		name: "RemoteCode",
+		urlSchemes: ["remotecode"],
 		version: "0.0.1",
 	},
 

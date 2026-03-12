@@ -85,6 +85,42 @@ export class PrivateAccountController {
 
 	public build() {
 		return new Elysia({ name: "private-account-controller" })
+			.use(
+				new Elysia()
+					.get(
+						"/private-account/browser-return",
+						async ({ query }) => {
+							try {
+								await this.service.completeBrowserReturn({
+									...(typeof query.backendUrl === "string" ? { backendUrl: query.backendUrl } : {}),
+									completionToken: query.completionToken,
+								});
+								return new Response(
+									"<!doctype html><html><body><p>RemoteCode desktop is ready. You can return to the app.</p></body></html>",
+									{
+										headers: {
+											"content-type": "text/html; charset=utf-8",
+										},
+										status: 200,
+									},
+								);
+							} catch (error) {
+								const response = this.toErrorResponse(error);
+								if (response) {
+									return response;
+								}
+
+								throw error;
+							}
+						},
+						{
+							query: t.Object({
+								backendUrl: t.Optional(t.String()),
+								completionToken: t.String(),
+							}),
+						},
+					),
+			)
 			.use(withRestAuth())
 			.get("/private-account/state", async ({ request }) => {
 				const requestId = serverLogger.createRequestId("pa-state");
@@ -96,6 +132,103 @@ export class PrivateAccountController {
 				});
 				try {
 					const response = await this.service.getState();
+					this.logRequestSuccess({
+						durationMs: serverLogger.traceDurationMs(startedAt),
+						requestId,
+						status: 200,
+					});
+					return response;
+				} catch (error) {
+					this.logRequestFailure({
+						durationMs: serverLogger.traceDurationMs(startedAt),
+						error,
+						requestId,
+					});
+					return this.toErrorResponse(error);
+				}
+			})
+			.post(
+				"/private-account/browser/register",
+				async ({ body, request }) => {
+					const requestId = serverLogger.createRequestId("pa-browser-register");
+					const startedAt = this.logRequestStart({
+						email: body.email,
+						method: "POST",
+						origin: request.headers.get("origin"),
+						path: "/v1/private-account/browser/register",
+						requestId,
+					});
+					try {
+						const response = await this.service.buildBrowserRegisterUrl({
+							...(body.email ? { email: body.email } : {}),
+						});
+						this.logRequestSuccess({
+							durationMs: serverLogger.traceDurationMs(startedAt),
+							requestId,
+							status: 200,
+						});
+						return response;
+					} catch (error) {
+						this.logRequestFailure({
+							durationMs: serverLogger.traceDurationMs(startedAt),
+							error,
+							requestId,
+						});
+						return this.toErrorResponse(error);
+					}
+				},
+				{
+					body: t.Object({
+						email: t.Optional(t.String()),
+					}),
+				},
+			)
+			.post(
+				"/private-account/browser/forgot-password",
+				async ({ body, request }) => {
+					const requestId = serverLogger.createRequestId("pa-browser-forgot");
+					const startedAt = this.logRequestStart({
+						email: body.email,
+						method: "POST",
+						origin: request.headers.get("origin"),
+						path: "/v1/private-account/browser/forgot-password",
+						requestId,
+					});
+					try {
+						const response = await this.service.buildBrowserForgotPasswordUrl({
+							...(body.email ? { email: body.email } : {}),
+						});
+						this.logRequestSuccess({
+							durationMs: serverLogger.traceDurationMs(startedAt),
+							requestId,
+							status: 200,
+						});
+						return response;
+					} catch (error) {
+						this.logRequestFailure({
+							durationMs: serverLogger.traceDurationMs(startedAt),
+							error,
+							requestId,
+						});
+						return this.toErrorResponse(error);
+					}
+				},
+				{
+					body: t.Object({
+						email: t.Optional(t.String()),
+					}),
+				},
+			)
+			.get("/private-account/browser/manage-subscription", async ({ request }) => {
+				const requestId = serverLogger.createRequestId("pa-browser-manage");
+				const startedAt = this.logRequestStart({
+					method: "GET",
+					origin: request.headers.get("origin"),
+					path: "/v1/private-account/browser/manage-subscription",
+					requestId,
+				});
+				try {
+					const response = await this.service.buildBrowserManageSubscriptionUrl();
 					this.logRequestSuccess({
 						durationMs: serverLogger.traceDurationMs(startedAt),
 						requestId,
@@ -172,41 +305,6 @@ export class PrivateAccountController {
 						});
 						return this.toErrorResponse(error);
 					}
-				},
-			)
-			.post(
-				"/private-account/register",
-				async ({ body, request }) => {
-					const requestId = serverLogger.createRequestId("pa-register");
-					const startedAt = this.logRequestStart({
-						email: body.email,
-						method: "POST",
-						origin: request.headers.get("origin"),
-						path: "/v1/private-account/register",
-						requestId,
-					});
-					try {
-						const response = await this.service.register(body);
-						this.logRequestSuccess({
-							durationMs: serverLogger.traceDurationMs(startedAt),
-							requestId,
-							status: 200,
-						});
-						return response;
-					} catch (error) {
-						this.logRequestFailure({
-							durationMs: serverLogger.traceDurationMs(startedAt),
-							error,
-							requestId,
-						});
-						return this.toErrorResponse(error);
-					}
-				},
-				{
-					body: t.Object({
-						email: t.String(),
-						password: t.String(),
-					}),
 				},
 			);
 	}

@@ -1,10 +1,14 @@
 /* eslint-disable @typescript-eslint/naming-convention, functional/no-classes */
-/* eslint-disable @typescript-eslint/parameter-properties, max-statements */
+/* eslint-disable @typescript-eslint/parameter-properties */
+/* eslint-disable max-lines, max-statements */
 /* eslint-disable @typescript-eslint/no-magic-numbers */
 import type {
+	PrivateAuthCompletionExchangeRequestDto,
 	PrivateBootstrapResponseDto,
 	PrivateBootstrapStatusDto,
 	PrivateConnectorsResponseDto,
+	PrivateForgotPasswordRequestDto,
+	PrivateForgotPasswordResponseDto,
 	PrivateLoginRequestDto,
 	PrivateLogoutRequestDto,
 	PrivateMeResponseDto,
@@ -16,7 +20,14 @@ import type {
 	PrivatePairingClaimResponseDto,
 	PrivateRefreshRequestDto,
 	PrivateRegisterRequestDto,
+	PrivateResetPasswordRequestDto,
+	PrivateResetPasswordResponseDto,
+	PrivateResetPasswordValidateResponseDto,
 	PrivateSessionDto,
+	PrivateSignupIntentCheckoutResponseDto,
+	PrivateSignupIntentCompletionResponseDto,
+	PrivateSignupIntentRequestDto,
+	PrivateSignupIntentResponseDto,
 } from "./private-protocol";
 
 interface PrivateClientConfig {
@@ -168,7 +179,16 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				path: "/v1/private/pairing/claim",
 			}),
 
-		createMobileConnectBootstrap: async (
+		completeSignupIntent: async (
+			signupIntentId: string,
+		): Promise<PrivateSignupIntentCompletionResponseDto> =>
+			await request<PrivateSignupIntentCompletionResponseDto>({
+				authenticated: false,
+				method: "POST",
+				path: `/v1/private/auth/signup-intents/${encodeURIComponent(signupIntentId)}/complete`,
+			}),
+
+			createMobileConnectBootstrap: async (
 			input: PrivateMobileConnectBootstrapRequestDto,
 		): Promise<PrivateMobileConnectBootstrapResponseDto> =>
 			await request<PrivateMobileConnectBootstrapResponseDto>({
@@ -177,7 +197,36 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				path: "/v1/private/mobile-connect/bootstrap",
 			}),
 
-			getBootstrapStatus: async (
+		createSignupIntent: async (
+			input: PrivateSignupIntentRequestDto,
+		): Promise<PrivateSignupIntentResponseDto> =>
+			await request<PrivateSignupIntentResponseDto>({
+				authenticated: false,
+				body: input,
+				method: "POST",
+				path: "/v1/private/auth/signup-intents",
+			}),
+
+		createSignupIntentCheckout: async (
+			signupIntentId: string,
+		): Promise<PrivateSignupIntentCheckoutResponseDto> =>
+			await request<PrivateSignupIntentCheckoutResponseDto>({
+				authenticated: false,
+				method: "POST",
+				path: `/v1/private/auth/signup-intents/${encodeURIComponent(signupIntentId)}/checkout`,
+			}),
+
+		exchangeCompletionToken: async (
+			input: PrivateAuthCompletionExchangeRequestDto,
+		): Promise<PrivateSessionDto> =>
+			await request<PrivateSessionDto>({
+				authenticated: false,
+				body: input,
+				method: "POST",
+				path: "/v1/private/auth/completion/exchange",
+			}),
+
+		getBootstrapStatus: async (
 				input: { pairingId: string; pollToken: string },
 			): Promise<PrivateBootstrapStatusDto> =>
 			await request<PrivateBootstrapStatusDto>({
@@ -186,6 +235,13 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 
 				path: `/v1/private/connectors/bootstrap/${encodeURIComponent(input.pairingId)}/status`
 					+ `?pollToken=${encodeURIComponent(input.pollToken)}`,
+			}),
+
+		getSignupIntent: async (signupIntentId: string): Promise<PrivateSignupIntentResponseDto> =>
+			await request<PrivateSignupIntentResponseDto>({
+				authenticated: false,
+				method: "GET",
+				path: `/v1/private/auth/signup-intents/${encodeURIComponent(signupIntentId)}`,
 			}),
 
 		listConnectors: async (): Promise<PrivateConnectorsResponseDto> =>
@@ -230,6 +286,35 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				body: input,
 				method: "POST",
 				path: "/v1/private/auth/register",
+			}),
+
+		requestPasswordReset: async (
+			input: PrivateForgotPasswordRequestDto,
+		): Promise<PrivateForgotPasswordResponseDto> =>
+			await request<PrivateForgotPasswordResponseDto>({
+				authenticated: false,
+				body: input,
+				method: "POST",
+				path: "/v1/private/auth/forgot-password",
+			}),
+
+		resetPassword: async (
+			input: PrivateResetPasswordRequestDto,
+		): Promise<PrivateResetPasswordResponseDto> =>
+			await request<PrivateResetPasswordResponseDto>({
+				authenticated: false,
+				body: input,
+				method: "POST",
+				path: "/v1/private/auth/reset-password",
+			}),
+
+		validatePasswordResetToken: async (
+			token: string,
+		): Promise<PrivateResetPasswordValidateResponseDto> =>
+			await request<PrivateResetPasswordValidateResponseDto>({
+				authenticated: false,
+				method: "GET",
+				path: `/v1/private/auth/reset-password/${encodeURIComponent(token)}/validate`,
 			}),
 	};
 };
