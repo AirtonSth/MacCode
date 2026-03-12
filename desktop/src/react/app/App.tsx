@@ -2384,6 +2384,23 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, electrobunView, selectedProject?.path]);
 
+	const handleOpenExternalUrl = useCallback(async (url: string) => {
+		if (!electrobunView) {
+			globalThis.open(url, "_blank", "noopener,noreferrer");
+			return;
+		}
+
+		try {
+			await electrobunView.rpc.request.openExternalUrl(url);
+		} catch (error) {
+			addError(
+				error instanceof Error ? error.message : "Unable to open external link",
+				"rest",
+				"open_external_url_error",
+			);
+		}
+	}, [addError]);
+
 	const handleToggleTerminal = useCallback(() => {
 		if (!state.selectedChatId) {
 			return;
@@ -2704,7 +2721,7 @@ const App = (): JSX.Element => {
 											)}
 										</div>
 									</ScrollArea>
-									<PrivateAccountSidebarFooter />
+								<PrivateAccountSidebarFooter openExternalUrl={handleOpenExternalUrl} />
 								</aside>
 
 								<button

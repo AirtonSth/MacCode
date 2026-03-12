@@ -72,6 +72,7 @@ declare module "electrobun/bun" {
 		paths: {
 			home: string;
 		};
+		openURL?: (url: string) => void | Promise<void>;
 		openFileDialog: (options: {
 			allowedFileTypes?: string;
 			allowsMultipleSelection?: boolean;

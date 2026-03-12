@@ -7,6 +7,43 @@ import { startMdnsBroadcast } from "./network/mdns";
 
 let mainWindowRef: BrowserWindow | null = null;
 
+const isExternalHttpUrl = (value: string): boolean => {
+	try {
+		const url = new URL(value);
+		return url.protocol === "http:" || url.protocol === "https:";
+	} catch {
+		return false;
+	}
+};
+
+const openExternalUrl = async (url: string): Promise<void> => {
+	if (!isExternalHttpUrl(url)) {
+		throw new Error("Invalid external URL");
+	}
+
+	if (Utils.openURL) {
+		await Utils.openURL(url);
+		return;
+	}
+
+	const platform = process.platform;
+	const command = platform === "darwin"
+		? ["open", url]
+		: platform === "win32"
+			? ["cmd", "/c", "start", "", url]
+			: ["xdg-open", url];
+	const subprocess = Bun.spawn(command, {
+		stderr: "pipe",
+		stdout: "ignore",
+	});
+	const exitCode = await subprocess.exited;
+
+	if (exitCode !== 0) {
+		const stderr = await new Response(subprocess.stderr).text();
+		throw new Error(stderr.trim() || "Unable to open external URL");
+	}
+};
+
 const appRPC = (BrowserView as unknown as {
 	defineRPC: <T>(config: {
 		maxRequestTime?: number;
@@ -39,6 +76,9 @@ const appRPC = (BrowserView as unknown as {
 			},
 			showProjectInFinder: (projectPath: string) => {
 				return Utils.showItemInFolder?.(projectPath);
+			},
+			openExternalUrl: async (url: string) => {
+				await openExternalUrl(url);
 			},
 			closeWindow: () => {
 				mainWindowRef?.close();

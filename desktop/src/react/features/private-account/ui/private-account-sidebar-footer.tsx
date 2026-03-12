@@ -99,9 +99,13 @@ const defaultCreateQrDataUrl = async (value: string): Promise<string> =>
 export const PrivateAccountSidebarFooter = ({
 	client = defaultClient,
 	createQrDataUrl = defaultCreateQrDataUrl,
+	openExternalUrl = async (url: string): Promise<void> => {
+		globalThis.open(url, "_blank", "noopener,noreferrer");
+	},
 }: {
 	client?: PrivateAccountApiClient;
 	createQrDataUrl?: (value: string) => Promise<string>;
+	openExternalUrl?: (url: string) => Promise<void>;
 }) => {
 	const [state, setState] = useState<PrivateAccountStateDto>(defaultState);
 	const [email, setEmail] = useState("");
@@ -202,6 +206,10 @@ export const PrivateAccountSidebarFooter = ({
 		void refreshState().catch(() => undefined);
 	}, [refreshState]);
 
+	const openSubscribeUrl = useCallback(async (): Promise<void> => {
+		await openExternalUrl(subscribeUrl);
+	}, [openExternalUrl, subscribeUrl]);
+
 	const submit = async () => {
 		setIsSubmitting(true);
 		setErrorMessage(null);
@@ -291,6 +299,10 @@ export const PrivateAccountSidebarFooter = ({
 							className="mt-3 inline-flex rounded-full bg-amber-200 px-3 py-1.5 text-xs font-semibold text-[#2b1906] transition hover:bg-amber-100"
 							data-testid="private-account-subscribe-link"
 							href={subscribeUrl}
+							onClick={(event) => {
+								event.preventDefault();
+								void openSubscribeUrl();
+							}}
 							rel="noreferrer"
 							target="_blank"
 						>
@@ -435,6 +447,10 @@ export const PrivateAccountSidebarFooter = ({
 										<a
 											className="mt-4 inline-flex rounded-full bg-amber-200 px-3 py-2 text-sm font-semibold text-[#2b1906] transition hover:bg-amber-100"
 											href={subscribeUrl}
+											onClick={(event) => {
+												event.preventDefault();
+												void openSubscribeUrl();
+											}}
 											rel="noreferrer"
 											target="_blank"
 										>
