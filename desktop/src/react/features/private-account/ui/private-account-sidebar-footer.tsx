@@ -9,6 +9,16 @@ import {
 	PrivateAccountApiError,
 } from "../api/private-account-api";
 
+export const buildPrivateSubscribeUrl = (email: string | null | undefined): string => {
+	const normalized = email?.trim() ?? "";
+	return normalized.length > 0
+		? `https://remotecode.io/subscribe/${encodeURIComponent(normalized)}`
+		: "https://remotecode.io/subscribe";
+};
+
+export const isPrivateAccountSubscribed = (state: PrivateAccountStateDto | null): boolean =>
+	Boolean(state?.user?.subscribed);
+
 export const serializePrivateAccountQrPayload = (state: PrivateAccountStateDto): string | null => {
 	if (!state.qrPayload) {
 		return null;
@@ -20,6 +30,10 @@ export const serializePrivateAccountQrPayload = (state: PrivateAccountStateDto):
 export const getPrivateAccountStatusLabel = (state: PrivateAccountStateDto | null): string => {
 	if (!state?.authenticated) {
 		return "Sign in";
+	}
+
+	if (!isPrivateAccountSubscribed(state)) {
+		return "Subscription required";
 	}
 
 	switch (state.connectorRelayState) {
@@ -179,6 +193,9 @@ export const PrivateAccountSidebarFooter = ({
 	}, [createQrDataUrl, state]);
 
 	const statusLabel = useMemo(() => getPrivateAccountStatusLabel(state), [state]);
+	const isSubscribed = useMemo(() => isPrivateAccountSubscribed(state), [state]);
+	const subscribeUrl = useMemo(() => buildPrivateSubscribeUrl(state.user?.email), [state.user?.email]);
+	const daysRemaining = state.user?.daysRemaining ?? state.user?.daysRemaing ?? 0;
 
 	const openModal = useCallback(() => {
 		setIsModalOpen(true);
@@ -229,33 +246,58 @@ export const PrivateAccountSidebarFooter = ({
 	return (
 		<div className="mt-3 border-t border-white/10 pt-3" data-testid="private-account-sidebar-footer">
 			{state.authenticated ? (
-				<button
-					className="mb-3 block w-full rounded-2xl border border-white/10 bg-black/20 p-3 text-left text-slate-100 transition hover:border-white/20 hover:bg-black/30"
-					data-testid="private-account-connector-card"
-					onClick={openModal}
-					type="button"
-				>
-					<div className="flex items-start justify-between gap-3">
-						<div className="min-w-0">
-							<p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Private Connector</p>
-							<p className="truncate text-sm font-semibold text-slate-100">
-								{state.connector?.name ?? state.qrPayload?.connectorName ?? "Desktop Connector"}
-							</p>
-							<p className="text-xs text-slate-300">{statusLabel}</p>
-						</div>
-						{qrDataUrl ? (
-							<img
-								alt="Private connect QR"
-								className="h-20 w-20 rounded-lg border border-white/10 bg-white p-1"
-								src={qrDataUrl}
-							/>
-						) : (
-							<div className="flex h-20 w-20 items-center justify-center rounded-lg border border-dashed border-white/15 text-[11px] text-slate-400">
-								QR
+				isSubscribed ? (
+					<button
+						className="mb-3 block w-full rounded-2xl border border-white/10 bg-black/20 p-3 text-left text-slate-100 transition hover:border-white/20 hover:bg-black/30"
+						data-testid="private-account-connector-card"
+						onClick={openModal}
+						type="button"
+					>
+						<div className="flex items-start justify-between gap-3">
+							<div className="min-w-0">
+								<p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Private Connector</p>
+								<p className="truncate text-sm font-semibold text-slate-100">
+									{state.connector?.name ?? state.qrPayload?.connectorName ?? "Desktop Connector"}
+								</p>
+								<p className="text-xs text-slate-300">{statusLabel}</p>
+								<p className="mt-2 text-[11px] text-emerald-200/80">
+									Subscription active · {daysRemaining} days remaining
+								</p>
 							</div>
-						)}
+							{qrDataUrl ? (
+								<img
+									alt="Private connect QR"
+									className="h-20 w-20 rounded-lg border border-white/10 bg-white p-1"
+									src={qrDataUrl}
+								/>
+							) : (
+								<div className="flex h-20 w-20 items-center justify-center rounded-lg border border-dashed border-white/15 text-[11px] text-slate-400">
+									QR
+								</div>
+							)}
+						</div>
+					</button>
+				) : (
+					<div
+						className="mb-3 rounded-2xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(250,204,21,0.15),rgba(249,115,22,0.08))] p-3 text-slate-100"
+						data-testid="private-account-subscribe-card"
+					>
+						<p className="text-[11px] uppercase tracking-[0.14em] text-amber-200/80">Private Access</p>
+						<p className="mt-1 text-sm font-semibold text-amber-50">Unlock mobile pairing and connector sync</p>
+						<p className="mt-1 text-xs text-amber-100/80">
+							Your account is signed in but does not have an active subscription.
+						</p>
+						<a
+							className="mt-3 inline-flex rounded-full bg-amber-200 px-3 py-1.5 text-xs font-semibold text-[#2b1906] transition hover:bg-amber-100"
+							data-testid="private-account-subscribe-link"
+							href={subscribeUrl}
+							rel="noreferrer"
+							target="_blank"
+						>
+							Subscribe now
+						</a>
 					</div>
-				</button>
+				)
 			) : null}
 
 			<button
@@ -340,34 +382,66 @@ export const PrivateAccountSidebarFooter = ({
 						{state.authenticated ? (
 							<div className="space-y-3">
 								<div className="rounded-2xl border border-white/10 bg-white/[0.03] p-3">
-									<p className="text-xs text-slate-400">Signed in as</p>
+								<p className="text-xs text-slate-400">Signed in as</p>
 									<p className="text-sm font-semibold text-slate-100">{state.user?.email}</p>
 									<p className="mt-1 text-xs text-slate-300">{statusLabel}</p>
-								</div>
-								<div className="rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))] p-4">
-									<div className="mb-3 flex items-center justify-between gap-3">
-										<div>
-											<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Connector QR</p>
-											<p className="text-sm text-slate-200">Scan on mobile with a larger code.</p>
-										</div>
+									<div className="mt-3 flex flex-wrap items-center gap-2">
+										<span
+											className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+												isSubscribed
+													? "bg-emerald-400/15 text-emerald-200"
+													: "bg-amber-300/15 text-amber-200"
+											}`}
+										>
+											{isSubscribed ? "Subscribed" : "Subscription inactive"}
+										</span>
+										<span className="text-[11px] text-slate-400">
+											{daysRemaining} days remaining
+										</span>
 									</div>
-									{qrDataUrl ? (
-										<div className="mx-auto flex w-fit flex-col items-center gap-3">
-											<img
-												alt="Private connect QR enlarged"
-												className="h-64 w-64 rounded-2xl border border-white/10 bg-white p-3 shadow-[0_12px_30px_rgba(0,0,0,0.28)]"
-												src={qrDataUrl}
-											/>
-											<p className="text-center text-xs text-slate-400">
-												Open the mobile app and scan this code to pair the connector.
-											</p>
-										</div>
-									) : (
-										<div className="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-white/15 text-sm text-slate-400">
-											QR code unavailable
-										</div>
-									)}
 								</div>
+								{isSubscribed ? (
+									<div className="rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))] p-4">
+										<div className="mb-3 flex items-center justify-between gap-3">
+											<div>
+												<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Connector QR</p>
+												<p className="text-sm text-slate-200">Scan on mobile with a larger code.</p>
+											</div>
+										</div>
+										{qrDataUrl ? (
+											<div className="mx-auto flex w-fit flex-col items-center gap-3">
+												<img
+													alt="Private connect QR enlarged"
+													className="h-64 w-64 rounded-2xl border border-white/10 bg-white p-3 shadow-[0_12px_30px_rgba(0,0,0,0.28)]"
+													src={qrDataUrl}
+												/>
+												<p className="text-center text-xs text-slate-400">
+													Open the mobile app and scan this code to pair the connector.
+												</p>
+											</div>
+										) : (
+											<div className="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-white/15 text-sm text-slate-400">
+												QR code unavailable
+											</div>
+										)}
+									</div>
+								) : (
+									<div className="rounded-2xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(250,204,21,0.15),rgba(249,115,22,0.08))] p-4">
+										<p className="text-[11px] uppercase tracking-[0.16em] text-amber-200/80">Subscription</p>
+										<h4 className="mt-1 text-base font-semibold text-amber-50">Activate pairing on mobile</h4>
+										<p className="mt-2 text-sm leading-6 text-amber-100/80">
+											Subscribe to generate QR codes, connect this desktop on mobile, and keep the relay available.
+										</p>
+										<a
+											className="mt-4 inline-flex rounded-full bg-amber-200 px-3 py-2 text-sm font-semibold text-[#2b1906] transition hover:bg-amber-100"
+											href={subscribeUrl}
+											rel="noreferrer"
+											target="_blank"
+										>
+											Go to subscription
+										</a>
+									</div>
+								)}
 								<button
 									className="w-full rounded-2xl bg-rose-400 px-3 py-2.5 text-sm font-semibold text-[#24080f] transition hover:bg-rose-300 disabled:opacity-60"
 									disabled={isSubmitting}

@@ -44,6 +44,7 @@ import { WsController } from "./modules/ws/ws.controller";
 import { WsService } from "./modules/ws/ws.service";
 import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
 import { DatabaseClientFactory } from "./shared/db/db.client";
+import { serverLogger } from "./shared/core/server-logger";
 
 const MIN_GZIP_PAYLOAD_BYTES = 1024;
 
@@ -300,6 +301,7 @@ export const ServerBootstrap = {
 		privateBackendUrl?: string;
 	}): Promise<BackendHandle> {
 		const listenPort = options?.port ?? serverConfig.port;
+		const bootStartedAt = Date.now();
 		const handle = await ServerBootstrap.buildServerApp({
 			databasePath: options?.databasePath,
 			disableLiveActivityPush: options?.disableLiveActivityPush,
@@ -317,8 +319,8 @@ export const ServerBootstrap = {
 					port: listenPort,
 				},
 				(server) => {
-				serverReference = server;
-				resolve();
+					serverReference = server;
+					resolve();
 				},
 			);
 		});
@@ -327,6 +329,12 @@ export const ServerBootstrap = {
 		await handle.privateAccountService.attachRuntime({
 			app: handle.app,
 			baseUrl: `http://127.0.0.1:${actualPort}`,
+		});
+		serverLogger.success("desktop-server", "HTTP server listening", {
+			bindHost: serverConfig.host,
+			durationMs: serverLogger.traceDurationMs(bootStartedAt),
+			localBaseUrl: `http://127.0.0.1:${actualPort}`,
+			privateBackendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 		});
 
 		return {

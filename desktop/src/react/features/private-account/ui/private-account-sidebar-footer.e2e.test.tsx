@@ -40,8 +40,11 @@ test("private account sidebar helpers hydrate state, authenticate, and build the
 				version: 1 as const,
 			},
 			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
 				email: "dev@example.com",
 				id: "usr_1",
+				subscribed: true,
 			},
 		}),
 		logout: async () => ({
@@ -66,8 +69,11 @@ test("private account sidebar helpers hydrate state, authenticate, and build the
 				version: 1 as const,
 			},
 			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
 				email: "new@example.com",
 				id: "usr_2",
+				subscribed: true,
 			},
 		}),
 	};

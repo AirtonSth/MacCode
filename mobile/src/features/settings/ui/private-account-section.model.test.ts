@@ -3,6 +3,8 @@ import { expect, test } from "bun:test";
 
 import {
 	authenticatePrivateAccount,
+	buildPrivateSubscribeUrl,
+	getPrivateSubscriptionSnapshot,
 	loadPrivateConnectorsSafely,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
@@ -67,8 +69,11 @@ test("authenticatePrivateAccount delegates login to the shared contracts client"
 				accessToken: "access-token",
 				refreshToken: "refresh-token",
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			}),
 		}) as never,
@@ -94,4 +99,25 @@ test("loadPrivateConnectorsSafely reports load failures instead of rejecting", a
 	});
 
 	expect(seenMessage).toBe("connector_load_failed");
+});
+
+test("buildPrivateSubscribeUrl encodes the account email into the subscribe path", () => {
+	expect(buildPrivateSubscribeUrl("dev@example.com")).toBe("https://remotecode.io/subscribe/dev%40example.com");
+});
+
+test("getPrivateSubscriptionSnapshot reads the subscription flags from the session", () => {
+	expect(getPrivateSubscriptionSnapshot({
+		accessToken: "access-token",
+		refreshToken: "refresh-token",
+		user: {
+			daysRemaing: 30,
+			daysRemaining: 30,
+			email: "dev@example.com",
+			id: "usr_1",
+			subscribed: false,
+		},
+	})).toEqual({
+		daysRemaining: 30,
+		isSubscribed: false,
+	});
 });

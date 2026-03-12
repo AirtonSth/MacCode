@@ -4,6 +4,7 @@ import {
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
 import { CameraView } from "expo-camera";
+import * as Linking from "expo-linking";
 import { useGlobalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -23,6 +24,8 @@ import {
 } from "../../../shared/api/private-mobile-connect";
 import {
 	authenticatePrivateAccount,
+	buildPrivateSubscribeUrl,
+	getPrivateSubscriptionSnapshot,
 	loadPrivateConnectorsSafely,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
@@ -66,6 +69,14 @@ export const PrivateAccountSection = ({
 	const [mode, setMode] = useState<"login" | "register">("login");
 	const [password, setPassword] = useState("");
 	const pendingConnectorId = pendingQrPayload?.connectorId ?? null;
+	const subscriptionSnapshot = useMemo(
+		() => getPrivateSubscriptionSnapshot(sessionRecord?.session),
+		[sessionRecord?.session],
+	);
+	const subscribeUrl = useMemo(
+		() => buildPrivateSubscribeUrl(sessionRecord?.session.user.email ?? email),
+		[email, sessionRecord?.session.user.email],
+	);
 	const privateConnectError = useMemo(() => {
 		const value = routeParams.privateConnectError;
 		const rawValue = Array.isArray(value) ? value[0] : value;
@@ -79,6 +90,11 @@ export const PrivateAccountSection = ({
 
 	const loadConnectors = useCallback(async (record = sessionRecord) => {
 		if (!record) {
+			setConnectors([]);
+			return [];
+		}
+
+		if (!record.session.user.subscribed) {
 			setConnectors([]);
 			return [];
 		}
@@ -184,6 +200,10 @@ export const PrivateAccountSection = ({
 				backendUrl,
 				session,
 			});
+			if (!session.user.subscribed) {
+				setConnectors([]);
+				return;
+			}
 			const nextConnectors = await loadConnectors({
 				backendUrl,
 				session,
@@ -307,68 +327,113 @@ export const PrivateAccountSection = ({
 			{sessionRecord ? (
 				<View style={styles.formBody}>
 					<View style={styles.accountSummary}>
+						<Text style={styles.summaryLabel}>Private access</Text>
+						<Text selectable style={styles.summaryValue}>{sessionRecord.session.user.email}</Text>
+						<Text style={styles.supportText}>
+							{subscriptionSnapshot.isSubscribed
+								? `${String(subscriptionSnapshot.daysRemaining)} days remaining`
+								: "Subscription inactive"}
+						</Text>
+						<View style={styles.subscriptionBadgeRow}>
+							<View
+								style={[
+									styles.subscriptionBadge,
+									subscriptionSnapshot.isSubscribed ? styles.subscriptionBadgeActive : styles.subscriptionBadgeInactive,
+								]}
+							>
+								<Text style={styles.subscriptionBadgeLabel}>
+									{subscriptionSnapshot.isSubscribed ? "Subscribed" : "Subscription required"}
+								</Text>
+							</View>
+						</View>
+					</View>
+					<View style={styles.accountSummary}>
 						<Text style={styles.summaryLabel}>Backend</Text>
 						<Text selectable style={styles.summaryValue}>{sessionRecord.backendUrl}</Text>
 					</View>
-					<View style={styles.inlineActions}>
-						<Pressable
-							onPress={() => {
-								setIsScannerOpen((current) => !current);
-							}}
-							style={({ pressed }) => [
-								styles.secondaryButton,
-								styles.inlineButton,
-								pressed ? styles.secondaryButtonPressed : null,
-							]}
-							testID="private-account-scan-qr"
-						>
-							<Text style={styles.secondaryLabel}>{isScannerOpen ? "Close Scanner" : "Scan QR"}</Text>
-						</Pressable>
-					</View>
+					{subscriptionSnapshot.isSubscribed ? (
+						<>
+							<View style={styles.inlineActions}>
+								<Pressable
+									onPress={() => {
+										setIsScannerOpen((current) => !current);
+									}}
+									style={({ pressed }) => [
+										styles.secondaryButton,
+										styles.inlineButton,
+										pressed ? styles.secondaryButtonPressed : null,
+									]}
+									testID="private-account-scan-qr"
+								>
+									<Text style={styles.secondaryLabel}>{isScannerOpen ? "Close Scanner" : "Scan QR"}</Text>
+								</Pressable>
+							</View>
 
-					{isScannerOpen ? (
-						<View style={styles.scannerCard} testID="private-account-qr-scanner">
-							<CameraView
-								barcodeScannerSettings={{
-									barcodeTypes: ["qr"],
-								}}
-								onBarcodeScanned={(event) => {
-									handleScannedQr(event.data);
-								}}
-								style={styles.camera}
-							/>
-							<Text style={styles.supportText}>{scannerHelpText}</Text>
-						</View>
-					) : null}
+							{isScannerOpen ? (
+								<View style={styles.scannerCard} testID="private-account-qr-scanner">
+									<CameraView
+										barcodeScannerSettings={{
+											barcodeTypes: ["qr"],
+										}}
+										onBarcodeScanned={(event) => {
+											handleScannedQr(event.data);
+										}}
+										style={styles.camera}
+									/>
+									<Text style={styles.supportText}>{scannerHelpText}</Text>
+								</View>
+							) : null}
 
-					<View style={styles.connectorList}>
-						<Text style={styles.summaryLabel}>Your Servers</Text>
-						{isLoadingConnectors ? <ActivityIndicator color={palette.accent} size="small" /> : null}
-						{connectors.length === 0 && !isLoadingConnectors ? (
-							<Text style={styles.supportText}>No private connectors found for this account yet.</Text>
-						) : null}
-						{connectors.map((connector, index) => (
+							<View style={styles.connectorList}>
+								<Text style={styles.summaryLabel}>Your Servers</Text>
+								{isLoadingConnectors ? <ActivityIndicator color={palette.accent} size="small" /> : null}
+								{connectors.length === 0 && !isLoadingConnectors ? (
+									<Text style={styles.supportText}>No private connectors found for this account yet.</Text>
+								) : null}
+								{connectors.map((connector, index) => (
+									<Pressable
+										key={connector.id}
+										onPress={() => {
+											void connectConnector(connector.id);
+										}}
+										style={({ pressed }) => [
+											styles.connectorRow,
+											pressed ? styles.connectorRowPressed : null,
+										]}
+										testID={`private-account-connector-${String(index)}`}
+									>
+										<View style={styles.rowTextGroup}>
+											<Text style={styles.rowTitle}>{connector.name}</Text>
+											<Text selectable style={styles.rowMeta}>
+												{connector.hostname} · {connector.status}
+											</Text>
+										</View>
+										<Text style={styles.secondaryLabel}>Connect</Text>
+									</Pressable>
+								))}
+							</View>
+						</>
+					) : (
+						<View style={styles.subscribeCard} testID="private-account-subscribe-cta">
+							<Text style={styles.subscribeEyebrow}>Subscription required</Text>
+							<Text style={styles.subscribeTitle}>Unlock desktop pairing on mobile</Text>
+							<Text style={styles.supportText}>
+								Subscribe to scan desktop QR codes, connect private connectors, and keep sync active on this device.
+							</Text>
 							<Pressable
-								key={connector.id}
 								onPress={() => {
-									void connectConnector(connector.id);
+									void Linking.openURL(subscribeUrl);
 								}}
 								style={({ pressed }) => [
-									styles.connectorRow,
-									pressed ? styles.connectorRowPressed : null,
+									styles.primaryButton,
+									pressed ? styles.primaryButtonPressed : null,
 								]}
-								testID={`private-account-connector-${String(index)}`}
+								testID="private-account-subscribe-link"
 							>
-								<View style={styles.rowTextGroup}>
-									<Text style={styles.rowTitle}>{connector.name}</Text>
-									<Text selectable style={styles.rowMeta}>
-										{connector.hostname} · {connector.status}
-									</Text>
-								</View>
-								<Text style={styles.secondaryLabel}>Connect</Text>
+								<Text style={styles.primaryLabel}>Open subscription</Text>
 							</Pressable>
-						))}
-					</View>
+						</View>
+					)}
 				</View>
 			) : (
 				<View style={styles.formBody}>
@@ -584,6 +649,26 @@ const styles = StyleSheet.create({
 		fontSize: 13,
 		fontWeight: "700",
 	},
+	subscribeCard: {
+		backgroundColor: "rgba(250,204,21,0.08)",
+		borderColor: "rgba(251,191,36,0.24)",
+		borderRadius: 16,
+		borderWidth: 1,
+		gap: 10,
+		padding: 14,
+	},
+	subscribeEyebrow: {
+		color: "#FCD34D",
+		fontSize: 12,
+		fontWeight: "700",
+		letterSpacing: 0.8,
+		textTransform: "uppercase",
+	},
+	subscribeTitle: {
+		color: palette.text,
+		fontSize: 17,
+		fontWeight: "700",
+	},
 	rowMeta: {
 		color: palette.muted,
 		fontSize: 12,
@@ -652,6 +737,25 @@ const styles = StyleSheet.create({
 		fontSize: 13,
 		lineHeight: 19,
 	},
+	subscriptionBadge: {
+		borderRadius: 999,
+		paddingHorizontal: 10,
+		paddingVertical: 6,
+	},
+	subscriptionBadgeActive: {
+		backgroundColor: "rgba(16,185,129,0.16)",
+	},
+	subscriptionBadgeInactive: {
+		backgroundColor: "rgba(245,158,11,0.16)",
+	},
+	subscriptionBadgeLabel: {
+		color: palette.text,
+		fontSize: 12,
+		fontWeight: "700",
+	},
+	subscriptionBadgeRow: {
+		flexDirection: "row",
+	},
 	summaryLabel: {
 		color: palette.muted,
 		fontSize: 12,
@@ -660,6 +764,7 @@ const styles = StyleSheet.create({
 	summaryValue: {
 		color: palette.text,
 		fontSize: 14,
+		fontWeight: "600",
 	},
 	supportText: {
 		color: palette.muted,

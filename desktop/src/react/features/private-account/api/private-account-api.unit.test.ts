@@ -77,8 +77,11 @@ describe("createPrivateAccountApiClient", () => {
 					version: 1,
 				},
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			}), {
 				headers: {

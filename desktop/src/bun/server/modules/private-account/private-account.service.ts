@@ -10,6 +10,12 @@ import {
 } from "@remotecode/contracts";
 
 import type { ServerApp } from "../../app";
+import {
+	maskEmailForLogs,
+	maskTokenForLogs,
+	serverLogger,
+	toLogErrorDetails,
+} from "../../shared/core/server-logger";
 import { RelayConnectorClient } from "./relay-connector.client";
 import type {
 	PersistedPrivateConnector,
@@ -38,12 +44,45 @@ interface MobileConnectQrLink {
 const DEFAULT_MOBILE_CONNECT_REFRESH_INTERVAL_MS = 5_000;
 
 const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
+	private_backend_unreachable: "Unable to connect. Is the computer able to access the url?",
 	missing_private_refresh_token: "Your session has expired. Please sign in again.",
 	private_connector_token_missing: "Desktop pairing could not be completed. Please try again.",
 	private_local_app_unavailable: "The local desktop service is unavailable. Please restart the app.",
 	private_relay_connect_failed: "The desktop relay could not connect. Please try again.",
 	private_relay_socket_error: "The desktop relay connection failed. Please try again.",
 	private_state_refresh_failed: "We couldn't refresh your private account state. Please try again.",
+};
+
+const createStatusError = (message: string, status: number): Error & { status: number } =>
+	Object.assign(new Error(message), { status });
+
+const isPrivateBackendUnreachableError = (error: unknown): boolean => {
+	if (!(error instanceof Error) || error instanceof PrivateApiError) {
+		return false;
+	}
+
+	const message = error.message.toLowerCase();
+	return message.includes("fetch failed")
+		|| message.includes("failed to fetch")
+		|| message.includes("unable to connect")
+		|| message.includes("econnrefused")
+		|| message.includes("enotfound");
+};
+
+const toPrivateBackendServiceError = (error: unknown): Error => {
+	if (error instanceof PrivateApiError) {
+		return error;
+	}
+
+	if (error instanceof Error && PRIVATE_ACCOUNT_ERROR_MESSAGES[error.message]) {
+		return error;
+	}
+
+	if (isPrivateBackendUnreachableError(error)) {
+		return createStatusError("private_backend_unreachable", 503);
+	}
+
+	return error instanceof Error ? error : createStatusError("private_account_request_failed", 500);
 };
 
 const toPrivateAccountErrorMessage = (error: unknown, fallbackCode: string): string => {
@@ -79,9 +118,19 @@ export class PrivateAccountService {
 			localServerToken: options.localServerToken,
 			onError: (message) => {
 				this.errorMessage = toPrivateAccountErrorMessage(new Error(message), message);
+				serverLogger.error("private-account", "Relay reported an error", {
+					relayState: this.connectorRelayState,
+					message,
+				});
 			},
 			onStateChange: (state) => {
+				const previousState = this.connectorRelayState;
 				this.connectorRelayState = state;
+				serverLogger.info("private-account", "Relay state changed", {
+					connectorId: this.connector?.connectorId ?? null,
+					nextState: state,
+					previousState,
+				});
 				if (state === "disconnected" && this.session && this.connector) {
 					this.scheduleReconnect();
 				}
@@ -92,6 +141,10 @@ export class PrivateAccountService {
 	public async attachRuntime(input: { app: ServerApp; baseUrl: string }): Promise<void> {
 		this.localApp = input.app;
 		this.localServerBaseUrl = input.baseUrl.replace(/\/+$/u, "");
+		serverLogger.info("private-account", "Runtime attached", {
+			localServerBaseUrl: this.localServerBaseUrl,
+			privateBackendUrl: this.options.backendUrl,
+		});
 		await this.resume();
 	}
 
@@ -100,7 +153,11 @@ export class PrivateAccountService {
 			try {
 				const connectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
 				this.connectorDto = connectors.connectors.find((item) => item.id === this.connector?.connectorId) ?? null;
-				await this.ensureMobileConnectLink();
+				if (this.session.user.subscribed) {
+					await this.ensureMobileConnectLink();
+				} else {
+					this.mobileConnectLink = null;
+				}
 			} catch (error) {
 				this.errorMessage = toPrivateAccountErrorMessage(error, "private_state_refresh_failed");
 			}
@@ -121,14 +178,35 @@ export class PrivateAccountService {
 	}
 
 	public async login(input: PrivateAccountAuthInput): Promise<PrivateAccountStateDto> {
-		const client = createPrivateClient({
-			baseUrl: this.options.backendUrl,
+		const startedAt = Date.now();
+		serverLogger.info("private-account", "Login started", {
+			email: maskEmailForLogs(input.email),
+			privateBackendUrl: this.options.backendUrl,
 		});
-		this.session = await client.login(input);
-		this.repository.saveSession(this.session);
-		this.errorMessage = null;
-		await this.ensureConnector(true);
-		return await this.getState();
+		try {
+			const client = createPrivateClient({
+				baseUrl: this.options.backendUrl,
+			});
+			this.session = await client.login(input);
+			serverLogger.success("private-account", "Login upstream accepted", {
+				durationMs: serverLogger.traceDurationMs(startedAt),
+				email: maskEmailForLogs(this.session.user.email),
+				refreshToken: maskTokenForLogs(this.session.refreshToken),
+				userId: this.session.user.id,
+			});
+			this.repository.saveSession(this.session);
+			this.errorMessage = null;
+			await this.ensureConnector(true);
+			return await this.getState();
+		} catch (error) {
+			serverLogger.error("private-account", "Login failed", {
+				durationMs: serverLogger.traceDurationMs(startedAt),
+				email: maskEmailForLogs(input.email),
+				privateBackendUrl: this.options.backendUrl,
+				...toLogErrorDetails(error),
+			});
+			throw toPrivateBackendServiceError(error);
+		}
 	}
 
 	public async logout(): Promise<PrivateAccountStateDto> {
@@ -149,14 +227,35 @@ export class PrivateAccountService {
 	}
 
 	public async register(input: PrivateAccountAuthInput): Promise<PrivateAccountStateDto> {
-		const client = createPrivateClient({
-			baseUrl: this.options.backendUrl,
+		const startedAt = Date.now();
+		serverLogger.info("private-account", "Register started", {
+			email: maskEmailForLogs(input.email),
+			privateBackendUrl: this.options.backendUrl,
 		});
-		this.session = await client.register(input);
-		this.repository.saveSession(this.session);
-		this.errorMessage = null;
-		await this.ensureConnector(true);
-		return await this.getState();
+		try {
+			const client = createPrivateClient({
+				baseUrl: this.options.backendUrl,
+			});
+			this.session = await client.register(input);
+			serverLogger.success("private-account", "Register upstream accepted", {
+				durationMs: serverLogger.traceDurationMs(startedAt),
+				email: maskEmailForLogs(this.session.user.email),
+				refreshToken: maskTokenForLogs(this.session.refreshToken),
+				userId: this.session.user.id,
+			});
+			this.repository.saveSession(this.session);
+			this.errorMessage = null;
+			await this.ensureConnector(true);
+			return await this.getState();
+		} catch (error) {
+			serverLogger.error("private-account", "Register failed", {
+				durationMs: serverLogger.traceDurationMs(startedAt),
+				email: maskEmailForLogs(input.email),
+				privateBackendUrl: this.options.backendUrl,
+				...toLogErrorDetails(error),
+			});
+			throw toPrivateBackendServiceError(error);
+		}
 	}
 
 	public async resume(): Promise<void> {
@@ -195,6 +294,11 @@ export class PrivateAccountService {
 		}
 
 		this.clearReconnect();
+		serverLogger.info("private-account", "Connecting relay", {
+			connectorId: this.connector.connectorId,
+			localServerBaseUrl: this.localServerBaseUrl,
+			privateBackendUrl: this.connector.backendUrl,
+		});
 		this.relayClient.start({
 			connectorId: this.connector.connectorId,
 			connectorToken: this.connector.connectorToken,
@@ -210,9 +314,18 @@ export class PrivateAccountService {
 
 		if (this.connector && this.localServerBaseUrl) {
 			try {
+				serverLogger.debug("private-account", "Reusing existing connector", {
+					allowRebootstrap,
+					connectorId: this.connector.connectorId,
+				});
 				await this.connectRelay();
 				return;
 			} catch (error) {
+				serverLogger.warn("private-account", "Existing connector failed, fallback to bootstrap", {
+					allowRebootstrap,
+					connectorId: this.connector.connectorId,
+					...toLogErrorDetails(error),
+				});
 				this.errorMessage = toPrivateAccountErrorMessage(error, "private_relay_connect_failed");
 				if (!allowRebootstrap) {
 					return;
@@ -220,6 +333,12 @@ export class PrivateAccountService {
 			}
 		}
 
+		serverLogger.info("private-account", "Bootstrapping connector", {
+			allowRebootstrap,
+			connectorName: this.options.connectorName ?? "Desktop Connector",
+			hostname: readHostname(),
+			privateBackendUrl: this.options.backendUrl,
+		});
 		const bootstrap = await this.withPrivateAuth(async (client) =>
 			await client.bootstrapConnector({
 				hostname: readHostname(),
@@ -250,6 +369,11 @@ export class PrivateAccountService {
 			connectorName: bootstrap.connector.name,
 			connectorToken: status.connector.accessToken,
 		};
+		serverLogger.success("private-account", "Connector bootstrapped", {
+			connectorId: this.connector.connectorId,
+			connectorName: this.connector.connectorName,
+			connectorToken: maskTokenForLogs(this.connector.connectorToken),
+		});
 		this.repository.saveConnector(this.connector);
 		await this.connectRelay();
 	}
@@ -326,6 +450,10 @@ export class PrivateAccountService {
 			throw new PrivateApiError(401, null, "missing_private_refresh_token");
 		}
 
+		serverLogger.warn("private-account", "Refreshing expired session", {
+			privateBackendUrl: this.options.backendUrl,
+			refreshToken: maskTokenForLogs(this.session.refreshToken),
+		});
 		const client = createPrivateClient({
 			baseUrl: this.options.backendUrl,
 		});
@@ -340,6 +468,10 @@ export class PrivateAccountService {
 			return;
 		}
 
+		serverLogger.warn("private-account", "Scheduling relay reconnect", {
+			connectorId: this.connector.connectorId,
+			delayMs: this.options.reconnectDelayMs ?? 1_000,
+		});
 		this.reconnectTimeout = setTimeout(() => {
 			this.reconnectTimeout = null;
 			void this.ensureConnector(false);
@@ -348,7 +480,7 @@ export class PrivateAccountService {
 	}
 
 	private snapshot(): PrivateAccountStateSnapshot {
-		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector && this.mobileConnectLink
+		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector && this.mobileConnectLink && this.session?.user.subscribed
 			? {
 				backendUrl: this.connector.backendUrl,
 				connectorId: this.connector.connectorId,
@@ -385,11 +517,18 @@ export class PrivateAccountService {
 			return await callback(createAuthedClient());
 		} catch (error) {
 			if (!(error instanceof PrivateApiError) || error.status !== 401) {
-				throw error;
+				throw toPrivateBackendServiceError(error);
 			}
 
+			serverLogger.warn("private-account", "Private API returned 401, retrying after refresh", {
+				privateBackendUrl: this.options.backendUrl,
+			});
 			await this.refreshSession();
-			return await callback(createAuthedClient());
+			try {
+				return await callback(createAuthedClient());
+			} catch (refreshError) {
+				throw toPrivateBackendServiceError(refreshError);
+			}
 		}
 	}
 }

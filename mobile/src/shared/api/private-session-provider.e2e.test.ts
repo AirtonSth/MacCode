@@ -8,8 +8,11 @@ test("refreshPrivateSessionRecord rotates the private session through the shared
 		accessToken: "next-access-token",
 		refreshToken: "next-refresh-token",
 		user: {
+			daysRemaing: 30,
+			daysRemaining: 30,
 			email: "dev@example.com",
 			id: "usr_1",
+			subscribed: true,
 		},
 	}));
 
@@ -24,8 +27,11 @@ test("refreshPrivateSessionRecord rotates the private session through the shared
 					accessToken: "access-token",
 					refreshToken: "refresh-token",
 					user: {
+						daysRemaing: 30,
+						daysRemaining: 30,
 						email: "dev@example.com",
 						id: "usr_1",
+						subscribed: true,
 					},
 				},
 			},

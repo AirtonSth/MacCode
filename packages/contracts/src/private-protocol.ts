@@ -1,7 +1,10 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 export interface PrivateAuthUserDto {
+	daysRemaing: number;
+	daysRemaining: number;
 	email: string;
 	id: string;
+	subscribed: boolean;
 }
 
 export interface PrivateSessionDto {

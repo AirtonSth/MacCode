@@ -34,8 +34,11 @@ describe("PrivateSessionStore", () => {
 				accessToken: "access-token",
 				refreshToken: "refresh-token",
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			},
 		});

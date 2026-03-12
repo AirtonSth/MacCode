@@ -10,10 +10,7 @@ import type { PersistedPrivateSessionRecord } from "./private-session-store";
 
 export const DEV_PRIVATE_BACKEND_URL = "http://127.0.0.1:8787";
 export const RELEASE_PRIVATE_BACKEND_URL = "https://private.remotecode.io:8787";
-export const DEFAULT_PRIVATE_BACKEND_URL =
-	process.env.NODE_ENV?.trim().toLowerCase() === "production"
-		? RELEASE_PRIVATE_BACKEND_URL
-		: DEV_PRIVATE_BACKEND_URL;
+export const DEFAULT_PRIVATE_BACKEND_URL = RELEASE_PRIVATE_BACKEND_URL;
 
 const PRIVATE_CONNECT_HOST = "qr.remotecode.dev";
 const PRIVATE_CONNECT_PATH_PREFIX = "/connect";
@@ -42,11 +39,6 @@ const normalizeBackendUrl = (value: string | null | undefined): string => {
 	return normalized.length > 0 ? normalized : DEFAULT_PRIVATE_BACKEND_URL;
 };
 
-const isLocalPrivateBackendUrl = (url: URL): boolean => (
-	(url.protocol === "http:" || url.protocol === "https:")
-	&& (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1")
-);
-
 const sanitizeBackendUrl = (value: string | null | undefined): string => {
 	const normalized = normalizeBackendUrl(value);
 	const parsed = (() => {
@@ -63,10 +55,6 @@ const sanitizeBackendUrl = (value: string | null | undefined): string => {
 
 	if (parsed.protocol === "https:" && parsed.hostname === "private.remotecode.io") {
 		return RELEASE_PRIVATE_BACKEND_URL;
-	}
-
-	if (isLocalPrivateBackendUrl(parsed)) {
-		return normalizeBackendUrl(parsed.toString());
 	}
 
 	return DEFAULT_PRIVATE_BACKEND_URL;
@@ -289,6 +277,10 @@ export const completePrivateMobileConnect = async (input: {
 		session: response.session,
 	};
 	await input.setSessionRecord(sessionRecord);
+	if (!response.session.user.subscribed) {
+		await input.clearPendingQrPayload?.();
+		throw new Error("private_subscription_required");
+	}
 	await input.activateConnector({
 		backendUrl: sessionRecord.backendUrl,
 		connectorId: response.connector.id,
@@ -313,6 +305,10 @@ export const toPrivateConnectErrorMessage = (error: unknown): string =>
 
 		if (error.message === "invalid_private_mobile_qr_payload") {
 			return "Invalid private connection QR code.";
+		}
+
+		if (error.message === "private_subscription_required") {
+			return "A private subscription is required before this device can connect.";
 		}
 
 		return error.message;

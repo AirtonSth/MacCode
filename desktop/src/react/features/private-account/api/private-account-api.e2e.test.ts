@@ -24,16 +24,22 @@ test("private-account api client completes desktop login and logout flow through
 			accessToken: "access-token",
 			refreshToken: "refresh-token",
 			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
 				email: "dev@example.com",
 				id: "usr_1",
+				subscribed: true,
 			},
 		}))
 		.post("/v1/private/auth/refresh", () => ({
 			accessToken: "access-token",
 			refreshToken: "refresh-token",
 			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
 				email: "dev@example.com",
 				id: "usr_1",
+				subscribed: true,
 			},
 		}))
 		.post("/v1/private/auth/logout", ({ set }) => {
@@ -78,6 +84,14 @@ test("private-account api client completes desktop login and logout flow through
 			claimedAt: new Date().toISOString(),
 			connectorId: "con_1",
 			status: "claimed",
+		}))
+		.post("/v1/private/mobile-connect/bootstrap", () => ({
+			connector: {
+				id: "con_1",
+				name: "Desktop Connector",
+			},
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			linkUrl: "https://qr.remotecode.dev/connect/mcs_1/secret_1",
 		}))
 		.get("/v1/private/connectors/bootstrap/:pairingId/status", () => ({
 			connector: {
@@ -131,4 +145,3 @@ test("private-account api client completes desktop login and logout flow through
 		rmSync(root, { force: true, recursive: true });
 	}
 });
-

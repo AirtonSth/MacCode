@@ -1,6 +1,5 @@
 const DEFAULT_PORT = 8835;
 const DEFAULT_TOKEN = "remotecode.io-token";
-const DEFAULT_DEV_PRIVATE_BACKEND_URL = "http://127.0.0.1:8787";
 const DEFAULT_RELEASE_PRIVATE_BACKEND_URL = "https://private.remotecode.io:8787";
 
 export interface ServerConfigValues {
@@ -59,9 +58,7 @@ export class ServerConfig {
 	}
 
 	private static defaultPrivateBackendUrl(): string {
-		return process.env.NODE_ENV?.trim().toLowerCase() === "production"
-			? DEFAULT_RELEASE_PRIVATE_BACKEND_URL
-			: DEFAULT_DEV_PRIVATE_BACKEND_URL;
+		return DEFAULT_RELEASE_PRIVATE_BACKEND_URL;
 	}
 
 	private static parseOptional(raw: string | undefined): string | undefined {

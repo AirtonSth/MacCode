@@ -42,8 +42,11 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 				accessToken: loginAccessToken,
 				refreshToken: loginRefreshToken,
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			};
 		})
@@ -57,8 +60,11 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 				accessToken: registerAccessToken,
 				refreshToken: registerRefreshToken,
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "founder@example.com",
 					id: "usr_2",
+					subscribed: true,
 				},
 			};
 		})
@@ -71,8 +77,11 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 				accessToken: loginAccessToken,
 				refreshToken: loginRefreshToken,
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			};
 		})
@@ -87,8 +96,11 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			expect(readBearer(request.headers.get("authorization"))).toBe(loginAccessToken);
 			return {
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			};
 		})
@@ -282,6 +294,48 @@ test("desktop private-account routes authenticate, expose QR state, and logout c
 			server.db.close();
 		}
 		await privateApp.stop(true);
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("desktop private-account login returns 503 when the private backend is unreachable", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-private-account-controller-unreachable-"));
+	const databasePath = join(root, "remotecode.sqlite");
+	let server:
+		| Awaited<ReturnType<typeof createBackendServer>>
+		| undefined;
+
+	try {
+		server = await createBackendServer({
+			databasePath,
+			disableLiveActivityPush: true,
+			port: 0,
+			privateBackendUrl: "http://127.0.0.1:1",
+		});
+		const baseUrl = `http://127.0.0.1:${requirePort(server.server)}`;
+
+		const loginResponse = await fetch(`${baseUrl}/v1/private-account/login`, {
+			body: JSON.stringify({
+				email: "dev@example.com",
+				password: "supersecret",
+			}),
+			headers: {
+				authorization: "Bearer remotecode.io-token",
+				"content-type": "application/json",
+			},
+			method: "POST",
+		});
+
+		expect(loginResponse.status).toBe(503);
+		expect(await loginResponse.json()).toEqual({
+			code: "private_backend_unreachable",
+			error: "Unable to connect. Is the computer able to access the url?",
+		});
+	} finally {
+		if (server) {
+			await server.app.stop(true);
+			server.db.close();
+		}
 		rmSync(root, { force: true, recursive: true });
 	}
 });

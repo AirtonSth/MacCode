@@ -23,8 +23,11 @@ test("fetchPrivateTargetHealth returns ok when the private connector is online",
 			}),
 			me: async () => ({
 				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
 					email: "dev@example.com",
 					id: "usr_1",
+					subscribed: true,
 				},
 			}),
 		}) as never,

@@ -2,6 +2,7 @@ import { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "ele
 
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
+import { maskTokenForLogs, serverLogger } from "./server/shared/core/server-logger";
 import { startMdnsBroadcast } from "./network/mdns";
 
 let mainWindowRef: BrowserWindow | null = null;
@@ -82,7 +83,10 @@ const waitForBackendReady = async () => {
 			});
 
 			if (response.ok) {
-				console.log("Backend is ready:", HEALTH_URL);
+				serverLogger.success("desktop-bootstrap", "Backend is ready", {
+					durationMs: serverLogger.traceDurationMs(start),
+					healthUrl: HEALTH_URL,
+				});
 				return;
 			}
 		} catch {
@@ -117,11 +121,15 @@ const logDiscoveryHints = (hints: DiscoveryConnectHints | undefined): void => {
 	}
 
 	if (hints.recommendedBaseUrls.length > 0) {
-		console.log("Reachable server URLs:", hints.recommendedBaseUrls.join(", "));
+		serverLogger.info("desktop-bootstrap", "Reachable server URLs", {
+			urls: hints.recommendedBaseUrls.join(", "),
+		});
 	}
 
 	if (hints.tailscaleAddresses.length > 0) {
-		console.log("Detected Tailscale addresses:", hints.tailscaleAddresses.join(", "));
+		serverLogger.info("desktop-bootstrap", "Detected Tailscale addresses", {
+			addresses: hints.tailscaleAddresses.join(", "),
+		});
 	}
 };
 
@@ -152,16 +160,27 @@ async function getMainViewUrl() {
 	if (channel === "dev") {
 		try {
 			await fetch(DEV_SERVER_URL, { method: "HEAD" });
-			console.log(`HMR active: using Vite at ${DEV_SERVER_URL}`);
+			serverLogger.success("desktop-bootstrap", "HMR active", {
+				viewUrl: DEV_SERVER_URL,
+			});
 
 			return DEV_SERVER_URL;
 		} catch {
-			console.log("Vite dev server not found. Run 'bun run dev:hmr' for HMR.");
+			serverLogger.warn("desktop-bootstrap", "Vite dev server not found", {
+				hint: "Run 'bun run dev:hmr' for HMR.",
+			});
 		}
 	}
 
 	return "views://react/index.html";
 }
+
+serverLogger.banner("Desktop Server Boot", {
+	backendUrl: serverConfig.privateBackendUrl,
+	host: serverConfig.host,
+	localToken: maskTokenForLogs(serverConfig.token),
+	port: serverConfig.port,
+});
 
 await createBackendServer({ port: serverConfig.port });
 await waitForBackendReady();
@@ -185,6 +204,7 @@ try {
 	}
 } catch {
 	// mDNS remains optional; keep app startup resilient
+	serverLogger.warn("desktop-bootstrap", "mDNS discovery broadcast unavailable");
 }
 
 process.on("exit", () => {
@@ -216,4 +236,7 @@ webview.on("dom-ready", () => {
 });
 
 void mainWindow;
-console.log("Electrobun app started with React + Vite");
+serverLogger.success("desktop-bootstrap", "Electrobun app started", {
+	windowTitle: "RemoteCode + Electrobun",
+	workspaceViewUrl: url,
+});

@@ -17,8 +17,11 @@ test("getPrivateAccountStatusLabel reflects relay state for authenticated users"
 		errorMessage: null,
 		qrPayload: null,
 		user: {
+			daysRemaing: 30,
+			daysRemaining: 30,
 			email: "dev@example.com",
 			id: "usr_1",
+			subscribed: true,
 		},
 	})).toBe("Relay online");
 });
@@ -38,8 +41,11 @@ test("serializePrivateAccountQrPayload prefers universal link payloads for QR ge
 			version: 1,
 		},
 		user: {
+			daysRemaing: 30,
+			daysRemaining: 30,
 			email: "dev@example.com",
 			id: "usr_1",
+			subscribed: true,
 		},
 	})).toBe("https://qr.remotecode.dev/connect/mcs_1/secret");
 });

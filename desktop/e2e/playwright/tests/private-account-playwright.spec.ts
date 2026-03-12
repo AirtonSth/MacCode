@@ -57,8 +57,23 @@ const connectedState = (email: string): PrivateAccountState => ({
 		version: 1,
 	},
 	user: {
+		daysRemaing: 30,
+		daysRemaining: 30,
 		email,
 		id: "usr_1",
+		subscribed: true,
+	},
+});
+
+const unsubscribedState = (email: string): PrivateAccountState => ({
+	...connectedState(email),
+	qrPayload: null,
+	user: {
+		daysRemaing: 30,
+		daysRemaining: 30,
+		email,
+		id: "usr_1",
+		subscribed: false,
 	},
 });
 
@@ -294,7 +309,6 @@ test("private account login renders connector state and logout resets the footer
 
 	await expect(page.getByTestId("private-account-sidebar-footer")).toBeVisible();
 	await expect(page.getByText("Log in or register")).toBeVisible();
-	await expect(page.getByText("Sign in", { exact: true })).toBeVisible();
 
 	await page.getByRole("button", { name: /Log in or register/i }).click();
 	const dialog = page.getByRole("dialog", { name: "Private account modal" });
@@ -317,13 +331,42 @@ test("private account login renders connector state and logout resets the footer
 
 	await expect(page.getByTestId("private-account-connector-card")).toHaveCount(0);
 	await expect(page.getByText("Log in or register")).toBeVisible();
-	await expect(page.getByText("Sign in", { exact: true })).toBeVisible();
 
 	await expect
 		.poll(() =>
 			apiMock.requests.filter((entry) => entry.method === "POST" && entry.path === "/v1/private-account/logout").length,
 		)
 		.toBe(1);
+});
+
+test("private account login without subscription shows subscribe CTA instead of QR", async ({ page }) => {
+	const apiMock = createApiMock({
+		initialState: unauthenticatedState,
+		loginState: unsubscribedState("maker@remotecode.io"),
+	});
+
+	await installMockWebSocket(page);
+	await page.route("**/v1/**", apiMock.route);
+	await page.goto("/");
+
+	await page.getByRole("button", { name: /Log in or register/i }).click();
+	const dialog = page.getByRole("dialog", { name: "Private account modal" });
+	await dialog.getByLabel("Email").fill("maker@remotecode.io");
+	await dialog.getByLabel("Password").fill("supersecret");
+	await dialog.getByRole("button", { name: "Log in", exact: true }).last().click();
+
+	await expect(page.getByTestId("private-account-subscribe-card")).toBeVisible();
+	await expect(page.getByTestId("private-account-subscribe-link")).toHaveAttribute(
+		"href",
+		"https://remotecode.io/subscribe/maker%40remotecode.io",
+	);
+	await expect(page.getByAltText("Private connect QR")).toHaveCount(0);
+
+	await page.getByRole("button", { name: /maker@remotecode.io/i }).click();
+	const connectedDialog = page.getByRole("dialog", { name: "Private account modal" });
+	await expect(connectedDialog.getByText("Subscription inactive")).toBeVisible();
+	await expect(connectedDialog.getByText("Go to subscription")).toBeVisible();
+	await expect(connectedDialog.getByAltText("Private connect QR enlarged")).toHaveCount(0);
 });
 
 test("private account login shows a friendly alert when credentials are invalid", async ({ page }) => {

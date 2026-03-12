@@ -109,12 +109,12 @@ test("ServerConfig.load uses a private backend URL override when configured", ()
 	expect(config.privateBackendUrl).toBe("https://private.remotecode.io:8787");
 });
 
-test("ServerConfig.load falls back to the development private backend URL outside production", () => {
+test("ServerConfig.load falls back to the release private backend URL outside production", () => {
 	clearLiveActivityEnv();
 
 	const config = ServerConfig.load();
 
-	expect(config.privateBackendUrl).toBe("http://127.0.0.1:8787");
+	expect(config.privateBackendUrl).toBe("https://private.remotecode.io:8787");
 });
 
 test("ServerConfig.load falls back to the release private backend URL in production", () => {

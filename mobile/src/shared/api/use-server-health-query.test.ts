@@ -14,8 +14,11 @@ test("fetchPrivateTargetHealth rejects when the selected connector is missing", 
 				}),
 				me: async () => ({
 					user: {
+						daysRemaing: 30,
+						daysRemaining: 30,
 						email: "dev@example.com",
 						id: "usr_1",
+						subscribed: true,
 					},
 				}),
 			}) as never,

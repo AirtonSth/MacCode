@@ -21,8 +21,11 @@ test("PrivateAccountRepository persists and clears session and connector state",
 		accessToken: "access",
 		refreshToken: "refresh",
 		user: {
+			daysRemaing: 30,
+			daysRemaining: 30,
 			email: "dev@example.com",
 			id: "usr_1",
+			subscribed: true,
 		},
 	});
 	repository.saveConnector({

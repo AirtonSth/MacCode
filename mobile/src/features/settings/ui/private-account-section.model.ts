@@ -4,6 +4,18 @@ import {
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
 
+export const buildPrivateSubscribeUrl = (email: string | null | undefined): string => {
+	const normalized = email?.trim() ?? "";
+	return normalized.length > 0
+		? `https://remotecode.io/subscribe/${encodeURIComponent(normalized)}`
+		: "https://remotecode.io/subscribe";
+};
+
+export const getPrivateSubscriptionSnapshot = (session: PrivateSessionDto | null | undefined) => ({
+	daysRemaining: session?.user.daysRemaining ?? session?.user.daysRemaing ?? 0,
+	isSubscribed: Boolean(session?.user.subscribed),
+});
+
 export const sortPrivateConnectors = (connectors: PrivateConnectorDto[]): PrivateConnectorDto[] =>
 	Array.from(connectors).sort((left, right) => {
 		if (left.status === right.status) {
