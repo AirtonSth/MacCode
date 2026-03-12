@@ -9,7 +9,7 @@ import {
 describe("private-protocol QR payload helpers", () => {
 	test("accepts a valid desktop mobile connect QR payload", () => {
 		const payload = {
-			backendUrl: "https://private.remotecode.io",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_123",
 			connectorName: "Studio MacBook",
 			type: "remotecode_private_mobile_connect" as const,

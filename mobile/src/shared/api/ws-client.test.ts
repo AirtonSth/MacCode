@@ -209,4 +209,13 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 			"x-remotecode-connector-id": "con_1",
 		});
 	});
+
+	test("preserves the explicit private backend port for relay mode", () => {
+		assert.equal(buildRealtimeWebSocketUrl({
+			accessToken: "private-access-token",
+			backendUrl: "https://private.remotecode.io:8787",
+			connectorId: "con_1",
+			kind: "private",
+		}), "wss://private.remotecode.io:8787/v1/ws");
+	});
 });

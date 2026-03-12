@@ -4,7 +4,9 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import {
 	claimPrivateMobileConnect,
 	buildPrivateConnectUrlFromParams,
+	DEV_PRIVATE_BACKEND_URL,
 	DEFAULT_PRIVATE_BACKEND_URL,
+	RELEASE_PRIVATE_BACKEND_URL,
 	parsePrivateConnectInput,
 	parsePrivateMobileConnectLink,
 } from "./private-mobile-connect";
@@ -26,19 +28,31 @@ describe("private mobile connect helpers", () => {
 				"https://qr.remotecode.dev/connect/mcs_1/secret",
 			),
 		).toEqual({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: DEFAULT_PRIVATE_BACKEND_URL,
 			code: "secret",
 			sessionId: "mcs_1",
 		});
 	});
 
-	test("accepts the legacy query-string connect link during rollout", () => {
+	test("accepts the legacy query-string connect link during rollout and keeps a trusted release backend", () => {
 		expect(
 			parsePrivateMobileConnectLink(
-				"https://qr.remotecode.dev/connect?backendUrl=https%3A%2F%2Fevil.example.com&sessionId=mcs_1&token=secret",
+				"https://qr.remotecode.dev/connect?backendUrl=https%3A%2F%2Fprivate.remotecode.io%3A8787&sessionId=mcs_1&token=secret",
 			),
 		).toEqual({
-			backendUrl: DEFAULT_PRIVATE_BACKEND_URL,
+			backendUrl: RELEASE_PRIVATE_BACKEND_URL,
+			code: "secret",
+			sessionId: "mcs_1",
+		});
+	});
+
+	test("accepts a trusted local backend override in dev links", () => {
+		expect(
+			parsePrivateMobileConnectLink(
+				"https://qr.remotecode.dev/connect?backendUrl=http%3A%2F%2F127.0.0.1%3A8787&sessionId=mcs_1&token=secret",
+			),
+		).toEqual({
+			backendUrl: DEV_PRIVATE_BACKEND_URL,
 			code: "secret",
 			sessionId: "mcs_1",
 		});
@@ -73,14 +87,36 @@ describe("private mobile connect helpers", () => {
 
 	test("round-trips encoded deep-link params through the native scheme", () => {
 		const deepLink = buildPrivateConnectUrlFromParams({
+			backendUrl: DEV_PRIVATE_BACKEND_URL,
 			code: "secret code",
 			sessionId: "mcs/special",
 		});
-		expect(deepLink).toBe("remotecode://connect/mcs%2Fspecial/secret%20code");
+		expect(deepLink).toBe("remotecode://connect/mcs%2Fspecial/secret%20code?backendUrl=http%3A%2F%2F127.0.0.1%3A8787");
 		expect(parsePrivateMobileConnectLink(deepLink!)).toEqual({
-			backendUrl: DEFAULT_PRIVATE_BACKEND_URL,
+			backendUrl: DEV_PRIVATE_BACKEND_URL,
 			code: "secret code",
 			sessionId: "mcs/special",
+		});
+	});
+
+	test("uses the QR payload backend when the embedded link omits it", () => {
+		expect(
+			parsePrivateConnectInput(JSON.stringify({
+				backendUrl: DEV_PRIVATE_BACKEND_URL,
+				connectorId: "con_1",
+				connectorName: "Desktop Connector",
+				linkUrl: "https://qr.remotecode.dev/connect/mcs_1/secret",
+				type: "remotecode_private_mobile_connect",
+				version: 1,
+			})),
+		).toEqual({
+			claim: {
+				backendUrl: DEV_PRIVATE_BACKEND_URL,
+				code: "secret",
+				sessionId: "mcs_1",
+			},
+			kind: "claim",
+			rawValue: "https://qr.remotecode.dev/connect/mcs_1/secret",
 		});
 	});
 
@@ -122,7 +158,7 @@ describe("private mobile connect helpers", () => {
 			});
 
 			return new Response(JSON.stringify({
-				backendUrl: "https://private.remotecode.dev",
+				backendUrl: RELEASE_PRIVATE_BACKEND_URL,
 				connector: {
 					id: "con_1",
 					name: "Studio MacBook",
@@ -143,7 +179,7 @@ describe("private mobile connect helpers", () => {
 
 		const claim = await claimPrivateMobileConnect({
 			link: {
-				backendUrl: "https://private.remotecode.dev",
+				backendUrl: RELEASE_PRIVATE_BACKEND_URL,
 				code: "secret",
 				sessionId: "mcs_1",
 			},
@@ -156,7 +192,7 @@ describe("private mobile connect helpers", () => {
 					code: "secret",
 					sessionId: "mcs_1",
 				}),
-				url: "https://private.remotecode.dev/v1/private/mobile-connect/claim",
+				url: "https://private.remotecode.io:8787/v1/private/mobile-connect/claim",
 			},
 		]);
 	});

@@ -42,10 +42,11 @@ export default function ConnectRoute() {
 		}
 
 		return buildPrivateConnectUrlFromParams({
+			backendUrl: normalizeParam(params.backendUrl),
 			code: normalizeParam(params.token),
 			sessionId: normalizeParam(params.sessionId),
 		});
-	}, [params.sessionId, params.token, params.url]);
+	}, [params.backendUrl, params.sessionId, params.token, params.url]);
 
 	useEffect(() => {
 		if (!isLoaded || !rawUrl || attemptedRef.current === rawUrl) {

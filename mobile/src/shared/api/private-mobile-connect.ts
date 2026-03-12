@@ -8,7 +8,12 @@ import {
 
 import type { PersistedPrivateSessionRecord } from "./private-session-store";
 
-export const DEFAULT_PRIVATE_BACKEND_URL = "https://private.remotecode.dev";
+export const DEV_PRIVATE_BACKEND_URL = "http://127.0.0.1:8787";
+export const RELEASE_PRIVATE_BACKEND_URL = "https://private.remotecode.io:8787";
+export const DEFAULT_PRIVATE_BACKEND_URL =
+	process.env.NODE_ENV?.trim().toLowerCase() === "production"
+		? RELEASE_PRIVATE_BACKEND_URL
+		: DEV_PRIVATE_BACKEND_URL;
 
 const PRIVATE_CONNECT_HOST = "qr.remotecode.dev";
 const PRIVATE_CONNECT_PATH_PREFIX = "/connect";
@@ -37,9 +42,34 @@ const normalizeBackendUrl = (value: string | null | undefined): string => {
 	return normalized.length > 0 ? normalized : DEFAULT_PRIVATE_BACKEND_URL;
 };
 
-const normalizeLegacyBackendUrl = (value: string | null | undefined): string => {
+const isLocalPrivateBackendUrl = (url: URL): boolean => (
+	(url.protocol === "http:" || url.protocol === "https:")
+	&& (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1")
+);
+
+const sanitizeBackendUrl = (value: string | null | undefined): string => {
 	const normalized = normalizeBackendUrl(value);
-	return normalized === DEFAULT_PRIVATE_BACKEND_URL ? normalized : DEFAULT_PRIVATE_BACKEND_URL;
+	const parsed = (() => {
+		try {
+			return new URL(normalized);
+		} catch {
+			return null;
+		}
+	})();
+
+	if (!parsed) {
+		return DEFAULT_PRIVATE_BACKEND_URL;
+	}
+
+	if (parsed.protocol === "https:" && parsed.hostname === "private.remotecode.io") {
+		return RELEASE_PRIVATE_BACKEND_URL;
+	}
+
+	if (isLocalPrivateBackendUrl(parsed)) {
+		return normalizeBackendUrl(parsed.toString());
+	}
+
+	return DEFAULT_PRIVATE_BACKEND_URL;
 };
 
 const toLogicalPath = (url: URL): string => {
@@ -110,7 +140,7 @@ export const parsePrivateMobileConnectLink = (raw: string): PrivateMobileConnect
 	}
 
 	return {
-		backendUrl: DEFAULT_PRIVATE_BACKEND_URL,
+		backendUrl: sanitizeBackendUrl(parsed.searchParams.get("backendUrl")),
 		code,
 		sessionId,
 	};
@@ -127,8 +157,14 @@ const parsePrivateConnectJson = (raw: string): PrivateConnectIntent | null => {
 			linkUrl?: unknown;
 		};
 		if (typeof candidate.linkUrl === "string" && candidate.linkUrl.trim().length > 0) {
+			const claim = parsePrivateMobileConnectLink(candidate.linkUrl);
 			return {
-				claim: parsePrivateMobileConnectLink(candidate.linkUrl),
+				claim: {
+					...claim,
+					backendUrl: claim.backendUrl === DEFAULT_PRIVATE_BACKEND_URL
+						? sanitizeBackendUrl(candidate.backendUrl)
+						: claim.backendUrl,
+				},
 				kind: "claim",
 				rawValue: candidate.linkUrl.trim(),
 			};
@@ -141,7 +177,7 @@ const parsePrivateConnectJson = (raw: string): PrivateConnectIntent | null => {
 		return {
 			kind: "legacy_qr",
 			payload: {
-				backendUrl: normalizeLegacyBackendUrl(candidate.backendUrl),
+				backendUrl: sanitizeBackendUrl(candidate.backendUrl),
 				connectorId: candidate.connectorId.trim(),
 				connectorName: candidate.connectorName.trim(),
 				linkUrl: typeof candidate.linkUrl === "string" ? candidate.linkUrl.trim() : null,
@@ -185,7 +221,7 @@ export const parsePrivateConnectInput = (raw: string): PrivateConnectIntent => {
 		return {
 			kind: "legacy_qr",
 			payload: {
-				backendUrl: normalizeLegacyBackendUrl(parsed.searchParams.get("backendUrl")),
+				backendUrl: sanitizeBackendUrl(parsed.searchParams.get("backendUrl")),
 				connectorId,
 				connectorName,
 				type: "remotecode_private_mobile_connect",
@@ -197,6 +233,7 @@ export const parsePrivateConnectInput = (raw: string): PrivateConnectIntent => {
 };
 
 export const buildPrivateConnectUrlFromParams = (input: {
+	backendUrl?: string | null;
 	code?: string | null;
 	sessionId?: string | null;
 }): string | null => {
@@ -206,7 +243,14 @@ export const buildPrivateConnectUrlFromParams = (input: {
 		return null;
 	}
 
-	return `remotecode://connect/${encodeURIComponent(sessionId)}/${encodeURIComponent(code)}`;
+	const params = new URLSearchParams();
+	const backendUrl = sanitizeBackendUrl(input.backendUrl);
+	if (input.backendUrl && backendUrl.length > 0) {
+		params.set("backendUrl", backendUrl);
+	}
+	const suffix = params.size > 0 ? `?${params.toString()}` : "";
+
+	return `remotecode://connect/${encodeURIComponent(sessionId)}/${encodeURIComponent(code)}${suffix}`;
 };
 
 export const claimPrivateMobileConnect = async (input: {

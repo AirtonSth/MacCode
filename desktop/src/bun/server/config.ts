@@ -1,5 +1,7 @@
 const DEFAULT_PORT = 8835;
 const DEFAULT_TOKEN = "remotecode.io-token";
+const DEFAULT_DEV_PRIVATE_BACKEND_URL = "http://127.0.0.1:8787";
+const DEFAULT_RELEASE_PRIVATE_BACKEND_URL = "https://private.remotecode.io:8787";
 
 export interface ServerConfigValues {
 	liveActivityApnsAuthKeyId?: string;
@@ -53,7 +55,13 @@ export class ServerConfig {
 
 	private static parsePrivateBackendUrl(raw: string | undefined): string {
 		const normalized = raw?.trim().replace(/\/+$/u, "");
-		return normalized && normalized.length > 0 ? normalized : "https://private.remotecode.dev";
+		return normalized && normalized.length > 0 ? normalized : ServerConfig.defaultPrivateBackendUrl();
+	}
+
+	private static defaultPrivateBackendUrl(): string {
+		return process.env.NODE_ENV?.trim().toLowerCase() === "production"
+			? DEFAULT_RELEASE_PRIVATE_BACKEND_URL
+			: DEFAULT_DEV_PRIVATE_BACKEND_URL;
 	}
 
 	private static parseOptional(raw: string | undefined): string | undefined {

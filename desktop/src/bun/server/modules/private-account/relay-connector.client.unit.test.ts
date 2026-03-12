@@ -115,3 +115,32 @@ test("RelayConnectorClient forwards proxy requests and websocket events", async 
 	expect(remoteSocket.sent.some((item) => item.includes("\"type\":\"proxy_response\""))).toBe(true);
 	expect(remoteSocket.sent.some((item) => item.includes("\"type\":\"ws_server_event\""))).toBe(true);
 });
+
+test("RelayConnectorClient preserves the private backend port for secure relay sockets", () => {
+	const createdUrls: string[] = [];
+	const client = new RelayConnectorClient({
+		createSocket: (url) => {
+			createdUrls.push(url);
+			return new FakeSocket() as unknown as WebSocket;
+		},
+		localRequestHandler: async () => ({
+			body: "",
+			headers: {},
+			status: 200,
+		}),
+		localServerToken: "local-token",
+	});
+
+	client.start({
+		connectorId: "con_1",
+		connectorToken: "connector-token",
+		localServerBaseUrl: "http://127.0.0.1:8835",
+		privateBackendUrl: "https://private.remotecode.io:8787",
+	});
+
+	expect(createdUrls[0]).toBe(
+		"wss://private.remotecode.io:8787/v1/private/connectors/socket?connectorId=con_1&token=connector-token",
+	);
+
+	client.stop();
+});

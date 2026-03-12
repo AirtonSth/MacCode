@@ -430,7 +430,7 @@ export const PrivateAccountSection = ({
 					<TextInput
 						autoCapitalize="none"
 						onChangeText={setBackendUrl}
-						placeholder="https://private.remotecode.dev"
+						placeholder={DEFAULT_PRIVATE_BACKEND_URL}
 						placeholderTextColor={palette.muted}
 						style={styles.input}
 						testID="private-account-backend-url"

@@ -26,7 +26,7 @@ test("PrivateAccountRepository persists and clears session and connector state",
 		},
 	});
 	repository.saveConnector({
-		backendUrl: "https://private.remotecode.io",
+		backendUrl: "https://private.remotecode.io:8787",
 		connectorId: "con_1",
 		connectorName: "Studio MacBook",
 		connectorToken: "connector-token",
@@ -41,4 +41,3 @@ test("PrivateAccountRepository persists and clears session and connector state",
 	expect(repository.readSession()).toBeNull();
 	expect(repository.readConnector()).toBeNull();
 });
-
