@@ -55,6 +55,20 @@ const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
 const createStatusError = (message: string, status: number): Error & { status: number } =>
 	Object.assign(new Error(message), { status });
 
+const isPrivateAccountSubscribed = (user: PrivateSessionDto["user"] | null | undefined): boolean =>
+	Boolean(user?.subscribed);
+
+const normalizePrivateSession = (input: PrivateSessionDto): PrivateSessionDto => ({
+	...input,
+	user: {
+		daysRemaing: input.user.daysRemaing,
+		daysRemaining: input.user.daysRemaining,
+		email: input.user.email.trim().toLowerCase(),
+		id: input.user.id.trim(),
+		subscribed: input.user.subscribed,
+	},
+});
+
 const isPrivateBackendUnreachableError = (error: unknown): boolean => {
 	if (!(error instanceof Error) || error instanceof PrivateApiError) {
 		return false;
@@ -109,7 +123,8 @@ export class PrivateAccountService {
 		private readonly repository: PrivateAccountRepository,
 		private readonly options: PrivateAccountServiceOptions,
 	) {
-		this.session = this.repository.readSession();
+		const storedSession = this.repository.readSession();
+		this.session = storedSession ? normalizePrivateSession(storedSession) : null;
 		this.connector = this.repository.readConnector();
 		this.relayClient = new RelayConnectorClient({
 			heartbeatIntervalMs: options.heartbeatIntervalMs,
@@ -150,9 +165,10 @@ export class PrivateAccountService {
 	public async getState(): Promise<PrivateAccountStateDto> {
 		if (this.session && this.connector) {
 			try {
+				await this.refreshSessionFromBackend();
 				const connectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
 				this.connectorDto = connectors.connectors.find((item) => item.id === this.connector?.connectorId) ?? null;
-				if (this.session.user.subscribed) {
+				if (isPrivateAccountSubscribed(this.session?.user)) {
 					await this.ensureMobileConnectLink();
 				} else {
 					this.mobileConnectLink = null;
@@ -186,7 +202,7 @@ export class PrivateAccountService {
 			const client = createPrivateClient({
 				baseUrl: this.options.backendUrl,
 			});
-			this.session = await client.login(input);
+			this.session = normalizePrivateSession(await client.login(input));
 			serverLogger.success("private-account", "Login upstream accepted", {
 				durationMs: serverLogger.traceDurationMs(startedAt),
 				email: maskEmailForLogs(this.session.user.email),
@@ -264,9 +280,9 @@ export class PrivateAccountService {
 		const client = createPrivateClient({
 			baseUrl: (input.backendUrl?.trim().replace(/\/+$/u, "") || this.options.backendUrl),
 		});
-		this.session = await client.exchangeCompletionToken({
+		this.session = normalizePrivateSession(await client.exchangeCompletionToken({
 			completionToken,
-		});
+		}));
 		this.repository.saveSession(this.session);
 		this.errorMessage = null;
 		await this.ensureConnector(true);
@@ -506,8 +522,22 @@ export class PrivateAccountService {
 		const client = createPrivateClient({
 			baseUrl: this.options.backendUrl,
 		});
-		this.session = await client.refresh({
+		this.session = normalizePrivateSession(await client.refresh({
 			refreshToken: this.session.refreshToken,
+		}));
+		this.repository.saveSession(this.session);
+	}
+
+	private async refreshSessionFromBackend(): Promise<void> {
+		if (!this.session) {
+			return;
+		}
+
+		const response = await this.withPrivateAuth(async (client) => await client.me());
+		this.session = normalizePrivateSession({
+			accessToken: this.session.accessToken,
+			refreshToken: this.session.refreshToken,
+			user: response.user,
 		});
 		this.repository.saveSession(this.session);
 	}
@@ -529,7 +559,7 @@ export class PrivateAccountService {
 	}
 
 	private snapshot(): PrivateAccountStateSnapshot {
-		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector && this.mobileConnectLink && this.session?.user.subscribed
+		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector && this.mobileConnectLink && isPrivateAccountSubscribed(this.session?.user)
 			? {
 				backendUrl: this.connector.backendUrl,
 				connectorId: this.connector.connectorId,

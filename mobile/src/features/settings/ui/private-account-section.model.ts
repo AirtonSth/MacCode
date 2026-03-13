@@ -1,8 +1,5 @@
-import {
-	createPrivateClient,
-	type PrivateConnectorDto,
-	type PrivateSessionDto,
-} from "@remotecode/contracts";
+import { createPrivateClient, PrivateApiError ,type  PrivateConnectorDto,type  PrivateSessionDto } from "@remotecode/contracts";
+import type { PersistedPrivateSessionRecord } from "../../../shared/api/private-session-store";
 
 import { ApiConfigStore } from "../../../shared/api/api-config-store";
 
@@ -75,11 +72,62 @@ export const loginPrivateAccount = async (input: {
 	});
 };
 
+type PrivateClientWithMeOnly = Pick<ReturnType<typeof createPrivateClient>, "me">;
+
 export const resolvePendingPrivateConnector = (input: {
 	connectors: PrivateConnectorDto[];
 	pendingConnectorId: string | null;
 }): PrivateConnectorDto | null =>
 	input.connectors.find((connector) => connector.id === input.pendingConnectorId) ?? null;
+
+export const refreshPrivateAccountSessionRecord = async (input: {
+	createClient?: (config: Parameters<typeof createPrivateClient>[0]) => PrivateClientWithMeOnly;
+	refreshSession?: () => Promise<PrivateSessionDto | null>;
+	sessionRecord: PersistedPrivateSessionRecord | null;
+}): Promise<PersistedPrivateSessionRecord | null> => {
+	if (!input.sessionRecord) {
+		return null;
+	}
+
+	const sessionRecord = input.sessionRecord;
+	const createBackendClient = (accessToken: string) => (input.createClient ?? createPrivateClient)({
+		baseUrl: sessionRecord.backendUrl,
+		getAccessToken: () => accessToken,
+	});
+
+	try {
+		const response = await createBackendClient(sessionRecord.session.accessToken).me();
+		return {
+			backendUrl: sessionRecord.backendUrl,
+			session: {
+				...sessionRecord.session,
+				user: response.user,
+			},
+		};
+	} catch (error) {
+		if (!(error instanceof PrivateApiError) || error.status !== 401) {
+			throw error;
+		}
+
+		if (!input.refreshSession) {
+			return null;
+		}
+
+		const refreshedSession = await input.refreshSession();
+		if (!refreshedSession) {
+			return null;
+		}
+
+		const refreshedResponse = await createBackendClient(refreshedSession.accessToken).me();
+		return {
+			backendUrl: input.sessionRecord.backendUrl,
+			session: {
+				...refreshedSession,
+				user: refreshedResponse.user,
+			},
+		};
+	}
+};
 
 export const persistSavedPrivateConnection = async (input: {
 	backendUrl: string;

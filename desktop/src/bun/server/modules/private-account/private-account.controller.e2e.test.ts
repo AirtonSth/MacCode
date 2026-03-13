@@ -56,6 +56,18 @@ test("desktop private-account browser routes hand off to the web flow and localh
 				},
 			};
 		})
+		.get("/v1/private/me", ({ request }) => {
+			expect(readBearer(request.headers.get("authorization"))).toBe("access-token");
+			return {
+				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
+					email: "dev@example.com",
+					id: "usr_1",
+					subscribed: false,
+				},
+			};
+		})
 		.get("/v1/private/connectors", ({ request }) => {
 			expect(readBearer(request.headers.get("authorization"))).toBe("access-token");
 			return {

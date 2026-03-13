@@ -28,6 +28,7 @@ import {
 	buildPrivateManageSubscriptionUrl,
 	buildPrivateRegisterUrl,
 	getPrivateSubscriptionSnapshot,
+	refreshPrivateAccountSessionRecord,
 	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
 	persistSavedPrivateConnection,
@@ -115,7 +116,23 @@ export const PrivateAccountSection = ({
 			return [];
 		}
 
-		if (!record.session.user.subscribed) {
+		const refreshedRecord = await refreshPrivateAccountSessionRecord({
+			refreshSession,
+			sessionRecord: record,
+		});
+		if (!refreshedRecord) {
+			await clearSessionRecord();
+			return [];
+		}
+
+		if (
+			refreshedRecord.session.user.email !== record.session.user.email
+			|| refreshedRecord.session.user.subscribed !== record.session.user.subscribed
+		) {
+			await setSessionRecord(refreshedRecord);
+		}
+
+		if (!refreshedRecord.session.user.subscribed) {
 			setConnectors([]);
 			return [];
 		}
@@ -123,12 +140,12 @@ export const PrivateAccountSection = ({
 		setIsLoadingConnectors(true);
 		try {
 			const createClient = (accessToken: string) => createPrivateClient({
-				baseUrl: record.backendUrl,
+				baseUrl: refreshedRecord.backendUrl,
 				getAccessToken: () => accessToken,
 			});
 
 			try {
-				const response = await createClient(record.session.accessToken).listConnectors();
+				const response = await createClient(refreshedRecord.session.accessToken).listConnectors();
 				const next = sortPrivateConnectors(response.connectors);
 				setConnectors(next);
 				return next;
@@ -150,7 +167,7 @@ export const PrivateAccountSection = ({
 		} finally {
 			setIsLoadingConnectors(false);
 		}
-	}, [refreshSession, sessionRecord]);
+	}, [clearSessionRecord, refreshSession, sessionRecord, setSessionRecord]);
 
 	const connectConnector = useCallback(async (
 		connector: Pick<PrivateConnectorDto, "id" | "name">,

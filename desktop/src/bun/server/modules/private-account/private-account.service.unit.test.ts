@@ -128,3 +128,75 @@ test("PrivateAccountService exchanges browser completion tokens and persists the
 		await privateApp.stop();
 	}
 });
+
+test("getState refreshes the subscription state from /v1/private/me before exposing QR payload", async () => {
+	const privateApp = new Elysia()
+		.get("/v1/private/me", ({ request }) => {
+			expect(request.headers.get("authorization")).toBe("Bearer access-token");
+			return {
+				user: {
+					daysRemaing: 30,
+					daysRemaining: 30,
+					email: "dev@example.com",
+					id: "usr_1",
+					subscribed: true,
+				},
+			};
+		})
+		.get("/v1/private/connectors", ({ request }) => {
+			expect(request.headers.get("authorization")).toBe("Bearer access-token");
+			return {
+				connectors: [
+					{
+						claimedAt: new Date().toISOString(),
+						hostname: "devbox.local",
+						id: "con_1",
+						isOnline: true,
+						lastSeenAt: new Date().toISOString(),
+						name: "Desktop Connector",
+						relayCapabilitiesVersion: "1",
+						relayVersion: "1.0.0",
+						status: "online",
+					},
+				],
+			};
+		});
+
+	await privateApp.listen(0);
+	const privatePort = privateApp.server?.port;
+	if (typeof privatePort !== "number") {
+		throw new Error("listener_port_unavailable");
+	}
+
+	try {
+		const repository = createInMemoryRepository();
+		repository.saveSession({
+			accessToken: "access-token",
+			refreshToken: "refresh-token",
+			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
+				email: "Dev@Example.com",
+				id: "usr_1",
+				subscribed: false,
+			},
+		});
+		repository.saveConnector({
+			backendUrl: `http://127.0.0.1:${privatePort}`,
+			connectorId: "con_1",
+			connectorName: "Desktop Connector",
+			connectorToken: "connector-token",
+		});
+		const service = new PrivateAccountService(repository, {
+			backendUrl: `http://127.0.0.1:${privatePort}`,
+			localServerToken: "local-token",
+		});
+
+		const state = await service.getState();
+
+		expect(state.user?.subscribed).toBe(true);
+		expect(state.connector?.id).toBe("con_1");
+	} finally {
+		await privateApp.stop();
+	}
+});

@@ -1,11 +1,14 @@
 /* eslint-disable import/no-unresolved */
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
+
+import { PrivateApiError } from "@remotecode/contracts";
 
 import {
 	buildPrivateForgotPasswordUrl,
 	buildPrivateManageSubscriptionUrl,
 	buildPrivateRegisterUrl,
 	getPrivateSubscriptionSnapshot,
+	refreshPrivateAccountSessionRecord,
 	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
 	persistSavedPrivateConnection,
@@ -153,6 +156,99 @@ test("buildPrivateForgotPasswordUrl preserves the backend and optional email", (
 
 test("buildPrivateManageSubscriptionUrl points to the private web app", () => {
 	expect(buildPrivateManageSubscriptionUrl()).toBe("https://remotecode.io/app");
+});
+
+test("refreshPrivateAccountSessionRecord updates subscription state from private account /me response", async () => {
+	const createClient = mock(() => ({
+		me: async () => ({
+			user: {
+				daysRemaing: 10,
+				daysRemaining: 10,
+				email: "dev@example.com",
+				id: "usr_1",
+				subscribed: true,
+			},
+		}),
+	}));
+
+	const refreshed = await refreshPrivateAccountSessionRecord({
+		createClient,
+		sessionRecord: {
+			backendUrl: "https://private.remotecode.dev",
+			session: {
+				accessToken: "access-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 10,
+					daysRemaining: 10,
+					email: "dev@example.com",
+					id: "usr_1",
+					subscribed: false,
+				},
+			},
+		},
+	});
+
+	expect(refreshed?.session.user.subscribed).toBe(true);
+	expect(createClient).toHaveBeenCalledTimes(1);
+});
+
+test("refreshPrivateAccountSessionRecord refreshes tokens when /me returns unauthorized", async () => {
+	let meCalls = 0;
+	const unauthorized = new PrivateApiError(401, null, "private_session_expired");
+	const createClient = mock(() => ({
+		me: async () => {
+			meCalls += 1;
+			if (meCalls === 1) {
+				throw unauthorized;
+			}
+
+			return {
+				user: {
+					daysRemaing: 10,
+					daysRemaining: 10,
+					email: "dev@example.com",
+					id: "usr_1",
+					subscribed: true,
+				},
+			};
+		},
+	}));
+	const refreshSession = mock(async () => ({
+		accessToken: "next-access-token",
+		refreshToken: "next-refresh-token",
+		user: {
+			daysRemaing: 10,
+			daysRemaining: 10,
+			email: "dev@example.com",
+			id: "usr_1",
+			subscribed: false,
+		},
+	}));
+
+	const refreshed = await refreshPrivateAccountSessionRecord({
+		createClient,
+		refreshSession,
+		sessionRecord: {
+			backendUrl: "https://private.remotecode.dev",
+			session: {
+				accessToken: "expired-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 10,
+					daysRemaining: 10,
+					email: "dev@example.com",
+					id: "usr_1",
+					subscribed: false,
+				},
+			},
+		},
+	});
+
+	expect(refreshed?.session.accessToken).toBe("next-access-token");
+	expect(refreshed?.session.user.subscribed).toBe(true);
+	expect(refreshSession).toHaveBeenCalledTimes(1);
+	expect(meCalls).toBe(2);
 });
 
 test("getPrivateSubscriptionSnapshot reads the subscription flags from the session", () => {
