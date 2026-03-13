@@ -332,6 +332,7 @@ test("private account login renders connector state and logout resets the footer
 	await expect(page.getByTestId("private-account-connector-card")).toBeVisible();
 	await expect(page.getByText("dev@example.com")).toBeVisible();
 	await expect(page.getByTestId("private-account-connector-card").getByText("Relay online")).toBeVisible();
+	await expect(page.getByTestId("private-account-connector-card")).not.toContainText("days remaining");
 	await expect(page.getByAltText("Private connect QR")).toBeVisible();
 
 	await page.getByRole("button", { name: /dev@example.com/i }).click();

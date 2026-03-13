@@ -293,9 +293,6 @@ export const PrivateAccountSidebarFooter = ({
 									{state.connector?.name ?? state.qrPayload?.connectorName ?? "Desktop Connector"}
 								</p>
 								<p className="text-xs text-slate-300">{statusLabel}</p>
-								<p className="mt-2 text-[11px] text-emerald-200/80">
-									Subscription active · {daysRemaining} days remaining
-								</p>
 							</div>
 							{qrDataUrl ? (
 								<img
