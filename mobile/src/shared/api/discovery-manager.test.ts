@@ -87,6 +87,7 @@ describe("DiscoveryManager saved VPN probing", () => {
 		storeState.savedConnections = [
 			{
 				baseUrl: `https://${vpnHost}:${String(DISCOVERY_PORT)}`,
+				kind: "local",
 				lastConnectedAt: new Date().toISOString(),
 				token: "vpn-token",
 			},
@@ -152,11 +153,13 @@ describe("DiscoveryManager saved VPN probing", () => {
 		storeState.savedConnections = [
 			{
 				baseUrl: `https://${vpnHost}:${String(DISCOVERY_PORT)}`,
+				kind: "local",
 				lastConnectedAt: new Date().toISOString(),
 				token: "vpn-token",
 			},
 			{
 				baseUrl: `${HTTP_SCHEME}://${vpnHost}:${String(DISCOVERY_PORT)}`,
+				kind: "local",
 				lastConnectedAt: new Date().toISOString(),
 				token: "second-token",
 			},

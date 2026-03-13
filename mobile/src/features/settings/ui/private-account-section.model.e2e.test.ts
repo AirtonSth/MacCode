@@ -6,6 +6,7 @@ import { parseDesktopMobileConnectQrPayload } from "@remotecode/contracts";
 import {
 	buildPrivateRegisterUrl,
 	loginPrivateAccount,
+	persistSavedPrivateConnection,
 	resolvePendingPrivateConnector,
 } from "./private-account-section.model";
 
@@ -63,4 +64,22 @@ test("private account section builds the browser registration URL with a native 
 		email: "founder@remotecode.io",
 		platform: "android",
 	})).toContain("returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete");
+});
+
+test("private account section persistence helper writes the claimed connector as a saved private connection", async () => {
+	let persistedConnectorId = "";
+
+	await persistSavedPrivateConnection({
+		backendUrl: "https://private.remotecode.dev",
+		connector: {
+			id: "con_42",
+			name: "Studio MacBook",
+		},
+		saveSavedConnection: async (input) => {
+			persistedConnectorId = input.kind === "private" ? input.connectorId : "";
+			return [];
+		},
+	});
+
+	expect(persistedConnectorId).toBe("con_42");
 });

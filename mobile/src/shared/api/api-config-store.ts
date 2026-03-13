@@ -17,11 +17,30 @@ export interface ApiConfig {
 	token: string;
 }
 
-export interface SavedConnection {
+export interface LocalSavedConnection {
+	baseUrl: string;
+	kind: "local";
+	lastConnectedAt: string;
+	token: string;
+}
+
+export interface PrivateSavedConnection {
+	backendUrl: string;
+	connectorId: string;
+	connectorName: string;
+	kind: "private";
+	lastConnectedAt: string;
+}
+
+export type SavedConnection = LocalSavedConnection | PrivateSavedConnection;
+
+export interface LegacySavedConnection {
 	baseUrl: string;
 	lastConnectedAt: string;
 	token: string;
 }
+
+const isSavedConnection = (value: SavedConnection | null): value is SavedConnection => value !== null;
 
 interface SecureStoreLike {
 	deleteItemAsync: (key: string) => Promise<void>;
@@ -70,6 +89,12 @@ const normalizeBaseUrl = (value: string): string => {
 	return trimmed.length > 0 ? trimmed : defaultLocalTarget.baseUrl;
 };
 
+const normalizeConnectorId = (value: string): string => value.trim();
+const normalizeConnectorName = (value: string): string => {
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : "Desktop Connector";
+};
+
 const normalizeToken = (value: string): string => {
 	const trimmed = value.trim();
 	const isEmpty = trimmed.length === 0;
@@ -111,6 +136,50 @@ const toTimestamp = (input: string): number => {
 	return Number.isNaN(timestamp) ? 0 : timestamp;
 };
 
+const toSavedConnectionKey = (connection: SavedConnection): string =>
+	connection.kind === "local"
+		? `local:${connection.baseUrl}`
+		: `private:${connection.backendUrl}:${connection.connectorId}`;
+
+const normalizeSavedTimestamp = (value: unknown): string =>
+	typeof value === "string" && !Number.isNaN(Date.parse(value))
+		? value
+		: new Date(0).toISOString();
+
+const parseSavedConnection = (item: unknown): SavedConnection | null => {
+	if (!item || typeof item !== "object") {
+		return null;
+	}
+
+	const candidate = item as Record<string, unknown>;
+	const kind = typeof candidate.kind === "string" ? candidate.kind : "local";
+	const lastConnectedAt = normalizeSavedTimestamp(candidate.lastConnectedAt);
+
+	if (kind === "private") {
+		const backendUrl = normalizeBaseUrl(String(candidate.backendUrl ?? ""));
+		const connectorId = normalizeConnectorId(String(candidate.connectorId ?? ""));
+		if (connectorId.length === 0) {
+			return null;
+		}
+
+		return {
+			backendUrl,
+			connectorId,
+			connectorName: normalizeConnectorName(String(candidate.connectorName ?? "")),
+			kind: "private",
+			lastConnectedAt,
+		};
+	}
+
+	const legacyBaseUrl = normalizeBaseUrl(String(candidate.baseUrl ?? ""));
+	return {
+		baseUrl: legacyBaseUrl,
+		kind: "local",
+		lastConnectedAt,
+		token: normalizeToken(String(candidate.token ?? "")),
+	};
+};
+
 const parseSavedConnections = (raw: string | null): SavedConnection[] => {
 	if (!raw) {
 		return [];
@@ -122,34 +191,18 @@ const parseSavedConnections = (raw: string | null): SavedConnection[] => {
 			return [];
 		}
 
-		const entries = parsed
-			.filter((item) => Boolean(item) && typeof item === "object")
-			.map((item) => {
-				const candidate = item as Record<string, unknown>;
-				const baseUrl = normalizeBaseUrl(String(candidate.baseUrl ?? ""));
-				const token = normalizeToken(String(candidate.token ?? ""));
-				const lastConnectedAtRaw = candidate.lastConnectedAt;
-				const lastConnectedAt =
-					typeof lastConnectedAtRaw === "string" && !Number.isNaN(Date.parse(lastConnectedAtRaw))
-						? lastConnectedAtRaw
-						: new Date(0).toISOString();
+		const entries = parsed.map((item) => parseSavedConnection(item)).filter(isSavedConnection);
 
-				return {
-					baseUrl,
-					lastConnectedAt,
-					token,
-				};
-			});
-
-		const uniqueByBaseUrl = new Map<string, SavedConnection>();
+		const uniqueById = new Map<string, SavedConnection>();
 		for (const entry of entries) {
-			const current = uniqueByBaseUrl.get(entry.baseUrl);
+			const key = toSavedConnectionKey(entry);
+			const current = uniqueById.get(key);
 			if (!current || toTimestamp(entry.lastConnectedAt) > toTimestamp(current.lastConnectedAt)) {
-				uniqueByBaseUrl.set(entry.baseUrl, entry);
+				uniqueById.set(key, entry);
 			}
 		}
 
-		return Array.from(uniqueByBaseUrl.values())
+		return Array.from(uniqueById.values())
 			.sort((left, right) => right.lastConnectedAt.localeCompare(left.lastConnectedAt))
 			.slice(0, MAX_SAVED_CONNECTIONS);
 	} catch {
@@ -286,21 +339,54 @@ export const ApiConfigStore = {
 		const raw = await secureStore.getItemAsync(SAVED_CONNECTIONS_KEY);
 		return parseSavedConnections(raw);
 	},
-	async saveSavedConnection(input: { baseUrl: string; token: string }): Promise<SavedConnection[]> {
-		const normalizedEntry: SavedConnection = {
-			baseUrl: normalizeBaseUrl(input.baseUrl),
-			lastConnectedAt: new Date().toISOString(),
-			token: normalizeToken(input.token),
-		};
+	async saveSavedConnection(input:
+		| {
+			baseUrl: string;
+			kind: "local";
+			token: string;
+		}
+		| {
+			backendUrl: string;
+			connectorId: string;
+			connectorName: string;
+			kind: "private";
+		}): Promise<SavedConnection[]> {
+		const normalizedEntry: SavedConnection = input.kind === "private"
+			? {
+				backendUrl: normalizeBaseUrl(input.backendUrl),
+				connectorId: normalizeConnectorId(input.connectorId),
+				connectorName: normalizeConnectorName(input.connectorName),
+				kind: "private",
+				lastConnectedAt: new Date().toISOString(),
+			}
+			: {
+				baseUrl: normalizeBaseUrl(input.baseUrl),
+				kind: "local",
+				lastConnectedAt: new Date().toISOString(),
+				token: normalizeToken(input.token),
+			};
 
 		const current = await this.readSavedConnections();
-		const next = [normalizedEntry, ...current.filter((item) => item.baseUrl !== normalizedEntry.baseUrl)];
+		const next = [normalizedEntry, ...current.filter((item) => toSavedConnectionKey(item) !== toSavedConnectionKey(normalizedEntry))];
 		return await writeSavedConnections(next);
 	},
-	async deleteSavedConnection(baseUrl: string): Promise<SavedConnection[]> {
-		const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+	async deleteSavedConnection(connection: SavedConnection): Promise<SavedConnection[]> {
+		const normalizedConnection = connection.kind === "private"
+			? {
+				backendUrl: normalizeBaseUrl(connection.backendUrl),
+				connectorId: normalizeConnectorId(connection.connectorId),
+				connectorName: normalizeConnectorName(connection.connectorName),
+				kind: "private" as const,
+				lastConnectedAt: connection.lastConnectedAt,
+			}
+			: {
+				baseUrl: normalizeBaseUrl(connection.baseUrl),
+				kind: "local" as const,
+				lastConnectedAt: connection.lastConnectedAt,
+				token: normalizeToken(connection.token),
+			};
 		const current = await this.readSavedConnections();
-		const next = current.filter((item) => item.baseUrl !== normalizedBaseUrl);
+		const next = current.filter((item) => toSavedConnectionKey(item) !== toSavedConnectionKey(normalizedConnection));
 		return await writeSavedConnections(next);
 	},
 };

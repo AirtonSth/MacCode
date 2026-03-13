@@ -1,5 +1,5 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	ActivityIndicator,
 	Alert,
@@ -17,6 +17,7 @@ import {
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { ApiConfigStore, type SavedConnection } from "../../../shared/api/api-config-store";
 import { DiscoveryManager, type DiscoveredServer } from "../../../shared/api/discovery-manager";
+import { usePrivateSession } from "../../../shared/api/private-session-provider";
 import { createRemoteCodeClient, isRemoteCodeUnauthorizedError } from "../../../shared/api/remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
@@ -88,53 +89,20 @@ const toHost = (value: string): string => {
 	return hostPort.split(":", 1)[0].trim();
 };
 
-const isPrivateIPv4 = (host: string): boolean => {
-	const parts = host.split(".");
-	if (parts.length !== 4) {
-		return false;
-	}
-
-	const numbers = parts.map((part) => Number.parseInt(part, 10));
-	if (numbers.some((part) => Number.isNaN(part) || part < 0 || part > 255)) {
-		return false;
-	}
-
-	return (
-		numbers[0] === 10 ||
-		numbers[0] === 127 ||
-		(numbers[0] === 169 && numbers[1] === 254) ||
-		(numbers[0] === 172 && numbers[1] >= 16 && numbers[1] <= 31) ||
-		(numbers[0] === 192 && numbers[1] === 168)
-	);
-};
-
-const isLanBaseUrl = (value: string): boolean => {
-	const host = toHost(value);
-	if (!host) {
-		return false;
-	}
-
-	if (
-		host === "localhost" ||
-		host === "::1" ||
-		host.endsWith(".local") ||
-		host.endsWith(".lan") ||
-		host.endsWith(".home") ||
-		host.startsWith("fe80:")
-	) {
-		return true;
-	}
-
-	return isPrivateIPv4(host);
-};
-
-const filterSavedConnections = (items: SavedConnection[]): SavedConnection[] =>
-	items.filter((item) => !isLanBaseUrl(item.baseUrl));
-
 const toManualConnectionInput = (value: string): string => {
 	const host = toHost(value);
 	return host.length > 0 ? host : value.trim();
 };
+
+const toSavedConnectionKey = (connection: SavedConnection): string =>
+	connection.kind === "private"
+		? `private:${connection.backendUrl}:${connection.connectorId}`
+		: `local:${connection.baseUrl}`;
+
+const getSavedConnectionTitle = (connection: SavedConnection): string =>
+	connection.kind === "private"
+		? connection.connectorName
+		: toHost(connection.baseUrl) || connection.baseUrl;
 
 const normalizeConnectionBaseUrl = (value: string): string => {
 	const trimmed = value.trim();
@@ -195,20 +163,20 @@ export const SettingsScreen = () => {
 	const searchParams = useLocalSearchParams() as SettingsScreenSearchParams;
 	const router = useRouter();
 	const { config, update } = useApiConfig();
+	const { activateConnector, clearPendingQrPayload, refreshSession, sessionRecord } = usePrivateSession();
 	const [baseUrl, setBaseUrl] = useState<string>(() => toManualConnectionInput(config.baseUrl));
 	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
 	const [statusMessage, setStatusMessage] = useState<string>("");
 	const [isScanning, setIsScanning] = useState<boolean>(false);
 	const [isConnectingManual, setIsConnectingManual] = useState<boolean>(false);
 	const [isConnectingByServerId, setIsConnectingByServerId] = useState<Record<string, boolean>>({});
-	const [isConnectingBySavedBaseUrl, setIsConnectingBySavedBaseUrl] = useState<Record<string, boolean>>({});
+	const [isConnectingBySavedKey, setIsConnectingBySavedKey] = useState<Record<string, boolean>>({});
 	const [savedConnectionActionTarget, setSavedConnectionActionTarget] = useState<SavedConnection | null>(null);
 	const [discoveredServers, setDiscoveredServers] = useState<DiscoveredServer[]>([]);
 	const [savedConnections, setSavedConnections] = useState<SavedConnection[]>([]);
 	const [rememberedTokenByServerId, setRememberedTokenByServerId] = useState<Record<string, string>>({});
-	const ignoreSavedPressByBaseUrlRef = useRef<Set<string>>(new Set());
+	const ignoreSavedPressByKeyRef = useRef<Set<string>>(new Set());
 	const debugAutoConnectSignatureRef = useRef<string | null>(null);
-	const visibleSavedConnections = useMemo(() => filterSavedConnections(savedConnections), [savedConnections]);
 	const debugBaseUrl = normalizeSearchParam(searchParams.debugBaseUrl);
 	const debugChatId = normalizeSearchParam(searchParams.debugChatId);
 	const debugToken = normalizeSearchParam(searchParams.debugToken);
@@ -261,26 +229,64 @@ export const SettingsScreen = () => {
 
 	const hydrateSavedConnections = useCallback(async () => {
 		const currentSaved = await ApiConfigStore.readSavedConnections();
-		const filteredSaved = filterSavedConnections(currentSaved);
-		const normalizedBaseUrl = config.baseUrl.trim();
-		const normalizedToken = config.token.trim();
-		const hasActiveNonLanConnection =
-			normalizedBaseUrl.length > 0 &&
-			normalizedToken.length > 0 &&
-			!isLanBaseUrl(normalizedBaseUrl);
-		const hasActiveInSavedList = filteredSaved.some((item) => item.baseUrl === normalizedBaseUrl);
+		if (config.activeTarget.kind === "local") {
+			const normalizedBaseUrl = config.baseUrl.trim();
+			const normalizedToken = config.token.trim();
+			const hasActiveConnection = normalizedBaseUrl.length > 0 && normalizedToken.length > 0;
+			const hasActiveInSavedList = currentSaved.some((item) =>
+				item.kind === "local" && item.baseUrl === normalizedBaseUrl
+			);
 
-		if (hasActiveNonLanConnection && !hasActiveInSavedList) {
-			const next = await ApiConfigStore.saveSavedConnection({
-				baseUrl: normalizedBaseUrl,
-				token: normalizedToken,
-			});
-			setSavedConnections(filterSavedConnections(next));
-			return;
+			if (hasActiveConnection && !hasActiveInSavedList) {
+				const next = await ApiConfigStore.saveSavedConnection({
+					baseUrl: normalizedBaseUrl,
+					kind: "local",
+					token: normalizedToken,
+				});
+				setSavedConnections(next);
+				return;
+			}
 		}
 
-		setSavedConnections(filteredSaved);
-	}, [config.baseUrl, config.token]);
+		setSavedConnections(currentSaved);
+	}, [config.activeTarget.kind, config.baseUrl, config.token]);
+
+	const connectSavedPrivateConnection = useCallback(async (connection: Extract<SavedConnection, { kind: "private" }>) => {
+		if (!sessionRecord || sessionRecord.backendUrl !== connection.backendUrl) {
+			setStatus("Sign in to reconnect this private server.", "error");
+			return false;
+		}
+
+		try {
+			const refreshedSession = await refreshSession();
+			if (!refreshedSession) {
+				setStatus("Sign in to reconnect this private server.", "error");
+				return false;
+			}
+
+			await activateConnector({
+				backendUrl: connection.backendUrl,
+				connectorId: connection.connectorId,
+				sessionRecordOverride: {
+					backendUrl: connection.backendUrl,
+					session: refreshedSession,
+				},
+			});
+			await clearPendingQrPayload();
+			const next = await ApiConfigStore.saveSavedConnection({
+				backendUrl: connection.backendUrl,
+				connectorId: connection.connectorId,
+				connectorName: connection.connectorName,
+				kind: "private",
+			});
+			setSavedConnections(next);
+			setStatus("Private server connected.", "success");
+			return true;
+		} catch (error: unknown) {
+			setStatus(error instanceof Error ? error.message : "Unable to connect to private server.", "error");
+			return false;
+		}
+	}, [activateConnector, clearPendingQrPayload, refreshSession, sessionRecord]);
 
 	useEffect(() => {
 		void scanLan();
@@ -352,9 +358,10 @@ export const SettingsScreen = () => {
 			}
 			const next = await ApiConfigStore.saveSavedConnection({
 				baseUrl: normalizedBaseUrl,
+				kind: "local",
 				token: candidateToken,
 			});
-			setSavedConnections(filterSavedConnections(next));
+			setSavedConnections(next);
 			await update({
 				baseUrl: normalizedBaseUrl,
 				token: candidateToken,
@@ -428,24 +435,27 @@ export const SettingsScreen = () => {
 	};
 
 	const connectSavedConnection = async (connection: SavedConnection) => {
+		const connectionKey = toSavedConnectionKey(connection);
 		setSavedConnectionActionTarget(null);
-		setIsConnectingBySavedBaseUrl((current) => ({ ...current, [connection.baseUrl]: true }));
+		setIsConnectingBySavedKey((current) => ({ ...current, [connectionKey]: true }));
 		setStatusMessage("");
-		const connected = await connectAndPersist({
-			baseUrl: connection.baseUrl,
-			token: connection.token,
-		});
-		setIsConnectingBySavedBaseUrl((current) => ({ ...current, [connection.baseUrl]: false }));
+		const connected = connection.kind === "private"
+			? await connectSavedPrivateConnection(connection)
+			: await connectAndPersist({
+				baseUrl: connection.baseUrl,
+				token: connection.token,
+			});
+		setIsConnectingBySavedKey((current) => ({ ...current, [connectionKey]: false }));
 		if (connected) {
 			goNext();
 		}
 	};
 
 	const deleteSavedConnection = async (connection: SavedConnection) => {
-		const next = await ApiConfigStore.deleteSavedConnection(connection.baseUrl);
-		setSavedConnections(filterSavedConnections(next));
+		const next = await ApiConfigStore.deleteSavedConnection(connection);
+		setSavedConnections(next);
 		setSavedConnectionActionTarget((current) =>
-			current?.baseUrl === connection.baseUrl ? null : current,
+			current && toSavedConnectionKey(current) === toSavedConnectionKey(connection) ? null : current,
 		);
 	};
 
@@ -557,25 +567,21 @@ export const SettingsScreen = () => {
 				keyboardShouldPersistTaps="handled"
 				showsVerticalScrollIndicator={false}
 			>
-				<PrivateAccountSection
-					onConnected={() => {
-						goNext();
-					}}
-				/>
 				<View style={styles.section}>
 					<View style={styles.sectionHeader}>
 						<Text style={styles.sectionTitle}>Saved Connections</Text>
 					</View>
 
 						<FlatList
-							data={visibleSavedConnections}
-							keyExtractor={(item) => item.baseUrl}
+							data={savedConnections}
+							keyExtractor={(item) => toSavedConnectionKey(item)}
 							renderItem={({ item: connection, index }) => {
-								const isConnecting = Boolean(isConnectingBySavedBaseUrl[connection.baseUrl]);
+								const connectionKey = toSavedConnectionKey(connection);
+								const isConnecting = Boolean(isConnectingBySavedKey[connectionKey]);
 
 								return (
 									<Pressable
-										accessibilityLabel={`Connect saved server ${toHost(connection.baseUrl) || connection.baseUrl}`}
+										accessibilityLabel={`Connect saved server ${getSavedConnectionTitle(connection)}`}
 										delayLongPress={280}
 										disabled={isConnecting}
 										onLongPress={() => {
@@ -583,24 +589,24 @@ export const SettingsScreen = () => {
 												return;
 											}
 
-											ignoreSavedPressByBaseUrlRef.current.add(connection.baseUrl);
+											ignoreSavedPressByKeyRef.current.add(connectionKey);
 											setSavedConnectionActionTarget(connection);
 										}}
 										onPress={() => {
-											if (ignoreSavedPressByBaseUrlRef.current.has(connection.baseUrl)) {
-												ignoreSavedPressByBaseUrlRef.current.delete(connection.baseUrl);
+											if (ignoreSavedPressByKeyRef.current.has(connectionKey)) {
+												ignoreSavedPressByKeyRef.current.delete(connectionKey);
 												return;
 											}
 
 											void connectSavedConnection(connection);
 										}}
 										onPressOut={() => {
-											if (!ignoreSavedPressByBaseUrlRef.current.has(connection.baseUrl)) {
+											if (!ignoreSavedPressByKeyRef.current.has(connectionKey)) {
 												return;
 											}
 
 											setTimeout(() => {
-												ignoreSavedPressByBaseUrlRef.current.delete(connection.baseUrl);
+												ignoreSavedPressByKeyRef.current.delete(connectionKey);
 											}, 0);
 										}}
 										style={({ pressed }) => [
@@ -613,10 +619,7 @@ export const SettingsScreen = () => {
 									>
 										<View style={styles.rowTextGroup}>
 											<Text numberOfLines={1} style={styles.rowTitle}>
-												{toHost(connection.baseUrl) || connection.baseUrl}
-											</Text>
-											<Text selectable numberOfLines={1} style={styles.rowMeta}>
-												{connection.baseUrl}
+												{getSavedConnectionTitle(connection)}
 											</Text>
 										</View>
 
@@ -635,6 +638,16 @@ export const SettingsScreen = () => {
 						showsVerticalScrollIndicator={false}
 					/>
 				</View>
+				<View style={styles.sectionDivider} />
+				<PrivateAccountSection
+					onConnected={() => {
+						goNext();
+					}}
+					onPrivateConnectionSaved={() => {
+						void hydrateSavedConnections();
+					}}
+				/>
+				<View style={styles.sectionDivider} />
 
 				<View style={styles.section}>
 					<View style={styles.sectionHeader}>
@@ -677,10 +690,7 @@ export const SettingsScreen = () => {
 									>
 										<View style={styles.rowTextGroup}>
 											<Text numberOfLines={1} style={styles.rowTitle}>
-												{server.hostname}:{String(server.port)}
-											</Text>
-											<Text selectable numberOfLines={1} style={styles.rowMeta}>
-												{server.baseUrl}
+												{server.hostname || toHost(server.baseUrl) || server.baseUrl}
 											</Text>
 										</View>
 
@@ -706,29 +716,32 @@ export const SettingsScreen = () => {
 					</View>
 
 					<View style={styles.formBody}>
-						<TextInput
-							autoCapitalize="none"
-							onChangeText={setBaseUrl}
-							placeholder="127.0.0.1"
-							placeholderTextColor={palette.muted}
-							style={styles.input}
-							testID="server-manual-base-url"
-							value={baseUrl}
-						/>
-						<Pressable
-							disabled={isConnectingManual}
-							onPress={() => {
-								void connectManual();
-							}}
-							style={({ pressed }) => [
-								styles.primaryButton,
-								pressed ? styles.primaryButtonPressed : null,
-								isConnectingManual ? styles.disabledButton : null,
-							]}
-							testID="server-manual-connect"
-						>
-							<Text style={styles.primaryLabel}>{isConnectingManual ? "Connecting..." : "Connect"}</Text>
-						</Pressable>
+						<View style={styles.manualConnectionRow}>
+							<TextInput
+								autoCapitalize="none"
+								onChangeText={setBaseUrl}
+								placeholder="127.0.0.1"
+								placeholderTextColor={palette.muted}
+								style={[styles.input, styles.manualConnectionInput]}
+								testID="server-manual-base-url"
+								value={baseUrl}
+							/>
+							<Pressable
+								disabled={isConnectingManual}
+								onPress={() => {
+									void connectManual();
+								}}
+								style={({ pressed }) => [
+									styles.primaryButton,
+									styles.manualConnectionButton,
+									pressed ? styles.primaryButtonPressed : null,
+									isConnectingManual ? styles.disabledButton : null,
+								]}
+								testID="server-manual-connect"
+							>
+								<Text style={styles.primaryLabel}>{isConnectingManual ? "Connecting..." : "Connect"}</Text>
+							</Pressable>
+						</View>
 					</View>
 				</View>
 
@@ -768,7 +781,7 @@ export const SettingsScreen = () => {
 					testID="saved-server-action-sheet"
 					title={
 						savedConnectionActionTarget
-							? toHost(savedConnectionActionTarget.baseUrl) || savedConnectionActionTarget.baseUrl
+							? getSavedConnectionTitle(savedConnectionActionTarget)
 							: "Connection options"
 					}
 					isVisible={savedConnectionActionTarget !== null}
@@ -783,6 +796,11 @@ const styles = StyleSheet.create({
 		paddingBottom: 36,
 		paddingHorizontal: 16,
 		paddingTop: 14,
+	},
+	sectionDivider: {
+		backgroundColor: "rgba(255,255,255,0.12)",
+		height: StyleSheet.hairlineWidth,
+		marginVertical: 2,
 	},
 	disabledButton: {
 		opacity: 0.45,
@@ -800,6 +818,17 @@ const styles = StyleSheet.create({
 		minHeight: 42,
 		paddingHorizontal: 12,
 		paddingVertical: 8,
+	},
+	manualConnectionButton: {
+		minWidth: 108,
+	},
+	manualConnectionInput: {
+		flex: 1,
+	},
+	manualConnectionRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 10,
 	},
 	listRow: {
 		alignItems: "center",

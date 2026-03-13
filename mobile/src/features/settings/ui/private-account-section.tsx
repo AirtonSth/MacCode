@@ -30,6 +30,7 @@ import {
 	getPrivateSubscriptionSnapshot,
 	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
+	persistSavedPrivateConnection,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
 } from "./private-account-section.model";
@@ -45,8 +46,10 @@ const palette = {
 
 export const PrivateAccountSection = ({
 	onConnected,
+	onPrivateConnectionSaved = undefined,
 }: {
 	onConnected: () => void;
+	onPrivateConnectionSaved?: () => void;
 }) => {
 	const routeParams = useGlobalSearchParams<{
 		privateConnectError?: string | string[];
@@ -150,7 +153,7 @@ export const PrivateAccountSection = ({
 	}, [refreshSession, sessionRecord]);
 
 	const connectConnector = useCallback(async (
-		connectorId: string,
+		connector: Pick<PrivateConnectorDto, "id" | "name">,
 		options?: {
 			sessionRecordOverride?: {
 				backendUrl: string;
@@ -159,15 +162,21 @@ export const PrivateAccountSection = ({
 			targetBackendUrl?: string;
 		},
 	) => {
+		const targetBackendUrl = options?.targetBackendUrl ?? sessionRecord?.backendUrl ?? backendUrl;
 		await activateConnector({
-			backendUrl: options?.targetBackendUrl ?? sessionRecord?.backendUrl ?? backendUrl,
-			connectorId,
+			backendUrl: targetBackendUrl,
+			connectorId: connector.id,
 			sessionRecordOverride: options?.sessionRecordOverride,
 		});
+		await persistSavedPrivateConnection({
+			backendUrl: targetBackendUrl,
+			connector,
+		});
+		onPrivateConnectionSaved?.();
 		setErrorMessage(null);
 		await clearPendingQrPayload();
 		onConnected();
-	}, [activateConnector, backendUrl, clearPendingQrPayload, onConnected, sessionRecord?.backendUrl]);
+	}, [activateConnector, backendUrl, clearPendingQrPayload, onConnected, onPrivateConnectionSaved, sessionRecord?.backendUrl]);
 
 	const resumePendingQrConnection = useCallback(async (candidateConnectors: PrivateConnectorDto[]) => {
 		if (!pendingQrPayload || !sessionRecord || pendingQrPayload.backendUrl !== sessionRecord.backendUrl) {
@@ -183,7 +192,7 @@ export const PrivateAccountSection = ({
 			return;
 		}
 
-		await connectConnector(connector.id, {
+		await connectConnector(connector, {
 			targetBackendUrl: pendingQrPayload.backendUrl,
 		});
 	}, [connectConnector, pendingConnectorId, pendingQrPayload, sessionRecord]);
@@ -231,7 +240,7 @@ export const PrivateAccountSection = ({
 					pendingConnectorId,
 				});
 				if (connector) {
-					await connectConnector(connector.id, {
+					await connectConnector(connector, {
 						sessionRecordOverride: {
 							backendUrl,
 							session,
@@ -341,7 +350,7 @@ export const PrivateAccountSection = ({
 			</View>
 
 			{sessionRecord ? (
-				<View style={styles.formBody}>
+					<View style={styles.formBody}>
 					<View style={styles.accountSummary}>
 						<Text style={styles.summaryLabel}>Private access</Text>
 						<Text selectable style={styles.summaryValue}>{sessionRecord.session.user.email}</Text>
@@ -362,25 +371,6 @@ export const PrivateAccountSection = ({
 								</Text>
 							</View>
 						</View>
-					</View>
-					<View style={styles.accountSummary}>
-						<Text style={styles.summaryLabel}>Backend</Text>
-						<Text selectable style={styles.summaryValue}>{sessionRecord.backendUrl}</Text>
-					</View>
-					<View style={styles.inlineActions}>
-						<Pressable
-							onPress={() => {
-								void Linking.openURL(manageSubscriptionUrl);
-							}}
-							style={({ pressed }) => [
-								styles.secondaryButton,
-								styles.inlineButton,
-								pressed ? styles.secondaryButtonPressed : null,
-							]}
-							testID="private-account-manage-subscription"
-						>
-							<Text style={styles.secondaryLabel}>Manage subscription</Text>
-						</Pressable>
 					</View>
 					{subscriptionSnapshot.isSubscribed ? (
 						<>
@@ -425,7 +415,7 @@ export const PrivateAccountSection = ({
 									<Pressable
 										key={connector.id}
 										onPress={() => {
-											void connectConnector(connector.id);
+											void connectConnector(connector);
 										}}
 										style={({ pressed }) => [
 											styles.connectorRow,
@@ -468,44 +458,6 @@ export const PrivateAccountSection = ({
 				</View>
 			) : (
 				<View style={styles.formBody}>
-					<View style={styles.inlineActions}>
-						<Pressable
-							onPress={() => {
-								setIsScannerOpen((current) => !current);
-							}}
-							style={({ pressed }) => [
-								styles.secondaryButton,
-								styles.inlineButton,
-								pressed ? styles.secondaryButtonPressed : null,
-							]}
-							testID="private-account-scan-qr"
-						>
-							<Text style={styles.secondaryLabel}>{isScannerOpen ? "Close Scanner" : "Scan QR"}</Text>
-						</Pressable>
-					</View>
-					{isScannerOpen ? (
-						<View style={styles.scannerCard} testID="private-account-qr-scanner">
-							<CameraView
-								barcodeScannerSettings={{
-									barcodeTypes: ["qr"],
-								}}
-								onBarcodeScanned={(event) => {
-									handleScannedQr(event.data);
-								}}
-								style={styles.camera}
-							/>
-							<Text style={styles.supportText}>{scannerHelpText}</Text>
-						</View>
-					) : null}
-					<TextInput
-						autoCapitalize="none"
-						onChangeText={setBackendUrl}
-						placeholder={DEFAULT_PRIVATE_BACKEND_URL}
-						placeholderTextColor={palette.muted}
-						style={styles.input}
-						testID="private-account-backend-url"
-						value={backendUrl}
-					/>
 					<TextInput
 						autoCapitalize="none"
 						keyboardType="email-address"

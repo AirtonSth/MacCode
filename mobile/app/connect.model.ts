@@ -30,6 +30,11 @@ export interface ConnectRouteFlowDependencies {
 	onStatusMessage?: (message: string) => void;
 	parseInput?: typeof parsePrivateConnectInput;
 	rawUrl: string;
+	saveSavedPrivateConnection?: (input: {
+		backendUrl: string;
+		connectorId: string;
+		connectorName: string;
+	}) => Promise<void>;
 	sessionRecord: PersistedPrivateSessionRecord | null;
 	setPendingQrPayload: (payload: DesktopMobileConnectQrPayloadDto) => Promise<void>;
 	setSessionRecord: (sessionRecord: PersistedPrivateSessionRecord) => Promise<void>;
@@ -74,6 +79,11 @@ export const runConnectRouteFlow = async (
 				backendUrl: intent.payload.backendUrl,
 				connectorId: intent.payload.connectorId,
 			});
+			await input.saveSavedPrivateConnection?.({
+				backendUrl: intent.payload.backendUrl,
+				connectorId: intent.payload.connectorId,
+				connectorName: intent.payload.connectorName,
+			});
 			await input.clearPendingQrPayload();
 			return {
 				pathname: "/workspaces",
@@ -90,6 +100,11 @@ export const runConnectRouteFlow = async (
 		});
 		const statusMessage = `Connected to ${result.connector.name}.`;
 		input.onStatusMessage?.(statusMessage);
+		await input.saveSavedPrivateConnection?.({
+			backendUrl: result.sessionRecord.backendUrl,
+			connectorId: result.connector.id,
+			connectorName: result.connector.name,
+		});
 		return {
 			pathname: "/workspaces",
 			statusMessage,

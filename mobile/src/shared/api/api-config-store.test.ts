@@ -60,6 +60,126 @@ describe("ApiConfigStore", () => {
 		expect(saved.token).toBe("token-1");
 	});
 
+	test("parses legacy saved local connections without a kind discriminator", async () => {
+		const memoryStore = createMemoryStore();
+		setSecureStoreAdapterForTests(memoryStore);
+		await memoryStore.setItemAsync("remotecode.saved_connections", JSON.stringify([
+			{
+				baseUrl: "https://192.168.1.20:8835",
+				lastConnectedAt: "2026-03-13T10:00:00.000Z",
+				token: "token-1",
+			},
+		]));
+
+		const saved = await ApiConfigStore.readSavedConnections();
+
+		expect(saved).toEqual([
+			{
+				baseUrl: "https://192.168.1.20:8835",
+				kind: "local",
+				lastConnectedAt: "2026-03-13T10:00:00.000Z",
+				token: "token-1",
+			},
+		]);
+	});
+
+	test("saves and reads mixed local and private saved connections", async () => {
+		const memoryStore = createMemoryStore();
+		setSecureStoreAdapterForTests(memoryStore);
+
+		await ApiConfigStore.saveSavedConnection({
+			baseUrl: "https://192.168.1.20:8835",
+			kind: "local",
+			token: "token-1",
+		});
+		await ApiConfigStore.saveSavedConnection({
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			connectorName: "Desktop Connector",
+			kind: "private",
+		});
+
+		const saved = await ApiConfigStore.readSavedConnections();
+
+		expect(saved).toHaveLength(2);
+		expect(saved.some((item) => item.kind === "local" && item.baseUrl === "https://192.168.1.20:8835")).toBe(true);
+		expect(saved.some((item) => item.kind === "private" && item.connectorId === "con_1")).toBe(true);
+	});
+
+	test("dedupes local entries by baseUrl and private entries by backendUrl plus connectorId", async () => {
+		const memoryStore = createMemoryStore();
+		setSecureStoreAdapterForTests(memoryStore);
+
+		await ApiConfigStore.saveSavedConnection({
+			baseUrl: "https://192.168.1.20:8835",
+			kind: "local",
+			token: "token-1",
+		});
+		await ApiConfigStore.saveSavedConnection({
+			baseUrl: "https://192.168.1.20:8835",
+			kind: "local",
+			token: "token-2",
+		});
+		await ApiConfigStore.saveSavedConnection({
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			connectorName: "Desktop A",
+			kind: "private",
+		});
+		await ApiConfigStore.saveSavedConnection({
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			connectorName: "Desktop B",
+			kind: "private",
+		});
+
+		const saved = await ApiConfigStore.readSavedConnections();
+		const locals = saved.filter((item) => item.kind === "local");
+		const privates = saved.filter((item) => item.kind === "private");
+
+		expect(locals).toHaveLength(1);
+		expect(locals[0]?.token).toBe("token-2");
+		expect(privates).toHaveLength(1);
+		expect(privates[0]?.connectorName).toBe("Desktop B");
+	});
+
+	test("deletes local and private saved entries independently", async () => {
+		const memoryStore = createMemoryStore();
+		setSecureStoreAdapterForTests(memoryStore);
+
+		await ApiConfigStore.saveSavedConnection({
+			baseUrl: "https://192.168.1.20:8835",
+			kind: "local",
+			token: "token-1",
+		});
+		await ApiConfigStore.saveSavedConnection({
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			connectorName: "Desktop Connector",
+			kind: "private",
+		});
+
+		await ApiConfigStore.deleteSavedConnection({
+			baseUrl: "https://192.168.1.20:8835",
+			kind: "local",
+			lastConnectedAt: new Date(0).toISOString(),
+			token: "token-1",
+		});
+		let saved = await ApiConfigStore.readSavedConnections();
+		expect(saved).toHaveLength(1);
+		expect(saved[0]?.kind).toBe("private");
+
+		await ApiConfigStore.deleteSavedConnection({
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_1",
+			connectorName: "Desktop Connector",
+			kind: "private",
+			lastConnectedAt: new Date(0).toISOString(),
+		});
+		saved = await ApiConfigStore.readSavedConnections();
+		expect(saved).toHaveLength(0);
+	});
+
 	test("does not silently replace an empty private access token with the local default token", async () => {
 		const memoryStore = createMemoryStore();
 		setSecureStoreAdapterForTests(memoryStore);

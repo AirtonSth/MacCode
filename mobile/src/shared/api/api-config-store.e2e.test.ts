@@ -37,7 +37,14 @@ describe("ApiConfigStore integration flow", () => {
 		});
 		await ApiConfigStore.saveSavedConnection({
 			baseUrl: "https://192.168.1.21:8835",
+			kind: "local",
 			token: "lan-token",
+		});
+		await ApiConfigStore.saveSavedConnection({
+			backendUrl: "https://private.remotecode.dev",
+			connectorId: "con_9",
+			connectorName: "Desktop Connector",
+			kind: "private",
 		});
 		await ApiConfigStore.save(toApiConfig({
 			accessToken: "private-token",
@@ -50,7 +57,8 @@ describe("ApiConfigStore integration flow", () => {
 		const savedConnections = await ApiConfigStore.readSavedConnections();
 
 		expect(privateConfig.activeTarget.kind).toBe("private");
-		expect(savedConnections).toHaveLength(1);
+		expect(savedConnections).toHaveLength(2);
+		expect(savedConnections.some((item) => item.kind === "private" && item.connectorId === "con_9")).toBe(true);
 
 		const localConfig = await ApiConfigStore.saveServerConnection({
 			baseUrl: "https://192.168.1.21:8835",

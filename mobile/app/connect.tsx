@@ -2,6 +2,7 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 
+import { ApiConfigStore } from "@/shared/api/api-config-store";
 import { usePrivateSession } from "@/shared/api/private-session-provider";
 import { buildPrivateConnectUrlFromParams } from "@/shared/api/private-mobile-connect";
 import { theme } from "@/shared/theme/tokens";
@@ -62,6 +63,14 @@ export default function ConnectRoute() {
 				clearPendingQrPayload,
 				onStatusMessage: setStatusMessage,
 				rawUrl,
+				saveSavedPrivateConnection: async (input) => {
+					await ApiConfigStore.saveSavedConnection({
+						backendUrl: input.backendUrl,
+						connectorId: input.connectorId,
+						connectorName: input.connectorName,
+						kind: "private",
+					});
+				},
 				sessionRecord,
 				setPendingQrPayload,
 				setSessionRecord,

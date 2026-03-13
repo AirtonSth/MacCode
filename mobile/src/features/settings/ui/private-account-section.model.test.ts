@@ -8,6 +8,7 @@ import {
 	getPrivateSubscriptionSnapshot,
 	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
+	persistSavedPrivateConnection,
 	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
 } from "./private-account-section.model";
@@ -102,13 +103,42 @@ test("loadPrivateConnectorsSafely reports load failures instead of rejecting", a
 	expect(seenMessage).toBe("connector_load_failed");
 });
 
+test("persistSavedPrivateConnection stores a reconnectable private saved connection", async () => {
+	let persistedBackendUrl = "";
+	let persistedConnectorId = "";
+	let persistedConnectorName = "";
+	let persistedKind = "";
+
+	await persistSavedPrivateConnection({
+		backendUrl: "https://private.remotecode.dev/",
+		connector: {
+			id: "con_1",
+			name: "Desktop Connector",
+		},
+		saveSavedConnection: async (input) => {
+			if (input.kind === "private") {
+				persistedBackendUrl = input.backendUrl;
+				persistedConnectorId = input.connectorId;
+				persistedConnectorName = input.connectorName;
+				persistedKind = input.kind;
+			}
+			return [];
+		},
+	});
+
+	expect(persistedBackendUrl).toBe("https://private.remotecode.dev");
+	expect(persistedConnectorId).toBe("con_1");
+	expect(persistedConnectorName).toBe("Desktop Connector");
+	expect(persistedKind).toBe("private");
+});
+
 test("buildPrivateRegisterUrl sends mobile users to the browser registration flow", () => {
 	expect(buildPrivateRegisterUrl({
 		backendUrl: "https://private.remotecode.dev/",
 		email: "dev@example.com",
 		platform: "ios",
 	})).toBe(
-		"https://remotecode.io/register?backendUrl=https%3A%2F%2Fprivate.remotecode.dev&platform=ios&returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete&target=mobile&email=dev%40example.com",
+		"https://remotecode.io/register?backendUrl=https%3A%2F%2Fprivate.remotecode.dev&email=dev%40example.com&platform=ios&returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete&target=mobile",
 	);
 });
 

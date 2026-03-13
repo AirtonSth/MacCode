@@ -4,6 +4,8 @@ import {
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
 
+import { ApiConfigStore } from "../../../shared/api/api-config-store";
+
 const REMOTECODE_WEB_URL = "https://remotecode.io";
 
 const trimBaseUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
@@ -78,6 +80,19 @@ export const resolvePendingPrivateConnector = (input: {
 	pendingConnectorId: string | null;
 }): PrivateConnectorDto | null =>
 	input.connectors.find((connector) => connector.id === input.pendingConnectorId) ?? null;
+
+export const persistSavedPrivateConnection = async (input: {
+	backendUrl: string;
+	connector: Pick<PrivateConnectorDto, "id" | "name">;
+	saveSavedConnection?: typeof ApiConfigStore.saveSavedConnection;
+}): Promise<void> => {
+	await (input.saveSavedConnection ?? ApiConfigStore.saveSavedConnection)({
+		backendUrl: trimBaseUrl(input.backendUrl),
+		connectorId: input.connector.id,
+		connectorName: input.connector.name,
+		kind: "private",
+	});
+};
 
 export const loadPrivateConnectorsSafely = async (input: {
 	loadConnectors: () => Promise<PrivateConnectorDto[]>;

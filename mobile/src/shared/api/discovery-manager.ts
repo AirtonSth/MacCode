@@ -1,7 +1,7 @@
 import * as Network from "expo-network";
 
 import type { DiscoveryInfoDTO } from "./types";
-import { ApiConfigStore, type SavedConnection } from "./api-config-store";
+import { ApiConfigStore, type LocalSavedConnection, type SavedConnection } from "./api-config-store";
 
 export interface DiscoveredServer extends DiscoveryInfoDTO {
 	baseUrl: string;
@@ -57,12 +57,12 @@ const parseHostFromBaseUrl = (baseUrl: string): string | null => {
 };
 
 interface SavedProbeTarget {
-	connection: SavedConnection;
+	connection: LocalSavedConnection;
 	host: string;
 }
 
 interface SavedProbeResult {
-	connection: SavedConnection;
+	connection: LocalSavedConnection;
 	host: string;
 	server: DiscoveredServer | null;
 }
@@ -356,6 +356,9 @@ const resolveCandidateHosts = async (input: {
 	}
 
 	for (const item of input.savedConnections) {
+		if (item.kind !== "local") {
+			continue;
+		}
 		pushUniqueHost(hosts, seen, parseHostFromBaseUrl(item.baseUrl));
 	}
 	pushUniqueHost(hosts, seen, parseHostFromBaseUrl(input.activeBaseUrl));
@@ -386,6 +389,9 @@ const toSavedProbeTargets = (savedConnections: SavedConnection[]): SavedProbeTar
 	const targets: SavedProbeTarget[] = [];
 	const seen = new Set<string>();
 	for (const connection of savedConnections) {
+		if (connection.kind !== "local") {
+			continue;
+		}
 		const host = parseHostFromBaseUrl(connection.baseUrl);
 		if (!host) {
 			continue;

@@ -6,6 +6,7 @@ import { runConnectRouteFlow } from "./connect.model";
 test("runConnectRouteFlow claims the private session and routes to workspaces", async () => {
 	const activateConnector = mock(async () => undefined);
 	const clearPendingQrPayload = mock(async () => undefined);
+	const saveSavedPrivateConnection = mock(async () => undefined);
 	const setPendingQrPayload = mock(async () => undefined);
 	const setSessionRecord = mock(async () => undefined);
 	const onStatusMessage = mock(() => undefined);
@@ -44,6 +45,7 @@ test("runConnectRouteFlow claims the private session and routes to workspaces", 
 			rawValue: "https://qr.remotecode.dev/connect/mcs_1/secret",
 		}),
 		rawUrl: "https://qr.remotecode.dev/connect/mcs_1/secret",
+		saveSavedPrivateConnection,
 		sessionRecord: null,
 		setPendingQrPayload,
 		setSessionRecord,
@@ -55,6 +57,11 @@ test("runConnectRouteFlow claims the private session and routes to workspaces", 
 	});
 	expect(onStatusMessage).toHaveBeenCalledWith("Claiming private connection.");
 	expect(onStatusMessage).toHaveBeenCalledWith("Connected to Studio MacBook.");
+	expect(saveSavedPrivateConnection).toHaveBeenCalledWith({
+		backendUrl: "https://private.remotecode.dev",
+		connectorId: "con_1",
+		connectorName: "Studio MacBook",
+	});
 	expect(setPendingQrPayload).toHaveBeenCalledTimes(0);
 });
 
@@ -90,6 +97,7 @@ test("runConnectRouteFlow surfaces claim failures back to settings", async () =>
 test("runConnectRouteFlow stores legacy QR payloads and reuses an active private session", async () => {
 	const activateConnector = mock(async () => undefined);
 	const clearPendingQrPayload = mock(async () => undefined);
+	const saveSavedPrivateConnection = mock(async () => undefined);
 	const setPendingQrPayload = mock(async () => undefined);
 	const onStatusMessage = mock(() => undefined);
 
@@ -109,6 +117,7 @@ test("runConnectRouteFlow stores legacy QR payloads and reuses an active private
 			rawValue: "{\"connectorId\":\"con_1\"}",
 		}),
 		rawUrl: "{\"connectorId\":\"con_1\"}",
+		saveSavedPrivateConnection,
 		sessionRecord: {
 			backendUrl: "https://private.remotecode.dev",
 			session: {
@@ -135,6 +144,11 @@ test("runConnectRouteFlow stores legacy QR payloads and reuses an active private
 	expect(activateConnector).toHaveBeenCalledWith({
 		backendUrl: "https://private.remotecode.dev",
 		connectorId: "con_1",
+	});
+	expect(saveSavedPrivateConnection).toHaveBeenCalledWith({
+		backendUrl: "https://private.remotecode.dev",
+		connectorId: "con_1",
+		connectorName: "Desktop Connector",
 	});
 	expect(clearPendingQrPayload).toHaveBeenCalledTimes(1);
 });
