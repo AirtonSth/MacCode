@@ -1,7 +1,7 @@
 /* eslint-disable import/no-unresolved */
 import { expect, mock, test } from "bun:test";
 
-import { runConnectRouteFlow } from "./connect.model";
+import { runConnectRouteFlow } from "./connect-route-flow";
 
 test("runConnectRouteFlow claims the private session and routes to workspaces", async () => {
 	const activateConnector = mock(async () => undefined);

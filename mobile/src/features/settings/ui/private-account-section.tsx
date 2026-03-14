@@ -3,10 +3,10 @@ import {
 	type PrivateConnectorDto,
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
-import { CameraView } from "expo-camera";
+import type { CameraViewProps } from "expo-camera";
 import * as Linking from "expo-linking";
 import { useGlobalSearchParams, useRouter } from "expo-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ComponentType } from "react";
 import {
 	ActivityIndicator,
 	Platform,
@@ -45,12 +45,37 @@ const palette = {
 	text: "#F1F4FA",
 };
 
+const areConnectorsEqual = (left: PrivateConnectorDto[], right: PrivateConnectorDto[]): boolean => {
+	if (left.length !== right.length) {
+		return false;
+	}
+
+	return left.every((leftConnector, index) => {
+		const rightConnector = right[index];
+		return (
+			leftConnector.id === rightConnector.id
+			&& leftConnector.name === rightConnector.name
+			&& leftConnector.hostname === rightConnector.hostname
+			&& leftConnector.status === rightConnector.status
+			&& leftConnector.isOnline === rightConnector.isOnline
+			&& leftConnector.lastSeenAt === rightConnector.lastSeenAt
+			&& leftConnector.claimedAt === rightConnector.claimedAt
+			&& leftConnector.relayCapabilitiesVersion === rightConnector.relayCapabilitiesVersion
+			&& leftConnector.relayVersion === rightConnector.relayVersion
+		);
+	});
+};
+
 export const PrivateAccountSection = ({
 	onConnected,
+	onConnectorsLoaded = undefined,
 	onPrivateConnectionSaved = undefined,
+	shouldShowConnectorList = false,
 }: {
 	onConnected: () => void;
+	onConnectorsLoaded?: (connectors: PrivateConnectorDto[]) => void;
 	onPrivateConnectionSaved?: () => void;
+	shouldShowConnectorList?: boolean;
 }) => {
 	const routeParams = useGlobalSearchParams<{
 		privateConnectError?: string | string[];
@@ -68,6 +93,8 @@ export const PrivateAccountSection = ({
 	} = usePrivateSession();
 	const [backendUrl, setBackendUrl] = useState(sessionRecord?.backendUrl ?? pendingQrPayload?.backendUrl ?? DEFAULT_PRIVATE_BACKEND_URL);
 	const [connectors, setConnectors] = useState<PrivateConnectorDto[]>([]);
+	const [cameraLoadError, setCameraLoadError] = useState<string | null>(null);
+	const [cameraView, setCameraView] = useState<ComponentType<CameraViewProps> | null>(null);
 	const [email, setEmail] = useState("");
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const [isAuthenticating, setIsAuthenticating] = useState(false);
@@ -109,10 +136,32 @@ export const PrivateAccountSection = ({
 		const trimmed = rawValue.trim();
 		return trimmed.length > 0 ? trimmed : null;
 	}, [routeParams.privateConnectError]);
+	const scannerButtonLabel = useMemo(() => {
+		if (cameraLoadError) {
+			return "Camera Unavailable";
+		}
+
+		if (!cameraView) {
+			return "Loading Camera";
+		}
+
+		return isScannerOpen ? "Close Scanner" : "Scan QR";
+	}, [cameraLoadError, cameraView, isScannerOpen]);
+	const scannerUnavailableMessage = useMemo(() => {
+		if (!cameraLoadError) {
+			return null;
+		}
+
+		return "QR scanner is unavailable in the current iOS build. Rebuild the dev client to restore camera access.";
+	}, [cameraLoadError]);
+	const CameraViewComponent = cameraView;
+	const setConnectorsIfUnchanged = (nextConnectors: PrivateConnectorDto[]) => {
+		setConnectors((currentConnectors) => (areConnectorsEqual(currentConnectors, nextConnectors) ? currentConnectors : nextConnectors));
+	};
 
 	const loadConnectors = useCallback(async (record = sessionRecord) => {
 		if (!record) {
-			setConnectors([]);
+			setConnectorsIfUnchanged([]);
 			return [];
 		}
 
@@ -133,7 +182,7 @@ export const PrivateAccountSection = ({
 		}
 
 		if (!refreshedRecord.session.user.subscribed) {
-			setConnectors([]);
+			setConnectorsIfUnchanged([]);
 			return [];
 		}
 
@@ -147,7 +196,7 @@ export const PrivateAccountSection = ({
 			try {
 				const response = await createClient(refreshedRecord.session.accessToken).listConnectors();
 				const next = sortPrivateConnectors(response.connectors);
-				setConnectors(next);
+				setConnectorsIfUnchanged(next);
 				return next;
 			} catch (error) {
 				if (!(error instanceof Error)) {
@@ -161,7 +210,7 @@ export const PrivateAccountSection = ({
 
 				const response = await createClient(refreshed.accessToken).listConnectors();
 				const next = sortPrivateConnectors(response.connectors);
-				setConnectors(next);
+				setConnectorsIfUnchanged(next);
 				return next;
 			}
 		} finally {
@@ -230,6 +279,37 @@ export const PrivateAccountSection = ({
 		}
 	}, [privateConnectError]);
 
+	useEffect(() => {
+		onConnectorsLoaded?.(connectors);
+	}, [connectors, onConnectorsLoaded]);
+
+	useEffect(() => {
+		let isCancelled = false;
+
+		void (async () => {
+			try {
+				const cameraModule = await import("expo-camera");
+				if (isCancelled) {
+					return;
+				}
+
+				setCameraView(() => cameraModule.CameraView);
+				setCameraLoadError(null);
+			} catch (error: unknown) {
+				if (isCancelled) {
+					return;
+				}
+
+				setCameraView(null);
+				setCameraLoadError(error instanceof Error ? error.message : "ExpoCamera native module is unavailable.");
+			}
+		})();
+
+		return () => {
+			isCancelled = true;
+		};
+	}, []);
+
 	const handleAuthenticate = useCallback(async () => {
 		setIsAuthenticating(true);
 		setErrorMessage(null);
@@ -244,7 +324,7 @@ export const PrivateAccountSection = ({
 				session,
 			});
 			if (!session.user.subscribed) {
-				setConnectors([]);
+				setConnectorsIfUnchanged([]);
 				return;
 			}
 			const nextConnectors = await loadConnectors({
@@ -302,7 +382,7 @@ export const PrivateAccountSection = ({
 		} finally {
 			await clearPendingQrPayload();
 			await clearSessionRecord();
-			setConnectors([]);
+			setConnectorsIfUnchanged([]);
 		}
 	}, [clearPendingQrPayload, clearSessionRecord, sessionRecord]);
 
@@ -367,7 +447,7 @@ export const PrivateAccountSection = ({
 			</View>
 
 			{sessionRecord ? (
-					<View style={styles.formBody}>
+				<View style={styles.formBody}>
 					<View style={styles.accountSummary}>
 						<Text style={styles.summaryLabel}>Private access</Text>
 						<Text selectable style={styles.summaryValue}>{sessionRecord.session.user.email}</Text>
@@ -393,6 +473,7 @@ export const PrivateAccountSection = ({
 						<>
 							<View style={styles.inlineActions}>
 								<Pressable
+									disabled={!cameraView}
 									onPress={() => {
 										setIsScannerOpen((current) => !current);
 									}}
@@ -400,16 +481,18 @@ export const PrivateAccountSection = ({
 										styles.secondaryButton,
 										styles.inlineButton,
 										pressed ? styles.secondaryButtonPressed : null,
+										!cameraView ? styles.disabledButton : null,
 									]}
 									testID="private-account-scan-qr"
 								>
-									<Text style={styles.secondaryLabel}>{isScannerOpen ? "Close Scanner" : "Scan QR"}</Text>
+									<Text style={styles.secondaryLabel}>{scannerButtonLabel}</Text>
 								</Pressable>
 							</View>
+							{scannerUnavailableMessage ? <Text style={styles.supportText}>{scannerUnavailableMessage}</Text> : null}
 
-							{isScannerOpen ? (
+							{isScannerOpen && CameraViewComponent ? (
 								<View style={styles.scannerCard} testID="private-account-qr-scanner">
-									<CameraView
+									<CameraViewComponent
 										barcodeScannerSettings={{
 											barcodeTypes: ["qr"],
 										}}
@@ -422,34 +505,36 @@ export const PrivateAccountSection = ({
 								</View>
 							) : null}
 
-							<View style={styles.connectorList}>
-								<Text style={styles.summaryLabel}>Your Servers</Text>
-								{isLoadingConnectors ? <ActivityIndicator color={palette.accent} size="small" /> : null}
-								{connectors.length === 0 && !isLoadingConnectors ? (
-									<Text style={styles.supportText}>No private connectors found for this account yet.</Text>
-								) : null}
-								{connectors.map((connector, index) => (
-									<Pressable
-										key={connector.id}
-										onPress={() => {
-											void connectConnector(connector);
-										}}
-										style={({ pressed }) => [
-											styles.connectorRow,
-											pressed ? styles.connectorRowPressed : null,
-										]}
-										testID={`private-account-connector-${String(index)}`}
-									>
-										<View style={styles.rowTextGroup}>
-											<Text style={styles.rowTitle}>{connector.name}</Text>
-											<Text selectable style={styles.rowMeta}>
-												{connector.hostname} · {connector.status}
-											</Text>
-										</View>
-										<Text style={styles.secondaryLabel}>Connect</Text>
-									</Pressable>
-								))}
-							</View>
+							{shouldShowConnectorList ? (
+								<View style={styles.connectorList}>
+									<Text style={styles.summaryLabel}>Your Servers</Text>
+									{isLoadingConnectors ? <ActivityIndicator color={palette.accent} size="small" /> : null}
+									{connectors.length === 0 && !isLoadingConnectors ? (
+										<Text style={styles.supportText}>No private connectors found for this account yet.</Text>
+									) : null}
+									{connectors.map((connector, index) => (
+										<Pressable
+											key={connector.id}
+											onPress={() => {
+												void connectConnector(connector);
+											}}
+											style={({ pressed }) => [
+												styles.connectorRow,
+												pressed ? styles.connectorRowPressed : null,
+											]}
+											testID={`private-account-connector-${String(index)}`}
+										>
+											<View style={styles.rowTextGroup}>
+												<Text style={styles.rowTitle}>{connector.name}</Text>
+												<Text selectable style={styles.rowMeta}>
+													{connector.hostname} · {connector.status}
+												</Text>
+											</View>
+											<Text style={styles.secondaryLabel}>Connect</Text>
+										</Pressable>
+									))}
+								</View>
+							) : null}
 						</>
 					) : (
 						<View style={styles.subscribeCard} testID="private-account-subscribe-cta">

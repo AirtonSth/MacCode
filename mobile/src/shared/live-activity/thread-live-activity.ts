@@ -1,11 +1,10 @@
 import * as SecureStore from "expo-secure-store";
-import { addPushToStartTokenListener, type LiveActivity } from "expo-widgets";
+import type { LiveActivity } from "expo-widgets";
 import { Platform, type AppStateStatus } from "react-native";
 
-import {
-	threadLiveActivityFactory,
-	type ThreadLiveActivityPhase,
-	type ThreadLiveActivityProps,
+import type {
+	ThreadLiveActivityPhase,
+	ThreadLiveActivityProps,
 } from "./thread-live-activity.widget";
 
 const LOG_PREFIX = "[thread-live-activity]";
@@ -75,8 +74,26 @@ interface LiveActivityPushTokenUpdate {
 	pushToken: string;
 }
 
+interface PushToStartTokenEvent {
+	activityPushToStartToken: string;
+}
+
+interface ThreadLiveActivityFactory {
+	getInstances: () => LiveActivity<ThreadLiveActivityProps>[];
+	start: (
+		props: ThreadLiveActivityProps,
+		deepLink: string,
+	) => LiveActivity<ThreadLiveActivityProps>;
+}
+
+interface LiveActivityBindings {
+	addPushToStartTokenListener: (listener: (event: PushToStartTokenEvent) => void) => Subscription;
+	threadLiveActivityFactory: ThreadLiveActivityFactory;
+}
+
 let initialized = false;
 let liveActivitiesUnavailable = false;
+let liveActivityBindings: LiveActivityBindings | null = null;
 let activeState: PersistedLiveActivityState | null = null;
 let activeActivity: LiveActivity<ThreadLiveActivityProps> | null = null;
 let activityPushTokenSubscription: Subscription | null = null;
@@ -252,6 +269,37 @@ const sanitizeStatusLine = (value: string | undefined, fallback: string): string
 
 const sanitizePreview = (value: string | undefined, fallback: string): string =>
 	withDefault(toSafeLiveActivityText(value, PREVIEW_LIMIT, "preview"), fallback);
+
+const loadLiveActivityBindings = async (): Promise<LiveActivityBindings | null> => {
+	if (liveActivitiesUnavailable) {
+		return null;
+	}
+
+	if (liveActivityBindings) {
+		return liveActivityBindings;
+	}
+
+		try {
+			const [widgetsModule, widgetModule] = await Promise.all([
+				import("expo-widgets"),
+				import("./thread-live-activity.widget"),
+			]);
+
+			const nextBindings: LiveActivityBindings = {
+				addPushToStartTokenListener: widgetsModule.addPushToStartTokenListener,
+				threadLiveActivityFactory: widgetModule.threadLiveActivityFactory,
+			};
+			// eslint-disable-next-line require-atomic-updates
+			liveActivityBindings = nextBindings;
+			return liveActivityBindings;
+		} catch (error) {
+		liveActivitiesUnavailable = true;
+		log("live activities unavailable", {
+			error: error instanceof Error ? error.message : "unknown-error",
+		});
+		return null;
+	}
+};
 
 const isSupportedIosVersion = (): boolean => {
 	if (Platform.OS !== "ios") {
@@ -440,11 +488,17 @@ async function normalizeActivityInstance(): Promise<LiveActivity<ThreadLiveActiv
 		return activeActivity;
 	}
 
-	const instances = threadLiveActivityFactory.getInstances();
+	const bindings = await loadLiveActivityBindings();
+	if (!bindings) {
+		return null;
+	}
+
+	const instances = bindings.threadLiveActivityFactory.getInstances();
 	if (instances.length === 0) {
 		return null;
 	}
 
+	// eslint-disable-next-line require-atomic-updates
 	activeActivity = instances[0];
 	attachActivityPushTokenSubscription(activeActivity);
 
@@ -618,7 +672,13 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 	}
 
 	try {
-		initialized = true;
+		const bindings = await loadLiveActivityBindings();
+		if (!bindings) {
+			return;
+		}
+
+			// eslint-disable-next-line require-atomic-updates
+			initialized = true;
 		await hydratePersistedState();
 		await normalizeActivityInstance();
 		await syncCurrentActivityPushToken();
@@ -631,7 +691,7 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 			});
 		}
 
-			pushToStartTokenSubscription ||= addPushToStartTokenListener((event) => {
+			pushToStartTokenSubscription ||= bindings.addPushToStartTokenListener((event) => {
 				log("push-to-start token received", {
 					pushToken: toTokenPreview(event.activityPushToStartToken),
 				});
@@ -651,6 +711,11 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	}
 
 	await initializeThreadLiveActivityManager();
+	const bindings = await loadLiveActivityBindings();
+	if (!bindings) {
+		return;
+	}
+
 	if (input.restart && activeState) {
 		await clearThreadLiveActivity({
 			chatId: activeState.chatId,
@@ -715,7 +780,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	}
 
 	try {
-		activeActivity = threadLiveActivityFactory.start(
+		activeActivity = bindings.threadLiveActivityFactory.start(
 			toProps(activeState),
 			`remotecode-mobile://chat?chatId=${encodeURIComponent(activeState.chatId)}`,
 		);

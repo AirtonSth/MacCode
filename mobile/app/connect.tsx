@@ -6,7 +6,7 @@ import { ApiConfigStore } from "@/shared/api/api-config-store";
 import { usePrivateSession } from "@/shared/api/private-session-provider";
 import { buildPrivateConnectUrlFromParams } from "@/shared/api/private-mobile-connect";
 import { theme } from "@/shared/theme/tokens";
-import { runConnectRouteFlow } from "./connect.model";
+import { runConnectRouteFlow } from "@/features/connect/connect-route-flow";
 
 const normalizeParam = (value: string | string[] | undefined): string => {
 	if (Array.isArray(value)) {

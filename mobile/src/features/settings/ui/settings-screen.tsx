@@ -1,5 +1,5 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	ActivityIndicator,
 	Alert,
@@ -13,6 +13,7 @@ import {
 	TextInput,
 	View,
 } from "react-native";
+import type { PrivateConnectorDto } from "@remotecode/contracts";
 
 import { useApiConfig } from "../../../shared/api/api-config-provider";
 import { ApiConfigStore, type SavedConnection } from "../../../shared/api/api-config-store";
@@ -22,6 +23,7 @@ import { createRemoteCodeClient, isRemoteCodeUnauthorizedError } from "../../../
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import { PrivateAccountSection } from "./private-account-section";
+import { buildSavedConnectionItems } from "./settings-screen.model";
 
 type StatusTone = "error" | "neutral" | "success";
 type SettingsScreenSearchParam = string | string[] | undefined;
@@ -48,7 +50,6 @@ const palette = {
 
 const DEFAULT_SERVER_TOKEN = "remotecode.io-token";
 const DEFAULT_SERVER_PORT = "8835";
-
 const normalizeSearchParam = (value: SettingsScreenSearchParam): string | null => {
 	const rawValue = Array.isArray(value) ? value[0] : value;
 	if (typeof rawValue !== "string") {
@@ -103,6 +104,12 @@ const getSavedConnectionTitle = (connection: SavedConnection): string =>
 	connection.kind === "private"
 		? connection.connectorName
 		: toHost(connection.baseUrl) || connection.baseUrl;
+
+interface PrivateConnectorTarget {
+	backendUrl: string;
+	connectorId: string;
+	connectorName: string;
+}
 
 const normalizeConnectionBaseUrl = (value: string): string => {
 	const trimmed = value.trim();
@@ -171,9 +178,11 @@ export const SettingsScreen = () => {
 	const [isConnectingManual, setIsConnectingManual] = useState<boolean>(false);
 	const [isConnectingByServerId, setIsConnectingByServerId] = useState<Record<string, boolean>>({});
 	const [isConnectingBySavedKey, setIsConnectingBySavedKey] = useState<Record<string, boolean>>({});
+	const [isConnectingByConnectorId, setIsConnectingByConnectorId] = useState<Record<string, boolean>>({});
 	const [savedConnectionActionTarget, setSavedConnectionActionTarget] = useState<SavedConnection | null>(null);
 	const [discoveredServers, setDiscoveredServers] = useState<DiscoveredServer[]>([]);
 	const [savedConnections, setSavedConnections] = useState<SavedConnection[]>([]);
+	const [privateConnectors, setPrivateConnectors] = useState<PrivateConnectorDto[]>([]);
 	const [rememberedTokenByServerId, setRememberedTokenByServerId] = useState<Record<string, string>>({});
 	const ignoreSavedPressByKeyRef = useRef<Set<string>>(new Set());
 	const debugAutoConnectSignatureRef = useRef<string | null>(null);
@@ -190,9 +199,9 @@ export const SettingsScreen = () => {
 		setStatusTone(tone);
 	};
 
-	const goNext = () => {
+	const goNext = useCallback(() => {
 		router.push("/workspaces");
-	};
+	}, [router]);
 
 	const scanLan = useCallback(async () => {
 		setIsScanning(true);
@@ -251,8 +260,12 @@ export const SettingsScreen = () => {
 		setSavedConnections(currentSaved);
 	}, [config.activeTarget.kind, config.baseUrl, config.token]);
 
-	const connectSavedPrivateConnection = useCallback(async (connection: Extract<SavedConnection, { kind: "private" }>) => {
-		if (!sessionRecord || sessionRecord.backendUrl !== connection.backendUrl) {
+	const handlePrivateConnectorsLoaded = useCallback((connectors: PrivateConnectorDto[]) => {
+		setPrivateConnectors(connectors);
+	}, []);
+
+	const connectSavedPrivateConnection = useCallback(async (target: PrivateConnectorTarget) => {
+		if (!sessionRecord || sessionRecord.backendUrl !== target.backendUrl) {
 			setStatus("Sign in to reconnect this private server.", "error");
 			return false;
 		}
@@ -265,18 +278,18 @@ export const SettingsScreen = () => {
 			}
 
 			await activateConnector({
-				backendUrl: connection.backendUrl,
-				connectorId: connection.connectorId,
+				backendUrl: target.backendUrl,
+				connectorId: target.connectorId,
 				sessionRecordOverride: {
-					backendUrl: connection.backendUrl,
+					backendUrl: target.backendUrl,
 					session: refreshedSession,
 				},
 			});
 			await clearPendingQrPayload();
 			const next = await ApiConfigStore.saveSavedConnection({
-				backendUrl: connection.backendUrl,
-				connectorId: connection.connectorId,
-				connectorName: connection.connectorName,
+				backendUrl: target.backendUrl,
+				connectorId: target.connectorId,
+				connectorName: target.connectorName,
 				kind: "private",
 			});
 			setSavedConnections(next);
@@ -287,6 +300,30 @@ export const SettingsScreen = () => {
 			return false;
 		}
 	}, [activateConnector, clearPendingQrPayload, refreshSession, sessionRecord]);
+
+	const connectPrivateConnector = useCallback(async (connector: PrivateConnectorDto) => {
+		if (!sessionRecord) {
+			setStatus("Sign in to reconnect this private server.", "error");
+			return false;
+		}
+
+		const target: PrivateConnectorTarget = {
+			backendUrl: sessionRecord.backendUrl,
+			connectorId: connector.id,
+			connectorName: connector.name,
+		};
+
+		setSavedConnectionActionTarget(null);
+		const connectorKey = connector.id;
+		setIsConnectingByConnectorId((current) => ({ ...current, [connectorKey]: true }));
+		const connected = await connectSavedPrivateConnection(target);
+		setIsConnectingByConnectorId((current) => ({ ...current, [connectorKey]: false }));
+		if (connected) {
+			goNext();
+		}
+
+		return connected;
+	}, [connectSavedPrivateConnection, goNext, sessionRecord]);
 
 	useEffect(() => {
 		void scanLan();
@@ -477,6 +514,15 @@ export const SettingsScreen = () => {
 		}
 	};
 
+	const savedConnectionItems = useMemo(() => {
+		return buildSavedConnectionItems({
+			discoveredServers,
+			privateConnectors,
+			savedConnections,
+			sessionBackendUrl: sessionRecord?.backendUrl ?? null,
+		});
+	}, [discoveredServers, privateConnectors, savedConnections, sessionRecord?.backendUrl]);
+
 	useEffect(() => {
 		if (!shouldDebugAutoConnect || !debugBaseUrl || isConnectingManual) {
 			return;
@@ -559,7 +605,7 @@ export const SettingsScreen = () => {
 			style={styles.root}
 			testID="screen-settings"
 		>
-				<IosStackHeader shouldShowBack={false} subtitle="Select server connection" title="Server" />
+			<IosStackHeader shouldShowBack={false} subtitle="Select server connection" title="Server" />
 
 			<ScrollView
 				contentContainerStyle={styles.content}
@@ -570,22 +616,37 @@ export const SettingsScreen = () => {
 				<View style={styles.section}>
 					<View style={styles.sectionHeader}>
 						<Text style={styles.sectionTitle}>Saved Connections</Text>
+						<Pressable
+							onPress={() => {
+								void scanLan();
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								pressed ? styles.secondaryButtonPressed : null,
+								isScanning ? styles.disabledButton : null,
+							]}
+							disabled={isScanning}
+							testID="server-scan-button"
+						>
+							{isScanning ? <ActivityIndicator color={palette.text} size="small" /> : <Text style={styles.secondaryLabel}>Scan</Text>}
+						</Pressable>
 					</View>
-
-						<FlatList
-							data={savedConnections}
-							keyExtractor={(item) => toSavedConnectionKey(item)}
-							renderItem={({ item: connection, index }) => {
-								const connectionKey = toSavedConnectionKey(connection);
+					<FlatList
+						data={savedConnectionItems}
+						keyExtractor={(item) => item.key}
+						renderItem={({ item, index }) => {
+							if (item.kind === "saved-connection") {
+								const connection = item.connection;
+								const connectionKey = item.key;
 								const isConnecting = Boolean(isConnectingBySavedKey[connectionKey]);
 
 								return (
 									<Pressable
-										accessibilityLabel={`Connect saved server ${getSavedConnectionTitle(connection)}`}
+										accessibilityLabel={`Connect saved server ${item.title}`}
 										delayLongPress={280}
 										disabled={isConnecting}
 										onLongPress={() => {
-											if (isConnecting) {
+											if (!item.canDelete || isConnecting) {
 												return;
 											}
 
@@ -619,7 +680,10 @@ export const SettingsScreen = () => {
 									>
 										<View style={styles.rowTextGroup}>
 											<Text numberOfLines={1} style={styles.rowTitle}>
-												{getSavedConnectionTitle(connection)}
+												{item.title}
+											</Text>
+											<Text numberOfLines={1} selectable style={styles.rowMeta}>
+												{item.subtitle}
 											</Text>
 										</View>
 
@@ -630,67 +694,33 @@ export const SettingsScreen = () => {
 										)}
 									</Pressable>
 								);
-							}}
-						ListEmptyComponent={<Text style={styles.supportText}>No saved connection.</Text>}
-						contentContainerStyle={styles.connectionList}
-						removeClippedSubviews={false}
-						scrollEnabled={false}
-						showsVerticalScrollIndicator={false}
-					/>
-				</View>
-				<View style={styles.sectionDivider} />
-				<PrivateAccountSection
-					onConnected={() => {
-						goNext();
-					}}
-					onPrivateConnectionSaved={() => {
-						void hydrateSavedConnections();
-					}}
-				/>
-				<View style={styles.sectionDivider} />
+							}
 
-				<View style={styles.section}>
-					<View style={styles.sectionHeader}>
-						<Text style={styles.sectionTitle}>LAN Discovery</Text>
+							if (item.kind === "discovered-server") {
+								const server = item.server;
+								const isConnecting = Boolean(isConnectingByServerId[server.serverId]);
+
+								return (
 									<Pressable
-							onPress={() => {
-								void scanLan();
-							}}
-							style={({ pressed }) => [
-								styles.secondaryButton,
-								pressed ? styles.secondaryButtonPressed : null,
-								isScanning ? styles.disabledButton : null,
-							]}
-							disabled={isScanning}
-							testID="server-scan-button"
-						>
-							{isScanning ? <ActivityIndicator color={palette.text} size="small" /> : <Text style={styles.secondaryLabel}>Scan</Text>}
-						</Pressable>
-					</View>
-
-					<FlatList
-						data={discoveredServers}
-						keyExtractor={(item) => item.serverId}
-						renderItem={({ item: server, index }) => {
-							const isConnecting = Boolean(isConnectingByServerId[server.serverId]);
-							return (
-								<Pressable
-									accessibilityLabel={`Connect server ${server.hostname}:${String(server.port)}`}
-									disabled={isConnecting}
-									onPress={() => {
-										void connectDiscoveredServer(server);
-									}}
-									style={({ pressed }) => [
-										styles.listRow,
-										index % 2 === 0 ? styles.listRowStriped : null,
-										pressed ? styles.listRowPressed : null,
-										isConnecting ? styles.disabledButton : null,
-									]}
-									testID={`server-item-${String(index)}`}
+										accessibilityLabel={`Connect server ${server.hostname}:${String(server.port)}`}
+										disabled={isConnecting}
+										onPress={() => {
+											void connectDiscoveredServer(server);
+										}}
+										style={({ pressed }) => [
+											styles.listRow,
+											index % 2 === 0 ? styles.listRowStriped : null,
+											pressed ? styles.listRowPressed : null,
+											isConnecting ? styles.disabledButton : null,
+										]}
+										testID={`server-item-${String(index)}`}
 									>
 										<View style={styles.rowTextGroup}>
 											<Text numberOfLines={1} style={styles.rowTitle}>
-												{server.hostname || toHost(server.baseUrl) || server.baseUrl}
+												{item.title}
+											</Text>
+											<Text numberOfLines={1} selectable style={styles.rowMeta}>
+												{item.subtitle}
 											</Text>
 										</View>
 
@@ -700,15 +730,63 @@ export const SettingsScreen = () => {
 											<Text style={styles.disclosureSymbol}>{">"}</Text>
 										)}
 									</Pressable>
+								);
+							}
+
+							const connector = item.connector;
+							const isConnecting = Boolean(isConnectingByConnectorId[connector.id]);
+
+							return (
+								<Pressable
+									accessibilityLabel={`Connect private connector ${item.title}`}
+									disabled={isConnecting}
+									onPress={() => {
+										void connectPrivateConnector(connector);
+									}}
+									style={({ pressed }) => [
+										styles.listRow,
+										index % 2 === 0 ? styles.listRowStriped : null,
+										pressed ? styles.listRowPressed : null,
+										isConnecting ? styles.disabledButton : null,
+									]}
+									testID={`private-connector-item-${String(index)}`}
+								>
+									<View style={styles.rowTextGroup}>
+										<Text numberOfLines={1} style={styles.rowTitle}>
+											{item.title}
+										</Text>
+										<Text numberOfLines={1} selectable style={styles.rowMeta}>
+											{item.subtitle}
+										</Text>
+									</View>
+
+									{isConnecting ? (
+										<ActivityIndicator color={palette.accent} size="small" />
+									) : (
+										<Text style={styles.disclosureSymbol}>{">"}</Text>
+									)}
+								</Pressable>
 							);
 						}}
-						ListEmptyComponent={<Text style={styles.supportText}>No discovered server.</Text>}
+						ListEmptyComponent={<Text style={styles.supportText}>No available connection.</Text>}
 						contentContainerStyle={styles.connectionList}
 						removeClippedSubviews={false}
 						scrollEnabled={false}
 						showsVerticalScrollIndicator={false}
 					/>
 				</View>
+				<View style={styles.sectionDivider} />
+				<PrivateAccountSection
+					onConnectorsLoaded={handlePrivateConnectorsLoaded}
+					onConnected={() => {
+						goNext();
+					}}
+					onPrivateConnectionSaved={() => {
+						void hydrateSavedConnections();
+					}}
+					shouldShowConnectorList={false}
+				/>
+				<View style={styles.sectionDivider} />
 
 				<View style={styles.section}>
 					<View style={styles.sectionHeader}>
@@ -757,30 +835,30 @@ export const SettingsScreen = () => {
 							{statusMessage}
 						</Text>
 					</View>
-					) : null}
-				</ScrollView>
-				<IosActionSheet
-					actions={[
-						{
-							icon: "delete-outline",
-							key: "delete-saved-connection",
-							label: "Delete",
-							onPress: () => {
-								if (!savedConnectionActionTarget) {
-									return;
-								}
-								void deleteSavedConnection(savedConnectionActionTarget);
-							},
-							testID: "saved-server-delete",
-							tone: "destructive",
+				) : null}
+			</ScrollView>
+			<IosActionSheet
+				actions={[
+					{
+						icon: "delete-outline",
+						key: "delete-saved-connection",
+						label: "Delete",
+						onPress: () => {
+							if (!savedConnectionActionTarget) {
+								return;
+							}
+							void deleteSavedConnection(savedConnectionActionTarget);
 						},
-					]}
-					onClose={() => {
-						setSavedConnectionActionTarget(null);
-					}}
-					testID="saved-server-action-sheet"
-					title={
-						savedConnectionActionTarget
+						testID: "saved-server-delete",
+						tone: "destructive",
+					},
+				]}
+				onClose={() => {
+					setSavedConnectionActionTarget(null);
+				}}
+				testID="saved-server-action-sheet"
+				title={
+					savedConnectionActionTarget
 							? getSavedConnectionTitle(savedConnectionActionTarget)
 							: "Connection options"
 					}

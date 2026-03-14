@@ -46,19 +46,19 @@ export type ConnectRouteFlowResult =
 			pathname: "/settings";
 			privateConnectError?: undefined;
 			statusMessage?: undefined;
-		}
+	  }
 	| {
 			errorMessage?: undefined;
 			pathname: "/workspaces";
 			privateConnectError?: undefined;
 			statusMessage: string;
-		}
+	  }
 	| {
 			errorMessage: string;
 			pathname: "/settings";
 			privateConnectError: string;
 			statusMessage?: undefined;
-		};
+	  };
 
 export const runConnectRouteFlow = async (
 	input: ConnectRouteFlowDependencies,

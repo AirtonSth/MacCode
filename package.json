@@ -1,6 +1,7 @@
 {
   "name": "remotecode-workspace",
   "private": true,
+  "main": "index.js",
   "workspaces": [
     "desktop",
     "mobile",
