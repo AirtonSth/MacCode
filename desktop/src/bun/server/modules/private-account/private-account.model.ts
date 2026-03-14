@@ -1,5 +1,4 @@
 import type {
-	DesktopMobileConnectQrPayloadDto,
 	PrivateAccountStateDto,
 	PrivateAuthUserDto,
 	PrivateConnectorDto,
@@ -22,7 +21,6 @@ export interface PrivateAccountStateSnapshot {
 	connector: PrivateConnectorDto | null;
 	connectorRelayState: PrivateAccountStateDto["connectorRelayState"];
 	errorMessage: string | null;
-	qrPayload: DesktopMobileConnectQrPayloadDto | null;
 	user: PrivateAuthUserDto | null;
 }
 
@@ -30,4 +28,3 @@ export interface PrivateAccountAuthInput {
 	email: string;
 	password: string;
 }
-

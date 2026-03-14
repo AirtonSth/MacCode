@@ -22,7 +22,7 @@ test("refreshPrivateSessionRecord rotates the private session through the shared
 				refresh: refreshSpy,
 			}) as never,
 			sessionRecord: {
-				backendUrl: "https://private.remotecode.dev",
+				backendUrl: "https://private.remotecode.io:8787",
 				session: {
 					accessToken: "access-token",
 					refreshToken: "refresh-token",

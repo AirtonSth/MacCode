@@ -24,7 +24,7 @@ test("fetchPrivateTargetHealth rejects when the selected connector is missing", 
 			}) as never,
 			target: {
 				accessToken: "token",
-				backendUrl: "https://private.remotecode.dev",
+				backendUrl: "https://private.remotecode.io:8787",
 				connectorId: "missing",
 				kind: "private",
 			},

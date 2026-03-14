@@ -279,7 +279,7 @@ export const buildRealtimeWebSocketUrl = (target: ActiveConnectionTarget): strin
 			: normalized.replace(/^http:\/\//, "ws://");
 
 	if (target.kind === "private") {
-		return `${wsBase}/v1/ws`;
+		return `${wsBase}/v1/ws?accessToken=${encodeURIComponent(target.accessToken)}&connectorId=${encodeURIComponent(target.connectorId)}`;
 	}
 
 	return `${wsBase}/v1/ws?token=${encodeURIComponent(target.token)}`;

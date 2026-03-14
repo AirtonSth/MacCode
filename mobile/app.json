@@ -18,9 +18,6 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "io.remotecode",
-      "associatedDomains": [
-        "applinks:qr.remotecode.dev"
-      ],
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "NSAppTransportSecurity": {
@@ -42,22 +39,7 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "intentFilters": [
-        {
-          "action": "VIEW",
-          "category": [
-            "BROWSABLE",
-            "DEFAULT"
-          ],
-          "data": [
-            {
-              "host": "qr.remotecode.dev",
-              "pathPrefix": "/connect",
-              "scheme": "https"
-            }
-          ]
-        }
-      ],
+      "intentFilters": [],
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "POST_NOTIFICATIONS"

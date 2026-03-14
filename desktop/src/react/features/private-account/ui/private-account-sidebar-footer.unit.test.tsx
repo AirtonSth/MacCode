@@ -2,50 +2,117 @@ import { expect, test } from "bun:test";
 
 import {
 	getPrivateAccountStatusLabel,
-	serializePrivateAccountQrPayload,
+	isPrivateAccountSubscribed,
+	loadPrivateAccountState,
+	runPrivateAccountLoginAction,
 } from "./private-account-sidebar-footer";
 
-test("getPrivateAccountStatusLabel returns signed-out copy when no session exists", () => {
+test("private account status labels map authenticated/relay states", () => {
 	expect(getPrivateAccountStatusLabel(null)).toBe("Sign in");
+
+	expect(
+		getPrivateAccountStatusLabel({
+			authenticated: true,
+			connector: null,
+			connectorRelayState: "idle",
+			errorMessage: null,
+			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
+				email: "dev@example.com",
+				id: "usr_1",
+				subscribed: true,
+			},
+		}),
+	).toBe("Account ready");
+
+	expect(
+		getPrivateAccountStatusLabel({
+			authenticated: true,
+			connector: null,
+			connectorRelayState: "connected",
+			errorMessage: null,
+			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
+				email: "dev@example.com",
+				id: "usr_1",
+				subscribed: true,
+			},
+		}),
+	).toBe("Relay online");
 });
 
-test("getPrivateAccountStatusLabel reflects relay state for authenticated users", () => {
-	expect(getPrivateAccountStatusLabel({
-		authenticated: true,
-		connector: null,
-		connectorRelayState: "connected",
-		errorMessage: null,
-		qrPayload: null,
-		user: {
-			daysRemaing: 30,
-			daysRemaining: 30,
-			email: "dev@example.com",
-			id: "usr_1",
-			subscribed: true,
-		},
-	})).toBe("Relay online");
+test("private account subscription helper checks user subscription state", () => {
+	expect(
+		isPrivateAccountSubscribed({
+			authenticated: true,
+			connector: null,
+			connectorRelayState: "idle",
+			errorMessage: null,
+			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
+				email: "dev@example.com",
+				id: "usr_1",
+				subscribed: false,
+			},
+		}),
+	).toBe(false);
 });
 
-test("serializePrivateAccountQrPayload prefers universal link payloads for QR generation", () => {
-	expect(serializePrivateAccountQrPayload({
-		authenticated: true,
-		connector: null,
-		connectorRelayState: "connected",
-		errorMessage: null,
-		qrPayload: {
-			backendUrl: "http://127.0.0.1:8787",
-			connectorId: "con_1",
-			connectorName: "Desktop Connector",
-			linkUrl: "https://qr.remotecode.dev/connect/mcs_1/secret",
-			type: "remotecode_private_mobile_connect",
-			version: 1,
-		},
-		user: {
-			daysRemaing: 30,
-			daysRemaining: 30,
-			email: "dev@example.com",
-			id: "usr_1",
-			subscribed: true,
-		},
-	})).toBe("https://qr.remotecode.dev/connect/mcs_1/secret");
+test("private account sidebar helpers hydrate state and authenticate", async () => {
+	const client = {
+		getState: async () => ({
+			authenticated: false,
+			connector: null,
+			connectorRelayState: "idle" as const,
+			errorMessage: null,
+			user: null,
+		}),
+		login: async () => ({
+			authenticated: true,
+			connector: {
+				claimedAt: new Date().toISOString(),
+				hostname: "devbox.local",
+				id: "con_1",
+				isOnline: true,
+				lastSeenAt: new Date().toISOString(),
+				name: "Desktop Connector",
+				relayCapabilitiesVersion: "1",
+				relayVersion: "1.0.0",
+				status: "online" as const,
+			},
+			connectorRelayState: "connected" as const,
+			errorMessage: null,
+			user: {
+				daysRemaing: 30,
+				daysRemaining: 30,
+				email: "dev@example.com",
+				id: "usr_1",
+				subscribed: true,
+			},
+		}),
+		logout: async () => ({
+			authenticated: false,
+			connector: null,
+			connectorRelayState: "idle" as const,
+			errorMessage: null,
+			user: null,
+		}),
+		browserForgotPassword: async () => ({ url: "https://remotecode.io/forgot-password" }),
+		browserManageSubscription: async () => ({ url: "https://remotecode.io/app" }),
+		browserRegister: async () => ({ url: "https://remotecode.io/register" }),
+	};
+
+	const initialState = await loadPrivateAccountState(client);
+	expect(initialState.authenticated).toBe(false);
+
+	const loggedInState = await runPrivateAccountLoginAction({
+		client,
+		email: "dev@example.com",
+		password: "supersecret",
+	});
+	expect(loggedInState.user?.email).toBe("dev@example.com");
+	expect(loggedInState.connector?.name).toBe("Desktop Connector");
 });

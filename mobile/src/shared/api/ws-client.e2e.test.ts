@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 
 import { createRealtimeClient } from "./ws-client";
 
-test("createRealtimeClient opens the private relay websocket with connector headers", () => {
+test("createRealtimeClient opens the private relay websocket with query auth and connector headers", () => {
 	const openedSockets: { options?: { headers?: Record<string, string> }; url: string }[] = [];
 	const fakeSocket = {
 		close: () => undefined,
@@ -25,7 +25,7 @@ test("createRealtimeClient opens the private relay websocket with connector head
 		},
 		target: {
 			accessToken: "private-access-token",
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			kind: "private",
 		},
@@ -41,7 +41,7 @@ test("createRealtimeClient opens the private relay websocket with connector head
 					"x-remotecode-connector-id": "con_1",
 				},
 			},
-			url: "wss://private.remotecode.dev/v1/ws",
+			url: "wss://private.remotecode.io:8787/v1/ws?accessToken=private-access-token&connectorId=con_1",
 		},
 	]);
 });

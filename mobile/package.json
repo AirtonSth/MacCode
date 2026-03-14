@@ -22,7 +22,6 @@
     "@tanstack/react-query": "^5.90.1",
     "expo": "~55.0.4",
     "expo-background-task": "~55.0.9",
-    "expo-camera": "^17.0.8",
     "expo-constants": "~55.0.7",
     "expo-font": "~55.0.4",
     "expo-haptics": "~15.0.7",

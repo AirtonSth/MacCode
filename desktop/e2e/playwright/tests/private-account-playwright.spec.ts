@@ -25,7 +25,6 @@ const unauthenticatedState: PrivateAccountState = {
 	connector: null,
 	connectorRelayState: "idle",
 	errorMessage: null,
-	qrPayload: null,
 	user: null,
 };
 
@@ -44,13 +43,6 @@ const connectedState = (email: string): PrivateAccountState => ({
 	},
 	connectorRelayState: "connected",
 	errorMessage: null,
-	qrPayload: {
-		backendUrl: "http://127.0.0.1:8787",
-		connectorId: "con_1",
-		connectorName: "Desktop Connector",
-		type: "remotecode_private_mobile_connect",
-		version: 1,
-	},
 	user: {
 		daysRemaing: 30,
 		daysRemaining: 30,
@@ -62,7 +54,6 @@ const connectedState = (email: string): PrivateAccountState => ({
 
 const unsubscribedState = (email: string): PrivateAccountState => ({
 	...connectedState(email),
-	qrPayload: null,
 	user: {
 		daysRemaing: 30,
 		daysRemaining: 30,
@@ -333,7 +324,6 @@ test("private account login renders connector state and logout resets the footer
 	await expect(page.getByText("dev@example.com")).toBeVisible();
 	await expect(page.getByTestId("private-account-connector-card").getByText("Relay online")).toBeVisible();
 	await expect(page.getByTestId("private-account-connector-card")).not.toContainText("days remaining");
-	await expect(page.getByAltText("Private connect QR")).toBeVisible();
 
 	await page.getByRole("button", { name: /dev@example.com/i }).click();
 	const connectedDialog = page.getByRole("dialog", { name: "Private account modal" });
@@ -370,14 +360,13 @@ test("private account login without subscription opens subscription management i
 	await expect(page.getByTestId("private-account-subscribe-card")).toBeVisible();
 	await page.getByTestId("private-account-subscribe-link").click();
 	await expect.poll(async () => await readOpenedUrls(page)).toContain("https://remotecode.io/app");
-	await expect(page.getByAltText("Private connect QR")).toHaveCount(0);
 
 	await page.getByRole("button", { name: /maker@remotecode.io/i }).click();
 	const connectedDialog = page.getByRole("dialog", { name: "Private account modal" });
 	await expect(connectedDialog.getByText("Subscription inactive")).toBeVisible();
 	await connectedDialog.getByRole("link", { name: "Manage subscription" }).click();
 	await expect.poll(async () => await readOpenedUrls(page)).toContain("https://remotecode.io/app");
-	await expect(connectedDialog.getByAltText("Private connect QR enlarged")).toHaveCount(0);
+	await expect(connectedDialog.getByText("Activate private access")).toBeVisible();
 });
 
 test("private account login shows a friendly alert when credentials are invalid", async ({ page }) => {

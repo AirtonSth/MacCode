@@ -27,7 +27,6 @@ describe("createPrivateAccountApiClient", () => {
 				connector: null,
 				connectorRelayState: "idle",
 				errorMessage: null,
-				qrPayload: null,
 				user: null,
 			}), {
 				headers: {
@@ -69,13 +68,6 @@ describe("createPrivateAccountApiClient", () => {
 				},
 				connectorRelayState: "connected",
 				errorMessage: null,
-				qrPayload: {
-					backendUrl: "http://127.0.0.1:8787",
-					connectorId: "con_1",
-					connectorName: "Desktop Connector",
-					type: "remotecode_private_mobile_connect",
-					version: 1,
-				},
 				user: {
 					daysRemaing: 30,
 					daysRemaining: 30,
@@ -102,7 +94,6 @@ describe("createPrivateAccountApiClient", () => {
 			password: "supersecret",
 		});
 		expect(state.user?.email).toBe("dev@example.com");
-		expect(state.qrPayload?.connectorId).toBe("con_1");
 	});
 
 	test("throws PrivateAccountApiError on request failure", async () => {

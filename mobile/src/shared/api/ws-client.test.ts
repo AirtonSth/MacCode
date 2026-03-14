@@ -195,13 +195,13 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 	test("builds private websocket url and headers for relay mode", () => {
 		assert.equal(buildRealtimeWebSocketUrl({
 			accessToken: "private-access-token",
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			kind: "private",
-		}), "wss://private.remotecode.dev/v1/ws");
+		}), "wss://private.remotecode.io:8787/v1/ws?accessToken=private-access-token&connectorId=con_1");
 		assert.deepEqual(buildRealtimeWebSocketHeaders({
 			accessToken: "private-access-token",
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			kind: "private",
 		}), {
@@ -216,6 +216,6 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			kind: "private",
-		}), "wss://private.remotecode.io:8787/v1/ws");
+		}), "wss://private.remotecode.io:8787/v1/ws?accessToken=private-access-token&connectorId=con_1");
 	});
 });

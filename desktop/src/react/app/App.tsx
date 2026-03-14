@@ -24,6 +24,10 @@ import { PrivateAccountSidebarFooter } from "../features/private-account/ui/priv
 import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
 import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
 import {
+	mergeBufferedMessagesIntoPage,
+	pruneBufferedMessages,
+} from "../features/workspace/model/message-window-cache";
+import {
 	type ChatDTO,
 	type MessageDTO,
 	type ProjectDTO,
@@ -351,6 +355,7 @@ const App = (): JSX.Element => {
 	const wsRef = useRef<ReturnType<(typeof RemoteCodeRealtime)["createClient"]> | null>(null);
 	const selectedChatIdRef = useRef<string | null>(null);
 	const selectedProjectIdRef = useRef<string | null>(null);
+	const bufferedWorkspaceMessagesByChatRef = useRef<Record<string, MessageDTO[]>>({});
 	const persistedSelectedChatIdRef = useRef<string | null>(null);
 	const isCreatingChatRef = useRef<boolean>(false);
 	const sidebarWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
@@ -817,12 +822,24 @@ const App = (): JSX.Element => {
 
 			dispatch({ payload: true, type: "SET_MESSAGE_WINDOW_LOADING" });
 			try {
-				const messagePage = await api.listMessagesPage(chatId, {
+				const serverMessagePage = await api.listMessagesPage(chatId, {
 					beforeMessageId: request.kind === "older" ? request.beforeMessageId : undefined,
 					limit: MESSAGE_PAGE_SIZE,
 				});
-				const pageTurns = cloneChatTurnSnapshots(messagePage.turns);
 				const isLatestRequest = request.kind === "latest";
+				const bufferedMessages = isLatestRequest
+					? (bufferedWorkspaceMessagesByChatRef.current[chatId] ?? [])
+					: [];
+				const messagePage = isLatestRequest
+					? mergeBufferedMessagesIntoPage(serverMessagePage, bufferedMessages, MESSAGE_PAGE_SIZE)
+					: serverMessagePage;
+				if (isLatestRequest && bufferedMessages.length > 0) {
+					bufferedWorkspaceMessagesByChatRef.current = {
+						...bufferedWorkspaceMessagesByChatRef.current,
+						[chatId]: pruneBufferedMessages(bufferedMessages, serverMessagePage.messages),
+					};
+				}
+				const pageTurns = cloneChatTurnSnapshots(messagePage.turns);
 				const currentMessageWindow = messageWindowRef.current;
 				const keepLatestDirty =
 					!isLatestRequest &&
@@ -1565,6 +1582,19 @@ const App = (): JSX.Element => {
 								break;
 							}
 							if (isMessagePayload(messagePayload)) {
+								bufferedWorkspaceMessagesByChatRef.current = {
+									...bufferedWorkspaceMessagesByChatRef.current,
+									[messagePayload.chatId]: mergeBufferedMessagesIntoPage(
+										{
+											hasMore: false,
+											messages: bufferedWorkspaceMessagesByChatRef.current[messagePayload.chatId] ?? [],
+											nextBeforeMessageId: null,
+											turns: [],
+										},
+										[messagePayload],
+										MESSAGE_PAGE_SIZE,
+									).messages,
+								};
 								if (messagePayload.chatId === selectedChatIdRef.current) {
 									if (isShowingLatestWindowForChat(messagePayload.chatId)) {
 										dispatch({

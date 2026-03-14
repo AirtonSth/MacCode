@@ -29,14 +29,6 @@ export interface PrivateConnectorsResponseDto {
 	connectors: PrivateConnectorDto[];
 }
 
-export interface PrivateBootstrapQrPayloadDto {
-	backendUrl: string;
-	pairingCode: string;
-	pairingId: string;
-	type: "remotecode_private_pairing";
-	version: 1;
-}
-
 export interface PrivateBootstrapResponseDto {
 	connector: {
 		id: string;
@@ -47,7 +39,6 @@ export interface PrivateBootstrapResponseDto {
 		code: string;
 		id: string;
 		pollToken: string;
-		qrPayload: PrivateBootstrapQrPayloadDto;
 	};
 }
 
@@ -150,83 +141,10 @@ export interface PrivatePairingClaimRequestDto {
 	pairingCode: string;
 }
 
-export interface DesktopMobileConnectQrPayloadDto {
-	backendUrl: string;
-	connectorId: string;
-	connectorName: string;
-	linkUrl?: string | null;
-	type: "remotecode_private_mobile_connect";
-	version: 1;
-}
-
-export interface PrivateMobileConnectBootstrapRequestDto {
-	connectorId: string;
-}
-
-export interface PrivateMobileConnectBootstrapResponseDto {
-	connector: {
-		id: string;
-		name: string;
-	};
-	expiresAt: string;
-	linkUrl: string;
-}
-
-export interface PrivateMobileConnectClaimRequestDto {
-	code: string;
-	sessionId: string;
-}
-
-export interface PrivateMobileConnectClaimResponseDto {
-	connector: {
-		id: string;
-		name: string;
-	};
-	backendUrl: string;
-	session: PrivateSessionDto;
-}
-
 export interface PrivateAccountStateDto {
 	authenticated: boolean;
 	connector: PrivateConnectorDto | null;
 	connectorRelayState: "idle" | "connecting" | "connected" | "disconnected" | "error";
 	errorMessage: string | null;
-	qrPayload: DesktopMobileConnectQrPayloadDto | null;
 	user: PrivateAuthUserDto | null;
 }
-
-const isObject = (value: unknown): value is Record<string, unknown> =>
-	typeof value === "object" && value !== null;
-
-export const isDesktopMobileConnectQrPayload = (value: unknown): value is DesktopMobileConnectQrPayloadDto => {
-	if (!isObject(value)) {
-		return false;
-	}
-
-	return (
-		value.type === "remotecode_private_mobile_connect"
-		&& value.version === 1
-		&& typeof value.backendUrl === "string"
-		&& value.backendUrl.trim().length > 0
-		&& typeof value.connectorId === "string"
-		&& value.connectorId.trim().length > 0
-		&& typeof value.connectorName === "string"
-		&& value.connectorName.trim().length > 0
-	);
-};
-
-export const parseDesktopMobileConnectQrPayload = (raw: string): DesktopMobileConnectQrPayloadDto => {
-	const parsed = JSON.parse(raw) as unknown;
-
-	if (!isDesktopMobileConnectQrPayload(parsed)) {
-		throw new Error("invalid_private_mobile_qr_payload");
-	}
-
-	return {
-		backendUrl: parsed.backendUrl.trim(),
-		connectorId: parsed.connectorId.trim(),
-		connectorName: parsed.connectorName.trim(),
-		type: parsed.type,
-		version: parsed.version,
-	};
-};

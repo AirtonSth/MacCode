@@ -71,27 +71,12 @@ test("private-account api client completes desktop login and logout flow through
 				code: "PAIR-123",
 				id: "pair_1",
 				pollToken: "poll_1",
-				qrPayload: {
-					backendUrl: "http://127.0.0.1:8787",
-					pairingCode: "PAIR-123",
-					pairingId: "pair_1",
-					type: "remotecode_private_pairing",
-					version: 1,
-				},
 			},
 		}))
 		.post("/v1/private/pairing/claim", () => ({
 			claimedAt: new Date().toISOString(),
 			connectorId: "con_1",
 			status: "claimed",
-		}))
-		.post("/v1/private/mobile-connect/bootstrap", () => ({
-			connector: {
-				id: "con_1",
-				name: "Desktop Connector",
-			},
-			expiresAt: new Date(Date.now() + 60_000).toISOString(),
-			linkUrl: "https://qr.remotecode.dev/connect/mcs_1/secret_1",
 		}))
 		.get("/v1/private/connectors/bootstrap/:pairingId/status", () => ({
 			connector: {
@@ -131,11 +116,9 @@ test("private-account api client completes desktop login and logout flow through
 			password: "supersecret",
 		});
 		expect(loggedIn.authenticated).toBe(true);
-		expect(loggedIn.qrPayload?.type).toBe("remotecode_private_mobile_connect");
 
 		const loggedOut = await client.logout();
 		expect(loggedOut.authenticated).toBe(false);
-		expect(loggedOut.qrPayload).toBeNull();
 	} finally {
 		if (backend) {
 			await backend.app.stop(true);

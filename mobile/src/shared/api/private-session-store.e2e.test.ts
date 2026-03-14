@@ -25,18 +25,11 @@ describe("PrivateSessionStore integration flow", () => {
 		resetPrivateSessionSecureStoreForTests();
 	});
 
-	test("keeps pending QR payload while session is created and clears it independently", async () => {
+	test("persists and reads private session records", async () => {
 		setPrivateSessionSecureStoreForTests(createMemoryStore());
 
-		await PrivateSessionStore.savePendingQrPayload({
-			backendUrl: "https://private.remotecode.dev",
-			connectorId: "con_1",
-			connectorName: "Desktop Connector",
-			type: "remotecode_private_mobile_connect",
-			version: 1,
-		});
 		await PrivateSessionStore.saveSessionRecord({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			session: {
 				accessToken: "access-token",
 				refreshToken: "refresh-token",
@@ -51,13 +44,7 @@ describe("PrivateSessionStore integration flow", () => {
 		});
 
 		const populated = await PrivateSessionStore.read();
-		expect(populated.pendingQrPayload?.connectorId).toBe("con_1");
-		expect(populated.pendingQrPayload?.backendUrl).toBe("https://private.remotecode.dev");
 		expect(populated.sessionRecord?.session.accessToken).toBe("access-token");
-
-		await PrivateSessionStore.clearPendingQrPayload();
-		const cleared = await PrivateSessionStore.read();
-		expect(cleared.pendingQrPayload).toBeNull();
-		expect(cleared.sessionRecord?.backendUrl).toBe("https://private.remotecode.dev");
+		expect(populated.sessionRecord?.session.user.id).toBe("usr_1");
 	});
 });

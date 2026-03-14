@@ -96,13 +96,6 @@ test("desktop private-account browser routes hand off to the web flow and localh
 				code: "PAIR-123",
 				id: "pair_1",
 				pollToken: "poll_1",
-				qrPayload: {
-					backendUrl: "http://127.0.0.1:8787",
-					pairingCode: "PAIR-123",
-					pairingId: "pair_1",
-					type: "remotecode_private_pairing",
-					version: 1,
-				},
 			},
 		}))
 		.post("/v1/private/pairing/claim", ({ request }) => {

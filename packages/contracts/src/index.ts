@@ -31,11 +31,9 @@ export type {
 } from "./protocol";
 export { createPrivateClient, PrivateApiError } from "./private-client";
 export type {
-	DesktopMobileConnectQrPayloadDto,
 	PrivateAccountStateDto,
 	PrivateAuthCompletionExchangeRequestDto,
 	PrivateAuthUserDto,
-	PrivateBootstrapQrPayloadDto,
 	PrivateBootstrapResponseDto,
 	PrivateBootstrapStatusDto,
 	PrivateConnectorDto,
@@ -45,10 +43,6 @@ export type {
 	PrivateLoginRequestDto,
 	PrivateLogoutRequestDto,
 	PrivateMeResponseDto,
-	PrivateMobileConnectBootstrapRequestDto,
-	PrivateMobileConnectBootstrapResponseDto,
-	PrivateMobileConnectClaimRequestDto,
-	PrivateMobileConnectClaimResponseDto,
 	PrivatePairingClaimRequestDto,
 	PrivatePairingClaimResponseDto,
 	PrivateRefreshRequestDto,
@@ -62,9 +56,5 @@ export type {
 	PrivateSignupIntentDto,
 	PrivateSignupIntentRequestDto,
 	PrivateSignupIntentResponseDto,
-} from "./private-protocol";
-export {
-	isDesktopMobileConnectQrPayload,
-	parseDesktopMobileConnectQrPayload,
 } from "./private-protocol";
 export type { ServerApp } from "./server-app";

@@ -6,7 +6,7 @@ import { exchangePrivateAuthCompletion } from "./private-auth-completion";
 test("exchangePrivateAuthCompletion stores the session returned by the completion token exchange", async () => {
 	const sessionRecord = await exchangePrivateAuthCompletion({
 		completion: {
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			completionToken: "token_123",
 		},
 		createClient: () => ({
@@ -25,7 +25,7 @@ test("exchangePrivateAuthCompletion stores the session returned by the completio
 	});
 
 	expect(sessionRecord).toEqual({
-		backendUrl: "https://private.remotecode.dev",
+		backendUrl: "https://private.remotecode.io:8787",
 		session: {
 			accessToken: "access-token",
 			refreshToken: "refresh-token",

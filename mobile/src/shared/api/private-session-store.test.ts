@@ -29,7 +29,7 @@ describe("PrivateSessionStore", () => {
 		setPrivateSessionSecureStoreForTests(createMemoryStore());
 
 		await PrivateSessionStore.saveSessionRecord({
-			backendUrl: "https://private.remotecode.dev/",
+			backendUrl: "https://private.remotecode.io:8787/",
 			session: {
 				accessToken: "access-token",
 				refreshToken: "refresh-token",
@@ -44,7 +44,7 @@ describe("PrivateSessionStore", () => {
 		});
 
 		const state = await PrivateSessionStore.read();
-		expect(state.sessionRecord?.backendUrl).toBe("https://private.remotecode.dev");
+		expect(state.sessionRecord?.backendUrl).toBe("https://private.remotecode.io:8787");
 		expect(state.sessionRecord?.session.user.email).toBe("dev@example.com");
 	});
 });

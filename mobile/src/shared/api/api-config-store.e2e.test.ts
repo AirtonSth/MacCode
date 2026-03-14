@@ -41,14 +41,14 @@ describe("ApiConfigStore integration flow", () => {
 			token: "lan-token",
 		});
 		await ApiConfigStore.saveSavedConnection({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_9",
 			connectorName: "Desktop Connector",
 			kind: "private",
 		});
 		await ApiConfigStore.save(toApiConfig({
 			accessToken: "private-token",
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_9",
 			kind: "private",
 		}));

@@ -94,11 +94,11 @@ describe("createRemoteCodeClient live activity subscription contract", () => {
 		const client = createRemoteCodeClient({
 			activeTarget: {
 				accessToken: "private-access-token",
-				backendUrl: "https://private.remotecode.dev",
+				backendUrl: "https://private.remotecode.io:8787",
 				connectorId: "con_1",
 				kind: "private",
 			},
-			baseUrl: "https://private.remotecode.dev",
+			baseUrl: "https://private.remotecode.io:8787",
 			token: "private-access-token",
 		});
 
@@ -140,11 +140,11 @@ describe("createRemoteCodeClient live activity subscription contract", () => {
 		const client = createRemoteCodeClient({
 			activeTarget: {
 				accessToken: "expired-access-token",
-				backendUrl: "https://private.remotecode.dev",
+				backendUrl: "https://private.remotecode.io:8787",
 				connectorId: "con_1",
 				kind: "private",
 			},
-			baseUrl: "https://private.remotecode.dev",
+			baseUrl: "https://private.remotecode.io:8787",
 			token: "expired-access-token",
 		}, {
 			refreshPrivateAccessToken: async () => "fresh-access-token",

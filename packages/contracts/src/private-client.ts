@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention, functional/no-classes */
 /* eslint-disable @typescript-eslint/parameter-properties */
-/* eslint-disable max-lines, max-statements */
+/* eslint-disable max-statements */
 /* eslint-disable @typescript-eslint/no-magic-numbers */
 import type {
 	PrivateAuthCompletionExchangeRequestDto,
@@ -12,10 +12,6 @@ import type {
 	PrivateLoginRequestDto,
 	PrivateLogoutRequestDto,
 	PrivateMeResponseDto,
-	PrivateMobileConnectBootstrapRequestDto,
-	PrivateMobileConnectBootstrapResponseDto,
-	PrivateMobileConnectClaimRequestDto,
-	PrivateMobileConnectClaimResponseDto,
 	PrivatePairingClaimRequestDto,
 	PrivatePairingClaimResponseDto,
 	PrivateRefreshRequestDto,
@@ -162,16 +158,6 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				path: "/v1/private/connectors/bootstrap",
 			}),
 
-		claimMobileConnect: async (
-			input: PrivateMobileConnectClaimRequestDto,
-		): Promise<PrivateMobileConnectClaimResponseDto> =>
-			await request<PrivateMobileConnectClaimResponseDto>({
-				authenticated: false,
-				body: input,
-				method: "POST",
-				path: "/v1/private/mobile-connect/claim",
-			}),
-
 		claimPairing: async (input: PrivatePairingClaimRequestDto): Promise<PrivatePairingClaimResponseDto> =>
 			await request<PrivatePairingClaimResponseDto>({
 				body: input,
@@ -186,15 +172,6 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				authenticated: false,
 				method: "POST",
 				path: `/v1/private/auth/signup-intents/${encodeURIComponent(signupIntentId)}/complete`,
-			}),
-
-			createMobileConnectBootstrap: async (
-			input: PrivateMobileConnectBootstrapRequestDto,
-		): Promise<PrivateMobileConnectBootstrapResponseDto> =>
-			await request<PrivateMobileConnectBootstrapResponseDto>({
-				body: input,
-				method: "POST",
-				path: "/v1/private/mobile-connect/bootstrap",
 			}),
 
 		createSignupIntent: async (

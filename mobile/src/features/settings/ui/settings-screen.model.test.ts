@@ -116,7 +116,7 @@ test("buildSavedConnectionItems only includes online private connectors", () => 
 			},
 		],
 		savedConnections: [],
-		sessionBackendUrl: "https://private.remotecode.dev",
+		sessionBackendUrl: "https://private.remotecode.io:8787",
 	});
 
 	expect(items).toHaveLength(1);
@@ -151,7 +151,7 @@ test("buildSavedConnectionItems hides saved private connections from a different
 				lastConnectedAt: "2026-03-14T10:00:00.000Z",
 			},
 		],
-		sessionBackendUrl: "https://private.remotecode.dev",
+		sessionBackendUrl: "https://private.remotecode.io:8787",
 	});
 
 	expect(items).toHaveLength(1);

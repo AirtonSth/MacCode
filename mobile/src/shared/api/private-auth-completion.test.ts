@@ -15,7 +15,7 @@ test("parsePrivateAuthCompletionInput reads the auth completion deeplink", () =>
 });
 
 test("parsePrivateAuthCompletionInput rejects unrelated private links", () => {
-	expect(() => parsePrivateAuthCompletionInput("remotecode://connect/mcs_1/secret")).toThrow(
+	expect(() => parsePrivateAuthCompletionInput("remotecode://private/session")).toThrow(
 		"invalid_private_auth_completion_url",
 	);
 });

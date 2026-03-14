@@ -2,7 +2,6 @@ import { hostname as readHostname } from "node:os";
 
 import {
 	createPrivateClient,
-	type DesktopMobileConnectQrPayloadDto,
 	type PrivateAccountStateDto,
 	type PrivateConnectorDto,
 	type PrivateSessionDto,
@@ -16,31 +15,33 @@ import {
 	serverLogger,
 	toLogErrorDetails,
 } from "../../shared/core/server-logger";
-import { RelayConnectorClient } from "./relay-connector.client";
+import {
+	createRelayConnectorClient,
+	type RelayConnectorOptions,
+} from "./relay-connector.client";
 import type { PersistedPrivateConnector, PrivateAccountAuthInput, PrivateAccountStateSnapshot } from "./private-account.model";
 import { PrivateAccountRepository } from "./private-account.repository";
+
+type RelayConnectorClientContract = Pick<
+	ReturnType<typeof createRelayConnectorClient>,
+	"getState" | "start" | "stop"
+>;
 
 interface PrivateAccountServiceOptions {
 	backendUrl: string;
 	clock?: () => Date;
 	connectorName?: string;
+	createRelayClient?: (options: RelayConnectorOptions) => RelayConnectorClientContract;
 	heartbeatIntervalMs?: number;
 	localServerToken: string;
-	mobileConnectRefreshIntervalMs?: number;
 	platform?: NodeJS.Platform;
 	publicWebUrl?: string;
+	reconnectMaxDelayMs?: number;
 	reconnectDelayMs?: number;
 }
-
-interface MobileConnectQrLink {
-	connectorId: string;
-	expiresAt: string;
-	generatedAtMs: number;
-	linkUrl: string;
-}
-
-const DEFAULT_MOBILE_CONNECT_REFRESH_INTERVAL_MS = 5_000;
 const DEFAULT_PUBLIC_WEB_URL = "https://remotecode.io";
+const DEFAULT_RECONNECT_DELAY_MS = 1_000;
+const DEFAULT_RECONNECT_MAX_DELAY_MS = 15_000;
 
 const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
 	private_backend_unreachable: "Unable to connect. Is the computer able to access the url?",
@@ -54,9 +55,6 @@ const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
 
 const createStatusError = (message: string, status: number): Error & { status: number } =>
 	Object.assign(new Error(message), { status });
-
-const isPrivateAccountSubscribed = (user: PrivateSessionDto["user"] | null | undefined): boolean =>
-	Boolean(user?.subscribed);
 
 const normalizePrivateSession = (input: PrivateSessionDto): PrivateSessionDto => ({
 	...input,
@@ -111,12 +109,13 @@ export class PrivateAccountService {
 	private connector: PersistedPrivateConnector | null;
 	private connectorDto: PrivateConnectorDto | null = null;
 	private connectorRelayState: PrivateAccountStateDto["connectorRelayState"] = "idle";
+	private errorSource: "relay" | "state" | null = null;
 	private errorMessage: string | null = null;
 	private localApp: ServerApp | null = null;
 	private localServerBaseUrl: string | null = null;
-	private mobileConnectLink: MobileConnectQrLink | null = null;
+	private reconnectAttemptCount = 0;
 	private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-	private relayClient: RelayConnectorClient;
+	private relayClient: RelayConnectorClientContract;
 	private session: PrivateSessionDto | null;
 
 	public constructor(
@@ -126,12 +125,12 @@ export class PrivateAccountService {
 		const storedSession = this.repository.readSession();
 		this.session = storedSession ? normalizePrivateSession(storedSession) : null;
 		this.connector = this.repository.readConnector();
-		this.relayClient = new RelayConnectorClient({
+		this.relayClient = (options.createRelayClient ?? createRelayConnectorClient)({
 			heartbeatIntervalMs: options.heartbeatIntervalMs,
 			localRequestHandler: async (input) => await this.handleLocalRequest(input),
 			localServerToken: options.localServerToken,
 			onError: (message) => {
-				this.errorMessage = toPrivateAccountErrorMessage(new Error(message), message);
+				this.setErrorMessage(toPrivateAccountErrorMessage(new Error(message), message), "relay");
 				serverLogger.error("private-account", "Relay reported an error", {
 					relayState: this.connectorRelayState,
 					message,
@@ -145,7 +144,14 @@ export class PrivateAccountService {
 					nextState: state,
 					previousState,
 				});
-				if (state === "disconnected" && this.session && this.connector) {
+				if (state === "connected") {
+					this.reconnectAttemptCount = 0;
+					this.clearReconnect();
+					this.clearErrorMessage("relay");
+					return;
+				}
+
+				if ((state === "disconnected" || state === "error") && this.session && this.connector) {
 					this.scheduleReconnect();
 				}
 			},
@@ -166,19 +172,15 @@ export class PrivateAccountService {
 		if (this.session && this.connector) {
 			try {
 				await this.refreshSessionFromBackend();
-				const connectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
-				this.connectorDto = connectors.connectors.find((item) => item.id === this.connector?.connectorId) ?? null;
-				if (isPrivateAccountSubscribed(this.session?.user)) {
-					await this.ensureMobileConnectLink();
-				} else {
-					this.mobileConnectLink = null;
+				await this.refreshConnectorState();
+				if (this.localApp && this.localServerBaseUrl && (this.connectorRelayState === "idle" || this.connectorRelayState === "disconnected" || this.connectorRelayState === "error")) {
+					this.scheduleReconnect();
 				}
 			} catch (error) {
-				this.errorMessage = toPrivateAccountErrorMessage(error, "private_state_refresh_failed");
+				this.setErrorMessage(toPrivateAccountErrorMessage(error, "private_state_refresh_failed"), "state");
 			}
 		} else {
 			this.connectorDto = null;
-			this.mobileConnectLink = null;
 		}
 
 		const snapshot = this.snapshot();
@@ -187,7 +189,6 @@ export class PrivateAccountService {
 			connector: snapshot.connector,
 			connectorRelayState: snapshot.connectorRelayState,
 			errorMessage: snapshot.errorMessage,
-			qrPayload: snapshot.qrPayload,
 			user: snapshot.user,
 		};
 	}
@@ -210,7 +211,7 @@ export class PrivateAccountService {
 				userId: this.session.user.id,
 			});
 			this.repository.saveSession(this.session);
-			this.errorMessage = null;
+			this.clearErrorMessage();
 			await this.ensureConnector(true);
 			return await this.getState();
 		} catch (error) {
@@ -284,7 +285,7 @@ export class PrivateAccountService {
 			completionToken,
 		}));
 		this.repository.saveSession(this.session);
-		this.errorMessage = null;
+		this.clearErrorMessage();
 		await this.ensureConnector(true);
 		return await this.getState();
 	}
@@ -303,8 +304,8 @@ export class PrivateAccountService {
 		this.connector = null;
 		this.connectorDto = null;
 		this.connectorRelayState = "idle";
-		this.errorMessage = null;
-		this.mobileConnectLink = null;
+		this.clearErrorMessage();
+		this.reconnectAttemptCount = 0;
 		this.session = null;
 		this.repository.clearConnector();
 		this.repository.clearSession();
@@ -330,12 +331,22 @@ export class PrivateAccountService {
 			localServerBaseUrl: this.localServerBaseUrl,
 			privateBackendUrl: this.connector.backendUrl,
 		});
-		this.relayClient.start({
-			connectorId: this.connector.connectorId,
-			connectorToken: this.connector.connectorToken,
-			localServerBaseUrl: this.localServerBaseUrl,
-			privateBackendUrl: this.connector.backendUrl,
-		});
+		try {
+			this.relayClient.start({
+				connectorId: this.connector.connectorId,
+				connectorToken: this.connector.connectorToken,
+				localServerBaseUrl: this.localServerBaseUrl,
+				privateBackendUrl: this.connector.backendUrl,
+			});
+		} catch (error) {
+			serverLogger.error("private-account", "Relay start threw synchronously", {
+				connectorId: this.connector.connectorId,
+				...toLogErrorDetails(error),
+			});
+			this.setErrorMessage(toPrivateAccountErrorMessage(error, "private_relay_connect_failed"), "relay");
+			this.connectorRelayState = "error";
+			this.scheduleReconnect();
+		}
 	}
 
 	private async ensureConnector(allowRebootstrap: boolean): Promise<void> {
@@ -357,7 +368,7 @@ export class PrivateAccountService {
 					connectorId: this.connector.connectorId,
 					...toLogErrorDetails(error),
 				});
-				this.errorMessage = toPrivateAccountErrorMessage(error, "private_relay_connect_failed");
+				this.setErrorMessage(toPrivateAccountErrorMessage(error, "private_relay_connect_failed"), "relay");
 				if (!allowRebootstrap) {
 					return;
 				}
@@ -407,6 +418,20 @@ export class PrivateAccountService {
 		});
 		this.repository.saveConnector(this.connector);
 		await this.connectRelay();
+	}
+
+	private clearErrorMessage(source?: "relay" | "state"): void {
+		if (source && this.errorSource !== source) {
+			return;
+		}
+
+		this.errorMessage = null;
+		this.errorSource = null;
+	}
+
+	private setErrorMessage(message: string | null, source: "relay" | "state"): void {
+		this.errorMessage = message;
+		this.errorSource = message ? source : null;
 	}
 
 	private buildPublicWebUrl(path: string, params?: Record<string, string>): string {
@@ -474,42 +499,6 @@ export class PrivateAccountService {
 		};
 	}
 
-	private async ensureMobileConnectLink(): Promise<void> {
-		if (!this.session || !this.connector) {
-			this.mobileConnectLink = null;
-			return;
-		}
-
-		const now = Date.now();
-		const expiresAt = this.mobileConnectLink?.expiresAt
-			? new Date(this.mobileConnectLink.expiresAt).getTime()
-			: Number.NaN;
-		const needsRefresh = (
-			!this.mobileConnectLink
-			|| this.mobileConnectLink.connectorId !== this.connector.connectorId
-			|| now - this.mobileConnectLink.generatedAtMs >= (this.options.mobileConnectRefreshIntervalMs ?? DEFAULT_MOBILE_CONNECT_REFRESH_INTERVAL_MS)
-			|| !Number.isFinite(expiresAt)
-			|| expiresAt <= now
-		);
-		if (!needsRefresh) {
-			return;
-		}
-
-		const connectorId = this.connector.connectorId;
-		const bootstrap = await this.withPrivateAuth(async (client) =>
-			await client.createMobileConnectBootstrap({
-				connectorId,
-			}),
-		);
-
-		this.mobileConnectLink = {
-			connectorId: bootstrap.connector.id,
-			expiresAt: bootstrap.expiresAt,
-			generatedAtMs: now,
-			linkUrl: bootstrap.linkUrl,
-		};
-	}
-
 	private async refreshSession(): Promise<void> {
 		if (!this.session?.refreshToken) {
 			throw new PrivateApiError(401, null, "missing_private_refresh_token");
@@ -547,34 +536,58 @@ export class PrivateAccountService {
 			return;
 		}
 
+		const baseDelayMs = this.options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS;
+		const maxDelayMs = this.options.reconnectMaxDelayMs ?? DEFAULT_RECONNECT_MAX_DELAY_MS;
+		const delayMs = Math.min(baseDelayMs * 2 ** this.reconnectAttemptCount, maxDelayMs);
+		this.reconnectAttemptCount += 1;
 		serverLogger.warn("private-account", "Scheduling relay reconnect", {
 			connectorId: this.connector.connectorId,
-			delayMs: this.options.reconnectDelayMs ?? 1_000,
+			delayMs,
+			reconnectAttemptCount: this.reconnectAttemptCount,
 		});
 		this.reconnectTimeout = setTimeout(() => {
 			this.reconnectTimeout = null;
 			void this.ensureConnector(false);
-		}, this.options.reconnectDelayMs ?? 1_000);
+		}, delayMs);
 		this.reconnectTimeout.unref?.();
 	}
 
-	private snapshot(): PrivateAccountStateSnapshot {
-		const qrPayload: DesktopMobileConnectQrPayloadDto | null = this.connector && this.mobileConnectLink && isPrivateAccountSubscribed(this.session?.user)
-			? {
-				backendUrl: this.connector.backendUrl,
-				connectorId: this.connector.connectorId,
-				connectorName: this.connector.connectorName,
-				linkUrl: this.mobileConnectLink.linkUrl,
-				type: "remotecode_private_mobile_connect",
-				version: 1,
-			}
-			: null;
+	private async refreshConnectorState(): Promise<void> {
+		const connectorId = this.connector?.connectorId ?? "";
+		if (!connectorId) {
+			this.connectorDto = null;
+			return;
+		}
 
+		const connectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
+		this.connectorDto = connectors.connectors.find((item) => item.id === connectorId) ?? null;
+
+		if (this.connectorDto || !this.localApp || !this.localServerBaseUrl) {
+			return;
+		}
+
+		serverLogger.warn("private-account", "Persisted connector no longer exists upstream, re-bootstrapping", {
+			connectorId,
+			privateBackendUrl: this.options.backendUrl,
+		});
+		this.relayClient.stop();
+		this.repository.clearConnector();
+		this.connector = null;
+		await this.ensureConnector(true);
+
+		if (!this.connector) {
+			return;
+		}
+
+		const refreshedConnectors = await this.withPrivateAuth(async (client) => await client.listConnectors());
+		this.connectorDto = refreshedConnectors.connectors.find((item) => item.id === this.connector?.connectorId) ?? null;
+	}
+
+	private snapshot(): PrivateAccountStateSnapshot {
 		return {
 			connector: this.connectorDto,
 			connectorRelayState: this.connectorRelayState,
 			errorMessage: this.errorMessage,
-			qrPayload,
 			user: this.session?.user ?? null,
 		};
 	}

@@ -74,12 +74,6 @@ export const loginPrivateAccount = async (input: {
 
 type PrivateClientWithMeOnly = Pick<ReturnType<typeof createPrivateClient>, "me">;
 
-export const resolvePendingPrivateConnector = (input: {
-	connectors: PrivateConnectorDto[];
-	pendingConnectorId: string | null;
-}): PrivateConnectorDto | null =>
-	input.connectors.find((connector) => connector.id === input.pendingConnectorId) ?? null;
-
 export const refreshPrivateAccountSessionRecord = async (input: {
 	createClient?: (config: Parameters<typeof createPrivateClient>[0]) => PrivateClientWithMeOnly;
 	refreshSession?: () => Promise<PrivateSessionDto | null>;
@@ -145,11 +139,9 @@ export const persistSavedPrivateConnection = async (input: {
 export const loadPrivateConnectorsSafely = async (input: {
 	loadConnectors: () => Promise<PrivateConnectorDto[]>;
 	onError: (message: string) => void;
-	resumePendingQrConnection: (connectors: PrivateConnectorDto[]) => Promise<void>;
 }): Promise<void> => {
 	try {
-		const connectors = await input.loadConnectors();
-		await input.resumePendingQrConnection(connectors);
+		await input.loadConnectors();
 	} catch (error) {
 		input.onError(error instanceof Error ? error.message : "Unable to load private connectors.");
 	}

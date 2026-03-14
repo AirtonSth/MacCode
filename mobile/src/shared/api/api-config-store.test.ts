@@ -33,13 +33,13 @@ describe("ApiConfigStore", () => {
 
 		const saved = await ApiConfigStore.save(toApiConfig({
 			accessToken: "private-access-token",
-			backendUrl: "https://private.remotecode.dev/",
+			backendUrl: "https://private.remotecode.io:8787/",
 			connectorId: "con_1",
 			kind: "private",
 		}));
 		const hydrated = await ApiConfigStore.read();
 
-		expect(saved.baseUrl).toBe("https://private.remotecode.dev");
+		expect(saved.baseUrl).toBe("https://private.remotecode.io:8787");
 		expect(saved.token).toBe("private-access-token");
 		expect(hydrated.activeTarget.kind).toBe("private");
 		expect(hydrated.activeTarget.kind === "private" ? hydrated.activeTarget.connectorId : null).toBe("con_1");
@@ -93,7 +93,7 @@ describe("ApiConfigStore", () => {
 			token: "token-1",
 		});
 		await ApiConfigStore.saveSavedConnection({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			connectorName: "Desktop Connector",
 			kind: "private",
@@ -121,13 +121,13 @@ describe("ApiConfigStore", () => {
 			token: "token-2",
 		});
 		await ApiConfigStore.saveSavedConnection({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			connectorName: "Desktop A",
 			kind: "private",
 		});
 		await ApiConfigStore.saveSavedConnection({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			connectorName: "Desktop B",
 			kind: "private",
@@ -153,7 +153,7 @@ describe("ApiConfigStore", () => {
 			token: "token-1",
 		});
 		await ApiConfigStore.saveSavedConnection({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			connectorName: "Desktop Connector",
 			kind: "private",
@@ -170,7 +170,7 @@ describe("ApiConfigStore", () => {
 		expect(saved[0]?.kind).toBe("private");
 
 		await ApiConfigStore.deleteSavedConnection({
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			connectorName: "Desktop Connector",
 			kind: "private",
@@ -186,7 +186,7 @@ describe("ApiConfigStore", () => {
 
 		const saved = await ApiConfigStore.save(toApiConfig({
 			accessToken: "",
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_2",
 			kind: "private",
 		}));

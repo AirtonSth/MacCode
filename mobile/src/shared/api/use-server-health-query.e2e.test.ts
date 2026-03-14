@@ -33,7 +33,7 @@ test("fetchPrivateTargetHealth returns ok when the private connector is online",
 		}) as never,
 		target: {
 			accessToken: "token",
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			connectorId: "con_1",
 			kind: "private",
 		},

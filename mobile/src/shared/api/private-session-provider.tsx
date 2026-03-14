@@ -9,7 +9,6 @@ import {
 
 import {
 	createPrivateClient,
-	type DesktopMobileConnectQrPayloadDto,
 	type PrivateSessionDto,
 	PrivateApiError,
 } from "@remotecode/contracts";
@@ -24,13 +23,10 @@ interface PrivateSessionContextValue {
 		connectorId: string;
 		sessionRecordOverride?: PersistedPrivateSessionRecord;
 	}) => Promise<void>;
-	clearPendingQrPayload: () => Promise<void>;
 	clearSessionRecord: () => Promise<void>;
 	isLoaded: boolean;
-	pendingQrPayload: DesktopMobileConnectQrPayloadDto | null;
 	refreshSession: () => Promise<PrivateSessionDto | null>;
 	sessionRecord: PersistedPrivateSessionRecord | null;
-	setPendingQrPayload: (payload: DesktopMobileConnectQrPayloadDto) => Promise<void>;
 	setSessionRecord: (input: PersistedPrivateSessionRecord) => Promise<void>;
 }
 
@@ -74,12 +70,10 @@ export const PrivateSessionProvider = ({
 }) => {
 	const { config, update } = useApiConfig();
 	const [isLoaded, setIsLoaded] = useState(false);
-	const [pendingQrPayloadState, setPendingQrPayloadState] = useState<DesktopMobileConnectQrPayloadDto | null>(null);
 	const [sessionRecordState, setSessionRecordState] = useState<PersistedPrivateSessionRecord | null>(null);
 
 	const reload = useCallback(async () => {
 		const state = await PrivateSessionStore.read();
-		setPendingQrPayloadState(state.pendingQrPayload);
 		setSessionRecordState(state.sessionRecord);
 		setIsLoaded(true);
 	}, []);
@@ -100,16 +94,6 @@ export const PrivateSessionProvider = ({
 			await update(ApiConfigStore.defaultConfig);
 		}
 	}, [config.activeTarget.kind, update]);
-
-	const setPendingQrPayload = useCallback(async (payload: DesktopMobileConnectQrPayloadDto) => {
-		await PrivateSessionStore.savePendingQrPayload(payload);
-		setPendingQrPayloadState(payload);
-	}, []);
-
-	const clearPendingQrPayload = useCallback(async () => {
-		await PrivateSessionStore.clearPendingQrPayload();
-		setPendingQrPayloadState(null);
-	}, []);
 
 	const activateConnector = useCallback(async (input: {
 		backendUrl: string;
@@ -159,23 +143,17 @@ export const PrivateSessionProvider = ({
 
 	const value = useMemo<PrivateSessionContextValue>(() => ({
 		activateConnector,
-		clearPendingQrPayload,
 		clearSessionRecord,
 		isLoaded,
-		pendingQrPayload: pendingQrPayloadState,
 		refreshSession,
 		sessionRecord: sessionRecordState,
-		setPendingQrPayload,
 		setSessionRecord,
 	}), [
 		activateConnector,
-		clearPendingQrPayload,
 		clearSessionRecord,
 		isLoaded,
-		pendingQrPayloadState,
 		refreshSession,
 		sessionRecordState,
-		setPendingQrPayload,
 		setSessionRecord,
 	]);
 

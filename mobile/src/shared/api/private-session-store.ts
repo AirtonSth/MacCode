@@ -1,7 +1,4 @@
-import type {
-	DesktopMobileConnectQrPayloadDto,
-	PrivateSessionDto,
-} from "@remotecode/contracts";
+import type { PrivateSessionDto } from "@remotecode/contracts";
 
 interface SecureStoreLike {
 	deleteItemAsync: (key: string) => Promise<void>;
@@ -15,7 +12,6 @@ export interface PersistedPrivateSessionRecord {
 }
 
 interface PersistedPrivateState {
-	pendingQrPayload: DesktopMobileConnectQrPayloadDto | null;
 	sessionRecord: PersistedPrivateSessionRecord | null;
 }
 
@@ -44,23 +40,9 @@ const getSecureStore = async (): Promise<SecureStoreLike> => {
 
 const normalizeBackendUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
 
-const normalizePendingQrPayload = (
-	payload: DesktopMobileConnectQrPayloadDto | null | undefined,
-): DesktopMobileConnectQrPayloadDto | null => {
-	if (!payload) {
-		return null;
-	}
-
-	return {
-		...payload,
-		backendUrl: normalizeBackendUrl(payload.backendUrl),
-	};
-};
-
 const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 	if (!raw) {
 		return {
-			pendingQrPayload: null,
 			sessionRecord: null,
 		};
 	}
@@ -68,7 +50,6 @@ const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 	try {
 		const parsed = JSON.parse(raw) as Partial<PersistedPrivateState> | null;
 		const sessionRecord = parsed?.sessionRecord;
-		const pendingQrPayload = normalizePendingQrPayload(parsed?.pendingQrPayload as DesktopMobileConnectQrPayloadDto | null);
 		if (
 			!sessionRecord
 			|| typeof sessionRecord !== "object"
@@ -76,13 +57,11 @@ const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 			|| !sessionRecord.session
 		) {
 			return {
-				pendingQrPayload,
 				sessionRecord: null,
 			};
 		}
 
 		return {
-			pendingQrPayload,
 			sessionRecord: {
 				backendUrl: normalizeBackendUrl(sessionRecord.backendUrl),
 				session: sessionRecord.session,
@@ -90,7 +69,6 @@ const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 		};
 	} catch {
 		return {
-			pendingQrPayload: null,
 			sessionRecord: null,
 		};
 	}
@@ -98,10 +76,9 @@ const parsePrivateState = (raw: string | null): PersistedPrivateState => {
 
 const writePrivateState = async (state: PersistedPrivateState): Promise<PersistedPrivateState> => {
 	const secureStore = await getSecureStore();
-	if (!state.sessionRecord && !state.pendingQrPayload) {
+	if (!state.sessionRecord) {
 		await secureStore.deleteItemAsync(PRIVATE_STATE_KEY);
 		return {
-			pendingQrPayload: null,
 			sessionRecord: null,
 		};
 	}
@@ -111,19 +88,8 @@ const writePrivateState = async (state: PersistedPrivateState): Promise<Persiste
 };
 
 export const PrivateSessionStore = {
-	async clearPendingQrPayload(): Promise<void> {
-		const secureStore = await getSecureStore();
-		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
-		await writePrivateState({
-			...current,
-			pendingQrPayload: null,
-		});
-	},
 	async clearSessionRecord(): Promise<void> {
-		const secureStore = await getSecureStore();
-		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 		await writePrivateState({
-			...current,
 			sessionRecord: null,
 		});
 	},
@@ -131,25 +97,12 @@ export const PrivateSessionStore = {
 		const secureStore = await getSecureStore();
 		return parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 	},
-	async savePendingQrPayload(payload: DesktopMobileConnectQrPayloadDto): Promise<DesktopMobileConnectQrPayloadDto> {
-		const secureStore = await getSecureStore();
-		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
-		const normalized = normalizePendingQrPayload(payload);
-		await writePrivateState({
-			...current,
-			pendingQrPayload: normalized,
-		});
-		return normalized!;
-	},
 	async saveSessionRecord(input: PersistedPrivateSessionRecord): Promise<PersistedPrivateSessionRecord> {
-		const secureStore = await getSecureStore();
-		const current = parsePrivateState(await secureStore.getItemAsync(PRIVATE_STATE_KEY));
 		const normalized = {
 			backendUrl: normalizeBackendUrl(input.backendUrl),
 			session: input.session,
 		};
 		await writePrivateState({
-			...current,
 			sessionRecord: normalized,
 		});
 		return normalized;

@@ -1,13 +1,12 @@
 import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
-import { Stack, usePathname, useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
 	exchangePrivateAuthCompletion,
 	parsePrivateAuthCompletionInput,
 } from "@/shared/api/private-auth-completion";
-import { parsePrivateConnectInput } from "@/shared/api/private-mobile-connect";
 import { usePrivateSession } from "@/shared/api/private-session-provider";
 import { queryClient } from "@/shared/api/query-client";
 import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
@@ -20,9 +19,8 @@ import { QueryClientProvider } from "@tanstack/react-query";
 export const RootLayoutContent = () => {
 	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);
 	const lastHandledPrivateUrlRef = useRef<string | null>(null);
-	const pathname = usePathname();
 	const router = useRouter();
-	const { pendingQrPayload, setSessionRecord } = usePrivateSession();
+	const { setSessionRecord } = usePrivateSession();
 
 	const routePrivateAuthCompletionUrl = useCallback((rawUrl: string | null): boolean => {
 		if (!rawUrl) {
@@ -51,7 +49,7 @@ export const RootLayoutContent = () => {
 					completion,
 				});
 				await setSessionRecord(sessionRecord);
-				router.replace(pendingQrPayload ? "/settings" : "/workspaces");
+				router.replace("/workspaces");
 			} catch (error) {
 				router.replace({
 					params: {
@@ -63,35 +61,21 @@ export const RootLayoutContent = () => {
 		})();
 
 		return true;
-	}, [pendingQrPayload, router, setSessionRecord]);
+	}, [router, setSessionRecord]);
 
-	const routePrivateConnectUrl = useCallback((rawUrl: string | null) => {
+	const routePrivateUrl = useCallback((rawUrl: string | null) => {
 		if (!rawUrl) {
 			return;
 		}
 
+		if (lastHandledPrivateUrlRef.current === rawUrl) {
+			return;
+		}
+
 		if (routePrivateAuthCompletionUrl(rawUrl)) {
-			return;
+			lastHandledPrivateUrlRef.current = rawUrl;
 		}
-
-		try {
-			parsePrivateConnectInput(rawUrl);
-		} catch {
-			return;
-		}
-
-		if (lastHandledPrivateUrlRef.current === rawUrl && pathname === "/connect") {
-			return;
-		}
-
-		lastHandledPrivateUrlRef.current = rawUrl;
-		router.replace({
-			params: {
-				url: rawUrl,
-			},
-			pathname: "/connect" as never,
-		});
-	}, [pathname, routePrivateAuthCompletionUrl, router]);
+	}, [routePrivateAuthCompletionUrl]);
 
 	useEffect(() => {
 		void (async () => {
@@ -125,7 +109,7 @@ export const RootLayoutContent = () => {
 			try {
 				const initialUrl = await Linking.getInitialURL();
 				if (isActive) {
-					routePrivateConnectUrl(initialUrl);
+					routePrivateUrl(initialUrl);
 				}
 			} catch {
 				// Ignore malformed startup URLs.
@@ -133,14 +117,14 @@ export const RootLayoutContent = () => {
 		})();
 
 		const subscription = Linking.addEventListener("url", (event) => {
-			routePrivateConnectUrl(event.url);
+			routePrivateUrl(event.url);
 		});
 
 		return () => {
 			isActive = false;
 			subscription.remove();
 		};
-	}, [routePrivateConnectUrl]);
+	}, [routePrivateUrl]);
 
 	return (
 		<QueryClientProvider client={queryClient}>
@@ -157,7 +141,6 @@ export const RootLayoutContent = () => {
 				}}
 			>
 				<Stack.Screen name="index" options={{ headerShown: false }} />
-				<Stack.Screen name="connect" options={{ headerShown: false }} />
 				<Stack.Screen name="workspaces" options={{ headerShown: false }} />
 				<Stack.Screen name="threads" options={{ headerShown: false }} />
 				<Stack.Screen name="active-threads" options={{ headerShown: false }} />

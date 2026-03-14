@@ -1,5 +1,4 @@
 import type { PrivateAccountStateDto } from "@remotecode/contracts";
-import QRCode from "qrcode";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -11,14 +10,6 @@ import {
 
 export const isPrivateAccountSubscribed = (state: PrivateAccountStateDto | null): boolean =>
 	Boolean(state?.user?.subscribed);
-
-export const serializePrivateAccountQrPayload = (state: PrivateAccountStateDto): string | null => {
-	if (!state.qrPayload) {
-		return null;
-	}
-
-	return state.qrPayload.linkUrl ?? JSON.stringify(state.qrPayload);
-};
 
 export const getPrivateAccountStatusLabel = (state: PrivateAccountStateDto | null): string => {
 	if (!state?.authenticated) {
@@ -57,41 +48,23 @@ export const runPrivateAccountLoginAction = async (input: {
 		password: input.password,
 	});
 
-export const buildPrivateAccountQrDataUrl = async (input: {
-	createQrDataUrl: (value: string) => Promise<string>;
-	state: PrivateAccountStateDto;
-}): Promise<string | null> => {
-	const payload = serializePrivateAccountQrPayload(input.state);
-	if (!payload) {
-		return null;
-	}
-
-	return await input.createQrDataUrl(payload);
-};
-
 const defaultState: PrivateAccountStateDto = {
 	authenticated: false,
 	connector: null,
 	connectorRelayState: "idle",
 	errorMessage: null,
-	qrPayload: null,
 	user: null,
 };
 
 const defaultClient = createPrivateAccountApiClient();
 
-const defaultCreateQrDataUrl = async (value: string): Promise<string> =>
-	await QRCode.toDataURL(value, { margin: 1, width: 256 });
-
 export const PrivateAccountSidebarFooter = ({
 	client = defaultClient,
-	createQrDataUrl = defaultCreateQrDataUrl,
 	openExternalUrl = async (url: string): Promise<void> => {
 		globalThis.open(url, "_blank", "noopener,noreferrer");
 	},
 }: {
 	client?: PrivateAccountApiClient;
-	createQrDataUrl?: (value: string) => Promise<string>;
 	openExternalUrl?: (url: string) => Promise<void>;
 }) => {
 	const [state, setState] = useState<PrivateAccountStateDto>(defaultState);
@@ -100,7 +73,6 @@ export const PrivateAccountSidebarFooter = ({
 	const [isModalOpen, setIsModalOpen] = useState(false);
 	const [isSubmitting, setIsSubmitting] = useState(false);
 	const [password, setPassword] = useState("");
-	const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
 	const [toastMessage, setToastMessage] = useState<string | null>(null);
 
 	const refreshState = useCallback(async (): Promise<void> => {
@@ -152,35 +124,6 @@ export const PrivateAccountSidebarFooter = ({
 			globalThis.clearTimeout(timeout);
 		};
 	}, [errorMessage]);
-
-	useEffect(() => {
-		const payload = serializePrivateAccountQrPayload(state);
-		if (!payload) {
-			setQrDataUrl(null);
-			return;
-		}
-
-		let cancelled = false;
-		void (async () => {
-			try {
-				const nextQrDataUrl = await buildPrivateAccountQrDataUrl({
-					createQrDataUrl,
-					state,
-				});
-				if (!cancelled) {
-					setQrDataUrl(nextQrDataUrl);
-				}
-			} catch {
-				if (!cancelled) {
-					setQrDataUrl(null);
-				}
-			}
-		})();
-
-		return () => {
-			cancelled = true;
-		};
-	}, [createQrDataUrl, state]);
 
 	const statusLabel = useMemo(() => getPrivateAccountStatusLabel(state), [state]);
 	const isSubscribed = useMemo(() => isPrivateAccountSubscribed(state), [state]);
@@ -287,26 +230,15 @@ export const PrivateAccountSidebarFooter = ({
 						type="button"
 					>
 						<div className="flex items-start justify-between gap-3">
-							<div className="min-w-0">
-								<p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Private Connector</p>
-								<p className="truncate text-sm font-semibold text-slate-100">
-									{state.connector?.name ?? state.qrPayload?.connectorName ?? "Desktop Connector"}
-								</p>
-								<p className="text-xs text-slate-300">{statusLabel}</p>
-							</div>
-							{qrDataUrl ? (
-								<img
-									alt="Private connect QR"
-									className="h-20 w-20 rounded-lg border border-white/10 bg-white p-1"
-									src={qrDataUrl}
-								/>
-							) : (
-								<div className="flex h-20 w-20 items-center justify-center rounded-lg border border-dashed border-white/15 text-[11px] text-slate-400">
-									QR
-								</div>
-							)}
-						</div>
-					</button>
+				<div className="min-w-0">
+						<p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Private Connector</p>
+						<p className="truncate text-sm font-semibold text-slate-100">
+							{state.connector?.name ?? "Desktop Connector"}
+						</p>
+						<p className="text-xs text-slate-300">{statusLabel}</p>
+					</div>
+					</div>
+				</button>
 				) : (
 					<div
 						className="mb-3 rounded-2xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(250,204,21,0.15),rgba(249,115,22,0.08))] p-3 text-slate-100"
@@ -434,38 +366,25 @@ export const PrivateAccountSidebarFooter = ({
 										</span>
 									</div>
 								</div>
-								{isSubscribed ? (
-									<div className="rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))] p-4">
-										<div className="mb-3 flex items-center justify-between gap-3">
-											<div>
-												<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Connector QR</p>
-												<p className="text-sm text-slate-200">Scan on mobile with a larger code.</p>
-											</div>
-										</div>
-										{qrDataUrl ? (
-											<div className="mx-auto flex w-fit flex-col items-center gap-3">
-												<img
-													alt="Private connect QR enlarged"
-													className="h-64 w-64 rounded-2xl border border-white/10 bg-white p-3 shadow-[0_12px_30px_rgba(0,0,0,0.28)]"
-													src={qrDataUrl}
-												/>
-												<p className="text-center text-xs text-slate-400">
-													Open the mobile app and scan this code to pair the connector.
-												</p>
-											</div>
-										) : (
-											<div className="flex min-h-64 items-center justify-center rounded-2xl border border-dashed border-white/15 text-sm text-slate-400">
-												QR code unavailable
-											</div>
-										)}
-									</div>
-								) : (
-									<div className="rounded-2xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(250,204,21,0.15),rgba(249,115,22,0.08))] p-4">
-										<p className="text-[11px] uppercase tracking-[0.16em] text-amber-200/80">Subscription</p>
-										<h4 className="mt-1 text-base font-semibold text-amber-50">Activate pairing on mobile</h4>
-										<p className="mt-2 text-sm leading-6 text-amber-100/80">
-											Subscribe to generate QR codes, connect this desktop on mobile, and keep the relay available.
-										</p>
+					{isSubscribed ? (
+						<div className="rounded-2xl border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.05),rgba(255,255,255,0.02))] p-4">
+							<div className="mb-3 flex items-center justify-between gap-3">
+								<div>
+									<p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Private Connector</p>
+									<p className="text-sm text-slate-200">Relay is connected to your desktop account.</p>
+								</div>
+							</div>
+							<p className="text-sm text-slate-200">
+								Relay remains available while the desktop stays signed in.
+							</p>
+						</div>
+					) : (
+						<div className="rounded-2xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(250,204,21,0.15),rgba(249,115,22,0.08))] p-4">
+							<p className="text-[11px] uppercase tracking-[0.16em] text-amber-200/80">Subscription</p>
+							<h4 className="mt-1 text-base font-semibold text-amber-50">Activate private access</h4>
+							<p className="mt-2 text-sm leading-6 text-amber-100/80">
+								Subscribe to unlock mobile sync and relay management.
+							</p>
 										<a
 											className="mt-4 inline-flex rounded-full bg-amber-200 px-3 py-2 text-sm font-semibold text-[#2b1906] transition hover:bg-amber-100"
 											href="#manage-subscription"

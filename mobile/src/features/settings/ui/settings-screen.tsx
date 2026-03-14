@@ -170,7 +170,7 @@ export const SettingsScreen = () => {
 	const searchParams = useLocalSearchParams() as SettingsScreenSearchParams;
 	const router = useRouter();
 	const { config, update } = useApiConfig();
-	const { activateConnector, clearPendingQrPayload, refreshSession, sessionRecord } = usePrivateSession();
+	const { activateConnector, refreshSession, sessionRecord } = usePrivateSession();
 	const [baseUrl, setBaseUrl] = useState<string>(() => toManualConnectionInput(config.baseUrl));
 	const [statusTone, setStatusTone] = useState<StatusTone>("neutral");
 	const [statusMessage, setStatusMessage] = useState<string>("");
@@ -285,7 +285,6 @@ export const SettingsScreen = () => {
 					session: refreshedSession,
 				},
 			});
-			await clearPendingQrPayload();
 			const next = await ApiConfigStore.saveSavedConnection({
 				backendUrl: target.backendUrl,
 				connectorId: target.connectorId,
@@ -299,7 +298,7 @@ export const SettingsScreen = () => {
 			setStatus(error instanceof Error ? error.message : "Unable to connect to private server.", "error");
 			return false;
 		}
-	}, [activateConnector, clearPendingQrPayload, refreshSession, sessionRecord]);
+	}, [activateConnector, refreshSession, sessionRecord]);
 
 	const connectPrivateConnector = useCallback(async (connector: PrivateConnectorDto) => {
 		if (!sessionRecord) {

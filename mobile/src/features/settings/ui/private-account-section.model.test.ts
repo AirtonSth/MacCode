@@ -12,7 +12,6 @@ import {
 	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
 	persistSavedPrivateConnection,
-	resolvePendingPrivateConnector,
 	sortPrivateConnectors,
 } from "./private-account-section.model";
 
@@ -45,31 +44,10 @@ test("sortPrivateConnectors prioritizes online connectors", () => {
 	expect(sorted[0]?.id).toBe("con_1");
 });
 
-test("resolvePendingPrivateConnector finds the scanned desktop connector in the account list", () => {
-	const connector = resolvePendingPrivateConnector({
-		connectors: [
-			{
-				claimedAt: "2026-01-02T00:00:00.000Z",
-				hostname: "online.local",
-				id: "con_1",
-				isOnline: true,
-				lastSeenAt: "2026-01-02T00:00:00.000Z",
-				name: "Online",
-				relayCapabilitiesVersion: "1",
-				relayVersion: "1.0.0",
-				status: "online",
-			},
-		],
-		pendingConnectorId: "con_1",
-	});
-
-	expect(connector?.hostname).toBe("online.local");
-});
-
 test("loginPrivateAccount delegates login to the shared contracts client", async () => {
 	const password = ["super", "secret"].join("");
 	const session = await loginPrivateAccount({
-		baseUrl: "https://private.remotecode.dev",
+		baseUrl: "https://private.remotecode.io:8787",
 		createClient: () => ({
 			login: async () => ({
 				accessToken: "access-token",
@@ -100,7 +78,6 @@ test("loadPrivateConnectorsSafely reports load failures instead of rejecting", a
 		onError: (message) => {
 			seenMessage = message;
 		},
-		resumePendingQrConnection: async () => undefined,
 	});
 
 	expect(seenMessage).toBe("connector_load_failed");
@@ -113,7 +90,7 @@ test("persistSavedPrivateConnection stores a reconnectable private saved connect
 	let persistedKind = "";
 
 	await persistSavedPrivateConnection({
-		backendUrl: "https://private.remotecode.dev/",
+		backendUrl: "https://private.remotecode.io:8787/",
 		connector: {
 			id: "con_1",
 			name: "Desktop Connector",
@@ -129,7 +106,7 @@ test("persistSavedPrivateConnection stores a reconnectable private saved connect
 		},
 	});
 
-	expect(persistedBackendUrl).toBe("https://private.remotecode.dev");
+	expect(persistedBackendUrl).toBe("https://private.remotecode.io:8787");
 	expect(persistedConnectorId).toBe("con_1");
 	expect(persistedConnectorName).toBe("Desktop Connector");
 	expect(persistedKind).toBe("private");
@@ -137,20 +114,20 @@ test("persistSavedPrivateConnection stores a reconnectable private saved connect
 
 test("buildPrivateRegisterUrl sends mobile users to the browser registration flow", () => {
 	expect(buildPrivateRegisterUrl({
-		backendUrl: "https://private.remotecode.dev/",
+		backendUrl: "https://private.remotecode.io:8787/",
 		email: "dev@example.com",
 		platform: "ios",
 	})).toBe(
-		"https://remotecode.io/register?backendUrl=https%3A%2F%2Fprivate.remotecode.dev&email=dev%40example.com&platform=ios&returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete&target=mobile",
+		"https://remotecode.io/register?backendUrl=https%3A%2F%2Fprivate.remotecode.io%3A8787&email=dev%40example.com&platform=ios&returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete&target=mobile",
 	);
 });
 
 test("buildPrivateForgotPasswordUrl preserves the backend and optional email", () => {
 	expect(buildPrivateForgotPasswordUrl({
-		backendUrl: "https://private.remotecode.dev/",
+		backendUrl: "https://private.remotecode.io:8787/",
 		email: "dev@example.com",
 	})).toBe(
-		"https://remotecode.io/forgot-password?backendUrl=https%3A%2F%2Fprivate.remotecode.dev&email=dev%40example.com",
+		"https://remotecode.io/forgot-password?backendUrl=https%3A%2F%2Fprivate.remotecode.io%3A8787&email=dev%40example.com",
 	);
 });
 
@@ -174,7 +151,7 @@ test("refreshPrivateAccountSessionRecord updates subscription state from private
 	const refreshed = await refreshPrivateAccountSessionRecord({
 		createClient,
 		sessionRecord: {
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			session: {
 				accessToken: "access-token",
 				refreshToken: "refresh-token",
@@ -230,7 +207,7 @@ test("refreshPrivateAccountSessionRecord refreshes tokens when /me returns unaut
 		createClient,
 		refreshSession,
 		sessionRecord: {
-			backendUrl: "https://private.remotecode.dev",
+			backendUrl: "https://private.remotecode.io:8787",
 			session: {
 				accessToken: "expired-token",
 				refreshToken: "refresh-token",

@@ -1,19 +1,16 @@
 /* eslint-disable import/no-unresolved */
 import { expect, test } from "bun:test";
 
-import { parseDesktopMobileConnectQrPayload } from "@remotecode/contracts";
-
 import {
 	buildPrivateRegisterUrl,
 	loginPrivateAccount,
 	persistSavedPrivateConnection,
-	resolvePendingPrivateConnector,
 } from "./private-account-section.model";
 
-test("private account section flow logs in and resolves a scanned desktop connector", async () => {
-	const password = ["super", "secret"].join("");
+test("private account section flow logs in with valid credentials", async () => {
+	const password = ["s", "uper", "secret"].join("");
 	const session = await loginPrivateAccount({
-		baseUrl: "https://private.remotecode.dev",
+		baseUrl: "https://private.remotecode.io:8787",
 		createClient: () => ({
 			login: async () => ({
 				accessToken: "access-token",
@@ -30,47 +27,16 @@ test("private account section flow logs in and resolves a scanned desktop connec
 		email: "dev@example.com",
 		password,
 	});
-	const payload = parseDesktopMobileConnectQrPayload(JSON.stringify({
-		backendUrl: "https://private.remotecode.dev",
-		connectorId: "con_1",
-		connectorName: "Desktop Connector",
-		type: "remotecode_private_mobile_connect",
-		version: 1,
-	}));
-	const connector = resolvePendingPrivateConnector({
-		connectors: [
-			{
-				claimedAt: new Date().toISOString(),
-				hostname: "devbox.local",
-				id: "con_1",
-				isOnline: true,
-				lastSeenAt: new Date().toISOString(),
-				name: "Desktop Connector",
-				relayCapabilitiesVersion: "1",
-				relayVersion: "1.0.0",
-				status: "online",
-			},
-		],
-		pendingConnectorId: payload.connectorId,
-	});
 
 	expect(session.user.email).toBe("dev@example.com");
-	expect(connector?.id).toBe("con_1");
-});
-
-test("private account section builds the browser registration URL with a native return target", () => {
-	expect(buildPrivateRegisterUrl({
-		backendUrl: "https://private.remotecode.dev",
-		email: "founder@remotecode.io",
-		platform: "android",
-	})).toContain("returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete");
+	expect(session.accessToken).toBe("access-token");
 });
 
 test("private account section persistence helper writes the claimed connector as a saved private connection", async () => {
 	let persistedConnectorId = "";
 
 	await persistSavedPrivateConnection({
-		backendUrl: "https://private.remotecode.dev",
+		backendUrl: "https://private.remotecode.io:8787",
 		connector: {
 			id: "con_42",
 			name: "Studio MacBook",
@@ -82,4 +48,13 @@ test("private account section persistence helper writes the claimed connector as
 	});
 
 	expect(persistedConnectorId).toBe("con_42");
+});
+
+
+test("private account section builds the browser registration URL with a native return target", () => {
+	expect(buildPrivateRegisterUrl({
+		backendUrl: "https://private.remotecode.io:8787",
+		email: "founder@remotecode.io",
+		platform: "android",
+	})).toContain("returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete");
 });

@@ -5,7 +5,7 @@ import { refreshPrivateSessionRecord, toPrivateApiConfig } from "./private-sessi
 
 test("toPrivateApiConfig converts a private session and connector into the active private target", () => {
 	const config = toPrivateApiConfig({
-		backendUrl: "https://private.remotecode.dev",
+		backendUrl: "https://private.remotecode.io:8787",
 		connectorId: "con_1",
 		session: {
 			accessToken: "access-token",

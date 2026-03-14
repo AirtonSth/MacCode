@@ -142,7 +142,6 @@ export const ServerBootstrap = {
 		databasePath?: string;
 		disableLiveActivityPush?: boolean;
 		port?: number;
-		privateMobileConnectRefreshIntervalMs?: number;
 		privateBackendUrl?: string;
 	}) {
 		const listenPort = options?.port ?? serverConfig.port;
@@ -197,7 +196,6 @@ export const ServerBootstrap = {
 		const privateAccountService = createPrivateAccountService(privateAccountRepository, {
 			backendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 			localServerToken: serverConfig.token,
-			mobileConnectRefreshIntervalMs: options?.privateMobileConnectRefreshIntervalMs,
 		});
 		const wsService = new WsService(
 			chatRepository,
@@ -297,7 +295,6 @@ export const ServerBootstrap = {
 		databasePath?: string;
 		disableLiveActivityPush?: boolean;
 		port?: number;
-		privateMobileConnectRefreshIntervalMs?: number;
 		privateBackendUrl?: string;
 	}): Promise<BackendHandle> {
 		const listenPort = options?.port ?? serverConfig.port;
@@ -306,7 +303,6 @@ export const ServerBootstrap = {
 			databasePath: options?.databasePath,
 			disableLiveActivityPush: options?.disableLiveActivityPush,
 			port: listenPort,
-			privateMobileConnectRefreshIntervalMs: options?.privateMobileConnectRefreshIntervalMs,
 			privateBackendUrl: options?.privateBackendUrl,
 		});
 
@@ -361,7 +357,6 @@ export const createBackendServer = async (
 		databasePath?: string;
 		disableLiveActivityPush?: boolean;
 		port?: number;
-		privateMobileConnectRefreshIntervalMs?: number;
 		privateBackendUrl?: string;
 	},
 ): Promise<BackendHandle> =>
