@@ -7,25 +7,33 @@ import { CodexModelsServiceError, type CodexModelsService } from "./codex-models
 test("ProviderController returns codex model catalog", async () => {
 	const app = new Elysia().group("/v1", (group) =>
 		group.use(
-			ProviderController.build({
-				getModelsCatalog: async () => ({
-					models: [
-						{
-							defaultReasoningEffort: "medium",
-							description: "Latest frontier agentic coding model.",
-							displayName: "gpt-5.3-codex",
-							id: "gpt-5.3-codex",
-							isDefault: true,
-							model: "gpt-5.3-codex",
-							supportedReasoningEfforts: [
-								{ description: "Medium", reasoningEffort: "medium" },
-								{ description: "High", reasoningEffort: "high" },
-							],
-						},
-					],
-					nextCursor: null,
-				}),
-			} as unknown as CodexModelsService),
+			ProviderController.build(
+				{
+					getModelsCatalog: async () => ({
+						models: [
+							{
+								defaultReasoningEffort: "medium",
+								description: "Latest frontier agentic coding model.",
+								displayName: "gpt-5.3-codex",
+								id: "gpt-5.3-codex",
+								isDefault: true,
+								model: "gpt-5.3-codex",
+								supportedReasoningEfforts: [
+									{ description: "Medium", reasoningEffort: "medium" },
+									{ description: "High", reasoningEffort: "high" },
+								],
+							},
+						],
+						nextCursor: null,
+					}),
+				} as unknown as CodexModelsService,
+				{
+					getModelsCatalog: async () => ({
+						models: [],
+						nextCursor: null,
+					}),
+				} as unknown as any,
+			),
 		),
 	);
 
@@ -60,11 +68,19 @@ test("ProviderController returns codex model catalog", async () => {
 test("ProviderController returns 503 when codex models cannot be loaded", async () => {
 	const app = new Elysia().group("/v1", (group) =>
 		group.use(
-			ProviderController.build({
-				getModelsCatalog: async () => {
-					throw new CodexModelsServiceError("codex unavailable", 503);
-				},
-			} as unknown as CodexModelsService),
+			ProviderController.build(
+				{
+					getModelsCatalog: async () => {
+						throw new CodexModelsServiceError("codex unavailable", 503);
+					},
+				} as unknown as CodexModelsService,
+				{
+					getModelsCatalog: async () => ({
+						models: [],
+						nextCursor: null,
+					}),
+				} as unknown as any,
+			),
 		),
 	);
 

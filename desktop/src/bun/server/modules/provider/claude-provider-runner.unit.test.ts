@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import { parseClaudeJsonEvents, ClaudeProviderRunner, buildClaudeCommand } from "./claude-provider-runner";
-import type { CodexProviderRunOptions, CodexProviderResult } from "../../types";
-import type { AssistantStreamEvent } from "../../../../shared/assistant-stream-event";
+import type { CodexProviderRunOptions } from "../../types";
+import type { AssertionError } from "bun:test";
 
 describe("parseClaudeJsonEvents", () => {
 	test("parses system init event into thread_started and turn_started", () => {
@@ -180,7 +180,7 @@ describe("ClaudeProviderRunner", () => {
 		const controller = new AbortController();
 		controller.abort();
 
-		const runner = new ClaudeProviderRunner(({ cmd, cwd, env, signal }) => {
+		const runner = new ClaudeProviderRunner(() => {
 			throw new Error("aborted");
 		});
 

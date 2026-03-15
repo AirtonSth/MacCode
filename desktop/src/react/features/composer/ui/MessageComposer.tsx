@@ -61,8 +61,6 @@ export const MessageComposer = ({
 	onSend,
 	onForceStop,
 	stopping = false,
-	permissionMode,
-	onPermissionModeChange,
 	availableModels,
 	selectedModel,
 	onModelChange,
@@ -267,7 +265,6 @@ export const MessageComposer = ({
 			: sending
 				? "Sending message..."
 				: validationError ?? (hasText ? `${value.length}/${MAX_MESSAGE_LENGTH}` : "Type a message to send.");
-	const permissionSelectId = focusMode ? "permission-mode-focus" : "permission-mode";
 	const modelSelectId = focusMode ? "model-focus" : "model";
 	const reasoningSelectId = focusMode ? "reasoning-focus" : "reasoning";
 

@@ -9,12 +9,14 @@ const createSelection = (input: {
 	selectedChatId: string | null;
 	permissionMode?: "default" | "plan" | "full";
 	selectedModel?: string | null;
+	selectedProvider?: "fake" | "codex" | "claude" | null;
 	selectedReasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
 }): WorkspaceSelection => ({
 	selectedChatId: input.selectedChatId,
 	selectedProjectId: input.selectedProjectId,
 	permissionMode: input.permissionMode ?? "default",
 	selectedModel: input.selectedModel ?? null,
+	selectedProvider: input.selectedProvider ?? null,
 	selectedReasoningEffort: input.selectedReasoningEffort ?? null,
 });
 
@@ -53,6 +55,7 @@ test("Selection service saves workspace selection through repository", async () 
 					selectedProjectId: null,
 					permissionMode: "default",
 					selectedModel: null,
+					selectedProvider: null,
 					selectedReasoningEffort: null,
 				}),
 			saveWorkspaceSelection: (selection: WorkspaceSelection) => {
@@ -63,6 +66,7 @@ test("Selection service saves workspace selection through repository", async () 
 					selectedChatId: selection.selectedChatId,
 					permissionMode: selection.permissionMode,
 					selectedModel: selection.selectedModel,
+					selectedProvider: selection.selectedProvider,
 					selectedReasoningEffort: selection.selectedReasoningEffort,
 				};
 			},

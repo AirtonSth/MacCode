@@ -611,9 +611,9 @@ export class ClaudeProviderRunner implements ClaudeProviderRunnerContract {
 
 	async run(options: CodexProviderRunOptions): Promise<CodexProviderResult> {
 		const command = buildCommand(options);
-		const environment = {
-			...process.env,
-		};
+		const environment = Object.fromEntries(
+			Object.entries(process.env).filter(([, v]) => v !== undefined)
+		);
 		const buildCancelledResult = (assistantTextValue: string, threadId?: string): CodexProviderResult => ({
 			assistantText: assistantTextValue,
 			cancelled: true,
