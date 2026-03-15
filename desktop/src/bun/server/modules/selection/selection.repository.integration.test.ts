@@ -10,15 +10,23 @@ import { workspaceSelection } from "../../shared/db/db.schema";
 import { createChatRepository } from "../chat/chat.repository";
 import { createProjectRepository } from "../project/project.repository";
 import { createSelectionRepository } from "./selection.repository";
+import type { WorkspaceSelection } from "./selection.model";
 
 const createSelectionFromRow = (row: {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
 	permissionMode: "default" | "plan" | "full";
 	selectedModel: string | null;
-	selectedProvider?: string | null;
+	selectedProvider?: "fake" | "codex" | "claude" | null;
 	selectedReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
-}) => ({ selectedProvider: null, ...row });
+}): WorkspaceSelection => ({
+	selectedProjectId: row.selectedProjectId,
+	selectedChatId: row.selectedChatId,
+	permissionMode: row.permissionMode,
+	selectedModel: row.selectedModel,
+	selectedProvider: row.selectedProvider ?? null,
+	selectedReasoningEffort: row.selectedReasoningEffort,
+});
 
 test("selection repository upserts one row and returns stored selection", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-selection-repository-save-"));

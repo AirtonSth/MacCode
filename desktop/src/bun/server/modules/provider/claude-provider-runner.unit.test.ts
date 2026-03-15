@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseClaudeJsonEvents, ClaudeProviderRunner, buildClaudeCommand } from "./claude-provider-runner";
 import type { CodexProviderRunOptions } from "../../types";
-import type { AssertionError } from "bun:test";
+import type { AssistantStreamEvent } from "../../../../shared/assistant-stream-event";
 
 describe("parseClaudeJsonEvents", () => {
 	test("parses system init event into thread_started and turn_started", () => {

@@ -613,7 +613,7 @@ export class ClaudeProviderRunner implements ClaudeProviderRunnerContract {
 		const command = buildCommand(options);
 		const environment = Object.fromEntries(
 			Object.entries(process.env).filter(([, v]) => v !== undefined)
-		);
+		) as Record<string, string>;
 		const buildCancelledResult = (assistantTextValue: string, threadId?: string): CodexProviderResult => ({
 			assistantText: assistantTextValue,
 			cancelled: true,
