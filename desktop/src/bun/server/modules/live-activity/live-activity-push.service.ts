@@ -4,6 +4,7 @@ import { createSign } from "node:crypto";
 
 import { cert, getApps, initializeApp, type ServiceAccount } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
+import type { Message } from "firebase-admin/messaging";
 
 import type { AssistantStreamEvent } from "../../../../shared/assistant-stream-event";
 import type {
@@ -91,6 +92,12 @@ export interface LiveActivityPushDeliveryResult {
 }
 
 type LiveActivityPushSender = (input: LiveActivityPushDeliveryInput) => Promise<LiveActivityPushDeliveryResult>;
+
+type LiveActivityFirebaseMessage = Message & {
+	apns?: NonNullable<Message["apns"]> & {
+		liveActivityToken?: string;
+	};
+};
 
 export interface LiveActivityPushEnvironmentInput {
 	apnsAuthKeyId?: string;
@@ -904,21 +911,24 @@ const createFirebaseSender = (input: {
 			topic,
 		});
 
-		try {
-			await messaging.send({
-				token: deliveryInput.pushToken,
-				apns: {
-					liveActivityToken: deliveryInput.liveActivityToken,
-					headers,
-					payload: {
-						aps: apsPayload as never,
+			try {
+				const message: LiveActivityFirebaseMessage = {
+					token: deliveryInput.pushToken,
+					apns: {
+						liveActivityToken: deliveryInput.liveActivityToken,
+						headers,
+						payload: {
+							aps: apsPayload as never,
+						},
 					},
-				},
-			});
-			return {
-				delivered: true,
-				shouldDropSubscription: false,
-			};
+				};
+
+				// Firebase messaging SDK typing currently omits liveActivityToken from ApnsConfig.
+				await messaging.send(message as Message);
+				return {
+					delivered: true,
+					shouldDropSubscription: false,
+				};
 		} catch (primaryError) {
 			const primaryCode = toMessagingErrorCode(primaryError);
 

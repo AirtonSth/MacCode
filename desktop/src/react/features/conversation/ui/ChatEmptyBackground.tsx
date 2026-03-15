@@ -39,7 +39,7 @@ export const ChatEmptyBackground = ({ reducedMotion }: { reducedMotion: boolean 
 
 	return (
 		<div className="pointer-events-none absolute inset-0 overflow-hidden rounded-2xl">
-			{/* @ts-expect-error R3F v8 types vs @types/react v19 mismatch */}
+			{/* @ts-expect-error mixed @types/react versions in workspace affect Canvas JSX typing */}
 			<Canvas
 				camera={{ far: 18, fov: 34, near: 0.1, position: [0, 0.1, 8.4] }}
 				dpr={[1, 1.5]}
