@@ -374,9 +374,11 @@ export const PrivateAccountSection = ({
 			<View style={styles.sectionHeader}>
 				<View>
 					<Text style={styles.sectionTitle}>Private Account</Text>
-					<Text selectable style={styles.supportText}>
-						{sessionRecord?.session.user.email ?? "Sign in to sync desktop and mobile."}
-					</Text>
+					{sessionRecord ? null : (
+						<Text selectable style={styles.supportText}>
+							Sign in to sync desktop and mobile.
+						</Text>
+					)}
 				</View>
 				{sessionRecord ? (
 					<Pressable
@@ -396,27 +398,12 @@ export const PrivateAccountSection = ({
 
 			{sessionRecord ? (
 				<View style={styles.formBody}>
-					<View style={styles.accountSummary}>
-						<Text style={styles.summaryLabel}>Private access</Text>
-						<Text selectable style={styles.summaryValue}>{sessionRecord.session.user.email}</Text>
-						<Text style={styles.supportText}>
-							{subscriptionSnapshot.isSubscribed
-								? `${String(subscriptionSnapshot.daysRemaining)} days remaining`
-								: "Subscription inactive"}
+					<Text selectable style={styles.summaryValue}>{sessionRecord.session.user.email}</Text>
+					{subscriptionSnapshot.isSubscribed ? (
+						<Text selectable style={styles.supportText}>
+							{`Active - ${String(subscriptionSnapshot.daysRemaining)} days remaining`}
 						</Text>
-						<View style={styles.subscriptionBadgeRow}>
-							<View
-								style={[
-									styles.subscriptionBadge,
-									subscriptionSnapshot.isSubscribed ? styles.subscriptionBadgeActive : styles.subscriptionBadgeInactive,
-								]}
-							>
-								<Text style={styles.subscriptionBadgeLabel}>
-									{subscriptionSnapshot.isSubscribed ? "Subscribed" : "Subscription required"}
-								</Text>
-							</View>
-						</View>
-					</View>
+					) : null}
 
 					{subscriptionState}
 				</View>
@@ -496,14 +483,6 @@ export const PrivateAccountSection = ({
 };
 
 const styles = StyleSheet.create({
-	accountSummary: {
-		backgroundColor: palette.soft,
-		borderColor: palette.border,
-		borderRadius: 12,
-		borderWidth: 1,
-		gap: 6,
-		padding: 12,
-	},
 	connectorList: {
 		gap: 8,
 	},
@@ -639,25 +618,6 @@ const styles = StyleSheet.create({
 		color: palette.text,
 		fontSize: 13,
 		lineHeight: 19,
-	},
-	subscriptionBadge: {
-		borderRadius: 999,
-		paddingHorizontal: 10,
-		paddingVertical: 6,
-	},
-	subscriptionBadgeActive: {
-		backgroundColor: "rgba(16,185,129,0.16)",
-	},
-	subscriptionBadgeInactive: {
-		backgroundColor: "rgba(245,158,11,0.16)",
-	},
-	subscriptionBadgeLabel: {
-		color: palette.text,
-		fontSize: 12,
-		fontWeight: "700",
-	},
-	subscriptionBadgeRow: {
-		flexDirection: "row",
 	},
 	summaryLabel: {
 		color: palette.muted,

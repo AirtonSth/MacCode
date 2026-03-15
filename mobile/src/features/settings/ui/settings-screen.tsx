@@ -635,14 +635,15 @@ export const SettingsScreen = () => {
 						keyExtractor={(item) => item.key}
 						renderItem={({ item, index }) => {
 							if (item.kind === "saved-connection") {
-								const connection = item.connection;
-								const connectionKey = item.key;
-								const isConnecting = Boolean(isConnectingBySavedKey[connectionKey]);
+										const connection = item.connection;
+										const connectionKey = item.key;
+										const statusBadge = item.connectionStatusBadge;
+										const isConnecting = Boolean(isConnectingBySavedKey[connectionKey]);
 
 								return (
-									<Pressable
-										accessibilityLabel={`Connect saved server ${item.title}`}
-										delayLongPress={280}
+							<Pressable
+								accessibilityLabel={`Connect saved server ${item.title}`}
+								delayLongPress={280}
 										disabled={isConnecting}
 										onLongPress={() => {
 											if (!item.canDelete || isConnecting) {
@@ -677,14 +678,37 @@ export const SettingsScreen = () => {
 										]}
 										testID={`saved-server-item-${String(index)}`}
 									>
-										<View style={styles.rowTextGroup}>
-											<Text numberOfLines={1} style={styles.rowTitle}>
-												{item.title}
-											</Text>
-											<Text numberOfLines={1} selectable style={styles.rowMeta}>
-												{item.subtitle}
-											</Text>
-										</View>
+											<View style={styles.rowTextGroup}>
+												<Text numberOfLines={1} style={styles.rowTitle}>
+													{item.title}
+												</Text>
+												<View style={styles.rowMetaRow}>
+													<View
+														style={[
+															styles.savedConnectionStatusBadge,
+															statusBadge === "online"
+																? styles.savedConnectionStatusBadgeOnline
+																: styles.savedConnectionStatusBadgeLocalNetwork,
+														]}
+													>
+													<Text
+														style={[
+															styles.savedConnectionStatusBadgeText,
+															statusBadge === "online"
+																? styles.savedConnectionStatusBadgeTextOnline
+																: styles.savedConnectionStatusBadgeTextLocalNetwork,
+														]}
+													>
+														{item.connectionStatusBadge}
+													</Text>
+													</View>
+													{item.subtitle.length > 0 ? (
+														<Text numberOfLines={1} selectable style={styles.rowMeta}>
+															{item.subtitle}
+														</Text>
+													) : null}
+												</View>
+											</View>
 
 										{isConnecting ? (
 											<ActivityIndicator color={palette.accent} size="small" />
@@ -718,9 +742,16 @@ export const SettingsScreen = () => {
 											<Text numberOfLines={1} style={styles.rowTitle}>
 												{item.title}
 											</Text>
-											<Text numberOfLines={1} selectable style={styles.rowMeta}>
-												{item.subtitle}
-											</Text>
+											<View style={styles.rowMetaRow}>
+												<View style={[styles.savedConnectionStatusBadge, styles.savedConnectionStatusBadgeLocalNetwork]}>
+													<Text style={[styles.savedConnectionStatusBadgeText, styles.savedConnectionStatusBadgeTextLocalNetwork]}>
+														local network
+													</Text>
+												</View>
+												<Text numberOfLines={1} selectable style={styles.rowMeta}>
+													{item.subtitle}
+												</Text>
+											</View>
 										</View>
 
 										{isConnecting ? (
@@ -733,7 +764,10 @@ export const SettingsScreen = () => {
 							}
 
 							const connector = item.connector;
-							const isConnecting = Boolean(isConnectingByConnectorId[connector.id]);
+										const isConnecting = Boolean(isConnectingByConnectorId[connector.id]);
+										const statusBadge = connector.isOnline && connector.status === "online"
+											? "online"
+											: "local network";
 
 							return (
 								<Pressable
@@ -750,14 +784,35 @@ export const SettingsScreen = () => {
 									]}
 									testID={`private-connector-item-${String(index)}`}
 								>
-									<View style={styles.rowTextGroup}>
-										<Text numberOfLines={1} style={styles.rowTitle}>
-											{item.title}
-										</Text>
-										<Text numberOfLines={1} selectable style={styles.rowMeta}>
-											{item.subtitle}
-										</Text>
-									</View>
+										<View style={styles.rowTextGroup}>
+											<Text numberOfLines={1} style={styles.rowTitle}>
+												{item.title}
+											</Text>
+											<View style={styles.rowMetaRow}>
+												<View
+													style={[
+														styles.savedConnectionStatusBadge,
+														statusBadge === "online"
+															? styles.savedConnectionStatusBadgeOnline
+															: styles.savedConnectionStatusBadgeLocalNetwork,
+													]}
+												>
+													<Text
+														style={[
+															styles.savedConnectionStatusBadgeText,
+															statusBadge === "online"
+																? styles.savedConnectionStatusBadgeTextOnline
+																: styles.savedConnectionStatusBadgeTextLocalNetwork,
+														]}
+													>
+														{statusBadge}
+													</Text>
+												</View>
+												<Text numberOfLines={1} selectable style={styles.rowMeta}>
+													{item.subtitle}
+												</Text>
+											</View>
+										</View>
 
 									{isConnecting ? (
 										<ActivityIndicator color={palette.accent} size="small" />
@@ -959,10 +1014,44 @@ const styles = StyleSheet.create({
 		color: palette.muted,
 		fontSize: 12,
 	},
+	rowMetaRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
+	},
 	rowTitle: {
 		color: palette.text,
 		fontSize: 15,
 		fontWeight: "600",
+	},
+	savedConnectionStatusBadge: {
+		alignItems: "center",
+		backgroundColor: "rgba(255,255,255,0.08)",
+		borderColor: "rgba(255,255,255,0.24)",
+		borderRadius: 999,
+		borderWidth: 1,
+		paddingHorizontal: 8,
+		paddingVertical: 3,
+	},
+	savedConnectionStatusBadgeText: {
+		color: palette.text,
+		fontSize: 10,
+		fontWeight: "700",
+		textTransform: "lowercase",
+	},
+	savedConnectionStatusBadgeOnline: {
+		backgroundColor: "rgba(52,211,153,0.2)",
+		borderColor: "rgba(52,211,153,0.45)",
+	},
+	savedConnectionStatusBadgeLocalNetwork: {
+		backgroundColor: "rgba(250,204,21,0.2)",
+		borderColor: "rgba(250,204,21,0.45)",
+	},
+	savedConnectionStatusBadgeTextOnline: {
+		color: "#6EE7B7",
+	},
+	savedConnectionStatusBadgeTextLocalNetwork: {
+		color: "#FDE68A",
 	},
 	secondaryButton: {
 		alignItems: "center",

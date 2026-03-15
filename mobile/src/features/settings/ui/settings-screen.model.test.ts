@@ -60,6 +60,7 @@ test("buildSavedConnectionItems keeps online saved local connections and dedupes
 		canDelete: true,
 		kind: "saved-connection",
 		title: "Desktop Connector",
+		connectionStatusBadge: "local network",
 	});
 });
 
@@ -85,6 +86,42 @@ test("buildSavedConnectionItems matches saved local connections after baseUrl no
 		canDelete: true,
 		kind: "saved-connection",
 		title: "Desktop Connector",
+		connectionStatusBadge: "local network",
+	});
+});
+
+test("buildSavedConnectionItems marks private saved connections as online", () => {
+	const items = buildSavedConnectionItems({
+		discoveredServers: [],
+		privateConnectors: [
+			{
+				claimedAt: null,
+				hostname: "online.local",
+				id: "con_online",
+				isOnline: true,
+				lastSeenAt: "2026-03-14T11:00:00.000Z",
+				name: "Online Connector",
+				relayCapabilitiesVersion: null,
+				relayVersion: null,
+				status: "online",
+			},
+		],
+		savedConnections: [
+			{
+				backendUrl: "https://private.remotecode.io:8787",
+				connectorId: "con_online",
+				connectorName: "Saved Connector",
+				kind: "private",
+				lastConnectedAt: "2026-03-14T10:00:00.000Z",
+			},
+		],
+		sessionBackendUrl: "https://private.remotecode.io:8787",
+	});
+
+	expect(items).toHaveLength(1);
+	expect(items[0]).toMatchObject({
+		kind: "saved-connection",
+		connectionStatusBadge: "online",
 	});
 });
 

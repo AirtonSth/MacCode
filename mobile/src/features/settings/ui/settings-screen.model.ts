@@ -12,6 +12,7 @@ interface SavedConnectionRowItem<TConnection extends SavedConnection = SavedConn
 	canDelete: boolean;
 	connection: TConnection;
 	key: string;
+	connectionStatusBadge: "online" | "local network";
 	subtitle: string;
 	title: string;
 }
@@ -75,6 +76,15 @@ const getSavedConnectionTitle = (connection: SavedConnection): string =>
 	connection.kind === "private"
 		? connection.connectorName
 		: toHost(connection.baseUrl) || connection.baseUrl;
+
+const getPrivateSavedConnectionTitle = (
+	item: PrivateSavedConnection,
+	privateConnectorById: Map<string, PrivateConnectorDto>,
+): string => {
+	const connector = privateConnectorById.get(item.connectorId);
+	const hostname = (connector?.hostname ?? "").trim();
+	return hostname.length > 0 ? hostname : item.connectorName;
+};
 
 const normalizeLocalBaseUrl = (value: string): string => {
 	const trimmed = value.trim();
@@ -158,6 +168,7 @@ export const buildSavedConnectionItems = (input: {
 				connection,
 				key: toSavedConnectionKey(connection),
 				kind: "saved-connection",
+				connectionStatusBadge: "local network",
 				subtitle: matchedServer?.hostname || toHost(connection.baseUrl) || connection.baseUrl,
 				title: matchedServer?.hostname || getSavedConnectionTitle(connection),
 			};
@@ -172,9 +183,12 @@ export const buildSavedConnectionItems = (input: {
 			return false;
 		}
 
-		return isPrivateConnectorConnectable(connector);
+	return isPrivateConnectorConnectable(connector);
 	});
 	const readyPrivateConnectorIds = new Set(readyPrivateConnectors.map((connector) => connector.id));
+	const readyPrivateConnectorById = new Map(
+		readyPrivateConnectors.map((connector) => [connector.id, connector]),
+	);
 
 	const privateSavedIds = new Set<string>();
 	const privateSavedItems: PrivateSavedConnectionRowItem[] = input.savedConnections
@@ -183,13 +197,15 @@ export const buildSavedConnectionItems = (input: {
 		.filter((item) => readyPrivateConnectorIds.has(item.connectorId))
 		.map((item) => {
 			privateSavedIds.add(item.connectorId);
+			const title = getPrivateSavedConnectionTitle(item, readyPrivateConnectorById);
 			return {
 				canDelete: true,
 				connection: item,
 				key: toSavedConnectionKey(item),
 				kind: "saved-connection",
-				subtitle: `Private server · ${toHost(item.backendUrl)}`,
-				title: getSavedConnectionTitle(item),
+				connectionStatusBadge: "online",
+				subtitle: "",
+				title,
 			};
 		});
 
