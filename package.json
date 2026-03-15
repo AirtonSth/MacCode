@@ -1,14 +1,14 @@
 {
   "name": "remotecode-workspace",
   "private": true,
-  "main": "index.js",
   "workspaces": [
     "desktop",
     "mobile",
     "packages/*"
   ],
   "scripts": {
-    "postinstall": "./scripts/apply-expo-ui-text-timer-patch.sh",
+    "postinstall": "./scripts/apply-expo-ui-text-timer-patch.sh && ./scripts/cleanup-stale-expo-artifacts.sh",
+    "clean": "./scripts/cleanup-stale-expo-artifacts.sh",
     "prepare": "husky",
     "lint": "bun run lint:mobile && bun run lint:contracts",
     "lint:desktop": "bun run --cwd desktop lint:check",
@@ -23,7 +23,7 @@
     "start:desktop": "bun run --cwd desktop start:hmr",
     "dev:desktop": "bun run --cwd desktop dev:hmr",
     "dev:mobile": "bun run --cwd mobile start",
-    "dev:mobile:ios": "cd mobile && bunx expo run ios",
+    "dev:mobile:ios": "cd mobile && bunx expo run:ios",
     "dev:mobile:ios-device": "cd mobile && bunx expo run:ios --device --configuration Release",
     "mcp:playwright-electron": "bun run --cwd desktop mcp:playwright-electron"
   },
