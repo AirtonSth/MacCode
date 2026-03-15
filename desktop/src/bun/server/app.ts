@@ -25,6 +25,8 @@ import { GitController } from "./modules/git/git.controller";
 import { GitService } from "./modules/git/git.service";
 import { ProviderController } from "./modules/provider/provider.controller";
 import { CodexModelsService } from "./modules/provider/codex-models.service";
+import { ClaudeModelsService } from "./modules/provider/claude-models.service";
+import { ClaudeProviderRunner } from "./modules/provider/claude-provider-runner";
 import { createServerMetadataRepository } from "./modules/server-metadata/server-metadata.repository";
 import { createServerMetadataService } from "./modules/server-metadata/server-metadata.service";
 import { SelectionController } from "./modules/selection/selection.controller";
@@ -197,11 +199,13 @@ export const ServerBootstrap = {
 			backendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 			localServerToken: serverConfig.token,
 		});
+		const claudeProviderRunner = new ClaudeProviderRunner();
 		const wsService = new WsService(
 			chatRepository,
 			messageRepository,
 			projectRepository,
 			undefined,
+			claudeProviderRunner,
 			workspaceEventsService,
 			chatStreamSnapshotRepository,
 			chatStreamEventRepository,
@@ -209,6 +213,7 @@ export const ServerBootstrap = {
 			chatTurnSnapshotRepository,
 		);
 		const codexModelsService = new CodexModelsService();
+		const claudeModelsService = new ClaudeModelsService();
 
 		const app = new Elysia()
 			.mapResponse(async ({ request, responseValue, set }) => {
@@ -271,7 +276,7 @@ export const ServerBootstrap = {
 					.use(ChatController.build(chatService, workspaceEventsService, wsService, wsService))
 					.use(MessageController.build(messageService))
 					.use(GitController.build(gitService, workspaceEventsService))
-					.use(ProviderController.build(codexModelsService))
+					.use(ProviderController.build(codexModelsService, claudeModelsService))
 					.use(SelectionController.build(workspaceSelectionService, workspaceEventsService))
 					.use(PrivateAccountController.build(privateAccountService))
 					.use(TerminalController.build(terminalService, workspaceEventsService))

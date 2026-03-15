@@ -2,9 +2,20 @@ import { Elysia, t } from "elysia";
 
 import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
+import type { ChatProvider } from "../../shared/core/server.types";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { LiveActivityPushSubscriptionInput } from "../live-activity/live-activity-push.model";
 import type { ChatService } from "./chat.service";
+
+const VALID_CHAT_PROVIDERS = new Set<string>(["codex", "claude"]);
+
+const parseChatProvider = (value: unknown): ChatProvider | null => {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	return VALID_CHAT_PROVIDERS.has(value) ? (value as ChatProvider) : null;
+};
 
 const LIVE_ACTIVITY_SUBSCRIPTION_LOG_PREFIX = "[live-activity-subscription]";
 
@@ -210,7 +221,12 @@ export class ChatController {
 				"/projects/:id/chats",
 				async ({ body, params: parameters, request, set }) => {
 					const title = body.title?.trim() || "New chat";
-					const chat = await this.service.createChat(parameters.id, title);
+					const provider = body.provider ? parseChatProvider(body.provider) : undefined;
+					if (body.provider && provider === null) {
+						set.status = 400;
+						return { error: "invalid provider" };
+					}
+					const chat = await this.service.createChat(parameters.id, title, provider ?? undefined);
 
 					if (!chat) {
 						set.status = 404;
@@ -235,6 +251,7 @@ export class ChatController {
 				{
 					body: t.Object({
 						title: t.Optional(t.String()),
+						provider: t.Optional(t.String()),
 					}),
 				},
 			)

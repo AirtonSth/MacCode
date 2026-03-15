@@ -200,6 +200,7 @@ test("WsService.startUserMessage forwards lifecycle updates to live activity pus
 		undefined,
 		undefined,
 		undefined,
+		undefined,
 		liveActivityPushService,
 	);
 	const collector = await collectEvents(() => {});
@@ -966,7 +967,7 @@ test("WsService.startUserMessage forwards structured assistant_event payloads", 
 		listByChatId: () => [],
 	};
 
-	const service = new WsService(chatRepository, messageRepository, projectRepository, runner, undefined, undefined, streamEvents);
+	const service = new WsService(chatRepository, messageRepository, projectRepository, runner, undefined, undefined, undefined, streamEvents);
 	const collector = await collectEvents(() => {});
 
 	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
@@ -1082,6 +1083,7 @@ test("WsService.startUserMessage updates and clears persisted stream snapshots",
 		messageRepository,
 		projectRepository,
 		runner,
+		undefined,
 		undefined,
 		snapshots,
 	);
@@ -1230,6 +1232,7 @@ test("WsService.startUserMessage persists completed turn snapshots and clears ra
 		runner,
 		undefined,
 		undefined,
+		undefined,
 		streamEvents,
 		undefined,
 		chatTurnSnapshots,
@@ -1355,6 +1358,7 @@ test("WsService.startUserMessage persists cancelled turn snapshots against the u
 		messageRepository,
 		projectRepository,
 		runner,
+		undefined,
 		undefined,
 		undefined,
 		streamEvents,

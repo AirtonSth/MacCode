@@ -20,6 +20,8 @@ import {
 	type CodexReasoningEffort,
 } from "../../../../shared/codex-model-config";
 
+type SelectedProvider = "codex" | "claude";
+
 interface MessageComposerProps {
 	disabled: boolean;
 	sending: boolean;
@@ -32,6 +34,8 @@ interface MessageComposerProps {
 	availableModels: CodexModelDescriptor[];
 	selectedModel: string | null;
 	onModelChange: (model: string) => void;
+	selectedProvider: SelectedProvider;
+	onProviderChange: (provider: SelectedProvider) => void;
 	availableReasoningEfforts: CodexReasoningEffort[];
 	selectedReasoningEffort: CodexReasoningEffort | null;
 	onReasoningEffortChange: (effort: CodexReasoningEffort) => void;
@@ -62,6 +66,8 @@ export const MessageComposer = ({
 	availableModels,
 	selectedModel,
 	onModelChange,
+	selectedProvider,
+	onProviderChange,
 	availableReasoningEfforts,
 	selectedReasoningEffort,
 	onReasoningEffortChange,
@@ -350,6 +356,23 @@ export const MessageComposer = ({
 
 							<div className="relative shrink-0">
 							<select
+									aria-label="Provider"
+									className={cn(subtleSelectClass, "min-w-[68px]")}
+								disabled={isInputLocked}
+									id={focusMode ? "provider-focus" : "provider"}
+									onChange={(event) => {
+										onProviderChange(event.target.value as SelectedProvider);
+									}}
+									value={selectedProvider}
+								>
+									<option value="codex">Codex</option>
+									<option value="claude">Claude Code</option>
+								</select>
+								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
+							</div>
+
+						<div className="relative shrink-0">
+							<select
 									aria-label="Model"
 									className={cn(subtleSelectClass, "min-w-[180px]")}
 								disabled={isInputLocked || availableModels.length === 0}
@@ -372,7 +395,7 @@ export const MessageComposer = ({
 							<div className="relative shrink-0">
 							<select
 									aria-label="Reasoning"
-									className={cn(subtleSelectClass, "min-w-[132px]")}
+									className={cn(subtleSelectClass, "min-w-[80px]")}
 								disabled={isInputLocked || availableReasoningEfforts.length === 0}
 									id={reasoningSelectId}
 									onChange={(event) => {
@@ -390,25 +413,7 @@ export const MessageComposer = ({
 								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
 
-							<div className="relative shrink-0">
-							<select
-									aria-label="Permission mode"
-									className={cn(subtleSelectClass, "min-w-[128px]")}
-								disabled={isInputLocked}
-									id={permissionSelectId}
-									onChange={(event) => {
-										onPermissionModeChange(event.target.value as CodexPermissionMode);
-									}}
-									value={permissionMode}
-								>
-									<option value="plan">Plan</option>
-									<option value="default">Default</option>
-									<option value="full">Full access</option>
-								</select>
-								<ChevronDown className="pointer-events-none absolute right-0 top-1/2 h-3 w-3 -translate-y-1/2 text-[#7a7f89]" />
 							</div>
-
-						</div>
 
 						<div className="flex items-center gap-1">
 							{onCheckoutBranch && onCreateBranch ? (

@@ -2,6 +2,7 @@ import type { PrivateAccountStateDto } from "@remotecode/contracts";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../components/ui/tooltip";
 import {
 	createPrivateAccountApiClient,
 	type PrivateAccountApiClient,
@@ -221,63 +222,39 @@ export const PrivateAccountSidebarFooter = ({
 
 	return (
 		<div className="mt-3 border-t border-white/10 pt-3" data-testid="private-account-sidebar-footer">
-			{state.authenticated ? (
-				isSubscribed ? (
+			<Tooltip>
+				<TooltipTrigger asChild>
 					<button
-						className="mb-3 block w-full rounded-2xl border border-white/10 bg-black/20 p-3 text-left text-slate-100 transition hover:border-white/20 hover:bg-black/30"
-						data-testid="private-account-connector-card"
+						className="flex w-full items-center gap-2.5 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left transition hover:bg-white/[0.08]"
 						onClick={openModal}
 						type="button"
 					>
-						<div className="flex items-start justify-between gap-3">
-				<div className="min-w-0">
-						<p className="text-[11px] uppercase tracking-[0.14em] text-slate-400">Private Connector</p>
-						<p className="truncate text-sm font-semibold text-slate-100">
-							{state.connector?.name ?? "Desktop Connector"}
-						</p>
-						<p className="text-xs text-slate-300">{statusLabel}</p>
-					</div>
-					</div>
-				</button>
-				) : (
-					<div
-						className="mb-3 rounded-2xl border border-amber-300/20 bg-[linear-gradient(135deg,rgba(250,204,21,0.15),rgba(249,115,22,0.08))] p-3 text-slate-100"
-						data-testid="private-account-subscribe-card"
-					>
-						<p className="text-[11px] uppercase tracking-[0.14em] text-amber-200/80">Private Access</p>
-						<p className="mt-1 text-sm font-semibold text-amber-50">Unlock mobile pairing and connector sync</p>
-						<p className="mt-1 text-xs text-amber-100/80">
-							Your account is signed in but does not have an active subscription.
-						</p>
-						<a
-							className="mt-3 inline-flex rounded-full bg-amber-200 px-3 py-1.5 text-xs font-semibold text-[#2b1906] transition hover:bg-amber-100"
-							data-testid="private-account-subscribe-link"
-							href="#manage-subscription"
-							onClick={(event) => {
-								event.preventDefault();
-								void openBrowserManageSubscription();
-							}}
-							rel="noreferrer"
-							target="_blank"
-						>
-							Manage subscription
-						</a>
-					</div>
-				)
-			) : null}
-
-			<button
-				className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-3 text-left transition hover:bg-white/[0.08]"
-				onClick={openModal}
-				type="button"
-			>
-				<span>
-					<span className="block text-[11px] uppercase tracking-[0.14em] text-slate-400">Account</span>
-					<span className="block text-sm font-semibold text-slate-100">
-						{state.user?.email ?? "Log in"}
-					</span>
-				</span>
-			</button>
+						{state.authenticated && isSubscribed ? (
+							<span
+								className="block h-2.5 w-2.5 shrink-0 rounded-full"
+								data-testid="private-account-status-dot"
+								style={{
+									backgroundColor:
+										state.connectorRelayState === "connected"
+											? "#34D399"
+											: state.connectorRelayState === "connecting"
+												? "#FBBF24"
+												: state.connectorRelayState === "error"
+													? "#F87171"
+													: "#64748B",
+								}}
+							/>
+						) : null}
+						<span className="min-w-0 flex-1">
+							<span className="block text-[11px] uppercase tracking-[0.14em] text-slate-400">Account</span>
+							<span className="block truncate text-sm font-semibold text-slate-100">
+								{state.user?.email ?? "Log in"}
+							</span>
+						</span>
+					</button>
+				</TooltipTrigger>
+				<TooltipContent side="top">{statusLabel}</TooltipContent>
+			</Tooltip>
 
 			{errorMessage ? (
 				<p

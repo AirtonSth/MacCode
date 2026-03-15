@@ -70,7 +70,7 @@ export interface ChatStreamEventPageDTO {
 	nextAfterId: number | null;
 }
 
-export type ChatProvider = "fake" | "codex";
+export type ChatProvider = "fake" | "codex" | "claude";
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
 
@@ -189,6 +189,7 @@ export interface WorkspaceSelectionDTO {
 	selectedChatId: string | null;
 	permissionMode: CodexPermissionMode;
 	selectedModel: string | null;
+	selectedProvider: ChatProvider | null;
 	selectedReasoningEffort: CodexReasoningEffort | null;
 }
 

@@ -24,7 +24,9 @@ export class ChatRepository {
 	}
 
 	private static normalizeProvider(provider: string): ChatProvider {
-		return provider === "codex" ? "codex" : "fake";
+		if (provider === "codex") return "codex";
+		if (provider === "claude") return "claude";
+		return "fake";
 	}
 
 	private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
@@ -71,7 +73,7 @@ export class ChatRepository {
 		};
 	}
 
-	createChat(projectId: string, title: string): ChatDTO {
+	createChat(projectId: string, title: string, provider: ChatProvider = "codex"): ChatDTO {
 		const now = new Date().toISOString();
 		const chatId = randomUUID();
 
@@ -83,7 +85,7 @@ export class ChatRepository {
 				id: chatId,
 				isActive: 0,
 				projectId,
-				provider: "codex",
+				provider,
 				providerThreadId: null,
 				status: "pending",
 				title,

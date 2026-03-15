@@ -2,13 +2,17 @@ import { Elysia } from "elysia";
 
 import { withRestAuth } from "../../shared/auth/auth.service";
 import { CodexModelsService, CodexModelsServiceError } from "./codex-models.service";
+import { ClaudeModelsService } from "./claude-models.service";
 
 export class ProviderController {
-	static build(service: CodexModelsService) {
-		return new ProviderController(service).build();
+	static build(codexModelsService: CodexModelsService, claudeModelsService: ClaudeModelsService) {
+		return new ProviderController(codexModelsService, claudeModelsService).build();
 	}
 
-	constructor(private readonly codexModelsService: CodexModelsService) {}
+	constructor(
+		private readonly codexModelsService: CodexModelsService,
+		private readonly claudeModelsService: ClaudeModelsService,
+	) {}
 
 	build() {
 		return new Elysia({ name: "provider-controller" })
@@ -30,8 +34,19 @@ export class ProviderController {
 					set.status = 503;
 					return { error: "failed to load codex models" };
 				}
+			})
+			.get("/providers/claude/models", async () => {
+				const catalog = await this.claudeModelsService.getModelsCatalog();
+
+				return {
+					models: catalog.models,
+					nextCursor: catalog.nextCursor,
+				};
 			});
 	}
 }
 
-export const createProviderController = (service: CodexModelsService) => ProviderController.build(service);
+export const createProviderController = (
+	codexModelsService: CodexModelsService,
+	claudeModelsService: ClaudeModelsService,
+) => ProviderController.build(codexModelsService, claudeModelsService);

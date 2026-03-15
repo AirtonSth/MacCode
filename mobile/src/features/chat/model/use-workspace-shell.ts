@@ -239,11 +239,18 @@ const normalizeSelection = (
 ): WorkspaceSelectionDTO => {
 	const selectedProjectId = selection.selectedProjectId;
 	const selectedChatId = selectedProjectId && typeof selection.selectedChatId === "string" ? selection.selectedChatId : null;
+	const validProviders = ["codex", "claude"] as const;
+	const selectedProvider =
+		typeof selection.selectedProvider === "string" && (validProviders as readonly string[]).includes(selection.selectedProvider)
+			? selection.selectedProvider
+			: null;
+
 	return {
 		selectedProjectId,
 		selectedChatId,
 		permissionMode: normalizePermissionMode(selection.permissionMode),
 		selectedModel: normalizeSelectedModel(selection.selectedModel),
+		selectedProvider,
 		selectedReasoningEffort: normalizeReasoningEffort(selection.selectedReasoningEffort),
 	};
 };
@@ -253,6 +260,7 @@ const DEFAULT_SELECTION: WorkspaceSelectionDTO = {
 	selectedChatId: null,
 	selectedModel: null,
 	selectedProjectId: null,
+	selectedProvider: null,
 	selectedReasoningEffort: null,
 };
 
@@ -443,6 +451,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(
 		initialSelection.selectedReasoningEffort,
 	);
+	const [selectedProvider, setSelectedProvider] = useState<string>(
+		initialSelection.selectedProvider ?? "codex",
+	);
 	const realtimeRef = useRef<ReturnType<typeof createRealtimeClient> | null>(null);
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
@@ -518,8 +529,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const deleteChatMutation = useDeleteChatMutation(selectedProjectId);
 	const modelsQuery = useQuery({
 		enabled: shouldEnableModelsQuery,
-		queryKey: ["codex-models"],
-		queryFn: async () => await client.listCodexModels(),
+		queryKey: ["provider-models", selectedProvider],
+		queryFn: async () => selectedProvider === "claude"
+			? await client.listClaudeModels()
+			: await client.listCodexModels(),
 		staleTime: 5 * 60_000,
 	});
 	const activeThreadsQuery = useQuery({
@@ -614,6 +627,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				? current
 				: normalizedSelection.selectedReasoningEffort
 		));
+		if (normalizedSelection.selectedProvider) {
+			setSelectedProvider((current) => (
+				current === normalizedSelection.selectedProvider ? current : (normalizedSelection.selectedProvider ?? current)
+			));
+		}
 	}, [selectionQuery.data]);
 
 	useEffect(() => {
@@ -1725,6 +1743,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			selectedChatId: string | null;
 			permissionMode?: string | null;
 			selectedModel?: string | null;
+			selectedProvider?: string | null;
 			selectedReasoningEffort?: string | null;
 		}) => {
 			const nextSelection = normalizeSelection({
@@ -1732,6 +1751,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				selectedChatId: input.selectedChatId,
 				permissionMode: input.permissionMode ?? permissionMode,
 				selectedModel: input.selectedModel ?? selectedModel,
+				selectedProvider: input.selectedProvider ?? selectedProvider,
 				selectedReasoningEffort: input.selectedReasoningEffort ?? selectedReasoningEffort,
 			});
 			queryClient.setQueryData(queryKeys.selection, nextSelection);
@@ -1742,7 +1762,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				},
 			});
 		},
-		[permissionMode, queryClient, selectedModel, selectedReasoningEffort, updateSelectionMutation],
+		[permissionMode, queryClient, selectedModel, selectedProvider, selectedReasoningEffort, updateSelectionMutation],
 	);
 
 	const setPermissionModeWithSync = useCallback(
@@ -1779,6 +1799,23 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			});
 		},
 		[persistSelection, selectedChatId, selectedProjectId],
+	);
+
+	const setSelectedProviderWithSync = useCallback(
+		(value: string) => {
+			setSelectedProvider(value);
+			setSelectedModel(null);
+			setSelectedReasoningEffort(null);
+			void queryClient.invalidateQueries({ queryKey: ["provider-models", value] });
+			persistSelection({
+				selectedProjectId,
+				selectedChatId,
+				selectedProvider: value,
+				selectedModel: null,
+				selectedReasoningEffort: null,
+			});
+		},
+		[persistSelection, queryClient, selectedChatId, selectedProjectId],
 	);
 
 	const selectProjectById = useCallback(
@@ -1883,6 +1920,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			const chat = await createChatMutation.mutateAsync({
 				projectId: selectedProjectId,
 				title,
+				provider: selectedProvider,
 			});
 
 			selectChatById({
@@ -1891,7 +1929,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			});
 			return chat;
 		},
-		[createChatMutation, selectedProjectId, selectChatById],
+		[createChatMutation, selectedProjectId, selectedProvider, selectChatById],
 	);
 
 	const createProject = useCallback(
@@ -2430,6 +2468,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		projects,
 		renameProject,
 		selectedModel,
+		selectedProvider,
 		selectedReasoningEffort,
 		selectChat,
 		selectChatById,
@@ -2437,6 +2476,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		selectProjectById,
 		setPermissionMode: setPermissionModeWithSync,
 		setSelectedModel: setSelectedModelWithSync,
+		setSelectedProvider: setSelectedProviderWithSync,
 		setSelectedReasoningEffort: setSelectedReasoningEffortWithSync,
 		setStreamItemExpanded,
 		setStreamItemState,

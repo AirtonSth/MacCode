@@ -525,9 +525,9 @@ export const RemoteCodeApi = {
 					return payload.threads;
 				},
 
-				createChat: async (projectId: string, title?: string): Promise<ChatDTO> => {
+				createChat: async (projectId: string, title?: string, provider?: string): Promise<ChatDTO> => {
 					const payload = await request<RestCreateChatResponse>({
-						body: { title },
+						body: { title, ...(provider ? { provider } : {}) },
 						method: "POST",
 						path: `/projects/${projectId}/chats`,
 					});
@@ -546,6 +546,13 @@ export const RemoteCodeApi = {
 				return await request<RestCodexModelsResponse>({
 					method: "GET",
 					path: "/providers/codex/models",
+				});
+			},
+
+			listClaudeModels: async (): Promise<CodexModelsCatalog> => {
+				return await request<RestCodexModelsResponse>({
+					method: "GET",
+					path: "/providers/claude/models",
 				});
 			},
 

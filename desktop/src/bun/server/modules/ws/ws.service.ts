@@ -7,6 +7,7 @@ import {
 	type CodexProviderRunnerContract,
 	CodexProviderRunner,
 } from "../provider/codex-provider-runner";
+import { ClaudeProviderRunner } from "../provider/claude-provider-runner";
 import type { ProjectRepository } from "../project/project.repository";
 import type { MessageRepository } from "../message/message.repository";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
@@ -91,6 +92,7 @@ export class WsService implements WsServiceContract {
 		private readonly messageRepository: MessageRepository,
 		private readonly projectRepository: ProjectRepository,
 		private readonly codexProviderRunner: CodexProviderRunnerContract = new CodexProviderRunner(),
+		private readonly claudeProviderRunner: CodexProviderRunnerContract = new ClaudeProviderRunner(),
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 		private readonly chatStreamSnapshots: ChatStreamSnapshotRepositoryContract = noopChatStreamSnapshotRepository,
 		private readonly chatStreamEvents: ChatStreamEventRepositoryContract = noopChatStreamEventRepository,
@@ -374,7 +376,10 @@ export class WsService implements WsServiceContract {
 
 		try {
 			const permissionMode = input.permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
-			const providerResult = await this.codexProviderRunner.run({
+			const providerRunner = chat.provider === "claude"
+				? this.claudeProviderRunner
+				: this.codexProviderRunner;
+			const providerResult = await providerRunner.run({
 				chatId,
 				model: input.model,
 				onDelta: (delta: string) => {
@@ -512,6 +517,7 @@ export const createWsService = (repositories: {
 		repositories.chat,
 		repositories.message,
 		repositories.project,
+		undefined,
 		undefined,
 		workspaceEvents,
 		chatStreamSnapshots,

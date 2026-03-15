@@ -2,10 +2,25 @@ import { Elysia, t } from "elysia";
 
 import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
+import type { ChatProvider } from "../../shared/core/server.types";
 import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { WorkspaceSelectionService } from "./selection.service";
+
+const VALID_PROVIDERS = new Set<string>(["codex", "claude"]);
+
+const parseSelectedProvider = (value: unknown): ChatProvider | null => {
+	if (value === null || value === undefined) {
+		return null;
+	}
+
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	return VALID_PROVIDERS.has(value) ? (value as ChatProvider) : null;
+};
 
 export class SelectionController {
 	static build(service: WorkspaceSelectionService, workspaceEvents?: WorkspaceEventsServiceContract) {
@@ -64,11 +79,24 @@ export class SelectionController {
 							return { error: "invalid selectedReasoningEffort" };
 						}
 
+						const selectedProvider =
+							body.selectedProvider === undefined
+								? current.selectedProvider
+								: body.selectedProvider === null
+									? null
+									: parseSelectedProvider(body.selectedProvider);
+						if (body.selectedProvider !== undefined && body.selectedProvider !== null && selectedProvider === null) {
+							set.status = 400;
+
+							return { error: "invalid selectedProvider" };
+						}
+
 						const selection = await this.service.saveWorkspaceSelection({
 							selectedChatId: body.selectedChatId,
 							selectedProjectId: body.selectedProjectId,
 							permissionMode,
 							selectedModel,
+							selectedProvider: selectedProvider ?? null,
 							selectedReasoningEffort,
 						});
 						const metadata = readMutationRequestMetadata(request);
@@ -90,6 +118,7 @@ export class SelectionController {
 							selectedProjectId: t.Nullable(t.String()),
 							permissionMode: t.Optional(t.String()),
 							selectedModel: t.Optional(t.Nullable(t.String())),
+							selectedProvider: t.Optional(t.Nullable(t.String())),
 							selectedReasoningEffort: t.Optional(t.Nullable(t.String())),
 						}),
 					},

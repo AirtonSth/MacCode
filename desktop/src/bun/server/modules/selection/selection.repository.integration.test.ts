@@ -16,8 +16,9 @@ const createSelectionFromRow = (row: {
 	selectedChatId: string | null;
 	permissionMode: "default" | "plan" | "full";
 	selectedModel: string | null;
+	selectedProvider?: string | null;
 	selectedReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | null;
-}) => ({ ...row });
+}) => ({ selectedProvider: null, ...row });
 
 test("selection repository upserts one row and returns stored selection", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-selection-repository-save-"));
@@ -38,6 +39,7 @@ test("selection repository upserts one row and returns stored selection", async 
 				selectedProjectId: null,
 				permissionMode: "default",
 				selectedModel: null,
+				selectedProvider: null,
 				selectedReasoningEffort: null,
 			});
 			expect(first).toEqual(
@@ -55,6 +57,7 @@ test("selection repository upserts one row and returns stored selection", async 
 				selectedChatId: null,
 				permissionMode: "plan",
 				selectedModel: "gpt-5.3-codex",
+				selectedProvider: null,
 				selectedReasoningEffort: "high",
 			});
 			expect(second.selectedProjectId).toBe(project.id);
@@ -65,6 +68,7 @@ test("selection repository upserts one row and returns stored selection", async 
 				selectedChatId: chat.id,
 				permissionMode: "full",
 				selectedModel: "gpt-5.3-codex-spark",
+				selectedProvider: null,
 				selectedReasoningEffort: "xhigh",
 			});
 			expect(third).toEqual(
@@ -130,6 +134,7 @@ test("selection repository clears ids when selected project is deleted", async (
 				selectedChatId: chat.id,
 				permissionMode: "plan",
 				selectedModel: "gpt-5.3-codex",
+				selectedProvider: null,
 				selectedReasoningEffort: "medium",
 			});
 

@@ -5,9 +5,20 @@ import {
 	parseCodexPermissionMode,
 } from "../../../../shared/codex-permission-mode";
 import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
+import type { ChatProvider } from "../../shared/core/server.types";
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { workspaceSelection } from "../../shared/db/db.schema";
 import type { WorkspaceSelection } from "./selection.model";
+
+const VALID_PROVIDERS = new Set<ChatProvider>(["codex", "claude"]);
+
+const parseSelectedProvider = (value: unknown): ChatProvider | null => {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	return VALID_PROVIDERS.has(value as ChatProvider) ? (value as ChatProvider) : null;
+};
 
 const WORKSPACE_SELECTION_ID = "default";
 
@@ -21,11 +32,14 @@ export class WorkspaceSelectionRepository {
 				: null;
 		const selectedReasoningEffort = parseCodexReasoningEffort(row?.selectedReasoningEffort) ?? null;
 
+		const selectedProvider = parseSelectedProvider(row?.selectedProvider);
+
 		return {
 			selectedChatId: row?.selectedChatId ?? null,
 			selectedProjectId: row?.selectedProjectId ?? null,
 			permissionMode,
 			selectedModel,
+			selectedProvider,
 			selectedReasoningEffort,
 		};
 	}
@@ -61,6 +75,7 @@ export class WorkspaceSelectionRepository {
 				selectedProjectId: selection.selectedProjectId,
 				permissionMode: selection.permissionMode,
 				selectedModel: selection.selectedModel,
+				selectedProvider: selection.selectedProvider,
 				selectedReasoningEffort: selection.selectedReasoningEffort,
 				updatedAt: now,
 			})
@@ -71,6 +86,7 @@ export class WorkspaceSelectionRepository {
 					selectedProjectId: selection.selectedProjectId,
 					permissionMode: selection.permissionMode,
 					selectedModel: selection.selectedModel,
+					selectedProvider: selection.selectedProvider,
 					selectedReasoningEffort: selection.selectedReasoningEffort,
 					updatedAt: now,
 				},

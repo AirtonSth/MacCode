@@ -106,7 +106,7 @@ interface LiveActivitySubscriptionResponse {
 type SelectionResponse = WorkspaceSelectionDTO;
 
 export interface RemoteCodeClient {
-	createChat: (projectId: string, title?: string) => Promise<ChatDTO>;
+	createChat: (projectId: string, title?: string, provider?: string) => Promise<ChatDTO>;
 	createProject: (input: { name?: string; path: string }) => Promise<ProjectDTO>;
 	deleteChat: (chatId: string) => Promise<DeleteResponse>;
 	stopChat: (chatId: string) => Promise<StopChatResponse>;
@@ -124,6 +124,7 @@ export interface RemoteCodeClient {
 		options?: { cursor?: number; limit?: number },
 	) => Promise<TerminalHistoryResponse>;
 	getSelection: () => Promise<WorkspaceSelectionDTO>;
+	listClaudeModels: () => Promise<CodexModelsCatalogDTO>;
 	listCodexModels: () => Promise<CodexModelsCatalogDTO>;
 	listFsEntries: (path: string) => Promise<FsListResponseDTO>;
 	listFsRoots: () => Promise<FsRootEntryDTO[]>;
@@ -279,11 +280,11 @@ export const createRemoteCodeClient = (
 	};
 
 	return {
-		async createChat(projectId: string, title?: string) {
+		async createChat(projectId: string, title?: string, provider?: string) {
 			const payload = await request<CreateChatResponse>({
 				method: "POST",
 				path: `/projects/${projectId}/chats`,
-				body: { title },
+				body: { title, ...(provider ? { provider } : {}) },
 			});
 
 			return payload.chat;
@@ -377,6 +378,18 @@ export const createRemoteCodeClient = (
 				method: "GET",
 				path: "/selection",
 			});
+		},
+
+		async listClaudeModels() {
+			const payload = await request<ListCodexModelsResponse>({
+				method: "GET",
+				path: "/providers/claude/models",
+			});
+
+			return {
+				models: payload.models,
+				nextCursor: payload.nextCursor,
+			};
 		},
 
 		async listCodexModels() {

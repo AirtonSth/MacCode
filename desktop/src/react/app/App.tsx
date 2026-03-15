@@ -150,6 +150,12 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "remotecode-desktop-sidebar-width";
 const PERMISSION_MODE_STORAGE_KEY = "remotecode:permission-mode";
 const MODEL_STORAGE_KEY = "remotecode:model";
 const REASONING_EFFORT_STORAGE_KEY = "remotecode:reasoning-effort";
+const PROVIDER_STORAGE_KEY = "remotecode:provider";
+
+type SelectedProvider = "codex" | "claude";
+
+const isValidProvider = (value: unknown): value is SelectedProvider =>
+	value === "codex" || value === "claude";
 const WS_CLIENT_ID_STORAGE_KEY = "remotecode:ws-client-id";
 const DEFAULT_SIDEBAR_WIDTH = 272;
 const SIDEBAR_WIDTH_MIN = 208;
@@ -479,9 +485,18 @@ const App = (): JSX.Element => {
 
 		return parseCodexReasoningEffort(window.localStorage.getItem(REASONING_EFFORT_STORAGE_KEY));
 	});
+	const [selectedProvider, setSelectedProvider] = useState<SelectedProvider>(() => {
+		if (typeof window === "undefined") {
+			return "codex";
+		}
+
+		const stored = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
+		return isValidProvider(stored) ? stored : "codex";
+	});
 	const permissionModeRef = useRef<CodexPermissionMode>(permissionMode);
 	const selectedModelRef = useRef<string | null>(selectedModel);
 	const selectedReasoningEffortRef = useRef<CodexReasoningEffort | null>(selectedReasoningEffort);
+	const selectedProviderRef = useRef<SelectedProvider>(selectedProvider);
 	const messageWindowRef = useRef(state.messageWindow);
 
 	const selectedModelDescriptor = useMemo(
@@ -543,6 +558,10 @@ const App = (): JSX.Element => {
 	useEffect(() => {
 		selectedReasoningEffortRef.current = selectedReasoningEffort;
 	}, [selectedReasoningEffort]);
+
+	useEffect(() => {
+		selectedProviderRef.current = selectedProvider;
+	}, [selectedProvider]);
 
 	useEffect(() => {
 		messageWindowRef.current = state.messageWindow;
@@ -1310,12 +1329,15 @@ const App = (): JSX.Element => {
 
 	const loadCodexModels = useCallback(async () => {
 		try {
-			const catalog = await api.listCodexModels();
+			const provider = selectedProviderRef.current;
+			const catalog = provider === "claude"
+				? await api.listClaudeModels()
+				: await api.listCodexModels();
 			setAvailableModels(catalog.models);
 			clearRestErrors();
 		} catch (error) {
 			addError(
-				formatApiErrorMessage(error, "Unable to load codex models"),
+				formatApiErrorMessage(error, "Unable to load models"),
 				"rest",
 				formatApiErrorCode(error),
 			);
@@ -1760,7 +1782,7 @@ const App = (): JSX.Element => {
 
 			dispatch({ payload: true, type: "SET_CREATING_CHAT" });
 			try {
-				const chat = await api.createChat(state.selectedProjectId, title);
+				const chat = await api.createChat(state.selectedProjectId, title, selectedProviderRef.current);
 				dispatch({ payload: chat, type: "UPSERT_CHAT" });
 				selectedProjectIdRef.current = state.selectedProjectId;
 				selectedChatIdRef.current = chat.id;
@@ -2016,6 +2038,37 @@ const App = (): JSX.Element => {
 			});
 		},
 		[persistCurrentSelectionPreferences],
+	);
+
+	const handleProviderChange = useCallback(
+		(provider: SelectedProvider) => {
+			setSelectedProvider(provider);
+			if (typeof window !== "undefined") {
+				window.localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
+			}
+			setSelectedModel(null);
+			setSelectedReasoningEffort(null);
+			setAvailableModels([]);
+			setHasLoadedCodexModels(false);
+			void (async () => {
+				try {
+					const catalog = provider === "claude"
+						? await api.listClaudeModels()
+						: await api.listCodexModels();
+					setAvailableModels(catalog.models);
+					const defaultModel = catalog.models.find((m) => m.isDefault) ?? catalog.models[0];
+					if (defaultModel) {
+						setSelectedModel(defaultModel.model);
+						setSelectedReasoningEffort(defaultModel.defaultReasoningEffort);
+					}
+				} catch {
+					// models will be empty until next load
+				} finally {
+					setHasLoadedCodexModels(true);
+				}
+			})();
+		},
+		[api],
 	);
 
 	const handleSetStreamItemExpanded = useCallback(
@@ -2847,6 +2900,55 @@ const App = (): JSX.Element => {
 														</TooltipTrigger>
 														<TooltipContent>Open in Finder</TooltipContent>
 													</Tooltip>
+													<div className="flex items-center rounded-lg border border-white/[0.06] bg-white/[0.03]">
+														{(["plan", "default", "full"] as const).map((mode) => {
+															const isActive = permissionMode === mode;
+															const dotColor =
+																mode === "full"
+																	? "#F97316"
+																	: mode === "plan"
+																		? "#1D4ED8"
+																		: "#94A3B8";
+															const label =
+																mode === "full"
+																	? "Bypass Permissions"
+																	: mode === "plan"
+																		? "Plan Mode"
+																		: "Default";
+															const tooltip =
+																mode === "full"
+																	? "Bypasses all approvals and sandbox. Use with caution."
+																	: mode === "plan"
+																		? "Read-only. The agent can only read files and plan changes."
+																		: "The agent can write to the workspace but asks for approval.";
+															return (
+																<Tooltip key={mode}>
+																	<TooltipTrigger asChild>
+																		<button
+																			aria-label={`Permission: ${label}`}
+																			className={cn(
+																				"flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium leading-4 transition-colors first:rounded-l-[7px] last:rounded-r-[7px]",
+																				isActive
+																					? "bg-white/[0.08] text-slate-100"
+																					: "text-slate-400 hover:text-slate-200",
+																			)}
+																			onClick={() => {
+																				handlePermissionModeChange(mode);
+																			}}
+																			type="button"
+																		>
+																			<span
+																				className="block h-2 w-2 shrink-0 rounded-full"
+																				style={{ backgroundColor: dotColor }}
+																			/>
+																			{label}
+																		</button>
+																	</TooltipTrigger>
+																	<TooltipContent>{tooltip}</TooltipContent>
+																</Tooltip>
+															);
+														})}
+													</div>
 													<GitQuickControl
 														className="relative"
 														client={api}
@@ -2919,6 +3021,8 @@ const App = (): JSX.Element => {
 									onSend={handleSendMessage}
 									permissionMode={permissionMode}
 									selectedModel={selectedModel}
+									selectedProvider={selectedProvider}
+									onProviderChange={handleProviderChange}
 									selectedReasoningEffort={selectedReasoningEffort}
 									sending={selectedChatSending}
 									stopping={selectedChatStopping}

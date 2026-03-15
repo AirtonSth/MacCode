@@ -53,7 +53,7 @@ const palette = {
 	userBubble: "rgba(99,200,255,0.19)",
 };
 
-type ActivePicker = "model" | "permission" | "reasoning";
+type ActivePicker = "provider" | "model" | "permission" | "reasoning";
 type FilePickerTarget = "chat" | "terminal";
 type GitCommitAction = "commit" | "push";
 
@@ -97,6 +97,9 @@ const getSelectModalTitle = (activePicker: ActivePicker | null): string => {
 		}
 		case "permission": {
 			return "Select permission";
+		}
+		case "provider": {
+			return "Select provider";
 		}
 		case "reasoning": {
 			return "Select reasoning";
@@ -188,6 +191,7 @@ export const ChatScreen = () => {
 		setStreamItemExpanded,
 		setStreamItemState,
 		setSelectedModel,
+		setSelectedProvider,
 		setSelectedReasoningEffort,
 		setPermissionMode,
 		selectProject,
@@ -198,6 +202,7 @@ export const ChatScreen = () => {
 		selectedProject,
 		selectedProjectId,
 		sendMessage,
+		selectedProvider,
 		selectedReasoningEffort,
 		streamHistoryTurns,
 		streamingText,
@@ -1102,6 +1107,12 @@ export const ChatScreen = () => {
 					setPermissionMode(value);
 					break;
 				}
+				case "provider": {
+					if (value === "codex" || value === "claude") {
+						setSelectedProvider(value);
+					}
+					break;
+				}
 				case "reasoning": {
 					setSelectedReasoningEffort(value);
 					break;
@@ -1117,6 +1128,7 @@ export const ChatScreen = () => {
 			selectedModel,
 			setPermissionMode,
 			setSelectedModel,
+			setSelectedProvider,
 			setSelectedReasoningEffort,
 		],
 	);
@@ -1185,6 +1197,8 @@ export const ChatScreen = () => {
 		));
 	}, [handleStreamItemExpanded, handleStreamItemState, historicalTurns, showRunDetails]);
 
+	const providerOptions = useMemo(() => ["codex", "claude"] as const, []);
+
 	const activePickerOptions = useMemo((): JSX.Element[] => {
 		const options: JSX.Element[] = [];
 
@@ -1241,6 +1255,33 @@ export const ChatScreen = () => {
 				);
 				break;
 			}
+			case "provider": {
+				options.push(
+					...providerOptions.map((provider) => {
+						const isCurrent = provider === selectedProvider;
+						const label = provider === "claude" ? "Claude Code" : "Codex";
+						return (
+							<Pressable
+								key={provider}
+								onPress={() => {
+									setPicker(provider);
+								}}
+								style={({ pressed }) => [
+									styles.selectModalItem,
+									isCurrent ? styles.selectModalItemActive : null,
+									pressed ? styles.selectModalItemPressed : null,
+								]}
+								testID={`chat-provider-option-${provider}`}
+							>
+								<Text numberOfLines={1} style={styles.selectModalItemLabel}>
+									{label}
+								</Text>
+							</Pressable>
+						);
+					}),
+				);
+				break;
+			}
 			case "reasoning": {
 				options.push(
 					...availableReasoningEfforts.map((effort) => {
@@ -1278,7 +1319,9 @@ export const ChatScreen = () => {
 		availableModels,
 		availableReasoningEfforts,
 		permissionMode,
+		providerOptions,
 		selectedModel,
+		selectedProvider,
 		selectedReasoningEffort,
 		permissionOptions,
 		setPicker,
@@ -1487,6 +1530,26 @@ export const ChatScreen = () => {
 						showsHorizontalScrollIndicator={false}
 						style={styles.selectorsRow}
 					>
+						<Pressable
+							onPress={() => {
+								setActivePicker("provider");
+							}}
+							style={({ pressed }) => [
+								styles.selectorButton,
+								pressed ? styles.selectorButtonPressed : null,
+							]}
+							testID="chat-provider-picker-button"
+						>
+							<View style={styles.selectorButtonContent}>
+								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+									Provider
+								</Text>
+								<Text numberOfLines={1} style={styles.selectorButtonValue}>
+									{selectedProvider === "claude" ? "Claude Code" : "Codex"}
+								</Text>
+							</View>
+							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+						</Pressable>
 						<Pressable
 							disabled={availableModels.length === 0}
 							onPress={() => {

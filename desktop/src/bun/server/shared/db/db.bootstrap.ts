@@ -5,7 +5,7 @@ const chatsCreateSql = `
 		id TEXT PRIMARY KEY,
 		projectId TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
 		title TEXT NOT NULL,
-		provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex')),
+		provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex', 'claude')),
 		providerThreadId TEXT,
 		status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
 		isActive INTEGER NOT NULL DEFAULT 0,
@@ -181,7 +181,8 @@ export class DatabaseBootstrap {
 		const hasIsActiveColumn = this.hasColumn(database, "chats", "isActive");
 		const createSql = this.getTableDefinition(database, "chats");
 		const hasLegacyProviderConstraint = createSql.includes("CHECK(provider = 'fake')");
-		return hasLegacyProviderConstraint || !hasThreadColumn || !hasIsActiveColumn;
+		const missingClaudeProvider = !createSql.includes("'claude'");
+		return hasLegacyProviderConstraint || missingClaudeProvider || !hasThreadColumn || !hasIsActiveColumn;
 	}
 
 	private static rebuildChatsTable(database: Database): void {
@@ -201,7 +202,7 @@ export class DatabaseBootstrap {
 					id TEXT PRIMARY KEY,
 					projectId TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
 					title TEXT NOT NULL,
-					provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex')),
+					provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex', 'claude')),
 					providerThreadId TEXT,
 					status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
 					isActive INTEGER NOT NULL DEFAULT 0,
@@ -229,7 +230,7 @@ export class DatabaseBootstrap {
 					projectId,
 					title,
 					CASE
-						WHEN provider IN ('fake', 'codex') THEN provider
+						WHEN provider IN ('fake', 'codex', 'claude') THEN provider
 						ELSE 'fake'
 					END,
 					${threadSelection},
@@ -295,6 +296,10 @@ export class DatabaseBootstrap {
 
 		if (!this.hasColumn(database, "workspace_selection", "selectedReasoningEffort")) {
 			database.exec("ALTER TABLE workspace_selection ADD COLUMN selectedReasoningEffort TEXT");
+		}
+
+		if (!this.hasColumn(database, "workspace_selection", "selectedProvider")) {
+			database.exec("ALTER TABLE workspace_selection ADD COLUMN selectedProvider TEXT");
 		}
 	}
 

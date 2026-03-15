@@ -2,6 +2,7 @@ import type {
 	ActiveThreadSummaryDTO,
 	ChatContextDTO,
 	ChatDTO,
+	ChatProvider,
 	ProjectSummaryDTO,
 	ThreadSummaryDTO,
 } from "../../types";
@@ -9,7 +10,7 @@ import type { ProjectRepository } from "../project/project.repository";
 import type { ChatRepository } from "./chat.repository";
 
 export interface ChatServiceContract {
-	createChat: (projectId: string, title: string) => Promise<ChatDTO | null>;
+	createChat: (projectId: string, title: string, provider?: ChatProvider) => Promise<ChatDTO | null>;
 	getChatContext: (chatId: string) => Promise<ChatContextDTO | null>;
 	getChatById: (chatId: string) => Promise<ChatDTO | null>;
 	listByProjectId: (projectId: string) => Promise<ChatDTO[] | null>;
@@ -56,14 +57,14 @@ export class ChatService implements ChatServiceContract {
 		};
 	}
 
-async createChat(projectId: string, title: string): Promise<ChatDTO | null> {
+async createChat(projectId: string, title: string, provider?: ChatProvider): Promise<ChatDTO | null> {
 		const project = await this.projectRepository.findProjectById(projectId);
 
 		if (!project) {
 			return null;
 		}
 
-		return this.chatRepository.createChat(projectId, title);
+		return this.chatRepository.createChat(projectId, title, provider);
 	}
 
 	

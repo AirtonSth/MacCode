@@ -32,6 +32,7 @@ test("selection service persists and reads workspace selection", async () => {
 				selectedChatId: null,
 				permissionMode: "default",
 				selectedModel: null,
+				selectedProvider: null,
 				selectedReasoningEffort: null,
 			});
 
@@ -40,6 +41,7 @@ test("selection service persists and reads workspace selection", async () => {
 				selectedChatId: chat.id,
 				permissionMode: "plan",
 				selectedModel: "gpt-5.3-codex",
+				selectedProvider: "claude",
 				selectedReasoningEffort: "high",
 			});
 
@@ -48,6 +50,7 @@ test("selection service persists and reads workspace selection", async () => {
 				selectedChatId: chat.id,
 				permissionMode: "plan",
 				selectedModel: "gpt-5.3-codex",
+				selectedProvider: "claude",
 				selectedReasoningEffort: "high",
 			});
 

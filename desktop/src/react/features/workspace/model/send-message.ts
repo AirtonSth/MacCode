@@ -6,7 +6,7 @@ export interface SendMessageInput {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;
 	selectedChatExists?: boolean;
-	selectedChatProvider?: "fake" | "codex" | null;
+	selectedChatProvider?: "fake" | "codex" | "claude" | null;
 	text: string;
 	createChatId: () => Promise<string | null>;
 	hasOpenWebSocket: boolean;

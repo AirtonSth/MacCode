@@ -25,7 +25,7 @@ export interface ChatDTO {
 	id: string;
 	isActive: boolean;
 	projectId: string;
-	provider: "fake" | "codex";
+	provider: "fake" | "codex" | "claude";
 	title: string;
 	status: ChatStatus;
 	diffAdded: number;
@@ -108,6 +108,7 @@ export interface WorkspaceSelectionDTO {
 	selectedChatId: string | null;
 	permissionMode: string;
 	selectedModel: string | null;
+	selectedProvider: string | null;
 	selectedReasoningEffort: string | null;
 }
 
