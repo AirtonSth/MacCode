@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "postinstall": "./scripts/apply-expo-ui-text-timer-patch.sh && ./scripts/cleanup-stale-expo-artifacts.sh",
+    "postinstall": "./scripts/apply-expo-ui-text-timer-patch.sh && ./scripts/cleanup-stale-expo-artifacts.sh && ./scripts/install-expo-wrapper.sh",
     "clean": "./scripts/cleanup-stale-expo-artifacts.sh",
     "prepare": "husky",
     "lint": "bun run lint:mobile && bun run lint:contracts",
