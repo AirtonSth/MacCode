@@ -1,3 +1,6 @@
+import path from "node:path";
+import { accessSync, constants, statSync } from "node:fs";
+
 import type { CodexProviderResult, CodexProviderRunOptions } from "../../types";
 import {
 	DEFAULT_CODEX_PERMISSION_MODE,
@@ -8,8 +11,10 @@ import type {
 	AssistantStreamItemState,
 	AssistantStreamItemType,
 } from "../../../../shared/assistant-stream-event";
+import type { CodexReasoningEffort } from "../../../../shared/codex-model-config";
 
 interface ClaudeJsonEvent {
+	event?: ClaudeStreamEventPayload;
 	type?: string;
 	subtype?: string;
 	session_id?: string;
@@ -25,6 +30,19 @@ interface ClaudeJsonEvent {
 	is_error?: boolean;
 }
 
+interface ClaudeStreamEventPayload {
+	type?: string;
+	index?: number;
+	content_block?: ClaudeContentBlock;
+	delta?: {
+		type?: string;
+		text?: string;
+		thinking?: string;
+		partial_json?: string;
+		signature?: string;
+	};
+}
+
 interface ClaudeContentBlock {
 	type?: string;
 	text?: string;
@@ -32,6 +50,9 @@ interface ClaudeContentBlock {
 	id?: string;
 	name?: string;
 	input?: unknown;
+	tool_use_id?: string;
+	content?: unknown;
+	is_error?: boolean;
 }
 
 export interface ClaudeParsedEvent {
@@ -41,9 +62,21 @@ export interface ClaudeParsedEvent {
 	error?: string;
 	itemId?: string;
 	itemType?: AssistantStreamItemType;
+	source?: "assistant" | "result" | "stream" | "tool" | "user";
+	streamIndex?: number;
 	text?: string;
 	threadId?: string;
-	type: "thread_started" | "turn_started" | "turn_completed" | "item_started" | "item_delta" | "item_completed" | "item_failed" | "error";
+	type:
+		| "thread_started"
+		| "turn_started"
+		| "turn_completed"
+		| "stream_message_started"
+		| "stream_block_stopped"
+		| "item_started"
+		| "item_delta"
+		| "item_completed"
+		| "item_failed"
+		| "error";
 }
 
 interface ClaudeRunnerState {
@@ -53,15 +86,84 @@ interface ClaudeRunnerState {
 	commandByItemId: Map<string, string>;
 	currentTurnId?: string;
 	errorMessage?: string;
+	hasSeenStreamEvents: boolean;
 	itemSequence: number;
 	lastStatusDelta?: string;
 	startedItemIds: Set<string>;
+	streamItemIdsByIndex: Map<number, string>;
+	streamItemTypesByIndex: Map<number, AssistantStreamItemType>;
 	streamedAgentMessageItemIds: Set<string>;
 	threadId?: string;
 	turnCompleted: boolean;
 	turnCounter: number;
 	pendingToolUseIds: Map<string, string>;
 }
+
+type ClaudeCommandInputPath = string | undefined;
+
+const CLAUDE_COMMAND = "claude";
+
+const isNodeModulesBinDirectory = (directory: string): boolean => {
+	const normalized = directory.replace(/\\+/g, "/");
+
+	return normalized.endsWith("/node_modules/.bin");
+};
+
+const isExecutable = (candidate: string): boolean => {
+	try {
+		accessSync(candidate, constants.X_OK);
+		const stats = statSync(candidate);
+		return stats.isFile() || stats.isFIFO();
+	} catch {
+		return false;
+	}
+};
+
+const commandCandidates = (platform: string): string[] => {
+	if (platform !== "win32") {
+		return [CLAUDE_COMMAND];
+	}
+
+	return [`${CLAUDE_COMMAND}.exe`, `${CLAUDE_COMMAND}.cmd`, `${CLAUDE_COMMAND}.bat`, `${CLAUDE_COMMAND}.com`, CLAUDE_COMMAND];
+};
+
+export const resolveClaudeCommand = (
+	pathValue: ClaudeCommandInputPath = process.env.PATH,
+): string => {
+	const pathEntries = (pathValue ?? "")
+		.split(path.delimiter)
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+
+	const tryResolveInDirectories = (directories: string[]): string | null => {
+		for (const directory of directories) {
+			for (const command of commandCandidates(process.platform)) {
+				const candidatePath = path.join(directory, command);
+
+				if (isExecutable(candidatePath)) {
+					return candidatePath;
+				}
+			}
+		}
+
+		return null;
+	};
+
+	const nonShadowedDirectories = pathEntries.filter((directory) => !isNodeModulesBinDirectory(directory));
+	const shadowedDirectories = pathEntries.filter((directory) => isNodeModulesBinDirectory(directory));
+
+	const preferred = tryResolveInDirectories(nonShadowedDirectories);
+	if (preferred) {
+		return preferred;
+	}
+
+	const fallback = tryResolveInDirectories(shadowedDirectories);
+	if (fallback) {
+		return fallback;
+	}
+
+	return CLAUDE_COMMAND;
+};
 
 interface ClaudeSpawnedProcess {
 	exitCode: number | null;
@@ -99,6 +201,21 @@ const normalizeLine = (value: string): string => value.replace(/\s+/g, " ").trim
 const sanitizeStatusLabel = (value: string): string =>
 	normalizeLine(value.replace(/[*_`#>~]/g, " ").replace(/\[(.*?)\]\((.*?)\)/g, "$1"));
 
+const extractTextParts = (value: unknown): string[] => {
+	if (typeof value === "string") {
+		return [value];
+	}
+
+	if (!Array.isArray(value)) {
+		return [];
+	}
+
+	return value
+		.filter((entry): entry is { text?: unknown } => Boolean(entry) && typeof entry === "object")
+		.map((entry) => (typeof entry.text === "string" ? entry.text : ""))
+		.filter((entry) => entry.length > 0);
+};
+
 const parseJsonLine = (line: string): ClaudeJsonEvent | null => {
 	const trimmed = line.trim();
 	if (!trimmed) {
@@ -110,6 +227,19 @@ const parseJsonLine = (line: string): ClaudeJsonEvent | null => {
 	} catch {
 		return null;
 	}
+};
+
+const buildStreamBlockItemId = (
+	itemType: AssistantStreamItemType,
+	streamIndex: number,
+): string => `${itemType}-stream-${streamIndex}`;
+
+const extractToolResultOutput = (block: ClaudeContentBlock): string => {
+	if (typeof block.content === "string") {
+		return block.content;
+	}
+
+	return extractTextParts(block.content).join("\n");
 };
 
 export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
@@ -132,6 +262,100 @@ export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
 		return events;
 	}
 
+	if (payload.type === "stream_event" && payload.event?.type) {
+		const streamEvent = payload.event;
+		if (streamEvent.type === "message_start") {
+			events.push({
+				type: "stream_message_started",
+				source: "stream",
+			});
+			return events;
+		}
+
+		if (streamEvent.type === "content_block_start" && typeof streamEvent.index === "number") {
+			const block = streamEvent.content_block;
+			if (!block?.type) {
+				return events;
+			}
+
+			if (block.type === "thinking") {
+				events.push({
+					type: "item_started",
+					itemId: buildStreamBlockItemId("reasoning", streamEvent.index),
+					itemType: "reasoning",
+					source: "stream",
+					streamIndex: streamEvent.index,
+				});
+				return events;
+			}
+
+			if (block.type === "text") {
+				events.push({
+					type: "item_started",
+					itemId: buildStreamBlockItemId("assistant_message", streamEvent.index),
+					itemType: "assistant_message",
+					source: "stream",
+					streamIndex: streamEvent.index,
+				});
+				return events;
+			}
+
+			if (block.type === "tool_use" && block.name) {
+				events.push({
+					type: "item_started",
+					itemId: block.id ?? buildStreamBlockItemId("tool", streamEvent.index),
+					itemType: "tool",
+					command: block.name,
+					source: "stream",
+					streamIndex: streamEvent.index,
+				});
+				return events;
+			}
+		}
+
+		if (streamEvent.type === "content_block_delta" && typeof streamEvent.index === "number") {
+			const delta = streamEvent.delta;
+			if (!delta?.type) {
+				return events;
+			}
+
+			if (delta.type === "thinking_delta" && delta.thinking) {
+				events.push({
+					type: "item_delta",
+					itemId: buildStreamBlockItemId("reasoning", streamEvent.index),
+					itemType: "reasoning",
+					source: "stream",
+					streamIndex: streamEvent.index,
+					text: delta.thinking,
+				});
+				return events;
+			}
+
+			if (delta.type === "text_delta" && delta.text) {
+				events.push({
+					type: "item_delta",
+					itemId: buildStreamBlockItemId("assistant_message", streamEvent.index),
+					itemType: "assistant_message",
+					source: "stream",
+					streamIndex: streamEvent.index,
+					text: delta.text,
+				});
+				return events;
+			}
+		}
+
+		if (streamEvent.type === "content_block_stop" && typeof streamEvent.index === "number") {
+			events.push({
+				type: "stream_block_stopped",
+				source: "stream",
+				streamIndex: streamEvent.index,
+			});
+			return events;
+		}
+
+		return events;
+	}
+
 	if (payload.type === "assistant" && payload.message?.content) {
 		for (const block of payload.message.content) {
 			if (!block.type) {
@@ -144,17 +368,20 @@ export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
 					type: "item_started",
 					itemId,
 					itemType: "reasoning",
+					source: "assistant",
 				});
 				events.push({
 					type: "item_delta",
 					itemId,
 					itemType: "reasoning",
+					source: "assistant",
 					text: block.thinking,
 				});
 				events.push({
 					type: "item_completed",
 					itemId,
 					itemType: "reasoning",
+					source: "assistant",
 					text: block.thinking,
 				});
 			}
@@ -163,6 +390,7 @@ export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
 				events.push({
 					type: "item_delta",
 					itemType: "assistant_message",
+					source: "assistant",
 					text: block.text,
 				});
 			}
@@ -177,8 +405,28 @@ export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
 					itemId: toolItemId,
 					itemType: "tool",
 					command: commandLabel,
+					source: "assistant",
 				});
 			}
+		}
+
+		return events;
+	}
+
+	if (payload.type === "user" && payload.message?.content) {
+		for (const block of payload.message.content) {
+			if (block.type !== "tool_result" || !block.tool_use_id) {
+				continue;
+			}
+
+			events.push({
+				type: "item_completed",
+				itemId: block.tool_use_id,
+				itemType: "tool",
+				commandExitCode: block.is_error ? 1 : 0,
+				commandOutput: extractToolResultOutput(block),
+				source: "user",
+			});
 		}
 
 		return events;
@@ -202,6 +450,7 @@ export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
 				itemType: "tool",
 				commandOutput: output,
 				commandExitCode: 0,
+				source: "tool",
 			});
 		}
 
@@ -218,8 +467,9 @@ export const parseClaudeJsonEvents = (line: string): ClaudeParsedEvent[] => {
 
 		if (payload.result && typeof payload.result === "string") {
 			events.push({
-				type: "item_delta",
+				type: "item_completed",
 				itemType: "assistant_message",
+				source: "result",
 				text: payload.result,
 			});
 		}
@@ -271,9 +521,22 @@ const resolveItemId = (
 	state: ClaudeRunnerState,
 	itemType: AssistantStreamItemType,
 	rawItemId: string | undefined,
+	streamIndex?: number,
 ): string => {
 	if (rawItemId) {
 		return rawItemId;
+	}
+
+	if (typeof streamIndex === "number") {
+		const existing = state.streamItemIdsByIndex.get(streamIndex);
+		if (existing) {
+			return existing;
+		}
+
+		state.itemSequence += 1;
+		const created = `${itemType}-stream-${state.itemSequence}`;
+		state.streamItemIdsByIndex.set(streamIndex, created);
+		return created;
 	}
 
 	const active = state.activeItemByType[itemType];
@@ -328,6 +591,14 @@ const applyParsedEvent = (
 		return;
 	}
 
+	if (event.type === "stream_message_started") {
+		state.hasSeenStreamEvents = true;
+		state.streamItemIdsByIndex.clear();
+		state.streamItemTypesByIndex.clear();
+		ensureTurn(state, input.onEvent);
+		return;
+	}
+
 	if (event.type === "turn_started") {
 		startTurn(state, input.onEvent);
 		input.onDelta("Thinking...\n");
@@ -343,6 +614,34 @@ const applyParsedEvent = (
 		state.turnCompleted = true;
 		state.currentTurnId = undefined;
 		state.activeItemByType = {};
+		state.streamItemIdsByIndex.clear();
+		state.streamItemTypesByIndex.clear();
+		return;
+	}
+
+	if (event.type === "stream_block_stopped") {
+		const itemType = typeof event.streamIndex === "number"
+			? state.streamItemTypesByIndex.get(event.streamIndex)
+			: undefined;
+		if (itemType !== "reasoning") {
+			return;
+		}
+
+		const turnId = ensureTurn(state, input.onEvent);
+		const itemId = resolveItemId(state, itemType, undefined, event.streamIndex);
+		emitStreamEvent(input.onEvent, {
+			type: "item_state",
+			turnId,
+			itemId,
+			state: "completed",
+		});
+		emitStreamEvent(input.onEvent, {
+			type: "item_completed",
+			turnId,
+			itemId,
+			state: "completed",
+		});
+		delete state.activeItemByType.reasoning;
 		return;
 	}
 
@@ -355,11 +654,19 @@ const applyParsedEvent = (
 		return;
 	}
 
+	if (state.hasSeenStreamEvents && event.source === "assistant") {
+		return;
+	}
+
 	const turnId = ensureTurn(state, input.onEvent);
-	const itemId = resolveItemId(state, event.itemType, event.itemId);
+	const itemId = resolveItemId(state, event.itemType, event.itemId, event.streamIndex);
 
 	if (event.type === "item_started") {
 		state.activeItemByType[event.itemType] = itemId;
+		if (typeof event.streamIndex === "number") {
+			state.streamItemIdsByIndex.set(event.streamIndex, itemId);
+			state.streamItemTypesByIndex.set(event.streamIndex, event.itemType);
+		}
 
 		if (!state.startedItemIds.has(itemId)) {
 			let summary: string | undefined;
@@ -524,6 +831,32 @@ const applyParsedEvent = (
 			state.assistantMessage = assistantMessage;
 		}
 
+		if (!state.startedItemIds.has(itemId)) {
+			state.activeItemByType.assistant_message = itemId;
+			emitStreamEvent(input.onEvent, {
+				type: "item_started",
+				turnId,
+				itemId,
+				itemType: "assistant_message",
+				state: "running",
+				summary: "Writing response...",
+			});
+			state.startedItemIds.add(itemId);
+		}
+
+		const hasStreamedDelta = state.streamedAgentMessageItemIds.has(itemId);
+		if (assistantMessage && assistantMessage.length > 0 && !hasStreamedDelta) {
+			state.agentMessageDeltaText += assistantMessage;
+			emitStreamEvent(input.onEvent, {
+				type: "item_delta",
+				turnId,
+				itemId,
+				target: "body",
+				delta: assistantMessage,
+			});
+			input.onDelta(assistantMessage);
+		}
+
 		emitStreamEvent(input.onEvent, {
 			type: "item_state",
 			turnId,
@@ -566,17 +899,32 @@ const buildPermissionFlags = (permissionMode: CodexPermissionMode | undefined): 
 	const mode = permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
 
 	if (mode === "full") {
-		return ["--dangerouslySkipPermissions"];
+		return ["--dangerously-skip-permissions"];
 	}
 
-	return [];
+	if (mode === "plan") {
+		return ["--permission-mode", "plan"];
+	}
+
+	return ["--permission-mode", "default"];
+};
+
+const buildEffortFlags = (reasoningEffort: CodexReasoningEffort | undefined): string[] => {
+	if (!reasoningEffort || reasoningEffort === "none" || reasoningEffort === "minimal") {
+		return [];
+	}
+
+	const effort = reasoningEffort === "xhigh" ? "max" : reasoningEffort;
+	return ["--effort", effort];
 };
 
 const buildCommand = (options: CodexProviderRunOptions): string[] => {
 	const permissionFlags = buildPermissionFlags(options.permissionMode);
+	const effortFlags = buildEffortFlags(options.reasoningEffort);
 	const modelFlags = options.model ? ["--model", options.model] : [];
+	const command = resolveClaudeCommand();
 
-	const cmd = ["claude"];
+	const cmd = [command];
 
 	if (options.threadId) {
 		cmd.push("--continue", options.threadId);
@@ -584,8 +932,10 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 
 	cmd.push("-p", options.text);
 	cmd.push("--output-format", "stream-json");
+	cmd.push("--include-partial-messages");
 	cmd.push("--verbose");
 	cmd.push(...modelFlags);
+	cmd.push(...effortFlags);
 	cmd.push(...permissionFlags);
 
 	return cmd;
@@ -653,7 +1003,10 @@ export class ClaudeProviderRunner implements ClaudeProviderRunnerContract {
 			commandByItemId: new Map<string, string>(),
 			currentTurnId: undefined,
 			itemSequence: 0,
+			hasSeenStreamEvents: false,
 			startedItemIds: new Set<string>(),
+			streamItemIdsByIndex: new Map<number, string>(),
+			streamItemTypesByIndex: new Map<number, AssistantStreamItemType>(),
 			streamedAgentMessageItemIds: new Set<string>(),
 			threadId: options.threadId,
 			turnCompleted: false,

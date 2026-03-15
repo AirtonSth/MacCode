@@ -83,7 +83,7 @@ test("frontend e2e message send creates a new codex chat when selected chat is l
 	const token = "local-dev-token";
 	let selectedProjectId: string | null = null;
 	let selectedChatId: string | null = null;
-	let selectedChatProvider: "fake" | "codex" | null = null;
+	let selectedChatProvider: "fake" | "codex" | "claude" | null = null;
 
 	const api = RemoteCodeApi.createClient({
 		baseUrl,

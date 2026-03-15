@@ -21,7 +21,7 @@ export interface ChatDTO {
 	isActive: boolean;
 	projectId: string;
 	title: string;
-	provider: "fake" | "codex";
+	provider: "fake" | "codex" | "claude";
 	status: ChatStatus;
 	diffAdded: number;
 	diffRemoved: number;

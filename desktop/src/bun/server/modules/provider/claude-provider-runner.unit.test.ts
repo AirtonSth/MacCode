@@ -1,8 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
-import { parseClaudeJsonEvents, ClaudeProviderRunner, buildClaudeCommand } from "./claude-provider-runner";
+import {
+	parseClaudeJsonEvents,
+	ClaudeProviderRunner,
+	buildClaudeCommand,
+	resolveClaudeCommand,
+} from "./claude-provider-runner";
 import type { CodexProviderRunOptions } from "../../types";
 import type { AssistantStreamEvent } from "../../../../shared/assistant-stream-event";
+
+const pathDelimiter = process.platform === "win32" ? ";" : ":";
 
 describe("parseClaudeJsonEvents", () => {
 	test("parses system init event into thread_started and turn_started", () => {
@@ -90,6 +100,84 @@ describe("parseClaudeJsonEvents", () => {
 		});
 	});
 
+	test("parses stream_event text deltas into assistant_message item events", () => {
+		const started = parseClaudeJsonEvents(
+			JSON.stringify({
+				type: "stream_event",
+				event: {
+					type: "content_block_start",
+					index: 1,
+					content_block: {
+						type: "text",
+						text: "",
+					},
+				},
+			}),
+		);
+		const delta = parseClaudeJsonEvents(
+			JSON.stringify({
+				type: "stream_event",
+				event: {
+					type: "content_block_delta",
+					index: 1,
+					delta: {
+						type: "text_delta",
+						text: "Hello",
+					},
+				},
+			}),
+		);
+
+		expect(started).toEqual([
+			expect.objectContaining({
+				type: "item_started",
+				itemId: "assistant_message-stream-1",
+				itemType: "assistant_message",
+				source: "stream",
+				streamIndex: 1,
+			}),
+		]);
+		expect(delta).toEqual([
+			expect.objectContaining({
+				type: "item_delta",
+				itemId: "assistant_message-stream-1",
+				itemType: "assistant_message",
+				source: "stream",
+				streamIndex: 1,
+				text: "Hello",
+			}),
+		]);
+	});
+
+	test("parses user tool_result into tool completion", () => {
+		const events = parseClaudeJsonEvents(
+			JSON.stringify({
+				type: "user",
+				message: {
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "toolu_123",
+							content: "tool output",
+							is_error: false,
+						},
+					],
+				},
+			}),
+		);
+
+		expect(events).toEqual([
+			expect.objectContaining({
+				type: "item_completed",
+				itemId: "toolu_123",
+				itemType: "tool",
+				commandOutput: "tool output",
+				commandExitCode: 0,
+				source: "user",
+			}),
+		]);
+	});
+
 	test("parses result success into turn_completed", () => {
 		const events = parseClaudeJsonEvents(
 			JSON.stringify({
@@ -138,11 +226,12 @@ describe("buildClaudeCommand", () => {
 	test("builds basic command with -p and stream-json", () => {
 		const cmd = buildClaudeCommand(baseOptions);
 
-		expect(cmd[0]).toBe("claude");
+		expect(cmd[0].endsWith("claude")).toBe(true);
 		expect(cmd).toContain("-p");
 		expect(cmd).toContain("Hello");
 		expect(cmd).toContain("--output-format");
 		expect(cmd).toContain("stream-json");
+		expect(cmd).toContain("--include-partial-messages");
 		expect(cmd).toContain("--verbose");
 	});
 
@@ -162,16 +251,68 @@ describe("buildClaudeCommand", () => {
 		expect(cmd[continueIdx + 1]).toBe("session-abc");
 	});
 
-	test("includes --dangerouslySkipPermissions for full mode", () => {
+	test("includes --dangerously-skip-permissions for full mode", () => {
 		const cmd = buildClaudeCommand({ ...baseOptions, permissionMode: "full" });
 
-		expect(cmd).toContain("--dangerouslySkipPermissions");
+		expect(cmd).toContain("--dangerously-skip-permissions");
 	});
 
-	test("does not include --dangerouslySkipPermissions for plan mode", () => {
+	test("does not include --dangerously-skip-permissions for plan mode", () => {
 		const cmd = buildClaudeCommand({ ...baseOptions, permissionMode: "plan" });
 
-		expect(cmd).not.toContain("--dangerouslySkipPermissions");
+		expect(cmd).not.toContain("--dangerously-skip-permissions");
+	});
+
+	test("maps reasoning effort to Claude --effort", () => {
+		const cmd = buildClaudeCommand({ ...baseOptions, reasoningEffort: "xhigh" });
+		const effortIdx = cmd.indexOf("--effort");
+
+		expect(effortIdx).toBeGreaterThan(-1);
+		expect(cmd[effortIdx + 1]).toBe("max");
+	});
+
+	test("prefers Claude binary outside node_modules/.bin when PATH contains both", () => {
+		const goodDir = mkdtempSync(join(tmpdir(), "claude-path-good-"));
+		const shadowBase = mkdtempSync(join(tmpdir(), "claude-path-shadow-"));
+		const shadowDir = join(shadowBase, "node_modules", ".bin");
+		mkdirSync(shadowDir, { recursive: true });
+
+		const goodBinary = join(goodDir, "claude");
+		const shadowBinary = join(shadowDir, "claude");
+		writeFileSync(goodBinary, "#!/usr/bin/env sh\nexit 0\n");
+		writeFileSync(shadowBinary, "#!/usr/bin/env sh\nexit 0\n");
+		chmodSync(goodBinary, 0o755);
+		chmodSync(shadowBinary, 0o755);
+
+		try {
+			const command = resolveClaudeCommand(`${shadowDir}${pathDelimiter}${goodDir}`);
+			expect(command).toBe(goodBinary);
+		} finally {
+			rmSync(shadowBase, { recursive: true, force: true });
+			rmSync(goodDir, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back to node_modules/.bin when no other candidate exists", () => {
+		const shadowBase = mkdtempSync(join(tmpdir(), "claude-path-shadow-only-"));
+		const shadowDir = join(shadowBase, "node_modules", ".bin");
+		mkdirSync(shadowDir, { recursive: true });
+
+		const shadowBinary = join(shadowDir, "claude");
+		writeFileSync(shadowBinary, "#!/usr/bin/env sh\nexit 0\n");
+		chmodSync(shadowBinary, 0o755);
+
+		try {
+			const command = resolveClaudeCommand(shadowDir);
+			expect(command).toBe(shadowBinary);
+		} finally {
+			rmSync(shadowBase, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back to plain claude when executable is not found in PATH", () => {
+		const command = resolveClaudeCommand("/tmp/does-not-exist");
+		expect(command).toBe("claude");
 	});
 });
 

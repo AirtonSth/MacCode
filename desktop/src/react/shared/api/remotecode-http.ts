@@ -30,7 +30,7 @@ export interface ChatDTO {
 	id: string;
 	isActive: boolean;
 	projectId: string;
-	provider: "fake" | "codex";
+	provider: "fake" | "codex" | "claude";
 	title: string;
 	status: "pending" | "running" | "completed" | "failed";
 	diffAdded: number;
