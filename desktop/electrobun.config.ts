@@ -4,6 +4,11 @@ import pkg from "./package.json";
 const appIconPath = "assets/app-icon.png";
 const macIconsetPath = "icon.iconset";
 
+// Enable macOS code signing & notarization via env var (set CODESIGN=true in CI when ready)
+const isCodesignEnabled = ["1", "true", "yes"].includes(
+	(process.env.CODESIGN ?? "").toLowerCase(),
+);
+
 const isCdpEnabled = ["1", "true", "yes"].includes(
 	(process.env.ELECTROBUN_CDP ?? "").toLowerCase(),
 );
@@ -43,6 +48,8 @@ const config: ElectrobunConfig = {
 
 		mac: {
 			icons: macIconsetPath,
+			codesign: isCodesignEnabled,
+			notarize: isCodesignEnabled,
 			...runtimeConfig,
 		},
 
