@@ -35,6 +35,8 @@ yarn-error.log*
 .env.*.local
 desktop/.secrets/
 mobile/GoogleService-Info.plist
+mobile/google-services.json
+*.keystore
 
 # Bun
 bun.lockb
