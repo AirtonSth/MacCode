@@ -1,6 +1,4 @@
-# Keep your AI Agent moving while you live your life.
-
-![Mobile UI](https://raw.githubusercontent.com/samuelfaj/remotecode.io/main/gif.gif)
+![Mobile UI](https://raw.githubusercontent.com/samuelfaj/remotecode.io/main/hero.gif)
 
 **Don’t want to configure anything?** Go to https://remotecode.io/ and get started now!
 
