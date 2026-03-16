@@ -15,7 +15,25 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            label: macOS-arm64
+            core-tarball: darwin-arm64
+            core-dist: dist-macos-arm64
+          - runner: ubuntu-latest
+            label: Linux-x64
+            core-tarball: linux-x64
+            core-dist: dist-linux-x64
+          - runner: windows-latest
+            label: Windows-x64
+            core-tarball: win-x64
+            core-dist: dist-win-x64
+
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout code
@@ -31,6 +49,7 @@ jobs:
 
       - name: Resolve version
         id: version
+        shell: bash
         run: |
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
@@ -45,6 +64,7 @@ jobs:
 
       - name: Determine build environment
         id: build-env
+        shell: bash
         run: |
           TAG="${{ github.ref_name }}"
           if [[ "$TAG" == *"-canary"* ]]; then
@@ -55,93 +75,101 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Verify Electrobun install
-        run: |
-          EBUN_PKG="node_modules/electrobun/package.json"
-          EBUN_VER=$(bun -e "console.log(require('./$EBUN_PKG').version)")
-          echo "Electrobun version: $EBUN_VER"
-          echo "Electrobun path: $(pwd)/$EBUN_PKG"
-
       - name: Pre-download Electrobun core binaries
+        shell: bash
         run: |
-          # Electrobun CLI resolves core binaries relative to cwd:
-          #   join(process.cwd(), "node_modules", "electrobun", "dist-<os>-<arch>")
-          # Build steps use working-directory: desktop, so we must place
-          # binaries at desktop/node_modules/electrobun/dist-*.
-          # Bun workspaces hoists electrobun to root node_modules/, so we
-          # symlink it into the desktop workspace for the CLI to find.
-          EBUN_ROOT="$(pwd)/node_modules/electrobun"
-          EBUN_VER=$(bun -e "console.log(require('${EBUN_ROOT}/package.json').version)")
+          # Electrobun CLI resolves core binaries via:
+          #   join(process.cwd(), "node_modules", "electrobun", "<dist-dir>")
+          # Bun workspaces hoists electrobun to root node_modules/.
+          EBUN_ROOT="node_modules/electrobun"
+          EBUN_VER=$(bun -e "console.log(require('./${EBUN_ROOT}/package.json').version)")
           EBUN_TAG="v${EBUN_VER}"
+          echo "Electrobun version: $EBUN_VER"
 
-          download_core() {
-            local tarball_name="$1"
-            local dist_name="$2"
-            local dist_dir="${EBUN_ROOT}/${dist_name}"
-
-            if [ -d "$dist_dir" ] && [ "$(ls -A "$dist_dir" 2>/dev/null)" ]; then
-              echo "Core binaries for $tarball_name already present"
-              return
-            fi
-
-            local url="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-core-${tarball_name}.tar.gz"
-            echo "Downloading $tarball_name -> $dist_dir"
-            mkdir -p "$dist_dir"
-            curl -fsSL "$url" -o "/tmp/ebun-${tarball_name}.tar.gz"
-            tar -xzf "/tmp/ebun-${tarball_name}.tar.gz" -C "$dist_dir"
-            rm -f "/tmp/ebun-${tarball_name}.tar.gz"
-            echo "  Extracted: $(ls "$dist_dir" | head -5)..."
-          }
-
-          download_core "darwin-arm64" "dist-macos-arm64"
-          download_core "darwin-x64"   "dist-macos-x64"
-          download_core "linux-arm64"  "dist-linux-arm64"
-          download_core "linux-x64"    "dist-linux-x64"
-          download_core "win-x64"      "dist-win-x64"
+          DIST_DIR="${EBUN_ROOT}/${{ matrix.core-dist }}"
+          if [ -d "$DIST_DIR" ] && [ "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
+            echo "Core binaries already present in $DIST_DIR"
+          else
+            URL="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-core-${{ matrix.core-tarball }}.tar.gz"
+            echo "Downloading ${{ matrix.core-tarball }} -> $DIST_DIR"
+            mkdir -p "$DIST_DIR"
+            curl -fsSL "$URL" -o /tmp/ebun-core.tar.gz
+            tar -xzf /tmp/ebun-core.tar.gz -C "$DIST_DIR"
+            rm -f /tmp/ebun-core.tar.gz
+            echo "Extracted: $(ls "$DIST_DIR" | head -5)..."
+          fi
 
           # Symlink hoisted electrobun into desktop workspace so the CLI
           # finds core binaries when running with working-directory: desktop
           mkdir -p desktop/node_modules
           ln -sfn ../../node_modules/electrobun desktop/node_modules/electrobun
-          echo "Symlinked desktop/node_modules/electrobun -> ../node_modules/electrobun"
-          ls desktop/node_modules/electrobun/dist-macos-arm64/ | head -3
+          ls "desktop/node_modules/electrobun/${{ matrix.core-dist }}/" | head -3
 
       - name: Build frontend
         working-directory: desktop
         run: bun run build:vite
 
-      # Electrobun deletes artifacts/ on each build invocation, so we
-      # collect outputs into a separate release/ directory after each step.
-      - name: Build desktop — macOS (arm64 + x64)
+      - name: Build desktop
         working-directory: desktop
+        shell: bash
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
           ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
           ELECTROBUN_TEAMID: ${{ secrets.ELECTROBUN_TEAMID }}
           ELECTROBUN_APPLEID: ${{ secrets.ELECTROBUN_APPLEID }}
           ELECTROBUN_APPLEIDPASS: ${{ secrets.ELECTROBUN_APPLEIDPASS }}
-        run: |
-          npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=macos-arm64,macos-x64
-          mkdir -p release && cp artifacts/* release/
-
-      - name: Build desktop — Linux (x64 + arm64)
-        working-directory: desktop
-        env:
-          APP_VERSION: ${{ steps.version.outputs.value }}
-        run: |
-          npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=linux-x64,linux-arm64
-          cp artifacts/* release/
-
-      - name: Build desktop — Windows (x64)
-        working-directory: desktop
-        env:
-          APP_VERSION: ${{ steps.version.outputs.value }}
-        run: |
-          npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=win-x64
-          cp artifacts/* release/
+        run: npx electrobun build --env=${{ steps.build-env.outputs.env }}
 
       - name: List artifacts
         working-directory: desktop
+        shell: bash
+        run: ls -lhR artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: desktop/artifacts/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref_name }}" == v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(cat desktop/package.json | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])")
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Determine build environment
+        id: build-env
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == *"-canary"* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: List release files
         run: ls -lhR release/
 
       - name: Create GitHub Release
@@ -152,6 +180,6 @@ jobs:
           draft: false
           prerelease: ${{ steps.build-env.outputs.prerelease }}
           generate_release_notes: true
-          files: desktop/release/*
+          files: release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
