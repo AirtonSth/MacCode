@@ -17,10 +17,6 @@ jobs:
   build:
     runs-on: macos-14
 
-    defaults:
-      run:
-        working-directory: desktop
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -42,7 +38,7 @@ jobs:
             VERSION="${{ github.ref_name }}"
             VERSION="${VERSION#v}"
           else
-            VERSION=$(bun -e "console.log(require('./package.json').version)")
+            VERSION=$(bun -e "console.log(require('./desktop/package.json').version)")
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $VERSION"
@@ -61,10 +57,10 @@ jobs:
 
       - name: Verify Electrobun install
         run: |
-          EBUN_VER=$(bun -e "console.log(require('./node_modules/electrobun/package.json').version)")
+          EBUN_PKG="node_modules/electrobun/package.json"
+          EBUN_VER=$(bun -e "console.log(require('./$EBUN_PKG').version)")
           echo "Electrobun version: $EBUN_VER"
-          echo "Working directory: $(pwd)"
-          ls node_modules/electrobun/package.json
+          echo "Electrobun path: $(pwd)/$EBUN_PKG"
 
       - name: Pre-download Electrobun core binaries
         run: |
@@ -72,7 +68,6 @@ jobs:
           EBUN_TAG="v${EBUN_VER}"
           EBUN_DIR="node_modules/electrobun"
 
-          # Map: tarball-name -> dist directory name expected by CLI
           declare -A TARGET_MAP=(
             ["darwin-arm64"]="dist-macos-arm64"
             ["darwin-x64"]="dist-macos-x64"
@@ -99,9 +94,11 @@ jobs:
           done
 
       - name: Build frontend
+        working-directory: desktop
         run: bun run build:vite
 
       - name: Build desktop — macOS (arm64 + x64)
+        working-directory: desktop
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
           ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
@@ -111,16 +108,19 @@ jobs:
         run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=macos-arm64,macos-x64
 
       - name: Build desktop — Linux (x64 + arm64)
+        working-directory: desktop
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
         run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=linux-x64,linux-arm64
 
       - name: Build desktop — Windows (x64)
+        working-directory: desktop
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
         run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=win-x64
 
       - name: List artifacts
+        working-directory: desktop
         run: ls -lhR artifacts/ || echo "No artifacts directory"
 
       - name: Create GitHub Release
