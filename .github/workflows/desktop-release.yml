@@ -140,7 +140,7 @@ jobs:
           ls "desktop/node_modules/electrobun/${{ matrix.core-dist }}/" | head -3
 
       - name: Import signing certificate
-        if: runner.os == 'macOS' && secrets.MACOS_CERTIFICATE != ''
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
@@ -165,7 +165,7 @@ jobs:
         shell: bash
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
-          CODESIGN: ${{ secrets.MACOS_CERTIFICATE != '' && 'true' || 'false' }}
+          CODESIGN: ${{ secrets.ELECTROBUN_DEVELOPER_ID && 'true' || 'false' }}
           ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
           ELECTROBUN_TEAMID: ${{ secrets.ELECTROBUN_TEAMID }}
           ELECTROBUN_APPLEID: ${{ secrets.ELECTROBUN_APPLEID }}
