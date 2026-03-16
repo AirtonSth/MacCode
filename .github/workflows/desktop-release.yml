@@ -45,7 +45,15 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        shell: bash
+        run: |
+          # --ignore-scripts avoids running postinstall shell scripts (Expo/mobile)
+          # that fail on Windows. Desktop build doesn't need them.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bun install --frozen-lockfile --ignore-scripts
+          else
+            bun install --frozen-lockfile
+          fi
 
       - name: Resolve version
         id: version
