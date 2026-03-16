@@ -12,7 +12,8 @@
     "test": "bun test src/shared/api/ws-client.test.ts src/shared/api/ws-client.e2e.test.ts src/shared/api/remotecode-client.test.ts src/shared/api/remotecode-client.e2e.test.ts src/shared/api/api-config-store.test.ts src/shared/api/api-config-store.e2e.test.ts src/shared/api/private-auth-completion.test.ts src/shared/api/private-auth-completion.e2e.test.ts src/shared/api/private-session-store.test.ts src/shared/api/private-session-store.e2e.test.ts src/shared/api/private-session-provider.test.ts src/shared/api/private-session-provider.e2e.test.ts src/shared/api/use-server-health-query.test.ts src/shared/api/use-server-health-query.e2e.test.ts src/shared/notifications/local-notifications.test.ts src/features/settings/ui/private-account-section.model.test.ts src/features/settings/ui/private-account-section.model.e2e.test.ts && bun test src/shared/api/discovery-manager.test.ts",
     "test:e2e:ios": "bash ./e2e/run-ios-e2e.sh",
     "test:e2e:ios:navigation": "bash ./e2e/ios-navigation-flow.sh",
-    "test:e2e:ios:terminal": "bash ./e2e/ios-terminal-flow.sh"
+    "test:e2e:ios:terminal": "bash ./e2e/ios-terminal-flow.sh",
+    "test:e2e:ios:account-compliance": "bash ./e2e/ios-account-compliance-flow.sh"
   },
   "dependencies": {
     "@expo/ui": "55.0.1",

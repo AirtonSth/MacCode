@@ -4,9 +4,12 @@ import { expect, mock, test } from "bun:test";
 import { PrivateApiError } from "@remotecode/contracts";
 
 import {
+	buildPrivacyPolicyUrl,
 	buildPrivateForgotPasswordUrl,
 	buildPrivateManageSubscriptionUrl,
 	buildPrivateRegisterUrl,
+	buildTermsOfUseUrl,
+	deletePrivateAccount,
 	getPrivateSubscriptionSnapshot,
 	refreshPrivateAccountSessionRecord,
 	loginPrivateAccount,
@@ -243,4 +246,26 @@ test("getPrivateSubscriptionSnapshot reads the subscription flags from the sessi
 		daysRemaining: 30,
 		isSubscribed: false,
 	});
+});
+
+test("buildPrivacyPolicyUrl returns the privacy policy page", () => {
+	expect(buildPrivacyPolicyUrl()).toBe("https://remotecode.io/privacy");
+});
+
+test("buildTermsOfUseUrl returns the terms of use page", () => {
+	expect(buildTermsOfUseUrl()).toBe("https://remotecode.io/terms");
+});
+
+test("deletePrivateAccount delegates deletion to the shared contracts client", async () => {
+	// eslint-disable-next-line @typescript-eslint/no-empty-function
+	const deleteAccount = mock(async () => {});
+	await deletePrivateAccount({
+		backendUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			deleteAccount,
+		}) as never,
+		getAccessToken: () => "access-token",
+	});
+
+	expect(deleteAccount).toHaveBeenCalledTimes(1);
 });

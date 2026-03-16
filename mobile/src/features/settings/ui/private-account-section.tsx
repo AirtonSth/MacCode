@@ -17,10 +17,14 @@ import {
 } from "react-native";
 
 import { usePrivateSession } from "../../../shared/api/private-session-provider";
+import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import {
+	buildPrivacyPolicyUrl,
 	buildPrivateForgotPasswordUrl,
 	buildPrivateManageSubscriptionUrl,
 	buildPrivateRegisterUrl,
+	buildTermsOfUseUrl,
+	deletePrivateAccount,
 	getPrivateSubscriptionSnapshot,
 	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
@@ -92,6 +96,8 @@ export const PrivateAccountSection = ({
 	const [email, setEmail] = useState("");
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 	const [isAuthenticating, setIsAuthenticating] = useState(false);
+	const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+	const [isDeleteConfirmVisible, setIsDeleteConfirmVisible] = useState(false);
 	const [isLoadingConnectors, setIsLoadingConnectors] = useState(false);
 	const [password, setPassword] = useState("");
 	const subscriptionSnapshot = useMemo(
@@ -118,6 +124,8 @@ export const PrivateAccountSection = ({
 		() => buildPrivateManageSubscriptionUrl(),
 		[],
 	);
+	const privacyPolicyUrl = useMemo(() => buildPrivacyPolicyUrl(), []);
+	const termsOfUseUrl = useMemo(() => buildTermsOfUseUrl(), []);
 	const privateConnectError = useMemo(() => {
 		const value = routeParams.privateConnectError;
 		const rawValue = Array.isArray(value) ? value[0] : value;
@@ -301,6 +309,28 @@ export const PrivateAccountSection = ({
 			setConnectorsIfUnchanged([]);
 		}
 	}, [clearSessionRecord, sessionRecord]);
+
+	const handleDeleteAccount = useCallback(async () => {
+		if (!sessionRecord) {
+			return;
+		}
+
+		setIsDeletingAccount(true);
+		setErrorMessage(null);
+		try {
+			await deletePrivateAccount({
+				backendUrl: sessionRecord.backendUrl,
+				getAccessToken: () => sessionRecord.session.accessToken,
+			});
+		} catch {
+			// best effort — even if the server call fails, clear the local session
+		} finally {
+			await clearSessionRecord();
+			setConnectorsIfUnchanged([]);
+			setIsDeletingAccount(false);
+		}
+	}, [clearSessionRecord, sessionRecord]);
+
 	const authenticateButtonLabel = useMemo(() => {
 		if (isAuthenticating) {
 			return "Working...";
@@ -473,11 +503,70 @@ export const PrivateAccountSection = ({
 				</View>
 			)}
 
+			{sessionRecord ? (
+				<Pressable
+					disabled={isDeletingAccount}
+					onPress={() => {
+						setIsDeleteConfirmVisible(true);
+					}}
+					style={({ pressed }) => [
+						styles.dangerButton,
+						pressed ? styles.dangerButtonPressed : null,
+						isDeletingAccount ? styles.disabledButton : null,
+					]}
+					testID="private-account-delete"
+				>
+					<Text style={styles.dangerLabel}>{isDeletingAccount ? "Deleting..." : "Delete account"}</Text>
+				</Pressable>
+			) : null}
+
+			<View style={styles.legalLinks}>
+				<Pressable
+					onPress={() => {
+						void Linking.openURL(privacyPolicyUrl);
+					}}
+					testID="private-account-privacy-policy"
+				>
+					<Text style={styles.legalText}>Privacy Policy</Text>
+				</Pressable>
+				<Text style={styles.legalSeparator}>·</Text>
+				<Pressable
+					onPress={() => {
+						void Linking.openURL(termsOfUseUrl);
+					}}
+					testID="private-account-terms-of-use"
+				>
+					<Text style={styles.legalText}>Terms of Use</Text>
+				</Pressable>
+			</View>
+
 			{errorMessage ? (
 				<View style={styles.statusBox}>
 					<Text selectable style={styles.statusText}>{errorMessage}</Text>
 				</View>
 			) : null}
+
+			<IosActionSheet
+				actions={[
+					{
+						icon: "delete-forever",
+						key: "confirm-delete-account",
+						label: "Delete my account",
+						onPress: () => {
+							void handleDeleteAccount();
+						},
+						testID: "private-account-delete-confirm",
+						tone: "destructive",
+					},
+				]}
+				isVisible={isDeleteConfirmVisible}
+				message="This will permanently delete your account, subscription, and all associated data. This action cannot be undone."
+				onClose={() => {
+					setIsDeleteConfirmVisible(false);
+				}}
+				testID="private-account-delete-sheet"
+				title="Delete Account"
+			/>
 		</View>
 	);
 };
@@ -495,6 +584,39 @@ const styles = StyleSheet.create({
 		flexDirection: "row",
 		gap: 10,
 		padding: 12,
+	},
+	dangerButton: {
+		alignItems: "center",
+		borderColor: "rgba(255,107,133,0.38)",
+		borderRadius: 10,
+		borderWidth: 1,
+		height: 34,
+		justifyContent: "center",
+		paddingHorizontal: 12,
+	},
+	dangerButtonPressed: {
+		backgroundColor: "rgba(255,107,133,0.12)",
+	},
+	dangerLabel: {
+		color: "#FF8F98",
+		fontSize: 13,
+		fontWeight: "600",
+	},
+	legalLinks: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 6,
+		justifyContent: "center",
+		paddingTop: 4,
+	},
+	legalSeparator: {
+		color: palette.muted,
+		fontSize: 12,
+	},
+	legalText: {
+		color: palette.muted,
+		fontSize: 12,
+		textDecorationLine: "underline",
 	},
 	connectorRowPressed: {
 		backgroundColor: "rgba(255,255,255,0.08)",

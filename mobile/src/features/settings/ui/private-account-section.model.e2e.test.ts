@@ -2,7 +2,10 @@
 import { expect, test } from "bun:test";
 
 import {
+	buildPrivacyPolicyUrl,
 	buildPrivateRegisterUrl,
+	buildTermsOfUseUrl,
+	deletePrivateAccount,
 	loginPrivateAccount,
 	persistSavedPrivateConnection,
 } from "./private-account-section.model";
@@ -57,4 +60,27 @@ test("private account section builds the browser registration URL with a native 
 		email: "founder@remotecode.io",
 		platform: "android",
 	})).toContain("returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete");
+});
+
+test("privacy policy URL points to remotecode.io/privacy", () => {
+	expect(buildPrivacyPolicyUrl()).toBe("https://remotecode.io/privacy");
+});
+
+test("terms of use URL points to remotecode.io/terms", () => {
+	expect(buildTermsOfUseUrl()).toBe("https://remotecode.io/terms");
+});
+
+test("deletePrivateAccount calls the deleteAccount method on the private client", async () => {
+	let deleteCalled = false;
+	await deletePrivateAccount({
+		backendUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			deleteAccount: async () => {
+				deleteCalled = true;
+			},
+		}) as never,
+		getAccessToken: () => "access-token",
+	});
+
+	expect(deleteCalled).toBe(true);
 });

@@ -4,6 +4,8 @@ import type { PersistedPrivateSessionRecord } from "../../../shared/api/private-
 import { ApiConfigStore } from "../../../shared/api/api-config-store";
 
 const REMOTECODE_WEB_URL = "https://remotecode.io";
+const REMOTECODE_PRIVACY_POLICY_URL = `${REMOTECODE_WEB_URL}/privacy`;
+const REMOTECODE_TERMS_OF_USE_URL = `${REMOTECODE_WEB_URL}/terms`;
 
 const trimBaseUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
 const buildRemoteCodeWebUrl = (path: string, params: Record<string, string>): string => {
@@ -41,6 +43,22 @@ export const buildPrivateForgotPasswordUrl = (input: {
 
 export const buildPrivateManageSubscriptionUrl = (): string =>
 	`${REMOTECODE_WEB_URL}/app`;
+
+export const buildPrivacyPolicyUrl = (): string => REMOTECODE_PRIVACY_POLICY_URL;
+
+export const buildTermsOfUseUrl = (): string => REMOTECODE_TERMS_OF_USE_URL;
+
+export const deletePrivateAccount = async (input: {
+	backendUrl: string;
+	createClient?: typeof createPrivateClient;
+	getAccessToken: () => string;
+}): Promise<void> => {
+	const client = (input.createClient ?? createPrivateClient)({
+		baseUrl: input.backendUrl,
+		getAccessToken: input.getAccessToken,
+	});
+	await client.deleteAccount();
+};
 
 export const getPrivateSubscriptionSnapshot = (session: PrivateSessionDto | null | undefined) => ({
 	daysRemaining: session?.user.daysRemaining ?? session?.user.daysRemaing ?? 0,
