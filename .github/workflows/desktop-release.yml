@@ -110,6 +110,8 @@ jobs:
         working-directory: desktop
         run: bun run build:vite
 
+      # Electrobun deletes artifacts/ on each build invocation, so we
+      # collect outputs into a separate release/ directory after each step.
       - name: Build desktop — macOS (arm64 + x64)
         working-directory: desktop
         env:
@@ -118,23 +120,29 @@ jobs:
           ELECTROBUN_TEAMID: ${{ secrets.ELECTROBUN_TEAMID }}
           ELECTROBUN_APPLEID: ${{ secrets.ELECTROBUN_APPLEID }}
           ELECTROBUN_APPLEIDPASS: ${{ secrets.ELECTROBUN_APPLEIDPASS }}
-        run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=macos-arm64,macos-x64
+        run: |
+          npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=macos-arm64,macos-x64
+          mkdir -p release && cp artifacts/* release/
 
       - name: Build desktop — Linux (x64 + arm64)
         working-directory: desktop
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
-        run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=linux-x64,linux-arm64
+        run: |
+          npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=linux-x64,linux-arm64
+          cp artifacts/* release/
 
       - name: Build desktop — Windows (x64)
         working-directory: desktop
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
-        run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=win-x64
+        run: |
+          npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=win-x64
+          cp artifacts/* release/
 
       - name: List artifacts
         working-directory: desktop
-        run: ls -lhR artifacts/ || echo "No artifacts directory"
+        run: ls -lhR release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -144,6 +152,6 @@ jobs:
           draft: false
           prerelease: ${{ steps.build-env.outputs.prerelease }}
           generate_release_notes: true
-          files: desktop/artifacts/*
+          files: desktop/release/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
