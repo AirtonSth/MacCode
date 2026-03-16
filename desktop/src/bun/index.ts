@@ -4,6 +4,9 @@ import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
 import { maskTokenForLogs, serverLogger } from "./server/shared/core/server-logger";
 import { startMdnsBroadcast } from "./network/mdns";
+import { checkForUpdates } from "./updater/check-update";
+
+const APP_VERSION = "0.0.1";
 
 let mainWindowRef: BrowserWindow | null = null;
 let privateAccountServiceRef:
@@ -142,6 +145,9 @@ const appRPC = (BrowserView as unknown as {
 			},
 			openExternalUrl: async (url: string) => {
 				await openExternalUrl(url);
+			},
+			checkForUpdates: async () => {
+				return checkForUpdates(APP_VERSION);
 			},
 			closeWindow: () => {
 				mainWindowRef?.close();
@@ -332,19 +338,14 @@ const mainWindow = new BrowserWindow({
 		x: 200,
 		y: 200,
 	},
-	title: "RemoteCode + Electrobun",
+	title: "RemoteCode.io",
 	url,
 	rpc: appRPC,
 });
 mainWindowRef = mainWindow;
 
-const webview = mainWindow.webview;
-webview.on("dom-ready", () => {
-	webview.openDevTools();
-});
-
 void mainWindow;
 serverLogger.success("desktop-bootstrap", "Electrobun app started", {
-	windowTitle: "RemoteCode + Electrobun",
+	windowTitle: "RemoteCode.io",
 	workspaceViewUrl: url,
 });

@@ -35,6 +35,8 @@ import {
 	useWorkspaceStore,
 } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
+import { useAppUpdate } from "../features/app-update/model/useAppUpdate";
+import { UpdateBanner } from "../features/app-update/ui/UpdateBanner";
 import { cn } from "../lib/utils";
 import type { AssistantStreamEvent } from "../../shared/assistant-stream-event";
 import {
@@ -498,6 +500,10 @@ const App = (): JSX.Element => {
 	const selectedReasoningEffortRef = useRef<CodexReasoningEffort | null>(selectedReasoningEffort);
 	const selectedProviderRef = useRef<SelectedProvider>(selectedProvider);
 	const messageWindowRef = useRef(state.messageWindow);
+
+	const appUpdate = useAppUpdate({
+		electrobunRpc: electrobunView ? { request: electrobunView.rpc.request } : null,
+	});
 
 	const selectedModelDescriptor = useMemo(
 		() => getModelDescriptorByName(availableModels, selectedModel),
@@ -2516,13 +2522,20 @@ const App = (): JSX.Element => {
 	const threadPanelBgClass = isThreadFocusMode ? "bg-[#13161b]" : "bg-slate-950/35";
 	return (
 				<TooltipProvider delayDuration={120}>
-			<div className="relative h-full w-full overflow-hidden">
+			<div className="relative flex h-full w-full flex-col overflow-hidden">
+				{appUpdate.hasUpdate && !appUpdate.dismissed ? (
+					<UpdateBanner
+						latestVersion={appUpdate.latestVersion}
+						onDismiss={appUpdate.dismiss}
+						onDownload={() => { void appUpdate.openRelease(); }}
+					/>
+				) : null}
 				<div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_48%_84%,rgba(55,150,255,0.22),transparent_44%)]" />
 				<motion.div
 						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
 						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
 						className={cn(
-							"grid h-full w-full min-h-0 overflow-hidden rounded-b-[14px] border-x border-b border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
+							"grid min-h-0 w-full flex-1 overflow-hidden rounded-b-[14px] border-x border-b border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
 							isSidebarVisible
 								? "grid-cols-[var(--desktop-sidebar-width)_8px_minmax(0,1fr)] max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
 								: "grid-cols-[minmax(0,1fr)]",
