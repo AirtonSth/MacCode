@@ -28,7 +28,7 @@ const runtimeConfig = {
 
 const config: ElectrobunConfig = {
 	app: {
-		identifier: "remotecode-electrobun.local",
+		identifier: "io.remotecode.desktop",
 		name: "RemoteCode",
 		urlSchemes: ["remotecode"],
 		version: process.env.APP_VERSION ?? pkg.version,
