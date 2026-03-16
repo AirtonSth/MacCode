@@ -927,7 +927,7 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 	const cmd = [command];
 
 	if (options.threadId) {
-		cmd.push("--continue", options.threadId);
+		cmd.push("--resume", options.threadId);
 	}
 
 	cmd.push("-p", options.text);

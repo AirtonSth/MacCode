@@ -243,12 +243,13 @@ describe("buildClaudeCommand", () => {
 		expect(cmd[modelIdx + 1]).toBe("opus");
 	});
 
-	test("includes --continue when threadId is specified", () => {
+	test("includes --resume when threadId is specified", () => {
 		const cmd = buildClaudeCommand({ ...baseOptions, threadId: "session-abc" });
 
-		const continueIdx = cmd.indexOf("--continue");
-		expect(continueIdx).toBeGreaterThan(-1);
-		expect(cmd[continueIdx + 1]).toBe("session-abc");
+		const resumeIdx = cmd.indexOf("--resume");
+		expect(resumeIdx).toBeGreaterThan(-1);
+		expect(cmd[resumeIdx + 1]).toBe("session-abc");
+		expect(cmd).not.toContain("--continue");
 	});
 
 	test("includes --dangerously-skip-permissions for full mode", () => {

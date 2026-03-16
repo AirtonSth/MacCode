@@ -793,6 +793,92 @@ test("WsService.startUserMessage always forwards project workspace path and exis
 	expect(collector.events.some((event) => event.event === "assistant_done")).toBe(true);
 });
 
+test("WsService.startUserMessage uses Claude runner and forwards the persisted Claude thread id", async () => {
+	const chat = createChat({ provider: "claude" });
+	const existingThreadId = "claude-session-1";
+	const workspacePath = "/tmp/claude-workspace";
+	let findChatCalls = 0;
+	let codexRunnerCalled = false;
+	let capturedWorkspacePath: string | undefined;
+	let capturedThreadId: string | undefined;
+
+	const chatRepository = {
+		findChatById: () => {
+			findChatCalls += 1;
+
+			if (findChatCalls === 1) {
+				return chat;
+			}
+
+			return {
+				...chat,
+				status: "completed",
+				updatedAt: new Date().toISOString(),
+			};
+		},
+		findProviderThreadIdByChatId: () => existingThreadId,
+		updateChat: (_chatId: string, update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>) => ({
+			...chat,
+			...update,
+			updatedAt: new Date().toISOString(),
+		}),
+		updateProviderThreadId: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => ({
+			chatId: chat.id,
+			content: "",
+			createdAt: new Date().toISOString(),
+			id: crypto.randomUUID(),
+			role: "assistant" as const,
+		}),
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => ({
+			createdAt: "",
+			id: "project-id",
+			isFavorite: false,
+			name: "p",
+			path: workspacePath,
+			updatedAt: "",
+		}),
+	} as unknown as ProjectRepository;
+
+	const codexRunner = {
+		run: async () => {
+			codexRunnerCalled = true;
+			throw new Error("codex runner should not be used for Claude chats");
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const claudeRunner = {
+		run: async (options: { onDelta: (delta: string) => void; threadId?: string; workspacePath: string }) => {
+			capturedThreadId = options.threadId;
+			capturedWorkspacePath = options.workspacePath;
+			options.onDelta("ok");
+			return {
+				assistantText: "ok",
+				diffAdded: 0,
+				diffRemoved: 0,
+				status: "completed" as const,
+				threadId: existingThreadId,
+			};
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const service = new WsService(chatRepository, messageRepository, projectRepository, codexRunner, claudeRunner);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({ chatId: "chat-id", emit: collector.emit, text: "hi" });
+
+	expect(codexRunnerCalled).toBe(false);
+	expect(capturedThreadId).toBe(existingThreadId);
+	expect(capturedWorkspacePath).toBe(workspacePath);
+	expect(collector.events.some((event) => event.event === "assistant_done")).toBe(true);
+});
+
 test("WsService.startUserMessage forwards intermediate assistant deltas in order", async () => {
 	const chat = createChat();
 	let updateCallCount = 0;
