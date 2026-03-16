@@ -83,7 +83,7 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Pre-download Electrobun core binaries
+      - name: Pre-download Electrobun binaries
         shell: bash
         run: |
           # Electrobun CLI resolves core binaries via:
@@ -94,6 +94,32 @@ jobs:
           EBUN_TAG="v${EBUN_VER}"
           echo "Electrobun version: $EBUN_VER"
 
+          # --- Pre-download CLI binary ---
+          # On Windows, --ignore-scripts skips postinstall so the CLI binary
+          # is missing. The lazy downloader uses tar with Windows paths which
+          # breaks GNU tar (D: interpreted as remote host). Pre-download it
+          # here using /tmp paths that work on all platforms.
+          BIN_EXT=""
+          CLI_PLATFORM="${{ matrix.core-tarball }}"
+          CLI_PLATFORM="${CLI_PLATFORM%%-*}"
+          if [ "$CLI_PLATFORM" = "win" ]; then BIN_EXT=".exe"; fi
+
+          CLI_BIN="${EBUN_ROOT}/bin/electrobun${BIN_EXT}"
+          if [ -f "$CLI_BIN" ]; then
+            echo "CLI binary already present at $CLI_BIN"
+          else
+            CLI_URL="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-cli-${{ matrix.core-tarball }}.tar.gz"
+            echo "Downloading CLI binary -> $CLI_BIN"
+            mkdir -p "${EBUN_ROOT}/bin" "${EBUN_ROOT}/.cache"
+            curl -fsSL "$CLI_URL" -o /tmp/ebun-cli.tar.gz
+            tar -xzf /tmp/ebun-cli.tar.gz -C "${EBUN_ROOT}/.cache"
+            cp "${EBUN_ROOT}/.cache/electrobun${BIN_EXT}" "$CLI_BIN"
+            if [ "$CLI_PLATFORM" != "win" ]; then chmod 755 "$CLI_BIN"; fi
+            rm -f /tmp/ebun-cli.tar.gz
+            echo "CLI binary installed"
+          fi
+
+          # --- Pre-download core binaries ---
           DIST_DIR="${EBUN_ROOT}/${{ matrix.core-dist }}"
           if [ -d "$DIST_DIR" ] && [ "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
             echo "Core binaries already present in $DIST_DIR"
