@@ -102,7 +102,7 @@ jobs:
           # Symlink hoisted electrobun into desktop workspace so the CLI
           # finds core binaries when running with working-directory: desktop
           mkdir -p desktop/node_modules
-          ln -sfn ../node_modules/electrobun desktop/node_modules/electrobun
+          ln -sfn ../../node_modules/electrobun desktop/node_modules/electrobun
           echo "Symlinked desktop/node_modules/electrobun -> ../node_modules/electrobun"
           ls desktop/node_modules/electrobun/dist-macos-arm64/ | head -3
 
