@@ -59,6 +59,45 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify Electrobun install
+        run: |
+          EBUN_VER=$(bun -e "console.log(require('./node_modules/electrobun/package.json').version)")
+          echo "Electrobun version: $EBUN_VER"
+          echo "Working directory: $(pwd)"
+          ls node_modules/electrobun/package.json
+
+      - name: Pre-download Electrobun core binaries
+        run: |
+          EBUN_VER=$(bun -e "console.log(require('./node_modules/electrobun/package.json').version)")
+          EBUN_TAG="v${EBUN_VER}"
+          EBUN_DIR="node_modules/electrobun"
+
+          # Map: tarball-name -> dist directory name expected by CLI
+          declare -A TARGET_MAP=(
+            ["darwin-arm64"]="dist-macos-arm64"
+            ["darwin-x64"]="dist-macos-x64"
+            ["linux-arm64"]="dist-linux-arm64"
+            ["linux-x64"]="dist-linux-x64"
+            ["win-x64"]="dist-win-x64"
+          )
+
+          for target in "${!TARGET_MAP[@]}"; do
+            DIST_DIR="${EBUN_DIR}/${TARGET_MAP[$target]}"
+
+            if [ -d "$DIST_DIR" ] && [ "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
+              echo "Core binaries for $target already present in $DIST_DIR"
+              continue
+            fi
+
+            URL="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-core-${target}.tar.gz"
+            echo "Downloading $target from $URL -> $DIST_DIR"
+            mkdir -p "$DIST_DIR"
+            curl -fsSL "$URL" -o "/tmp/ebun-${target}.tar.gz"
+            tar -xzf "/tmp/ebun-${target}.tar.gz" -C "$DIST_DIR"
+            rm -f "/tmp/ebun-${target}.tar.gz"
+            echo "  Extracted: $(ls "$DIST_DIR" | head -5)..."
+          done
+
       - name: Build frontend
         run: bun run build:vite
 
