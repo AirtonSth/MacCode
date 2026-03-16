@@ -193,6 +193,8 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				path: `/v1/private/auth/signup-intents/${encodeURIComponent(signupIntentId)}/checkout`,
 			}),
 
+		deleteAccount: async (): Promise<void> => { await request<null>({ method: "POST", path: "/v1/private/account/delete" }); },
+
 		exchangeCompletionToken: async (
 			input: PrivateAuthCompletionExchangeRequestDto,
 		): Promise<PrivateSessionDto> =>
