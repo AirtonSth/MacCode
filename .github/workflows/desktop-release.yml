@@ -68,30 +68,30 @@ jobs:
           EBUN_TAG="v${EBUN_VER}"
           EBUN_DIR="node_modules/electrobun"
 
-          declare -A TARGET_MAP=(
-            ["darwin-arm64"]="dist-macos-arm64"
-            ["darwin-x64"]="dist-macos-x64"
-            ["linux-arm64"]="dist-linux-arm64"
-            ["linux-x64"]="dist-linux-x64"
-            ["win-x64"]="dist-win-x64"
-          )
+          download_core() {
+            local tarball_name="$1"
+            local dist_name="$2"
+            local dist_dir="${EBUN_DIR}/${dist_name}"
 
-          for target in "${!TARGET_MAP[@]}"; do
-            DIST_DIR="${EBUN_DIR}/${TARGET_MAP[$target]}"
-
-            if [ -d "$DIST_DIR" ] && [ "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
-              echo "Core binaries for $target already present in $DIST_DIR"
-              continue
+            if [ -d "$dist_dir" ] && [ "$(ls -A "$dist_dir" 2>/dev/null)" ]; then
+              echo "Core binaries for $tarball_name already present"
+              return
             fi
 
-            URL="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-core-${target}.tar.gz"
-            echo "Downloading $target from $URL -> $DIST_DIR"
-            mkdir -p "$DIST_DIR"
-            curl -fsSL "$URL" -o "/tmp/ebun-${target}.tar.gz"
-            tar -xzf "/tmp/ebun-${target}.tar.gz" -C "$DIST_DIR"
-            rm -f "/tmp/ebun-${target}.tar.gz"
-            echo "  Extracted: $(ls "$DIST_DIR" | head -5)..."
-          done
+            local url="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-core-${tarball_name}.tar.gz"
+            echo "Downloading $tarball_name -> $dist_dir"
+            mkdir -p "$dist_dir"
+            curl -fsSL "$url" -o "/tmp/ebun-${tarball_name}.tar.gz"
+            tar -xzf "/tmp/ebun-${tarball_name}.tar.gz" -C "$dist_dir"
+            rm -f "/tmp/ebun-${tarball_name}.tar.gz"
+            echo "  Extracted: $(ls "$dist_dir" | head -5)..."
+          }
+
+          download_core "darwin-arm64" "dist-macos-arm64"
+          download_core "darwin-x64"   "dist-macos-x64"
+          download_core "linux-arm64"  "dist-linux-arm64"
+          download_core "linux-x64"    "dist-linux-x64"
+          download_core "win-x64"      "dist-win-x64"
 
       - name: Build frontend
         working-directory: desktop
