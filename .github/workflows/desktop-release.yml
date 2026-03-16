@@ -64,14 +64,20 @@ jobs:
 
       - name: Pre-download Electrobun core binaries
         run: |
-          EBUN_VER=$(bun -e "console.log(require('./node_modules/electrobun/package.json').version)")
+          # Electrobun CLI resolves core binaries relative to cwd:
+          #   join(process.cwd(), "node_modules", "electrobun", "dist-<os>-<arch>")
+          # Build steps use working-directory: desktop, so we must place
+          # binaries at desktop/node_modules/electrobun/dist-*.
+          # Bun workspaces hoists electrobun to root node_modules/, so we
+          # symlink it into the desktop workspace for the CLI to find.
+          EBUN_ROOT="$(pwd)/node_modules/electrobun"
+          EBUN_VER=$(bun -e "console.log(require('${EBUN_ROOT}/package.json').version)")
           EBUN_TAG="v${EBUN_VER}"
-          EBUN_DIR="node_modules/electrobun"
 
           download_core() {
             local tarball_name="$1"
             local dist_name="$2"
-            local dist_dir="${EBUN_DIR}/${dist_name}"
+            local dist_dir="${EBUN_ROOT}/${dist_name}"
 
             if [ -d "$dist_dir" ] && [ "$(ls -A "$dist_dir" 2>/dev/null)" ]; then
               echo "Core binaries for $tarball_name already present"
@@ -92,6 +98,13 @@ jobs:
           download_core "linux-arm64"  "dist-linux-arm64"
           download_core "linux-x64"    "dist-linux-x64"
           download_core "win-x64"      "dist-win-x64"
+
+          # Symlink hoisted electrobun into desktop workspace so the CLI
+          # finds core binaries when running with working-directory: desktop
+          mkdir -p desktop/node_modules
+          ln -sfn ../node_modules/electrobun desktop/node_modules/electrobun
+          echo "Symlinked desktop/node_modules/electrobun -> ../node_modules/electrobun"
+          ls desktop/node_modules/electrobun/dist-macos-arm64/ | head -3
 
       - name: Build frontend
         working-directory: desktop
