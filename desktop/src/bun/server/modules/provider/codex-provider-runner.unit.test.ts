@@ -336,8 +336,8 @@ test("CodexProviderRunner builds plan mode command for fresh exec", async () => 
 	});
 
 	expect(result.status).toBe("completed");
-	expect(capturedCommand).toEqual([
-		"codex",
+	expect(capturedCommand[0]!.endsWith("codex") || capturedCommand[0]!.endsWith("codex.exe")).toBe(true);
+	expect(capturedCommand.slice(1)).toEqual([
 		"--sandbox",
 		"read-only",
 		"--ask-for-approval",
@@ -383,8 +383,8 @@ test("CodexProviderRunner defaults to workspace-write mode when permission mode 
 	});
 
 	expect(result.status).toBe("completed");
-	expect(capturedCommand).toEqual([
-		"codex",
+	expect(capturedCommand[0]!.endsWith("codex") || capturedCommand[0]!.endsWith("codex.exe")).toBe(true);
+	expect(capturedCommand.slice(1)).toEqual([
 		"--sandbox",
 		"workspace-write",
 		"--ask-for-approval",
@@ -430,8 +430,8 @@ test("CodexProviderRunner builds full access resume command with workspace cwd",
 	});
 
 	expect(result.status).toBe("completed");
-	expect(capturedCommand).toEqual([
-		"codex",
+	expect(capturedCommand[0]!.endsWith("codex") || capturedCommand[0]!.endsWith("codex.exe")).toBe(true);
+	expect(capturedCommand.slice(1)).toEqual([
 		"--dangerously-bypass-approvals-and-sandbox",
 		"-m",
 		"gpt-5.3-codex-spark",

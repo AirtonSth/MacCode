@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-
 import type { ChatRepository } from "../chat/chat.repository";
 import type { ProjectRepository } from "../project/project.repository";
 import type { TerminalCommandStatus, TerminalEntryDTO } from "../../types";
@@ -11,12 +9,11 @@ import type {
 	TerminalServiceContract,
 } from "./terminal.model";
 import type { TerminalRepository } from "./terminal.repository";
+import { resolveShell as platformResolveShell, buildShellArgs, killProcess } from "../../platform/index";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 120_000;
 const MAX_CAPTURED_OUTPUT_BYTES = 256 * 1024;
-const FALLBACK_SHELL = "/bin/zsh";
-const SECONDARY_FALLBACK_SHELL = "/bin/sh";
 const TRUNCATION_NOTICE = `\n[output truncated: ${MAX_CAPTURED_OUTPUT_BYTES} byte limit reached]\n`;
 
 const ANSI_OSC_SEQUENCE = /\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g;
@@ -39,23 +36,7 @@ const normalizeTimeoutMs = (timeoutMs: number | undefined): number => {
 	return Math.min(MAX_TIMEOUT_MS, Math.floor(timeoutMs));
 };
 
-const resolveShell = (): string => {
-	const configuredShell = process.env.SHELL?.trim();
-
-	if (configuredShell && existsSync(configuredShell)) {
-		return configuredShell;
-	}
-
-	if (existsSync(FALLBACK_SHELL)) {
-		return FALLBACK_SHELL;
-	}
-
-	if (existsSync(SECONDARY_FALLBACK_SHELL)) {
-		return SECONDARY_FALLBACK_SHELL;
-	}
-
-	return FALLBACK_SHELL;
-};
+const resolveShell = platformResolveShell;
 
 export const sanitizeTerminalOutput = (raw: string): string => {
 	if (!raw) {
@@ -166,7 +147,7 @@ const executeCommand = async (input: {
 	timeoutMs: number;
 }): Promise<ExecuteCommandResult> => {
 	const subprocess = Bun.spawn({
-		cmd: [input.shell, "-lc", input.command],
+		cmd: buildShellArgs(input.shell, input.command),
 		cwd: input.cwd,
 		env: process.env,
 		stderr: "pipe",
@@ -178,7 +159,7 @@ const executeCommand = async (input: {
 	const timeout = setTimeout(() => {
 		timedOut = true;
 		try {
-			subprocess.kill("SIGKILL");
+			killProcess(subprocess, "force");
 		} catch {
 			// Process may already be gone.
 		}

@@ -1,4 +1,5 @@
 import type { ElectrobunConfig } from "electrobun";
+import pkg from "./package.json";
 
 const appIconPath = "assets/app-icon.png";
 const macIconsetPath = "icon.iconset";
@@ -25,7 +26,7 @@ const config: ElectrobunConfig = {
 		identifier: "remotecode-electrobun.local",
 		name: "RemoteCode",
 		urlSchemes: ["remotecode"],
-		version: "0.0.1",
+		version: process.env.APP_VERSION ?? pkg.version,
 	},
 
 	build: {

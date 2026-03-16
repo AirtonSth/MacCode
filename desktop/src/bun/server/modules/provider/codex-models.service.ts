@@ -3,6 +3,7 @@ import {
 	type CodexModelsCatalog,
 	parseCodexReasoningEffort,
 } from "../../../../shared/codex-model-config";
+import { killProcess, resolveCommandInPath } from "../../platform/index";
 
 interface CodexAppServerResult {
 	exitCode: number | null;
@@ -216,8 +217,9 @@ const readStdoutUntilModelListResponse = async (
 };
 
 const defaultExecuteCodexAppServer: ExecuteCodexAppServer = async (timeoutMs: number) => {
+	const codexCommand = resolveCommandInPath("codex");
 	const subprocess = Bun.spawn({
-		cmd: ["codex", "app-server", "--listen", "stdio://"],
+		cmd: [codexCommand, "app-server", "--listen", "stdio://"],
 		env: process.env,
 		stderr: "pipe",
 		stdin: "pipe",
@@ -230,7 +232,7 @@ const defaultExecuteCodexAppServer: ExecuteCodexAppServer = async (timeoutMs: nu
 	const timer = setTimeout(() => {
 		timedOut = true;
 		try {
-			subprocess.kill("SIGKILL");
+			killProcess(subprocess, "force");
 		} catch {
 			// process may have already exited
 		}
@@ -243,7 +245,7 @@ const defaultExecuteCodexAppServer: ExecuteCodexAppServer = async (timeoutMs: nu
 		completed = true;
 
 		try {
-			subprocess.kill("SIGTERM");
+			killProcess(subprocess, "graceful");
 		} catch {
 			// process may have already exited
 		}
@@ -256,7 +258,7 @@ const defaultExecuteCodexAppServer: ExecuteCodexAppServer = async (timeoutMs: nu
 		};
 	} catch (error) {
 		try {
-			subprocess.kill("SIGKILL");
+			killProcess(subprocess, "force");
 		} catch {
 			// process may have already exited
 		}

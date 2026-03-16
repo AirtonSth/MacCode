@@ -8,6 +8,7 @@ import type {
 	AssistantStreamItemState,
 	AssistantStreamItemType,
 } from "../../../../shared/assistant-stream-event";
+import { resolveCommandInPath } from "../../platform/index";
 
 interface CodexCommandExecutionItem {
 	aggregated_output?: unknown;
@@ -841,6 +842,7 @@ const buildPermissionFlags = (permissionMode: CodexPermissionMode | undefined): 
 };
 
 const buildCommand = (options: CodexProviderRunOptions): string[] => {
+	const codexCommand = resolveCommandInPath("codex");
 	const permissionFlags = buildPermissionFlags(options.permissionMode);
 	const modelFlags = options.model ? ["-m", options.model] : [];
 	const reasoningFlags = options.reasoningEffort
@@ -849,7 +851,7 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 
 	if (options.threadId) {
 		return [
-			"codex",
+			codexCommand,
 			...permissionFlags,
 			...modelFlags,
 			...reasoningFlags,
@@ -865,7 +867,7 @@ const buildCommand = (options: CodexProviderRunOptions): string[] => {
 	}
 
 	return [
-		"codex",
+		codexCommand,
 		...permissionFlags,
 		...modelFlags,
 		...reasoningFlags,

@@ -1,0 +1,97 @@
+name: Desktop Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version override (e.g. 1.2.0). Defaults to desktop/package.json version."
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref_name }}" == v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(bun -e "console.log(require('./package.json').version)")
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Determine build environment
+        id: build-env
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" == *"-canary"* ]]; then
+            echo "env=canary" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "env=stable" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build frontend
+        run: bun run build:vite
+
+      - name: Build desktop — macOS (arm64 + x64)
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+          ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
+          ELECTROBUN_TEAMID: ${{ secrets.ELECTROBUN_TEAMID }}
+          ELECTROBUN_APPLEID: ${{ secrets.ELECTROBUN_APPLEID }}
+          ELECTROBUN_APPLEIDPASS: ${{ secrets.ELECTROBUN_APPLEIDPASS }}
+        run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=macos-arm64,macos-x64
+
+      - name: Build desktop — Linux (x64 + arm64)
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=linux-x64,linux-arm64
+
+      - name: Build desktop — Windows (x64)
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: npx electrobun build --env=${{ steps.build-env.outputs.env }} --targets=win-x64
+
+      - name: List artifacts
+        run: ls -lhR artifacts/ || echo "No artifacts directory"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.value }}
+          name: RemoteCode v${{ steps.version.outputs.value }}
+          draft: false
+          prerelease: ${{ steps.build-env.outputs.prerelease }}
+          generate_release_notes: true
+          files: desktop/artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
