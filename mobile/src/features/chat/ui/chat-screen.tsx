@@ -160,7 +160,7 @@ export const ChatScreen = () => {
 	const searchParams = useLocalSearchParams() as ChatScreenSearchParams;
 	const source = normalizeSearchParam(searchParams.source) ?? undefined;
 	const api = useRemoteCodeClient();
-	const { goBackOr, replace } = useFlowNavigator();
+	const { goBackOr, push, replace } = useFlowNavigator();
 	const { isLoaded: isConfigLoaded } = useApiConfig();
 	const isFocused = useIsFocused();
 	const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
@@ -387,6 +387,10 @@ export const ChatScreen = () => {
 	const selectedChatIsRunning = Boolean(
 		selectedChat?.isActive ||
 		(selectedChatId && activeThreads.some((thread) => thread.id === selectedChatId)),
+	);
+	const otherActiveThreadsCount = useMemo(
+		() => activeThreads.filter((thread) => thread.id !== selectedChatId).length,
+		[activeThreads, selectedChatId],
 	);
 	const isSendActionDisabled =
 		isSending || isStopping || !selectedProjectId || selectedChatIsRunning;
@@ -1354,6 +1358,24 @@ export const ChatScreen = () => {
 				subtitle={selectedProject?.name ?? "No workspace selected"}
 				title={selectedChat?.title ?? "Chat"}
 			/>
+
+			{otherActiveThreadsCount > 0 ? (
+				<Pressable
+					accessibilityRole="button"
+					onPress={() => {
+						push("/active-threads");
+					}}
+					style={({ pressed }) => [styles.activeThreadsBanner, pressed ? styles.activeThreadsBannerPressed : null]}
+					testID="chat-active-threads-banner"
+				>
+					<ActivityIndicator color={palette.accent} size={10} />
+					<Text style={styles.activeThreadsBannerText}>
+						{otherActiveThreadsCount === 1
+							? "1 other active thread"
+							: `${String(otherActiveThreadsCount)} other active threads`}
+					</Text>
+				</Pressable>
+			) : null}
 
 			<View style={styles.body}>
 					<ScrollView
@@ -2792,6 +2814,25 @@ const styles = StyleSheet.create({
 		fontFamily: Platform.select({ ios: "Menlo", default: "monospace" }),
 		fontSize: 13,
 		lineHeight: 20,
+	},
+	activeThreadsBanner: {
+		alignItems: "center",
+		backgroundColor: "rgba(99,200,255,0.10)",
+		borderBottomColor: "rgba(99,200,255,0.25)",
+		borderBottomWidth: 1,
+		flexDirection: "row",
+		gap: 8,
+		justifyContent: "center",
+		paddingHorizontal: 14,
+		paddingVertical: 8,
+	},
+	activeThreadsBannerPressed: {
+		opacity: 0.7,
+	},
+	activeThreadsBannerText: {
+		color: "#9FDBFF",
+		fontSize: 12,
+		fontWeight: "600",
 	},
 	workingIndicator: {
 		alignItems: "center",

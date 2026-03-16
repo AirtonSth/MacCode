@@ -1671,6 +1671,9 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 			realtimeRef.current?.connect();
 			realtimeRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.activeThreads,
+			});
 
 			const activeProjectId = selectedProjectIdRef.current;
 			if (activeProjectId && shouldEnableChatsQuery) {
@@ -2404,6 +2407,22 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		});
 		notifyMessageCompletion(selectedChatId, selectedChat.status);
 	}, [finishLiveActivity, notifyMessageCompletion, selectedChat, selectedChatId]);
+
+	useEffect(() => {
+		if (!selectedChatId || !selectedChat) {
+			return;
+		}
+
+		const isRunning = selectedChat.isActive || selectedChat.status === "running";
+		if (!isRunning) {
+			return;
+		}
+
+		pendingCompletionNotificationChatIdsRef.current.add(selectedChatId);
+		startRunningLiveActivity(selectedChatId, {
+			chatTitle: selectedChat.title,
+		});
+	}, [selectedChatId, selectedChat, startRunningLiveActivity]);
 
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
 	const streamHistoryTurns = useMemo(

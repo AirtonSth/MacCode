@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-import { buildLiveActivityApnsHeaders, createLiveActivityPushServiceForTests } from "./live-activity-push.service";
+import { createLiveActivityPushServiceForTests } from "./live-activity-push.service";
 import type { LiveActivityPushSubscriptionStoreContract } from "./live-activity-push.model";
 
 interface CapturedDelivery {
@@ -347,24 +347,6 @@ test("LiveActivityPushService stays stable with hostile mixed payloads", async (
 	expect(endDelivery?.preview).not.toContain("<");
 	expect(endDelivery?.preview).not.toContain(">");
 	expect(endDelivery?.preview).not.toContain("\\");
-});
-
-test("buildLiveActivityApnsHeaders uses low priority for updates and high priority for end", () => {
-	const updateHeaders = buildLiveActivityApnsHeaders({
-		event: "update",
-		expirationSeconds: 123,
-		topic: "com.example.app.push-type.liveactivity",
-	});
-	const endHeaders = buildLiveActivityApnsHeaders({
-		event: "end",
-		expirationSeconds: 456,
-		topic: "com.example.app.push-type.liveactivity",
-	});
-
-	expect(updateHeaders["apns-priority"]).toBe("5");
-	expect(endHeaders["apns-priority"]).toBe("10");
-	expect(updateHeaders["apns-push-type"]).toBe("liveactivity");
-	expect(updateHeaders["apns-topic"]).toBe("com.example.app.push-type.liveactivity");
 });
 
 test("LiveActivityPushService persists subscriptions and clears them after a successful end", async () => {

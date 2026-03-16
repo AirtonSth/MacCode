@@ -2,6 +2,8 @@ import { createDatabaseClient } from "../shared/db/db.client";
 import { initializeDatabaseSchema } from "../shared/db/db.bootstrap";
 import { serverConfig } from "../config";
 import { createLiveActivitySubscriptionRepository } from "../modules/live-activity/live-activity-subscription.repository";
+import { createPrivateAccountRepository } from "../modules/private-account/private-account.repository";
+import { createServerMetadataRepository } from "../modules/server-metadata/server-metadata.repository";
 import {
 	createLiveActivityPushDebugClientFromEnvironment,
 	type LiveActivityPushDebugSendInput,
@@ -103,14 +105,19 @@ const main = async (): Promise<void> => {
 			totalSelected: subscriptions.length,
 		});
 
+		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
+		const privateAccountRepository = createPrivateAccountRepository(serverMetadataRepository);
 		const debugClient = createLiveActivityPushDebugClientFromEnvironment({
-			apnsAuthKeyId: serverConfig.liveActivityApnsAuthKeyId,
-			apnsPrivateKeyPath: serverConfig.liveActivityApnsPrivateKeyPath,
-			apnsTeamId: serverConfig.liveActivityApnsTeamId,
-			apnsUseSandbox: serverConfig.liveActivityApnsUseSandbox,
-			bundleIdentifier: serverConfig.liveActivityBundleIdentifier ?? "",
-			firebaseProjectId: serverConfig.liveActivityFirebaseProjectId,
-			serviceAccountPath: serverConfig.liveActivityServiceAccountPath,
+			getConnectorCredentials: () => {
+				const connector = privateAccountRepository.readConnector();
+				if (!connector) return null;
+				return {
+					backendUrl: connector.backendUrl,
+					connectorId: connector.connectorId,
+					connectorToken: connector.connectorToken,
+				};
+			},
+			privateBackendUrl: serverConfig.privateBackendUrl,
 		});
 
 		console.info("[live-activity-test] sender", {

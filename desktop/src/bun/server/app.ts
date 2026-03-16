@@ -186,13 +186,16 @@ export const ServerBootstrap = {
 		const liveActivityPushService = options?.disableLiveActivityPush
 			? createNoopLiveActivityPushService()
 			: createLiveActivityPushServiceFromEnvironment({
-				apnsAuthKeyId: serverConfig.liveActivityApnsAuthKeyId,
-				apnsPrivateKeyPath: serverConfig.liveActivityApnsPrivateKeyPath,
-				apnsTeamId: serverConfig.liveActivityApnsTeamId,
-				apnsUseSandbox: serverConfig.liveActivityApnsUseSandbox,
-				bundleIdentifier: serverConfig.liveActivityBundleIdentifier ?? "",
-				firebaseProjectId: serverConfig.liveActivityFirebaseProjectId,
-				serviceAccountPath: serverConfig.liveActivityServiceAccountPath,
+				getConnectorCredentials: () => {
+					const connector = privateAccountRepository.readConnector();
+					if (!connector) return null;
+					return {
+						backendUrl: connector.backendUrl,
+						connectorId: connector.connectorId,
+						connectorToken: connector.connectorToken,
+					};
+				},
+				privateBackendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 				subscriptionStore: liveActivitySubscriptionRepository,
 		});
 		const privateAccountService = createPrivateAccountService(privateAccountRepository, {
