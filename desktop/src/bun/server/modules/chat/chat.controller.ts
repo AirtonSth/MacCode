@@ -4,7 +4,7 @@ import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
 import type { ChatProvider } from "../../shared/core/server.types";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
-import type { LiveActivityPushSubscriptionInput } from "../live-activity/live-activity-push.model";
+import type { LiveActivityPushSubscriptionInput, PushToStartTokenInput } from "../live-activity/live-activity-push.model";
 import type { ChatService } from "./chat.service";
 
 const VALID_CHAT_PROVIDERS = new Set<string>(["codex", "claude"]);
@@ -47,6 +47,7 @@ interface RuntimeActiveThreadReader {
 interface LiveActivitySubscriptionReader {
 	getLiveActivityPushIsEnabled: () => boolean;
 	upsertLiveActivityPushSubscription: (input: LiveActivityPushSubscriptionInput) => Promise<boolean>;
+	registerPushToStartToken: (input: PushToStartTokenInput) => void;
 }
 
 export class ChatController {
@@ -192,6 +193,51 @@ export class ChatController {
 						pushToken: t.Optional(t.String()),
 						pushTokenType: t.Optional(t.Union([t.Literal("apns"), t.Literal("fcm")])),
 						liveActivityToken: t.String(),
+					}),
+				},
+			)
+			.post(
+				"/live-activity/push-to-start-token",
+				async ({ body, set }) => {
+					const liveActivitySubscriptionReader = this.liveActivitySubscriptionReader;
+					const pushToStartToken = body.pushToStartToken?.trim() || "";
+					const pushToken = body.pushToken?.trim() || "";
+					const pushTokenType = body.pushTokenType;
+					const enabled = liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false;
+
+					if (
+						pushToStartToken.length === 0
+						|| pushToken.length === 0
+						|| (pushTokenType !== "apns" && pushTokenType !== "fcm")
+					) {
+						set.status = 400;
+						return { error: "invalid push-to-start token payload" };
+					}
+
+					if (!liveActivitySubscriptionReader || !enabled) {
+						return { enabled: false, registered: false };
+					}
+
+					liveActivitySubscriptionReader.registerPushToStartToken({
+						pushToStartToken,
+						pushToken,
+						pushTokenType,
+					});
+
+					logLiveActivitySubscription("push-to-start token registered", {
+						enabled,
+						pushToStartToken: toTokenPreview(pushToStartToken),
+						pushToken: toTokenPreview(pushToken),
+						pushTokenType,
+					});
+
+					return { enabled: true, registered: true };
+				},
+				{
+					body: t.Object({
+						pushToStartToken: t.String(),
+						pushToken: t.String(),
+						pushTokenType: t.Union([t.Literal("apns"), t.Literal("fcm")]),
 					}),
 				},
 			)

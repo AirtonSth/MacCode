@@ -40,6 +40,22 @@ export interface LiveActivityPushSubscriptionStoreContract {
 	upsert(input: LiveActivityPushSubscriptionInput): LiveActivityPushStoredSubscription;
 }
 
+export interface PushToStartTokenInput {
+	pushToStartToken: string;
+	pushToken: string;
+	pushTokenType: LiveActivityPushTokenType;
+}
+
+export interface PushToStartTokenStored extends PushToStartTokenInput {
+	updatedAt: string;
+}
+
+export interface PushToStartTokenStoreContract {
+	listAll(): PushToStartTokenStored[];
+	upsert(input: PushToStartTokenInput): PushToStartTokenStored;
+	deleteByPushToken(pushToken: string, pushTokenType: LiveActivityPushTokenType): void;
+}
+
 export interface LiveActivityPushServiceContract {
 	getIsEnabled(): boolean;
 	onAssistantDelta(chatId: string, delta: string): void;
@@ -47,4 +63,5 @@ export interface LiveActivityPushServiceContract {
 	onChatStarted(input: LiveActivityPushStartInput): void;
 	onChatFinished(input: LiveActivityPushFinishInput): Promise<void>;
 	upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean>;
+	registerPushToStartToken(input: PushToStartTokenInput): void;
 }

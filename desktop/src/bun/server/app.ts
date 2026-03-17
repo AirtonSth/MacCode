@@ -14,6 +14,7 @@ import { MessageRepository } from "./modules/message/message.repository";
 import { createChatTurnSnapshotRepository } from "./modules/message/chat-turn-snapshot.repository";
 import { MessageService } from "./modules/message/message.service";
 import { createLiveActivitySubscriptionRepository } from "./modules/live-activity/live-activity-subscription.repository";
+import { createPushToStartTokenRepository } from "./modules/live-activity/push-to-start-token.repository";
 import {
 	createLiveActivityPushServiceFromEnvironment,
 	createNoopLiveActivityPushService,
@@ -164,6 +165,7 @@ export const ServerBootstrap = {
 		const serverMetadataRepository = createServerMetadataRepository(databaseClient.orm);
 		const privateAccountRepository = createPrivateAccountRepository(serverMetadataRepository);
 		const liveActivitySubscriptionRepository = createLiveActivitySubscriptionRepository(databaseClient.orm);
+		const pushToStartTokenRepository = createPushToStartTokenRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
@@ -197,6 +199,7 @@ export const ServerBootstrap = {
 				},
 				privateBackendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 				subscriptionStore: liveActivitySubscriptionRepository,
+				pushToStartTokenStore: pushToStartTokenRepository,
 		});
 		const privateAccountService = createPrivateAccountService(privateAccountRepository, {
 			backendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,

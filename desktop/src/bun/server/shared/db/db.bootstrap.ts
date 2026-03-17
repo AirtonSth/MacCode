@@ -117,6 +117,7 @@ export class DatabaseBootstrap {
 		this.createChatTurnSnapshotsTable(database);
 		this.createServerMetadataTable(database);
 		this.createLiveActivitySubscriptionsTable(database);
+		this.createPushToStartTokensTable(database);
 		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
 	}
@@ -370,6 +371,18 @@ export class DatabaseBootstrap {
 		database.exec(liveActivitySubscriptionsCreateSql);
 	}
 
+	private static createPushToStartTokensTable(database: Database): void {
+		database.exec(`
+			CREATE TABLE IF NOT EXISTS push_to_start_tokens (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				pushToStartToken TEXT NOT NULL,
+				pushToken TEXT NOT NULL,
+				pushTokenType TEXT NOT NULL CHECK(pushTokenType IN ('apns', 'fcm')),
+				updatedAt TEXT NOT NULL
+			)
+		`);
+	}
+
 	private static dropLegacyTerminalSessionsTable(database: Database): void {
 		if (!this.hasTable(database, "terminal_sessions")) {
 			return;
@@ -419,6 +432,9 @@ export class DatabaseBootstrap {
 		);
 		database.exec(
 			"CREATE UNIQUE INDEX IF NOT EXISTS idx_live_activity_subscriptions_token_pair ON live_activity_subscriptions(chatId, pushTokenType, pushToken, liveActivityToken)",
+		);
+		database.exec(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_push_to_start_tokens_device ON push_to_start_tokens(pushTokenType, pushToken)",
 		);
 	}
 }

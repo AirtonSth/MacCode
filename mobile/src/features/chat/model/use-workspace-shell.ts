@@ -41,6 +41,8 @@ import {
 	startThreadLiveActivity,
 	subscribeThreadLiveActivityPushToken,
 	updateThreadLiveActivity,
+	getPushToStartToken,
+	subscribePushToStartToken,
 } from "../../../shared/live-activity/thread-live-activity";
 import {
 	ensurePushDeliveryToken,
@@ -1066,12 +1068,58 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 		void syncPushDeliveryToken("initial");
 
+		const registerPushToStartTokenWithBackend = async (pushToStartToken: string): Promise<void> => {
+			const deliveryToken = pushDeliveryTokenRef.current;
+			if (!deliveryToken || deliveryToken.token.trim().length === 0) {
+				return;
+			}
+			if (deliveryToken.type !== "apns" && deliveryToken.type !== "fcm") {
+				return;
+			}
+			try {
+				await client.registerPushToStartToken({
+					pushToStartToken,
+					pushToken: deliveryToken.token.trim(),
+					pushTokenType: deliveryToken.type,
+				});
+				logLiveActivitySubscription("push-to-start token registered with backend", {
+					pushToStartToken: toTokenPreview(pushToStartToken),
+					pushTokenType: deliveryToken.type,
+				});
+			} catch {
+				logLiveActivitySubscription("push-to-start token registration failed");
+			}
+		};
+
+		const syncPushToStartToken = async (): Promise<void> => {
+			const token = await getPushToStartToken();
+			if (canceled || !token) {
+				return;
+			}
+			void registerPushToStartTokenWithBackend(token);
+		};
+
+		// Delay push-to-start token sync to ensure push delivery token is available.
+		setTimeout(() => {
+			if (!canceled) {
+				void syncPushToStartToken();
+			}
+		}, 3_000);
+
+		const unsubscribePushToStart = subscribePushToStartToken((token) => {
+			if (canceled) {
+				return;
+			}
+			void registerPushToStartTokenWithBackend(token);
+		});
+
 		const unsubscribe = subscribePushDeliveryTokenRefresh((token) => {
 			if (canceled) {
 				return;
 			}
 
 			storePushDeliveryToken(token, "refresh");
+			void syncPushToStartToken();
 		});
 			const appStateSubscription = AppState.addEventListener("change", (nextState) => {
 				if (canceled || nextState !== "active") {
@@ -1091,9 +1139,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			return () => {
 				canceled = true;
 				unsubscribe();
+				unsubscribePushToStart();
 				appStateSubscription.remove();
 			};
-		}, [flushLiveActivitySubscriptions]);
+		}, [client, flushLiveActivitySubscriptions]);
 
 	useEffect(() => {
 		return () => {

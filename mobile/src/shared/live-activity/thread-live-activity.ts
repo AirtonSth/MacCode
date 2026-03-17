@@ -681,6 +681,21 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 			initialized = true;
 		await hydratePersistedState();
 		await normalizeActivityInstance();
+
+		if (activeActivity && !activeState) {
+			log("detected remotely-started live activity, creating local state");
+			activeState = {
+				chatId: "remote",
+				chatTitle: "Thread",
+				phase: "running",
+				preview: "Waiting for updates...",
+				startedAtMs: nowMs(),
+				statusLine: "Generating response",
+				remoteManaged: true,
+			};
+			awaitingAuthoritativeSync = true;
+		}
+
 		await syncCurrentActivityPushToken();
 
 		if (activeState && !isTerminalPhase(activeState.phase) && canWriteLocally()) {
@@ -696,6 +711,13 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 					pushToken: toTokenPreview(event.activityPushToStartToken),
 				});
 				void SecureStore.setItemAsync(PUSH_TO_START_TOKEN_KEY, event.activityPushToStartToken);
+				for (const listener of pushToStartTokenListeners) {
+					try {
+						listener(event.activityPushToStartToken);
+					} catch {
+						// Keep listeners isolated.
+					}
+				}
 			});
 		} catch {
 		liveActivitiesUnavailable = true;
@@ -1040,3 +1062,23 @@ export const subscribeThreadLiveActivityPushToken = (
 };
 
 export const getThreadLiveActivityStateForBackgroundTask = (): PersistedLiveActivityState | null => activeState;
+
+export const getPushToStartToken = async (): Promise<string | null> => {
+	try {
+		const token = await SecureStore.getItemAsync(PUSH_TO_START_TOKEN_KEY);
+		return token && token.trim().length > 0 ? token.trim() : null;
+	} catch {
+		return null;
+	}
+};
+
+const pushToStartTokenListeners = new Set<(token: string) => void>();
+
+export const subscribePushToStartToken = (
+	listener: (token: string) => void,
+): (() => void) => {
+	pushToStartTokenListeners.add(listener);
+	return () => {
+		pushToStartTokenListeners.delete(listener);
+	};
+};

@@ -145,6 +145,9 @@ export interface RemoteCodeClient {
 		chatId: string,
 		input: { chatTitle?: string; liveActivityToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
 	) => Promise<LiveActivitySubscriptionResponse>;
+	registerPushToStartToken: (
+		input: { pushToStartToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
+	) => Promise<{ enabled: boolean; registered: boolean }>;
 	listProjects: () => Promise<ProjectDTO[]>;
 	commitProject: (
 		projectId: string,
@@ -523,6 +526,23 @@ export const createRemoteCodeClient = (
 					throw error;
 				}
 			},
+
+		async registerPushToStartToken(
+			input: { pushToStartToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
+		) {
+			try {
+				return await request<{ enabled: boolean; registered: boolean }>({
+					method: "POST",
+					path: "/live-activity/push-to-start-token",
+					body: input,
+				});
+			} catch (error) {
+				if (error instanceof RemoteCodeRequestError && (error.status === 501 || error.status === 404)) {
+					return { enabled: false, registered: false };
+				}
+				throw error;
+			}
+		},
 
 		async listProjects() {
 			const payload = await request<ListProjectsResponse>({

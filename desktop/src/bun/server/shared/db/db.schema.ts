@@ -147,6 +147,23 @@ export const liveActivitySubscriptions = sqliteTable(
 	}),
 );
 
+export const pushToStartTokens = sqliteTable(
+	"push_to_start_tokens",
+	{
+		id: integer("id").primaryKey({ autoIncrement: true }),
+		pushToStartToken: text("pushToStartToken").notNull(),
+		pushToken: text("pushToken").notNull(),
+		pushTokenType: text("pushTokenType").notNull(),
+		updatedAt: text("updatedAt").notNull(),
+	},
+	(table) => ({
+		uniqueDevice: uniqueIndex("idx_push_to_start_tokens_device").on(
+			table.pushTokenType,
+			table.pushToken,
+		),
+	}),
+);
+
 export type ChatRow = typeof chats.$inferSelect;
 
 export type MessageRow = typeof messages.$inferSelect;
@@ -160,6 +177,7 @@ export type ChatStreamEventRow = typeof chatStreamEvents.$inferSelect;
 export type ChatTurnSnapshotRow = typeof chatTurnSnapshots.$inferSelect;
 export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
 export type LiveActivitySubscriptionRow = typeof liveActivitySubscriptions.$inferSelect;
+export type PushToStartTokenRow = typeof pushToStartTokens.$inferSelect;
 
 export class DatabaseSchema {
 	static readonly projects = projects;
@@ -185,4 +203,6 @@ export class DatabaseSchema {
 	static readonly serverMetadata = serverMetadata;
 
 	static readonly liveActivitySubscriptions = liveActivitySubscriptions;
+
+	static readonly pushToStartTokens = pushToStartTokens;
 }

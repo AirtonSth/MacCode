@@ -8,6 +8,9 @@ import type {
 	LiveActivityPushSubscriptionInput,
 	LiveActivityPushSubscriptionStoreContract,
 	LiveActivityPushTokenType,
+	PushToStartTokenInput,
+	PushToStartTokenStoreContract,
+	PushToStartTokenStored,
 } from "./live-activity-push.model";
 
 const PUSH_MIN_UPDATE_INTERVAL_MS = 15_000;
@@ -23,7 +26,7 @@ const LIVE_ACTIVITY_NAME = "ThreadLiveActivity";
 const LIVE_ACTIVITY_LOG_PREFIX = "[live-activity]";
 const LIVE_ACTIVITY_VERBOSE_LOGS = process.env.REMOTECODE_LIVE_ACTIVITY_VERBOSE_LOGS === "1";
 
-type PushEvent = "update" | "end";
+type PushEvent = "update" | "end" | "start";
 
 interface LiveActivityContentState {
 	chatId: string;
@@ -68,6 +71,8 @@ interface LiveActivityPushDeliveryInput {
 	pushTokenType: LiveActivityPushTokenType;
 	liveActivityToken: string;
 	timestampSeconds: number;
+	attributesType?: string;
+	attributes?: Record<string, unknown>;
 }
 
 export interface LiveActivityPushDeliveryResult {
@@ -88,6 +93,7 @@ export interface LiveActivityPushEnvironmentInput {
 	getConnectorCredentials: () => LiveActivityPushConnectorCredentials | null;
 	privateBackendUrl: string;
 	subscriptionStore?: LiveActivityPushSubscriptionStoreContract;
+	pushToStartTokenStore?: PushToStartTokenStoreContract;
 }
 
 export interface LiveActivityPushDebugSendInput {
@@ -122,6 +128,8 @@ export const buildLiveActivityApsPayload = (input: {
 	event: PushEvent;
 	timestampSeconds?: number;
 	nowMs?: number;
+	attributesType?: string;
+	attributes?: Record<string, unknown>;
 }): Record<string, unknown> => {
 	const timestampSeconds = typeof input.timestampSeconds === "number" && Number.isFinite(input.timestampSeconds)
 		? Math.max(0, Math.floor(input.timestampSeconds))
@@ -154,12 +162,19 @@ export const buildLiveActivityApsPayload = (input: {
 		},
 	};
 
+	if (input.event === "start") {
+		apsPayload["attributes-type"] = input.attributesType ?? "LiveActivityAttributes";
+		apsPayload["attributes"] = input.attributes ?? {};
+		apsPayload["stale-date"] = timestampSeconds + PUSH_STALE_WINDOW_SECONDS;
+	}
+
 	if (input.event === "update") {
 		apsPayload["stale-date"] = timestampSeconds + PUSH_STALE_WINDOW_SECONDS;
 	}
 
 	if (input.event === "end") {
 		apsPayload["dismissal-date"] = timestampSeconds + PUSH_END_DISMISS_SECONDS;
+		apsPayload["sound"] = "default";
 	}
 
 	return apsPayload;
@@ -647,6 +662,8 @@ const createPrivateBackendSender = (input: {
 				pushToken: deliveryInput.pushToken,
 				pushTokenType: deliveryInput.pushTokenType,
 				timestampSeconds: deliveryInput.timestampSeconds,
+				...(deliveryInput.attributesType ? { attributesType: deliveryInput.attributesType } : {}),
+				...(deliveryInput.attributes ? { attributes: deliveryInput.attributes } : {}),
 			}),
 			signal: controller.signal,
 		});
@@ -735,18 +752,40 @@ class NoopLiveActivityPushService implements LiveActivityPushServiceContract {
 	async upsertSubscription(): Promise<boolean> {
 		return false;
 	}
+
+	registerPushToStartToken(): void {}
 }
 
 export class LiveActivityPushService implements LiveActivityPushServiceContract {
 	private readonly runtimesByChatId = new Map<string, ChatRuntimeState>();
 	private readonly subscriptionsByChatId = new Map<string, Map<string, LiveActivitySubscription>>();
+	private readonly pushToStartTokens = new Map<string, PushToStartTokenStored>();
 
 	constructor(
 		private readonly sender: LiveActivityPushSender,
 		private readonly supportedPushTokenTypes: ReadonlySet<LiveActivityPushTokenType> = new Set(["apns", "fcm"]),
 		private readonly subscriptionStore?: LiveActivityPushSubscriptionStoreContract,
+		private readonly pushToStartTokenStore?: PushToStartTokenStoreContract,
 	) {
 		this.restorePersistedSubscriptions();
+		this.restorePersistedPushToStartTokens();
+	}
+
+	private restorePersistedPushToStartTokens(): void {
+		const tokens = this.pushToStartTokenStore?.listAll() ?? [];
+		for (const token of tokens) {
+			if (!this.supportedPushTokenTypes.has(token.pushTokenType)) {
+				continue;
+			}
+			const key = `${token.pushTokenType}::${token.pushToken}`;
+			this.pushToStartTokens.set(key, token);
+		}
+
+		if (tokens.length > 0) {
+			logLiveActivityInfo("restored persisted push-to-start tokens", {
+				count: this.pushToStartTokens.size,
+			});
+		}
 	}
 
 	private restorePersistedSubscriptions(): void {
@@ -1254,6 +1293,8 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			this.queueFlush(input.chatId, "update", {
 				immediate: true,
 			});
+		} else if (this.pushToStartTokens.size > 0) {
+			void this.sendPushToStart(input.chatId, runtime);
 		}
 		this.ensureHeartbeat(input.chatId);
 	}
@@ -1377,6 +1418,110 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		});
 	}
 
+	registerPushToStartToken(input: PushToStartTokenInput): void {
+		const pushToken = toNormalized(input.pushToken);
+		const pushTokenType = input.pushTokenType;
+		const pushToStartToken = toNormalized(input.pushToStartToken);
+		if (
+			pushToken.length === 0
+			|| pushToStartToken.length === 0
+			|| (pushTokenType !== "apns" && pushTokenType !== "fcm")
+		) {
+			return;
+		}
+
+		if (!this.supportedPushTokenTypes.has(pushTokenType)) {
+			return;
+		}
+
+		const key = `${pushTokenType}::${pushToken}`;
+		this.pushToStartTokens.set(key, {
+			pushToStartToken,
+			pushToken,
+			pushTokenType,
+			updatedAt: new Date().toISOString(),
+		});
+
+		try {
+			this.pushToStartTokenStore?.upsert({
+				pushToStartToken,
+				pushToken,
+				pushTokenType,
+			});
+		} catch {
+			logLiveActivityWarn("push-to-start token persistence failed", {
+				pushTokenType,
+				pushToken: toTokenPreview(pushToken),
+			});
+		}
+
+		logLiveActivityInfo("push-to-start token registered", {
+			pushTokenType,
+			pushToken: toTokenPreview(pushToken),
+			pushToStartToken: toTokenPreview(pushToStartToken),
+		});
+	}
+
+	private async sendPushToStart(chatId: string, runtime: ChatRuntimeState): Promise<void> {
+		if (this.pushToStartTokens.size === 0) {
+			return;
+		}
+
+		const contentState = this.toContentState(runtime);
+		const timestampSeconds = toNextTimestampSeconds({});
+
+		for (const [key, tokenEntry] of this.pushToStartTokens.entries()) {
+			try {
+				const result = await this.sender({
+					contentState,
+					event: "start",
+					pushToken: tokenEntry.pushToken,
+					pushTokenType: tokenEntry.pushTokenType,
+					liveActivityToken: tokenEntry.pushToStartToken,
+					timestampSeconds,
+					attributesType: "LiveActivityAttributes",
+					attributes: {},
+				});
+
+				if (result.shouldDropSubscription) {
+					this.pushToStartTokens.delete(key);
+					try {
+						this.pushToStartTokenStore?.deleteByPushToken(tokenEntry.pushToken, tokenEntry.pushTokenType);
+					} catch {
+						// Ignore cleanup failures.
+					}
+					logLiveActivityWarn("dropping push-to-start token after permanent error", {
+						chatId,
+						code: result.errorCode ?? "unknown",
+						pushTokenType: tokenEntry.pushTokenType,
+						pushToken: toTokenPreview(tokenEntry.pushToken),
+					});
+					continue;
+				}
+
+				if (result.delivered) {
+					logLiveActivityInfo("push-to-start sent", {
+						chatId,
+						pushTokenType: tokenEntry.pushTokenType,
+						pushToken: toTokenPreview(tokenEntry.pushToken),
+					});
+				} else {
+					logLiveActivityWarn("push-to-start delivery failed", {
+						chatId,
+						code: result.errorCode ?? "unknown",
+						pushTokenType: tokenEntry.pushTokenType,
+						pushToken: toTokenPreview(tokenEntry.pushToken),
+					});
+				}
+			} catch {
+				logLiveActivityWarn("push-to-start send error", {
+					chatId,
+					pushTokenType: tokenEntry.pushTokenType,
+				});
+			}
+		}
+	}
+
 	async upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
 		const pushToken = toNormalized(input.pushToken);
 		const pushTokenType = input.pushTokenType;
@@ -1486,7 +1631,7 @@ export const createLiveActivityPushServiceFromEnvironment = (
 		privateBackendUrl: input.privateBackendUrl,
 	});
 
-	return new LiveActivityPushService(sender, new Set(["apns", "fcm"]), input.subscriptionStore);
+	return new LiveActivityPushService(sender, new Set(["apns", "fcm"]), input.subscriptionStore, input.pushToStartTokenStore);
 };
 
 export const createLiveActivityPushDebugClientFromEnvironment = (
@@ -1514,5 +1659,6 @@ export const createLiveActivityPushDebugClientFromEnvironment = (
 export const createLiveActivityPushServiceForTests = (
 	sender?: LiveActivityPushSender,
 	subscriptionStore?: LiveActivityPushSubscriptionStoreContract,
+	pushToStartTokenStore?: PushToStartTokenStoreContract,
 ): LiveActivityPushService =>
-	new LiveActivityPushService(sender ?? createNoopSender(), new Set(["apns", "fcm"]), subscriptionStore);
+	new LiveActivityPushService(sender ?? createNoopSender(), new Set(["apns", "fcm"]), subscriptionStore, pushToStartTokenStore);

@@ -190,6 +190,7 @@ test("WsService.startUserMessage forwards lifecycle updates to live activity pus
 			started.push(input);
 		},
 		upsertSubscription: async () => true,
+		registerPushToStartToken: () => {},
 	};
 
 	const service = new WsService(

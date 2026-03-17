@@ -16,6 +16,7 @@ import type {
 	LiveActivityPushServiceContract,
 	LiveActivityPushStartInput,
 	LiveActivityPushSubscriptionInput,
+	PushToStartTokenInput,
 } from "../live-activity/live-activity-push.model";
 import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
@@ -81,6 +82,9 @@ const noopLiveActivityPushService: LiveActivityPushServiceContract = {
 		// no-op
 	},
 	upsertSubscription: async () => false,
+	registerPushToStartToken: () => {
+		// no-op
+	},
 };
 
 export class WsService implements WsServiceContract {
@@ -106,6 +110,14 @@ export class WsService implements WsServiceContract {
 
 	async upsertLiveActivityPushSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
 		return await this.liveActivityPushService.upsertSubscription(input);
+	}
+
+	registerPushToStartToken(input: PushToStartTokenInput): void {
+		try {
+			this.liveActivityPushService.registerPushToStartToken(input);
+		} catch {
+			// Keep ws execution resilient when push-to-start registration fails.
+		}
 	}
 
 	private async finishLiveActivity(input: LiveActivityPushFinishInput): Promise<void> {
