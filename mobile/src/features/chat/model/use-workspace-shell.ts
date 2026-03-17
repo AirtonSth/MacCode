@@ -787,20 +787,20 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		[chats, queryClient],
 	);
 
-	const startRunningLiveActivity = useCallback(
-		(chatId: string, input?: { chatTitle?: string; statusLine?: string; restart?: boolean }) => {
-			const title = input?.chatTitle?.trim() || resolveChatTitle(chatId);
+		const startRunningLiveActivity = useCallback(
+			async (chatId: string, input?: { chatTitle?: string; statusLine?: string; restart?: boolean }) => {
+				const title = input?.chatTitle?.trim() || resolveChatTitle(chatId);
 
-			void startThreadLiveActivity({
-				chatId,
-				chatTitle: title,
-				remoteManaged: true,
-				restart: input?.restart,
-				statusLine: input?.statusLine ?? "Generating response",
-			});
-		},
-		[resolveChatTitle],
-	);
+				return await startThreadLiveActivity({
+					chatId,
+					chatTitle: title,
+					remoteManaged: true,
+					restart: input?.restart,
+					statusLine: input?.statusLine ?? "Generating response",
+				});
+			},
+			[resolveChatTitle],
+		);
 
 		const updateRunningLiveActivity = useCallback(
 			(input: {
@@ -2274,15 +2274,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				pendingSendChatIdsRef.current.add(activeChatId);
 				pendingCompletionNotificationChatIdsRef.current.add(activeChatId);
 				invalidateWorkspaceQuery(queryKeys.activeThreads);
-				if (!isThreadLiveActivityEnabled()) {
-					void ensureLocalNotificationPermission();
-				}
-				clearStructuredLiveActivityPreview(activeChatId);
-				startRunningLiveActivity(activeChatId, {
-					chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
-					restart: true,
-					statusLine: "Running",
-				});
+					clearStructuredLiveActivityPreview(activeChatId);
+					const liveActivityStarted = await startRunningLiveActivity(activeChatId, {
+						chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
+						restart: true,
+						statusLine: "Running",
+					});
+					if (!liveActivityStarted) {
+						void ensureLocalNotificationPermission();
+					}
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {

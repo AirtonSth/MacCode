@@ -11,27 +11,49 @@ const secureStoreState = new Map<string, string>();
 interface MockActivity {
 	addPushTokenListener: (listener: (event: { pushToken: string }) => void) => { remove: () => void };
 	end: (...args: unknown[]) => Promise<void>;
+	getId: () => string;
+	getProps: () => { chatId: string } | null;
 	getPushToken: () => Promise<string | null>;
+	id: string;
 	update: (props: unknown) => Promise<void>;
 	updateCalls: unknown[];
 }
 
-const createMockActivity = (): MockActivity => ({
-	addPushTokenListener: () => ({
-		remove: () => undefined,
-	}),
-	end: async () => undefined,
-	async getPushToken() {
-		return null;
-	},
-	async update(props: unknown) {
-		this.updateCalls.push(props);
-	},
-	updateCalls: [],
-});
+const createMockActivity = (input?: { chatId?: string; id?: string }): MockActivity => {
+	const state = {
+		props: input?.chatId ? { chatId: input.chatId } : null,
+	};
+
+	return {
+		addPushTokenListener: () => ({
+			remove: () => undefined,
+		}),
+		end: async () => undefined,
+		getId() {
+			return this.id;
+		},
+		getProps() {
+			return state.props;
+		},
+		async getPushToken() {
+			return null;
+		},
+		id: input?.id ?? `activity-${Math.random().toString(36).slice(2)}`,
+		async update(props: unknown) {
+			if (props && typeof props === "object" && "chatId" in props && typeof props.chatId === "string") {
+				state.props = {
+					chatId: props.chatId,
+				};
+			}
+			this.updateCalls.push(props);
+		},
+		updateCalls: [],
+	};
+};
 
 const widgetsState = {
 	instances: [] as MockActivity[],
+	startError: null as Error | null,
 };
 
 mock.module("react-native", () => ({
@@ -63,8 +85,13 @@ mock.module("expo-widgets", () => ({
 mock.module("./thread-live-activity.widget", () => ({
 	threadLiveActivityFactory: {
 		getInstances: () => widgetsState.instances,
-		start: () => {
-			const activity = createMockActivity();
+		start: (props: { chatId?: string }) => {
+			if (widgetsState.startError) {
+				throw widgetsState.startError;
+			}
+			const activity = createMockActivity({
+				chatId: props.chatId,
+			});
 			widgetsState.instances.push(activity);
 			return activity;
 		},
@@ -77,6 +104,7 @@ const PUSH_TO_START_TOKEN_KEY = "remotecode.live_activity.push_to_start_token";
 const {
 	clearThreadLiveActivity,
 	getThreadLiveActivityStateForBackgroundTask,
+	hasActiveLiveActivityEntry,
 	initializeThreadLiveActivityManager,
 	onThreadLiveActivityAppStateChanged,
 	resetThreadLiveActivityManagerForTests,
@@ -90,6 +118,7 @@ beforeEach(() => {
 	platformState.Version = "18.0";
 	secureStoreState.clear();
 	widgetsState.instances = [];
+	widgetsState.startError = null;
 	resetThreadLiveActivityManagerForTests();
 	Date.now = realDateNow;
 });
@@ -149,5 +178,61 @@ describe("thread live activity manager", () => {
 		});
 
 		expect(secureStoreState.get(PUSH_TO_START_TOKEN_KEY)).toBe("push-to-start-token");
+	});
+
+	test("removes placeholder state when the native activity fails to start", async () => {
+		widgetsState.startError = new Error("activities-disabled");
+
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: true,
+		});
+
+		expect(started).toBe(false);
+		expect(hasActiveLiveActivityEntry("chat-1")).toBe(false);
+		expect(secureStoreState.get(ACTIVE_STATE_KEY)).toBeUndefined();
+	});
+
+	test("adopts restored activities by chat identity instead of instance order", async () => {
+		const activityForChatB = createMockActivity({
+			chatId: "chat-b",
+			id: "activity-b",
+		});
+		const activityForChatA = createMockActivity({
+			chatId: "chat-a",
+			id: "activity-a",
+		});
+		widgetsState.instances = [activityForChatB, activityForChatA];
+		secureStoreState.set(ACTIVE_STATE_KEY, JSON.stringify([
+			{
+				chatId: "chat-a",
+				chatTitle: "Thread A",
+				phase: "running",
+				preview: "Waiting for updates...",
+				remoteManaged: false,
+				startedAtMs: 1_000,
+				statusLine: "Generating response",
+			},
+			{
+				chatId: "chat-b",
+				chatTitle: "Thread B",
+				phase: "running",
+				preview: "Waiting for updates...",
+				remoteManaged: false,
+				startedAtMs: 1_000,
+				statusLine: "Generating response",
+			},
+		]));
+
+		Date.now = () => 10_000;
+		await initializeThreadLiveActivityManager();
+		await Bun.sleep(50);
+
+		expect(activityForChatA.updateCalls[0]).toMatchObject({
+			chatId: "chat-a",
+		});
+		expect(activityForChatB.updateCalls[0]).toMatchObject({
+			chatId: "chat-b",
+		});
 	});
 });

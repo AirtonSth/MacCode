@@ -1,0 +1,254 @@
+--- a/node_modules/expo-widgets/src/Widgets.ts
++++ b/node_modules/expo-widgets/src/Widgets.ts
+@@ -69,6 +69,29 @@ export class LiveActivity<T extends object = object> {
+     this.nativeLiveActivity = nativeLiveActivity;
+   }
+ 
++  /**
++   * Returns the native ActivityKit identifier for this Live Activity instance.
++   */
++  getId(): string {
++    return this.nativeLiveActivity.getId();
++  }
++
++  /**
++   * Returns the current content-state props for this Live Activity instance.
++   */
++  getProps(): T | null {
++    const props = this.nativeLiveActivity.getProps();
++    if (!props) {
++      return null;
++    }
++
++    try {
++      return JSON.parse(props) as T;
++    } catch {
++      return null;
++    }
++  }
++
+   /**
+    * Updates the Live Activity's content. The UI reflects the new properties immediately.
+    * @param props The updated content properties.
+--- a/node_modules/expo-widgets/src/Widgets.types.ts
++++ b/node_modules/expo-widgets/src/Widgets.types.ts
+@@ -188,6 +188,8 @@ export declare class NativeLiveActivityFactory extends SharedObject {
+ }
+ 
+ export declare class NativeLiveActivity extends SharedObject<LiveActivityEvents> {
++  getId(): string;
++  getProps(): string | null;
+   update(props: string): Promise<void>;
+   end(
+     dismissalPolicy?: string,
+--- a/node_modules/expo-widgets/build/Widgets.js
++++ b/node_modules/expo-widgets/build/Widgets.js
+@@ -47,6 +47,27 @@ export class LiveActivity {
+     constructor(nativeLiveActivity) {
+         this.nativeLiveActivity = nativeLiveActivity;
+     }
++    /**
++     * Returns the native ActivityKit identifier for this Live Activity instance.
++     */
++    getId() {
++        return this.nativeLiveActivity.getId();
++    }
++    /**
++     * Returns the current content-state props for this Live Activity instance.
++     */
++    getProps() {
++        const props = this.nativeLiveActivity.getProps();
++        if (!props) {
++            return null;
++        }
++        try {
++            return JSON.parse(props);
++        }
++        catch {
++            return null;
++        }
++    }
+     /**
+      * Updates the Live Activity's content. The UI reflects the new properties immediately.
+      * @param props The updated content properties.
+@@ -155,4 +176,4 @@ export function addUserInteractionListener(listener) {
+ export function addPushToStartTokenListener(listener) {
+     return ExpoWidgetsModule.addListener('onExpoWidgetsPushToStartTokenReceived', listener);
+ }
+-//# sourceMappingURL=Widgets.js.map
+\ No newline at end of file
++//# sourceMappingURL=Widgets.js.map
+--- a/node_modules/expo-widgets/build/Widgets.d.ts
++++ b/node_modules/expo-widgets/build/Widgets.d.ts
+@@ -33,6 +33,14 @@ export declare class LiveActivity<T extends object = object> {
+     /** @hidden */
+     private nativeLiveActivity;
+     constructor(nativeLiveActivity: NativeLiveActivity);
++    /**
++     * Returns the native ActivityKit identifier for this Live Activity instance.
++     */
++    getId(): string;
++    /**
++     * Returns the current content-state props for this Live Activity instance.
++     */
++    getProps(): T | null;
+     /**
+      * Updates the Live Activity's content. The UI reflects the new properties immediately.
+      * @param props The updated content properties.
+@@ -111,4 +119,4 @@ export declare function addUserInteractionListener(listener: ExpoWidgetsEvents['
+  * @return An event subscription that can be used to remove the listener.
+  */
+ export declare function addPushToStartTokenListener(listener: ExpoWidgetsEvents['onExpoWidgetsPushToStartTokenReceived']): EventSubscription;
+-//# sourceMappingURL=Widgets.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=Widgets.d.ts.map
+--- a/node_modules/expo-widgets/build/Widgets.types.d.ts
++++ b/node_modules/expo-widgets/build/Widgets.types.d.ts
+@@ -165,8 +165,10 @@ export declare class NativeLiveActivityFactory extends SharedObject {
+     getInstances(): NativeLiveActivity[];
+ }
+ export declare class NativeLiveActivity extends SharedObject<LiveActivityEvents> {
++    getId(): string;
++    getProps(): string | null;
+     update(props: string): Promise<void>;
+     end(dismissalPolicy?: string, afterDate?: number, state?: string, contentDate?: number): Promise<void>;
+     getPushToken(): Promise<string | null>;
+ }
+-//# sourceMappingURL=Widgets.types.d.ts.map
+\ No newline at end of file
++//# sourceMappingURL=Widgets.types.d.ts.map
+--- a/node_modules/expo-widgets/ios/LiveActivity.swift
++++ b/node_modules/expo-widgets/ios/LiveActivity.swift
+@@ -23,6 +23,20 @@ final class LiveActivity: SharedObject {
+     await activity.update(ActivityContent(state: newState, staleDate: nil))
+   }
+ 
++  func getId() -> String {
++    id
++  }
++
++  func getProps() throws -> String? {
++    guard #available(iOS 16.2, *) else { throw LiveActivitiesNotSupportedException() }
++
++    guard let activity = Activity<LiveActivityAttributes>.activities.first(where: { $0.id == id }) else {
++      throw LiveActivityNotFoundException(id)
++    }
++
++    return activity.content.state.props
++  }
++
+   func end(dismissalPolicy: LiveActivityDismissalPolicy?, afterDate: Date?, props: String?, contentDate: Date?) async throws {
+     guard #available(iOS 16.2, *) else { throw LiveActivitiesNotSupportedException() }
+ 
+@@ -37,11 +51,13 @@ final class LiveActivity: SharedObject {
+       content = nil
+     }
+ 
+-    guard let contentDate, #available(iOS 17.2, *) else {
+-      return await activity.end(content, dismissalPolicy: dismissalPolicy?.toDismissalPolicy(date: afterDate) ?? .default)
++    if let contentDate, #available(iOS 17.2, *) {
++      await activity.end(content, dismissalPolicy: dismissalPolicy?.toDismissalPolicy(date: afterDate) ?? .default, timestamp: contentDate)
++    } else {
++      await activity.end(content, dismissalPolicy: dismissalPolicy?.toDismissalPolicy(date: afterDate) ?? .default)
+     }
+ 
+-    await activity.end(content, dismissalPolicy: dismissalPolicy?.toDismissalPolicy(date: afterDate) ?? .default, timestamp: contentDate)
++    WidgetsStorage.removeObject(forKey: "__expo_widgets_live_activity_\(name)_url_\(id)")
+   }
+ 
+   func getPushToken() throws -> String? {
+--- a/node_modules/expo-widgets/ios/LiveActivityFactory.swift
++++ b/node_modules/expo-widgets/ios/LiveActivityFactory.swift
+@@ -19,10 +19,6 @@ final class LiveActivityFactory: SharedObject {
+       throw LiveActivitiesNotSupportedException()
+     }
+ 
+-    if let url {
+-      WidgetsStorage.set(url.absoluteString, forKey: "__expo_widgets_live_activity_\(name)_url")
+-    }
+-
+     do {
+       let initialState = LiveActivityAttributes.ContentState(name: name, props: props)
+       let activity = try Activity.request(
+@@ -31,6 +27,11 @@ final class LiveActivityFactory: SharedObject {
+         pushType: LiveActivityFactory.pushNotificationsEnabled ? .token : nil
+       )
+ 
++      if let url {
++        WidgetsStorage.set(url.absoluteString, forKey: "__expo_widgets_live_activity_\(name)_url")
++        WidgetsStorage.set(url.absoluteString, forKey: "__expo_widgets_live_activity_\(name)_url_\(activity.id)")
++      }
++
+       let instance = LiveActivity(id: activity.id, name: name)
+       instance.observePushTokenUpdates(for: activity, pushNotificationsEnabled: LiveActivityFactory.pushNotificationsEnabled)
+       return instance
+--- a/node_modules/expo-widgets/ios/WidgetsModule.swift
++++ b/node_modules/expo-widgets/ios/WidgetsModule.swift
+@@ -82,6 +82,14 @@ public final class WidgetsModule: Module {
+     }
+ 
+     Class("LiveActivity", LiveActivity.self) {
++      Function("getId") { (instance: LiveActivity) in
++        instance.getId()
++      }
++
++      Function("getProps") { (instance: LiveActivity) in
++        try instance.getProps()
++      }
++
+       AsyncFunction("update") { (instance: LiveActivity, props: String) in
+         try await instance.update(props: props)
+       }
+--- a/node_modules/expo-widgets/ios/Widgets/Utils.swift
++++ b/node_modules/expo-widgets/ios/Widgets/Utils.swift
+@@ -52,10 +52,17 @@ func getLiveActivityNodes(forName name: String, props: String = "{}") -> [String
+   return result?.toObject() as? [String: Any] ?? [:]
+ }
+ 
+-func getLiveActivityUrl(forName name: String) -> URL? {
+-  let data = WidgetsStorage.getData(forKey: "__expo_widgets_live_activity_\(name)_url")
+-  if let data, let url = String(data: data, encoding: .utf8) {
+-    return URL(string: url)
++func getLiveActivityUrl(forName name: String, activityId: String? = nil) -> URL? {
++  if let activityId {
++    let activityData = WidgetsStorage.getData(forKey: "__expo_widgets_live_activity_\(name)_url_\(activityId)")
++    if let activityData, let activityUrl = String(data: activityData, encoding: .utf8) {
++      return URL(string: activityUrl)
++    }
++  }
++
++  let fallbackData = WidgetsStorage.getData(forKey: "__expo_widgets_live_activity_\(name)_url")
++  if let fallbackData, let fallbackUrl = String(data: fallbackData, encoding: .utf8) {
++    return URL(string: fallbackUrl)
+   }
+   return nil
+ }
+--- a/node_modules/expo-widgets/ios/Widgets/WidgetLiveActivity.swift
++++ b/node_modules/expo-widgets/ios/Widgets/WidgetLiveActivity.swift
+@@ -19,13 +19,17 @@ public struct WidgetLiveActivity: Widget {
+   public var body: some WidgetConfiguration {
+     ActivityConfiguration(for: LiveActivityAttributes.self) { context in
+       let nodes = getLiveActivityNodes(forName: context.state.name, props: context.state.props)
++      let activityUrl = getLiveActivityUrl(forName: context.state.name, activityId: context.activityID)
+       if #available(iOS 18.0, *) {
+         LiveActivityBanner(context: context, nodes: nodes)
++          .widgetURL(activityUrl)
+       } else {
+         liveActivitySection("banner", source: context.activityID, nodes: nodes)
++          .widgetURL(activityUrl)
+       }
+     } dynamicIsland: { context in
+       let nodes = getLiveActivityNodes(forName: context.state.name, props: context.state.props)
++      let activityUrl = getLiveActivityUrl(forName: context.state.name, activityId: context.activityID)
+       return DynamicIsland {
+         expandedContent(source: context.activityID, nodes: nodes)
+       } compactLeading: {
+@@ -35,7 +39,7 @@ public struct WidgetLiveActivity: Widget {
+       } minimal: {
+         liveActivitySection("minimal", source: context.activityID, nodes: nodes)
+       }
+-      .widgetURL(getLiveActivityUrl(forName: context.state.name))
++      .widgetURL(activityUrl)
+     }
+     .supplementalActivityFamiliesIfAvailable()
+   }

@@ -12,8 +12,7 @@ const ACTIVE_STATE_KEY = "remotecode.live_activity.active_state";
 const PUSH_TOKEN_KEY = "remotecode.live_activity.push_token";
 const PUSH_TO_START_TOKEN_KEY = "remotecode.live_activity.push_to_start_token";
 const LOCAL_CONTENT_UPDATE_MIN_INTERVAL_MS = 1_000;
-const LOCAL_HEARTBEAT_INTERVAL_MS = 1_000;
-const LOCAL_ELAPSED_BUCKET_SECONDS = 1;
+const LOCAL_HEARTBEAT_INTERVAL_MS = 5_000;
 const LOCAL_STATE_PERSIST_MIN_INTERVAL_MS = 5_000;
 const PREVIEW_LIMIT = 140;
 const TITLE_LIMIT = 80;
@@ -34,6 +33,7 @@ interface Subscription {
 }
 
 interface PersistedLiveActivityState {
+	activityId?: string | null;
 	chatId: string;
 	chatTitle: string;
 	phase: ThreadLiveActivityPhase;
@@ -109,6 +109,12 @@ interface LiveActivityBindings {
 	threadLiveActivityFactory: ThreadLiveActivityFactory;
 }
 
+interface ActivityRecord {
+	activity: LiveActivity<ThreadLiveActivityProps>;
+	activityId: string | null;
+	chatId: string | null;
+}
+
 let initialized = false;
 let liveActivitiesUnavailable = false;
 let liveActivityBindings: LiveActivityBindings | null = null;
@@ -139,6 +145,11 @@ const log = (message: string, meta?: Record<string, unknown>): void => {
 const withDefault = (value: string | undefined, fallback: string): string => {
 	const trimmed = value?.trim();
 	return trimmed && trimmed.length > 0 ? trimmed : fallback;
+};
+
+const withOptionalValue = (value: string | null | undefined): string | null => {
+	const trimmed = value?.trim();
+	return trimmed && trimmed.length > 0 ? trimmed : null;
 };
 
 type LiveActivityTextField = "preview" | "status" | "title";
@@ -347,9 +358,6 @@ const toElapsedSeconds = (startedAtMs: number): number => {
 	return Math.floor(deltaMs / 1_000);
 };
 
-const toElapsedBucket = (startedAtMs: number): number =>
-	Math.floor(toElapsedSeconds(startedAtMs) / LOCAL_ELAPSED_BUCKET_SECONDS);
-
 const toProps = (state: PersistedLiveActivityState): ThreadLiveActivityProps => ({
 	chatId: state.chatId,
 	chatTitle: sanitizeTitle(state.chatTitle, "Thread"),
@@ -364,13 +372,12 @@ const isTerminalPhase = (phase: ThreadLiveActivityPhase): boolean =>
 
 const toContentSignature = (state: PersistedLiveActivityState): string =>
 	[
-		state.chatId,
-		state.chatTitle,
-		state.phase,
-		state.statusLine,
-		state.preview,
-		String(toElapsedBucket(state.startedAtMs)),
-	].join("\u0001");
+			state.chatId,
+			state.chatTitle,
+			state.phase,
+			state.statusLine,
+			state.preview,
+		].join("\u0001");
 
 const persistAllEntries = async (): Promise<void> => {
 	if (entries.size === 0) {
@@ -415,10 +422,11 @@ const hydratePersistedState = async (): Promise<void> => {
 				continue;
 			}
 
-			const state: PersistedLiveActivityState = {
-				chatId,
-				chatTitle: sanitizeTitle(item.chatTitle, "Thread"),
-				phase: item.phase ?? "running",
+				const state: PersistedLiveActivityState = {
+					activityId: withOptionalValue(item.activityId),
+					chatId,
+					chatTitle: sanitizeTitle(item.chatTitle, "Thread"),
+					phase: item.phase ?? "running",
 				preview: sanitizePreview(item.preview, "Waiting for updates..."),
 				startedAtMs:
 					typeof item.startedAtMs === "number" && Number.isFinite(item.startedAtMs) && item.startedAtMs > 0
@@ -521,6 +529,98 @@ const syncEntryPushToken = async (entry: ActivityEntry): Promise<void> => {
 	}
 };
 
+const getActivityId = (activity: LiveActivity<ThreadLiveActivityProps>): string | null => {
+	try {
+		return withOptionalValue(activity.getId());
+	} catch {
+		return null;
+	}
+};
+
+const getActivityChatId = (activity: LiveActivity<ThreadLiveActivityProps>): string | null => {
+	try {
+		return withOptionalValue(activity.getProps()?.chatId);
+	} catch {
+		return null;
+	}
+};
+
+const toActivityRecords = async (
+	bindings: LiveActivityBindings,
+): Promise<ActivityRecord[]> => bindings.threadLiveActivityFactory.getInstances().map((activity) => ({
+	activity,
+	activityId: getActivityId(activity),
+	chatId: getActivityChatId(activity),
+}));
+
+const isActivityRecordOwnedByOtherEntry = (record: ActivityRecord, currentEntry: ActivityEntry): boolean => {
+	for (const other of entries.values()) {
+		if (other === currentEntry) {
+			continue;
+		}
+		if (record.activityId && other.state.activityId === record.activityId) {
+			return true;
+		}
+		if (!record.activityId && other.activity === record.activity) {
+			return true;
+		}
+	}
+
+	return false;
+};
+
+const findMatchingActivityRecord = (input: {
+	allowLegacyFallback: boolean;
+	currentEntry: ActivityEntry;
+	records: ActivityRecord[];
+}): ActivityRecord | null => {
+	const savedActivityId = withOptionalValue(input.currentEntry.state.activityId);
+	if (savedActivityId) {
+		const byId = input.records.find((record) =>
+			record.activityId === savedActivityId && !isActivityRecordOwnedByOtherEntry(record, input.currentEntry));
+		if (byId) {
+			return byId;
+		}
+	}
+
+	const chatMatches = input.records.filter((record) =>
+		record.chatId === input.currentEntry.state.chatId && !isActivityRecordOwnedByOtherEntry(record, input.currentEntry));
+	if (chatMatches.length === 1) {
+		return chatMatches[0] ?? null;
+	}
+
+	if (!input.allowLegacyFallback || savedActivityId) {
+		return null;
+	}
+
+	const unresolvedEntries = Array.from(entries.values()).filter((entry) =>
+		!entry.activity && !withOptionalValue(entry.state.activityId));
+	const unownedRecords = input.records.filter((record) => !isActivityRecordOwnedByOtherEntry(record, input.currentEntry));
+	if (unresolvedEntries.length === 1 && unownedRecords.length === 1) {
+		return unownedRecords[0] ?? null;
+	}
+
+	return null;
+};
+
+const bindActivityToEntry = async (
+	entry: ActivityEntry,
+	record: ActivityRecord,
+): Promise<LiveActivity<ThreadLiveActivityProps>> => {
+	const nextEntry = entry;
+	nextEntry.activity = record.activity;
+	attachEntryPushTokenSubscription(nextEntry);
+	if (record.activityId && record.activityId !== nextEntry.state.activityId) {
+		nextEntry.state = {
+			...nextEntry.state,
+			activityId: record.activityId,
+		};
+		await persistEntry(nextEntry.state.chatId);
+	}
+
+	return record.activity;
+};
+
 async function resolveActivityInstance(entry: ActivityEntry): Promise<LiveActivity<ThreadLiveActivityProps> | null> {
 	if (entry.activity) {
 		return entry.activity;
@@ -531,29 +631,21 @@ async function resolveActivityInstance(entry: ActivityEntry): Promise<LiveActivi
 		return null;
 	}
 
-	const instances = bindings.threadLiveActivityFactory.getInstances();
-	if (instances.length === 0) {
+	const records = await toActivityRecords(bindings);
+	if (records.length === 0) {
 		return null;
 	}
 
-	// Try to match an unowned instance to this entry
-	const ownedActivities = new Set<LiveActivity<ThreadLiveActivityProps>>();
-	for (const other of entries.values()) {
-		if (other.activity) {
-			ownedActivities.add(other.activity);
-		}
+	const match = findMatchingActivityRecord({
+		allowLegacyFallback: true,
+		currentEntry: entry,
+		records,
+	});
+	if (!match) {
+		return null;
 	}
 
-	for (const instance of instances) {
-		if (!ownedActivities.has(instance)) {
-			// eslint-disable-next-line no-param-reassign
-			entry.activity = instance;
-			attachEntryPushTokenSubscription(entry);
-			return instance;
-		}
-	}
-
-	return null;
+	return await bindActivityToEntry(entry, match);
 }
 
 const clearEntryFlush = (entry: ActivityEntry): void => {
@@ -580,9 +672,7 @@ const ensureHeartbeat = (): void => {
 		return;
 	}
 
-	const hasTickableEntries = Array.from(entries.values()).some(
-		(entry) => !isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry),
-	);
+	const hasTickableEntries = Array.from(entries.values()).some((entry) => !isTerminalPhase(entry.state.phase));
 	if (!hasTickableEntries) {
 		return;
 	}
@@ -594,12 +684,10 @@ const ensureHeartbeat = (): void => {
 			}
 		}
 
-		const stillHasTickable = Array.from(entries.values()).some(
-			(e) => !isTerminalPhase(e.state.phase) && canEntryWriteLocally(e),
-		);
-		if (!stillHasTickable) {
-			clearHeartbeat();
-		}
+			const stillHasTickable = Array.from(entries.values()).some((e) => !isTerminalPhase(e.state.phase));
+			if (!stillHasTickable) {
+				clearHeartbeat();
+			}
 	}, LOCAL_HEARTBEAT_INTERVAL_MS);
 };
 
@@ -726,31 +814,21 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 			return;
 		}
 
-		// eslint-disable-next-line require-atomic-updates
-		initialized = true;
-		await hydratePersistedState();
+			// eslint-disable-next-line require-atomic-updates
+			initialized = true;
+			await hydratePersistedState();
 
-		// Adopt existing OS-level activity instances
-		const instances = bindings.threadLiveActivityFactory.getInstances();
-		const ownedActivities = new Set<LiveActivity<ThreadLiveActivityProps>>();
+			await Promise.all(Array.from(entries.values(), async (entry) => {
+				await resolveActivityInstance(entry);
+			}));
 
-		for (const [, entry] of entries) {
-			if (instances.length === 0) {
-				break;
-			}
-
-			const unowned = instances.find((inst) => !ownedActivities.has(inst));
-			if (unowned) {
-				entry.activity = unowned;
-				ownedActivities.add(unowned);
-				attachEntryPushTokenSubscription(entry);
-			}
-		}
-
-		const unownedInstancesCount = instances.length - ownedActivities.size;
-		if (unownedInstancesCount > 0) {
-			log("unowned live activity instances detected; keeping them available for later adoption", {
-				count: unownedInstancesCount,
+			const records = await toActivityRecords(bindings);
+			const unownedInstancesCount = records.filter((record) =>
+				!Array.from(entries.values()).some((entry) =>
+					entry.activity === record.activity || (record.activityId && entry.state.activityId === record.activityId))).length;
+			if (unownedInstancesCount > 0) {
+				log("unowned live activity instances detected; keeping them available for later adoption", {
+					count: unownedInstancesCount,
 			});
 		}
 
@@ -762,17 +840,15 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 		);
 
 		// Start heartbeat for active entries and flush initial state
-		const hasActive = Array.from(entries.values()).some(
-			(entry) => !isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry),
-		);
-		if (hasActive) {
-			ensureHeartbeat();
-			await Promise.all(
-				Array.from(entries.entries())
-					.filter(([, entry]) => !isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry))
-					.map(async ([chatId]) => { await queueEntryStateUpdate(chatId, { immediate: true, force: true }); }),
-			);
-		}
+			const hasActive = Array.from(entries.values()).some((entry) => !isTerminalPhase(entry.state.phase));
+			if (hasActive) {
+				ensureHeartbeat();
+				await Promise.all(
+					Array.from(entries.entries())
+						.filter(([, entry]) => !isTerminalPhase(entry.state.phase))
+						.map(async ([chatId]) => { await queueEntryStateUpdate(chatId, { immediate: true, force: true }); }),
+				);
+			}
 
 		pushToStartTokenSubscription ||= bindings.addPushToStartTokenListener((event) => {
 			log("push-to-start token received", {
@@ -797,15 +873,15 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 	}
 };
 
-export const startThreadLiveActivity = async (input: LiveActivityStartInput): Promise<void> => {
+export const startThreadLiveActivity = async (input: LiveActivityStartInput): Promise<boolean> => {
 	if (!canUseLiveActivities()) {
-		return;
+		return false;
 	}
 
 	await initializeThreadLiveActivityManager();
 	const bindings = await loadLiveActivityBindings();
 	if (!bindings) {
-		return;
+		return false;
 	}
 
 	const existing = entries.get(input.chatId);
@@ -827,6 +903,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 
 	const previousState = entries.get(input.chatId)?.state;
 	const state: PersistedLiveActivityState = {
+		activityId: previousState?.activityId ?? null,
 		chatId: input.chatId,
 		chatTitle: sanitizeTitle(
 			input.chatTitle,
@@ -886,7 +963,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 			force: true,
 		});
 		await syncEntryPushToken(entry);
-		return;
+		return true;
 	}
 
 	try {
@@ -894,13 +971,21 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 			toProps(state),
 			`remotecode-mobile://chat?chatId=${encodeURIComponent(input.chatId)}`,
 		);
+		entry.state = {
+			...entry.state,
+			activityId: getActivityId(entry.activity),
+		};
 		log("activity instance started", { chatId: input.chatId });
 		attachEntryPushTokenSubscription(entry);
 		entry.lastContentSignature = toContentSignature(state);
 		entry.lastContentUpdateAtMs = nowMs();
+		await persistEntry(input.chatId);
 		await syncEntryPushToken(entry);
+		return true;
 	} catch {
-		// Ignore startup failures to keep app flow resilient.
+		log("activity instance start failed", { chatId: input.chatId });
+		await removeEntry(input.chatId);
+		return false;
 	}
 };
 
@@ -1125,7 +1210,9 @@ export const isThreadLiveActivityEnabled = (): boolean => canUseLiveActivities()
 
 export const hasActiveLiveActivityEntry = (chatId: string): boolean => {
 	const entry = entries.get(chatId);
-	return Boolean(entry) && !isTerminalPhase(entry!.state.phase);
+	return Boolean(entry)
+		&& !isTerminalPhase(entry!.state.phase)
+		&& Boolean(entry!.activity || withOptionalValue(entry!.state.activityId));
 };
 
 export const setThreadLiveActivityRemoteManaged = async (input: {
