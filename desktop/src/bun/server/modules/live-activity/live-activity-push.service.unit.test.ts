@@ -4,7 +4,7 @@ import { createLiveActivityPushServiceForTests } from "./live-activity-push.serv
 import type { LiveActivityPushSubscriptionStoreContract } from "./live-activity-push.model";
 
 interface CapturedDelivery {
-	event: "update" | "end";
+	event: "update" | "end" | "start";
 	chatTitle: string;
 	preview: string;
 }
@@ -416,8 +416,8 @@ test("LiveActivityPushService immediately flushes a follow-up update when new st
 	let releaseFirstDelivery = () => {
 		// Assigned once the first delivery starts.
 	};
-	const deliveryEvents: Array<"update" | "end"> = [];
-	const sender = async (input: { event: "update" | "end" }) => {
+	const deliveryEvents: Array<"update" | "end" | "start"> = [];
+	const sender = async (input: { event: "update" | "end" | "start" }) => {
 		deliveryEvents.push(input.event);
 		if (deliveryEvents.length === 1) {
 			await new Promise<void>((resolve) => {
