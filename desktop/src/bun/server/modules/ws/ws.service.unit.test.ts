@@ -177,6 +177,7 @@ test("WsService.startUserMessage forwards lifecycle updates to live activity pus
 	const finished: Array<{ chatId: string; outcome: string; chatTitle?: string }> = [];
 	const liveActivityPushService: LiveActivityPushServiceContract = {
 		getIsEnabled: () => true,
+		getSupportedPushTokenTypes: async () => new Set(["apns", "fcm"]),
 		onAssistantDelta: (_chatId, delta) => {
 			deltas.push(delta);
 		},
@@ -190,7 +191,7 @@ test("WsService.startUserMessage forwards lifecycle updates to live activity pus
 			started.push(input);
 		},
 		upsertSubscription: async () => true,
-		registerPushToStartToken: () => {},
+		registerPushToStartToken: async () => {},
 	};
 
 	const service = new WsService(

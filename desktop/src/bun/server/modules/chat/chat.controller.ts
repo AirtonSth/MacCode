@@ -46,8 +46,9 @@ interface RuntimeActiveThreadReader {
 
 interface LiveActivitySubscriptionReader {
 	getLiveActivityPushIsEnabled: () => boolean;
+	getLiveActivityPushSupportedTokenTypes: () => Promise<ReadonlySet<"apns" | "fcm">>;
 	upsertLiveActivityPushSubscription: (input: LiveActivityPushSubscriptionInput) => Promise<boolean>;
-	registerPushToStartToken: (input: PushToStartTokenInput) => void;
+	registerPushToStartToken: (input: PushToStartTokenInput) => Promise<void>;
 }
 
 export class ChatController {
@@ -111,13 +112,18 @@ export class ChatController {
 					const pushToken = body.pushToken?.trim() || legacyFcmToken;
 					const pushTokenType = body.pushTokenType ?? (legacyFcmToken.length > 0 ? "fcm" : null);
 					const liveActivityToken = body.liveActivityToken.trim();
-					const enabled = liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false;
+					const supportedPushTokenTypes = liveActivitySubscriptionReader
+						? await liveActivitySubscriptionReader.getLiveActivityPushSupportedTokenTypes()
+						: new Set<"apns" | "fcm">();
+					const enabled = (liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false)
+						&& supportedPushTokenTypes.size > 0;
 					logLiveActivitySubscription("request received", {
 						chatId: parameters.id,
 						enabled,
 						liveActivityToken: toTokenPreview(liveActivityToken),
 						pushToken: toTokenPreview(pushToken),
 						pushTokenType,
+						supportedPushTokenTypes: Array.from(supportedPushTokenTypes),
 					});
 					if (
 						pushToken.length === 0
@@ -157,6 +163,23 @@ export class ChatController {
 							liveActivityToken: toTokenPreview(liveActivityToken),
 							pushToken: toTokenPreview(pushToken),
 							pushTokenType,
+							supportedPushTokenTypes: Array.from(supportedPushTokenTypes),
+							subscribed: false,
+						});
+						return {
+							enabled: false,
+							subscribed: false,
+						};
+					}
+
+					if (!supportedPushTokenTypes.has(pushTokenType)) {
+						logLiveActivitySubscription("request completed (unsupported push token type)", {
+							chatId: parameters.id,
+							enabled,
+							liveActivityToken: toTokenPreview(liveActivityToken),
+							pushToken: toTokenPreview(pushToken),
+							pushTokenType,
+							supportedPushTokenTypes: Array.from(supportedPushTokenTypes),
 							subscribed: false,
 						});
 						return {
@@ -178,6 +201,7 @@ export class ChatController {
 						liveActivityToken: toTokenPreview(liveActivityToken),
 						pushToken: toTokenPreview(pushToken),
 						pushTokenType,
+						supportedPushTokenTypes: Array.from(supportedPushTokenTypes),
 						subscribed,
 					});
 
@@ -203,7 +227,11 @@ export class ChatController {
 					const pushToStartToken = body.pushToStartToken?.trim() || "";
 					const pushToken = body.pushToken?.trim() || "";
 					const pushTokenType = body.pushTokenType;
-					const enabled = liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false;
+					const supportedPushTokenTypes = liveActivitySubscriptionReader
+						? await liveActivitySubscriptionReader.getLiveActivityPushSupportedTokenTypes()
+						: new Set<"apns" | "fcm">();
+					const enabled = (liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false)
+						&& supportedPushTokenTypes.size > 0;
 
 					if (
 						pushToStartToken.length === 0
@@ -218,7 +246,11 @@ export class ChatController {
 						return { enabled: false, registered: false };
 					}
 
-					liveActivitySubscriptionReader.registerPushToStartToken({
+					if (!supportedPushTokenTypes.has(pushTokenType)) {
+						return { enabled: false, registered: false };
+					}
+
+					await liveActivitySubscriptionReader.registerPushToStartToken({
 						pushToStartToken,
 						pushToken,
 						pushTokenType,

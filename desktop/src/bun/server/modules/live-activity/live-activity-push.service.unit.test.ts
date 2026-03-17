@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
 
-import { createLiveActivityPushServiceForTests } from "./live-activity-push.service";
+import {
+	createLiveActivityPushServiceForTests,
+	createLiveActivityPushServiceFromEnvironment,
+} from "./live-activity-push.service";
 import type { LiveActivityPushSubscriptionStoreContract } from "./live-activity-push.model";
 
 interface CapturedDelivery {
@@ -456,4 +459,147 @@ test("LiveActivityPushService immediately flushes a follow-up update when new st
 	}
 
 	expect(deliveryEvents).toEqual(["update", "update"]);
+});
+
+test("createLiveActivityPushServiceFromEnvironment rejects subscriptions for token types unsupported by the private backend", async () => {
+	const originalFetch = globalThis.fetch;
+	const deliveryBodies: Array<Record<string, unknown>> = [];
+	let statusRequests = 0;
+
+	const mockedFetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+		const url = typeof input === "string"
+			? input
+			: input instanceof URL
+				? input.toString()
+				: input.url;
+
+		if (url.endsWith("/v1/private/push-notification/status")) {
+			statusRequests += 1;
+			return Response.json({
+				enabled: true,
+				supportedPushTokenTypes: ["fcm"],
+			});
+		}
+
+		if (url.endsWith("/v1/private/push-notification/deliver")) {
+			deliveryBodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+			return Response.json({
+				delivered: true,
+				shouldDropSubscription: false,
+			});
+		}
+
+		return new Response("not found", { status: 404 });
+	}, {
+		preconnect: originalFetch.preconnect.bind(originalFetch),
+	}) as typeof fetch;
+	globalThis.fetch = mockedFetch;
+
+	try {
+		const service = createLiveActivityPushServiceFromEnvironment({
+			getConnectorCredentials: () => ({
+				backendUrl: "https://private.example.test",
+				connectorId: "connector-id",
+				connectorToken: "connector-token",
+			}),
+			privateBackendUrl: "https://private.example.test",
+		});
+
+		service.onChatStarted({
+			chatId: "chat-private-apns",
+			chatTitle: "Private backend",
+		});
+
+		const supportedPushTokenTypes = await service.getSupportedPushTokenTypes();
+		const subscribed = await service.upsertSubscription({
+			chatId: "chat-private-apns",
+			chatTitle: "Private backend",
+			liveActivityToken: "live-activity-token",
+			pushToken: "device-token",
+			pushTokenType: "apns",
+		});
+
+		expect(supportedPushTokenTypes).toEqual(new Set(["fcm"]));
+		expect(subscribed).toBe(false);
+		expect(statusRequests).toBe(1);
+		expect(deliveryBodies).toHaveLength(0);
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});
+
+test("createLiveActivityPushServiceFromEnvironment caches backend capabilities and only delivers supported token types", async () => {
+	const originalFetch = globalThis.fetch;
+	const deliveryBodies: Array<Record<string, unknown>> = [];
+	let statusRequests = 0;
+
+	const mockedFetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+		const url = typeof input === "string"
+			? input
+			: input instanceof URL
+				? input.toString()
+				: input.url;
+
+		if (url.endsWith("/v1/private/push-notification/status")) {
+			statusRequests += 1;
+			return Response.json({
+				enabled: true,
+				supportedPushTokenTypes: ["fcm"],
+			});
+		}
+
+		if (url.endsWith("/v1/private/push-notification/deliver")) {
+			deliveryBodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+			return Response.json({
+				delivered: true,
+				shouldDropSubscription: false,
+			});
+		}
+
+		return new Response("not found", { status: 404 });
+	}, {
+		preconnect: originalFetch.preconnect.bind(originalFetch),
+	}) as typeof fetch;
+	globalThis.fetch = mockedFetch;
+
+	try {
+		const service = createLiveActivityPushServiceFromEnvironment({
+			getConnectorCredentials: () => ({
+				backendUrl: "https://private.example.test",
+				connectorId: "connector-id",
+				connectorToken: "connector-token",
+			}),
+			privateBackendUrl: "https://private.example.test",
+		});
+
+		service.onChatStarted({
+			chatId: "chat-private-fcm",
+			chatTitle: "Private backend",
+		});
+
+		await service.registerPushToStartToken({
+			pushToStartToken: "push-to-start-token",
+			pushToken: "device-token-apns",
+			pushTokenType: "apns",
+		});
+
+		const subscribed = await service.upsertSubscription({
+			chatId: "chat-private-fcm",
+			chatTitle: "Private backend",
+			liveActivityToken: "live-activity-token",
+			pushToken: "device-token-fcm",
+			pushTokenType: "fcm",
+		});
+
+		expect(subscribed).toBe(true);
+		expect(statusRequests).toBe(1);
+		expect(deliveryBodies).toHaveLength(1);
+		expect(deliveryBodies[0]).toMatchObject({
+			event: "update",
+			pushToken: "device-token-fcm",
+			pushTokenType: "fcm",
+		});
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 });

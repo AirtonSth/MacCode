@@ -58,10 +58,11 @@ export interface PushToStartTokenStoreContract {
 
 export interface LiveActivityPushServiceContract {
 	getIsEnabled(): boolean;
+	getSupportedPushTokenTypes(): Promise<ReadonlySet<LiveActivityPushTokenType>>;
 	onAssistantDelta(chatId: string, delta: string): void;
 	onAssistantEvent(chatId: string, event: AssistantStreamEvent): void;
 	onChatStarted(input: LiveActivityPushStartInput): void;
 	onChatFinished(input: LiveActivityPushFinishInput): Promise<void>;
 	upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean>;
-	registerPushToStartToken(input: PushToStartTokenInput): void;
+	registerPushToStartToken(input: PushToStartTokenInput): Promise<void>;
 }

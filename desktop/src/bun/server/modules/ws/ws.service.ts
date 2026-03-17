@@ -69,6 +69,7 @@ const noopChatTurnSnapshotRepository: ChatTurnSnapshotRepositoryContract = {
 
 const noopLiveActivityPushService: LiveActivityPushServiceContract = {
 	getIsEnabled: () => false,
+	getSupportedPushTokenTypes: async () => new Set(),
 	onAssistantDelta: () => {
 		// no-op
 	},
@@ -82,7 +83,7 @@ const noopLiveActivityPushService: LiveActivityPushServiceContract = {
 		// no-op
 	},
 	upsertSubscription: async () => false,
-	registerPushToStartToken: () => {
+	registerPushToStartToken: async () => {
 		// no-op
 	},
 };
@@ -108,13 +109,17 @@ export class WsService implements WsServiceContract {
 		return this.liveActivityPushService.getIsEnabled();
 	}
 
+	async getLiveActivityPushSupportedTokenTypes(): Promise<ReadonlySet<"apns" | "fcm">> {
+		return await this.liveActivityPushService.getSupportedPushTokenTypes();
+	}
+
 	async upsertLiveActivityPushSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
 		return await this.liveActivityPushService.upsertSubscription(input);
 	}
 
-	registerPushToStartToken(input: PushToStartTokenInput): void {
+	async registerPushToStartToken(input: PushToStartTokenInput): Promise<void> {
 		try {
-			this.liveActivityPushService.registerPushToStartToken(input);
+			await this.liveActivityPushService.registerPushToStartToken(input);
 		} catch {
 			// Keep ws execution resilient when push-to-start registration fails.
 		}
