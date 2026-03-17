@@ -50,6 +50,16 @@
 		background: transparent;
 		font-family: "Manrope", "Plus Jakarta Sans", "Avenir Next", "SF Pro Display", sans-serif;
 		-webkit-font-smoothing: antialiased;
+		-webkit-user-select: text;
+		user-select: text;
+	}
+
+	textarea,
+	input[type="text"],
+	input[type="search"],
+	[contenteditable] {
+		-webkit-user-select: text;
+		user-select: text;
 	}
 
 	#root {

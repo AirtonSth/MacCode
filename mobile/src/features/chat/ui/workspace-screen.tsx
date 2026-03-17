@@ -34,6 +34,7 @@ const styles = StyleSheet.create({
 		fontSize: 15,
 		paddingHorizontal: 12,
 		paddingVertical: 10,
+		userSelect: "text",
 	},
 });
 
@@ -860,7 +861,7 @@ export const WorkspaceScreen = () => {
 									</View>
 								</View>
 							))}
-							{hasStreamingText && !hasStreamingItems ? (
+							{hasStreamingText && !hasStreamingItems && (selectedChat?.isActive || isSending) ? (
 								<View
 									style={{
 										alignItems: "flex-start",

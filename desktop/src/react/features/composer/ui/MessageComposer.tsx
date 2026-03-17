@@ -316,9 +316,7 @@ export const MessageComposer = ({
 						ref={textareaRef}
 						aria-label="Message input"
 						className={cn(
-							focusMode
-								? `min-h-[56px] max-h-[220px] resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`
-								: `min-h-[56px] max-h-[220px] resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`,
+							`min-h-[56px] max-h-[220px] select-text resize-none overflow-hidden border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`,
 						)}
 						disabled={isInputLocked}
 						maxLength={MAX_MESSAGE_LENGTH}

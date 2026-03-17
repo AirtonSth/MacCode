@@ -1,15 +1,197 @@
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { AlertTriangle, Bot, ChevronDown, Loader2, Sparkles, User2 } from "lucide-react";
+import { AlertTriangle, Bot, Check, ChevronDown, Copy, Loader2, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
 import { ScrollArea } from "../../../components/ui/scroll-area";
 import ReactMarkdown from "react-markdown";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../../lib/utils";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import type { AssistantStreamItemState } from "../../../../shared/assistant-stream-event";
 import type { ChatDTO, MessageDTO, StreamTurnState } from "../../workspace/model/useWorkspaceStore";
 import { StreamingTimeline } from "./StreamingTimeline";
+
+const remarkPlugins = [remarkGfm];
+
+const extractTextFromChildren = (children: React.ReactNode): string => {
+	if (typeof children === "string") return children;
+	if (typeof children === "number") return String(children);
+	if (!children) return "";
+	if (Array.isArray(children)) return children.map(extractTextFromChildren).join("");
+	if (typeof children === "object" && "props" in children) {
+		return extractTextFromChildren((children as { props: { children?: React.ReactNode } }).props.children);
+	}
+	return "";
+};
+
+const hasActiveSelection = (): boolean => {
+	const selection = window.getSelection();
+	return Boolean(selection && selection.type === "Range" && selection.toString().length > 0);
+};
+
+const CopyButton = React.memo(({ text, className }: { text: string; className?: string }) => {
+	const [copied, setCopied] = useState(false);
+	const handleCopy = useCallback(() => {
+		void navigator.clipboard.writeText(text).then(() => {
+			setCopied(true);
+			setTimeout(() => setCopied(false), 1800);
+		});
+	}, [text]);
+	return (
+		<button
+			aria-label={copied ? "Copied" : "Copy"}
+			className={cn(
+				"inline-flex items-center justify-center rounded-md p-1 text-slate-400 transition-all hover:bg-white/10 hover:text-slate-200",
+				copied && "text-emerald-400 hover:text-emerald-300",
+				className,
+			)}
+			onClick={handleCopy}
+			type="button"
+		>
+			{copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+		</button>
+	);
+});
+CopyButton.displayName = "CopyButton";
+
+const buildMarkdownComponents = (focusMode: boolean): Components => {
+	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
+	return {
+		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,
+		h2: ({ children, ...props }) => <h2 className="mb-2 mt-3 text-base font-semibold" {...props}>{children}</h2>,
+		h3: ({ children, ...props }) => <h3 className="mb-1 mt-3 font-semibold" {...props}>{children}</h3>,
+		p: ({ children, ...props }) => (
+			<p className={cn(messageTextClass, "[&_code]:text-inherit [&:not(:first-child)]:mt-3")} {...props}>
+				{children}
+			</p>
+		),
+		ul: ({ children, ...props }) => <ul className="mb-2 mt-2 list-disc pl-5" {...props}>{children}</ul>,
+		ol: ({ children, ...props }) => <ol className="mb-2 mt-2 list-decimal pl-5" {...props}>{children}</ol>,
+		li: ({ children, ...props }) => <li className="mt-1" {...props}>{children}</li>,
+		a: ({ children, href, ...props }) => (
+			<a className="text-cyan-100 underline underline-offset-2 hover:text-white" href={href} rel="noreferrer noopener" target="_blank" {...props}>
+				{children}
+			</a>
+		),
+		code: (props) => {
+			const { children, className, ...rest } = props;
+			const inline = !className?.includes("language-");
+			return inline ? (
+				<code
+					className={cn(
+						"rounded bg-white/10 px-1.5 py-0.5 font-mono text-[13px] leading-none tracking-tight",
+						focusMode ? "text-slate-100/95" : "text-cyan-100",
+						className,
+					)}
+					{...rest}
+				>
+					{children}
+				</code>
+			) : (
+				<code className={cn("block", className)} {...rest}>
+					{children}
+				</code>
+			);
+		},
+		pre: ({ children, ...props }) => {
+			const codeText = extractTextFromChildren(children);
+			return (
+				<div className="group/code relative mb-3 mt-2">
+					<pre
+						className={cn(
+							"overflow-x-auto rounded-xl border border-white/15 bg-slate-950/75 p-3 pr-10",
+							focusMode ? "text-[13px] leading-6" : "text-[12px] leading-5",
+						)}
+						{...props}
+					>
+						{children}
+					</pre>
+					<CopyButton
+						className="absolute right-2 top-2 opacity-0 transition-opacity group-hover/code:opacity-100"
+						text={codeText}
+					/>
+				</div>
+			);
+		},
+		blockquote: ({ children, ...props }) => (
+			<blockquote className="mt-2 border-l-2 border-white/30 pl-3 italic" {...props}>
+				{children}
+			</blockquote>
+		),
+		table: ({ children, ...props }) => (
+			<div className="my-2 overflow-x-auto">
+				<table className="w-full border-collapse text-left" {...props}>
+					{children}
+				</table>
+			</div>
+		),
+		th: ({ children, ...props }) => <th className="border-b border-white/20 px-2 py-1 text-left text-xs font-semibold" {...props}>{children}</th>,
+		td: ({ children, ...props }) => <td className="border-b border-white/10 px-2 py-1 align-top" {...props}>{children}</td>,
+	};
+};
+
+const MARKDOWN_COMPONENTS_NORMAL = buildMarkdownComponents(false);
+const MARKDOWN_COMPONENTS_FOCUS = buildMarkdownComponents(true);
+
+interface MessageBubbleProps {
+	message: MessageDTO;
+	focusMode: boolean;
+	shouldReduceMotion: boolean;
+}
+
+const MessageBubble = React.memo(({ message, focusMode, shouldReduceMotion }: MessageBubbleProps) => {
+	const bubbleMotion = shouldReduceMotion
+		? {}
+		: {
+				animate: { opacity: 1, y: 0 },
+				exit: { opacity: 0, y: -4 },
+				initial: { opacity: 0, y: 8 },
+				transition: { duration: 0.2, ease: "easeOut" as const },
+			};
+	const markdownComponents = focusMode ? MARKDOWN_COMPONENTS_FOCUS : MARKDOWN_COMPONENTS_NORMAL;
+
+	return (
+		<motion.article
+			className={cn(
+				"group/msg relative select-text",
+				focusMode
+					? message.role === "user"
+						? "ml-auto w-fit max-w-[min(86%,40rem)] rounded-[1.35rem] border border-white/10 bg-white/[0.06] px-4 py-3 text-[15px] leading-7 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.16)]"
+						: "w-full py-4 text-[15px] leading-7 text-slate-100"
+					: cn(
+							"max-w-[85ch] rounded-2xl border px-4 py-3 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
+							message.role === "user"
+								? "ml-auto border-cyan-300/25 bg-cyan-400/10 text-cyan-50"
+								: "mr-auto border-white/10 bg-slate-900/85 text-slate-100",
+						),
+			)}
+			data-testid={`conversation-message-row-${message.id}`}
+			{...bubbleMotion}
+		>
+			{focusMode ? null : (
+				<div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-300/85">
+					{message.role === "user" ? <User2 className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}
+					{message.role}
+				</div>
+			)}
+			<ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+				{message.content}
+			</ReactMarkdown>
+			<CopyButton
+				className={cn(
+					"absolute opacity-0 transition-opacity group-hover/msg:opacity-100",
+					focusMode
+						? message.role === "user"
+							? "-bottom-7 right-0"
+							: "-bottom-7 left-0"
+						: "-bottom-3 right-3",
+				)}
+				text={message.content}
+			/>
+		</motion.article>
+	);
+});
+MessageBubble.displayName = "MessageBubble";
 
 interface ConversationPanelProps {
 	chat: ChatDTO | null;
@@ -69,6 +251,7 @@ export const ConversationPanel = ({
 	const topPaginationTriggeredRef = useRef(false);
 	const latestReloadTriggeredRef = useRef(false);
 	const olderWindowBottomArmRef = useRef(false);
+	const isAtBottomRef = useRef(true);
 	const bubbleMotion = shouldReduceMotion
 		? {}
 		: {
@@ -96,15 +279,23 @@ export const ConversationPanel = ({
 			return;
 		}
 		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-		setIsAtBottom(distanceFromBottom <= 24);
+		const atBottom = distanceFromBottom <= 24;
+		isAtBottomRef.current = atBottom;
+		setIsAtBottom(atBottom);
 	}, []);
 	const forceScrollToBottom = useCallback(() => {
+		if (hasActiveSelection()) {
+			return;
+		}
 		scrollToBottom("auto");
 		if (typeof window === "undefined") {
 			return;
 		}
 
 		window.requestAnimationFrame(() => {
+			if (hasActiveSelection()) {
+				return;
+			}
 			scrollToBottom("auto");
 			updateIsAtBottom();
 		});
@@ -146,6 +337,7 @@ export const ConversationPanel = ({
 	}, [hasOlderMessages, loading, messageWindowMode, onLoadLatestMessages, onLoadOlderMessages, updateIsAtBottom]);
 	useEffect(() => {
 		setIsAtBottom(true);
+		isAtBottomRef.current = true;
 		setShowRunDetails(false);
 		topPaginationTriggeredRef.current = false;
 		latestReloadTriggeredRef.current = false;
@@ -162,6 +354,9 @@ export const ConversationPanel = ({
 		if (!hasContent) {
 			return;
 		}
+		if (hasActiveSelection()) {
+			return;
+		}
 		if (messageWindowMode === "older") {
 			const viewport = scrollViewportRef.current;
 			if (viewport) {
@@ -173,72 +368,10 @@ export const ConversationPanel = ({
 			}
 			return;
 		}
-		forceScrollToBottom();
+		if (isAtBottomRef.current) {
+			forceScrollToBottom();
+		}
 	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messageWindowMode, messages, streamingText, updateIsAtBottom]);
-	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
-	const markdownComponents: Components = {
-		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,
-		h2: ({ children, ...props }) => <h2 className="mb-2 mt-3 text-base font-semibold" {...props}>{children}</h2>,
-		h3: ({ children, ...props }) => <h3 className="mb-1 mt-3 font-semibold" {...props}>{children}</h3>,
-		p: ({ children, ...props }) => (
-			<p className={cn(messageTextClass, "[&_code]:text-inherit [&:not(:first-child)]:mt-3")} {...props}>
-				{children}
-			</p>
-		),
-		ul: ({ children, ...props }) => <ul className="mb-2 mt-2 list-disc pl-5" {...props}>{children}</ul>,
-		ol: ({ children, ...props }) => <ol className="mb-2 mt-2 list-decimal pl-5" {...props}>{children}</ol>,
-		li: ({ children, ...props }) => <li className="mt-1" {...props}>{children}</li>,
-		a: ({ children, href, ...props }) => (
-			<a className="text-cyan-100 underline underline-offset-2 hover:text-white" href={href} rel="noreferrer noopener" target="_blank" {...props}>
-				{children}
-			</a>
-		),
-		code: (props) => {
-			const { children, className, ...rest } = props;
-			const inline = !className?.includes("language-");
-			return inline ? (
-				<code
-					className={cn(
-						"rounded bg-white/10 px-1.5 py-0.5 font-mono text-[13px] leading-none tracking-tight",
-						focusMode ? "text-slate-100/95" : "text-cyan-100",
-						className,
-					)}
-					{...rest}
-				>
-					{children}
-				</code>
-			) : (
-				<code className={cn("block", className)} {...rest}>
-					{children}
-				</code>
-			);
-		},
-		pre: ({ children, ...props }) => (
-			<pre
-				className={cn(
-					"mb-3 mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/75 p-3",
-					focusMode ? "text-[13px] leading-6" : "text-[12px] leading-5",
-				)}
-				{...props}
-			>
-				{children}
-			</pre>
-		),
-		blockquote: ({ children, ...props }) => (
-			<blockquote className="mt-2 border-l-2 border-white/30 pl-3 italic" {...props}>
-				{children}
-			</blockquote>
-		),
-		table: ({ children, ...props }) => (
-			<div className="my-2 overflow-x-auto">
-				<table className="w-full border-collapse text-left" {...props}>
-					{children}
-				</table>
-			</div>
-		),
-		th: ({ children, ...props }) => <th className="border-b border-white/20 px-2 py-1 text-left text-xs font-semibold" {...props}>{children}</th>,
-		td: ({ children, ...props }) => <td className="border-b border-white/10 px-2 py-1 align-top" {...props}>{children}</td>,
-	};
 
 	return (
 		<section
@@ -374,33 +507,12 @@ export const ConversationPanel = ({
 								</span>
 								<AnimatePresence initial={false}>
 									{messages.map((message) => (
-										<motion.article
-											className={cn(
-												focusMode
-													? message.role === "user"
-														? "ml-auto w-fit max-w-[min(86%,40rem)] rounded-[1.35rem] border border-white/10 bg-white/[0.06] px-4 py-3 text-[15px] leading-7 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.16)]"
-														: "w-full py-4 text-[15px] leading-7 text-slate-100"
-													: cn(
-															"max-w-[85ch] rounded-2xl border px-4 py-3 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
-															message.role === "user"
-																? "ml-auto border-cyan-300/25 bg-cyan-400/10 text-cyan-50"
-																: "mr-auto border-white/10 bg-slate-900/85 text-slate-100",
-														),
-											)}
-											data-testid={`conversation-message-row-${message.id}`}
+										<MessageBubble
 											key={message.id}
-											{...bubbleMotion}
-										>
-											{focusMode ? null : (
-												<div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-300/85">
-													{message.role === "user" ? <User2 className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}
-													{message.role}
-												</div>
-											)}
-											<ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-												{message.content}
-											</ReactMarkdown>
-										</motion.article>
+											message={message}
+											focusMode={focusMode}
+											shouldReduceMotion={shouldReduceMotion}
+										/>
 									))}
 
 									{liveTurn ? (
@@ -430,6 +542,7 @@ export const ConversationPanel = ({
 									{streamingText && !hasStreamingTimeline ? (
 										<motion.article
 											className={cn(
+												"select-text",
 												focusMode
 													? "w-full py-4 text-[15px] leading-7 text-slate-100"
 													: "mr-auto max-w-[85ch] rounded-2xl border border-sky-200/20 bg-sky-500/10 px-4 py-3 text-sky-50 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",

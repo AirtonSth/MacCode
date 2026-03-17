@@ -1442,7 +1442,7 @@ export const ChatScreen = () => {
 
 					{renderedMessages}
 
-						{hasStreamingText && !hasStreamingItems ? (
+						{hasStreamingText && !hasStreamingItems && (selectedChatIsRunning || isSending) ? (
 							<View style={[styles.messageRow, styles.messageRowAssistant]}>
 								<View style={styles.assistantMessageContent}>
 									<MessageMarkdown
@@ -2214,6 +2214,7 @@ const styles = StyleSheet.create({
 		minHeight: 42,
 		paddingHorizontal: 12,
 		paddingVertical: 8,
+		userSelect: "text",
 	},
 	composerRow: {
 		alignItems: "flex-end",
