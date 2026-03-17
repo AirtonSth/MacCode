@@ -22,6 +22,7 @@ const PREVIEW_ELLIPSIS = "...";
 const MIN_IOS_LIVE_ACTIVITIES_MAJOR = 16;
 const MIN_IOS_LIVE_ACTIVITIES_MINOR = 1;
 const FINISH_DISMISS_DELAY_MS = 4_000;
+const AUTHORITATIVE_SYNC_GRACE_PERIOD_MS = 30_000;
 const MARKDOWN_CODE_FENCE_PATTERN = /```[\s\S]*?```/gu;
 const INLINE_CODE_PATTERN = /`[^`]*`/gu;
 const STRUCTURAL_CODE_CHARACTER_PATTERN = /[<>{}[\]\\|=]/gu;
@@ -55,6 +56,7 @@ interface ActivityEntry {
 	pendingForceWrite: boolean;
 	flushTimeout: ReturnType<typeof setTimeout> | null;
 	awaitingAuthoritativeSync: boolean;
+	awaitingAuthoritativeSyncStartedAtMs: number;
 }
 
 interface LiveActivityStartInput {
@@ -330,8 +332,14 @@ const isSupportedIosVersion = (): boolean => {
 
 const canUseLiveActivities = (): boolean => !liveActivitiesUnavailable && isSupportedIosVersion();
 
+const hasAuthoritativeSyncTimedOut = (entry: ActivityEntry): boolean => (
+	entry.awaitingAuthoritativeSync
+	&& entry.awaitingAuthoritativeSyncStartedAtMs > 0
+	&& (nowMs() - entry.awaitingAuthoritativeSyncStartedAtMs) >= AUTHORITATIVE_SYNC_GRACE_PERIOD_MS
+);
+
 const canEntryWriteLocally = (entry: ActivityEntry): boolean =>
-	!entry.state.remoteManaged || !entry.awaitingAuthoritativeSync;
+	!entry.state.remoteManaged || !entry.awaitingAuthoritativeSync || hasAuthoritativeSyncTimedOut(entry);
 
 const toElapsedSeconds = (startedAtMs: number): number => {
 	const started = Number.isFinite(startedAtMs) && startedAtMs > 0 ? startedAtMs : nowMs();
@@ -433,6 +441,7 @@ const hydratePersistedState = async (): Promise<void> => {
 				pendingForceWrite: false,
 				flushTimeout: null,
 				awaitingAuthoritativeSync: state.remoteManaged && !isTerminalPhase(state.phase),
+				awaitingAuthoritativeSyncStartedAtMs: state.remoteManaged && !isTerminalPhase(state.phase) ? nowMs() : 0,
 			});
 		}
 	} catch {
@@ -702,10 +711,7 @@ const removeEntry = async (chatId: string): Promise<void> => {
 
 	if (entries.size === 0) {
 		clearHeartbeat();
-		await Promise.all([
-			SecureStore.deleteItemAsync(PUSH_TOKEN_KEY),
-			SecureStore.deleteItemAsync(PUSH_TO_START_TOKEN_KEY),
-		]);
+		await SecureStore.deleteItemAsync(PUSH_TOKEN_KEY);
 	}
 };
 
@@ -741,53 +747,12 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 			}
 		}
 
-		// If there are OS instances but no persisted entries, create placeholder entries
-		for (const instance of instances) {
-			if (ownedActivities.has(instance)) {
-				continue;
-			}
-
-			const placeholderId = `remote-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-			log("detected remotely-started live activity, creating local state", { chatId: placeholderId });
-			const entry: ActivityEntry = {
-				state: {
-					chatId: placeholderId,
-					chatTitle: "Thread",
-					phase: "running",
-					preview: "Waiting for updates...",
-					startedAtMs: nowMs(),
-					statusLine: "Generating response",
-					remoteManaged: true,
-				},
-				activity: instance,
-				pushTokenSubscription: null,
-				finishInProgress: false,
-				lastContentSignature: "",
-				lastContentUpdateAtMs: 0,
-				lastStatePersistAtMs: 0,
-				writeInFlight: false,
-				writeAgain: false,
-				pendingForceWrite: false,
-				flushTimeout: null,
-				awaitingAuthoritativeSync: true,
-			};
-			entries.set(placeholderId, entry);
-			ownedActivities.add(instance);
-			attachEntryPushTokenSubscription(entry);
+		const unownedInstancesCount = instances.length - ownedActivities.size;
+		if (unownedInstancesCount > 0) {
+			log("unowned live activity instances detected; keeping them available for later adoption", {
+				count: unownedInstancesCount,
+			});
 		}
-
-		// Clean up duplicate OS instances
-		await Promise.all(
-			instances
-				.filter((instance) => !ownedActivities.has(instance))
-				.map(async (instance) => {
-					try {
-						await instance.end("immediate");
-					} catch {
-						// Ignore cleanup failures.
-					}
-				}),
-		);
 
 		// Sync push tokens for all entries with activities
 		await Promise.all(
@@ -883,6 +848,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	if (entry) {
 		entry.state = state;
 		entry.awaitingAuthoritativeSync = false;
+		entry.awaitingAuthoritativeSyncStartedAtMs = 0;
 		entry.finishInProgress = false;
 	} else {
 		entry = {
@@ -898,6 +864,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 			pendingForceWrite: false,
 			flushTimeout: null,
 			awaitingAuthoritativeSync: false,
+			awaitingAuthoritativeSyncStartedAtMs: 0,
 		};
 		entries.set(input.chatId, entry);
 	}
@@ -957,6 +924,7 @@ export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): 
 	};
 	if (input.authoritative) {
 		entry.awaitingAuthoritativeSync = false;
+		entry.awaitingAuthoritativeSyncStartedAtMs = 0;
 	}
 	const shouldPersistState =
 		Boolean(input.force)
@@ -1038,6 +1006,7 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 		remoteManaged: entry.state.remoteManaged,
 	};
 	entry.awaitingAuthoritativeSync = false;
+	entry.awaitingAuthoritativeSyncStartedAtMs = 0;
 
 	try {
 		clearEntryFlush(entry);
@@ -1181,6 +1150,8 @@ export const setThreadLiveActivityRemoteManaged = async (input: {
 		...entry.state,
 		remoteManaged: input.remoteManaged,
 	};
+	entry.awaitingAuthoritativeSync = input.remoteManaged && !isTerminalPhase(entry.state.phase);
+	entry.awaitingAuthoritativeSyncStartedAtMs = entry.awaitingAuthoritativeSync ? nowMs() : 0;
 	await persistEntry(input.chatId);
 
 	ensureHeartbeat();
@@ -1224,4 +1195,21 @@ export const subscribePushToStartToken = (
 	return () => {
 		pushToStartTokenListeners.delete(listener);
 	};
+};
+
+export const resetThreadLiveActivityManagerForTests = (): void => {
+	clearHeartbeat();
+	pushToStartTokenSubscription?.remove();
+	pushToStartTokenSubscription = null;
+	for (const entry of entries.values()) {
+		clearEntryFlush(entry);
+		detachEntryPushTokenSubscription(entry);
+	}
+	entries.clear();
+	pushTokenListeners.clear();
+	pushToStartTokenListeners.clear();
+	initialized = false;
+	liveActivitiesUnavailable = false;
+	liveActivityBindings = null;
+	currentAppState = "active";
 };

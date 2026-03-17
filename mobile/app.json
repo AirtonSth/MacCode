@@ -24,6 +24,8 @@
           "NSAllowsArbitraryLoads": true
         },
         "NSLocalNetworkUsageDescription": "Remotecode discovers and connects to your local desktop server.",
+        "NSSupportsLiveActivities": true,
+        "NSSupportsLiveActivitiesFrequentUpdates": true,
         "NSUserNotificationsUsageDescription": "Remotecode notifies you when a thread response is ready.",
         "UIBackgroundModes": [
           "fetch",

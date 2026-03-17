@@ -170,6 +170,15 @@ const ensurePushPermission = async (): Promise<boolean> => {
 let cachedPushDeliveryToken: PushDeliveryToken | null = null;
 let inflightPushDeliveryTokenPromise: Promise<PushDeliveryToken | null> | null = null;
 
+const storeResolvedPushDeliveryToken = (token: PushDeliveryToken): PushDeliveryToken => {
+	cachedPushDeliveryToken = token;
+	log("token obtained", {
+		token: toTokenPreview(token.token),
+		type: token.type,
+	});
+	return token;
+};
+
 interface ResolvePushDeliveryTokenOptions {
 	attempt: number;
 	requestedPermission: boolean;
@@ -198,30 +207,38 @@ const resolvePushDeliveryTokenWithRetry = async (
 	options: ResolvePushDeliveryTokenOptions,
 ): Promise<PushDeliveryToken | null> => {
 	const attempt = options.attempt + 1;
-	const hasPermission = options.requestedPermission
-		? hasGrantedPermission(await Notifications.getPermissionsAsync())
-		: await ensurePushPermission();
+	const directToken = await readPushDeliveryToken();
+	if (directToken) {
+		return storeResolvedPushDeliveryToken(directToken);
+	}
+
+	let requestedPermission = options.requestedPermission;
+	let hasPermission = hasGrantedPermission(await Notifications.getPermissionsAsync());
+	const shouldRequestPermission = !requestedPermission && isActiveAppState(AppState.currentState);
+	if (!hasPermission && shouldRequestPermission) {
+		requestedPermission = true;
+		hasPermission = await ensurePushPermission();
+		if (hasPermission) {
+			const tokenAfterPermission = await readPushDeliveryToken();
+			if (tokenAfterPermission) {
+				return storeResolvedPushDeliveryToken(tokenAfterPermission);
+			}
+		}
+	}
 
 	if (!hasPermission) {
-		if (attempt === 1) {
-			log("permission not granted");
-		} else {
+		if (requestedPermission) {
 			log("permission still unavailable; retrying", {
+				appState: AppState.currentState,
+				attempt,
+			});
+		} else {
+			log("permission not granted; retrying direct token read", {
 				appState: AppState.currentState,
 				attempt,
 			});
 		}
 	} else {
-		const token = await readPushDeliveryToken();
-		if (token) {
-			cachedPushDeliveryToken = token;
-			log("token obtained", {
-				token: toTokenPreview(token.token),
-				type: token.type,
-			});
-			return token;
-		}
-
 		log("token unavailable; retrying", {
 			appState: AppState.currentState,
 			attempt,
@@ -249,7 +266,7 @@ const resolvePushDeliveryTokenWithRetry = async (
 
 	return await resolvePushDeliveryTokenWithRetry({
 		attempt,
-		requestedPermission: true,
+		requestedPermission,
 		startedAtMs: options.startedAtMs,
 	});
 };
@@ -320,3 +337,8 @@ export const subscribePushDeliveryTokenRefresh = (
 
 export const ensureFirebaseMessagingToken = ensurePushDeliveryToken;
 export const subscribeFirebaseMessagingTokenRefresh = subscribePushDeliveryTokenRefresh;
+
+export const resetPushDeliveryTokenForTests = (): void => {
+	cachedPushDeliveryToken = null;
+	inflightPushDeliveryTokenPromise = null;
+};

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppState, type AppStateStatus } from "react-native";
+import { AppState, Platform, type AppStateStatus } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
 import { useChatContextQuery } from "../api/use-chat-context-query";
@@ -173,6 +173,34 @@ const toLiveActivityStatusLineFromEvent = (event: AssistantEventPayload): string
 			return undefined;
 		}
 	}
+};
+
+const resolveLiveActivitySubscriptionTransport = (input: {
+	liveActivityToken: string;
+	pushDeliveryToken: PushDeliveryToken | null;
+}): { pushToken: string; pushTokenType: "apns" | "fcm" } | null => {
+	const normalizedLiveActivityToken = input.liveActivityToken.trim();
+	if (normalizedLiveActivityToken.length === 0) {
+		return null;
+	}
+
+	const normalizedPushToken = input.pushDeliveryToken?.token.trim() ?? "";
+	const pushTokenType = input.pushDeliveryToken?.type;
+	if (normalizedPushToken.length > 0 && (pushTokenType === "apns" || pushTokenType === "fcm")) {
+		return {
+			pushToken: normalizedPushToken,
+			pushTokenType,
+		};
+	}
+
+	if (Platform.OS === "ios") {
+		return {
+			pushToken: normalizedLiveActivityToken,
+			pushTokenType: "apns",
+		};
+	}
+
+	return null;
 };
 
 const isPlaceholderThreadTitle = (title: string): boolean => {
@@ -897,17 +925,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	);
 
 	const flushLiveActivitySubscriptions = useCallback(() => {
-		const pushDeliveryToken = pushDeliveryTokenRef.current;
-		const pushToken = pushDeliveryToken?.token.trim() ?? "";
-		const pushTokenType = pushDeliveryToken?.type;
-		if (pushToken.length === 0 || (pushTokenType !== "apns" && pushTokenType !== "fcm")) {
-			logLiveActivitySubscription("flush skipped (missing push delivery token)", {
-				hasPushToken: pushToken.length > 0,
-				pushTokenType: pushTokenType ?? null,
-			});
-			return;
-		}
-
 		for (const [chatId, liveActivityToken] of Object.entries(liveActivityTokenByChatRef.current)) {
 			const normalizedLiveActivityToken = liveActivityToken.trim();
 			if (normalizedLiveActivityToken.length === 0) {
@@ -917,6 +934,19 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				continue;
 			}
 
+			const transport = resolveLiveActivitySubscriptionTransport({
+				liveActivityToken: normalizedLiveActivityToken,
+				pushDeliveryToken: pushDeliveryTokenRef.current,
+			});
+			if (!transport) {
+				logLiveActivitySubscription("flush skipped (missing subscription transport)", {
+					chatId,
+					hasPushDeliveryToken: Boolean(pushDeliveryTokenRef.current?.token.trim().length),
+				});
+				continue;
+			}
+
+			const { pushToken, pushTokenType } = transport;
 			const signature = `${pushTokenType}::${pushToken}::${normalizedLiveActivityToken}`;
 			if (registeredLiveActivitySignatureByChatRef.current[chatId] === signature) {
 				logLiveActivitySubscription("flush skipped (already registered)", {
@@ -981,12 +1011,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						return;
 					}
 
-					const currentPushToken = pushDeliveryTokenRef.current?.token.trim() ?? "";
-					const currentPushTokenType = pushDeliveryTokenRef.current?.type ?? null;
 					const currentLiveActivityToken = liveActivityTokenByChatRef.current[chatId]?.trim() ?? "";
+					const currentTransport = resolveLiveActivitySubscriptionTransport({
+						liveActivityToken: currentLiveActivityToken,
+						pushDeliveryToken: pushDeliveryTokenRef.current,
+					});
 					if (
-						currentPushToken !== pushToken
-						|| currentPushTokenType !== pushTokenType
+						!currentTransport
+						|| currentTransport.pushToken !== pushToken
+						|| currentTransport.pushTokenType !== pushTokenType
 						|| currentLiveActivityToken !== normalizedLiveActivityToken
 					) {
 						logLiveActivitySubscription("subscription response ignored (stale token state)", {
@@ -1127,28 +1160,28 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			storePushDeliveryToken(token, "refresh");
 			void syncPushToStartToken();
 		});
-			const appStateSubscription = AppState.addEventListener("change", (nextState) => {
-				if (canceled || nextState !== "active") {
-					return;
-				}
+		const appStateSubscription = AppState.addEventListener("change", (nextState) => {
+			if (canceled || nextState !== "active") {
+				return;
+			}
 
-				if (!pushDeliveryTokenRef.current?.token.trim().length) {
-					logLiveActivitySubscription("retrying push delivery token on foreground");
-					void syncPushDeliveryToken("foreground retry");
-					return;
-				}
+			if (!pushDeliveryTokenRef.current?.token.trim().length) {
+				logLiveActivitySubscription("retrying push delivery token on foreground");
+				void syncPushDeliveryToken("foreground retry");
+				return;
+			}
 
-				logLiveActivitySubscription("retrying live activity subscriptions on foreground");
-				flushLiveActivitySubscriptionsRef.current();
-			});
+			logLiveActivitySubscription("retrying live activity subscriptions on foreground");
+			flushLiveActivitySubscriptionsRef.current();
+		});
 
-			return () => {
-				canceled = true;
-				unsubscribe();
-				unsubscribePushToStart();
-				appStateSubscription.remove();
-			};
-		}, [client, flushLiveActivitySubscriptions]);
+		return () => {
+			canceled = true;
+			unsubscribe();
+			unsubscribePushToStart();
+			appStateSubscription.remove();
+		};
+	}, [client, flushLiveActivitySubscriptions]);
 
 	useEffect(() => {
 		return () => {
