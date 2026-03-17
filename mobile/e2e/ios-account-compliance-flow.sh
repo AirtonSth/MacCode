@@ -52,12 +52,12 @@ if ! exists "private-account-terms-of-use"; then
 fi
 echo "PASS: Terms of Use link is visible."
 
-echo "Checking delete account button visibility (should NOT be visible when logged out)..."
-if exists "private-account-delete"; then
-	echo "FAIL: Delete account button should not be visible when user is not logged in." >&2
+echo "Checking options button visibility (should NOT be visible when logged out)..."
+if exists "private-account-options"; then
+	echo "FAIL: Options button should not be visible when user is not logged in." >&2
 	exit 1
 fi
-echo "PASS: Delete account button is hidden when not logged in."
+echo "PASS: Options button is hidden when not logged in."
 
 echo "Account compliance flow passed."
 ad close >/dev/null || true

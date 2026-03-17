@@ -98,6 +98,7 @@ export const PrivateAccountSection = ({
 	const [isAuthenticating, setIsAuthenticating] = useState(false);
 	const [isDeletingAccount, setIsDeletingAccount] = useState(false);
 	const [isDeleteConfirmVisible, setIsDeleteConfirmVisible] = useState(false);
+	const [isOptionsSheetVisible, setIsOptionsSheetVisible] = useState(false);
 	const [isLoadingConnectors, setIsLoadingConnectors] = useState(false);
 	const [password, setPassword] = useState("");
 	const subscriptionSnapshot = useMemo(
@@ -413,15 +414,15 @@ export const PrivateAccountSection = ({
 				{sessionRecord ? (
 					<Pressable
 						onPress={() => {
-							void handleLogout();
+							setIsOptionsSheetVisible(true);
 						}}
 						style={({ pressed }) => [
-							styles.secondaryButton,
+							styles.optionsButton,
 							pressed ? styles.secondaryButtonPressed : null,
 						]}
-						testID="private-account-logout"
+						testID="private-account-options"
 					>
-						<Text style={styles.secondaryLabel}>Logout</Text>
+						<Text style={styles.optionsLabel}>⋯</Text>
 					</Pressable>
 				) : null}
 			</View>
@@ -503,23 +504,6 @@ export const PrivateAccountSection = ({
 				</View>
 			)}
 
-			{sessionRecord ? (
-				<Pressable
-					disabled={isDeletingAccount}
-					onPress={() => {
-						setIsDeleteConfirmVisible(true);
-					}}
-					style={({ pressed }) => [
-						styles.dangerButton,
-						pressed ? styles.dangerButtonPressed : null,
-						isDeletingAccount ? styles.disabledButton : null,
-					]}
-					testID="private-account-delete"
-				>
-					<Text style={styles.dangerLabel}>{isDeletingAccount ? "Deleting..." : "Delete account"}</Text>
-				</Pressable>
-			) : null}
-
 			<View style={styles.legalLinks}>
 				<Pressable
 					onPress={() => {
@@ -545,6 +529,36 @@ export const PrivateAccountSection = ({
 					<Text selectable style={styles.statusText}>{errorMessage}</Text>
 				</View>
 			) : null}
+
+			<IosActionSheet
+				actions={[
+					{
+						icon: "logout",
+						key: "logout",
+						label: "Logout",
+						onPress: () => {
+							void handleLogout();
+						},
+						testID: "private-account-logout",
+					},
+					{
+						icon: "delete-forever",
+						key: "delete-account",
+						label: isDeletingAccount ? "Deleting..." : "Delete account",
+						onPress: () => {
+							setIsDeleteConfirmVisible(true);
+						},
+						testID: "private-account-delete",
+						tone: "destructive",
+					},
+				]}
+				isVisible={isOptionsSheetVisible}
+				onClose={() => {
+					setIsOptionsSheetVisible(false);
+				}}
+				testID="private-account-options-sheet"
+				title="Account"
+			/>
 
 			<IosActionSheet
 				actions={[
@@ -585,39 +599,6 @@ const styles = StyleSheet.create({
 		gap: 10,
 		padding: 12,
 	},
-	dangerButton: {
-		alignItems: "center",
-		borderColor: "rgba(255,107,133,0.38)",
-		borderRadius: 10,
-		borderWidth: 1,
-		height: 34,
-		justifyContent: "center",
-		paddingHorizontal: 12,
-	},
-	dangerButtonPressed: {
-		backgroundColor: "rgba(255,107,133,0.12)",
-	},
-	dangerLabel: {
-		color: "#FF8F98",
-		fontSize: 13,
-		fontWeight: "600",
-	},
-	legalLinks: {
-		alignItems: "center",
-		flexDirection: "row",
-		gap: 6,
-		justifyContent: "center",
-		paddingTop: 4,
-	},
-	legalSeparator: {
-		color: palette.muted,
-		fontSize: 12,
-	},
-	legalText: {
-		color: palette.muted,
-		fontSize: 12,
-		textDecorationLine: "underline",
-	},
 	connectorRowPressed: {
 		backgroundColor: "rgba(255,255,255,0.08)",
 	},
@@ -645,6 +626,37 @@ const styles = StyleSheet.create({
 		paddingHorizontal: 12,
 		paddingVertical: 8,
 	},
+	legalLinks: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 6,
+		justifyContent: "center",
+		paddingTop: 4,
+	},
+	legalSeparator: {
+		color: palette.muted,
+		fontSize: 12,
+	},
+	legalText: {
+		color: palette.muted,
+		fontSize: 12,
+		textDecorationLine: "underline",
+	},
+	optionsButton: {
+		alignItems: "center",
+		borderColor: palette.border,
+		borderRadius: 10,
+		borderWidth: 1,
+		height: 34,
+		justifyContent: "center",
+		width: 34,
+	},
+	optionsLabel: {
+		color: palette.text,
+		fontSize: 18,
+		fontWeight: "700",
+		marginTop: -2,
+	},
 	primaryButton: {
 		alignItems: "center",
 		backgroundColor: palette.accent,
@@ -659,26 +671,6 @@ const styles = StyleSheet.create({
 	primaryLabel: {
 		color: "#0A1D2B",
 		fontSize: 13,
-		fontWeight: "700",
-	},
-	subscribeCard: {
-		backgroundColor: "rgba(250,204,21,0.08)",
-		borderColor: "rgba(251,191,36,0.24)",
-		borderRadius: 16,
-		borderWidth: 1,
-		gap: 10,
-		padding: 14,
-	},
-	subscribeEyebrow: {
-		color: "#FCD34D",
-		fontSize: 12,
-		fontWeight: "700",
-		letterSpacing: 0.8,
-		textTransform: "uppercase",
-	},
-	subscribeTitle: {
-		color: palette.text,
-		fontSize: 17,
 		fontWeight: "700",
 	},
 	rowMeta: {
@@ -740,6 +732,26 @@ const styles = StyleSheet.create({
 		color: palette.text,
 		fontSize: 13,
 		lineHeight: 19,
+	},
+	subscribeCard: {
+		backgroundColor: "rgba(250,204,21,0.08)",
+		borderColor: "rgba(251,191,36,0.24)",
+		borderRadius: 16,
+		borderWidth: 1,
+		gap: 10,
+		padding: 14,
+	},
+	subscribeEyebrow: {
+		color: "#FCD34D",
+		fontSize: 12,
+		fontWeight: "700",
+		letterSpacing: 0.8,
+		textTransform: "uppercase",
+	},
+	subscribeTitle: {
+		color: palette.text,
+		fontSize: 17,
+		fontWeight: "700",
 	},
 	summaryLabel: {
 		color: palette.muted,

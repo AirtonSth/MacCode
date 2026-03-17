@@ -21,6 +21,7 @@ const STATUS_LIMIT = 80;
 const PREVIEW_ELLIPSIS = "...";
 const MIN_IOS_LIVE_ACTIVITIES_MAJOR = 16;
 const MIN_IOS_LIVE_ACTIVITIES_MINOR = 1;
+const FINISH_DISMISS_DELAY_MS = 4_000;
 const MARKDOWN_CODE_FENCE_PATTERN = /```[\s\S]*?```/gu;
 const INLINE_CODE_PATTERN = /`[^`]*`/gu;
 const STRUCTURAL_CODE_CHARACTER_PATTERN = /[<>{}[\]\\|=]/gu;
@@ -39,6 +40,21 @@ interface PersistedLiveActivityState {
 	startedAtMs: number;
 	statusLine: string;
 	remoteManaged: boolean;
+}
+
+interface ActivityEntry {
+	state: PersistedLiveActivityState;
+	activity: LiveActivity<ThreadLiveActivityProps> | null;
+	pushTokenSubscription: Subscription | null;
+	finishInProgress: boolean;
+	lastContentSignature: string;
+	lastContentUpdateAtMs: number;
+	lastStatePersistAtMs: number;
+	writeInFlight: boolean;
+	writeAgain: boolean;
+	pendingForceWrite: boolean;
+	flushTimeout: ReturnType<typeof setTimeout> | null;
+	awaitingAuthoritativeSync: boolean;
 }
 
 interface LiveActivityStartInput {
@@ -94,22 +110,12 @@ interface LiveActivityBindings {
 let initialized = false;
 let liveActivitiesUnavailable = false;
 let liveActivityBindings: LiveActivityBindings | null = null;
-let activeState: PersistedLiveActivityState | null = null;
-let activeActivity: LiveActivity<ThreadLiveActivityProps> | null = null;
-let activityPushTokenSubscription: Subscription | null = null;
 let pushToStartTokenSubscription: Subscription | null = null;
-let finishingChatId: string | null = null;
-let flushTimeout: ReturnType<typeof setTimeout> | null = null;
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-let writeInFlight = false;
-let writeAgain = false;
-let pendingForceWrite = false;
-let lastContentSignature = "";
-let lastContentUpdateAtMs = 0;
-let lastStatePersistAtMs = 0;
 let currentAppState: AppStateStatus = "active";
-let awaitingAuthoritativeSync = false;
+const entries = new Map<string, ActivityEntry>();
 const pushTokenListeners = new Set<(event: LiveActivityPushTokenUpdate) => void>();
+const pushToStartTokenListeners = new Set<(token: string) => void>();
 
 const nowMs = (): number => Date.now();
 
@@ -279,20 +285,20 @@ const loadLiveActivityBindings = async (): Promise<LiveActivityBindings | null> 
 		return liveActivityBindings;
 	}
 
-		try {
-			const [widgetsModule, widgetModule] = await Promise.all([
-				import("expo-widgets"),
-				import("./thread-live-activity.widget"),
-			]);
+	try {
+		const [widgetsModule, widgetModule] = await Promise.all([
+			import("expo-widgets"),
+			import("./thread-live-activity.widget"),
+		]);
 
-			const nextBindings: LiveActivityBindings = {
-				addPushToStartTokenListener: widgetsModule.addPushToStartTokenListener,
-				threadLiveActivityFactory: widgetModule.threadLiveActivityFactory,
-			};
-			// eslint-disable-next-line require-atomic-updates
-			liveActivityBindings = nextBindings;
-			return liveActivityBindings;
-		} catch (error) {
+		const nextBindings: LiveActivityBindings = {
+			addPushToStartTokenListener: widgetsModule.addPushToStartTokenListener,
+			threadLiveActivityFactory: widgetModule.threadLiveActivityFactory,
+		};
+		// eslint-disable-next-line require-atomic-updates
+		liveActivityBindings = nextBindings;
+		return liveActivityBindings;
+	} catch (error) {
 		liveActivitiesUnavailable = true;
 		log("live activities unavailable", {
 			error: error instanceof Error ? error.message : "unknown-error",
@@ -324,13 +330,8 @@ const isSupportedIosVersion = (): boolean => {
 
 const canUseLiveActivities = (): boolean => !liveActivitiesUnavailable && isSupportedIosVersion();
 
-const canWriteLocally = (): boolean => {
-	if (!activeState) {
-		return false;
-	}
-
-	return !activeState.remoteManaged || !awaitingAuthoritativeSync;
-};
+const canEntryWriteLocally = (entry: ActivityEntry): boolean =>
+	!entry.state.remoteManaged || !entry.awaitingAuthoritativeSync;
 
 const toElapsedSeconds = (startedAtMs: number): number => {
 	const started = Number.isFinite(startedAtMs) && startedAtMs > 0 ? startedAtMs : nowMs();
@@ -363,15 +364,22 @@ const toContentSignature = (state: PersistedLiveActivityState): string =>
 		String(toElapsedBucket(state.startedAtMs)),
 	].join("\u0001");
 
-const persistActiveState = async (): Promise<void> => {
-	if (!activeState) {
+const persistAllEntries = async (): Promise<void> => {
+	if (entries.size === 0) {
 		await SecureStore.deleteItemAsync(ACTIVE_STATE_KEY);
-		lastStatePersistAtMs = 0;
 		return;
 	}
 
-	await SecureStore.setItemAsync(ACTIVE_STATE_KEY, JSON.stringify(activeState));
-	lastStatePersistAtMs = nowMs();
+	const states = Array.from(entries.values(), (entry) => entry.state);
+	await SecureStore.setItemAsync(ACTIVE_STATE_KEY, JSON.stringify(states));
+};
+
+const persistEntry = async (chatId: string): Promise<void> => {
+	const entry = entries.get(chatId);
+	if (entry) {
+		entry.lastStatePersistAtMs = nowMs();
+	}
+	await persistAllEntries();
 };
 
 const hydratePersistedState = async (): Promise<void> => {
@@ -381,41 +389,55 @@ const hydratePersistedState = async (): Promise<void> => {
 	}
 
 	try {
-		const parsed = JSON.parse(raw) as Partial<PersistedLiveActivityState> | null;
-		if (!parsed || typeof parsed !== "object") {
-			return;
-		}
+		const parsed = JSON.parse(raw) as unknown;
+		const toStates = (): Partial<PersistedLiveActivityState>[] => {
+			if (Array.isArray(parsed)) {
+				return parsed;
+			}
+			if (parsed && typeof parsed === "object" && "chatId" in parsed) {
+				return [parsed as Partial<PersistedLiveActivityState>];
+			}
+			return [];
+		};
+		const states = toStates();
 
-		const chatId = withDefault(parsed.chatId, "");
-		if (chatId.length === 0) {
-			return;
-		}
+		for (const item of states) {
+			const chatId = withDefault(item.chatId, "");
+			if (chatId.length === 0 || entries.has(chatId)) {
+				continue;
+			}
 
-		activeState = {
-			chatId,
-			chatTitle: sanitizeTitle(parsed.chatTitle, "Thread"),
-			phase: parsed.phase ?? "running",
-			preview: sanitizePreview(parsed.preview, "Waiting for updates..."),
+			const state: PersistedLiveActivityState = {
+				chatId,
+				chatTitle: sanitizeTitle(item.chatTitle, "Thread"),
+				phase: item.phase ?? "running",
+				preview: sanitizePreview(item.preview, "Waiting for updates..."),
 				startedAtMs:
-					typeof parsed.startedAtMs === "number" && Number.isFinite(parsed.startedAtMs) && parsed.startedAtMs > 0
-						? Math.floor(parsed.startedAtMs)
+					typeof item.startedAtMs === "number" && Number.isFinite(item.startedAtMs) && item.startedAtMs > 0
+						? Math.floor(item.startedAtMs)
 						: nowMs(),
-				statusLine: sanitizeStatusLine(parsed.statusLine, "Generating response"),
-				remoteManaged: parsed.remoteManaged !== false,
+				statusLine: sanitizeStatusLine(item.statusLine, "Generating response"),
+				remoteManaged: item.remoteManaged !== false,
 			};
-		awaitingAuthoritativeSync = activeState.remoteManaged && !isTerminalPhase(activeState.phase);
+
+			entries.set(chatId, {
+				state,
+				activity: null,
+				pushTokenSubscription: null,
+				finishInProgress: false,
+				lastContentSignature: "",
+				lastContentUpdateAtMs: 0,
+				lastStatePersistAtMs: 0,
+				writeInFlight: false,
+				writeAgain: false,
+				pendingForceWrite: false,
+				flushTimeout: null,
+				awaitingAuthoritativeSync: state.remoteManaged && !isTerminalPhase(state.phase),
+			});
+		}
 	} catch {
 		// Ignore malformed persisted state.
 	}
-};
-
-const detachActivityPushTokenSubscription = (): void => {
-	if (!activityPushTokenSubscription) {
-		return;
-	}
-
-	activityPushTokenSubscription.remove();
-	activityPushTokenSubscription = null;
 };
 
 const emitPushToken = (chatId: string, pushToken: string): void => {
@@ -435,14 +457,25 @@ const emitPushToken = (chatId: string, pushToken: string): void => {
 	}
 };
 
-const attachActivityPushTokenSubscription = (activity: LiveActivity<ThreadLiveActivityProps>): void => {
-	detachActivityPushTokenSubscription();
-	activityPushTokenSubscription = activity.addPushTokenListener((event) => {
-		const chatId = activeState?.chatId;
-		if (!chatId) {
-			return;
-		}
+const detachEntryPushTokenSubscription = (entry: ActivityEntry): void => {
+	if (!entry.pushTokenSubscription) {
+		return;
+	}
 
+	entry.pushTokenSubscription.remove();
+	// eslint-disable-next-line no-param-reassign
+	entry.pushTokenSubscription = null;
+};
+
+const attachEntryPushTokenSubscription = (entry: ActivityEntry): void => {
+	detachEntryPushTokenSubscription(entry);
+	if (!entry.activity) {
+		return;
+	}
+
+	// eslint-disable-next-line no-param-reassign
+	entry.pushTokenSubscription = entry.activity.addPushTokenListener((event) => {
+		const chatId = entry.state.chatId;
 		const normalizedPushToken = withDefault(event.pushToken, "");
 		if (normalizedPushToken.length === 0) {
 			return;
@@ -457,35 +490,31 @@ const attachActivityPushTokenSubscription = (activity: LiveActivity<ThreadLiveAc
 	});
 };
 
-const syncCurrentActivityPushToken = async (): Promise<void> => {
-	const chatId = activeState?.chatId;
-	if (!chatId || !activeActivity) {
+const syncEntryPushToken = async (entry: ActivityEntry): Promise<void> => {
+	if (!entry.activity) {
 		return;
 	}
 
 	try {
-		const pushToken = withDefault(await activeActivity.getPushToken() ?? "", "");
+		const pushToken = withDefault(await entry.activity.getPushToken() ?? "", "");
 		if (pushToken.length === 0) {
-			log("current activity push token unavailable", {
-				chatId,
-			});
 			return;
 		}
 
 		await SecureStore.setItemAsync(PUSH_TOKEN_KEY, pushToken);
-		log("current activity push token synchronized", {
-			chatId,
+		log("activity push token synchronized", {
+			chatId: entry.state.chatId,
 			pushToken: toTokenPreview(pushToken),
 		});
-		emitPushToken(chatId, pushToken);
+		emitPushToken(entry.state.chatId, pushToken);
 	} catch {
 		// Ignore push-token synchronization failures.
 	}
 };
 
-async function normalizeActivityInstance(): Promise<LiveActivity<ThreadLiveActivityProps> | null> {
-	if (activeActivity) {
-		return activeActivity;
+async function resolveActivityInstance(entry: ActivityEntry): Promise<LiveActivity<ThreadLiveActivityProps> | null> {
+	if (entry.activity) {
+		return entry.activity;
 	}
 
 	const bindings = await loadLiveActivityBindings();
@@ -498,32 +527,34 @@ async function normalizeActivityInstance(): Promise<LiveActivity<ThreadLiveActiv
 		return null;
 	}
 
-	// eslint-disable-next-line require-atomic-updates
-	activeActivity = instances[0];
-	attachActivityPushTokenSubscription(activeActivity);
-
-	if (instances.length > 1) {
-		await Promise.all(
-			instances.slice(1).map(async (instance) => {
-				try {
-					await instance.end("immediate");
-				} catch {
-					// Ignore duplicate activity cleanup failures.
-				}
-			}),
-		);
+	// Try to match an unowned instance to this entry
+	const ownedActivities = new Set<LiveActivity<ThreadLiveActivityProps>>();
+	for (const other of entries.values()) {
+		if (other.activity) {
+			ownedActivities.add(other.activity);
+		}
 	}
 
-	return activeActivity;
+	for (const instance of instances) {
+		if (!ownedActivities.has(instance)) {
+			// eslint-disable-next-line no-param-reassign
+			entry.activity = instance;
+			attachEntryPushTokenSubscription(entry);
+			return instance;
+		}
+	}
+
+	return null;
 }
 
-const clearScheduledFlush = (): void => {
-	if (!flushTimeout) {
+const clearEntryFlush = (entry: ActivityEntry): void => {
+	if (!entry.flushTimeout) {
 		return;
 	}
 
-	clearTimeout(flushTimeout);
-	flushTimeout = null;
+	clearTimeout(entry.flushTimeout);
+	// eslint-disable-next-line no-param-reassign
+	entry.flushTimeout = null;
 };
 
 const clearHeartbeat = (): void => {
@@ -536,134 +567,146 @@ const clearHeartbeat = (): void => {
 };
 
 const ensureHeartbeat = (): void => {
-	if (
-		heartbeatInterval
-		|| !activeState
-		|| isTerminalPhase(activeState.phase)
-		|| !canWriteLocally()
-	) {
+	if (heartbeatInterval) {
+		return;
+	}
+
+	const hasTickableEntries = Array.from(entries.values()).some(
+		(entry) => !isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry),
+	);
+	if (!hasTickableEntries) {
 		return;
 	}
 
 	heartbeatInterval = setInterval(() => {
-		void queueStateUpdate();
+		for (const [chatId, entry] of entries) {
+			if (!isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry)) {
+				void queueEntryStateUpdate(chatId);
+			}
+		}
+
+		const stillHasTickable = Array.from(entries.values()).some(
+			(e) => !isTerminalPhase(e.state.phase) && canEntryWriteLocally(e),
+		);
+		if (!stillHasTickable) {
+			clearHeartbeat();
+		}
 	}, LOCAL_HEARTBEAT_INTERVAL_MS);
 };
 
-const flushStateUpdate = async (input?: { force?: boolean }): Promise<void> => {
-	if (!activeState || isTerminalPhase(activeState.phase) || !canWriteLocally()) {
+const flushEntryStateUpdate = async (chatId: string, input?: { force?: boolean }): Promise<void> => {
+	const entry = entries.get(chatId);
+	if (!entry || isTerminalPhase(entry.state.phase) || !canEntryWriteLocally(entry)) {
 		return;
 	}
 
-	if (writeInFlight) {
+	if (entry.writeInFlight) {
 		if (input?.force) {
-			pendingForceWrite = true;
+			entry.pendingForceWrite = true;
 		}
-		writeAgain = true;
+		entry.writeAgain = true;
 		return;
 	}
 
-	writeInFlight = true;
-	const activity = await normalizeActivityInstance();
-	if (!activity || !activeState || isTerminalPhase(activeState.phase)) {
-		// eslint-disable-next-line require-atomic-updates
-		writeInFlight = false;
-		if (writeAgain || pendingForceWrite) {
-			writeAgain = false;
-			void queueStateUpdate({
-				force: pendingForceWrite,
-			});
+	entry.writeInFlight = true;
+	const activity = await resolveActivityInstance(entry);
+	const currentEntry = entries.get(chatId);
+	if (!activity || !currentEntry || isTerminalPhase(currentEntry.state.phase)) {
+		if (currentEntry) {
+			currentEntry.writeInFlight = false;
+			if (currentEntry.writeAgain || currentEntry.pendingForceWrite) {
+				currentEntry.writeAgain = false;
+				void queueEntryStateUpdate(chatId, {
+					force: currentEntry.pendingForceWrite,
+				});
+			}
 		}
 		return;
 	}
 
-	const force = (input?.force ?? false) || pendingForceWrite;
-	const elapsedSinceLastUpdate = nowMs() - lastContentUpdateAtMs;
-	if (!force && lastContentUpdateAtMs > 0 && elapsedSinceLastUpdate < LOCAL_CONTENT_UPDATE_MIN_INTERVAL_MS) {
-		// eslint-disable-next-line require-atomic-updates
-		writeInFlight = false;
-		void queueStateUpdate();
+	const force = (input?.force ?? false) || currentEntry.pendingForceWrite;
+	const elapsedSinceLastUpdate = nowMs() - currentEntry.lastContentUpdateAtMs;
+	if (!force && currentEntry.lastContentUpdateAtMs > 0 && elapsedSinceLastUpdate < LOCAL_CONTENT_UPDATE_MIN_INTERVAL_MS) {
+		currentEntry.writeInFlight = false;
+		void queueEntryStateUpdate(chatId);
 		return;
 	}
 
-	const signature = toContentSignature(activeState);
-	if (!force && signature === lastContentSignature) {
-		// eslint-disable-next-line require-atomic-updates
-		writeInFlight = false;
+	const signature = toContentSignature(currentEntry.state);
+	if (!force && signature === currentEntry.lastContentSignature) {
+		currentEntry.writeInFlight = false;
 		return;
 	}
 
-	pendingForceWrite = false;
+	currentEntry.pendingForceWrite = false;
 	try {
-		await activity.update(toProps(activeState));
-		// eslint-disable-next-line require-atomic-updates
-		lastContentSignature = signature;
-		// eslint-disable-next-line require-atomic-updates
-		lastContentUpdateAtMs = nowMs();
+		await activity.update(toProps(currentEntry.state));
+		currentEntry.lastContentSignature = signature;
+		currentEntry.lastContentUpdateAtMs = nowMs();
 	} catch {
 		// Ignore runtime update failures.
 	} finally {
-		// eslint-disable-next-line require-atomic-updates
-		writeInFlight = false;
-		if (writeAgain) {
-			writeAgain = false;
-			void queueStateUpdate({
-				force: pendingForceWrite,
+		currentEntry.writeInFlight = false;
+		if (currentEntry.writeAgain) {
+			currentEntry.writeAgain = false;
+			void queueEntryStateUpdate(chatId, {
+				force: currentEntry.pendingForceWrite,
 			});
 		}
 	}
 };
 
-async function queueStateUpdate(input?: { immediate?: boolean; force?: boolean }): Promise<void> {
-	if (!activeState || isTerminalPhase(activeState.phase) || !canWriteLocally()) {
+async function queueEntryStateUpdate(chatId: string, input?: { immediate?: boolean; force?: boolean }): Promise<void> {
+	const entry = entries.get(chatId);
+	if (!entry || isTerminalPhase(entry.state.phase) || !canEntryWriteLocally(entry)) {
 		return;
 	}
 
 	if (input?.force) {
-		pendingForceWrite = true;
+		entry.pendingForceWrite = true;
 	}
 
 	if (input?.immediate) {
-		clearScheduledFlush();
-		await flushStateUpdate({
+		clearEntryFlush(entry);
+		await flushEntryStateUpdate(chatId, {
 			force: true,
 		});
 		return;
 	}
 
-	if (flushTimeout) {
+	if (entry.flushTimeout) {
 		return;
 	}
 
-	const elapsedSinceLastUpdate = nowMs() - lastContentUpdateAtMs;
-	const delayMs = lastContentUpdateAtMs <= 0
+	const elapsedSinceLastUpdate = nowMs() - entry.lastContentUpdateAtMs;
+	const delayMs = entry.lastContentUpdateAtMs <= 0
 		? 0
 		: Math.max(0, LOCAL_CONTENT_UPDATE_MIN_INTERVAL_MS - elapsedSinceLastUpdate);
 
-	flushTimeout = setTimeout(() => {
-		flushTimeout = null;
-		void flushStateUpdate();
+	entry.flushTimeout = setTimeout(() => {
+		entry.flushTimeout = null;
+		void flushEntryStateUpdate(chatId);
 	}, delayMs);
 }
 
-const resetRuntimeState = async (): Promise<void> => {
-	clearScheduledFlush();
-	clearHeartbeat();
-	detachActivityPushTokenSubscription();
-	activeActivity = null;
-	activeState = null;
-	writeInFlight = false;
-	writeAgain = false;
-	pendingForceWrite = false;
-	lastContentSignature = "";
-	lastContentUpdateAtMs = 0;
-	lastStatePersistAtMs = 0;
-	awaitingAuthoritativeSync = false;
-	await Promise.all([
-		persistActiveState(),
-		SecureStore.deleteItemAsync(PUSH_TOKEN_KEY),
-		SecureStore.deleteItemAsync(PUSH_TO_START_TOKEN_KEY),
-	]);
+const removeEntry = async (chatId: string): Promise<void> => {
+	const entry = entries.get(chatId);
+	if (!entry) {
+		return;
+	}
+
+	clearEntryFlush(entry);
+	detachEntryPushTokenSubscription(entry);
+	entries.delete(chatId);
+	await persistAllEntries();
+
+	if (entries.size === 0) {
+		clearHeartbeat();
+		await Promise.all([
+			SecureStore.deleteItemAsync(PUSH_TOKEN_KEY),
+			SecureStore.deleteItemAsync(PUSH_TO_START_TOKEN_KEY),
+		]);
+	}
 };
 
 export const initializeThreadLiveActivityManager = async (): Promise<void> => {
@@ -677,51 +720,113 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 			return;
 		}
 
-			// eslint-disable-next-line require-atomic-updates
-			initialized = true;
+		// eslint-disable-next-line require-atomic-updates
+		initialized = true;
 		await hydratePersistedState();
-		await normalizeActivityInstance();
 
-		if (activeActivity && !activeState) {
-			log("detected remotely-started live activity, creating local state");
-			activeState = {
-				chatId: "remote",
-				chatTitle: "Thread",
-				phase: "running",
-				preview: "Waiting for updates...",
-				startedAtMs: nowMs(),
-				statusLine: "Generating response",
-				remoteManaged: true,
+		// Adopt existing OS-level activity instances
+		const instances = bindings.threadLiveActivityFactory.getInstances();
+		const ownedActivities = new Set<LiveActivity<ThreadLiveActivityProps>>();
+
+		for (const [, entry] of entries) {
+			if (instances.length === 0) {
+				break;
+			}
+
+			const unowned = instances.find((inst) => !ownedActivities.has(inst));
+			if (unowned) {
+				entry.activity = unowned;
+				ownedActivities.add(unowned);
+				attachEntryPushTokenSubscription(entry);
+			}
+		}
+
+		// If there are OS instances but no persisted entries, create placeholder entries
+		for (const instance of instances) {
+			if (ownedActivities.has(instance)) {
+				continue;
+			}
+
+			const placeholderId = `remote-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+			log("detected remotely-started live activity, creating local state", { chatId: placeholderId });
+			const entry: ActivityEntry = {
+				state: {
+					chatId: placeholderId,
+					chatTitle: "Thread",
+					phase: "running",
+					preview: "Waiting for updates...",
+					startedAtMs: nowMs(),
+					statusLine: "Generating response",
+					remoteManaged: true,
+				},
+				activity: instance,
+				pushTokenSubscription: null,
+				finishInProgress: false,
+				lastContentSignature: "",
+				lastContentUpdateAtMs: 0,
+				lastStatePersistAtMs: 0,
+				writeInFlight: false,
+				writeAgain: false,
+				pendingForceWrite: false,
+				flushTimeout: null,
+				awaitingAuthoritativeSync: true,
 			};
-			awaitingAuthoritativeSync = true;
+			entries.set(placeholderId, entry);
+			ownedActivities.add(instance);
+			attachEntryPushTokenSubscription(entry);
 		}
 
-		await syncCurrentActivityPushToken();
-
-		if (activeState && !isTerminalPhase(activeState.phase) && canWriteLocally()) {
-			ensureHeartbeat();
-			await queueStateUpdate({
-				immediate: true,
-				force: true,
-			});
-		}
-
-			pushToStartTokenSubscription ||= bindings.addPushToStartTokenListener((event) => {
-				log("push-to-start token received", {
-					pushToken: toTokenPreview(event.activityPushToStartToken),
-				});
-				void SecureStore.setItemAsync(PUSH_TO_START_TOKEN_KEY, event.activityPushToStartToken);
-				for (const listener of pushToStartTokenListeners) {
+		// Clean up duplicate OS instances
+		await Promise.all(
+			instances
+				.filter((instance) => !ownedActivities.has(instance))
+				.map(async (instance) => {
 					try {
-						listener(event.activityPushToStartToken);
+						await instance.end("immediate");
 					} catch {
-						// Keep listeners isolated.
+						// Ignore cleanup failures.
 					}
-				}
+				}),
+		);
+
+		// Sync push tokens for all entries with activities
+		await Promise.all(
+			Array.from(entries.values())
+				.filter((entry) => Boolean(entry.activity))
+				.map(async (entry) => { await syncEntryPushToken(entry); }),
+		);
+
+		// Start heartbeat for active entries and flush initial state
+		const hasActive = Array.from(entries.values()).some(
+			(entry) => !isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry),
+		);
+		if (hasActive) {
+			ensureHeartbeat();
+			await Promise.all(
+				Array.from(entries.entries())
+					.filter(([, entry]) => !isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry))
+					.map(async ([chatId]) => { await queueEntryStateUpdate(chatId, { immediate: true, force: true }); }),
+			);
+		}
+
+		pushToStartTokenSubscription ||= bindings.addPushToStartTokenListener((event) => {
+			log("push-to-start token received", {
+				pushToken: toTokenPreview(event.activityPushToStartToken),
 			});
-		} catch {
+			void SecureStore.setItemAsync(PUSH_TO_START_TOKEN_KEY, event.activityPushToStartToken);
+			for (const listener of pushToStartTokenListeners) {
+				try {
+					listener(event.activityPushToStartToken);
+				} catch {
+					// Keep listeners isolated.
+				}
+			}
+		});
+	} catch {
 		liveActivitiesUnavailable = true;
-		await resetRuntimeState();
+
+		// Reset all entries
+		await Promise.all(Array.from(entries.keys(), async (chatId) => { await removeEntry(chatId); }));
 		// eslint-disable-next-line require-atomic-updates
 		initialized = false;
 	}
@@ -738,16 +843,10 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		return;
 	}
 
-	if (input.restart && activeState) {
-		await clearThreadLiveActivity({
-			chatId: activeState.chatId,
-		});
-	}
+	const existing = entries.get(input.chatId);
 
-	if (activeState && activeState.chatId !== input.chatId) {
-		await clearThreadLiveActivity({
-			chatId: activeState.chatId,
-		});
+	if (input.restart && existing) {
+		await clearThreadLiveActivity({ chatId: input.chatId });
 	}
 
 	const hasExplicitStartTime =
@@ -755,17 +854,18 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	let startedAtMs = nowMs();
 	if (hasExplicitStartTime) {
 		startedAtMs = Math.floor(input.startedAtMs ?? startedAtMs);
-	} else if (activeState?.chatId === input.chatId && !input.restart) {
-		startedAtMs = activeState.startedAtMs;
+	} else if (existing && !input.restart) {
+		startedAtMs = existing.state.startedAtMs;
 	} else {
 		startedAtMs = nowMs();
 	}
 
-	activeState = {
+	const previousState = entries.get(input.chatId)?.state;
+	const state: PersistedLiveActivityState = {
 		chatId: input.chatId,
 		chatTitle: sanitizeTitle(
 			input.chatTitle,
-			activeState?.chatId === input.chatId ? activeState.chatTitle : "Thread",
+			previousState ? previousState.chatTitle : "Thread",
 		),
 		phase: currentAppState === "background" || currentAppState === "inactive" ? "background" : "running",
 		preview: sanitizePreview(input.preview, "Waiting for updates..."),
@@ -778,41 +878,60 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		),
 		remoteManaged: input.remoteManaged ?? true,
 	};
-	awaitingAuthoritativeSync = false;
+
+	let entry = entries.get(input.chatId);
+	if (entry) {
+		entry.state = state;
+		entry.awaitingAuthoritativeSync = false;
+		entry.finishInProgress = false;
+	} else {
+		entry = {
+			state,
+			activity: null,
+			pushTokenSubscription: null,
+			finishInProgress: false,
+			lastContentSignature: "",
+			lastContentUpdateAtMs: 0,
+			lastStatePersistAtMs: 0,
+			writeInFlight: false,
+			writeAgain: false,
+			pendingForceWrite: false,
+			flushTimeout: null,
+			awaitingAuthoritativeSync: false,
+		};
+		entries.set(input.chatId, entry);
+	}
+
 	log("start requested", {
-		chatId: activeState.chatId,
-		chatTitle: activeState.chatTitle,
-		remoteManaged: activeState.remoteManaged,
+		chatId: state.chatId,
+		chatTitle: state.chatTitle,
+		remoteManaged: state.remoteManaged,
 		restart: input.restart ?? false,
 	});
-	await persistActiveState();
+	await persistEntry(input.chatId);
 	ensureHeartbeat();
 
-	const existing = await normalizeActivityInstance();
-	if (existing) {
-		log("reusing existing activity instance", {
-			chatId: activeState.chatId,
-		});
-		await queueStateUpdate({
+	const activity = await resolveActivityInstance(entry);
+	if (activity) {
+		log("reusing existing activity instance", { chatId: input.chatId });
+		await queueEntryStateUpdate(input.chatId, {
 			immediate: true,
 			force: true,
 		});
-		await syncCurrentActivityPushToken();
+		await syncEntryPushToken(entry);
 		return;
 	}
 
 	try {
-		activeActivity = bindings.threadLiveActivityFactory.start(
-			toProps(activeState),
-			`remotecode-mobile://chat?chatId=${encodeURIComponent(activeState.chatId)}`,
+		entry.activity = bindings.threadLiveActivityFactory.start(
+			toProps(state),
+			`remotecode-mobile://chat?chatId=${encodeURIComponent(input.chatId)}`,
 		);
-		log("activity instance started", {
-			chatId: activeState.chatId,
-		});
-		attachActivityPushTokenSubscription(activeActivity);
-		lastContentSignature = toContentSignature(activeState);
-		lastContentUpdateAtMs = nowMs();
-		await syncCurrentActivityPushToken();
+		log("activity instance started", { chatId: input.chatId });
+		attachEntryPushTokenSubscription(entry);
+		entry.lastContentSignature = toContentSignature(state);
+		entry.lastContentUpdateAtMs = nowMs();
+		await syncEntryPushToken(entry);
 	} catch {
 		// Ignore startup failures to keep app flow resilient.
 	}
@@ -824,37 +943,37 @@ export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): 
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState || activeState.chatId !== input.chatId) {
+	const entry = entries.get(input.chatId);
+	if (!entry) {
 		return;
 	}
 
 	const nextState: PersistedLiveActivityState = {
-		...activeState,
-		chatTitle: sanitizeTitle(input.chatTitle, activeState.chatTitle),
-		phase: input.phase ?? activeState.phase,
-		preview: sanitizePreview(input.preview, activeState.preview),
-		statusLine: sanitizeStatusLine(input.statusLine, activeState.statusLine),
+		...entry.state,
+		chatTitle: sanitizeTitle(input.chatTitle, entry.state.chatTitle),
+		phase: input.phase ?? entry.state.phase,
+		preview: sanitizePreview(input.preview, entry.state.preview),
+		statusLine: sanitizeStatusLine(input.statusLine, entry.state.statusLine),
 	};
 	if (input.authoritative) {
-		awaitingAuthoritativeSync = false;
+		entry.awaitingAuthoritativeSync = false;
 	}
 	const shouldPersistState =
 		Boolean(input.force)
-		|| nextState.chatTitle !== activeState.chatTitle
-		|| nextState.phase !== activeState.phase
-		|| nextState.statusLine !== activeState.statusLine
-		|| nowMs() - lastStatePersistAtMs >= LOCAL_STATE_PERSIST_MIN_INTERVAL_MS;
-	activeState = nextState;
+		|| nextState.chatTitle !== entry.state.chatTitle
+		|| nextState.phase !== entry.state.phase
+		|| nextState.statusLine !== entry.state.statusLine
+		|| nowMs() - entry.lastStatePersistAtMs >= LOCAL_STATE_PERSIST_MIN_INTERVAL_MS;
+	entry.state = nextState;
 	if (shouldPersistState) {
-		await persistActiveState();
+		await persistEntry(input.chatId);
 	}
 	if (isTerminalPhase(nextState.phase)) {
-		clearHeartbeat();
-		clearScheduledFlush();
+		clearEntryFlush(entry);
 	} else {
 		ensureHeartbeat();
 	}
-	await queueStateUpdate({
+	await queueEntryStateUpdate(input.chatId, {
 		force: input.force,
 		immediate: false,
 	});
@@ -866,15 +985,16 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState || activeState.chatId !== input.chatId) {
+	const entry = entries.get(input.chatId);
+	if (!entry) {
 		return;
 	}
 
-	if (finishingChatId === input.chatId) {
+	if (entry.finishInProgress) {
 		return;
 	}
 
-	finishingChatId = input.chatId;
+	entry.finishInProgress = true;
 
 	const outcomePhase: ThreadLiveActivityPhase = (() => {
 		switch (input.outcome) {
@@ -910,22 +1030,21 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 	})();
 	const finalState: PersistedLiveActivityState = {
 		chatId: input.chatId,
-		chatTitle: sanitizeTitle(input.chatTitle, activeState.chatTitle),
+		chatTitle: sanitizeTitle(input.chatTitle, entry.state.chatTitle),
 		phase: outcomePhase,
-		preview: sanitizePreview(input.preview, activeState.preview),
-		startedAtMs: activeState.startedAtMs,
+		preview: sanitizePreview(input.preview, entry.state.preview),
+		startedAtMs: entry.state.startedAtMs,
 		statusLine: sanitizeStatusLine(input.statusLine, defaultStatusLine),
-		remoteManaged: activeState.remoteManaged,
+		remoteManaged: entry.state.remoteManaged,
 	};
-	awaitingAuthoritativeSync = false;
+	entry.awaitingAuthoritativeSync = false;
 
 	try {
-		clearHeartbeat();
-		clearScheduledFlush();
-		activeState = finalState;
-		await persistActiveState();
+		clearEntryFlush(entry);
+		entry.state = finalState;
+		await persistEntry(input.chatId);
 
-		const activity = await normalizeActivityInstance();
+		const activity = await resolveActivityInstance(entry);
 		if (activity) {
 			try {
 				await activity.update(toProps(finalState));
@@ -933,22 +1052,30 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 				// Ignore final update failures.
 			}
 
-			if (!finalState.remoteManaged) {
-				try {
-					await activity.end("default", toProps(finalState));
-				} catch {
-					// Ignore completion failures.
-				}
-			}
+			// Always end the activity locally after a brief delay so the user sees the final state
+			const chatIdToEnd = input.chatId;
+			setTimeout(() => {
+				void (async () => {
+					try {
+						await activity.end("default", toProps(finalState));
+					} catch {
+						// Ignore end failures.
+					}
+
+					// Only remove entry if it hasn't been replaced by a new start
+					const currentEntry = entries.get(chatIdToEnd);
+					if (currentEntry && isTerminalPhase(currentEntry.state.phase)) {
+						await removeEntry(chatIdToEnd);
+					}
+				})();
+			}, FINISH_DISMISS_DELAY_MS);
+			return;
 		}
 	} finally {
-		if (!finalState.remoteManaged) {
-			await resetRuntimeState();
-		}
-		if (finishingChatId === input.chatId) {
-			finishingChatId = null;
-		}
+		entry.finishInProgress = false;
 	}
+
+	await removeEntry(input.chatId);
 };
 
 export const clearThreadLiveActivity = async (input: { chatId: string }): Promise<void> => {
@@ -957,70 +1084,80 @@ export const clearThreadLiveActivity = async (input: { chatId: string }): Promis
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState || activeState.chatId !== input.chatId) {
+	const entry = entries.get(input.chatId);
+	if (!entry) {
 		return;
 	}
 
-	clearHeartbeat();
-	clearScheduledFlush();
-	const activity = await normalizeActivityInstance();
-	if (activity) {
+	clearEntryFlush(entry);
+	if (entry.activity) {
 		try {
-			await activity.end("immediate");
+			await entry.activity.end("immediate");
 		} catch {
 			// Ignore cleanup failures.
 		}
 	}
 
-	await resetRuntimeState();
+	await removeEntry(input.chatId);
 };
 
 export const onThreadLiveActivityAppStateChanged = async (nextState: AppStateStatus): Promise<void> => {
 	currentAppState = nextState;
 
-	if (!canUseLiveActivities() || !activeState) {
+	if (!canUseLiveActivities() || entries.size === 0) {
 		return;
 	}
 
-	if (isTerminalPhase(activeState.phase)) {
-		return;
+	const updates: { chatId: string; phase: "background" | "running" }[] = [];
+
+	for (const [chatId, entry] of entries) {
+		if (isTerminalPhase(entry.state.phase)) {
+			continue;
+		}
+
+		if (nextState === "background" || nextState === "inactive") {
+			if (!canEntryWriteLocally(entry)) {
+				continue;
+			}
+			ensureHeartbeat();
+			if (entry.state.phase === "finalizing") {
+				continue;
+			}
+
+			updates.push({ chatId, phase: "background" });
+			continue;
+		}
+
+		if (nextState === "active") {
+			if (!canEntryWriteLocally(entry)) {
+				continue;
+			}
+			ensureHeartbeat();
+			if (entry.state.phase === "finalizing") {
+				continue;
+			}
+
+			updates.push({ chatId, phase: "running" });
+		}
 	}
 
-	if (nextState === "background" || nextState === "inactive") {
-		if (!canWriteLocally()) {
-			return;
-		}
-		ensureHeartbeat();
-		if (activeState.phase === "finalizing") {
-			return;
-		}
-
-		await updateThreadLiveActivity({
-			chatId: activeState.chatId,
-			phase: "background",
-			force: false,
-		});
-		return;
-	}
-
-	if (nextState === "active") {
-		if (!canWriteLocally()) {
-			return;
-		}
-		ensureHeartbeat();
-		if (activeState.phase === "finalizing") {
-			return;
-		}
-
-		await updateThreadLiveActivity({
-			chatId: activeState.chatId,
-			phase: "running",
-			force: false,
-		});
-	}
+	await Promise.all(
+		updates.map(async (update) =>
+			{ await updateThreadLiveActivity({
+				chatId: update.chatId,
+				phase: update.phase,
+				force: false,
+			}); },
+		),
+	);
 };
 
 export const isThreadLiveActivityEnabled = (): boolean => canUseLiveActivities();
+
+export const hasActiveLiveActivityEntry = (chatId: string): boolean => {
+	const entry = entries.get(chatId);
+	return Boolean(entry) && !isTerminalPhase(entry!.state.phase);
+};
 
 export const setThreadLiveActivityRemoteManaged = async (input: {
 	chatId: string;
@@ -1031,22 +1168,23 @@ export const setThreadLiveActivityRemoteManaged = async (input: {
 	}
 
 	await initializeThreadLiveActivityManager();
-	if (!activeState || activeState.chatId !== input.chatId) {
+	const entry = entries.get(input.chatId);
+	if (!entry) {
 		return;
 	}
 
-	if (activeState.remoteManaged === input.remoteManaged) {
+	if (entry.state.remoteManaged === input.remoteManaged) {
 		return;
 	}
 
-	activeState = {
-		...activeState,
+	entry.state = {
+		...entry.state,
 		remoteManaged: input.remoteManaged,
 	};
-	await persistActiveState();
+	await persistEntry(input.chatId);
 
 	ensureHeartbeat();
-	await queueStateUpdate({
+	await queueEntryStateUpdate(input.chatId, {
 		immediate: true,
 		force: true,
 	});
@@ -1061,7 +1199,14 @@ export const subscribeThreadLiveActivityPushToken = (
 	};
 };
 
-export const getThreadLiveActivityStateForBackgroundTask = (): PersistedLiveActivityState | null => activeState;
+export const getThreadLiveActivityStateForBackgroundTask = (): PersistedLiveActivityState | null => {
+	for (const [, entry] of entries) {
+		if (!isTerminalPhase(entry.state.phase)) {
+			return entry.state;
+		}
+	}
+	return null;
+};
 
 export const getPushToStartToken = async (): Promise<string | null> => {
 	try {
@@ -1071,8 +1216,6 @@ export const getPushToStartToken = async (): Promise<string | null> => {
 		return null;
 	}
 };
-
-const pushToStartTokenListeners = new Set<(token: string) => void>();
 
 export const subscribePushToStartToken = (
 	listener: (token: string) => void,
