@@ -590,6 +590,10 @@ test("createLiveActivityPushServiceFromEnvironment caches backend capabilities a
 			pushToken: "device-token-fcm",
 			pushTokenType: "fcm",
 		});
+		await service.onChatFinished({
+			chatId: "chat-private-fcm",
+			outcome: "completed",
+		});
 
 		expect(subscribed).toBe(true);
 		expect(statusRequests).toBe(1);
