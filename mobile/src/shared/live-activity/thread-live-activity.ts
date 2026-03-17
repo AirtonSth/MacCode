@@ -621,17 +621,100 @@ const bindActivityToEntry = async (
 	return record.activity;
 };
 
-async function resolveActivityInstance(entry: ActivityEntry): Promise<LiveActivity<ThreadLiveActivityProps> | null> {
-	if (entry.activity) {
-		return entry.activity;
+const unbindActivityFromEntry = async (
+	entry: ActivityEntry,
+	input?: { clearPersistedActivityId?: boolean },
+): Promise<void> => {
+	const nextEntry = entry;
+
+	detachEntryPushTokenSubscription(nextEntry);
+	nextEntry.activity = null;
+	if (!input?.clearPersistedActivityId || !nextEntry.state.activityId) {
+		return;
 	}
 
-	const bindings = await loadLiveActivityBindings();
+	nextEntry.state = {
+		...nextEntry.state,
+		activityId: null,
+	};
+	await persistEntry(nextEntry.state.chatId);
+};
+
+const startActivityInstance = async (
+	entry: ActivityEntry,
+	input: {
+		bindings: LiveActivityBindings;
+		removeEntryOnFailure: boolean;
+	},
+): Promise<LiveActivity<ThreadLiveActivityProps> | null> => {
+	const nextEntry = entry;
+
+	try {
+		nextEntry.activity = input.bindings.threadLiveActivityFactory.start(
+			toProps(nextEntry.state),
+			`remotecode-mobile://chat?chatId=${encodeURIComponent(nextEntry.state.chatId)}`,
+		);
+		nextEntry.state = {
+			...nextEntry.state,
+			activityId: getActivityId(nextEntry.activity),
+		};
+		log("activity instance started", { chatId: nextEntry.state.chatId });
+		attachEntryPushTokenSubscription(nextEntry);
+		nextEntry.lastContentSignature = toContentSignature(nextEntry.state);
+		nextEntry.lastContentUpdateAtMs = nowMs();
+		await persistEntry(nextEntry.state.chatId);
+		await syncEntryPushToken(nextEntry);
+		return nextEntry.activity;
+	} catch {
+		log("activity instance start failed", { chatId: nextEntry.state.chatId });
+		await unbindActivityFromEntry(nextEntry, {
+			clearPersistedActivityId: true,
+		});
+		if (input.removeEntryOnFailure) {
+			await removeEntry(nextEntry.state.chatId);
+		}
+		return null;
+	}
+};
+
+async function resolveActivityInstance(
+	entry: ActivityEntry,
+	input?: { bindings?: LiveActivityBindings | null },
+): Promise<LiveActivity<ThreadLiveActivityProps> | null> {
+	const bindings = input?.bindings ?? await loadLiveActivityBindings();
 	if (!bindings) {
 		return null;
 	}
 
 	const records = await toActivityRecords(bindings);
+	if (entry.activity) {
+		const boundActivityId = getActivityId(entry.activity) ?? withOptionalValue(entry.state.activityId);
+		const boundRecord = records.find((record) =>
+			(
+				record.activity === entry.activity
+				|| (Boolean(boundActivityId) && record.activityId === boundActivityId)
+			)
+			&& !isActivityRecordOwnedByOtherEntry(record, entry));
+		if (boundRecord) {
+			if (boundRecord.activityId && boundRecord.activityId !== entry.state.activityId) {
+				const nextEntry = entry;
+				nextEntry.state = {
+					...nextEntry.state,
+					activityId: boundRecord.activityId,
+				};
+				await persistEntry(nextEntry.state.chatId);
+			}
+			return entry.activity;
+		}
+
+		log("bound activity instance missing; clearing binding", {
+			chatId: entry.state.chatId,
+		});
+		await unbindActivityFromEntry(entry, {
+			clearPersistedActivityId: true,
+		});
+	}
+
 	if (records.length === 0) {
 		return null;
 	}
@@ -706,8 +789,16 @@ const flushEntryStateUpdate = async (chatId: string, input?: { force?: boolean }
 	}
 
 	entry.writeInFlight = true;
-	const activity = await resolveActivityInstance(entry);
-	const currentEntry = entries.get(chatId);
+	const bindings = await loadLiveActivityBindings();
+	let activity = bindings ? await resolveActivityInstance(entry, { bindings }) : null;
+	let currentEntry = entries.get(chatId);
+	if (!activity && bindings && currentEntry && !isTerminalPhase(currentEntry.state.phase)) {
+		activity = await startActivityInstance(currentEntry, {
+			bindings,
+			removeEntryOnFailure: false,
+		});
+		currentEntry = entries.get(chatId);
+	}
 	if (!activity || !currentEntry || isTerminalPhase(currentEntry.state.phase)) {
 		if (currentEntry) {
 			currentEntry.writeInFlight = false;
@@ -955,7 +1046,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	await persistEntry(input.chatId);
 	ensureHeartbeat();
 
-	const activity = await resolveActivityInstance(entry);
+	const activity = await resolveActivityInstance(entry, { bindings });
 	if (activity) {
 		log("reusing existing activity instance", { chatId: input.chatId });
 		await queueEntryStateUpdate(input.chatId, {
@@ -966,27 +1057,10 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		return true;
 	}
 
-	try {
-		entry.activity = bindings.threadLiveActivityFactory.start(
-			toProps(state),
-			`remotecode-mobile://chat?chatId=${encodeURIComponent(input.chatId)}`,
-		);
-		entry.state = {
-			...entry.state,
-			activityId: getActivityId(entry.activity),
-		};
-		log("activity instance started", { chatId: input.chatId });
-		attachEntryPushTokenSubscription(entry);
-		entry.lastContentSignature = toContentSignature(state);
-		entry.lastContentUpdateAtMs = nowMs();
-		await persistEntry(input.chatId);
-		await syncEntryPushToken(entry);
-		return true;
-	} catch {
-		log("activity instance start failed", { chatId: input.chatId });
-		await removeEntry(input.chatId);
-		return false;
-	}
+	return Boolean(await startActivityInstance(entry, {
+		bindings,
+		removeEntryOnFailure: true,
+	}));
 };
 
 export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): Promise<void> => {
@@ -995,7 +1069,21 @@ export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): 
 	}
 
 	await initializeThreadLiveActivityManager();
-	const entry = entries.get(input.chatId);
+	let entry = entries.get(input.chatId);
+	if (!entry) {
+		const started = await startThreadLiveActivity({
+			chatId: input.chatId,
+			chatTitle: input.chatTitle,
+			preview: input.preview,
+			remoteManaged: true,
+			statusLine: input.statusLine,
+		});
+		if (!started) {
+			return;
+		}
+
+		entry = entries.get(input.chatId);
+	}
 	if (!entry) {
 		return;
 	}
@@ -1028,7 +1116,7 @@ export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): 
 	}
 	await queueEntryStateUpdate(input.chatId, {
 		force: input.force,
-		immediate: false,
+		immediate: Boolean(input.force),
 	});
 };
 

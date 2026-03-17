@@ -109,6 +109,7 @@ const {
 	onThreadLiveActivityAppStateChanged,
 	resetThreadLiveActivityManagerForTests,
 	startThreadLiveActivity,
+	updateThreadLiveActivity,
 } = await import("./thread-live-activity");
 
 const realDateNow = Date.now;
@@ -191,6 +192,35 @@ describe("thread live activity manager", () => {
 		expect(started).toBe(false);
 		expect(hasActiveLiveActivityEntry("chat-1")).toBe(false);
 		expect(secureStoreState.get(ACTIVE_STATE_KEY)).toBeUndefined();
+	});
+
+	test("recreates a dismissed activity when a new update arrives", async () => {
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: false,
+		});
+
+		expect(started).toBe(true);
+		expect(widgetsState.instances).toHaveLength(1);
+
+		const dismissedActivity = widgetsState.instances[0];
+		widgetsState.instances = [];
+
+		await updateThreadLiveActivity({
+			chatId: "chat-1",
+			force: true,
+			preview: "New output after dismiss",
+			statusLine: "Generating response",
+		});
+		await Bun.sleep(50);
+
+		expect(widgetsState.instances).toHaveLength(1);
+		expect(widgetsState.instances[0]).not.toBe(dismissedActivity);
+		expect(widgetsState.instances[0]?.updateCalls).toHaveLength(1);
+		expect(widgetsState.instances[0]?.updateCalls[0]).toMatchObject({
+			chatId: "chat-1",
+			preview: "New output after dismiss",
+		});
 	});
 
 	test("adopts restored activities by chat identity instead of instance order", async () => {

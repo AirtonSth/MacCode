@@ -61,6 +61,7 @@ import {
 	setStreamItemState as updateStreamItemState,
 	type StreamTurnState,
 } from "./stream-turn-state";
+import { resolveTrackedLiveActivityChats } from "./live-activity-tracking";
 
 type WorkspaceShellScope = "legacy" | "workspaces" | "threads" | "chat";
 
@@ -492,6 +493,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const previousSelectedChatIdRef = useRef<string | null>(selectedChatId);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const pendingCompletionNotificationChatIdsRef = useRef<Set<string>>(new Set());
+	const trackedLiveActivityChatIdsRef = useRef<Set<string>>(new Set());
 	const lastSendAttemptChatIdRef = useRef<string | null>(null);
 	const pushDeliveryTokenRef = useRef<PushDeliveryToken | null>(null);
 	const liveActivityTokenByChatRef = useRef<Record<string, string>>({});
@@ -2538,6 +2540,14 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		},
 		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
 	);
+	const trackedLiveActivityChats = useMemo(
+		() => resolveTrackedLiveActivityChats({
+			activeThreads: activeThreadsQuery.data ?? [],
+			selectedChat,
+			selectedChatId,
+		}),
+		[activeThreadsQuery.data, selectedChat, selectedChatId],
+	);
 
 	useEffect(() => {
 		if (!selectedChatId || !selectedChat) {
@@ -2555,20 +2565,34 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	}, [finishLiveActivity, notifyMessageCompletion, selectedChat, selectedChatId]);
 
 	useEffect(() => {
-		if (!selectedChatId || !selectedChat) {
+		if (trackedLiveActivityChats.length === 0) {
+			trackedLiveActivityChatIdsRef.current = new Set();
 			return;
 		}
 
-		const isRunning = selectedChat.isActive || selectedChat.status === "running";
-		if (!isRunning) {
-			return;
+		const runningStatus =
+			appStateRef.current === "background" || appStateRef.current === "inactive"
+				? "Running in background"
+				: "Running";
+		const previousTrackedChatIds = trackedLiveActivityChatIdsRef.current;
+
+		for (const trackedChat of trackedLiveActivityChats) {
+			pendingCompletionNotificationChatIdsRef.current.add(trackedChat.chatId);
+			realtimeRef.current?.sendJoinChat(trackedChat.chatId);
+			if (previousTrackedChatIds.has(trackedChat.chatId)) {
+				continue;
+			}
+
+			void startRunningLiveActivity(trackedChat.chatId, {
+				chatTitle: trackedChat.chatTitle,
+				statusLine: runningStatus,
+			});
 		}
 
-		pendingCompletionNotificationChatIdsRef.current.add(selectedChatId);
-		startRunningLiveActivity(selectedChatId, {
-			chatTitle: selectedChat.title,
-		});
-	}, [selectedChatId, selectedChat, startRunningLiveActivity]);
+		trackedLiveActivityChatIdsRef.current = new Set(
+			trackedLiveActivityChats.map((trackedChat) => trackedChat.chatId),
+		);
+	}, [startRunningLiveActivity, trackedLiveActivityChats]);
 
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
 	const streamHistoryTurns = useMemo(
