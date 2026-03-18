@@ -311,6 +311,7 @@ export interface ClientMessageEvent {
 		model?: string;
 		permissionMode?: string;
 		projectId?: string;
+		provider?: string;
 		requestId?: string;
 		reasoningEffort?: string;
 	};

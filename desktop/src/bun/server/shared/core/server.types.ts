@@ -97,6 +97,7 @@ export interface ClientMessageEvent {
 		model?: string;
 		permissionMode?: CodexPermissionMode;
 		projectId?: string;
+		provider?: ChatProvider;
 		requestId?: string;
 		reasoningEffort?: CodexReasoningEffort;
 		text: string;

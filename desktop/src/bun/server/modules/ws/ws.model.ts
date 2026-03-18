@@ -37,6 +37,7 @@ export interface WsServiceInput {
 	model?: ClientMessageEvent["data"]["model"];
 	permissionMode?: ClientMessageEvent["data"]["permissionMode"];
 	projectId?: ClientMessageEvent["data"]["projectId"];
+	provider?: ClientMessageEvent["data"]["provider"];
 	requestId?: string;
 	reasoningEffort?: ClientMessageEvent["data"]["reasoningEffort"];
 	text: string;

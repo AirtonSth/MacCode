@@ -1072,43 +1072,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	useEffect(() => {
 		let canceled = false;
 
-		const storePushDeliveryToken = (
-			token: PushDeliveryToken,
-			reason: "initial" | "foreground retry" | "refresh",
-		): void => {
-			const normalized = token.token.trim();
-			if (normalized.length === 0) {
-				return;
-			}
-
-			pushDeliveryTokenRef.current = {
-				...token,
-				token: normalized,
-			};
-			logLiveActivitySubscription(`${reason} push delivery token stored`, {
-				pushToken: toTokenPreview(normalized),
-				pushTokenType: token.type,
-			});
-			flushLiveActivitySubscriptions();
-		};
-
-		const syncPushDeliveryToken = async (
-			reason: "initial" | "foreground retry",
-		): Promise<void> => {
-			const token = await ensurePushDeliveryToken();
-			if (canceled || !token || token.token.trim().length === 0) {
-				logLiveActivitySubscription(`${reason} push delivery token unavailable`, {
-					canceled,
-					hasToken: Boolean(token?.token.trim().length),
-				});
-				return;
-			}
-
-			storePushDeliveryToken(token, reason);
-		};
-
-		void syncPushDeliveryToken("initial");
-
 		const registerPushToStartTokenWithBackend = async (pushToStartToken: string): Promise<void> => {
 			const deliveryToken = pushDeliveryTokenRef.current;
 			if (!deliveryToken || deliveryToken.token.trim().length === 0) {
@@ -1140,12 +1103,45 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			void registerPushToStartTokenWithBackend(token);
 		};
 
-		// Delay push-to-start token sync to ensure push delivery token is available.
-		setTimeout(() => {
-			if (!canceled) {
-				void syncPushToStartToken();
+		const storePushDeliveryToken = (
+			token: PushDeliveryToken,
+			reason: "initial" | "foreground retry" | "refresh",
+		): void => {
+			const normalized = token.token.trim();
+			if (normalized.length === 0) {
+				return;
 			}
-		}, 3_000);
+
+			pushDeliveryTokenRef.current = {
+				...token,
+				token: normalized,
+			};
+			logLiveActivitySubscription(`${reason} push delivery token stored`, {
+				pushToken: toTokenPreview(normalized),
+				pushTokenType: token.type,
+			});
+			flushLiveActivitySubscriptions();
+
+			// Register push-to-start token immediately once push delivery token is available.
+			void syncPushToStartToken();
+		};
+
+		const syncPushDeliveryToken = async (
+			reason: "initial" | "foreground retry",
+		): Promise<void> => {
+			const token = await ensurePushDeliveryToken();
+			if (canceled || !token || token.token.trim().length === 0) {
+				logLiveActivitySubscription(`${reason} push delivery token unavailable`, {
+					canceled,
+					hasToken: Boolean(token?.token.trim().length),
+				});
+				return;
+			}
+
+			storePushDeliveryToken(token, reason);
+		};
+
+		void syncPushDeliveryToken("initial");
 
 		const unsubscribePushToStart = subscribePushToStartToken((token) => {
 			if (canceled) {
@@ -2292,6 +2288,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				model: selectedModel ?? undefined,
 				permissionMode,
 				projectId: activeProjectId,
+				provider: selectedProvider ?? undefined,
 				reasoningEffort: selectedReasoningEffort ?? undefined,
 				requestId: toRequestId(),
 			});

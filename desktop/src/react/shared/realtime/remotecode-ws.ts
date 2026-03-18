@@ -616,6 +616,7 @@ export const RemoteCodeRealtime = {
 				reasoningEffort?: CodexReasoningEffort,
 				clientId?: string,
 				requestId?: string,
+				provider?: string,
 			) {
 				send({
 					data: {
@@ -624,6 +625,7 @@ export const RemoteCodeRealtime = {
 						...(model ? { model } : {}),
 						...(permissionMode ? { permissionMode } : {}),
 						...(projectId ? { projectId } : {}),
+						...(provider ? { provider } : {}),
 						...(requestId ? { requestId } : {}),
 						...(reasoningEffort ? { reasoningEffort } : {}),
 						text,

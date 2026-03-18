@@ -246,7 +246,7 @@ describe("LiveActivityPushService push-to-start", () => {
 			expect(startDelivery?.attributes).toEqual({});
 		});
 
-		it("does NOT send push-to-start when active subscriptions exist", async () => {
+		it("sends push-to-start even when active subscriptions exist", async () => {
 			const store = createInMemoryPushToStartTokenStore();
 			const subStore = createInMemorySubscriptionStore();
 			const { deliveries, service } = createRecordingHarness(store, subStore);
@@ -270,7 +270,7 @@ describe("LiveActivityPushService push-to-start", () => {
 				liveActivityToken: "live-token-existing",
 			});
 
-			// Start a second chat — this time subscriptions exist for it
+			// Start a second chat — push-to-start is always sent regardless of subscriptions
 			service.onChatStarted({
 				chatId: "chat-with-sub",
 				chatTitle: "Thread",
@@ -278,10 +278,9 @@ describe("LiveActivityPushService push-to-start", () => {
 
 			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
 
-			// The first onChatStarted should have triggered push-to-start (no subscriptions yet),
-			// but the second one should NOT (subscription exists)
+			// Both onChatStarted calls should trigger push-to-start (global broadcast)
 			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			expect(startDeliveries).toHaveLength(1);
+			expect(startDeliveries.length).toBeGreaterThanOrEqual(2);
 		});
 
 		it("does NOT send push-to-start when no tokens registered", async () => {
@@ -327,7 +326,7 @@ describe("LiveActivityPushService push-to-start", () => {
 			expect(pushTokens).toEqual(["device-a", "device-b"]);
 		});
 
-		it("drops push-to-start token when delivery returns shouldDropSubscription", async () => {
+		it("never drops push-to-start token even when delivery returns shouldDropSubscription", async () => {
 			const store = createInMemoryPushToStartTokenStore();
 			const deliveries: CapturedDelivery[] = [];
 			const service = createLiveActivityPushServiceForTests(
@@ -365,8 +364,8 @@ describe("LiveActivityPushService push-to-start", () => {
 
 			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
 
-			// Token should be dropped from store after permanent failure
-			expect(store.rows.size).toBe(0);
+			// Token should be kept in store — push-to-start tokens are permanent
+			expect(store.rows.size).toBe(1);
 		});
 	});
 

@@ -571,6 +571,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				model?: string;
 				permissionMode?: string;
 				projectId?: string;
+				provider?: string;
 				reasoningEffort?: string;
 				requestId?: string;
 			},
@@ -583,6 +584,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 					...(options?.model ? { model: options.model } : {}),
 					...(options?.permissionMode ? { permissionMode: options.permissionMode } : {}),
 					...(options?.projectId ? { projectId: options.projectId } : {}),
+					...(options?.provider ? { provider: options.provider } : {}),
 					...(options?.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
 					...(options?.requestId ? { requestId: options.requestId } : {}),
 				},

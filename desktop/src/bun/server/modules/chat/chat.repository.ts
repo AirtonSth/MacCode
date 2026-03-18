@@ -223,7 +223,7 @@ export class ChatRepository {
 
 	updateChat(
 		chatId: string,
-		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive" | "provider">>,
 	): ChatDTO | null {
 		this.database
 			.update(chats)
@@ -232,6 +232,7 @@ export class ChatRepository {
 				...(update.diffAdded === undefined ? {} : { diffAdded: update.diffAdded }),
 				...(update.diffRemoved === undefined ? {} : { diffRemoved: update.diffRemoved }),
 				...(update.isActive === undefined ? {} : { isActive: update.isActive ? 1 : 0 }),
+				...(update.provider === undefined ? {} : { provider: update.provider }),
 				updatedAt: new Date().toISOString(),
 			})
 			.where(eq(chats.id, chatId))

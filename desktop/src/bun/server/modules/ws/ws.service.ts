@@ -340,11 +340,15 @@ export class WsService implements WsServiceContract {
 			return;
 		}
 
+		const effectiveProvider = input.provider ?? chat.provider;
+		const providerChanged = effectiveProvider !== chat.provider && effectiveProvider !== "fake";
+
 		const runningChat = await this.chatRepository.updateChat(chatId, {
 			diffAdded: 0,
 			diffRemoved: 0,
 			isActive: true,
 			status: "running",
+			...(providerChanged ? { provider: effectiveProvider } : {}),
 		});
 		const userMessage = await this.messageRepository.createMessage(chatId, "user", text);
 		this.workspaceEvents?.append({
@@ -393,7 +397,7 @@ export class WsService implements WsServiceContract {
 
 		try {
 			const permissionMode = input.permissionMode ?? DEFAULT_CODEX_PERMISSION_MODE;
-			const providerRunner = chat.provider === "claude"
+			const providerRunner = effectiveProvider === "claude"
 				? this.claudeProviderRunner
 				: this.codexProviderRunner;
 			const providerResult = await providerRunner.run({

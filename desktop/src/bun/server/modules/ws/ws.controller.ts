@@ -3,7 +3,7 @@ import { Elysia, t } from "elysia";
 import { isValidToken, resolveWsToken } from "../../shared/auth/auth.service";
 import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
 import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
-import type { ClientWsEvent, ServerWsEvent } from "../../types";
+import type { ChatProvider, ClientWsEvent, ServerWsEvent } from "../../types";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { WorkspaceEventEnvelope } from "../workspace-events/workspace-events.model";
 import type { WsService } from "./ws.model";
@@ -378,6 +378,24 @@ export class WsController {
 							return;
 						}
 
+						const VALID_PROVIDERS = new Set<string>(["codex", "claude"]);
+						const rawProvider = (payload.data as { provider?: unknown }).provider;
+						const provider =
+							typeof rawProvider === "string" && VALID_PROVIDERS.has(rawProvider)
+								? (rawProvider as ChatProvider)
+								: null;
+						if (rawProvider !== undefined && provider === null) {
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: invalid provider",
+								},
+								event: "error",
+							});
+							return;
+						}
+
 						this.joinChat(chatId, ws as BroadcastSocket);
 						await this.service.startUserMessage({
 							chatId,
@@ -386,6 +404,7 @@ export class WsController {
 							model: model ?? undefined,
 							permissionMode: permissionMode ?? undefined,
 							projectId: projectId ?? undefined,
+							provider: provider ?? undefined,
 							requestId:
 								typeof payload.data.requestId === "string"
 									? payload.data.requestId.trim() || undefined

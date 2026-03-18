@@ -1881,6 +1881,7 @@ const App = (): JSX.Element => {
 							selectedReasoningEffort ?? undefined,
 							workspaceClientIdRef.current,
 							requestId,
+							selectedProvider ?? undefined,
 						);
 					},
 				onSetSending: (chatId, sending) => {
@@ -1917,6 +1918,7 @@ const App = (): JSX.Element => {
 				state.messageWindow.chatId,
 				state.messageWindow.mode,
 				selectedModel,
+				selectedProvider,
 				selectedReasoningEffort,
 				selectedChat?.status,
 			selectedChat?.provider,
