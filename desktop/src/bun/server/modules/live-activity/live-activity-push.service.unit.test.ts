@@ -240,6 +240,95 @@ test("LiveActivityPushService emits a frozen terminal summary when the last chat
 	expect(deliveries.some((delivery) => delivery.event === "end")).toBe(false);
 });
 
+test("LiveActivityPushService joins body chunks without splitting words in the preview", async () => {
+	Date.now = () => 1_000;
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-preview",
+		chatTitle: "Preview",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-preview",
+		chatTitle: "Preview",
+		pushToken: "fcm-token-preview",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-preview",
+	});
+
+	service.onAssistantEvent("chat-preview", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "body",
+		delta: "Estado im",
+	});
+	service.onAssistantEvent("chat-preview", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "body",
+		delta: "utavel cada trans",
+	});
+	service.onAssistantEvent("chat-preview", {
+		type: "item_delta",
+		turnId: "turn-1",
+		itemId: "item-1",
+		target: "body",
+		delta: "icao retorna novo objeto.",
+	});
+	service.onAssistantEvent("chat-preview", {
+		type: "turn_completed",
+		turnId: "turn-1",
+	});
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
+	});
+
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		phase: "finalizing",
+		preview: "Estado imutavel cada transicao retorna novo objeto.",
+		statusLine: "Finalizing response",
+	});
+});
+
+test("LiveActivityPushService still preserves intended spaces between streamed preview chunks", async () => {
+	Date.now = () => 1_000;
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-preview-spaces",
+		chatTitle: "Preview Spaces",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-preview-spaces",
+		chatTitle: "Preview Spaces",
+		pushToken: "fcm-token-preview-spaces",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-preview-spaces",
+	});
+
+	service.onAssistantDelta("chat-preview-spaces", "apura");
+	service.onAssistantDelta("chat-preview-spaces", "()");
+	service.onAssistantDelta("chat-preview-spaces", " e UI");
+	service.onAssistantDelta("chat-preview-spaces", "()");
+	service.onAssistantEvent("chat-preview-spaces", {
+		type: "turn_completed",
+		turnId: "turn-2",
+	});
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
+	});
+
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		phase: "finalizing",
+		preview: "apura() e UI()",
+		statusLine: "Finalizing response",
+	});
+});
+
 test("LiveActivityPushService resets elapsed time and outcome when a new session begins", async () => {
 	Date.now = () => 1_000;
 	const { deliveries, service } = createRecordingHarness();

@@ -219,8 +219,13 @@ const PREVIEW_ALLOWED_PATTERN = /[^\p{L}\p{N}\p{Zs}'.,;:!?@#%&+\-_/()]/gu;
 const PREVIEW_UTF8_BYTE_LIMIT = 192;
 const TITLE_UTF8_BYTE_LIMIT = 256;
 const STATUS_UTF8_BYTE_LIMIT = 256;
+const PREVIEW_BOUNDARY_WORD_PATTERN = /[\p{L}\p{N}]/u;
+const PREVIEW_TIGHT_PREFIX_PATTERN = /^[,.;:!?%(){}\[\]'"/\\-]/u;
+const PREVIEW_TIGHT_SUFFIX_PATTERN = /[(\[{'"\/\\-]$/u;
 
 const toUtf8ByteLength = (value: string): number => new TextEncoder().encode(value).length;
+const toFirstCodePoint = (value: string): string => Array.from(value)[0] ?? "";
+const toLastCodePoint = (value: string): string => Array.from(value).at(-1) ?? "";
 const toCodePointHead = (value: string, maxLength: number): string => {
 	const points = Array.from(value);
 	if (points.length <= maxLength) {
@@ -491,6 +496,32 @@ const toPhaseFromEvent = (event: AssistantStreamEvent): LiveActivityPhase => {
 	return "running";
 };
 
+const shouldInsertPreviewBoundarySpace = (preview: string, delta: string, normalizedDelta: string): boolean => {
+	if (preview.length === 0 || normalizedDelta.length === 0) {
+		return false;
+	}
+
+	if (/^\s/u.test(delta)) {
+		return true;
+	}
+
+	const lastPoint = toLastCodePoint(preview);
+	const firstPoint = toFirstCodePoint(normalizedDelta);
+	if (lastPoint.length === 0 || firstPoint.length === 0) {
+		return false;
+	}
+
+	if (PREVIEW_TIGHT_SUFFIX_PATTERN.test(lastPoint) || PREVIEW_TIGHT_PREFIX_PATTERN.test(firstPoint)) {
+		return false;
+	}
+
+	if (PREVIEW_BOUNDARY_WORD_PATTERN.test(lastPoint) && PREVIEW_BOUNDARY_WORD_PATTERN.test(firstPoint)) {
+		return false;
+	}
+
+	return true;
+};
+
 const toPreviewChunk = (preview: string, delta: string): string => {
 	const normalizedDelta = toNormalizedPreviewText(delta);
 	if (normalizedDelta.length === 0) {
@@ -498,7 +529,9 @@ const toPreviewChunk = (preview: string, delta: string): string => {
 	}
 
 	const base = toNormalizedPreviewText(preview);
-	const next = `${base} ${normalizedDelta}`.trim();
+	const next = shouldInsertPreviewBoundarySpace(base, delta, normalizedDelta)
+		? `${base} ${normalizedDelta}`
+		: `${base}${normalizedDelta}`;
 	return toUtf8Head(next, PREVIEW_UTF8_BYTE_LIMIT);
 };
 
@@ -1679,7 +1712,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			const previewBase = runtime.previewSource === "legacy-response"
 				? runtime.preview
 				: "";
-			runtime.preview = toPreviewChunk(previewBase, normalizedDelta);
+			runtime.preview = toPreviewChunk(previewBase, delta);
 			runtime.previewSource = "legacy-response";
 		}
 		const previousPhase = runtime.phase;
@@ -1714,7 +1747,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			const deltaText = toNormalizedPreviewText(event.delta);
 			if ((event.target === "body" || event.target === "output") && deltaText.length > 0) {
 				const previewBase = runtime.previewSource === "structured-response" ? runtime.preview : "";
-				runtime.preview = toPreviewChunk(previewBase, deltaText);
+				runtime.preview = toPreviewChunk(previewBase, event.delta);
 				runtime.previewSource = "structured-response";
 			}
 			if (event.target === "summary" && deltaText.length > 0) {
