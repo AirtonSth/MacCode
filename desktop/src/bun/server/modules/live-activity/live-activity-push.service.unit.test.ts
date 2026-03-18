@@ -597,12 +597,14 @@ test("createLiveActivityPushServiceFromEnvironment caches backend capabilities a
 
 		expect(subscribed).toBe(true);
 		expect(statusRequests).toBe(1);
-		expect(deliveryBodies).toHaveLength(1);
-		expect(deliveryBodies[0]).toMatchObject({
-			event: "update",
-			pushToken: "device-token-fcm",
-			pushTokenType: "fcm",
-		});
+		// Two deliveries: one update on subscription, one end on finish — both FCM only (APNS filtered)
+		expect(deliveryBodies).toHaveLength(2);
+		for (const body of deliveryBodies) {
+			expect(body).toMatchObject({
+				pushToken: "device-token-fcm",
+				pushTokenType: "fcm",
+			});
+		}
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
