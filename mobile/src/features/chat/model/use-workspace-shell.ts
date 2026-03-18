@@ -601,9 +601,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			return;
 		}
 
-		const defaultModel = models.find((item) => item.isDefault)?.model ?? models[0]?.model ?? null;
-		if (defaultModel && !selectedModel) {
-			setSelectedModel(defaultModel);
+		const isCurrentModelValid = selectedModel !== null && models.some((m) => m.model === selectedModel);
+		if (!isCurrentModelValid) {
+			const defaultModelDescriptor = models.find((item) => item.isDefault) ?? models[0] ?? null;
+			if (defaultModelDescriptor) {
+				setSelectedModel(defaultModelDescriptor.model);
+				setSelectedReasoningEffort(defaultModelDescriptor.defaultReasoningEffort ?? null);
+			}
 		}
 	}, [modelsQuery.data?.models, selectedModel]);
 
