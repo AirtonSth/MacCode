@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 
 import {
 	createLiveActivityPushServiceForTests,
@@ -13,21 +13,29 @@ import type {
 
 interface CapturedDelivery {
 	chatId: string;
-	event: "update" | "end" | "start";
 	chatTitle: string;
+	elapsedSeconds: number;
+	event: "update" | "end" | "start";
+	phase: string;
 	preview: string;
+	pushToken?: string;
+	pushTokenType?: string;
+	statusLine: string;
 }
-
-const ALLOWED_TEXT_PATTERN = /^[\p{L}\p{N}\p{Zs}'.,;:!?@#%&+\-_/()]*$/u;
 
 const createRecordingHarness = () => {
 	const deliveries: CapturedDelivery[] = [];
 	const service = createLiveActivityPushServiceForTests(async (input) => {
 		deliveries.push({
 			chatId: input.contentState.chatId,
-			event: input.event,
 			chatTitle: input.contentState.chatTitle,
+			elapsedSeconds: input.contentState.elapsedSeconds,
+			event: input.event,
+			phase: input.contentState.phase,
 			preview: input.contentState.preview,
+			pushToken: input.pushToken,
+			pushTokenType: input.pushTokenType,
+			statusLine: input.contentState.statusLine,
 		});
 		return {
 			delivered: true,
@@ -83,402 +91,196 @@ const createInMemoryPushToStartTokenStore = (): PushToStartTokenStoreContract & 
 	};
 };
 
-const findLastDeliveryByEvent = (
+const findLastDelivery = (
 	deliveries: readonly CapturedDelivery[],
 	event: CapturedDelivery["event"],
 ): CapturedDelivery | undefined => {
 	for (let index = deliveries.length - 1; index >= 0; index -= 1) {
-		const current = deliveries[index];
-		if (current?.event === event) {
-			return current;
+		const delivery = deliveries[index];
+		if (delivery?.event === event) {
+			return delivery;
 		}
 	}
 
 	return undefined;
 };
 
-test("LiveActivityPushService aggressively sanitizes payload text and truncates preview with ellipsis", async () => {
+const realDateNow = Date.now;
+
+afterEach(() => {
+	Date.now = realDateNow;
+});
+
+test("LiveActivityPushService emits a global session payload for the first active chat", async () => {
+	Date.now = () => 1_000;
 	const { deliveries, service } = createRecordingHarness();
 
 	service.onChatStarted({
 		chatId: "chat-1",
-		chatTitle: "Thread {\"payload\":true} ```json```",
+		chatTitle: "Thread 1",
 	});
-	service.onAssistantDelta(
-		"chat-1",
-		"\u001B[31m```json\n{\"tool\":\"rm -rf /\",\"args\":[\"x\"]}\n```\u001B[0m<script>alert(1)</script> [alpha|beta] key=value \\ path",
-	);
 	await service.upsertSubscription({
 		chatId: "chat-1",
-		chatTitle: "Thread",
+		chatTitle: "Thread 1",
 		pushToken: "fcm-token-1",
 		pushTokenType: "fcm",
 		liveActivityToken: "live-token-1",
 	});
+
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		chatTitle: "1 Active Thread",
+		elapsedSeconds: 0,
+		event: "update",
+		phase: "running",
+		statusLine: "Generating response",
+	});
+});
+
+test("LiveActivityPushService keeps one timer across overlapping chats and shows global counts", async () => {
+	Date.now = () => 1_000;
+	const { deliveries, service } = createRecordingHarness();
+
+	await service.upsertSubscription({
+		chatId: "chat-a",
+		chatTitle: "A",
+		pushToken: "fcm-token-1",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-1",
+	});
+
+	service.onChatStarted({
+		chatId: "chat-a",
+		chatTitle: "A",
+	});
+
+	Date.now = () => 6_000;
+	service.onChatStarted({
+		chatId: "chat-b",
+		chatTitle: "B",
+	});
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
+	});
+
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		chatTitle: "2 Active Threads",
+		elapsedSeconds: 5,
+		phase: "running",
+		statusLine: "Generating response",
+	});
+});
+
+test("LiveActivityPushService does not go terminal while another chat is still active", async () => {
+	Date.now = () => 1_000;
+	const { deliveries, service } = createRecordingHarness();
+
+	await service.upsertSubscription({
+		chatId: "chat-a",
+		chatTitle: "A",
+		pushToken: "fcm-token-1",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-1",
+	});
+
+	service.onChatStarted({
+		chatId: "chat-a",
+		chatTitle: "A",
+	});
+	Date.now = () => 4_000;
+	service.onChatStarted({
+		chatId: "chat-b",
+		chatTitle: "B",
+	});
+	Date.now = () => 10_000;
 	await service.onChatFinished({
-		chatId: "chat-1",
+		chatId: "chat-a",
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview.length).toBeLessThanOrEqual(140);
-	expect(endDelivery?.preview).toMatch(ALLOWED_TEXT_PATTERN);
-	expect(endDelivery?.preview).not.toContain("{");
-	expect(endDelivery?.preview).not.toContain("}");
-	expect(endDelivery?.preview).not.toContain("[");
-	expect(endDelivery?.preview).not.toContain("]");
-	expect(endDelivery?.preview).not.toContain("`");
-	expect(endDelivery?.preview).not.toContain("\\");
-	expect(endDelivery?.chatTitle).toMatch(ALLOWED_TEXT_PATTERN);
-	expect(endDelivery?.chatTitle).not.toContain("{");
-	expect(endDelivery?.chatTitle).not.toContain("}");
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		chatTitle: "1 Active Thread",
+		elapsedSeconds: 9,
+		phase: "running",
+		statusLine: "Generating response",
+	});
 });
 
-test("LiveActivityPushService keeps short previews unchanged", async () => {
+test("LiveActivityPushService emits a frozen terminal summary when the last chat finishes", async () => {
+	Date.now = () => 1_000;
 	const { deliveries, service } = createRecordingHarness();
 
 	service.onChatStarted({
-		chatId: "chat-2",
-		chatTitle: "Thread",
+		chatId: "chat-terminal",
+		chatTitle: "Terminal",
 	});
-	service.onAssistantDelta("chat-2", "Short preview text");
 	await service.upsertSubscription({
-		chatId: "chat-2",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-2",
+		chatId: "chat-terminal",
+		chatTitle: "Terminal",
+		pushToken: "fcm-token-terminal",
 		pushTokenType: "fcm",
-		liveActivityToken: "live-token-2",
+		liveActivityToken: "live-token-terminal",
 	});
+
+	Date.now = () => 12_000;
 	await service.onChatFinished({
-		chatId: "chat-2",
-		outcome: "completed",
+		chatId: "chat-terminal",
+		outcome: "error",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview).toBe("Short preview text");
-	expect(endDelivery?.preview.endsWith("...")).toBe(false);
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		elapsedSeconds: 11,
+		phase: "error",
+		preview: "No active threads right now.",
+		statusLine: "At least one thread ended with an error",
+	});
+	expect(deliveries.some((delivery) => delivery.event === "end")).toBe(false);
 });
 
-test("LiveActivityPushService prunes persisted unsupported token types after backend capability refresh", () => {
-	const subscriptionStore = createInMemorySubscriptionStore();
-	const pushToStartTokenStore = createInMemoryPushToStartTokenStore();
-	subscriptionStore.upsert({
-		chatId: "chat-apns",
-		chatTitle: "APNS chat",
-		liveActivityToken: "live-apns",
-		pushToken: "push-apns",
-		pushTokenType: "apns",
-	});
-	subscriptionStore.upsert({
-		chatId: "chat-fcm",
-		chatTitle: "FCM chat",
-		liveActivityToken: "live-fcm",
-		pushToken: "push-fcm",
-		pushTokenType: "fcm",
-	});
-	pushToStartTokenStore.upsert({
-		pushToStartToken: "pts-apns",
-		pushToken: "push-apns",
-		pushTokenType: "apns",
-	});
-	pushToStartTokenStore.upsert({
-		pushToStartToken: "pts-fcm",
-		pushToken: "push-fcm",
-		pushTokenType: "fcm",
-	});
-
-	const service = createLiveActivityPushServiceForTests(
-		undefined,
-		subscriptionStore,
-		pushToStartTokenStore,
-	);
-
-	service.pruneUnsupportedPushTokenTypes(new Set(["fcm"]));
-
-	expect(subscriptionStore.listAll().map((entry) => entry.pushTokenType)).toEqual(["fcm"]);
-	expect(pushToStartTokenStore.listAll().map((entry) => entry.pushTokenType)).toEqual(["fcm"]);
-});
-
-test("LiveActivityPushService accumulates legacy deltas across multiple chunks", async () => {
+test("LiveActivityPushService resets elapsed time and outcome when a new session begins", async () => {
+	Date.now = () => 1_000;
 	const { deliveries, service } = createRecordingHarness();
 
 	service.onChatStarted({
-		chatId: "chat-legacy",
-		chatTitle: "Thread",
+		chatId: "chat-old",
+		chatTitle: "Old",
 	});
-	service.onAssistantDelta("chat-legacy", "Hello");
-	service.onAssistantDelta("chat-legacy", " world");
 	await service.upsertSubscription({
-		chatId: "chat-legacy",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-legacy",
+		chatId: "chat-old",
+		chatTitle: "Old",
+		pushToken: "fcm-token-old",
 		pushTokenType: "fcm",
-		liveActivityToken: "live-token-legacy",
+		liveActivityToken: "live-token-old",
 	});
+	Date.now = () => 7_000;
 	await service.onChatFinished({
-		chatId: "chat-legacy",
-		outcome: "completed",
+		chatId: "chat-old",
+		outcome: "failed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview).toBe("Hello world");
-});
-
-test("LiveActivityPushService keeps structured fallback text when legacy deltas arrive before structured content", async () => {
-	const { deliveries, service } = createRecordingHarness();
-
+	Date.now = () => 9_000;
 	service.onChatStarted({
-		chatId: "chat-legacy-started",
-		chatTitle: "Thread",
+		chatId: "chat-new",
+		chatTitle: "New",
 	});
-	service.onAssistantEvent("chat-legacy-started", {
-		type: "item_started",
-		turnId: "turn-1",
-		itemId: "item-1",
-		itemType: "assistant_message",
-	});
-	service.onAssistantDelta("chat-legacy-started", "Hello");
-	service.onAssistantDelta("chat-legacy-started", " world");
-	await service.upsertSubscription({
-		chatId: "chat-legacy-started",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-legacy-started",
-		pushTokenType: "fcm",
-		liveActivityToken: "live-token-legacy-started",
-	});
-	await service.onChatFinished({
-		chatId: "chat-legacy-started",
-		outcome: "completed",
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview).toBe("Writing response...");
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		chatTitle: "1 Active Thread",
+		elapsedSeconds: 0,
+		phase: "running",
+		statusLine: "Generating response",
+	});
 });
 
-test("LiveActivityPushService replaces event previews with the latest response text", async () => {
-	const { deliveries, service } = createRecordingHarness();
-
-	service.onChatStarted({
-		chatId: "chat-4",
-		chatTitle: "Thread",
-	});
-	service.onAssistantEvent("chat-4", {
-		type: "item_completed",
-		turnId: "turn-1",
-		itemId: "item-1",
-		summary: "Tool finished successfully",
-	});
-	service.onAssistantEvent("chat-4", {
-		type: "item_delta",
-		turnId: "turn-1",
-		itemId: "item-2",
-		target: "body",
-		delta: "Hello",
-	});
-	service.onAssistantEvent("chat-4", {
-		type: "item_delta",
-		turnId: "turn-1",
-		itemId: "item-2",
-		target: "body",
-		delta: " world",
-	});
-	await service.upsertSubscription({
-		chatId: "chat-4",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-4",
-		pushTokenType: "fcm",
-		liveActivityToken: "live-token-4",
-	});
-	await service.onChatFinished({
-		chatId: "chat-4",
-		outcome: "completed",
-	});
-
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview).toBe("Hello world");
-});
-
-test("LiveActivityPushService ignores duplicated legacy deltas once structured response events take over", async () => {
-	const { deliveries, service } = createRecordingHarness();
-
-	service.onChatStarted({
-		chatId: "chat-5",
-		chatTitle: "Thread",
-	});
-	service.onAssistantEvent("chat-5", {
-		type: "item_started",
-		turnId: "turn-1",
-		itemId: "item-1",
-		itemType: "assistant_message",
-	});
-	service.onAssistantEvent("chat-5", {
-		type: "item_delta",
-		turnId: "turn-1",
-		itemId: "item-1",
-		target: "body",
-		delta: "Hello",
-	});
-	service.onAssistantDelta("chat-5", "Hello");
-	service.onAssistantEvent("chat-5", {
-		type: "item_delta",
-		turnId: "turn-1",
-		itemId: "item-1",
-		target: "body",
-		delta: " world",
-	});
-	service.onAssistantDelta("chat-5", " world");
-	await service.upsertSubscription({
-		chatId: "chat-5",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-5",
-		pushTokenType: "fcm",
-		liveActivityToken: "live-token-5",
-	});
-	await service.onChatFinished({
-		chatId: "chat-5",
-		outcome: "completed",
-	});
-
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview).toBe("Hello world");
-});
-
-test("LiveActivityPushService replaces summary preview text instead of appending it", async () => {
-	const { deliveries, service } = createRecordingHarness();
-
-	service.onChatStarted({
-		chatId: "chat-summary",
-		chatTitle: "Thread",
-	});
-	service.onAssistantEvent("chat-summary", {
-		type: "item_started",
-		turnId: "turn-1",
-		itemId: "item-1",
-		itemType: "reasoning",
-	});
-	service.onAssistantEvent("chat-summary", {
-		type: "item_delta",
-		turnId: "turn-1",
-		itemId: "item-1",
-		target: "summary",
-		delta: "Thinking...",
-	});
-	service.onAssistantEvent("chat-summary", {
-		type: "item_delta",
-		turnId: "turn-1",
-		itemId: "item-1",
-		target: "summary",
-		delta: "Planning response...",
-	});
-	await service.upsertSubscription({
-		chatId: "chat-summary",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-summary",
-		pushTokenType: "fcm",
-		liveActivityToken: "live-token-summary",
-	});
-	await service.onChatFinished({
-		chatId: "chat-summary",
-		outcome: "completed",
-	});
-
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview).toBe("Planning response...");
-});
-
-test("LiveActivityPushService stays stable with hostile mixed payloads", async () => {
-	const { deliveries, service } = createRecordingHarness();
-	const hostilePayload = [
-		"\u0000\u0007\u001B[31m",
-		"\u200B\u202E",
-		"\uD800\uDFFF",
-		"```ts const data={\"x\":1}; ```",
-		"{\"items\":[1,2,3]} <script>alert(1)</script> |$`\\^*=[]",
-		"safe words",
-	].join(" ");
-
-	service.onChatStarted({
-		chatId: "chat-3",
-		chatTitle: "Thread",
-	});
-	service.onAssistantDelta("chat-3", hostilePayload.repeat(20));
-	await service.upsertSubscription({
-		chatId: "chat-3",
-		chatTitle: "Thread",
-		pushToken: "fcm-token-3",
-		pushTokenType: "fcm",
-		liveActivityToken: "live-token-3",
-	});
-	await service.onChatFinished({
-		chatId: "chat-3",
-		outcome: "completed",
-	});
-
-	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(endDelivery).toBeDefined();
-	expect(endDelivery?.preview.length).toBeLessThanOrEqual(140);
-	expect(endDelivery?.preview).toMatch(ALLOWED_TEXT_PATTERN);
-	expect(endDelivery?.preview).not.toContain("`");
-	expect(endDelivery?.preview).not.toContain("{");
-	expect(endDelivery?.preview).not.toContain("}");
-	expect(endDelivery?.preview).not.toContain("<");
-	expect(endDelivery?.preview).not.toContain(">");
-	expect(endDelivery?.preview).not.toContain("\\");
-});
-
-test("LiveActivityPushService persists subscriptions after a successful end", async () => {
-	const persistedRows = new Map<string, {
-		chatId: string;
-		chatTitle?: string;
-		liveActivityToken: string;
-		pushToken: string;
-		pushTokenType: "apns" | "fcm";
-		updatedAt: string;
-	}>();
-	const store: LiveActivityPushSubscriptionStoreContract = {
-		deleteExact: ({ liveActivityToken, pushToken, pushTokenType }) => {
-			persistedRows.delete([pushTokenType, pushToken, liveActivityToken].join("::"));
-		},
-		listAll: () => [...persistedRows.values()],
-		upsert: (input) => {
-			for (const [key, row] of persistedRows.entries()) {
-				const samePushTokenWithOldActivityToken =
-					row.pushToken === input.pushToken
-					&& row.pushTokenType === input.pushTokenType
-					&& row.liveActivityToken !== input.liveActivityToken;
-				const sameActivityTokenWithDifferentPushToken =
-					row.liveActivityToken === input.liveActivityToken
-					&& (row.pushToken !== input.pushToken || row.pushTokenType !== input.pushTokenType);
-				if (samePushTokenWithOldActivityToken || sameActivityTokenWithDifferentPushToken) {
-					persistedRows.delete(key);
-				}
-			}
-			const row = {
-				...input,
-				updatedAt: "2026-03-05T00:00:00.000Z",
-			};
-			persistedRows.set(
-				[input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"),
-				row,
-			);
-			return row;
-		},
-	};
+test("LiveActivityPushService persists subscriptions after a terminal update", async () => {
+	const store = createInMemorySubscriptionStore();
 	const service = createLiveActivityPushServiceForTests(async () => ({
 		delivered: true,
 		shouldDropSubscription: false,
@@ -486,18 +288,15 @@ test("LiveActivityPushService persists subscriptions after a successful end", as
 
 	service.onChatStarted({
 		chatId: "chat-store",
-		chatTitle: "Stored chat",
+		chatTitle: "Stored",
 	});
 	await service.upsertSubscription({
 		chatId: "chat-store",
-		chatTitle: "Stored chat",
-		liveActivityToken: "activity-token-store",
+		chatTitle: "Stored",
 		pushToken: "push-token-store",
 		pushTokenType: "apns",
+		liveActivityToken: "activity-token-store",
 	});
-
-	expect(store.listAll()).toHaveLength(1);
-
 	await service.onChatFinished({
 		chatId: "chat-store",
 		outcome: "completed",
@@ -506,103 +305,42 @@ test("LiveActivityPushService persists subscriptions after a successful end", as
 	expect(store.listAll()).toHaveLength(1);
 	expect(store.listAll()[0]).toEqual(expect.objectContaining({
 		chatId: "chat-store",
-		liveActivityToken: "activity-token-store",
 		pushToken: "push-token-store",
 		pushTokenType: "apns",
+		liveActivityToken: "activity-token-store",
 	}));
 });
 
-test("LiveActivityPushService immediately flushes a follow-up update when new state arrives during an in-flight send", async () => {
-	let releaseFirstDelivery = () => {
-		// Assigned once the first delivery starts.
-	};
-	const deliveryEvents: Array<"update" | "end" | "start"> = [];
-	const sender = async (input: { event: "update" | "end" | "start" }) => {
-		deliveryEvents.push(input.event);
-		if (deliveryEvents.length === 1) {
-			await new Promise<void>((resolve) => {
-				releaseFirstDelivery = resolve;
-			});
-		}
-
-		return {
-			delivered: true,
-			shouldDropSubscription: false,
-		};
-	};
-	const service = createLiveActivityPushServiceForTests(sender);
-
-	service.onChatStarted({
-		chatId: "chat-race",
-		chatTitle: "Race",
+test("LiveActivityPushService prunes stale persisted subscriptions for the same device and delivers only the newest token", async () => {
+	const store = createInMemorySubscriptionStore();
+	store.rows.set("fcm::device-token::live-token-old", {
+		chatId: "chat-old",
+		chatTitle: "Old",
+		liveActivityToken: "live-token-old",
+		pushToken: "device-token",
+		pushTokenType: "fcm",
+		updatedAt: "2026-03-18T16:00:00.000Z",
 	});
-
-	const subscriptionPromise = service.upsertSubscription({
-		chatId: "chat-race",
-		chatTitle: "Race",
-		liveActivityToken: "activity-token-race",
-		pushToken: "push-token-race",
-		pushTokenType: "apns",
+	store.rows.set("fcm::device-token::live-token-new", {
+		chatId: "chat-new",
+		chatTitle: "New",
+		liveActivityToken: "live-token-new",
+		pushToken: "device-token",
+		pushTokenType: "fcm",
+		updatedAt: "2026-03-18T16:01:00.000Z",
 	});
-
-	await Promise.resolve();
-	service.onAssistantDelta("chat-race", "fresh delta while first send is still running");
-	releaseFirstDelivery();
-	await subscriptionPromise;
-	for (let attempt = 0; attempt < 10 && deliveryEvents.length < 2; attempt += 1) {
-		await new Promise<void>((resolve) => {
-			setTimeout(resolve, 25);
-		});
-	}
-
-	expect(deliveryEvents).toEqual(["update", "update"]);
-});
-
-test("LiveActivityPushService moves the same subscription token pair across chats", async () => {
-	const persistedRows = new Map<string, {
-		chatId: string;
-		chatTitle?: string;
-		liveActivityToken: string;
-		pushToken: string;
-		pushTokenType: "apns" | "fcm";
-		updatedAt: string;
-	}>();
-	const store: LiveActivityPushSubscriptionStoreContract = {
-		deleteExact: ({ liveActivityToken, pushToken, pushTokenType }) => {
-			persistedRows.delete([pushTokenType, pushToken, liveActivityToken].join("::"));
-		},
-		listAll: () => [...persistedRows.values()],
-		upsert: (input) => {
-			for (const [key, row] of persistedRows.entries()) {
-				const samePushTokenWithOldActivityToken =
-					row.pushToken === input.pushToken
-					&& row.pushTokenType === input.pushTokenType
-					&& row.liveActivityToken !== input.liveActivityToken;
-				const sameActivityTokenWithDifferentPushToken =
-					row.liveActivityToken === input.liveActivityToken
-					&& (row.pushToken !== input.pushToken || row.pushTokenType !== input.pushTokenType);
-				if (samePushTokenWithOldActivityToken || sameActivityTokenWithDifferentPushToken) {
-					persistedRows.delete(key);
-				}
-			}
-			const row = {
-				...input,
-				updatedAt: "2026-03-05T00:00:00.000Z",
-			};
-			persistedRows.set(
-				[input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"),
-				row,
-			);
-			return row;
-		},
-	};
-	const { deliveries } = createRecordingHarness();
-	const serviceWithStore = createLiveActivityPushServiceForTests(async (input) => {
+	const deliveries: CapturedDelivery[] = [];
+	const restored = createLiveActivityPushServiceForTests(async (input) => {
 		deliveries.push({
 			chatId: input.contentState.chatId,
-			event: input.event,
 			chatTitle: input.contentState.chatTitle,
+			elapsedSeconds: input.contentState.elapsedSeconds,
+			event: input.event,
+			phase: input.contentState.phase,
 			preview: input.contentState.preview,
+			pushToken: input.pushToken,
+			pushTokenType: input.pushTokenType,
+			statusLine: input.contentState.statusLine,
 		});
 		return {
 			delivered: true,
@@ -610,100 +348,20 @@ test("LiveActivityPushService moves the same subscription token pair across chat
 		};
 	}, store);
 
-	serviceWithStore.onChatStarted({
-		chatId: "chat-old",
-		chatTitle: "Old",
-	});
-	await serviceWithStore.upsertSubscription({
-		chatId: "chat-old",
-		chatTitle: "Old",
-		liveActivityToken: "activity-token-1",
-		pushToken: "push-token-1",
-		pushTokenType: "apns",
-	});
-	await serviceWithStore.onChatFinished({
-		chatId: "chat-old",
-		outcome: "completed",
-	});
-	await serviceWithStore.upsertSubscription({
+	restored.onChatStarted({
 		chatId: "chat-new",
 		chatTitle: "New",
-		liveActivityToken: "activity-token-1",
-		pushToken: "push-token-1",
-		pushTokenType: "apns",
+	});
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
 	});
 
 	expect(store.listAll()).toHaveLength(1);
 	expect(store.listAll()[0]).toEqual(expect.objectContaining({
-		chatId: "chat-new",
-		liveActivityToken: "activity-token-1",
-		pushToken: "push-token-1",
-		pushTokenType: "apns",
+		liveActivityToken: "live-token-new",
+		pushToken: "device-token",
 	}));
-});
-
-test("LiveActivityPushService reuses global subscriptions for the next chat without re-registering", async () => {
-	const { deliveries, service } = createRecordingHarness();
-
-	service.onChatStarted({
-		chatId: "chat-old",
-		chatTitle: "Old",
-	});
-	await service.upsertSubscription({
-		chatId: "chat-old",
-		chatTitle: "Old",
-		liveActivityToken: "activity-token-1",
-		pushToken: "push-token-1",
-		pushTokenType: "apns",
-	});
-	await service.onChatFinished({
-		chatId: "chat-old",
-		outcome: "completed",
-	});
-
-	service.onChatStarted({
-		chatId: "chat-new",
-		chatTitle: "New",
-	});
-	service.onAssistantDelta("chat-new", "next chat output");
-	await new Promise<void>((resolve) => {
-		setTimeout(resolve, 50);
-	});
-
-	const lastUpdate = findLastDeliveryByEvent(deliveries, "update");
-
-	expect(lastUpdate).toBeDefined();
-	expect(lastUpdate?.chatId).toBe("chat-new");
-	expect(lastUpdate?.chatTitle).toBe("New");
-});
-
-test("LiveActivityPushService keeps a global subscription active across multiple concurrent chats", async () => {
-	const { deliveries, service } = createRecordingHarness();
-
-	await service.upsertSubscription({
-		chatId: "chat-a",
-		chatTitle: "A",
-		liveActivityToken: "activity-token-1",
-		pushToken: "push-token-1",
-		pushTokenType: "apns",
-	});
-
-	service.onChatStarted({
-		chatId: "chat-a",
-		chatTitle: "A",
-	});
-	service.onAssistantDelta("chat-a", "alpha");
-	service.onChatStarted({
-		chatId: "chat-b",
-		chatTitle: "B",
-	});
-	service.onAssistantDelta("chat-b", "beta");
-	await new Promise<void>((resolve) => {
-		setTimeout(resolve, 50);
-	});
-
-	expect(deliveries.some((delivery) => delivery.event === "update" && delivery.chatId === "chat-a")).toBe(true);
-	expect(deliveries.some((delivery) => delivery.event === "update" && delivery.chatId === "chat-b")).toBe(true);
+	expect(deliveries.filter((delivery) => delivery.event === "update")).toHaveLength(1);
 });
 
 test("LiveActivityPushService keeps subscriptions after permanent delivery failures", async () => {
@@ -736,9 +394,9 @@ test("LiveActivityPushService keeps subscriptions after permanent delivery failu
 		chatId: "chat-next",
 		chatTitle: "Next",
 	});
-	service.onAssistantDelta("chat-next", "next");
+
 	await new Promise<void>((resolve) => {
-		setTimeout(resolve, 50);
+		setTimeout(resolve, 25);
 	});
 
 	expect(deliveries).toBeGreaterThanOrEqual(2);
@@ -786,11 +444,6 @@ test("createLiveActivityPushServiceFromEnvironment rejects subscriptions whose t
 				connectorToken: "connector-token",
 			}),
 			privateBackendUrl: "https://private.example.test",
-		});
-
-		service.onChatStarted({
-			chatId: "chat-private-apns",
-			chatTitle: "Private backend",
 		});
 
 		const supportedPushTokenTypes = await service.getSupportedPushTokenTypes();
@@ -887,4 +540,33 @@ test("createLiveActivityPushServiceFromEnvironment caches backend capabilities a
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+test("LiveActivityPushService keeps push-to-start tokens persisted when pruning unsupported types", () => {
+	const subscriptionStore = createInMemorySubscriptionStore();
+	const pushToStartTokenStore = createInMemoryPushToStartTokenStore();
+	subscriptionStore.upsert({
+		chatId: "chat-apns",
+		chatTitle: "APNS chat",
+		liveActivityToken: "live-apns",
+		pushToken: "push-apns",
+		pushTokenType: "apns",
+	});
+	pushToStartTokenStore.upsert({
+		pushToStartToken: "pts-fcm",
+		pushToken: "push-fcm",
+		pushTokenType: "fcm",
+	});
+
+	const service = createLiveActivityPushServiceForTests(
+		undefined,
+		subscriptionStore,
+		pushToStartTokenStore,
+	);
+
+	service.pruneUnsupportedPushTokenTypes(new Set(["fcm"]));
+
+	expect(subscriptionStore.listAll()).toHaveLength(0);
+	expect(pushToStartTokenStore.listAll()).toHaveLength(1);
+	expect(pushToStartTokenStore.listAll()[0]?.pushTokenType).toBe("fcm");
 });

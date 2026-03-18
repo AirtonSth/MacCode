@@ -8,6 +8,11 @@ export interface TrackedLiveActivityChat {
 	chatTitle: string | undefined;
 }
 
+export interface TrackedLiveActivityChatReconciliation {
+	addedChatIds: string[];
+	removedChatIds: string[];
+}
+
 interface ResolveTrackedLiveActivityChatsInput {
 	activeThreads: readonly ActiveThreadSummaryDTO[];
 	selectedChat: Pick<ChatDTO, "id" | "isActive" | "status" | "title"> | null;
@@ -42,4 +47,30 @@ export const resolveTrackedLiveActivityChats = (
 	}
 
 	return Array.from(trackedChats.values());
+};
+
+export const reconcileTrackedLiveActivityChats = (input: {
+	nextTrackedChats: readonly TrackedLiveActivityChat[];
+	previousTrackedChatIds: ReadonlySet<string>;
+}): TrackedLiveActivityChatReconciliation => {
+	const nextTrackedChatIds = new Set(input.nextTrackedChats.map((trackedChat) => trackedChat.chatId));
+	const addedChatIds: string[] = [];
+	const removedChatIds: string[] = [];
+
+	for (const trackedChat of input.nextTrackedChats) {
+		if (!input.previousTrackedChatIds.has(trackedChat.chatId)) {
+			addedChatIds.push(trackedChat.chatId);
+		}
+	}
+
+	for (const previousTrackedChatId of input.previousTrackedChatIds) {
+		if (!nextTrackedChatIds.has(previousTrackedChatId)) {
+			removedChatIds.push(previousTrackedChatId);
+		}
+	}
+
+	return {
+		addedChatIds,
+		removedChatIds,
+	};
 };

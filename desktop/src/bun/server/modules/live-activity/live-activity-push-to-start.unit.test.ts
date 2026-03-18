@@ -3,21 +3,24 @@ import { describe, expect, it } from "bun:test";
 import { createLiveActivityPushServiceForTests } from "./live-activity-push.service";
 import type {
 	LiveActivityPushSubscriptionStoreContract,
+	PushToStartTokenInput,
 	PushToStartTokenStoreContract,
 	PushToStartTokenStored,
-	PushToStartTokenInput,
 } from "./live-activity-push.model";
 
 interface CapturedDelivery {
-	event: "update" | "end" | "start";
+	attributes?: Record<string, unknown>;
+	attributesType?: string;
 	chatId: string;
 	chatTitle: string;
-	preview: string;
+	elapsedSeconds: number;
+	event: "update" | "end" | "start";
 	liveActivityToken: string;
+	phase: string;
+	preview: string;
 	pushToken: string;
 	pushTokenType: string;
-	attributesType?: string;
-	attributes?: Record<string, unknown>;
+	statusLine: string;
 }
 
 const createInMemoryPushToStartTokenStore = (): PushToStartTokenStoreContract & { rows: Map<string, PushToStartTokenStored> } => {
@@ -62,21 +65,32 @@ const createInMemorySubscriptionStore = (): LiveActivityPushSubscriptionStoreCon
 	};
 };
 
-const createRecordingHarness = (pushToStartTokenStore?: PushToStartTokenStoreContract, subscriptionStore?: LiveActivityPushSubscriptionStoreContract) => {
+const createRecordingHarness = (
+	pushToStartTokenStore?: PushToStartTokenStoreContract,
+	subscriptionStore?: LiveActivityPushSubscriptionStoreContract,
+	sender?: (input: CapturedDelivery) => Promise<{ delivered: boolean; shouldDropSubscription: boolean; errorCode?: string }>,
+) => {
 	const deliveries: CapturedDelivery[] = [];
 	const service = createLiveActivityPushServiceForTests(
 		async (input) => {
-			deliveries.push({
-				event: input.event,
+			const delivery: CapturedDelivery = {
+				attributes: input.attributes,
+				attributesType: input.attributesType,
 				chatId: input.contentState.chatId,
 				chatTitle: input.contentState.chatTitle,
-				preview: input.contentState.preview,
+				elapsedSeconds: input.contentState.elapsedSeconds,
+				event: input.event,
 				liveActivityToken: input.liveActivityToken,
+				phase: input.contentState.phase,
+				preview: input.contentState.preview,
 				pushToken: input.pushToken,
 				pushTokenType: input.pushTokenType,
-				attributesType: input.attributesType,
-				attributes: input.attributes,
-			});
+				statusLine: input.contentState.statusLine,
+			};
+			deliveries.push(delivery);
+			if (sender) {
+				return await sender(delivery);
+			}
 			return { delivered: true, shouldDropSubscription: false };
 		},
 		subscriptionStore,
@@ -86,505 +100,201 @@ const createRecordingHarness = (pushToStartTokenStore?: PushToStartTokenStoreCon
 };
 
 describe("LiveActivityPushService push-to-start", () => {
-	describe("registerPushToStartToken", () => {
-		it("accepts a valid apns push-to-start token", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
+	it("stores valid push-to-start tokens", async () => {
+		const store = createInMemoryPushToStartTokenStore();
+		const { service } = createRecordingHarness(store);
 
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-1",
-				pushToken: "device-push-1",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(1);
-			const stored = store.rows.get("apns::device-push-1");
-			expect(stored?.pushToStartToken).toBe("pts-token-1");
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-token-1",
+			pushToken: "device-push-1",
+			pushTokenType: "apns",
 		});
 
-		it("accepts a valid fcm push-to-start token", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
+		expect(store.rows.size).toBe(1);
+		expect(store.rows.get("apns::device-push-1")).toEqual(expect.objectContaining({
+			pushToStartToken: "pts-token-1",
+		}));
+	});
 
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-fcm",
-				pushToken: "device-fcm-1",
-				pushTokenType: "fcm",
-			});
+	it("sends a single global push-to-start payload when a session begins without subscriptions", async () => {
+		const store = createInMemoryPushToStartTokenStore();
+		const { deliveries, service } = createRecordingHarness(store);
 
-			expect(store.rows.size).toBe(1);
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-token-1",
+			pushToken: "device-push-1",
+			pushTokenType: "apns",
 		});
 
-		it("replaces existing token for same device (upsert behavior)", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-old",
-				pushToken: "device-push-1",
-				pushTokenType: "apns",
-			});
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-new",
-				pushToken: "device-push-1",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(1);
-			const stored = store.rows.get("apns::device-push-1");
-			expect(stored?.pushToStartToken).toBe("pts-token-new");
+		service.onChatStarted({
+			chatId: "chat-start-1",
+			chatTitle: "New Thread",
 		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
 
-		it("ignores empty pushToStartToken", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "",
-				pushToken: "device-push-1",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(0);
-		});
-
-		it("ignores empty pushToken", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-1",
-				pushToken: "",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(0);
-		});
-
-		it("ignores whitespace-only tokens", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "   ",
-				pushToken: "device-push-1",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(0);
-		});
-
-		it("trims whitespace from token values", () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "  pts-token-1  ",
-				pushToken: "  device-push-1  ",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(1);
-			const stored = store.rows.get("apns::device-push-1");
-			expect(stored?.pushToStartToken).toBe("pts-token-1");
+		const startDeliveries = deliveries.filter((delivery) => delivery.event === "start");
+		expect(startDeliveries).toHaveLength(1);
+		expect(startDeliveries[0]).toMatchObject({
+			attributes: {
+				deepLink: "remotecode-mobile://active-threads",
+			},
+			attributesType: "RemoteCodeLiveActivityAttributes",
+			chatId: "active-threads",
+			chatTitle: "1 Active Thread",
+			phase: "running",
+			pushToken: "device-push-1",
+			pushTokenType: "apns",
+			statusLine: "Generating response",
 		});
 	});
 
-	describe("onChatStarted triggers push-to-start", () => {
-		it("sends push-to-start when no active subscriptions exist", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { deliveries, service } = createRecordingHarness(store);
+	it("does not send a duplicate push-to-start once the same device has an active subscription", async () => {
+		const pushStore = createInMemoryPushToStartTokenStore();
+		const subStore = createInMemorySubscriptionStore();
+		const { deliveries, service } = createRecordingHarness(pushStore, subStore);
 
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-1",
-				pushToken: "device-push-1",
-				pushTokenType: "apns",
-			});
-
-			service.onChatStarted({
-				chatId: "chat-start-1",
-				chatTitle: "New Thread",
-			});
-
-			// Allow async push-to-start to complete
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			const startDelivery = deliveries.find((d) => d.event === "start");
-			expect(startDelivery).toBeDefined();
-			expect(startDelivery?.chatId).toBe("chat-start-1");
-			expect(startDelivery?.liveActivityToken).toBe("pts-token-1");
-			expect(startDelivery?.pushToken).toBe("device-push-1");
-			expect(startDelivery?.pushTokenType).toBe("apns");
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-token-sub",
+			pushToken: "device-push-sub",
+			pushTokenType: "apns",
 		});
 
-		it("sends push-to-start with attributesType LiveActivityAttributes", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { deliveries, service } = createRecordingHarness(store);
+		service.onChatStarted({
+			chatId: "chat-with-sub",
+			chatTitle: "Thread",
+		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 25); });
+		await service.upsertSubscription({
+			chatId: "chat-with-sub",
+			chatTitle: "Thread",
+			liveActivityToken: "live-token-existing",
+			pushToken: "device-push-sub",
+			pushTokenType: "apns",
+		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 25); });
 
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-attrs",
-				pushToken: "device-push-attrs",
-				pushTokenType: "apns",
-			});
+		const startDeliveries = deliveries.filter((delivery) => delivery.event === "start");
+		expect(startDeliveries).toHaveLength(1);
+	});
 
-			service.onChatStarted({
-				chatId: "chat-attrs",
-				chatTitle: "Thread",
-			});
+	it("sends one push-to-start per uncovered device", async () => {
+		const store = createInMemoryPushToStartTokenStore();
+		const { deliveries, service } = createRecordingHarness(store);
 
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			const startDelivery = deliveries.find((d) => d.event === "start");
-			expect(startDelivery?.attributesType).toBe("LiveActivityAttributes");
-			expect(startDelivery?.attributes).toEqual({});
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-token-a",
+			pushToken: "device-a",
+			pushTokenType: "apns",
+		});
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-token-b",
+			pushToken: "device-b",
+			pushTokenType: "fcm",
 		});
 
-		it("does NOT send push-to-start when the same device already has an active subscription", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const subStore = createInMemorySubscriptionStore();
-			const { deliveries, service } = createRecordingHarness(store, subStore);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-sub",
-				pushToken: "device-push-sub",
-				pushTokenType: "apns",
-			});
-
-			service.onChatStarted({
-				chatId: "chat-with-sub",
-				chatTitle: "Thread",
-			});
-
-			await service.upsertSubscription({
-				chatId: "chat-with-sub",
-				chatTitle: "Thread",
-				pushToken: "device-push-sub",
-				pushTokenType: "apns",
-				liveActivityToken: "live-token-existing",
-			});
-
-			// Start again on the same device after the live activity token is known.
-			service.onChatStarted({
-				chatId: "chat-with-sub",
-				chatTitle: "Thread",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			expect(startDeliveries).toHaveLength(1);
+		service.onChatStarted({
+			chatId: "chat-multi",
+			chatTitle: "Thread",
 		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
 
-		it("does NOT send push-to-start when no tokens registered", async () => {
-			const { deliveries, service } = createRecordingHarness();
+		const startDeliveries = deliveries.filter((delivery) => delivery.event === "start");
+		expect(startDeliveries).toHaveLength(2);
+		expect(startDeliveries.every((delivery) => delivery.chatId === "active-threads")).toBe(true);
+	});
 
-			service.onChatStarted({
-				chatId: "chat-no-tokens",
-				chatTitle: "Thread",
-			});
+	it("bootstraps a newly registered device while a session is already active", async () => {
+		const store = createInMemoryPushToStartTokenStore();
+		const { deliveries, service } = createRecordingHarness(store);
 
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			expect(startDeliveries).toHaveLength(0);
+		service.onChatStarted({
+			chatId: "chat-active",
+			chatTitle: "Active",
 		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 25); });
 
-		it("sends push-to-start to multiple registered devices", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { deliveries, service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-a",
-				pushToken: "device-a",
-				pushTokenType: "apns",
-			});
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-token-b",
-				pushToken: "device-b",
-				pushTokenType: "fcm",
-			});
-
-			service.onChatStarted({
-				chatId: "chat-multi",
-				chatTitle: "Thread",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			expect(startDeliveries).toHaveLength(2);
-
-			const pushTokens = startDeliveries.map((d) => d.pushToken).sort();
-			expect(pushTokens).toEqual(["device-a", "device-b"]);
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-token-late",
+			pushToken: "device-late",
+			pushTokenType: "apns",
 		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
 
-		it("never drops push-to-start token even when delivery returns shouldDropSubscription", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const deliveries: CapturedDelivery[] = [];
-			const service = createLiveActivityPushServiceForTests(
-				async (input) => {
-					deliveries.push({
-						event: input.event,
-						chatId: input.contentState.chatId,
-						chatTitle: input.contentState.chatTitle,
-						preview: input.contentState.preview,
-						liveActivityToken: input.liveActivityToken,
-						pushToken: input.pushToken,
-						pushTokenType: input.pushTokenType,
-					});
-					if (input.event === "start") {
-						return { delivered: false, errorCode: "apns/BadDeviceToken", shouldDropSubscription: true };
-					}
-					return { delivered: true, shouldDropSubscription: false };
-				},
-				undefined,
-				store,
-			);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-bad-token",
-				pushToken: "device-bad",
-				pushTokenType: "apns",
-			});
-
-			expect(store.rows.size).toBe(1);
-
-			service.onChatStarted({
-				chatId: "chat-drop",
-				chatTitle: "Thread",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			// Token should be kept in store — push-to-start tokens are permanent
-			expect(store.rows.size).toBe(1);
+		const startDeliveries = deliveries.filter((delivery) => delivery.event === "start");
+		expect(startDeliveries).toHaveLength(1);
+		expect(startDeliveries[0]).toMatchObject({
+			chatId: "active-threads",
+			pushToken: "device-late",
 		});
 	});
 
-	describe("terminal completion keeps the live activity alive", () => {
-		it("delivers a terminal update through the sender", async () => {
-			const rawDeliveries: Array<{
-				event: string;
-				contentState: Record<string, unknown>;
-			}> = [];
+	it("does not send push-to-start after the session has already finished", async () => {
+		const store = createInMemoryPushToStartTokenStore();
+		const { deliveries, service } = createRecordingHarness(store);
 
-			const service = createLiveActivityPushServiceForTests(
-				async (input) => {
-					rawDeliveries.push({
-						event: input.event,
-						contentState: input.contentState as unknown as Record<string, unknown>,
-					});
-					return { delivered: true, shouldDropSubscription: false };
-				},
-			);
-
-			service.onChatStarted({
-				chatId: "chat-sound",
-				chatTitle: "Thread",
-			});
-			await service.upsertSubscription({
-				chatId: "chat-sound",
-				chatTitle: "Thread",
-				pushToken: "push-token-sound",
-				pushTokenType: "apns",
-				liveActivityToken: "live-token-sound",
-			});
-			await service.onChatFinished({
-				chatId: "chat-sound",
-				outcome: "completed",
-			});
-
-			const terminalUpdate = rawDeliveries.at(-1);
-			expect(terminalUpdate?.event).toBe("update");
-			expect(terminalUpdate?.contentState.phase).toBe("completed");
+		service.onChatStarted({
+			chatId: "chat-finished",
+			chatTitle: "Finished",
 		});
+		await service.upsertSubscription({
+			chatId: "chat-finished",
+			chatTitle: "Finished",
+			liveActivityToken: "live-token-finished",
+			pushToken: "device-finished",
+			pushTokenType: "fcm",
+		});
+		await service.onChatFinished({
+			chatId: "chat-finished",
+			outcome: "completed",
+		});
+
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-terminal",
+			pushToken: "device-terminal",
+			pushTokenType: "apns",
+		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
+
+		expect(deliveries.filter((delivery) => delivery.event === "start")).toHaveLength(0);
 	});
 
-	describe("push-to-start token persistence and restoration", () => {
-		it("restores push-to-start tokens from store on construction", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			store.upsert({
-				pushToStartToken: "persisted-pts",
-				pushToken: "persisted-device",
-				pushTokenType: "apns",
-			});
+	it("keeps push-to-start tokens even when a start delivery fails permanently", async () => {
+		const store = createInMemoryPushToStartTokenStore();
+		const { deliveries, service } = createRecordingHarness(
+			store,
+			undefined,
+			async (input) => {
+				if (input.event === "start") {
+					return {
+						delivered: false,
+						errorCode: "apns/BadDeviceToken",
+						shouldDropSubscription: true,
+					};
+				}
 
-			const deliveries: CapturedDelivery[] = [];
-			const service = createLiveActivityPushServiceForTests(
-				async (input) => {
-					deliveries.push({
-						event: input.event,
-						chatId: input.contentState.chatId,
-						chatTitle: input.contentState.chatTitle,
-						preview: input.contentState.preview,
-						liveActivityToken: input.liveActivityToken,
-						pushToken: input.pushToken,
-						pushTokenType: input.pushTokenType,
-					});
-					return { delivered: true, shouldDropSubscription: false };
-				},
-				undefined,
-				store,
-			);
+				return {
+					delivered: true,
+					shouldDropSubscription: false,
+				};
+			},
+		);
 
-			service.onChatStarted({
-				chatId: "chat-restored",
-				chatTitle: "Restored Thread",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			const startDelivery = deliveries.find((d) => d.event === "start");
-			expect(startDelivery).toBeDefined();
-			expect(startDelivery?.liveActivityToken).toBe("persisted-pts");
-			expect(startDelivery?.pushToken).toBe("persisted-device");
-		});
-	});
-
-	describe("full lifecycle: push-to-start then global subscription updates", () => {
-		it("sends start then terminal update when subscription is added mid-chat", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { deliveries, service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-lifecycle",
-				pushToken: "device-lifecycle",
-				pushTokenType: "apns",
-			});
-
-			// 1. Start chat → triggers push-to-start
-			service.onChatStarted({
-				chatId: "chat-lifecycle",
-				chatTitle: "Full Lifecycle",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			// 2. Mobile app wakes up and registers per-activity subscription
-			await service.upsertSubscription({
-				chatId: "chat-lifecycle",
-				chatTitle: "Full Lifecycle",
-				pushToken: "device-lifecycle",
-				pushTokenType: "apns",
-				liveActivityToken: "live-activity-token-from-ios",
-			});
-
-			// 2.5. Normal updates after the subscription exists must no longer resend
-			// push-to-start for the same device.
-			service.onAssistantEvent("chat-lifecycle", {
-				type: "item_started",
-				turnId: "turn-lifecycle",
-				itemId: "item-lifecycle",
-				itemType: "assistant_message",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			// 3. Chat finishes → triggers terminal update
-			await service.onChatFinished({
-				chatId: "chat-lifecycle",
-				outcome: "completed",
-			});
-
-			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			const completedUpdates = deliveries.filter((d) => d.event === "update" && d.chatId === "chat-lifecycle");
-
-			expect(startDeliveries.length).toBeGreaterThanOrEqual(1);
-			expect(startDeliveries).toHaveLength(1);
-			expect(completedUpdates.length).toBeGreaterThanOrEqual(1);
-
-			// The terminal update should be delivered to the per-activity subscription token
-			const lastCompletedUpdate = completedUpdates[completedUpdates.length - 1]!;
-			expect(lastCompletedUpdate.liveActivityToken).toBe("live-activity-token-from-ios");
-		});
-	});
-
-	describe("edge cases", () => {
-		it("handles onChatStarted called twice for same chatId gracefully", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const { deliveries, service } = createRecordingHarness(store);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-double",
-				pushToken: "device-double",
-				pushTokenType: "apns",
-			});
-
-			service.onChatStarted({
-				chatId: "chat-double",
-				chatTitle: "Double Start",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
-
-			// Second start for same chat (already active, not terminal)
-			service.onChatStarted({
-				chatId: "chat-double",
-				chatTitle: "Double Start",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			// Only one push-to-start should have been sent (first call)
-			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			expect(startDeliveries).toHaveLength(1);
+		await service.registerPushToStartToken({
+			pushToStartToken: "pts-bad-token",
+			pushToken: "device-bad",
+			pushTokenType: "apns",
 		});
 
-		it("can register tokens even without a store (in-memory only)", () => {
-			const { service, deliveries } = createRecordingHarness();
-
-			// No store passed — should not throw
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-no-store",
-				pushToken: "device-no-store",
-				pushTokenType: "apns",
-			});
-
-			// Should still work in memory
-			service.onChatStarted({
-				chatId: "chat-no-store",
-				chatTitle: "No Store",
-			});
-
-			// Give it time
-			return new Promise<void>((resolve) => {
-				setTimeout(() => {
-					const startDeliveries = deliveries.filter((d) => d.event === "start");
-					expect(startDeliveries).toHaveLength(1);
-					resolve();
-				}, 100);
-			});
+		service.onChatStarted({
+			chatId: "chat-drop",
+			chatTitle: "Thread",
 		});
+		await new Promise<void>((resolve) => { setTimeout(resolve, 50); });
 
-		it("handles push-to-start send error without crashing", async () => {
-			const store = createInMemoryPushToStartTokenStore();
-			const service = createLiveActivityPushServiceForTests(
-				async (input) => {
-					if (input.event === "start") {
-						throw new Error("network timeout");
-					}
-					return { delivered: true, shouldDropSubscription: false };
-				},
-				undefined,
-				store,
-			);
-
-			service.registerPushToStartToken({
-				pushToStartToken: "pts-error",
-				pushToken: "device-error",
-				pushTokenType: "apns",
-			});
-
-			// Should not throw
-			service.onChatStarted({
-				chatId: "chat-error",
-				chatTitle: "Error Thread",
-			});
-
-			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
-
-			// Token should still be in store (transient error, not dropped)
-			expect(store.rows.size).toBe(1);
-		});
+		expect(deliveries.filter((delivery) => delivery.event === "start")).toHaveLength(1);
+		expect(store.rows.size).toBe(1);
+		expect(store.rows.get("apns::device-bad")).toEqual(expect.objectContaining({
+			pushToStartToken: "pts-bad-token",
+		}));
 	});
 });

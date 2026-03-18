@@ -1,0 +1,403 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0C6B1DDFFD091719B7D5D070 /* WatchSnapshotPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5E020FE9FBAB09DD0CF282A /* WatchSnapshotPresentationTests.swift */; };
+		2AB37EB06C89959B36FF4C24 /* LiveActivitySharedSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6B325C9B08BC1F60EEB611F /* LiveActivitySharedSnapshot.swift */; };
+		2F0035879D5CB512BDAF10EA /* WatchSnapshotPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAA426FF16B9528BE5E7C5FF /* WatchSnapshotPresentation.swift */; };
+		744D150942EBCD7931131972 /* WatchSnapshotContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7879B0F5E5910E99AB876B10 /* WatchSnapshotContentView.swift */; };
+		82EFA983D20ABBC8D8E23DF0 /* RemoteCodeWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = D84A89A3E40427F58D615C5F /* RemoteCodeWatchApp.swift */; };
+		AC4CE067BC7509C2753AC843 /* WatchSnapshotPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAA426FF16B9528BE5E7C5FF /* WatchSnapshotPresentation.swift */; };
+		CD224EF712C798D777AEB06C /* LiveActivitySharedSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6B325C9B08BC1F60EEB611F /* LiveActivitySharedSnapshot.swift */; };
+		F5D6CF651A6809B9F548625B /* WatchSnapshotSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8660A7847762A074EDAEB1E /* WatchSnapshotSession.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		7879B0F5E5910E99AB876B10 /* WatchSnapshotContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSnapshotContentView.swift; sourceTree = "<group>"; };
+		8600DA1DD4E5CE105BFE8D51 /* RemoteCodeWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RemoteCodeWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A5E020FE9FBAB09DD0CF282A /* WatchSnapshotPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSnapshotPresentationTests.swift; sourceTree = "<group>"; };
+		C8660A7847762A074EDAEB1E /* WatchSnapshotSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSnapshotSession.swift; sourceTree = "<group>"; };
+		D6B325C9B08BC1F60EEB611F /* LiveActivitySharedSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivitySharedSnapshot.swift; sourceTree = "<group>"; };
+		D84A89A3E40427F58D615C5F /* RemoteCodeWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteCodeWatchApp.swift; sourceTree = "<group>"; };
+		E0A9F5B1423469235038583C /* RemoteCodeWatchLogicTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RemoteCodeWatchLogicTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FAA426FF16B9528BE5E7C5FF /* WatchSnapshotPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSnapshotPresentation.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		16D9753D4BF2D8B49772CF31 /* RemoteCodeWatchLogicTests */ = {
+			isa = PBXGroup;
+			children = (
+				A5E020FE9FBAB09DD0CF282A /* WatchSnapshotPresentationTests.swift */,
+			);
+			name = RemoteCodeWatchLogicTests;
+			path = Tests/RemoteCodeWatchLogicTests;
+			sourceTree = "<group>";
+		};
+		2138C89086343BCA642CFD42 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				8600DA1DD4E5CE105BFE8D51 /* RemoteCodeWatch.app */,
+				E0A9F5B1423469235038583C /* RemoteCodeWatchLogicTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		9CE811A6B2DD3097D1D3ECA5 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				D84A89A3E40427F58D615C5F /* RemoteCodeWatchApp.swift */,
+				7879B0F5E5910E99AB876B10 /* WatchSnapshotContentView.swift */,
+				C8660A7847762A074EDAEB1E /* WatchSnapshotSession.swift */,
+			);
+			name = App;
+			path = Sources/App;
+			sourceTree = "<group>";
+		};
+		A09F9AE0DFC1E48EDA4731ED /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				D6B325C9B08BC1F60EEB611F /* LiveActivitySharedSnapshot.swift */,
+				FAA426FF16B9528BE5E7C5FF /* WatchSnapshotPresentation.swift */,
+			);
+			name = Core;
+			path = Sources/Core;
+			sourceTree = "<group>";
+		};
+		D6F3A725F2F707356060AB1F = {
+			isa = PBXGroup;
+			children = (
+				9CE811A6B2DD3097D1D3ECA5 /* App */,
+				A09F9AE0DFC1E48EDA4731ED /* Core */,
+				16D9753D4BF2D8B49772CF31 /* RemoteCodeWatchLogicTests */,
+				2138C89086343BCA642CFD42 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		154082EEDA58E5D2C50D9AD7 /* RemoteCodeWatch */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A3902A2CAFA9588307EA6304 /* Build configuration list for PBXNativeTarget "RemoteCodeWatch" */;
+			buildPhases = (
+				D175EA90E52AD4E8A5EDE73C /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RemoteCodeWatch;
+			packageProductDependencies = (
+			);
+			productName = RemoteCodeWatch;
+			productReference = 8600DA1DD4E5CE105BFE8D51 /* RemoteCodeWatch.app */;
+			productType = "com.apple.product-type.application";
+		};
+		51A76CCD634EF2942A967B1B /* RemoteCodeWatchLogicTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C80446EFD4BE7662CD812D28 /* Build configuration list for PBXNativeTarget "RemoteCodeWatchLogicTests" */;
+			buildPhases = (
+				71B976507F66A38A3C9FEA7A /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RemoteCodeWatchLogicTests;
+			packageProductDependencies = (
+			);
+			productName = RemoteCodeWatchLogicTests;
+			productReference = E0A9F5B1423469235038583C /* RemoteCodeWatchLogicTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		9AD13C12E183F78A934D0B03 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 2AC5850D6F13739B4994830B /* Build configuration list for PBXProject "RemoteCodeWatch" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = D6F3A725F2F707356060AB1F;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 2138C89086343BCA642CFD42 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				154082EEDA58E5D2C50D9AD7 /* RemoteCodeWatch */,
+				51A76CCD634EF2942A967B1B /* RemoteCodeWatchLogicTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		71B976507F66A38A3C9FEA7A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CD224EF712C798D777AEB06C /* LiveActivitySharedSnapshot.swift in Sources */,
+				2F0035879D5CB512BDAF10EA /* WatchSnapshotPresentation.swift in Sources */,
+				0C6B1DDFFD091719B7D5D070 /* WatchSnapshotPresentationTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D175EA90E52AD4E8A5EDE73C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2AB37EB06C89959B36FF4C24 /* LiveActivitySharedSnapshot.swift in Sources */,
+				82EFA983D20ABBC8D8E23DF0 /* RemoteCodeWatchApp.swift in Sources */,
+				744D150942EBCD7931131972 /* WatchSnapshotContentView.swift in Sources */,
+				AC4CE067BC7509C2753AC843 /* WatchSnapshotPresentation.swift in Sources */,
+				F5D6CF651A6809B9F548625B /* WatchSnapshotSession.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		3567A9ED03F6997B6F2A86AB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Release;
+		};
+		7E6750DC1ABC0AAD305EFEA7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Debug;
+		};
+		E20E928DC6DE3D5259357815 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch.tests;
+				PRODUCT_NAME = RemoteCodeWatchLogicTests;
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.1;
+			};
+			name = Debug;
+		};
+		E314111DE8D550452E80EB28 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch.tests;
+				PRODUCT_NAME = RemoteCodeWatchLogicTests;
+				SDKROOT = macosx;
+				SWIFT_VERSION = 5.1;
+			};
+			name = Release;
+		};
+		E99640E141411EA9F9EBD9B3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_WKApplication = YES;
+				INFOPLIST_KEY_WKWatchOnly = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch;
+				PRODUCT_NAME = RemoteCodeWatch;
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.1;
+				TARGETED_DEVICE_FAMILY = 4;
+			};
+			name = Debug;
+		};
+		F38CD22A3D1642BE435E3551 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_WKApplication = YES;
+				INFOPLIST_KEY_WKWatchOnly = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch;
+				PRODUCT_NAME = RemoteCodeWatch;
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.1;
+				TARGETED_DEVICE_FAMILY = 4;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		2AC5850D6F13739B4994830B /* Build configuration list for PBXProject "RemoteCodeWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7E6750DC1ABC0AAD305EFEA7 /* Debug */,
+				3567A9ED03F6997B6F2A86AB /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		A3902A2CAFA9588307EA6304 /* Build configuration list for PBXNativeTarget "RemoteCodeWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E99640E141411EA9F9EBD9B3 /* Debug */,
+				F38CD22A3D1642BE435E3551 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C80446EFD4BE7662CD812D28 /* Build configuration list for PBXNativeTarget "RemoteCodeWatchLogicTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E20E928DC6DE3D5259357815 /* Debug */,
+				E314111DE8D550452E80EB28 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 9AD13C12E183F78A934D0B03 /* Project object */;
+}

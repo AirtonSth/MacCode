@@ -1,7 +1,10 @@
 /* eslint-disable import/no-unresolved */
 import { describe, expect, test } from "bun:test";
 
-import { resolveTrackedLiveActivityChats } from "./live-activity-tracking";
+import {
+	reconcileTrackedLiveActivityChats,
+	resolveTrackedLiveActivityChats,
+} from "./live-activity-tracking";
 
 describe("resolveTrackedLiveActivityChats", () => {
 	test("tracks all active threads and deduplicates the selected running chat", () => {
@@ -70,5 +73,41 @@ describe("resolveTrackedLiveActivityChats", () => {
 			},
 			selectedChatId: "chat-done",
 		})).toEqual([]);
+	});
+});
+
+describe("reconcileTrackedLiveActivityChats", () => {
+	test("returns added and removed chat ids against the previous authoritative set", () => {
+		expect(reconcileTrackedLiveActivityChats({
+			nextTrackedChats: [
+				{
+					chatId: "chat-b",
+					chatTitle: "Thread B",
+				},
+				{
+					chatId: "chat-c",
+					chatTitle: "Thread C",
+				},
+			],
+			previousTrackedChatIds: new Set(["chat-a", "chat-b"]),
+		})).toEqual({
+			addedChatIds: ["chat-c"],
+			removedChatIds: ["chat-a"],
+		});
+	});
+
+	test("returns empty diffs when the authoritative set is unchanged", () => {
+		expect(reconcileTrackedLiveActivityChats({
+			nextTrackedChats: [
+				{
+					chatId: "chat-a",
+					chatTitle: "Thread A",
+				},
+			],
+			previousTrackedChatIds: new Set(["chat-a"]),
+		})).toEqual({
+			addedChatIds: [],
+			removedChatIds: [],
+		});
 	});
 });

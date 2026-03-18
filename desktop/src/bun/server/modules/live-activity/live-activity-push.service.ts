@@ -12,22 +12,27 @@ import type {
 	PushToStartTokenStoreContract,
 	PushToStartTokenStored,
 } from "./live-activity-push.model";
+import { createApnsSender, loadApnsConfigFromEnvironment, type ApnsSendInput } from "./apns-sender";
 
 const PUSH_MIN_UPDATE_INTERVAL_MS = 15_000;
 const PUSH_HEARTBEAT_INTERVAL_MS = 15_000;
 const PUSH_STALE_WINDOW_SECONDS = 180;
 const PUSH_END_DISMISS_SECONDS = 30;
 const PRIVATE_BACKEND_STATUS_CACHE_TTL_MS = 30_000;
+const GLOBAL_ACTIVITY_CHAT_ID = "active-threads";
+const GLOBAL_ACTIVITY_TITLE = "Active Threads";
 const PREVIEW_LIMIT = 140;
 const TITLE_LIMIT = 80;
 const STATUS_LIMIT = 80;
 const SANITIZE_INPUT_CODEPOINT_LIMIT = 4_096;
 const PREVIEW_ELLIPSIS = "...";
-const LIVE_ACTIVITY_NAME = "ThreadLiveActivity";
+const LIVE_ACTIVITY_ATTRIBUTES_TYPE = "RemoteCodeLiveActivityAttributes";
+const LIVE_ACTIVITY_DEEP_LINK = "remotecode-mobile://active-threads";
 const LIVE_ACTIVITY_LOG_PREFIX = "[live-activity]";
 
 
 type PushEvent = "update" | "end" | "start";
+type TerminalOutcome = Extract<LiveActivityPhase, "completed" | "error" | "failed">;
 
 interface LiveActivityContentState {
 	chatId: string;
@@ -63,6 +68,18 @@ interface ChatRuntimeState {
 	sending: boolean;
 	sendAgain: boolean;
 	pendingEvent: PushEvent | null;
+}
+
+interface GlobalSessionState {
+	elapsedSecondsSnapshot: number | null;
+	flushTimeout: ReturnType<typeof setTimeout> | null;
+	heartbeatInterval: ReturnType<typeof setInterval> | null;
+	lastSentAtMs: number;
+	pendingEvent: PushEvent | null;
+	revision: number;
+	sendAgain: boolean;
+	sending: boolean;
+	startedAtMs: number;
 }
 
 interface LiveActivityPushDeliveryInput {
@@ -141,37 +158,35 @@ export const buildLiveActivityApsPayload = (input: {
 	const timestampSeconds = typeof input.timestampSeconds === "number" && Number.isFinite(input.timestampSeconds)
 		? Math.max(0, Math.floor(input.timestampSeconds))
 		: Math.floor((input.nowMs ?? Date.now()) / 1_000);
-	const serializedProps = (() => {
+	const normalizedContentState = (() => {
 		try {
-			const payload = JSON.stringify(input.contentState);
-			const parsed = JSON.parse(payload) as unknown;
+			const parsed = JSON.parse(JSON.stringify(input.contentState)) as unknown;
 			if (!parsed || typeof parsed !== "object") {
 				throw new Error("invalid serialized props");
 			}
-			return payload;
+			return parsed as Record<string, unknown>;
 		} catch {
-			return JSON.stringify({
+			return {
 				chatId: "unknown",
 				chatTitle: "Thread",
 				elapsedSeconds: 0,
 				phase: "running",
 				preview: "Working on your latest request.",
 				statusLine: "Generating response",
-			});
+			};
 		}
 	})();
 	const apsPayload: Record<string, unknown> = {
 		timestamp: timestampSeconds,
 		event: input.event,
-		"content-state": {
-			name: LIVE_ACTIVITY_NAME,
-			props: serializedProps,
-		},
+		"content-state": normalizedContentState,
 	};
 
 	if (input.event === "start") {
-		apsPayload["attributes-type"] = input.attributesType ?? "LiveActivityAttributes";
-		apsPayload["attributes"] = input.attributes ?? {};
+		apsPayload["attributes-type"] = input.attributesType ?? LIVE_ACTIVITY_ATTRIBUTES_TYPE;
+		apsPayload["attributes"] = input.attributes ?? {
+			deepLink: LIVE_ACTIVITY_DEEP_LINK,
+		};
 		apsPayload["stale-date"] = timestampSeconds + PUSH_STALE_WINDOW_SECONDS;
 	}
 
@@ -344,6 +359,39 @@ const toDefaultPreview = (phase: LiveActivityPhase): string => {
 	}
 };
 
+const toRunningStatusLine = (count: number): string =>
+	count === 1 ? "1 thread active" : `${String(count)} threads active`;
+
+const toRunningPreview = (count: number): string =>
+	count === 1
+		? "RemoteCode is working on 1 active thread."
+		: `RemoteCode is working on ${String(count)} active threads.`;
+
+const toFinalizingStatusLine = (count: number): string =>
+	count === 1 ? "Finalizing 1 thread" : `Finalizing ${String(count)} threads`;
+
+const toFinalizingPreview = (count: number): string =>
+	count === 1
+		? "RemoteCode is wrapping up the remaining thread."
+		: "RemoteCode is wrapping up the remaining threads.";
+
+const toTerminalStatusLine = (outcome: TerminalOutcome): string => {
+	switch (outcome) {
+		case "failed": {
+			return "At least one thread failed";
+		}
+		case "error": {
+			return "At least one thread ended with an error";
+		}
+		case "completed":
+		default: {
+			return "All threads completed";
+		}
+	}
+};
+
+const toTerminalPreview = (): string => "No active threads right now.";
+
 const toEventSummary = (event: AssistantStreamEvent): string | undefined => {
 	switch (event.type) {
 		case "item_delta": {
@@ -499,6 +547,31 @@ const toNextTimestampSeconds = (input: { lastTimestampSeconds?: number; nowMs?: 
 
 const isTerminalPhase = (phase: LiveActivityPhase): boolean =>
 	phase === "completed" || phase === "failed" || phase === "error";
+
+const toTerminalOutcomeSeverity = (outcome: TerminalOutcome | null): number => {
+	switch (outcome) {
+		case "completed": {
+			return 1;
+		}
+		case "failed": {
+			return 2;
+		}
+		case "error": {
+			return 3;
+		}
+		default: {
+			return 0;
+		}
+	}
+};
+
+const toWorstTerminalOutcome = (
+	left: TerminalOutcome | null,
+	right: TerminalOutcome | null,
+): TerminalOutcome | null =>
+	toTerminalOutcomeSeverity(right) > toTerminalOutcomeSeverity(left)
+		? right
+		: left;
 
 const LIVE_ACTIVITY_LOG_META_KEY_WIDTH = 24;
 const LIVE_ACTIVITY_COLOR_RESET = "\u001B[0m";
@@ -874,6 +947,17 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 	private readonly runtimesByChatId = new Map<string, ChatRuntimeState>();
 	private readonly subscriptions = new Map<string, LiveActivitySubscription>();
 	private readonly pushToStartTokens = new Map<string, PushToStartTokenStored>();
+	private readonly session: GlobalSessionState = {
+		elapsedSecondsSnapshot: null,
+		flushTimeout: null,
+		heartbeatInterval: null,
+		lastSentAtMs: 0,
+		pendingEvent: null,
+		revision: 0,
+		sendAgain: false,
+		sending: false,
+		startedAtMs: 0,
+	};
 	private supportedPushTokenTypes: Set<LiveActivityPushTokenType>;
 
 	constructor(
@@ -912,6 +996,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			}
 			this.setSubscriptionInMemory(subscription);
 		}
+		this.pruneStaleSubscriptionsByDevice();
 
 		logLiveActivityInfo("restore subscriptions", {
 			hasStore: Boolean(this.subscriptionStore),
@@ -939,6 +1024,40 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		};
 		this.subscriptions.set(subscriptionKey, subscription);
 		return subscription;
+	}
+
+	private pruneStaleSubscriptionsByDevice(): void {
+		const latestByDevice = new Map<string, { key: string; subscription: LiveActivitySubscription }>();
+		for (const [key, subscription] of this.subscriptions.entries()) {
+			const deviceKey = toPushDeviceKey(subscription);
+			const current = latestByDevice.get(deviceKey);
+			if (!current || subscription.updatedAtMs >= current.subscription.updatedAtMs) {
+				latestByDevice.set(deviceKey, { key, subscription });
+			}
+		}
+
+		for (const [key, subscription] of this.subscriptions.entries()) {
+			const deviceKey = toPushDeviceKey(subscription);
+			const latest = latestByDevice.get(deviceKey);
+			if (!latest || latest.key === key) {
+				continue;
+			}
+
+			this.subscriptions.delete(key);
+			this.deletePersistedSubscription({
+				chatId: subscription.chatId,
+				chatTitle: subscription.chatTitle,
+				liveActivityToken: subscription.liveActivityToken,
+				pushToken: subscription.pushToken,
+				pushTokenType: subscription.pushTokenType,
+			});
+			logLiveActivityInfo("pruned stale subscription for device", {
+				chatId: subscription.chatId,
+				pushTokenType: subscription.pushTokenType,
+				pushToken: toTokenPreview(subscription.pushToken),
+				liveActivityToken: toTokenPreview(subscription.liveActivityToken),
+			});
+		}
 	}
 
 	private deleteConflictingSubscriptions(input: LiveActivityPushSubscriptionInput): void {
@@ -1044,6 +1163,55 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		return this.subscriptions.size > 0;
 	}
 
+	private getSessionCounts(): {
+		activeCount: number;
+		finalizingCount: number;
+		runningCount: number;
+		worstOutcome: TerminalOutcome | null;
+	} {
+		let runningCount = 0;
+		let finalizingCount = 0;
+		let worstOutcome: TerminalOutcome | null = null;
+
+		for (const runtime of this.runtimesByChatId.values()) {
+			if (runtime.phase === "running") {
+				runningCount += 1;
+				continue;
+			}
+			if (runtime.phase === "finalizing") {
+				finalizingCount += 1;
+				continue;
+			}
+			if (runtime.phase === "completed" || runtime.phase === "failed" || runtime.phase === "error") {
+				worstOutcome = toWorstTerminalOutcome(worstOutcome, runtime.phase);
+			}
+		}
+
+		return {
+			activeCount: runningCount + finalizingCount,
+			finalizingCount,
+			runningCount,
+			worstOutcome,
+		};
+	}
+
+	private hasRenderableSession(): boolean {
+		return this.runtimesByChatId.size > 0;
+	}
+
+	private resetGlobalSession(startedAtMs: number): void {
+		this.session.revision += 1;
+		this.clearScheduledFlush();
+		this.clearHeartbeat();
+		this.runtimesByChatId.clear();
+		this.session.elapsedSecondsSnapshot = null;
+		this.session.lastSentAtMs = 0;
+		this.session.pendingEvent = null;
+		this.session.sendAgain = false;
+		this.session.sending = false;
+		this.session.startedAtMs = startedAtMs;
+	}
+
 	private getOrCreateRuntime(input: { chatId: string; chatTitle?: string }): ChatRuntimeState {
 		const existing = this.runtimesByChatId.get(input.chatId);
 		if (existing) {
@@ -1073,178 +1241,163 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		return runtime;
 	}
 
-	private toContentState(runtime: ChatRuntimeState): LiveActivityContentState {
-		const safeTitle = toSafeLiveActivityText(runtime.chatTitle, TITLE_LIMIT, "title");
-		const safePreview = toSafeLiveActivityText(
-			toNormalized(runtime.preview) || toDefaultPreview(runtime.phase),
-			PREVIEW_LIMIT,
-			"preview",
-		);
-		const safeStatusLine = toSafeLiveActivityText(
-			toNormalized(runtime.statusLine) || toDefaultStatusLine(runtime.phase),
-			STATUS_LIMIT,
-			"status",
-		);
+	private getLatestActiveRuntime(): ChatRuntimeState | null {
+		let latest: ChatRuntimeState | null = null;
+		for (const runtime of this.runtimesByChatId.values()) {
+			if (runtime.phase === "running" || runtime.phase === "finalizing") {
+				if (!latest || runtime.startedAtMs >= latest.startedAtMs) {
+					latest = runtime;
+				}
+			}
+		}
+		return latest;
+	}
 
+	private toContentState(): LiveActivityContentState | null {
+		const { activeCount, finalizingCount, runningCount, worstOutcome } = this.getSessionCounts();
+		if (!this.hasRenderableSession()) {
+			return null;
+		}
+
+		if (activeCount > 0) {
+			const phase: LiveActivityPhase = runningCount > 0 ? "running" : "finalizing";
+			const dynamicTitle = toSafeLiveActivityText(
+				`${String(activeCount)} Active Thread${activeCount === 1 ? "" : "s"}`,
+				TITLE_LIMIT,
+				"title",
+			);
+			const latestRuntime = this.getLatestActiveRuntime();
+			const statusLine = latestRuntime
+				? toSafeLiveActivityText(latestRuntime.statusLine, STATUS_LIMIT, "status") || (runningCount > 0 ? toRunningStatusLine(activeCount) : toFinalizingStatusLine(finalizingCount))
+				: (runningCount > 0 ? toRunningStatusLine(activeCount) : toFinalizingStatusLine(finalizingCount));
+			const preview = latestRuntime && latestRuntime.previewSource !== "default"
+				? toSafeLiveActivityText(latestRuntime.preview, PREVIEW_LIMIT, "preview") || (runningCount > 0 ? toRunningPreview(activeCount) : toFinalizingPreview(finalizingCount))
+				: (runningCount > 0 ? toRunningPreview(activeCount) : toFinalizingPreview(finalizingCount));
+
+			return {
+				chatId: GLOBAL_ACTIVITY_CHAT_ID,
+				chatTitle: dynamicTitle.length > 0 ? dynamicTitle : GLOBAL_ACTIVITY_TITLE,
+				elapsedSeconds: toElapsedSeconds(this.session.startedAtMs),
+				phase,
+				preview,
+				statusLine,
+			};
+		}
+
+		const outcome = worstOutcome ?? "completed";
 		return {
-			chatId: runtime.chatId,
-			chatTitle: safeTitle.length > 0 ? safeTitle : "Thread",
-			elapsedSeconds: toElapsedSeconds(runtime.startedAtMs),
-			phase: runtime.phase,
-			preview: safePreview.length > 0 ? safePreview : toDefaultPreview(runtime.phase),
-			statusLine: safeStatusLine.length > 0 ? safeStatusLine : toDefaultStatusLine(runtime.phase),
+			chatId: GLOBAL_ACTIVITY_CHAT_ID,
+			chatTitle: GLOBAL_ACTIVITY_TITLE,
+			elapsedSeconds: Math.max(0, Math.floor(this.session.elapsedSecondsSnapshot ?? 0)),
+			phase: outcome,
+			preview: toTerminalPreview(),
+			statusLine: toTerminalStatusLine(outcome),
 		};
 	}
 
-	private clearScheduledFlush(chatId: string): void {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime?.flushTimeout) {
+	private clearScheduledFlush(): void {
+		if (!this.session.flushTimeout) {
 			return;
 		}
 
-		clearTimeout(runtime.flushTimeout);
-		runtime.flushTimeout = null;
+		clearTimeout(this.session.flushTimeout);
+		this.session.flushTimeout = null;
 	}
 
 	private hasAnyDeliveryTarget(): boolean {
 		return this.hasSubscriptions() || this.pushToStartTokens.size > 0;
 	}
 
-	private ensureHeartbeat(chatId: string): void {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime || runtime.heartbeatInterval || isTerminalPhase(runtime.phase) || !this.hasAnyDeliveryTarget()) {
+	private ensureHeartbeat(): void {
+		const { activeCount } = this.getSessionCounts();
+		if (this.session.heartbeatInterval || activeCount === 0 || !this.hasAnyDeliveryTarget()) {
 			return;
 		}
 
 		logLiveActivityInfo("heartbeat started", {
-			chatId,
+			chatId: GLOBAL_ACTIVITY_CHAT_ID,
 			intervalMs: PUSH_HEARTBEAT_INTERVAL_MS,
 		});
-		runtime.heartbeatInterval = setInterval(() => {
-			void this.queueFlush(chatId, "update");
+		this.session.heartbeatInterval = setInterval(() => {
+			void this.queueFlush("update");
 		}, PUSH_HEARTBEAT_INTERVAL_MS);
+		this.session.heartbeatInterval.unref?.();
 	}
 
-	private clearHeartbeat(chatId: string): void {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime?.heartbeatInterval) {
+	private clearHeartbeat(): void {
+		if (!this.session.heartbeatInterval) {
 			return;
 		}
 
-		logLiveActivityInfo("heartbeat stopped", { chatId });
-		clearInterval(runtime.heartbeatInterval);
-		runtime.heartbeatInterval = null;
+		logLiveActivityInfo("heartbeat stopped", { chatId: GLOBAL_ACTIVITY_CHAT_ID });
+		clearInterval(this.session.heartbeatInterval);
+		this.session.heartbeatInterval = null;
 	}
 
-	private markPendingEvent(runtime: ChatRuntimeState, event: PushEvent): void {
-		if (event === "end" || runtime.pendingEvent !== "end") {
-			runtime.pendingEvent = event;
+	private markPendingEvent(event: PushEvent): void {
+		if (event === "end" || this.session.pendingEvent !== "end") {
+			this.session.pendingEvent = event;
 		}
 	}
 
-	private scheduleUpdateFlush(chatId: string): void {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime || runtime.flushTimeout || runtime.pendingEvent === "end") {
+	private scheduleUpdateFlush(): void {
+		if (this.session.flushTimeout || this.session.pendingEvent === "end") {
 			return;
 		}
 
-		const elapsedSinceLastSendMs = Date.now() - runtime.lastSentAtMs;
-		const delayMs = runtime.lastSentAtMs <= 0
+		const elapsedSinceLastSendMs = Date.now() - this.session.lastSentAtMs;
+		const delayMs = this.session.lastSentAtMs <= 0
 			? 0
 			: Math.max(0, PUSH_MIN_UPDATE_INTERVAL_MS - elapsedSinceLastSendMs);
 
 		logLiveActivityInfo("flush scheduled", {
-			chatId,
+			chatId: GLOBAL_ACTIVITY_CHAT_ID,
 			delayMs,
 		});
-		runtime.flushTimeout = setTimeout(() => {
-			const current = this.getRuntime(chatId);
-			if (!current) {
-				return;
-			}
-
-			current.flushTimeout = null;
-			void this.flushChat(chatId, "update");
+		this.session.flushTimeout = setTimeout(() => {
+			this.session.flushTimeout = null;
+			void this.flushSession("update");
 		}, delayMs);
+		this.session.flushTimeout.unref?.();
 	}
 
-	private scheduleEndRetry(chatId: string): void {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime || runtime.flushTimeout) {
-			return;
-		}
-		logLiveActivityWarn("scheduling end retry", {
-			chatId,
-		});
-
-		runtime.flushTimeout = setTimeout(() => {
-			const current = this.getRuntime(chatId);
-			if (!current) {
-				return;
-			}
-
-			current.flushTimeout = null;
-			void this.flushChat(chatId, "end", {
-				force: true,
-			});
-		}, PUSH_MIN_UPDATE_INTERVAL_MS);
-	}
-
-	private queueFlush(chatId: string, event: PushEvent, input?: { immediate?: boolean }): void {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime) {
+	private queueFlush(event: PushEvent, input?: { immediate?: boolean }): void {
+		if (!this.hasRenderableSession()) {
 			return;
 		}
 
-		this.markPendingEvent(runtime, event);
-		if (runtime.sending) {
-			runtime.sendAgain = true;
+		this.markPendingEvent(event);
+		if (this.session.sending) {
+			this.session.sendAgain = true;
 			return;
 		}
 		const immediate = input?.immediate ?? event === "end";
 		if (immediate) {
 			logLiveActivityInfo("queue flush immediate", {
-				chatId,
+				chatId: GLOBAL_ACTIVITY_CHAT_ID,
 				event,
 			});
-			this.clearScheduledFlush(chatId);
-			void this.flushChat(chatId, event, {
+			this.clearScheduledFlush();
+			void this.flushSession(event, {
 				force: true,
 			});
 			return;
 		}
 
-		this.ensureHeartbeat(chatId);
-		this.scheduleUpdateFlush(chatId);
+		this.ensureHeartbeat();
+		this.scheduleUpdateFlush();
 	}
 
-	private async waitForTerminalFlush(chatId: string): Promise<void> {
-		for (let attempt = 0; attempt < 20; attempt += 1) {
-			const runtime = this.getRuntime(chatId);
-			if (!runtime) {
-				return;
-			}
-
-			if (runtime.pendingEvent !== "end" && !runtime.sending && !runtime.sendAgain) {
-				return;
-			}
-
-			await new Promise<void>((resolve) => {
-				setTimeout(resolve, 50);
-			});
-		}
-	}
-
-	private async flushChat(chatId: string, event: PushEvent, input?: { force?: boolean }): Promise<void> {
-		const runtime = this.getRuntime(chatId);
-		if (!runtime) {
+	private async flushSession(event: PushEvent, input?: { force?: boolean }): Promise<void> {
+		if (!this.hasRenderableSession()) {
 			return;
 		}
 
-		const nextEvent: PushEvent = runtime.pendingEvent === "end" ? "end" : event;
+		const revision = this.session.revision;
+		const nextEvent: PushEvent = this.session.pendingEvent === "end" ? "end" : event;
 		const deliveryEvent: PushEvent = nextEvent === "end" ? "update" : nextEvent;
 		if (nextEvent === "end") {
-			this.clearScheduledFlush(chatId);
+			this.clearScheduledFlush();
 		}
 
 		const subscriptions = [...this.subscriptions.entries()];
@@ -1252,48 +1405,49 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		const hasPushToStartTokens = this.pushToStartTokens.size > 0;
 
 		if (!hasSubscriptions && !hasPushToStartTokens) {
-			if (runtime.pendingEvent === nextEvent) {
-				runtime.pendingEvent = null;
+			if (this.session.pendingEvent === nextEvent) {
+				this.session.pendingEvent = null;
 			}
 			logLiveActivityInfo("flush skipped (no subscriptions or devices)", {
-				chatId,
+				chatId: GLOBAL_ACTIVITY_CHAT_ID,
 				event: nextEvent,
 			});
-			this.clearHeartbeat(chatId);
+			this.clearHeartbeat();
 			return;
 		}
 
-		if (runtime.sending) {
+		if (this.session.sending) {
 			logLiveActivityInfo("flush skipped (already sending)", {
-				chatId,
+				chatId: GLOBAL_ACTIVITY_CHAT_ID,
 				event: nextEvent,
 			});
-			this.markPendingEvent(runtime, nextEvent);
-			runtime.sendAgain = true;
+			this.markPendingEvent(nextEvent);
+			this.session.sendAgain = true;
 			return;
 		}
 
-		runtime.sending = true;
-		if (runtime.pendingEvent === nextEvent) {
-			runtime.pendingEvent = null;
+		this.session.sending = true;
+		if (this.session.pendingEvent === nextEvent) {
+			this.session.pendingEvent = null;
 		}
-		let completedEndEvent = false;
 
 		try {
+			const contentState = this.toContentState();
+			if (!contentState) {
+				return;
+			}
 			const force = input?.force ?? false;
-			const elapsedSinceLastSendMs = Date.now() - runtime.lastSentAtMs;
-			if (nextEvent === "update" && !force && runtime.lastSentAtMs > 0 && elapsedSinceLastSendMs < PUSH_MIN_UPDATE_INTERVAL_MS) {
-				this.markPendingEvent(runtime, "update");
+			const elapsedSinceLastSendMs = Date.now() - this.session.lastSentAtMs;
+			if (nextEvent === "update" && !force && this.session.lastSentAtMs > 0 && elapsedSinceLastSendMs < PUSH_MIN_UPDATE_INTERVAL_MS) {
+				this.markPendingEvent("update");
 				logLiveActivityInfo("flush deferred by min interval", {
-					chatId,
+					chatId: GLOBAL_ACTIVITY_CHAT_ID,
 					elapsedSinceLastSendMs,
 					minIntervalMs: PUSH_MIN_UPDATE_INTERVAL_MS,
 				});
-				this.scheduleUpdateFlush(chatId);
+				this.scheduleUpdateFlush();
 				return;
 			}
-
-			const contentState = this.toContentState(runtime);
 			const deliverySignature = toDeliverySignature({
 				contentState,
 				event: deliveryEvent,
@@ -1305,6 +1459,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			let skippedDuplicateCount = 0;
 			let transientFailureCount = 0;
 			const coveredPushToStartDeviceKeys = new Set<string>();
+			const { activeCount } = this.getSessionCounts();
 
 			for (const [key, subscription] of subscriptions) {
 				const subscriptionDeviceKey = toPushDeviceKey(subscription);
@@ -1326,12 +1481,15 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 					liveActivityToken: subscription.liveActivityToken,
 					timestampSeconds,
 				});
+				if (this.session.revision !== revision) {
+					return;
+				}
 				if (deliveryResult.shouldDropSubscription) {
 					hadTransientFailure = true;
 					retainedFailureCount += 1;
 					transientFailureCount += 1;
 					logLiveActivityWarn("permanent push delivery failure (subscription kept)", {
-						chatId,
+						chatId: GLOBAL_ACTIVITY_CHAT_ID,
 						event: deliveryEvent,
 						code: deliveryResult.errorCode ?? "unknown",
 						pushTokenType: subscription.pushTokenType,
@@ -1344,7 +1502,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 					hadTransientFailure = true;
 					transientFailureCount += 1;
 					logLiveActivityWarn("transient push delivery failure", {
-						chatId,
+						chatId: GLOBAL_ACTIVITY_CHAT_ID,
 						event: deliveryEvent,
 						code: deliveryResult.errorCode ?? "unknown",
 						pushTokenType: subscription.pushTokenType,
@@ -1363,57 +1521,59 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 				sentAnyUpdate = true;
 			}
 
-			// Push-to-start is only a bootstrap/recovery path. If a device already
-			// received a successful (or duplicate-equivalent) subscription update in
-			// this flush, do not send another start event for that same device.
-			for (const tokenEntry of this.pushToStartTokens.values()) {
-				const deviceKey = toPushDeviceKey(tokenEntry);
-				if (coveredPushToStartDeviceKeys.has(deviceKey)) {
-					continue;
-				}
-				try {
-					attemptedAnyDelivery = true;
-					const pushToStartResult = await this.sender({
-						contentState,
-						event: "start",
-						pushToken: tokenEntry.pushToken,
-						pushTokenType: tokenEntry.pushTokenType,
-						liveActivityToken: tokenEntry.pushToStartToken,
-						timestampSeconds: toNextTimestampSeconds({}),
-						attributesType: "LiveActivityAttributes",
-						attributes: {},
-					});
-					if (pushToStartResult.delivered) {
-						sentAnyUpdate = true;
-					} else {
-						logLiveActivityWarn("push-to-start broadcast delivery failed", {
-							chatId,
-							event: nextEvent,
-							code: pushToStartResult.errorCode ?? "unknown",
+			// Push-to-start is only a bootstrap/recovery path for active sessions.
+			if (activeCount > 0) {
+				for (const tokenEntry of this.pushToStartTokens.values()) {
+					const deviceKey = toPushDeviceKey(tokenEntry);
+					if (coveredPushToStartDeviceKeys.has(deviceKey)) {
+						continue;
+					}
+					try {
+						attemptedAnyDelivery = true;
+						const pushToStartResult = await this.sender({
+							contentState,
+							event: "start",
+							pushToken: tokenEntry.pushToken,
 							pushTokenType: tokenEntry.pushTokenType,
-							pushToken: toTokenPreview(tokenEntry.pushToken),
+							liveActivityToken: tokenEntry.pushToStartToken,
+							timestampSeconds: toNextTimestampSeconds({}),
+							attributesType: LIVE_ACTIVITY_ATTRIBUTES_TYPE,
+							attributes: {
+								deepLink: LIVE_ACTIVITY_DEEP_LINK,
+							},
+						});
+						if (this.session.revision !== revision) {
+							return;
+						}
+						if (pushToStartResult.delivered) {
+							sentAnyUpdate = true;
+						} else {
+							logLiveActivityWarn("push-to-start broadcast delivery failed", {
+								chatId: GLOBAL_ACTIVITY_CHAT_ID,
+								event: nextEvent,
+								code: pushToStartResult.errorCode ?? "unknown",
+								pushTokenType: tokenEntry.pushTokenType,
+								pushToken: toTokenPreview(tokenEntry.pushToken),
+							});
+						}
+					} catch {
+						logLiveActivityWarn("push-to-start broadcast error", {
+							chatId: GLOBAL_ACTIVITY_CHAT_ID,
+							pushTokenType: tokenEntry.pushTokenType,
 						});
 					}
-				} catch {
-					logLiveActivityWarn("push-to-start broadcast error", {
-						chatId,
-						pushTokenType: tokenEntry.pushTokenType,
-					});
 				}
 			}
 
 			if (hadTransientFailure) {
-				this.markPendingEvent(runtime, nextEvent);
-			}
-			if (!hasSubscriptions && !hasPushToStartTokens) {
-				this.clearHeartbeat(chatId);
+				this.markPendingEvent(nextEvent);
 			}
 
 			if (attemptedAnyDelivery) {
-				runtime.lastSentAtMs = Date.now();
+				this.session.lastSentAtMs = Date.now();
 			}
 			logLiveActivityInfo("flush completed", {
-				chatId,
+				chatId: GLOBAL_ACTIVITY_CHAT_ID,
 				retainedFailureCount,
 				elapsedSeconds: contentState.elapsedSeconds,
 				event: deliveryEvent,
@@ -1427,38 +1587,42 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 				statusLine: contentState.statusLine,
 				transientFailureCount,
 			});
-			if (nextEvent === "end" && !hadTransientFailure) {
-				completedEndEvent = true;
-			}
 		} finally {
-			runtime.sending = false;
-			const shouldFlushAgain = runtime.sendAgain;
-			runtime.sendAgain = false;
-			if (completedEndEvent && runtime.pendingEvent !== "end") {
-				this.clearScheduledFlush(chatId);
-				this.clearHeartbeat(chatId);
-				this.runtimesByChatId.delete(chatId);
+			if (this.session.revision !== revision) {
 				return;
 			}
-			if (runtime.pendingEvent === "end") {
-				this.scheduleEndRetry(chatId);
-				return;
-			}
+			this.session.sending = false;
+			const shouldFlushAgain = this.session.sendAgain;
+			this.session.sendAgain = false;
 			if (shouldFlushAgain) {
-				this.queueFlush(chatId, "update", {
+				this.queueFlush("update", {
 					immediate: true,
 				});
 				return;
 			}
-			if (runtime.pendingEvent === "update") {
-				this.scheduleUpdateFlush(chatId);
-				this.ensureHeartbeat(chatId);
+			if (this.session.pendingEvent === "update" || this.session.pendingEvent === "end") {
+				this.scheduleUpdateFlush();
+				if (this.getSessionCounts().activeCount > 0) {
+					this.ensureHeartbeat();
+				} else {
+					this.clearHeartbeat();
+				}
 				return;
 			}
+			if (this.getSessionCounts().activeCount > 0) {
+				this.ensureHeartbeat();
+				return;
+			}
+			this.clearHeartbeat();
 		}
 	}
 
 	onChatStarted(input: LiveActivityPushStartInput): void {
+		const { activeCount } = this.getSessionCounts();
+		if (activeCount === 0) {
+			this.resetGlobalSession(Date.now());
+		}
+
 		const hadRuntime = this.getRuntime(input.chatId) !== null;
 		const runtime = this.getOrCreateRuntime({
 			chatId: input.chatId,
@@ -1469,15 +1633,15 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			logLiveActivityInfo("chat started", {
 				chatId: input.chatId,
 				chatTitle: runtime.chatTitle,
+				sessionStartedAtMs: this.session.startedAtMs,
 			});
 		}
 		if (isTerminalPhase(runtime.phase)) {
-			runtime.startedAtMs = Date.now();
 			runtime.preview = toDefaultPreview("running");
 			runtime.previewSource = "default";
 		}
 		runtime.pendingEvent = null;
-		this.clearScheduledFlush(input.chatId);
+		this.clearScheduledFlush();
 		runtime.phase = "running";
 		runtime.statusLine = toDefaultStatusLine("running");
 		if (toNormalized(runtime.preview).length === 0) {
@@ -1485,34 +1649,20 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			runtime.previewSource = "default";
 		}
 		if (alreadyActive) {
-			this.ensureHeartbeat(input.chatId);
+			this.ensureHeartbeat();
 			return;
 		}
 
-		if (this.hasSubscriptions()) {
-			logLiveActivityInfo("flushing update to subscriptions", {
-				chatId: input.chatId,
-				subscriptions: this.subscriptions.size,
-			});
-			this.queueFlush(input.chatId, "update", {
-				immediate: true,
-			});
-		}
-
-		if (this.pushToStartTokens.size > 0) {
-			logLiveActivityInfo("sending push-to-start to all devices", {
-				chatId: input.chatId,
-				pushToStartTokenCount: this.pushToStartTokens.size,
-			});
-			void this.sendPushToStart(input.chatId, runtime);
-		}
+		this.queueFlush("update", {
+			immediate: true,
+		});
 
 		if (!this.hasSubscriptions() && this.pushToStartTokens.size === 0) {
 			logLiveActivityInfo("chat started without any registered devices", {
 				chatId: input.chatId,
 			});
 		}
-		this.ensureHeartbeat(input.chatId);
+		this.ensureHeartbeat();
 	}
 
 	onAssistantDelta(chatId: string, delta: string): void {
@@ -1532,11 +1682,14 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			runtime.preview = toPreviewChunk(previewBase, normalizedDelta);
 			runtime.previewSource = "legacy-response";
 		}
+		const previousPhase = runtime.phase;
 		if (runtime.phase !== "finalizing") {
 			runtime.phase = "running";
 		}
 		runtime.statusLine = toDefaultStatusLine(runtime.phase);
-		this.queueFlush(chatId, "update");
+		if (previousPhase !== runtime.phase) {
+			this.queueFlush("update");
+		}
 	}
 
 	onAssistantEvent(chatId: string, event: AssistantStreamEvent): void {
@@ -1556,6 +1709,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		if (event.type === "item_delta") {
+			const previousPhase = runtime.phase;
 			runtime.phase = "running";
 			const deltaText = toNormalizedPreviewText(event.delta);
 			if ((event.target === "body" || event.target === "output") && deltaText.length > 0) {
@@ -1568,7 +1722,9 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 				runtime.preview = toLatestPreview(deltaText);
 				runtime.previewSource = "event";
 			}
-			this.queueFlush(chatId, "update");
+			if (previousPhase !== runtime.phase) {
+				this.queueFlush("update");
+			}
 			return;
 		}
 
@@ -1587,7 +1743,11 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			phase: runtime.phase,
 			statusLine: runtime.statusLine,
 		});
-		this.queueFlush(chatId, "update");
+		if (previousPhase !== runtime.phase || event.type === "turn_completed") {
+			this.queueFlush("update", {
+				immediate: true,
+			});
+		}
 	}
 
 	async onChatFinished(input: LiveActivityPushFinishInput): Promise<void> {
@@ -1606,35 +1766,26 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			runtime.preview = toDefaultPreview(input.outcome);
 			runtime.previewSource = "default";
 		}
-		logLiveActivityInfo("chat finished (queueing end)", {
+		const countsAfter = this.getSessionCounts();
+		if (countsAfter.activeCount === 0) {
+			this.session.elapsedSecondsSnapshot = this.session.startedAtMs > 0
+				? toElapsedSeconds(this.session.startedAtMs)
+				: 0;
+		}
+		logLiveActivityInfo("chat finished", {
 			chatId: input.chatId,
 			outcome: input.outcome,
 			phase: runtime.phase,
+			activeThreadCount: countsAfter.activeCount,
 		});
 
-		this.clearScheduledFlush(input.chatId);
-		runtime.pendingEvent = "end";
-		await this.flushChat(input.chatId, "end", {
+		this.clearScheduledFlush();
+		if (countsAfter.activeCount === 0) {
+			this.clearHeartbeat();
+		}
+		await this.flushSession("update", {
 			force: true,
 		});
-		await this.waitForTerminalFlush(input.chatId);
-		const currentRuntime = this.getRuntime(input.chatId);
-		if (!currentRuntime) {
-			logLiveActivityInfo("chat finish cleanup completed", {
-				chatId: input.chatId,
-			});
-			return;
-		}
-		if (currentRuntime.pendingEvent === "end" || currentRuntime.sending || currentRuntime.sendAgain) {
-			this.scheduleEndRetry(input.chatId);
-			logLiveActivityWarn("chat finish pending retry", {
-				chatId: input.chatId,
-			});
-			return;
-		}
-
-		this.clearScheduledFlush(input.chatId);
-		this.runtimesByChatId.delete(input.chatId);
 		logLiveActivityInfo("chat finish cleanup completed", {
 			chatId: input.chatId,
 		});
@@ -1685,17 +1836,15 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 
 		// Send push-to-start to all active (non-terminal) chats so the device
 		// creates a Live Activity and registers a real subscription back.
-		for (const [chatId, runtime] of this.runtimesByChatId.entries()) {
-			if (isTerminalPhase(runtime.phase)) {
-				continue;
-			}
-			logLiveActivityInfo("sending push-to-start to late-registered device for active chat", {
-				chatId,
-				phase: runtime.phase,
+		if (this.getSessionCounts().activeCount > 0) {
+			logLiveActivityInfo("queueing active-session bootstrap for late-registered device", {
+				chatId: GLOBAL_ACTIVITY_CHAT_ID,
 				pushTokenType,
 				pushToken: toTokenPreview(pushToken),
 			});
-			void this.sendPushToStart(chatId, runtime);
+			this.queueFlush("update", {
+				immediate: true,
+			});
 		}
 	}
 
@@ -1734,57 +1883,6 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			removedSubscriptions,
 			supportedPushTokenTypes: Array.from(supportedPushTokenTypes),
 		});
-	}
-
-	private async sendPushToStart(chatId: string, runtime: ChatRuntimeState): Promise<void> {
-		if (this.pushToStartTokens.size === 0) {
-			return;
-		}
-
-		const contentState = this.toContentState(runtime);
-		const timestampSeconds = toNextTimestampSeconds({});
-		const subscribedDeviceKeys = new Set(
-			Array.from(this.subscriptions.values(), (subscription) => toPushDeviceKey(subscription)),
-		);
-
-		for (const [, tokenEntry] of this.pushToStartTokens.entries()) {
-			const deviceKey = toPushDeviceKey(tokenEntry);
-			if (subscribedDeviceKeys.has(deviceKey)) {
-				continue;
-			}
-			try {
-				const result = await this.sender({
-					contentState,
-					event: "start",
-					pushToken: tokenEntry.pushToken,
-					pushTokenType: tokenEntry.pushTokenType,
-					liveActivityToken: tokenEntry.pushToStartToken,
-					timestampSeconds,
-					attributesType: "LiveActivityAttributes",
-					attributes: {},
-				});
-
-				if (result.delivered) {
-					logLiveActivityInfo("push-to-start sent", {
-						chatId,
-						pushTokenType: tokenEntry.pushTokenType,
-						pushToken: toTokenPreview(tokenEntry.pushToken),
-					});
-				} else {
-					logLiveActivityWarn("push-to-start delivery failed (token kept)", {
-						chatId,
-						code: result.errorCode ?? "unknown",
-						pushTokenType: tokenEntry.pushTokenType,
-						pushToken: toTokenPreview(tokenEntry.pushToken),
-					});
-				}
-			} catch {
-				logLiveActivityWarn("push-to-start send error", {
-					chatId,
-					pushTokenType: tokenEntry.pushTokenType,
-				});
-			}
-		}
 	}
 
 	async upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
@@ -1839,6 +1937,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		this.setSubscriptionInMemory(persistedSubscription);
+		this.pruneStaleSubscriptionsByDevice();
 		logLiveActivityInfo("subscription upserted", {
 			chatId,
 			isNewSubscription: !previousSubscription,
@@ -1848,27 +1947,20 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			liveActivityToken: toTokenPreview(liveActivityToken),
 		});
 
-		const runtime = this.getRuntime(chatId);
-		if (!runtime) {
+		const contentState = this.toContentState();
+		if (!contentState) {
 			return true;
 		}
-
-		if (toNormalized(input.chatTitle).length > 0) {
-			runtime.chatTitle = toNormalized(input.chatTitle);
+		if (this.getSessionCounts().activeCount > 0) {
+			this.ensureHeartbeat();
 		}
-
-		if (!isTerminalPhase(runtime.phase)) {
-			this.ensureHeartbeat(chatId);
-		}
-
-		const nextEvent: PushEvent = isTerminalPhase(runtime.phase) ? "end" : "update";
 		const shouldFlushImmediately =
 			!previousSubscription
 			|| previousSubscription.chatId !== chatId
-			|| previousSubscription.chatTitle !== (toNormalized(input.chatTitle) || undefined);
+			|| previousSubscription.chatTitle !== (toNormalized(input.chatTitle) || undefined)
+			|| contentState.phase !== "running";
 		if (shouldFlushImmediately) {
-			runtime.pendingEvent = nextEvent;
-			await this.flushChat(chatId, nextEvent, {
+			await this.flushSession("update", {
 				force: true,
 			});
 		}
@@ -1964,7 +2056,7 @@ export const createNoopLiveActivityPushService = (): LiveActivityPushServiceCont
 export const createLiveActivityPushServiceFromEnvironment = (
 	input: LiveActivityPushEnvironmentInput,
 ): LiveActivityPushServiceContract => {
-	const sender = createPrivateBackendSender({
+	const privateBackendSender = createPrivateBackendSender({
 		getConnectorCredentials: input.getConnectorCredentials,
 		privateBackendUrl: input.privateBackendUrl,
 	});
@@ -1973,8 +2065,33 @@ export const createLiveActivityPushServiceFromEnvironment = (
 		privateBackendUrl: input.privateBackendUrl,
 	});
 
-	logLiveActivityInfo("service enabled (private backend sender)", {
+	const apnsConfig = loadApnsConfigFromEnvironment();
+	const apnsSend = apnsConfig ? createApnsSender(apnsConfig) : null;
+	const sender: LiveActivityPushSender = apnsSend
+		? async (deliveryInput) => {
+			const apnsResult = await apnsSend({
+				contentState: deliveryInput.contentState,
+				event: deliveryInput.event,
+				liveActivityToken: deliveryInput.liveActivityToken,
+				timestampSeconds: deliveryInput.timestampSeconds,
+				attributesType: deliveryInput.attributesType,
+				attributes: deliveryInput.attributes,
+			});
+			if (apnsResult.delivered) {
+				return apnsResult;
+			}
+			// Fall back to private backend on APNS failure (not token-level errors)
+			if (!apnsResult.shouldDropSubscription) {
+				return await privateBackendSender(deliveryInput);
+			}
+			return apnsResult;
+		}
+		: privateBackendSender;
+
+	logLiveActivityInfo("service enabled", {
 		privateBackendUrl: input.privateBackendUrl,
+		apnsDirect: Boolean(apnsSend),
+		apnsSandbox: apnsConfig?.useSandbox ?? false,
 	});
 
 	return new PrivateBackendLiveActivityPushService(

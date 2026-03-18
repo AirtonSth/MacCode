@@ -47,7 +47,7 @@ const FALLBACK_LAYOUT: LiveActivityLayout = {
 	expandedBottom: null,
 };
 
-const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
+export const buildThreadLiveActivityLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 	"widget";
 
 	// eslint-disable-next-line unicorn/consistent-function-scoping -- Widget helpers must stay inside this function for runtime serialization.
@@ -84,6 +84,39 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 		}
 
 		return trimmed.length > 140 ? `${trimmed.slice(0, 140)}...` : trimmed;
+	};
+
+	 
+	const resolveCompactGlyph = (input: {
+		phase: ThreadLiveActivityPhase;
+		statusLine: string | undefined;
+	}): string => {
+		const normalizedStatusLine = input.statusLine?.trim() ?? "";
+		const numericMatch = /^(?<count>\d+)\s+thread/iu.exec(normalizedStatusLine)
+			?? /^finalizing\s+(?<count>\d+)\s+thread/iu.exec(normalizedStatusLine);
+		const countGlyph = numericMatch?.groups?.count ?? null;
+
+		if (input.phase === "running" || input.phase === "finalizing") {
+			return countGlyph ?? "RC";
+		}
+
+		switch (input.phase) {
+			case "background": {
+				return "B";
+			}
+			case "completed": {
+				return "C";
+			}
+			case "error": {
+				return "E";
+			}
+			case "failed": {
+				return "F";
+			}
+			default: {
+				return "R";
+			}
+		}
 	};
 
 	const globalValues = globalThis as Record<string, unknown>;
@@ -227,9 +260,10 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 	const elapsed = toElapsed(data.elapsedSeconds);
 	const timerInterval = toTimerInterval(data.elapsedSeconds);
 	const usesLiveTimer = data.phase === "running" || data.phase === "background" || data.phase === "finalizing";
-	const compactGlyph = data.phase === "running" || data.phase === "finalizing"
-		? "RC"
-		: visual.label.slice(0, 1).toUpperCase();
+	const compactGlyph = resolveCompactGlyph({
+		phase: data.phase,
+		statusLine: data.statusLine,
+	});
 
 	const logoIcon = imageView
 		? imageView({
@@ -417,5 +451,5 @@ const toLayout = (props?: ThreadLiveActivityProps): LiveActivityLayout => {
 
 export const threadLiveActivityFactory = createLiveActivity<ThreadLiveActivityProps>(
 	"ThreadLiveActivity",
-	toLayout,
+	buildThreadLiveActivityLayout,
 );
