@@ -12,7 +12,7 @@ import type {
 	PushToStartTokenStoreContract,
 	PushToStartTokenStored,
 } from "./live-activity-push.model";
-import { createApnsSender, loadApnsConfigFromEnvironment, type ApnsSendInput } from "./apns-sender";
+import { createApnsSender, loadApnsConfigFromEnvironment } from "./apns-sender";
 
 const PUSH_MIN_UPDATE_INTERVAL_MS = 15_000;
 const PUSH_HEARTBEAT_INTERVAL_MS = 15_000;
