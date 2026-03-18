@@ -329,6 +329,74 @@ test("LiveActivityPushService still preserves intended spaces between streamed p
 	});
 });
 
+test("LiveActivityPushService pushes content updates before the heartbeat when the min interval elapsed", async () => {
+	Date.now = () => 1_000;
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-near-realtime",
+		chatTitle: "Near Realtime",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-near-realtime",
+		chatTitle: "Near Realtime",
+		pushToken: "fcm-token-near-realtime",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-near-realtime",
+	});
+
+	Date.now = () => 4_500;
+	service.onAssistantEvent("chat-near-realtime", {
+		type: "item_delta",
+		turnId: "turn-near-realtime",
+		itemId: "item-near-realtime",
+		target: "body",
+		delta: "preview atualizado",
+	});
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
+	});
+
+	expect(findLastDelivery(deliveries, "update")).toMatchObject({
+		chatId: "active-threads",
+		phase: "running",
+		preview: "preview atualizado",
+		statusLine: "Generating response",
+	});
+});
+
+test("LiveActivityPushService still throttles bursts that arrive before the min interval", async () => {
+	Date.now = () => 1_000;
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-throttle",
+		chatTitle: "Throttle",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-throttle",
+		chatTitle: "Throttle",
+		pushToken: "fcm-token-throttle",
+		pushTokenType: "fcm",
+		liveActivityToken: "live-token-throttle",
+	});
+	const updateCountBeforeBurst = deliveries.filter((delivery) => delivery.event === "update").length;
+
+	Date.now = () => 2_000;
+	service.onAssistantEvent("chat-throttle", {
+		type: "item_delta",
+		turnId: "turn-throttle",
+		itemId: "item-throttle",
+		target: "body",
+		delta: "ainda cedo demais",
+	});
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 25);
+	});
+
+	expect(deliveries.filter((delivery) => delivery.event === "update")).toHaveLength(updateCountBeforeBurst);
+});
+
 test("LiveActivityPushService resets elapsed time and outcome when a new session begins", async () => {
 	Date.now = () => 1_000;
 	const { deliveries, service } = createRecordingHarness();

@@ -14,7 +14,7 @@ import type {
 } from "./live-activity-push.model";
 import { createApnsSender, loadApnsConfigFromEnvironment } from "./apns-sender";
 
-const PUSH_MIN_UPDATE_INTERVAL_MS = 15_000;
+const PUSH_MIN_UPDATE_INTERVAL_MS = 3_000;
 const PUSH_HEARTBEAT_INTERVAL_MS = 15_000;
 const PUSH_STALE_WINDOW_SECONDS = 180;
 const PUSH_END_DISMISS_SECONDS = 30;
@@ -1705,6 +1705,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		const normalizedDelta = toNormalizedPreviewText(delta);
+		const previousPreview = runtime.preview;
 		if (
 			normalizedDelta.length > 0
 			&& (runtime.previewSource === "default" || runtime.previewSource === "legacy-response")
@@ -1720,7 +1721,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			runtime.phase = "running";
 		}
 		runtime.statusLine = toDefaultStatusLine(runtime.phase);
-		if (previousPhase !== runtime.phase) {
+		if (previousPhase !== runtime.phase || previousPreview !== runtime.preview) {
 			this.queueFlush("update");
 		}
 	}
@@ -1743,6 +1744,8 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 
 		if (event.type === "item_delta") {
 			const previousPhase = runtime.phase;
+			const previousPreview = runtime.preview;
+			const previousStatusLine = runtime.statusLine;
 			runtime.phase = "running";
 			const deltaText = toNormalizedPreviewText(event.delta);
 			if ((event.target === "body" || event.target === "output") && deltaText.length > 0) {
@@ -1755,13 +1758,19 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 				runtime.preview = toLatestPreview(deltaText);
 				runtime.previewSource = "event";
 			}
-			if (previousPhase !== runtime.phase) {
+			if (
+				previousPhase !== runtime.phase
+				|| previousPreview !== runtime.preview
+				|| previousStatusLine !== runtime.statusLine
+			) {
 				this.queueFlush("update");
 			}
 			return;
 		}
 
 		const previousPhase = runtime.phase;
+		const previousPreview = runtime.preview;
+		const previousStatusLine = runtime.statusLine;
 		runtime.phase = toPhaseFromEvent(event);
 		runtime.statusLine = toStatusLineFromEvent(event) ?? toDefaultStatusLine(runtime.phase);
 		const eventSummary = toEventSummary(event);
@@ -1776,9 +1785,14 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			phase: runtime.phase,
 			statusLine: runtime.statusLine,
 		});
-		if (previousPhase !== runtime.phase || event.type === "turn_completed") {
+		if (
+			previousPhase !== runtime.phase
+			|| previousPreview !== runtime.preview
+			|| previousStatusLine !== runtime.statusLine
+			|| event.type === "turn_completed"
+		) {
 			this.queueFlush("update", {
-				immediate: true,
+				immediate: event.type === "turn_completed",
 			});
 		}
 	}
