@@ -2116,6 +2116,10 @@ export const createLiveActivityPushServiceFromEnvironment = (
 	const apnsSend = apnsConfig ? createApnsSender(apnsConfig) : null;
 	const sender: LiveActivityPushSender = apnsSend
 		? async (deliveryInput) => {
+			// FCM tokens must go through the private backend; APNS direct only handles APNS tokens
+			if (deliveryInput.pushTokenType !== "apns") {
+				return await privateBackendSender(deliveryInput);
+			}
 			const apnsResult = await apnsSend({
 				contentState: deliveryInput.contentState,
 				event: deliveryInput.event,
