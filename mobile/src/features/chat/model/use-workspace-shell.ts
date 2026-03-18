@@ -37,6 +37,7 @@ import {
 	clearThreadLiveActivity,
 	finishThreadLiveActivity,
 	hasActiveLiveActivityEntry,
+	setThreadLiveActivityRemoteManaged,
 	isThreadLiveActivityEnabled,
 	onThreadLiveActivityAppStateChanged,
 	startThreadLiveActivity,
@@ -61,6 +62,10 @@ import {
 	setStreamItemState as updateStreamItemState,
 	type StreamTurnState,
 } from "./stream-turn-state";
+import {
+	resolveLiveActivitySubscriptionError,
+	resolveLiveActivitySubscriptionResponse,
+} from "./live-activity-subscription";
 import { resolveTrackedLiveActivityChats } from "./live-activity-tracking";
 
 type WorkspaceShellScope = "legacy" | "workspaces" | "threads" | "chat";
@@ -991,24 +996,25 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						enabled: result.enabled,
 						subscribed: result.subscribed,
 					});
-					if (!result.enabled || !result.subscribed) {
-						if (!result.enabled) {
-							logLiveActivitySubscription("clearing live activity after disabled subscription", {
-								chatId,
-							});
-							clearLiveActivitySubscriptionState(chatId);
-							void clearThreadLiveActivity({
-								chatId,
-							});
-							return;
-						}
-
+					const decision = resolveLiveActivitySubscriptionResponse(result);
+					if (decision.kind === "local-only") {
+						logLiveActivitySubscription("keeping local live activity after disabled subscription", {
+							chatId,
+						});
+						clearLiveActivitySubscriptionState(chatId);
+						void setThreadLiveActivityRemoteManaged({
+							chatId,
+							remoteManaged: false,
+						});
+						return;
+					}
+					if (decision.kind === "retry") {
 						logLiveActivitySubscription("subscription not accepted yet; keeping activity and retrying", {
 							chatId,
 						});
 						scheduleLiveActivitySubscriptionRetry({
 							chatId,
-							reason: "subscription-not-accepted",
+							reason: decision.reason,
 						});
 						return;
 					}
@@ -1032,15 +1038,27 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 					registeredLiveActivitySignatureByChatRef.current[chatId] = signature;
 				} catch (error) {
-					if (error instanceof RemoteCodeRequestError && (error.status === 400 || error.status === 404)) {
+					const decision = resolveLiveActivitySubscriptionError(error);
+					if (decision.kind === "clear") {
 						logLiveActivitySubscription("clearing live activity after permanent subscription failure", {
 							chatId,
-							error: error.message,
-							status: error.status,
+							error: error instanceof Error ? error.message : "unknown",
 						});
 						clearLiveActivitySubscriptionState(chatId);
 						void clearThreadLiveActivity({
 							chatId,
+						});
+						return;
+					}
+					if (decision.kind === "local-only") {
+						logLiveActivitySubscription("keeping local live activity after subscription failure", {
+							chatId,
+							error: error instanceof Error ? error.message : "unknown",
+						});
+						clearLiveActivitySubscriptionState(chatId);
+						void setThreadLiveActivityRemoteManaged({
+							chatId,
+							remoteManaged: false,
 						});
 						return;
 					}
@@ -1049,9 +1067,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						chatId,
 						error: error instanceof Error ? error.message : "unknown",
 					});
+					if (decision.kind !== "retry") {
+						return;
+					}
 					scheduleLiveActivitySubscriptionRetry({
 						chatId,
-						reason: error instanceof Error ? error.message : "request-failed",
+						reason: decision.reason,
 					});
 				} finally {
 					if (pendingLiveActivitySignatureByChatRef.current[chatId] === signature) {
@@ -2275,7 +2296,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					clearStructuredLiveActivityPreview(activeChatId);
 					const liveActivityStarted = await startRunningLiveActivity(activeChatId, {
 						chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
-						restart: true,
 						statusLine: "Running",
 					});
 					if (!liveActivityStarted) {

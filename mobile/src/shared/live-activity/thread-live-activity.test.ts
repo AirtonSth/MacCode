@@ -11,6 +11,7 @@ const secureStoreState = new Map<string, string>();
 interface MockActivity {
 	addPushTokenListener: (listener: (event: { pushToken: string }) => void) => { remove: () => void };
 	end: (...args: unknown[]) => Promise<void>;
+	endCalls: unknown[][];
 	getId: () => string;
 	getProps: () => { chatId: string } | null;
 	getPushToken: () => Promise<string | null>;
@@ -28,7 +29,10 @@ const createMockActivity = (input?: { chatId?: string; id?: string }): MockActiv
 		addPushTokenListener: () => ({
 			remove: () => undefined,
 		}),
-		end: async () => undefined,
+		async end(...args: unknown[]) {
+			this.endCalls.push(args);
+		},
+		endCalls: [],
 		getId() {
 			return this.id;
 		},
@@ -103,6 +107,7 @@ const PUSH_TO_START_TOKEN_KEY = "remotecode.live_activity.push_to_start_token";
 
 const {
 	clearThreadLiveActivity,
+	finishThreadLiveActivity,
 	getThreadLiveActivityStateForBackgroundTask,
 	hasActiveLiveActivityEntry,
 	initializeThreadLiveActivityManager,
@@ -220,6 +225,161 @@ describe("thread live activity manager", () => {
 		expect(widgetsState.instances[0]?.updateCalls[0]).toMatchObject({
 			chatId: "chat-1",
 			preview: "New output after dismiss",
+		});
+	});
+
+	test("keeps completed activities open until explicitly cleared", async () => {
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: false,
+		});
+
+		expect(started).toBe(true);
+		const activity = widgetsState.instances[0];
+		expect(activity).toBeDefined();
+
+		await finishThreadLiveActivity({
+			chatId: "chat-1",
+			outcome: "completed",
+		});
+
+		await Bun.sleep(50);
+
+		expect(activity?.endCalls).toHaveLength(0);
+		expect(activity?.updateCalls.length ?? 0).toBeGreaterThanOrEqual(1);
+		expect(activity?.updateCalls.at(-1)).toMatchObject({
+			chatId: "chat-1",
+			phase: "completed",
+		});
+		expect(widgetsState.instances).toHaveLength(1);
+	});
+
+	test("reuses the same activity when a completed chat starts again", async () => {
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: false,
+		});
+
+		expect(started).toBe(true);
+		const activity = widgetsState.instances[0];
+		expect(activity).toBeDefined();
+
+		await finishThreadLiveActivity({
+			chatId: "chat-1",
+			outcome: "completed",
+		});
+		await Bun.sleep(50);
+
+		const restarted = await startThreadLiveActivity({
+			chatId: "chat-1",
+			preview: "New output",
+			remoteManaged: false,
+			statusLine: "Generating response",
+		});
+
+		expect(restarted).toBe(true);
+		await Bun.sleep(50);
+
+		expect(widgetsState.instances).toHaveLength(1);
+		expect(widgetsState.instances[0]).toBe(activity);
+		expect(activity?.endCalls).toHaveLength(0);
+		expect(activity?.updateCalls.length ?? 0).toBeGreaterThanOrEqual(2);
+		expect(activity?.updateCalls.at(-1)).toMatchObject({
+			chatId: "chat-1",
+			phase: "running",
+			preview: "New output",
+			statusLine: "Generating response",
+		});
+	});
+
+	test("reuses the already open activity when a different chat starts", async () => {
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: false,
+		});
+
+		expect(started).toBe(true);
+		const activity = widgetsState.instances[0];
+		expect(activity).toBeDefined();
+
+		const startedSecondChat = await startThreadLiveActivity({
+			chatId: "chat-2",
+			preview: "New chat output",
+			remoteManaged: false,
+			statusLine: "Generating response",
+		});
+
+		expect(startedSecondChat).toBe(true);
+		await Bun.sleep(50);
+
+		expect(widgetsState.instances).toHaveLength(1);
+		expect(widgetsState.instances[0]).toBe(activity);
+		expect(activity?.endCalls).toHaveLength(0);
+		expect(activity?.updateCalls.length ?? 0).toBeGreaterThanOrEqual(1);
+		expect(activity?.updateCalls.at(-1)).toMatchObject({
+			chatId: "chat-2",
+			phase: "running",
+			preview: "New chat output",
+			statusLine: "Generating response",
+		});
+	});
+
+	test("reuses the already open activity when a different chat finishes", async () => {
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: false,
+		});
+
+		expect(started).toBe(true);
+		const activity = widgetsState.instances[0];
+		expect(activity).toBeDefined();
+
+		await finishThreadLiveActivity({
+			chatId: "chat-2",
+			outcome: "completed",
+			preview: "Final answer",
+		});
+		await Bun.sleep(50);
+
+		expect(widgetsState.instances).toHaveLength(1);
+		expect(widgetsState.instances[0]).toBe(activity);
+		expect(activity?.endCalls).toHaveLength(0);
+		expect(activity?.updateCalls.length ?? 0).toBeGreaterThanOrEqual(1);
+		expect(activity?.updateCalls.at(-1)).toMatchObject({
+			chatId: "chat-2",
+			phase: "completed",
+			preview: "Final answer",
+			statusLine: "Response is ready",
+		});
+	});
+
+	test("recreates a dismissed activity when a completion arrives", async () => {
+		const started = await startThreadLiveActivity({
+			chatId: "chat-1",
+			remoteManaged: false,
+		});
+
+		expect(started).toBe(true);
+		widgetsState.instances = [];
+
+		await clearThreadLiveActivity({
+			chatId: "chat-1",
+		});
+
+		await finishThreadLiveActivity({
+			chatId: "chat-1",
+			outcome: "completed",
+			preview: "Final answer after dismiss",
+		});
+		await Bun.sleep(50);
+
+		expect(widgetsState.instances).toHaveLength(1);
+		expect(widgetsState.instances[0]?.updateCalls).toHaveLength(1);
+		expect(widgetsState.instances[0]?.updateCalls[0]).toMatchObject({
+			chatId: "chat-1",
+			phase: "completed",
+			preview: "Final answer after dismiss",
+			statusLine: "Response is ready",
 		});
 	});
 

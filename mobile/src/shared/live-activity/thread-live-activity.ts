@@ -20,7 +20,6 @@ const STATUS_LIMIT = 80;
 const PREVIEW_ELLIPSIS = "...";
 const MIN_IOS_LIVE_ACTIVITIES_MAJOR = 16;
 const MIN_IOS_LIVE_ACTIVITIES_MINOR = 1;
-const FINISH_DISMISS_DELAY_MS = 4_000;
 const AUTHORITATIVE_SYNC_GRACE_PERIOD_MS = 30_000;
 const MARKDOWN_CODE_FENCE_PATTERN = /```[\s\S]*?```/gu;
 const INLINE_CODE_PATTERN = /`[^`]*`/gu;
@@ -352,6 +351,9 @@ const hasAuthoritativeSyncTimedOut = (entry: ActivityEntry): boolean => (
 const canEntryWriteLocally = (entry: ActivityEntry): boolean =>
 	!entry.state.remoteManaged || !entry.awaitingAuthoritativeSync || hasAuthoritativeSyncTimedOut(entry);
 
+const hasEntryBinding = (entry: ActivityEntry): boolean =>
+	Boolean(entry.activity || withOptionalValue(entry.state.activityId));
+
 const toElapsedSeconds = (startedAtMs: number): number => {
 	const started = Number.isFinite(startedAtMs) && startedAtMs > 0 ? startedAtMs : nowMs();
 	const deltaMs = Math.max(0, nowMs() - started);
@@ -436,21 +438,7 @@ const hydratePersistedState = async (): Promise<void> => {
 				remoteManaged: item.remoteManaged !== false,
 			};
 
-			entries.set(chatId, {
-				state,
-				activity: null,
-				pushTokenSubscription: null,
-				finishInProgress: false,
-				lastContentSignature: "",
-				lastContentUpdateAtMs: 0,
-				lastStatePersistAtMs: 0,
-				writeInFlight: false,
-				writeAgain: false,
-				pendingForceWrite: false,
-				flushTimeout: null,
-				awaitingAuthoritativeSync: state.remoteManaged && !isTerminalPhase(state.phase),
-				awaitingAuthoritativeSyncStartedAtMs: state.remoteManaged && !isTerminalPhase(state.phase) ? nowMs() : 0,
-			});
+			entries.set(chatId, createEntry(state));
 		}
 	} catch {
 		// Ignore malformed persisted state.
@@ -621,6 +609,57 @@ const bindActivityToEntry = async (
 	return record.activity;
 };
 
+const createEntry = (state: PersistedLiveActivityState): ActivityEntry => ({
+	state,
+	activity: null,
+	pushTokenSubscription: null,
+	finishInProgress: false,
+	lastContentSignature: "",
+	lastContentUpdateAtMs: 0,
+	lastStatePersistAtMs: 0,
+	writeInFlight: false,
+	writeAgain: false,
+	pendingForceWrite: false,
+	flushTimeout: null,
+	awaitingAuthoritativeSync: state.remoteManaged && !isTerminalPhase(state.phase),
+	awaitingAuthoritativeSyncStartedAtMs: state.remoteManaged && !isTerminalPhase(state.phase) ? nowMs() : 0,
+});
+
+const takeReusableActivityRecord = async (
+	entry: ActivityEntry,
+	bindings: LiveActivityBindings,
+): Promise<ActivityRecord | null> => {
+	const records = await toActivityRecords(bindings);
+	let reusableOwner: ActivityEntry | null = null;
+	let reusableRecord: ActivityRecord | null = null;
+
+	for (const otherEntry of entries.values()) {
+		if (otherEntry === entry || !hasEntryBinding(otherEntry)) {
+			continue;
+		}
+
+		const boundRecord = records.find((record) =>
+			record.activity === otherEntry.activity
+			|| (Boolean(record.activityId) && record.activityId === otherEntry.state.activityId));
+		if (!boundRecord) {
+			continue;
+		}
+
+		reusableOwner = otherEntry;
+		reusableRecord = boundRecord;
+		break;
+	}
+
+	if (reusableOwner && reusableRecord) {
+		await unbindActivityFromEntry(reusableOwner, {
+			clearPersistedActivityId: true,
+		});
+		return reusableRecord;
+	}
+
+	return records.find((record) => !isActivityRecordOwnedByOtherEntry(record, entry)) ?? null;
+};
+
 const unbindActivityFromEntry = async (
 	entry: ActivityEntry,
 	input?: { clearPersistedActivityId?: boolean },
@@ -675,6 +714,29 @@ const startActivityInstance = async (
 		}
 		return null;
 	}
+};
+
+const acquireActivityInstance = async (
+	entry: ActivityEntry,
+	input: {
+		bindings: LiveActivityBindings;
+		removeEntryOnFailure: boolean;
+	},
+): Promise<LiveActivity<ThreadLiveActivityProps> | null> => {
+	const resolved = await resolveActivityInstance(entry, { bindings: input.bindings });
+	if (resolved) {
+		return resolved;
+	}
+
+	const reusableRecord = await takeReusableActivityRecord(entry, input.bindings);
+	if (reusableRecord) {
+		return await bindActivityToEntry(entry, reusableRecord);
+	}
+
+	return await startActivityInstance(entry, {
+		bindings: input.bindings,
+		removeEntryOnFailure: input.removeEntryOnFailure,
+	});
 };
 
 async function resolveActivityInstance(
@@ -755,19 +817,21 @@ const ensureHeartbeat = (): void => {
 		return;
 	}
 
-	const hasTickableEntries = Array.from(entries.values()).some((entry) => !isTerminalPhase(entry.state.phase));
+	const hasTickableEntries = Array.from(entries.values()).some((entry) =>
+		!isTerminalPhase(entry.state.phase) && hasEntryBinding(entry));
 	if (!hasTickableEntries) {
 		return;
 	}
 
 	heartbeatInterval = setInterval(() => {
 		for (const [chatId, entry] of entries) {
-			if (!isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry)) {
+			if (!isTerminalPhase(entry.state.phase) && canEntryWriteLocally(entry) && hasEntryBinding(entry)) {
 				void queueEntryStateUpdate(chatId);
 			}
 		}
 
-			const stillHasTickable = Array.from(entries.values()).some((e) => !isTerminalPhase(e.state.phase));
+			const stillHasTickable = Array.from(entries.values()).some((entry) =>
+				!isTerminalPhase(entry.state.phase) && hasEntryBinding(entry));
 			if (!stillHasTickable) {
 				clearHeartbeat();
 			}
@@ -790,15 +854,11 @@ const flushEntryStateUpdate = async (chatId: string, input?: { force?: boolean }
 
 	entry.writeInFlight = true;
 	const bindings = await loadLiveActivityBindings();
-	let activity = bindings ? await resolveActivityInstance(entry, { bindings }) : null;
-	let currentEntry = entries.get(chatId);
-	if (!activity && bindings && currentEntry && !isTerminalPhase(currentEntry.state.phase)) {
-		activity = await startActivityInstance(currentEntry, {
-			bindings,
-			removeEntryOnFailure: false,
-		});
-		currentEntry = entries.get(chatId);
-	}
+	const activity = bindings ? await acquireActivityInstance(entry, {
+		bindings,
+		removeEntryOnFailure: false,
+	}) : null;
+	const currentEntry = entries.get(chatId);
 	if (!activity || !currentEntry || isTerminalPhase(currentEntry.state.phase)) {
 		if (currentEntry) {
 			currentEntry.writeInFlight = false;
@@ -931,12 +991,13 @@ export const initializeThreadLiveActivityManager = async (): Promise<void> => {
 		);
 
 		// Start heartbeat for active entries and flush initial state
-			const hasActive = Array.from(entries.values()).some((entry) => !isTerminalPhase(entry.state.phase));
+			const hasActive = Array.from(entries.values()).some((entry) =>
+				!isTerminalPhase(entry.state.phase) && hasEntryBinding(entry));
 			if (hasActive) {
 				ensureHeartbeat();
 				await Promise.all(
 					Array.from(entries.entries())
-						.filter(([, entry]) => !isTerminalPhase(entry.state.phase))
+						.filter(([, entry]) => !isTerminalPhase(entry.state.phase) && hasEntryBinding(entry))
 						.map(async ([chatId]) => { await queueEntryStateUpdate(chatId, { immediate: true, force: true }); }),
 				);
 			}
@@ -1019,21 +1080,9 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		entry.awaitingAuthoritativeSyncStartedAtMs = 0;
 		entry.finishInProgress = false;
 	} else {
-		entry = {
-			state,
-			activity: null,
-			pushTokenSubscription: null,
-			finishInProgress: false,
-			lastContentSignature: "",
-			lastContentUpdateAtMs: 0,
-			lastStatePersistAtMs: 0,
-			writeInFlight: false,
-			writeAgain: false,
-			pendingForceWrite: false,
-			flushTimeout: null,
-			awaitingAuthoritativeSync: false,
-			awaitingAuthoritativeSyncStartedAtMs: 0,
-		};
+		entry = createEntry(state);
+		entry.awaitingAuthoritativeSync = false;
+		entry.awaitingAuthoritativeSyncStartedAtMs = 0;
 		entries.set(input.chatId, entry);
 	}
 
@@ -1046,9 +1095,12 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 	await persistEntry(input.chatId);
 	ensureHeartbeat();
 
-	const activity = await resolveActivityInstance(entry, { bindings });
+	const activity = await acquireActivityInstance(entry, {
+		bindings,
+		removeEntryOnFailure: true,
+	});
 	if (activity) {
-		log("reusing existing activity instance", { chatId: input.chatId });
+		log("activity instance acquired", { chatId: input.chatId });
 		await queueEntryStateUpdate(input.chatId, {
 			immediate: true,
 			force: true,
@@ -1056,11 +1108,7 @@ export const startThreadLiveActivity = async (input: LiveActivityStartInput): Pr
 		await syncEntryPushToken(entry);
 		return true;
 	}
-
-	return Boolean(await startActivityInstance(entry, {
-		bindings,
-		removeEntryOnFailure: true,
-	}));
+	return false;
 };
 
 export const updateThreadLiveActivity = async (input: LiveActivityUpdateInput): Promise<void> => {
@@ -1126,16 +1174,11 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 	}
 
 	await initializeThreadLiveActivityManager();
-	const entry = entries.get(input.chatId);
-	if (!entry) {
+	let entry = entries.get(input.chatId);
+
+	if (entry?.finishInProgress) {
 		return;
 	}
-
-	if (entry.finishInProgress) {
-		return;
-	}
-
-	entry.finishInProgress = true;
 
 	const outcomePhase: ThreadLiveActivityPhase = (() => {
 		switch (input.outcome) {
@@ -1169,55 +1212,46 @@ export const finishThreadLiveActivity = async (input: LiveActivityFinishInput): 
 			}
 		}
 	})();
+	const previousState = entry?.state;
 	const finalState: PersistedLiveActivityState = {
+		activityId: previousState?.activityId ?? null,
 		chatId: input.chatId,
-		chatTitle: sanitizeTitle(input.chatTitle, entry.state.chatTitle),
+		chatTitle: sanitizeTitle(input.chatTitle, previousState?.chatTitle ?? "Thread"),
 		phase: outcomePhase,
-		preview: sanitizePreview(input.preview, entry.state.preview),
-		startedAtMs: entry.state.startedAtMs,
+		preview: sanitizePreview(input.preview, previousState?.preview ?? "Waiting for updates..."),
+		startedAtMs: previousState?.startedAtMs ?? nowMs(),
 		statusLine: sanitizeStatusLine(input.statusLine, defaultStatusLine),
-		remoteManaged: entry.state.remoteManaged,
+		remoteManaged: previousState?.remoteManaged ?? true,
 	};
+	if (!entry) {
+		entry = createEntry(finalState);
+		entries.set(input.chatId, entry);
+	} else {
+		entry.state = finalState;
+	}
+	entry.finishInProgress = true;
 	entry.awaitingAuthoritativeSync = false;
 	entry.awaitingAuthoritativeSyncStartedAtMs = 0;
 
 	try {
 		clearEntryFlush(entry);
-		entry.state = finalState;
 		await persistEntry(input.chatId);
 
-		const activity = await resolveActivityInstance(entry);
+		const bindings = await loadLiveActivityBindings();
+		const activity = bindings ? await acquireActivityInstance(entry, {
+			bindings,
+			removeEntryOnFailure: true,
+		}) : null;
 		if (activity) {
 			try {
 				await activity.update(toProps(finalState));
 			} catch {
 				// Ignore final update failures.
 			}
-
-			// Always end the activity locally after a brief delay so the user sees the final state
-			const chatIdToEnd = input.chatId;
-			setTimeout(() => {
-				void (async () => {
-					try {
-						await activity.end("default", toProps(finalState));
-					} catch {
-						// Ignore end failures.
-					}
-
-					// Only remove entry if it hasn't been replaced by a new start
-					const currentEntry = entries.get(chatIdToEnd);
-					if (currentEntry && isTerminalPhase(currentEntry.state.phase)) {
-						await removeEntry(chatIdToEnd);
-					}
-				})();
-			}, FINISH_DISMISS_DELAY_MS);
-			return;
 		}
 	} finally {
 		entry.finishInProgress = false;
 	}
-
-	await removeEntry(input.chatId);
 };
 
 export const clearThreadLiveActivity = async (input: { chatId: string }): Promise<void> => {
