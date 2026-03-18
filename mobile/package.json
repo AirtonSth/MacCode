@@ -18,6 +18,8 @@
   "dependencies": {
     "@expo/ui": "55.0.1",
     "@expo/vector-icons": "^15.0.2",
+    "@react-native-firebase/app": "23.8.8",
+    "@react-native-firebase/messaging": "23.8.8",
     "@react-navigation/native": "^7.1.28",
     "@remotecode/contracts": "workspace:*",
     "@tanstack/react-query": "^5.90.1",

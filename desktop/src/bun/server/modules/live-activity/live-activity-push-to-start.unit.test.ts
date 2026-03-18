@@ -50,20 +50,13 @@ const createInMemorySubscriptionStore = (): LiveActivityPushSubscriptionStoreCon
 		updatedAt: string;
 	}>();
 	return {
-		deleteByChatId: (chatId) => {
-			for (const [key, row] of rows.entries()) {
-				if (row.chatId === chatId) {
-					rows.delete(key);
-				}
-			}
-		},
-		deleteExact: ({ chatId, liveActivityToken, pushToken, pushTokenType }) => {
-			rows.delete([chatId, pushTokenType, pushToken, liveActivityToken].join("::"));
+		deleteExact: ({ liveActivityToken, pushToken, pushTokenType }) => {
+			rows.delete([pushTokenType, pushToken, liveActivityToken].join("::"));
 		},
 		listAll: () => [...rows.values()],
 		upsert: (input) => {
 			const row = { ...input, updatedAt: new Date().toISOString() };
-			rows.set([input.chatId, input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"), row);
+			rows.set([input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"), row);
 			return row;
 		},
 	};
@@ -246,7 +239,7 @@ describe("LiveActivityPushService push-to-start", () => {
 			expect(startDelivery?.attributes).toEqual({});
 		});
 
-		it("sends push-to-start even when active subscriptions exist", async () => {
+		it("does NOT send push-to-start when the same device already has an active subscription", async () => {
 			const store = createInMemoryPushToStartTokenStore();
 			const subStore = createInMemorySubscriptionStore();
 			const { deliveries, service } = createRecordingHarness(store, subStore);
@@ -270,7 +263,7 @@ describe("LiveActivityPushService push-to-start", () => {
 				liveActivityToken: "live-token-existing",
 			});
 
-			// Start a second chat — push-to-start is always sent regardless of subscriptions
+			// Start again on the same device after the live activity token is known.
 			service.onChatStarted({
 				chatId: "chat-with-sub",
 				chatTitle: "Thread",
@@ -278,9 +271,8 @@ describe("LiveActivityPushService push-to-start", () => {
 
 			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
 
-			// Both onChatStarted calls should trigger push-to-start (global broadcast)
 			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			expect(startDeliveries.length).toBeGreaterThanOrEqual(2);
+			expect(startDeliveries).toHaveLength(1);
 		});
 
 		it("does NOT send push-to-start when no tokens registered", async () => {
@@ -369,8 +361,8 @@ describe("LiveActivityPushService push-to-start", () => {
 		});
 	});
 
-	describe("end event includes sound", () => {
-		it("delivers end event with sound=default through the sender", async () => {
+	describe("terminal completion keeps the live activity alive", () => {
+		it("delivers a terminal update through the sender", async () => {
 			const rawDeliveries: Array<{
 				event: string;
 				contentState: Record<string, unknown>;
@@ -402,9 +394,9 @@ describe("LiveActivityPushService push-to-start", () => {
 				outcome: "completed",
 			});
 
-			const endEvent = rawDeliveries.find((d) => d.event === "end");
-			expect(endEvent).toBeDefined();
-			expect(endEvent?.contentState.phase).toBe("completed");
+			const terminalUpdate = rawDeliveries.at(-1);
+			expect(terminalUpdate?.event).toBe("update");
+			expect(terminalUpdate?.contentState.phase).toBe("completed");
 		});
 	});
 
@@ -449,8 +441,8 @@ describe("LiveActivityPushService push-to-start", () => {
 		});
 	});
 
-	describe("full lifecycle: push-to-start then end with sound", () => {
-		it("sends start then end when subscription is added mid-chat", async () => {
+	describe("full lifecycle: push-to-start then global subscription updates", () => {
+		it("sends start then terminal update when subscription is added mid-chat", async () => {
 			const store = createInMemoryPushToStartTokenStore();
 			const { deliveries, service } = createRecordingHarness(store);
 
@@ -477,21 +469,33 @@ describe("LiveActivityPushService push-to-start", () => {
 				liveActivityToken: "live-activity-token-from-ios",
 			});
 
-			// 3. Chat finishes → triggers end event
+			// 2.5. Normal updates after the subscription exists must no longer resend
+			// push-to-start for the same device.
+			service.onAssistantEvent("chat-lifecycle", {
+				type: "item_started",
+				turnId: "turn-lifecycle",
+				itemId: "item-lifecycle",
+				itemType: "assistant_message",
+			});
+
+			await new Promise<void>((resolve) => { setTimeout(resolve, 100); });
+
+			// 3. Chat finishes → triggers terminal update
 			await service.onChatFinished({
 				chatId: "chat-lifecycle",
 				outcome: "completed",
 			});
 
 			const startDeliveries = deliveries.filter((d) => d.event === "start");
-			const endDeliveries = deliveries.filter((d) => d.event === "end");
+			const completedUpdates = deliveries.filter((d) => d.event === "update" && d.chatId === "chat-lifecycle");
 
 			expect(startDeliveries.length).toBeGreaterThanOrEqual(1);
-			expect(endDeliveries.length).toBeGreaterThanOrEqual(1);
+			expect(startDeliveries).toHaveLength(1);
+			expect(completedUpdates.length).toBeGreaterThanOrEqual(1);
 
-			// End should be delivered to the per-activity subscription token
-			const lastEnd = endDeliveries[endDeliveries.length - 1]!;
-			expect(lastEnd.liveActivityToken).toBe("live-activity-token-from-ios");
+			// The terminal update should be delivered to the per-activity subscription token
+			const lastCompletedUpdate = completedUpdates[completedUpdates.length - 1]!;
+			expect(lastCompletedUpdate.liveActivityToken).toBe("live-activity-token-from-ios");
 		});
 	});
 

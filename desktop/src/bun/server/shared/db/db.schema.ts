@@ -126,9 +126,7 @@ export const liveActivitySubscriptions = sqliteTable(
 	"live_activity_subscriptions",
 	{
 		id: integer("id").primaryKey({ autoIncrement: true }),
-		chatId: text("chatId")
-			.notNull()
-			.references(() => chats.id, { onDelete: "cascade" }),
+		chatId: text("chatId").notNull(),
 		chatTitle: text("chatTitle"),
 		pushToken: text("pushToken").notNull(),
 		pushTokenType: text("pushTokenType").notNull(),
@@ -139,7 +137,6 @@ export const liveActivitySubscriptions = sqliteTable(
 		chatIdIndex: index("idx_live_activity_subscriptions_chat_id").on(table.chatId),
 		updatedAtIndex: index("idx_live_activity_subscriptions_updated_at").on(table.updatedAt),
 		uniqueTokenPair: uniqueIndex("idx_live_activity_subscriptions_token_pair").on(
-			table.chatId,
 			table.pushTokenType,
 			table.pushToken,
 			table.liveActivityToken,

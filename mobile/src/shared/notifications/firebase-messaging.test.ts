@@ -6,7 +6,6 @@ const appState = {
 };
 
 const notificationsState = {
-	devicePushTokenResponses: [] as unknown[],
 	getPermissionsResponse: {
 		granted: false,
 		ios: {
@@ -22,8 +21,15 @@ const notificationsState = {
 	},
 };
 
+const messagingState = {
+	getTokenResponses: [] as unknown[],
+	getTokenCalls: 0,
+	isDeviceRegisteredForRemoteMessages: false,
+	onTokenRefreshListener: null as ((token: string) => void) | null,
+	registerDeviceForRemoteMessagesCalls: 0,
+};
+
 const resetNotificationsState = () => {
-	notificationsState.devicePushTokenResponses = [];
 	notificationsState.getPermissionsResponse = {
 		granted: false,
 		ios: {
@@ -37,6 +43,14 @@ const resetNotificationsState = () => {
 			status: 0,
 		},
 	};
+};
+
+const resetMessagingState = () => {
+	messagingState.getTokenResponses = [];
+	messagingState.getTokenCalls = 0;
+	messagingState.isDeviceRegisteredForRemoteMessages = false;
+	messagingState.onTokenRefreshListener = null;
+	messagingState.registerDeviceForRemoteMessagesCalls = 0;
 };
 
 mock.module("react-native", () => ({
@@ -60,10 +74,6 @@ mock.module("expo-notifications", () => ({
 	IosAuthorizationStatus: {
 		PROVISIONAL: 3,
 	},
-	addPushTokenListener: () => ({
-		remove: () => undefined,
-	}),
-	getDevicePushTokenAsync: async () => notificationsState.devicePushTokenResponses.shift() ?? null,
 	getPermissionsAsync: async () => notificationsState.getPermissionsResponse,
 	requestPermissionsAsync: async () => {
 		notificationsState.requestPermissionsCalls += 1;
@@ -74,42 +84,61 @@ mock.module("expo-notifications", () => ({
 	setNotificationHandler: () => undefined,
 }));
 
+mock.module("@react-native-firebase/messaging", () => ({
+	default: () => ({
+		get isDeviceRegisteredForRemoteMessages() {
+			return messagingState.isDeviceRegisteredForRemoteMessages;
+		},
+		getToken: async () => {
+			messagingState.getTokenCalls += 1;
+			return messagingState.getTokenResponses.shift() ?? null;
+		},
+		onTokenRefresh: (listener: (token: string) => void) => {
+			messagingState.onTokenRefreshListener = listener;
+			return () => {
+				if (messagingState.onTokenRefreshListener === listener) {
+					messagingState.onTokenRefreshListener = null;
+				}
+			};
+		},
+		registerDeviceForRemoteMessages: async () => {
+			messagingState.registerDeviceForRemoteMessagesCalls += 1;
+			messagingState.isDeviceRegisteredForRemoteMessages = true;
+		},
+	}),
+}));
+
 const {
 	ensurePushDeliveryToken,
 	resetPushDeliveryTokenForTests,
+	subscribePushDeliveryTokenRefresh,
 } = await import("./firebase-messaging");
 
 beforeEach(() => {
 	appState.currentState = "active";
 	resetNotificationsState();
+	resetMessagingState();
 	resetPushDeliveryTokenForTests();
 });
 
 describe("push delivery token resolution", () => {
-	test("returns the APNS token without requesting notification permission when direct token access already works", async () => {
-		notificationsState.devicePushTokenResponses = [
-			{
-				data: "apns-token-direct",
-				type: "ios",
-			},
-		];
+	test("returns the FCM token without requesting notification permission when direct token access already works", async () => {
+		messagingState.getTokenResponses = ["fcm-token-direct"];
 
 		const token = await ensurePushDeliveryToken();
 
 		expect(token).toEqual({
-			token: "apns-token-direct",
-			type: "apns",
+			token: "fcm-token-direct",
+			type: "fcm",
 		});
 		expect(notificationsState.requestPermissionsCalls).toBe(0);
+		expect(messagingState.registerDeviceForRemoteMessagesCalls).toBe(1);
 	});
 
-	test("retries the direct token read immediately after permission is granted", async () => {
-		notificationsState.devicePushTokenResponses = [
+	test("retries the FCM token read immediately after permission is granted", async () => {
+		messagingState.getTokenResponses = [
 			null,
-			{
-				data: "apns-token-after-permission",
-				type: "apns",
-			},
+			"fcm-token-after-permission",
 		];
 		notificationsState.requestPermissionsResponse = {
 			granted: true,
@@ -121,9 +150,25 @@ describe("push delivery token resolution", () => {
 		const token = await ensurePushDeliveryToken();
 
 		expect(token).toEqual({
-			token: "apns-token-after-permission",
-			type: "apns",
+			token: "fcm-token-after-permission",
+			type: "fcm",
 		});
 		expect(notificationsState.requestPermissionsCalls).toBe(1);
+		expect(messagingState.getTokenCalls).toBe(2);
+	});
+
+	test("publishes token refresh updates as FCM", () => {
+		const refreshedTokens: { token: string; type: string }[] = [];
+		const unsubscribe = subscribePushDeliveryTokenRefresh((token) => {
+			refreshedTokens.push(token);
+		});
+
+		messagingState.onTokenRefreshListener?.("fcm-token-refresh");
+		unsubscribe();
+
+		expect(refreshedTokens).toEqual([{
+			token: "fcm-token-refresh",
+			type: "fcm",
+		}]);
 	});
 });

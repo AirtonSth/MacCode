@@ -128,6 +128,10 @@ test("DB initialization creates schema, indices and pragmas for REST terminal mo
 		expect(liveActivitySubscriptionIndexes).toContain("idx_live_activity_subscriptions_chat_id");
 		expect(liveActivitySubscriptionIndexes).toContain("idx_live_activity_subscriptions_updated_at");
 		expect(liveActivitySubscriptionIndexes).toContain("idx_live_activity_subscriptions_token_pair");
+		const liveActivitySubscriptionForeignKeys = client.sqlite
+			.prepare("PRAGMA foreign_key_list(live_activity_subscriptions)")
+			.all();
+		expect(liveActivitySubscriptionForeignKeys).toEqual([]);
 
 		const chatColumns = client.sqlite
 			.prepare("PRAGMA table_info(chats)")
@@ -371,6 +375,98 @@ test("DB initialization rebuilds legacy terminal tables to REST terminal schema"
 		);
 		expect(terminalEntryColumns).not.toContain("sessionId");
 		expect(terminalEntryColumns).not.toContain("direction");
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("DB initialization migrates live activity subscriptions away from chat cascade deletes", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-db-live-activity-migrate-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
+
+	try {
+		client.sqlite.exec(`
+			CREATE TABLE projects (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				path TEXT NOT NULL UNIQUE,
+				isFavorite INTEGER NOT NULL DEFAULT 0,
+				createdAt TEXT NOT NULL,
+				updatedAt TEXT NOT NULL
+			)
+		`);
+		client.sqlite.exec(`
+			CREATE TABLE chats (
+				id TEXT PRIMARY KEY,
+				projectId TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+				title TEXT NOT NULL,
+				provider TEXT NOT NULL CHECK(provider IN ('fake', 'codex', 'claude')),
+				providerThreadId TEXT,
+				status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+				isActive INTEGER NOT NULL DEFAULT 0,
+				diffAdded INTEGER NOT NULL DEFAULT 0,
+				diffRemoved INTEGER NOT NULL DEFAULT 0,
+				updatedAt TEXT NOT NULL
+			)
+		`);
+		client.sqlite.exec(`
+			CREATE TABLE live_activity_subscriptions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+				chatTitle TEXT,
+				pushToken TEXT NOT NULL,
+				pushTokenType TEXT NOT NULL CHECK(pushTokenType IN ('apns', 'fcm')),
+				liveActivityToken TEXT NOT NULL,
+				updatedAt TEXT NOT NULL
+			)
+		`);
+		client.sqlite.exec(
+			"CREATE UNIQUE INDEX idx_live_activity_subscriptions_token_pair ON live_activity_subscriptions(chatId, pushTokenType, pushToken, liveActivityToken)",
+		);
+
+		client.sqlite
+			.prepare(
+				"INSERT INTO projects (id, name, path, isFavorite, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run("project-1", "Project", "/tmp/db-live-activity-bootstrap", 0, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+		client.sqlite
+			.prepare(
+				"INSERT INTO chats (id, projectId, title, provider, providerThreadId, status, isActive, diffAdded, diffRemoved, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run("chat-1", "project-1", "Legacy chat", "codex", "thread-1", "running", 1, 0, 0, "2026-01-01T00:00:00.000Z");
+		client.sqlite
+			.prepare(
+				"INSERT INTO live_activity_subscriptions (chatId, chatTitle, pushToken, pushTokenType, liveActivityToken, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run("chat-1", "Legacy chat", "push-token-1", "apns", "activity-token-1", "2026-01-01T00:00:00.000Z");
+
+		initializeDatabaseSchema(client.sqlite);
+
+		const liveActivitySubscriptionForeignKeys = client.sqlite
+			.prepare("PRAGMA foreign_key_list(live_activity_subscriptions)")
+			.all();
+		expect(liveActivitySubscriptionForeignKeys).toEqual([]);
+
+		client.sqlite.prepare("DELETE FROM chats WHERE id = ?").run("chat-1");
+
+		const retainedSubscriptions = client.sqlite
+			.prepare("SELECT chatId, pushToken, pushTokenType, liveActivityToken FROM live_activity_subscriptions")
+			.all() as Array<{
+				chatId: string;
+				liveActivityToken: string;
+				pushToken: string;
+				pushTokenType: string;
+			}>;
+		expect(retainedSubscriptions).toEqual([
+			expect.objectContaining({
+				chatId: "chat-1",
+				pushToken: "push-token-1",
+				pushTokenType: "apns",
+				liveActivityToken: "activity-token-1",
+			}),
+		]);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });

@@ -114,6 +114,7 @@ const {
 	onThreadLiveActivityAppStateChanged,
 	resetThreadLiveActivityManagerForTests,
 	startThreadLiveActivity,
+	subscribeThreadLiveActivityPushToken,
 	updateThreadLiveActivity,
 } = await import("./thread-live-activity");
 
@@ -322,6 +323,33 @@ describe("thread live activity manager", () => {
 			preview: "New chat output",
 			statusLine: "Generating response",
 		});
+	});
+
+	test("reemits the persisted push token when reusing an activity for another chat", async () => {
+		secureStoreState.set("remotecode.live_activity.push_token", "push-token-1");
+		const pushTokenEvents: { chatId: string; pushToken: string }[] = [];
+		const unsubscribe = subscribeThreadLiveActivityPushToken((event) => {
+			pushTokenEvents.push(event);
+		});
+
+		try {
+			const started = await startThreadLiveActivity({
+				chatId: "chat-1",
+				remoteManaged: false,
+			});
+			expect(started).toBe(true);
+
+			await startThreadLiveActivity({
+				chatId: "chat-2",
+				remoteManaged: false,
+			});
+			await Bun.sleep(50);
+		} finally {
+			unsubscribe();
+		}
+
+		expect(pushTokenEvents.some((event) =>
+			event.chatId === "chat-2" && event.pushToken === "push-token-1")).toBe(true);
 	});
 
 	test("reuses the already open activity when a different chat finishes", async () => {

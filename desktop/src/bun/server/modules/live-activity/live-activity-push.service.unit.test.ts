@@ -4,9 +4,15 @@ import {
 	createLiveActivityPushServiceForTests,
 	createLiveActivityPushServiceFromEnvironment,
 } from "./live-activity-push.service";
-import type { LiveActivityPushSubscriptionStoreContract } from "./live-activity-push.model";
+import type {
+	LiveActivityPushStoredSubscription,
+	LiveActivityPushSubscriptionStoreContract,
+	PushToStartTokenStoreContract,
+	PushToStartTokenStored,
+} from "./live-activity-push.model";
 
 interface CapturedDelivery {
+	chatId: string;
 	event: "update" | "end" | "start";
 	chatTitle: string;
 	preview: string;
@@ -18,6 +24,7 @@ const createRecordingHarness = () => {
 	const deliveries: CapturedDelivery[] = [];
 	const service = createLiveActivityPushServiceForTests(async (input) => {
 		deliveries.push({
+			chatId: input.contentState.chatId,
 			event: input.event,
 			chatTitle: input.contentState.chatTitle,
 			preview: input.contentState.preview,
@@ -31,6 +38,48 @@ const createRecordingHarness = () => {
 	return {
 		deliveries,
 		service,
+	};
+};
+
+const createInMemorySubscriptionStore = (): LiveActivityPushSubscriptionStoreContract & {
+	rows: Map<string, LiveActivityPushStoredSubscription>;
+} => {
+	const rows = new Map<string, LiveActivityPushStoredSubscription>();
+	return {
+		rows,
+		deleteExact: ({ liveActivityToken, pushToken, pushTokenType }) => {
+			rows.delete([pushTokenType, pushToken, liveActivityToken].join("::"));
+		},
+		listAll: () => [...rows.values()],
+		upsert: (input) => {
+			const stored: LiveActivityPushStoredSubscription = {
+				...input,
+				updatedAt: new Date().toISOString(),
+			};
+			rows.set([input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"), stored);
+			return stored;
+		},
+	};
+};
+
+const createInMemoryPushToStartTokenStore = (): PushToStartTokenStoreContract & {
+	rows: Map<string, PushToStartTokenStored>;
+} => {
+	const rows = new Map<string, PushToStartTokenStored>();
+	return {
+		rows,
+		deleteByPushToken: (pushToken, pushTokenType) => {
+			rows.delete(`${pushTokenType}::${pushToken}`);
+		},
+		listAll: () => [...rows.values()],
+		upsert: (input) => {
+			const stored: PushToStartTokenStored = {
+				...input,
+				updatedAt: new Date().toISOString(),
+			};
+			rows.set(`${input.pushTokenType}::${input.pushToken}`, stored);
+			return stored;
+		},
 	};
 };
 
@@ -71,7 +120,7 @@ test("LiveActivityPushService aggressively sanitizes payload text and truncates 
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview.length).toBeLessThanOrEqual(140);
@@ -107,11 +156,51 @@ test("LiveActivityPushService keeps short previews unchanged", async () => {
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview).toBe("Short preview text");
 	expect(endDelivery?.preview.endsWith("...")).toBe(false);
+});
+
+test("LiveActivityPushService prunes persisted unsupported token types after backend capability refresh", () => {
+	const subscriptionStore = createInMemorySubscriptionStore();
+	const pushToStartTokenStore = createInMemoryPushToStartTokenStore();
+	subscriptionStore.upsert({
+		chatId: "chat-apns",
+		chatTitle: "APNS chat",
+		liveActivityToken: "live-apns",
+		pushToken: "push-apns",
+		pushTokenType: "apns",
+	});
+	subscriptionStore.upsert({
+		chatId: "chat-fcm",
+		chatTitle: "FCM chat",
+		liveActivityToken: "live-fcm",
+		pushToken: "push-fcm",
+		pushTokenType: "fcm",
+	});
+	pushToStartTokenStore.upsert({
+		pushToStartToken: "pts-apns",
+		pushToken: "push-apns",
+		pushTokenType: "apns",
+	});
+	pushToStartTokenStore.upsert({
+		pushToStartToken: "pts-fcm",
+		pushToken: "push-fcm",
+		pushTokenType: "fcm",
+	});
+
+	const service = createLiveActivityPushServiceForTests(
+		undefined,
+		subscriptionStore,
+		pushToStartTokenStore,
+	);
+
+	service.pruneUnsupportedPushTokenTypes(new Set(["fcm"]));
+
+	expect(subscriptionStore.listAll().map((entry) => entry.pushTokenType)).toEqual(["fcm"]);
+	expect(pushToStartTokenStore.listAll().map((entry) => entry.pushTokenType)).toEqual(["fcm"]);
 });
 
 test("LiveActivityPushService accumulates legacy deltas across multiple chunks", async () => {
@@ -135,7 +224,7 @@ test("LiveActivityPushService accumulates legacy deltas across multiple chunks",
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview).toBe("Hello world");
@@ -168,7 +257,7 @@ test("LiveActivityPushService keeps structured fallback text when legacy deltas 
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview).toBe("Writing response...");
@@ -213,7 +302,7 @@ test("LiveActivityPushService replaces event previews with the latest response t
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview).toBe("Hello world");
@@ -260,7 +349,7 @@ test("LiveActivityPushService ignores duplicated legacy deltas once structured r
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview).toBe("Hello world");
@@ -305,7 +394,7 @@ test("LiveActivityPushService replaces summary preview text instead of appending
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview).toBe("Planning response...");
@@ -339,7 +428,7 @@ test("LiveActivityPushService stays stable with hostile mixed payloads", async (
 		outcome: "completed",
 	});
 
-	const endDelivery = findLastDeliveryByEvent(deliveries, "end");
+	const endDelivery = findLastDeliveryByEvent(deliveries, "update");
 
 	expect(endDelivery).toBeDefined();
 	expect(endDelivery?.preview.length).toBeLessThanOrEqual(140);
@@ -352,7 +441,7 @@ test("LiveActivityPushService stays stable with hostile mixed payloads", async (
 	expect(endDelivery?.preview).not.toContain("\\");
 });
 
-test("LiveActivityPushService persists subscriptions and clears them after a successful end", async () => {
+test("LiveActivityPushService persists subscriptions after a successful end", async () => {
 	const persistedRows = new Map<string, {
 		chatId: string;
 		chatTitle?: string;
@@ -361,27 +450,30 @@ test("LiveActivityPushService persists subscriptions and clears them after a suc
 		pushTokenType: "apns" | "fcm";
 		updatedAt: string;
 	}>();
-	const deleteByChatCalls: string[] = [];
 	const store: LiveActivityPushSubscriptionStoreContract = {
-		deleteByChatId: (chatId) => {
-			deleteByChatCalls.push(chatId);
-			for (const [key, row] of persistedRows.entries()) {
-				if (row.chatId === chatId) {
-					persistedRows.delete(key);
-				}
-			}
-		},
-		deleteExact: ({ chatId, liveActivityToken, pushToken, pushTokenType }) => {
-			persistedRows.delete([chatId, pushTokenType, pushToken, liveActivityToken].join("::"));
+		deleteExact: ({ liveActivityToken, pushToken, pushTokenType }) => {
+			persistedRows.delete([pushTokenType, pushToken, liveActivityToken].join("::"));
 		},
 		listAll: () => [...persistedRows.values()],
 		upsert: (input) => {
+			for (const [key, row] of persistedRows.entries()) {
+				const samePushTokenWithOldActivityToken =
+					row.pushToken === input.pushToken
+					&& row.pushTokenType === input.pushTokenType
+					&& row.liveActivityToken !== input.liveActivityToken;
+				const sameActivityTokenWithDifferentPushToken =
+					row.liveActivityToken === input.liveActivityToken
+					&& (row.pushToken !== input.pushToken || row.pushTokenType !== input.pushTokenType);
+				if (samePushTokenWithOldActivityToken || sameActivityTokenWithDifferentPushToken) {
+					persistedRows.delete(key);
+				}
+			}
 			const row = {
 				...input,
 				updatedAt: "2026-03-05T00:00:00.000Z",
 			};
 			persistedRows.set(
-				[input.chatId, input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"),
+				[input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"),
 				row,
 			);
 			return row;
@@ -411,8 +503,13 @@ test("LiveActivityPushService persists subscriptions and clears them after a suc
 		outcome: "completed",
 	});
 
-	expect(deleteByChatCalls).toEqual(["chat-store"]);
-	expect(store.listAll()).toEqual([]);
+	expect(store.listAll()).toHaveLength(1);
+	expect(store.listAll()[0]).toEqual(expect.objectContaining({
+		chatId: "chat-store",
+		liveActivityToken: "activity-token-store",
+		pushToken: "push-token-store",
+		pushTokenType: "apns",
+	}));
 });
 
 test("LiveActivityPushService immediately flushes a follow-up update when new state arrives during an in-flight send", async () => {
@@ -461,7 +558,193 @@ test("LiveActivityPushService immediately flushes a follow-up update when new st
 	expect(deliveryEvents).toEqual(["update", "update"]);
 });
 
-test("createLiveActivityPushServiceFromEnvironment rejects subscriptions for token types unsupported by the private backend", async () => {
+test("LiveActivityPushService moves the same subscription token pair across chats", async () => {
+	const persistedRows = new Map<string, {
+		chatId: string;
+		chatTitle?: string;
+		liveActivityToken: string;
+		pushToken: string;
+		pushTokenType: "apns" | "fcm";
+		updatedAt: string;
+	}>();
+	const store: LiveActivityPushSubscriptionStoreContract = {
+		deleteExact: ({ liveActivityToken, pushToken, pushTokenType }) => {
+			persistedRows.delete([pushTokenType, pushToken, liveActivityToken].join("::"));
+		},
+		listAll: () => [...persistedRows.values()],
+		upsert: (input) => {
+			for (const [key, row] of persistedRows.entries()) {
+				const samePushTokenWithOldActivityToken =
+					row.pushToken === input.pushToken
+					&& row.pushTokenType === input.pushTokenType
+					&& row.liveActivityToken !== input.liveActivityToken;
+				const sameActivityTokenWithDifferentPushToken =
+					row.liveActivityToken === input.liveActivityToken
+					&& (row.pushToken !== input.pushToken || row.pushTokenType !== input.pushTokenType);
+				if (samePushTokenWithOldActivityToken || sameActivityTokenWithDifferentPushToken) {
+					persistedRows.delete(key);
+				}
+			}
+			const row = {
+				...input,
+				updatedAt: "2026-03-05T00:00:00.000Z",
+			};
+			persistedRows.set(
+				[input.pushTokenType, input.pushToken, input.liveActivityToken].join("::"),
+				row,
+			);
+			return row;
+		},
+	};
+	const { deliveries } = createRecordingHarness();
+	const serviceWithStore = createLiveActivityPushServiceForTests(async (input) => {
+		deliveries.push({
+			chatId: input.contentState.chatId,
+			event: input.event,
+			chatTitle: input.contentState.chatTitle,
+			preview: input.contentState.preview,
+		});
+		return {
+			delivered: true,
+			shouldDropSubscription: false,
+		};
+	}, store);
+
+	serviceWithStore.onChatStarted({
+		chatId: "chat-old",
+		chatTitle: "Old",
+	});
+	await serviceWithStore.upsertSubscription({
+		chatId: "chat-old",
+		chatTitle: "Old",
+		liveActivityToken: "activity-token-1",
+		pushToken: "push-token-1",
+		pushTokenType: "apns",
+	});
+	await serviceWithStore.onChatFinished({
+		chatId: "chat-old",
+		outcome: "completed",
+	});
+	await serviceWithStore.upsertSubscription({
+		chatId: "chat-new",
+		chatTitle: "New",
+		liveActivityToken: "activity-token-1",
+		pushToken: "push-token-1",
+		pushTokenType: "apns",
+	});
+
+	expect(store.listAll()).toHaveLength(1);
+	expect(store.listAll()[0]).toEqual(expect.objectContaining({
+		chatId: "chat-new",
+		liveActivityToken: "activity-token-1",
+		pushToken: "push-token-1",
+		pushTokenType: "apns",
+	}));
+});
+
+test("LiveActivityPushService reuses global subscriptions for the next chat without re-registering", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	service.onChatStarted({
+		chatId: "chat-old",
+		chatTitle: "Old",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-old",
+		chatTitle: "Old",
+		liveActivityToken: "activity-token-1",
+		pushToken: "push-token-1",
+		pushTokenType: "apns",
+	});
+	await service.onChatFinished({
+		chatId: "chat-old",
+		outcome: "completed",
+	});
+
+	service.onChatStarted({
+		chatId: "chat-new",
+		chatTitle: "New",
+	});
+	service.onAssistantDelta("chat-new", "next chat output");
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 50);
+	});
+
+	const lastUpdate = findLastDeliveryByEvent(deliveries, "update");
+
+	expect(lastUpdate).toBeDefined();
+	expect(lastUpdate?.chatId).toBe("chat-new");
+	expect(lastUpdate?.chatTitle).toBe("New");
+});
+
+test("LiveActivityPushService keeps a global subscription active across multiple concurrent chats", async () => {
+	const { deliveries, service } = createRecordingHarness();
+
+	await service.upsertSubscription({
+		chatId: "chat-a",
+		chatTitle: "A",
+		liveActivityToken: "activity-token-1",
+		pushToken: "push-token-1",
+		pushTokenType: "apns",
+	});
+
+	service.onChatStarted({
+		chatId: "chat-a",
+		chatTitle: "A",
+	});
+	service.onAssistantDelta("chat-a", "alpha");
+	service.onChatStarted({
+		chatId: "chat-b",
+		chatTitle: "B",
+	});
+	service.onAssistantDelta("chat-b", "beta");
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 50);
+	});
+
+	expect(deliveries.some((delivery) => delivery.event === "update" && delivery.chatId === "chat-a")).toBe(true);
+	expect(deliveries.some((delivery) => delivery.event === "update" && delivery.chatId === "chat-b")).toBe(true);
+});
+
+test("LiveActivityPushService keeps subscriptions after permanent delivery failures", async () => {
+	let deliveries = 0;
+	const service = createLiveActivityPushServiceForTests(async () => {
+		deliveries += 1;
+		return {
+			delivered: false,
+			errorCode: "push/unsupported-token-type-apns",
+			shouldDropSubscription: true,
+		};
+	});
+
+	service.onChatStarted({
+		chatId: "chat-keep",
+		chatTitle: "Keep",
+	});
+	await service.upsertSubscription({
+		chatId: "chat-keep",
+		chatTitle: "Keep",
+		liveActivityToken: "activity-token-keep",
+		pushToken: "push-token-keep",
+		pushTokenType: "apns",
+	});
+	await service.onChatFinished({
+		chatId: "chat-keep",
+		outcome: "completed",
+	});
+	service.onChatStarted({
+		chatId: "chat-next",
+		chatTitle: "Next",
+	});
+	service.onAssistantDelta("chat-next", "next");
+	await new Promise<void>((resolve) => {
+		setTimeout(resolve, 50);
+	});
+
+	expect(deliveries).toBeGreaterThanOrEqual(2);
+});
+
+test("createLiveActivityPushServiceFromEnvironment rejects subscriptions whose token type is not supported by backend capabilities", async () => {
 	const originalFetch = globalThis.fetch;
 	const deliveryBodies: Array<Record<string, unknown>> = [];
 	let statusRequests = 0;
@@ -597,14 +880,10 @@ test("createLiveActivityPushServiceFromEnvironment caches backend capabilities a
 
 		expect(subscribed).toBe(true);
 		expect(statusRequests).toBe(1);
-		// Two deliveries: one update on subscription, one end on finish — both FCM only (APNS filtered)
-		expect(deliveryBodies).toHaveLength(2);
-		for (const body of deliveryBodies) {
-			expect(body).toMatchObject({
-				pushToken: "device-token-fcm",
-				pushTokenType: "fcm",
-			});
-		}
+		expect(deliveryBodies.length).toBeGreaterThanOrEqual(1);
+		expect(deliveryBodies.every((body) => body.pushTokenType === "fcm")).toBe(true);
+		expect(deliveryBodies.some((body) => body.pushToken === "device-token-fcm")).toBe(true);
+		expect(deliveryBodies.some((body) => body.pushToken === "device-token-apns")).toBe(false);
 	} finally {
 		globalThis.fetch = originalFetch;
 	}

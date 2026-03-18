@@ -47,21 +47,24 @@ export class LiveActivitySubscriptionRepository implements LiveActivityPushSubsc
 
 		this.database
 			.delete(liveActivitySubscriptions)
-			.where(and(
-				eq(liveActivitySubscriptions.chatId, input.chatId),
-				or(
-					and(
-						eq(liveActivitySubscriptions.pushToken, input.pushToken),
-						eq(liveActivitySubscriptions.pushTokenType, input.pushTokenType),
-						ne(liveActivitySubscriptions.liveActivityToken, input.liveActivityToken),
+			.where(or(
+				and(
+					eq(liveActivitySubscriptions.pushToken, input.pushToken),
+					eq(liveActivitySubscriptions.pushTokenType, input.pushTokenType),
+					ne(liveActivitySubscriptions.liveActivityToken, input.liveActivityToken),
+				),
+				and(
+					eq(liveActivitySubscriptions.liveActivityToken, input.liveActivityToken),
+					or(
+						ne(liveActivitySubscriptions.pushToken, input.pushToken),
+						ne(liveActivitySubscriptions.pushTokenType, input.pushTokenType),
 					),
-					and(
-						eq(liveActivitySubscriptions.liveActivityToken, input.liveActivityToken),
-						or(
-							ne(liveActivitySubscriptions.pushToken, input.pushToken),
-							ne(liveActivitySubscriptions.pushTokenType, input.pushTokenType),
-						),
-					),
+				),
+				and(
+					eq(liveActivitySubscriptions.pushToken, input.pushToken),
+					eq(liveActivitySubscriptions.pushTokenType, input.pushTokenType),
+					eq(liveActivitySubscriptions.liveActivityToken, input.liveActivityToken),
+					ne(liveActivitySubscriptions.chatId, input.chatId),
 				),
 			))
 			.run();
@@ -94,18 +97,10 @@ export class LiveActivitySubscriptionRepository implements LiveActivityPushSubsc
 		this.database
 			.delete(liveActivitySubscriptions)
 			.where(and(
-				eq(liveActivitySubscriptions.chatId, input.chatId),
 				eq(liveActivitySubscriptions.liveActivityToken, input.liveActivityToken),
 				eq(liveActivitySubscriptions.pushToken, input.pushToken),
 				eq(liveActivitySubscriptions.pushTokenType, input.pushTokenType),
 			))
-			.run();
-	}
-
-	deleteByChatId(chatId: string): void {
-		this.database
-			.delete(liveActivitySubscriptions)
-			.where(eq(liveActivitySubscriptions.chatId, chatId))
 			.run();
 	}
 }

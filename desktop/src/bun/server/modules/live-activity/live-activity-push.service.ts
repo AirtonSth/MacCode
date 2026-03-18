@@ -465,6 +465,10 @@ const toSubscriptionKey = (
 	subscription: { liveActivityToken: string; pushToken: string; pushTokenType: LiveActivityPushTokenType },
 ): string => `${subscription.pushTokenType}::${subscription.pushToken}::${subscription.liveActivityToken}`;
 
+const toPushDeviceKey = (
+	input: { pushToken: string; pushTokenType: LiveActivityPushTokenType },
+): string => `${input.pushTokenType}::${input.pushToken}`;
+
 const toDeliverySignature = (input: {
 	contentState: LiveActivityContentState;
 	event: PushEvent;
@@ -868,15 +872,17 @@ class NoopLiveActivityPushService implements LiveActivityPushServiceContract {
 
 export class LiveActivityPushService implements LiveActivityPushServiceContract {
 	private readonly runtimesByChatId = new Map<string, ChatRuntimeState>();
-	private readonly subscriptionsByChatId = new Map<string, Map<string, LiveActivitySubscription>>();
+	private readonly subscriptions = new Map<string, LiveActivitySubscription>();
 	private readonly pushToStartTokens = new Map<string, PushToStartTokenStored>();
+	private supportedPushTokenTypes: Set<LiveActivityPushTokenType>;
 
 	constructor(
 		private readonly sender: LiveActivityPushSender,
-		private readonly supportedPushTokenTypes: ReadonlySet<LiveActivityPushTokenType> = new Set(["apns", "fcm"]),
+		supportedPushTokenTypes: ReadonlySet<LiveActivityPushTokenType> = new Set(["apns", "fcm"]),
 		private readonly subscriptionStore?: LiveActivityPushSubscriptionStoreContract,
 		private readonly pushToStartTokenStore?: PushToStartTokenStoreContract,
 	) {
+		this.supportedPushTokenTypes = new Set(supportedPushTokenTypes);
 		this.restorePersistedSubscriptions();
 		this.restorePersistedPushToStartTokens();
 	}
@@ -910,18 +916,17 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		logLiveActivityInfo("restore subscriptions", {
 			hasStore: Boolean(this.subscriptionStore),
 			persisted: persistedSubscriptions.length,
-			loaded: [...this.subscriptionsByChatId.values()].reduce((total, byChat) => total + byChat.size, 0),
+			loaded: this.subscriptions.size,
 		});
 	}
 
 	private setSubscriptionInMemory(input: LiveActivityPushStoredSubscription): LiveActivitySubscription {
-		const existingByChat = this.subscriptionsByChatId.get(input.chatId) ?? new Map<string, LiveActivitySubscription>();
 		const subscriptionKey = toSubscriptionKey({
 			pushToken: input.pushToken,
 			pushTokenType: input.pushTokenType,
 			liveActivityToken: input.liveActivityToken,
 		});
-		const previousSubscription = existingByChat.get(subscriptionKey);
+		const previousSubscription = this.subscriptions.get(subscriptionKey);
 		const subscription: LiveActivitySubscription = {
 			chatId: input.chatId,
 			chatTitle: toNormalized(input.chatTitle) || undefined,
@@ -932,9 +937,42 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			lastTimestampSeconds: previousSubscription?.lastTimestampSeconds,
 			updatedAtMs: Date.parse(input.updatedAt) || Date.now(),
 		};
-		existingByChat.set(subscriptionKey, subscription);
-		this.subscriptionsByChatId.set(input.chatId, existingByChat);
+		this.subscriptions.set(subscriptionKey, subscription);
 		return subscription;
+	}
+
+	private deleteConflictingSubscriptions(input: LiveActivityPushSubscriptionInput): void {
+		for (const [key, subscriptionEntry] of this.subscriptions.entries()) {
+			const samePushTokenWithOldActivityToken =
+				subscriptionEntry.pushToken === input.pushToken
+				&& subscriptionEntry.pushTokenType === input.pushTokenType
+				&& subscriptionEntry.liveActivityToken !== input.liveActivityToken;
+			const sameActivityTokenWithDifferentPushToken =
+				subscriptionEntry.liveActivityToken === input.liveActivityToken
+				&& (
+					subscriptionEntry.pushToken !== input.pushToken
+					|| subscriptionEntry.pushTokenType !== input.pushTokenType
+				);
+			if (!samePushTokenWithOldActivityToken && !sameActivityTokenWithDifferentPushToken) {
+				continue;
+			}
+
+			this.subscriptions.delete(key);
+			this.deletePersistedSubscription({
+				chatId: subscriptionEntry.chatId,
+				chatTitle: subscriptionEntry.chatTitle,
+				liveActivityToken: subscriptionEntry.liveActivityToken,
+				pushToken: subscriptionEntry.pushToken,
+				pushTokenType: subscriptionEntry.pushTokenType,
+			});
+			logLiveActivityInfo("replacing stale subscription token pair", {
+				chatId: subscriptionEntry.chatId,
+				nextChatId: input.chatId,
+				pushTokenType: subscriptionEntry.pushTokenType,
+				pushToken: toTokenPreview(subscriptionEntry.pushToken),
+				liveActivityToken: toTokenPreview(subscriptionEntry.liveActivityToken),
+			});
+		}
 	}
 
 	getIsEnabled(): boolean {
@@ -983,16 +1021,17 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 	}
 
-	private deletePersistedSubscriptionsByChatId(chatId: string): void {
-		if (!this.subscriptionStore) {
+	private deletePersistedPushToStartToken(input: PushToStartTokenStored): void {
+		if (!this.pushToStartTokenStore) {
 			return;
 		}
 
 		try {
-			this.subscriptionStore.deleteByChatId(chatId);
+			this.pushToStartTokenStore.deleteByPushToken(input.pushToken, input.pushTokenType);
 		} catch {
-			logLiveActivityWarn("subscription persistence delete-by-chat failed", {
-				chatId,
+			logLiveActivityWarn("push-to-start token persistence delete failed", {
+				pushTokenType: input.pushTokenType,
+				pushToken: toTokenPreview(input.pushToken),
 			});
 		}
 	}
@@ -1001,8 +1040,8 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		return this.runtimesByChatId.get(chatId) ?? null;
 	}
 
-	private hasSubscriptions(chatId: string): boolean {
-		return (this.subscriptionsByChatId.get(chatId)?.size ?? 0) > 0;
+	private hasSubscriptions(): boolean {
+		return this.subscriptions.size > 0;
 	}
 
 	private getOrCreateRuntime(input: { chatId: string; chatTitle?: string }): ChatRuntimeState {
@@ -1067,13 +1106,13 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		runtime.flushTimeout = null;
 	}
 
-	private hasAnyDeliveryTarget(chatId: string): boolean {
-		return this.hasSubscriptions(chatId) || this.pushToStartTokens.size > 0;
+	private hasAnyDeliveryTarget(): boolean {
+		return this.hasSubscriptions() || this.pushToStartTokens.size > 0;
 	}
 
 	private ensureHeartbeat(chatId: string): void {
 		const runtime = this.getRuntime(chatId);
-		if (!runtime || runtime.heartbeatInterval || isTerminalPhase(runtime.phase) || !this.hasAnyDeliveryTarget(chatId)) {
+		if (!runtime || runtime.heartbeatInterval || isTerminalPhase(runtime.phase) || !this.hasAnyDeliveryTarget()) {
 			return;
 		}
 
@@ -1203,12 +1242,13 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		const nextEvent: PushEvent = runtime.pendingEvent === "end" ? "end" : event;
+		const deliveryEvent: PushEvent = nextEvent === "end" ? "update" : nextEvent;
 		if (nextEvent === "end") {
 			this.clearScheduledFlush(chatId);
 		}
 
-		const subscriptions = this.subscriptionsByChatId.get(chatId);
-		const hasSubscriptions = subscriptions !== undefined && subscriptions.size > 0;
+		const subscriptions = [...this.subscriptions.entries()];
+		const hasSubscriptions = subscriptions.length > 0;
 		const hasPushToStartTokens = this.pushToStartTokens.size > 0;
 
 		if (!hasSubscriptions && !hasPushToStartTokens) {
@@ -1256,76 +1296,83 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			const contentState = this.toContentState(runtime);
 			const deliverySignature = toDeliverySignature({
 				contentState,
-				event: nextEvent,
+				event: deliveryEvent,
 			});
+			let attemptedAnyDelivery = false;
 			let sentAnyUpdate = false;
 			let hadTransientFailure = false;
-			let droppedSubscriptionsCount = 0;
+			let retainedFailureCount = 0;
 			let skippedDuplicateCount = 0;
 			let transientFailureCount = 0;
+			const coveredPushToStartDeviceKeys = new Set<string>();
 
-			if (subscriptions) {
-				for (const [key, subscription] of subscriptions.entries()) {
-					if (nextEvent === "update" && !force && subscription.lastDeliveredSignature === deliverySignature) {
-						skippedDuplicateCount += 1;
-						continue;
-					}
-
-					const timestampSeconds = toNextTimestampSeconds({
-						lastTimestampSeconds: subscription.lastTimestampSeconds,
-					});
-					const deliveryResult = await this.sender({
-						contentState,
-						event: nextEvent,
-						pushToken: subscription.pushToken,
-						pushTokenType: subscription.pushTokenType,
-						liveActivityToken: subscription.liveActivityToken,
-						timestampSeconds,
-					});
-					if (deliveryResult.shouldDropSubscription) {
-						subscriptions.delete(key);
-						this.deletePersistedSubscription({
-							chatId,
-							chatTitle: subscription.chatTitle,
-							liveActivityToken: subscription.liveActivityToken,
-							pushToken: subscription.pushToken,
-							pushTokenType: subscription.pushTokenType,
-						});
-						droppedSubscriptionsCount += 1;
-						logLiveActivityWarn("dropping subscription after permanent delivery error", {
-							chatId,
-							event: nextEvent,
-							code: deliveryResult.errorCode ?? "unknown",
-							pushTokenType: subscription.pushTokenType,
-							pushToken: toTokenPreview(subscription.pushToken),
-							liveActivityToken: toTokenPreview(subscription.liveActivityToken),
-						});
-						continue;
-					}
-					if (!deliveryResult.delivered) {
-						hadTransientFailure = true;
-						transientFailureCount += 1;
-						logLiveActivityWarn("transient push delivery failure", {
-							chatId,
-							event: nextEvent,
-							code: deliveryResult.errorCode ?? "unknown",
-							pushTokenType: subscription.pushTokenType,
-							pushToken: toTokenPreview(subscription.pushToken),
-							liveActivityToken: toTokenPreview(subscription.liveActivityToken),
-						});
-						continue;
-					}
-
-					subscription.lastDeliveredSignature = deliverySignature;
-					subscription.lastTimestampSeconds = timestampSeconds;
-					sentAnyUpdate = true;
+			for (const [key, subscription] of subscriptions) {
+				const subscriptionDeviceKey = toPushDeviceKey(subscription);
+				if (deliveryEvent === "update" && !force && subscription.lastDeliveredSignature === deliverySignature) {
+					skippedDuplicateCount += 1;
+					coveredPushToStartDeviceKeys.add(subscriptionDeviceKey);
+					continue;
 				}
+
+				const timestampSeconds = toNextTimestampSeconds({
+					lastTimestampSeconds: subscription.lastTimestampSeconds,
+				});
+				attemptedAnyDelivery = true;
+				const deliveryResult = await this.sender({
+					contentState,
+					event: deliveryEvent,
+					pushToken: subscription.pushToken,
+					pushTokenType: subscription.pushTokenType,
+					liveActivityToken: subscription.liveActivityToken,
+					timestampSeconds,
+				});
+				if (deliveryResult.shouldDropSubscription) {
+					hadTransientFailure = true;
+					retainedFailureCount += 1;
+					transientFailureCount += 1;
+					logLiveActivityWarn("permanent push delivery failure (subscription kept)", {
+						chatId,
+						event: deliveryEvent,
+						code: deliveryResult.errorCode ?? "unknown",
+						pushTokenType: subscription.pushTokenType,
+						pushToken: toTokenPreview(subscription.pushToken),
+						liveActivityToken: toTokenPreview(subscription.liveActivityToken),
+					});
+					continue;
+				}
+				if (!deliveryResult.delivered) {
+					hadTransientFailure = true;
+					transientFailureCount += 1;
+					logLiveActivityWarn("transient push delivery failure", {
+						chatId,
+						event: deliveryEvent,
+						code: deliveryResult.errorCode ?? "unknown",
+						pushTokenType: subscription.pushTokenType,
+						pushToken: toTokenPreview(subscription.pushToken),
+						liveActivityToken: toTokenPreview(subscription.liveActivityToken),
+					});
+					continue;
+				}
+
+				this.subscriptions.set(key, {
+					...subscription,
+					lastDeliveredSignature: deliverySignature,
+					lastTimestampSeconds: timestampSeconds,
+				});
+				coveredPushToStartDeviceKeys.add(subscriptionDeviceKey);
+				sentAnyUpdate = true;
 			}
 
-			// Broadcast to all registered devices via push-to-start tokens.
-			// Push-to-start tokens are global (not per-chat) and never dropped.
+			// Push-to-start is only a bootstrap/recovery path. If a device already
+			// received a successful (or duplicate-equivalent) subscription update in
+			// this flush, do not send another start event for that same device.
 			for (const tokenEntry of this.pushToStartTokens.values()) {
+				const deviceKey = toPushDeviceKey(tokenEntry);
+				if (coveredPushToStartDeviceKeys.has(deviceKey)) {
+					continue;
+				}
 				try {
+					attemptedAnyDelivery = true;
 					const pushToStartResult = await this.sender({
 						contentState,
 						event: "start",
@@ -1358,26 +1405,22 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			if (hadTransientFailure) {
 				this.markPendingEvent(runtime, nextEvent);
 			}
-
-			if (subscriptions && subscriptions.size === 0) {
-				this.subscriptionsByChatId.delete(chatId);
-			}
 			if (!hasSubscriptions && !hasPushToStartTokens) {
 				this.clearHeartbeat(chatId);
 			}
 
-			if (sentAnyUpdate) {
+			if (attemptedAnyDelivery) {
 				runtime.lastSentAtMs = Date.now();
 			}
 			logLiveActivityInfo("flush completed", {
 				chatId,
-				droppedSubscriptionsCount,
+				retainedFailureCount,
 				elapsedSeconds: contentState.elapsedSeconds,
-				event: nextEvent,
+				event: deliveryEvent,
 				hadTransientFailure,
 				phase: contentState.phase,
 				previewTail: contentState.preview.slice(-80),
-				remainingSubscriptions: subscriptions?.size ?? 0,
+				remainingSubscriptions: this.subscriptions.size,
 				pushToStartDevices: this.pushToStartTokens.size,
 				sentAnyUpdate,
 				skippedDuplicateCount,
@@ -1394,9 +1437,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			if (completedEndEvent && runtime.pendingEvent !== "end") {
 				this.clearScheduledFlush(chatId);
 				this.clearHeartbeat(chatId);
-				this.deletePersistedSubscriptionsByChatId(chatId);
 				this.runtimesByChatId.delete(chatId);
-				this.subscriptionsByChatId.delete(chatId);
 				return;
 			}
 			if (runtime.pendingEvent === "end") {
@@ -1448,10 +1489,10 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			return;
 		}
 
-		if (this.hasSubscriptions(input.chatId)) {
+		if (this.hasSubscriptions()) {
 			logLiveActivityInfo("flushing update to subscriptions", {
 				chatId: input.chatId,
-				subscriptions: this.subscriptionsByChatId.get(input.chatId)?.size ?? 0,
+				subscriptions: this.subscriptions.size,
 			});
 			this.queueFlush(input.chatId, "update", {
 				immediate: true,
@@ -1466,7 +1507,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			void this.sendPushToStart(input.chatId, runtime);
 		}
 
-		if (!this.hasSubscriptions(input.chatId) && this.pushToStartTokens.size === 0) {
+		if (!this.hasSubscriptions() && this.pushToStartTokens.size === 0) {
 			logLiveActivityInfo("chat started without any registered devices", {
 				chatId: input.chatId,
 			});
@@ -1593,9 +1634,7 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		this.clearScheduledFlush(input.chatId);
-		this.deletePersistedSubscriptionsByChatId(input.chatId);
 		this.runtimesByChatId.delete(input.chatId);
-		this.subscriptionsByChatId.delete(input.chatId);
 		logLiveActivityInfo("chat finish cleanup completed", {
 			chatId: input.chatId,
 		});
@@ -1661,42 +1700,40 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 	}
 
 	pruneUnsupportedPushTokenTypes(supportedPushTokenTypes: ReadonlySet<LiveActivityPushTokenType>): void {
+		this.supportedPushTokenTypes = new Set(supportedPushTokenTypes);
+		let removedSubscriptions = 0;
+		for (const [key, subscriptionEntry] of this.subscriptions.entries()) {
+			if (this.supportedPushTokenTypes.has(subscriptionEntry.pushTokenType)) {
+				continue;
+			}
+
+			this.subscriptions.delete(key);
+			this.deletePersistedSubscription({
+				chatId: subscriptionEntry.chatId,
+				chatTitle: subscriptionEntry.chatTitle,
+				liveActivityToken: subscriptionEntry.liveActivityToken,
+				pushToken: subscriptionEntry.pushToken,
+				pushTokenType: subscriptionEntry.pushTokenType,
+			});
+			removedSubscriptions += 1;
+		}
+
+		let removedPushToStartTokens = 0;
 		for (const [key, tokenEntry] of this.pushToStartTokens.entries()) {
-			if (supportedPushTokenTypes.has(tokenEntry.pushTokenType)) {
+			if (this.supportedPushTokenTypes.has(tokenEntry.pushTokenType)) {
 				continue;
 			}
 
 			this.pushToStartTokens.delete(key);
-			try {
-				this.pushToStartTokenStore?.deleteByPushToken(tokenEntry.pushToken, tokenEntry.pushTokenType);
-			} catch {
-				logLiveActivityWarn("push-to-start token prune persistence failed", {
-					pushTokenType: tokenEntry.pushTokenType,
-					pushToken: toTokenPreview(tokenEntry.pushToken),
-				});
-			}
+			this.deletePersistedPushToStartToken(tokenEntry);
+			removedPushToStartTokens += 1;
 		}
 
-		for (const [chatId, subscriptions] of this.subscriptionsByChatId.entries()) {
-			for (const [key, subscription] of subscriptions.entries()) {
-				if (supportedPushTokenTypes.has(subscription.pushTokenType)) {
-					continue;
-				}
-
-				subscriptions.delete(key);
-				this.deletePersistedSubscription({
-					chatId,
-					chatTitle: subscription.chatTitle,
-					liveActivityToken: subscription.liveActivityToken,
-					pushToken: subscription.pushToken,
-					pushTokenType: subscription.pushTokenType,
-				});
-			}
-
-			if (subscriptions.size === 0) {
-				this.subscriptionsByChatId.delete(chatId);
-			}
-		}
+		logLiveActivityInfo("backend capability refresh", {
+			removedPushToStartTokens,
+			removedSubscriptions,
+			supportedPushTokenTypes: Array.from(supportedPushTokenTypes),
+		});
 	}
 
 	private async sendPushToStart(chatId: string, runtime: ChatRuntimeState): Promise<void> {
@@ -1706,8 +1743,15 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 
 		const contentState = this.toContentState(runtime);
 		const timestampSeconds = toNextTimestampSeconds({});
+		const subscribedDeviceKeys = new Set(
+			Array.from(this.subscriptions.values(), (subscription) => toPushDeviceKey(subscription)),
+		);
 
 		for (const [, tokenEntry] of this.pushToStartTokens.entries()) {
+			const deviceKey = toPushDeviceKey(tokenEntry);
+			if (subscribedDeviceKeys.has(deviceKey)) {
+				continue;
+			}
 			try {
 				const result = await this.sender({
 					contentState,
@@ -1770,28 +1814,19 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			return false;
 		}
 
-		const existingByChat = this.subscriptionsByChatId.get(chatId) ?? new Map<string, LiveActivitySubscription>();
-		for (const [key, subscriptionEntry] of existingByChat.entries()) {
-			const samePushTokenWithOldActivityToken =
-				subscriptionEntry.pushToken === pushToken
-				&& subscriptionEntry.pushTokenType === pushTokenType
-				&& subscriptionEntry.liveActivityToken !== liveActivityToken;
-			const sameActivityTokenWithDifferentPushToken =
-				subscriptionEntry.liveActivityToken === liveActivityToken
-				&& (
-					subscriptionEntry.pushToken !== pushToken
-					|| subscriptionEntry.pushTokenType !== pushTokenType
-				);
-			if (samePushTokenWithOldActivityToken || sameActivityTokenWithDifferentPushToken) {
-				existingByChat.delete(key);
-				logLiveActivityInfo("replacing stale subscription token pair", {
-					chatId,
-					pushTokenType: subscriptionEntry.pushTokenType,
-					pushToken: toTokenPreview(subscriptionEntry.pushToken),
-					liveActivityToken: toTokenPreview(subscriptionEntry.liveActivityToken),
-				});
-			}
-		}
+		this.deleteConflictingSubscriptions({
+			chatId,
+			chatTitle: input.chatTitle,
+			liveActivityToken,
+			pushToken,
+			pushTokenType,
+		});
+		const subscriptionKey = toSubscriptionKey({
+			pushToken,
+			pushTokenType,
+			liveActivityToken,
+		});
+		const previousSubscription = this.subscriptions.get(subscriptionKey);
 		const persistedSubscription = this.persistSubscription({
 			chatId,
 			chatTitle: toNormalized(input.chatTitle) || undefined,
@@ -1803,17 +1838,11 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 			return false;
 		}
 
-		const subscriptionKey = toSubscriptionKey({
-			pushToken,
-			pushTokenType,
-			liveActivityToken,
-		});
-		const previousSubscription = existingByChat.get(subscriptionKey);
 		this.setSubscriptionInMemory(persistedSubscription);
 		logLiveActivityInfo("subscription upserted", {
 			chatId,
 			isNewSubscription: !previousSubscription,
-			subscriptionsForChat: this.subscriptionsByChatId.get(chatId)?.size ?? 0,
+			subscriptions: this.subscriptions.size,
 			pushTokenType,
 			pushToken: toTokenPreview(pushToken),
 			liveActivityToken: toTokenPreview(liveActivityToken),
@@ -1833,7 +1862,11 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 
 		const nextEvent: PushEvent = isTerminalPhase(runtime.phase) ? "end" : "update";
-		if (!previousSubscription) {
+		const shouldFlushImmediately =
+			!previousSubscription
+			|| previousSubscription.chatId !== chatId
+			|| previousSubscription.chatTitle !== (toNormalized(input.chatTitle) || undefined);
+		if (shouldFlushImmediately) {
 			runtime.pendingEvent = nextEvent;
 			await this.flushChat(chatId, nextEvent, {
 				force: true,
@@ -1915,28 +1948,12 @@ class PrivateBackendLiveActivityPushService implements LiveActivityPushServiceCo
 	}
 
 	async upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
-		const supportedPushTokenTypes = await this.getSupportedPushTokenTypes();
-		if (!supportedPushTokenTypes.has(input.pushTokenType)) {
-			logLiveActivityWarn("subscription ignored (backend does not support push token type)", {
-				chatId: input.chatId,
-				pushTokenType: input.pushTokenType,
-			});
-			return false;
-		}
-
+		await this.getCapabilities();
 		return await this.delegate.upsertSubscription(input);
 	}
 
 	async registerPushToStartToken(input: PushToStartTokenInput): Promise<void> {
-		const supportedPushTokenTypes = await this.getSupportedPushTokenTypes();
-		if (!supportedPushTokenTypes.has(input.pushTokenType)) {
-			logLiveActivityWarn("push-to-start token ignored (backend does not support push token type)", {
-				pushTokenType: input.pushTokenType,
-				pushToken: toTokenPreview(input.pushToken),
-			});
-			return;
-		}
-
+		await this.getCapabilities();
 		await this.delegate.registerPushToStartToken(input);
 	}
 }

@@ -183,7 +183,7 @@ export class ChatController {
 							subscribed: false,
 						});
 						return {
-							enabled: false,
+							enabled: true,
 							subscribed: false,
 						};
 					}
@@ -247,7 +247,7 @@ export class ChatController {
 					}
 
 					if (!supportedPushTokenTypes.has(pushTokenType)) {
-						return { enabled: false, registered: false };
+						return { enabled: true, registered: false };
 					}
 
 					await liveActivitySubscriptionReader.registerPushToStartToken({

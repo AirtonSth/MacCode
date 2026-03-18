@@ -92,7 +92,7 @@ const serverMetadataCreateSql = `
 const liveActivitySubscriptionsCreateSql = `
 	CREATE TABLE IF NOT EXISTS live_activity_subscriptions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		chatId TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+		chatId TEXT NOT NULL,
 		chatTitle TEXT,
 		pushToken TEXT NOT NULL,
 		pushTokenType TEXT NOT NULL CHECK(pushTokenType IN ('apns', 'fcm')),
@@ -116,7 +116,7 @@ export class DatabaseBootstrap {
 		this.createChatStreamEventsTable(database);
 		this.createChatTurnSnapshotsTable(database);
 		this.createServerMetadataTable(database);
-		this.createLiveActivitySubscriptionsTable(database);
+		this.createOrMigrateLiveActivitySubscriptionsTable(database);
 		this.createPushToStartTokensTable(database);
 		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
@@ -367,7 +367,104 @@ export class DatabaseBootstrap {
 		database.exec(serverMetadataCreateSql);
 	}
 
-	private static createLiveActivitySubscriptionsTable(database: Database): void {
+	private static needsLiveActivitySubscriptionsMigration(database: Database): boolean {
+		if (!this.hasTable(database, "live_activity_subscriptions")) {
+			return false;
+		}
+
+		const createSql = this.getTableDefinition(database, "live_activity_subscriptions");
+		return createSql.includes("REFERENCES chats(id) ON DELETE CASCADE")
+			|| createSql.includes("idx_live_activity_subscriptions_token_pair(chatId, pushTokenType, pushToken, liveActivityToken)");
+	}
+
+	private static rebuildLiveActivitySubscriptionsTable(database: Database): void {
+		type LegacySubscriptionRow = {
+			chatId: string;
+			chatTitle: string | null;
+			id: number;
+			liveActivityToken: string;
+			pushToken: string;
+			pushTokenType: string;
+			updatedAt: string;
+		};
+
+		const rows = database
+			.prepare(`
+				SELECT id, chatId, chatTitle, pushToken, pushTokenType, liveActivityToken, updatedAt
+				FROM live_activity_subscriptions
+				ORDER BY updatedAt DESC, id DESC
+			`)
+			.all() as LegacySubscriptionRow[];
+		const uniqueRows: LegacySubscriptionRow[] = [];
+		const seenTokenPairs = new Set<string>();
+		for (const row of rows) {
+			const tokenPairKey = `${row.pushTokenType}::${row.pushToken}::${row.liveActivityToken}`;
+			if (seenTokenPairs.has(tokenPairKey)) {
+				continue;
+			}
+
+			seenTokenPairs.add(tokenPairKey);
+			uniqueRows.push(row);
+		}
+
+		database.exec("PRAGMA foreign_keys = OFF;");
+		database.exec("BEGIN;");
+
+		try {
+			database.exec(`
+				CREATE TABLE live_activity_subscriptions_next (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					chatId TEXT NOT NULL,
+					chatTitle TEXT,
+					pushToken TEXT NOT NULL,
+					pushTokenType TEXT NOT NULL CHECK(pushTokenType IN ('apns', 'fcm')),
+					liveActivityToken TEXT NOT NULL,
+					updatedAt TEXT NOT NULL
+				)
+			`);
+
+			const insertStatement = database.prepare(`
+				INSERT INTO live_activity_subscriptions_next (
+					chatId,
+					chatTitle,
+					pushToken,
+					pushTokenType,
+					liveActivityToken,
+					updatedAt
+				) VALUES (?, ?, ?, ?, ?, ?)
+			`);
+			for (const row of uniqueRows) {
+				insertStatement.run(
+					row.chatId,
+					row.chatTitle,
+					row.pushToken,
+					row.pushTokenType,
+					row.liveActivityToken,
+					row.updatedAt,
+				);
+			}
+
+			database.exec("DROP TABLE live_activity_subscriptions;");
+			database.exec("ALTER TABLE live_activity_subscriptions_next RENAME TO live_activity_subscriptions;");
+			database.exec("COMMIT;");
+		} catch (error) {
+			database.exec("ROLLBACK;");
+			throw error;
+		} finally {
+			database.exec("PRAGMA foreign_keys = ON;");
+		}
+	}
+
+	private static createOrMigrateLiveActivitySubscriptionsTable(database: Database): void {
+		if (!this.hasTable(database, "live_activity_subscriptions")) {
+			database.exec(liveActivitySubscriptionsCreateSql);
+			return;
+		}
+
+		if (this.needsLiveActivitySubscriptionsMigration(database)) {
+			this.rebuildLiveActivitySubscriptionsTable(database);
+		}
+
 		database.exec(liveActivitySubscriptionsCreateSql);
 	}
 
@@ -431,7 +528,7 @@ export class DatabaseBootstrap {
 			"CREATE INDEX IF NOT EXISTS idx_live_activity_subscriptions_updated_at ON live_activity_subscriptions(updatedAt DESC)",
 		);
 		database.exec(
-			"CREATE UNIQUE INDEX IF NOT EXISTS idx_live_activity_subscriptions_token_pair ON live_activity_subscriptions(chatId, pushTokenType, pushToken, liveActivityToken)",
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_live_activity_subscriptions_token_pair ON live_activity_subscriptions(pushTokenType, pushToken, liveActivityToken)",
 		);
 		database.exec(
 			"CREATE UNIQUE INDEX IF NOT EXISTS idx_push_to_start_tokens_device ON push_to_start_tokens(pushTokenType, pushToken)",

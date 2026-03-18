@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppState, Platform, type AppStateStatus } from "react-native";
+import { AppState, type AppStateStatus } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
 import { useChatContextQuery } from "../api/use-chat-context-query";
@@ -184,7 +184,7 @@ const toLiveActivityStatusLineFromEvent = (event: AssistantEventPayload): string
 const resolveLiveActivitySubscriptionTransport = (input: {
 	liveActivityToken: string;
 	pushDeliveryToken: PushDeliveryToken | null;
-}): { pushToken: string; pushTokenType: "apns" | "fcm" } | null => {
+}): { pushToken: string; pushTokenType: "fcm" } | null => {
 	const normalizedLiveActivityToken = input.liveActivityToken.trim();
 	if (normalizedLiveActivityToken.length === 0) {
 		return null;
@@ -192,17 +192,10 @@ const resolveLiveActivitySubscriptionTransport = (input: {
 
 	const normalizedPushToken = input.pushDeliveryToken?.token.trim() ?? "";
 	const pushTokenType = input.pushDeliveryToken?.type;
-	if (normalizedPushToken.length > 0 && (pushTokenType === "apns" || pushTokenType === "fcm")) {
+	if (normalizedPushToken.length > 0 && pushTokenType === "fcm") {
 		return {
 			pushToken: normalizedPushToken,
 			pushTokenType,
-		};
-	}
-
-	if (Platform.OS === "ios") {
-		return {
-			pushToken: normalizedLiveActivityToken,
-			pushTokenType: "apns",
 		};
 	}
 
@@ -1098,7 +1091,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			if (!deliveryToken || deliveryToken.token.trim().length === 0) {
 				return;
 			}
-			if (deliveryToken.type !== "apns" && deliveryToken.type !== "fcm") {
+			if (deliveryToken.type !== "fcm") {
 				return;
 			}
 			try {

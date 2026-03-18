@@ -462,6 +462,23 @@ const emitPushToken = (chatId: string, pushToken: string): void => {
 	}
 };
 
+const emitPersistedPushTokenForEntry = async (entry: ActivityEntry): Promise<void> => {
+	try {
+		const pushToken = withDefault(await SecureStore.getItemAsync(PUSH_TOKEN_KEY) ?? "", "");
+		if (pushToken.length === 0) {
+			return;
+		}
+
+		log("reusing persisted activity push token", {
+			chatId: entry.state.chatId,
+			pushToken: toTokenPreview(pushToken),
+		});
+		emitPushToken(entry.state.chatId, pushToken);
+	} catch {
+		// Ignore persisted push-token reuse failures.
+	}
+};
+
 const detachEntryPushTokenSubscription = (entry: ActivityEntry): void => {
 	if (!entry.pushTokenSubscription) {
 		return;
@@ -598,6 +615,7 @@ const bindActivityToEntry = async (
 	const nextEntry = entry;
 	nextEntry.activity = record.activity;
 	attachEntryPushTokenSubscription(nextEntry);
+	await emitPersistedPushTokenForEntry(nextEntry);
 	if (record.activityId && record.activityId !== nextEntry.state.activityId) {
 		nextEntry.state = {
 			...nextEntry.state,

@@ -34,7 +34,6 @@ export interface LiveActivityPushStoredSubscription extends LiveActivityPushSubs
 }
 
 export interface LiveActivityPushSubscriptionStoreContract {
-	deleteByChatId(chatId: string): void;
 	deleteExact(input: LiveActivityPushSubscriptionInput): void;
 	listAll(): LiveActivityPushStoredSubscription[];
 	upsert(input: LiveActivityPushSubscriptionInput): LiveActivityPushStoredSubscription;

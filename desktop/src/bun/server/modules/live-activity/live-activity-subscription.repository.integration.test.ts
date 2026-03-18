@@ -70,8 +70,8 @@ test("LiveActivitySubscriptionRepository upsert replaces stale token pairs", asy
 	}
 });
 
-test("LiveActivitySubscriptionRepository deleteByChatId removes persisted rows", async () => {
-	const root = mkdtempSync(join(tmpdir(), "remotecode-live-activity-delete-"));
+test("LiveActivitySubscriptionRepository deleteExact removes persisted rows globally by token pair", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-live-activity-delete-exact-"));
 	const databasePath = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(databasePath);
 
@@ -90,9 +90,98 @@ test("LiveActivitySubscriptionRepository deleteByChatId removes persisted rows",
 
 		expect(repository.listAll()).toHaveLength(1);
 
-		repository.deleteByChatId("chat-1");
+		repository.deleteExact({
+			chatId: "different-chat-id",
+			chatTitle: "Different",
+			liveActivityToken: "activity-token-1",
+			pushToken: "push-token-1",
+			pushTokenType: "apns",
+		});
 
 		expect(repository.listAll()).toEqual([]);
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("LiveActivitySubscriptionRepository keeps subscriptions after the source chat is deleted", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-live-activity-no-cascade-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
+
+	try {
+		initializeDatabaseSchema(client.sqlite);
+		seedChat(client.sqlite);
+		const repository = createLiveActivitySubscriptionRepository(client.orm);
+
+		repository.upsert({
+			chatId: "chat-1",
+			chatTitle: "Live Activity",
+			liveActivityToken: "activity-token-1",
+			pushToken: "push-token-1",
+			pushTokenType: "apns",
+		});
+
+		client.sqlite.prepare("DELETE FROM chats WHERE id = ?").run("chat-1");
+
+		expect(repository.listAll()).toEqual([
+			expect.objectContaining({
+				chatId: "chat-1",
+				chatTitle: "Live Activity",
+				liveActivityToken: "activity-token-1",
+				pushToken: "push-token-1",
+				pushTokenType: "apns",
+			}),
+		]);
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("LiveActivitySubscriptionRepository moves the same token pair across chats", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-live-activity-move-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(databasePath);
+
+	try {
+		initializeDatabaseSchema(client.sqlite);
+		seedChat(client.sqlite);
+		client.sqlite
+			.prepare(
+				"INSERT INTO chats (id, projectId, title, provider, providerThreadId, status, isActive, diffAdded, diffRemoved, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run("chat-2", "project-1", "Next chat", "codex", "thread-2", "running", 1, 0, 0, "2026-01-01T00:00:01.000Z");
+		const repository = createLiveActivitySubscriptionRepository(client.orm);
+
+		repository.upsert({
+			chatId: "chat-1",
+			chatTitle: "Live Activity",
+			liveActivityToken: "activity-token-1",
+			pushToken: "push-token-1",
+			pushTokenType: "apns",
+		});
+		repository.upsert({
+			chatId: "chat-2",
+			chatTitle: "Next chat",
+			liveActivityToken: "activity-token-1",
+			pushToken: "push-token-1",
+			pushTokenType: "apns",
+		});
+
+		const rows = repository.listAll();
+
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toEqual(
+			expect.objectContaining({
+				chatId: "chat-2",
+				chatTitle: "Next chat",
+				liveActivityToken: "activity-token-1",
+				pushToken: "push-token-1",
+				pushTokenType: "apns",
+			}),
+		);
 	} finally {
 		client.close();
 		rmSync(root, { force: true, recursive: true });
