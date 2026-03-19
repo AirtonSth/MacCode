@@ -134,6 +134,7 @@ export const chatScreenStyles = StyleSheet.create({
 		flex: 1,
 		justifyContent: "center",
 		paddingHorizontal: 16,
+		zIndex: 200,
 	},
 	gitCommitModalHeader: {
 		alignItems: "center",
@@ -192,6 +193,7 @@ export const chatScreenStyles = StyleSheet.create({
 		backgroundColor: "rgba(2,5,10,0.62)",
 		flex: 1,
 		justifyContent: "flex-end",
+		zIndex: 200,
 	},
 	selectModalList: {
 		gap: 8,
@@ -243,6 +245,7 @@ export const chatScreenStyles = StyleSheet.create({
 	terminalRoot: {
 		backgroundColor: chatScreenPalette.background,
 		flex: 1,
+		zIndex: 100,
 	},
 	terminalText: {
 		color: chatScreenPalette.text,

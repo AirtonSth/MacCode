@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ActivityIndicator, Animated, Pressable, StyleSheet, Text } from "react-native";
+import { ActivityIndicator, Animated, Pressable, StyleSheet, Text, View } from "react-native";
 
 const palette = {
 	accent: "#63C8FF",
@@ -28,33 +28,40 @@ export const ActiveThreadsBanner = ({ count, onPress }: ActiveThreadsBannerProps
 		count === 1 ? "1 other active thread" : `${String(count)} other active threads`;
 
 	return (
-		<Animated.View
-			pointerEvents={isVisible ? "auto" : "none"}
-			style={[styles.wrapper, { opacity: fadeAnim }]}
-		>
-			<Pressable
-				accessibilityRole="button"
-				onPress={onPress}
-				style={({ pressed }) => [
-					styles.banner,
-					pressed ? styles.bannerPressed : null,
-				]}
-				testID="chat-active-threads-banner"
+		<View style={styles.wrapper}>
+			<Animated.View
+				pointerEvents={isVisible ? "auto" : "none"}
+				style={[styles.bannerLayer, { opacity: fadeAnim }]}
 			>
-				<ActivityIndicator color={palette.accent} size={10} />
-				<Text style={styles.text}>{label}</Text>
-			</Pressable>
-		</Animated.View>
+				<Pressable
+					accessibilityRole="button"
+					onPress={onPress}
+					style={({ pressed }) => [
+						styles.banner,
+						pressed ? styles.bannerPressed : null,
+					]}
+					testID="chat-active-threads-banner"
+				>
+					<ActivityIndicator color={palette.accent} size={10} />
+					<Text style={styles.text}>{label}</Text>
+				</Pressable>
+			</Animated.View>
+		</View>
 	);
 };
 
 const styles = StyleSheet.create({
 	wrapper: {
+		minHeight: 35,
+		position: "relative",
+		zIndex: 10,
+	},
+	bannerLayer: {
+		bottom: 0,
 		left: 0,
 		position: "absolute",
 		right: 0,
 		top: 0,
-		zIndex: 10,
 	},
 	banner: {
 		alignItems: "center",

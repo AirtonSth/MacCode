@@ -24,3 +24,22 @@ describe("[D-29] Status text crossfade transition", () => {
 		expect(composerSource).toMatch(stylePattern);
 	});
 });
+
+describe("[D-43] Provider and model selects show focus-visible affordance", () => {
+	it("shared select class adds a focus-visible ring", () => {
+		expect(composerSource).toContain("focus-visible:ring-2");
+		expect(composerSource).toContain("focus-visible:ring-sky-400/60");
+		expect(composerSource).toContain("focus-visible:ring-offset-[#181a1f]");
+	});
+});
+
+describe("[D-56] Model dropdown avoids a premature empty state while loading", () => {
+	it("supports a dedicated modelsLoading prop", () => {
+		expect(composerSource).toContain("modelsLoading?: boolean");
+		expect(composerSource).toContain("modelsLoading = false");
+	});
+
+	it("shows Loading models instead of No models during model fetches", () => {
+		expect(composerSource).toContain('<option value="">Loading models...</option>');
+	});
+});

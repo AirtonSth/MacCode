@@ -92,6 +92,11 @@
 }
 
 @layer components {
+	.skeleton-pulse-sync {
+		animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+		animation-delay: 0ms;
+	}
+
 	.codex-sidebar {
 		font-family:
 			"SF Pro Text",

@@ -373,6 +373,7 @@ const App = (): JSX.Element => {
 	const isCreatingChatRef = useRef<boolean>(false);
 	const sidebarWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
 	const isSidebarResizingRef = useRef<boolean>(false);
+	const errorAutoDismissTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 	const sidebarResizeStartXRef = useRef<number>(0);
 	const sidebarResizeStartWidthRef = useRef<number>(DEFAULT_SIDEBAR_WIDTH);
 	const terminalOpenByChatRef = useRef<Record<string, boolean>>({});
@@ -381,6 +382,8 @@ const App = (): JSX.Element => {
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const activeChatIdsRef = useRef<Set<string>>(new Set());
 	const bootstrapDoneRef = useRef<boolean>(false);
+	const skipPostBootstrapChatsLoadRef = useRef<boolean>(false);
+	const skipPostBootstrapMessagesLoadRef = useRef<boolean>(false);
 	const projectsLoadInFlightRef = useRef<Promise<void> | null>(null);
 	const projectsLoadQueuedRef = useRef<boolean>(false);
 	const chatsLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
@@ -474,6 +477,7 @@ const App = (): JSX.Element => {
 		return parseSidebarWidth(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
 	});
 	const [isSidebarVisible, setIsSidebarVisible] = useState<boolean>(true);
+	const [isSidebarResizing, setIsSidebarResizing] = useState(false);
 	const [permissionMode, setPermissionMode] = useState<CodexPermissionMode>(() => {
 		if (typeof window === "undefined") {
 			return DEFAULT_CODEX_PERMISSION_MODE;
@@ -527,6 +531,11 @@ const App = (): JSX.Element => {
 		() => selectedModelDescriptor?.supportedReasoningEfforts.map((item) => item.reasoningEffort) ?? [],
 		[selectedModelDescriptor],
 	);
+	const sidebarResizeBound = sidebarWidth <= SIDEBAR_WIDTH_MIN
+		? "min"
+		: sidebarWidth >= SIDEBAR_WIDTH_MAX
+			? "max"
+			: null;
 
 	useEffect(() => {
 		sidebarWidthRef.current = sidebarWidth;
@@ -716,6 +725,7 @@ const App = (): JSX.Element => {
 		}
 
 		isSidebarResizingRef.current = false;
+		setIsSidebarResizing(false);
 		document.body.classList.remove("select-none");
 		document.body.classList.remove("cursor-ew-resize");
 		persistSidebarWidth(sidebarWidthRef.current);
@@ -739,6 +749,7 @@ const App = (): JSX.Element => {
 		}
 
 		isSidebarResizingRef.current = true;
+		setIsSidebarResizing(true);
 		sidebarResizeStartXRef.current = event.clientX;
 		sidebarResizeStartWidthRef.current = sidebarWidthRef.current;
 		document.body.classList.add("select-none");
@@ -759,6 +770,39 @@ const App = (): JSX.Element => {
 	useEffect(() => () => {
 		document.body.classList.remove("select-none");
 		document.body.classList.remove("cursor-ew-resize");
+	}, []);
+
+	useEffect(() => {
+		const timers = errorAutoDismissTimersRef.current;
+
+		for (const error of state.errors) {
+			if (timers.has(error.id)) {
+				continue;
+			}
+
+			timers.set(error.id, setTimeout(() => {
+				timers.delete(error.id);
+				dispatch({ payload: error.id, type: "REMOVE_ERROR" });
+			}, 6_000));
+		}
+
+		for (const [errorId, timer] of timers) {
+			if (state.errors.some((error) => error.id === errorId)) {
+				continue;
+			}
+
+			clearTimeout(timer);
+			timers.delete(errorId);
+		}
+	}, [dispatch, state.errors]);
+
+	useEffect(() => {
+		return () => {
+			for (const timer of errorAutoDismissTimersRef.current.values()) {
+				clearTimeout(timer);
+			}
+			errorAutoDismissTimersRef.current.clear();
+		};
 	}, []);
 
 	useEffect(() => {
@@ -1391,7 +1435,7 @@ const App = (): JSX.Element => {
 		}
 	}, [addError, api, clearRestErrors, formatApiErrorCode, formatApiErrorMessage]);
 
-	const handleWsEvent = useCallback(
+	const handleWsEventImpl = useCallback(
 		async (event: ServerWsEvent) => {
 			const clearChatSending = (chatId: string) => {
 				if (!pendingSendChatIdsRef.current.has(chatId)) {
@@ -1730,7 +1774,17 @@ const App = (): JSX.Element => {
 		],
 	);
 
-	const handleWsState = useCallback(
+	const handleWsEventRef = useRef(handleWsEventImpl);
+	handleWsEventRef.current = handleWsEventImpl;
+
+	const handleWsEvent = useCallback(
+		(event: ServerWsEvent) => {
+			void handleWsEventRef.current(event);
+		},
+		[],
+	);
+
+	const handleWsStateImpl = useCallback(
 			(connectionState: ConnectionState) => {
 				dispatch({ payload: connectionState, type: "SET_CONNECTION_STATE" });
 				if (connectionState === "connected") {
@@ -1741,6 +1795,16 @@ const App = (): JSX.Element => {
 				}
 			},
 			[dispatch],
+	);
+
+	const handleWsStateRef = useRef(handleWsStateImpl);
+	handleWsStateRef.current = handleWsStateImpl;
+
+	const handleWsState = useCallback(
+		(connectionState: ConnectionState) => {
+			handleWsStateRef.current(connectionState);
+		},
+		[],
 	);
 
 	const handleBootstrap = useCallback(async () => {
@@ -1823,6 +1887,8 @@ const App = (): JSX.Element => {
 			persistedSelectedChatIdRef.current = preferredChatId;
 			selectedProjectIdRef.current = selectedProjectId;
 			selectedChatIdRef.current = selectedChatId;
+			skipPostBootstrapChatsLoadRef.current = selectedProjectId !== null;
+			skipPostBootstrapMessagesLoadRef.current = selectedChatId !== null;
 
 			dispatch({
 				payload: {
@@ -1885,11 +1951,19 @@ const App = (): JSX.Element => {
 		if (!bootstrapDoneRef.current) {
 			return;
 		}
+		if (skipPostBootstrapChatsLoadRef.current) {
+			skipPostBootstrapChatsLoadRef.current = false;
+			return;
+		}
 		void loadChatsForProject(state.selectedProjectId, persistedSelectedChatIdRef.current);
 	}, [loadChatsForProject, state.selectedProjectId]);
 
 	useEffect(() => {
 		if (!bootstrapDoneRef.current) {
+			return;
+		}
+		if (skipPostBootstrapMessagesLoadRef.current) {
+			skipPostBootstrapMessagesLoadRef.current = false;
 			return;
 		}
 		void loadMessagesForChat(state.selectedChatId, { kind: "latest" });
@@ -2757,6 +2831,12 @@ const App = (): JSX.Element => {
 							transition={{ duration: 0.1, ease: "easeOut" }}
 						>
 						<span className="noise-mask" />
+						{isSidebarResizing ? (
+							<div
+								className="pointer-events-none absolute inset-0 z-20 bg-slate-950/12 backdrop-blur-[1px]"
+								data-testid="sidebar-resize-overlay"
+							/>
+						) : null}
 
 									{isSidebarVisible ? (
 							<>
@@ -2815,17 +2895,17 @@ const App = (): JSX.Element => {
 											{state.projectsLoading ? (
 												<div className="space-y-3 px-2 py-1.5">
 													<div className="flex items-center gap-2">
-														<div className="h-3.5 w-3.5 shrink-0 animate-pulse rounded bg-slate-600/40" />
-														<div className="h-3 w-24 animate-pulse rounded bg-slate-600/40" />
+														<div className="skeleton-pulse-sync h-3.5 w-3.5 shrink-0 rounded bg-slate-600/40" />
+														<div className="skeleton-pulse-sync h-3 w-24 rounded bg-slate-600/40" />
 													</div>
 													<div className="ml-5 space-y-2">
-														<div className="h-2.5 w-32 animate-pulse rounded bg-slate-700/30" />
-														<div className="h-2.5 w-28 animate-pulse rounded bg-slate-700/30" />
-														<div className="h-2.5 w-36 animate-pulse rounded bg-slate-700/30" />
+														<div className="skeleton-pulse-sync h-2.5 w-32 rounded bg-slate-700/30" />
+														<div className="skeleton-pulse-sync h-2.5 w-28 rounded bg-slate-700/30" />
+														<div className="skeleton-pulse-sync h-2.5 w-36 rounded bg-slate-700/30" />
 													</div>
 													<div className="flex items-center gap-2">
-														<div className="h-3.5 w-3.5 shrink-0 animate-pulse rounded bg-slate-600/40" />
-														<div className="h-3 w-20 animate-pulse rounded bg-slate-600/40" />
+														<div className="skeleton-pulse-sync h-3.5 w-3.5 shrink-0 rounded bg-slate-600/40" />
+														<div className="skeleton-pulse-sync h-3 w-20 rounded bg-slate-600/40" />
 													</div>
 												</div>
 											) : state.projects.length === 0 ? (
@@ -3117,7 +3197,10 @@ const App = (): JSX.Element => {
 								<button
 									aria-label="Resize sidebar"
 									className={cn(
-										"z-20 h-full cursor-ew-resize touch-none p-0 transition-colors duration-150 hover:bg-white/[0.04] max-[920px]:hidden",
+										"z-20 h-full cursor-ew-resize touch-none p-0 transition-colors duration-150 max-[920px]:hidden",
+										isSidebarResizing ? "bg-white/[0.08]" : "hover:bg-white/[0.04]",
+										sidebarResizeBound === "min" ? "bg-amber-300/10" : "",
+										sidebarResizeBound === "max" ? "bg-sky-300/10" : "",
 										threadPanelBgClass,
 									)}
 									onPointerCancel={stopSidebarResize}
@@ -3316,6 +3399,7 @@ const App = (): JSX.Element => {
 														isGitRepository={
 															selectedProject ? projectGitState.status?.isRepo ?? null : false
 														}
+														modelsLoading={!hasLoadedCodexModels}
 														onCheckoutBranch={checkoutBranch}
 														onCreateBranch={createBranch}
 														onModelChange={handleModelChange}

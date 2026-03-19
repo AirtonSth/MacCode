@@ -191,6 +191,7 @@ const StreamingTimelineRow = ({
 	);
 
 	const prevStateRef = useRef(item.state);
+	const autoCollapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	useEffect(() => {
 		if (item.type !== "tool" || shouldReduceMotion) {
@@ -235,12 +236,20 @@ const StreamingTimelineRow = ({
 			return;
 		}
 
-		const timer = setTimeout(() => {
+		if (autoCollapseTimerRef.current !== null) {
+			clearTimeout(autoCollapseTimerRef.current);
+		}
+
+		autoCollapseTimerRef.current = setTimeout(() => {
+			autoCollapseTimerRef.current = null;
 			onSetItemExpanded(item.id, false, false);
 		}, AUTO_COLLAPSE_DELAY_MS);
 
 		return () => {
-			clearTimeout(timer);
+			if (autoCollapseTimerRef.current !== null) {
+				clearTimeout(autoCollapseTimerRef.current);
+				autoCollapseTimerRef.current = null;
+			}
 		};
 	}, [
 		item.expandedByUser,
@@ -249,6 +258,16 @@ const StreamingTimelineRow = ({
 		item.state,
 		onSetItemExpanded,
 	]);
+
+	// Clear the auto-collapse timer when the item changes (e.g. user switches chat).
+	useEffect(() => {
+		return () => {
+			if (autoCollapseTimerRef.current !== null) {
+				clearTimeout(autoCollapseTimerRef.current);
+				autoCollapseTimerRef.current = null;
+			}
+		};
+	}, [item.id]);
 
 	if (item.type === "assistant_message") {
 		return (
@@ -282,7 +301,7 @@ const StreamingTimelineRow = ({
 						</p>
 						<span
 							className={cn(
-								"mt-0.5 rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-[0.16em] transition-all duration-200",
+								"mt-0.5 rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-[0.16em] transition-all duration-200 ease-out",
 								item.state === "failed" || item.state === "cancelled"
 									? "border-rose-300/35 bg-rose-400/10 text-rose-100"
 									: item.state === "completed" || item.state === "preview" || item.state === "collapsed"

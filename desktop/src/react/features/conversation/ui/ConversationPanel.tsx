@@ -37,12 +37,29 @@ const hasActiveSelection = (): boolean => {
 
 const CopyButton = React.memo(({ text, className }: { text: string; className?: string }) => {
 	const [copied, setCopied] = useState(false);
+	const resetCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const handleCopy = useCallback(() => {
 		void navigator.clipboard.writeText(text).then(() => {
 			setCopied(true);
-			setTimeout(() => setCopied(false), 1800);
+			if (resetCopiedTimerRef.current) {
+				clearTimeout(resetCopiedTimerRef.current);
+			}
+			resetCopiedTimerRef.current = setTimeout(() => {
+				resetCopiedTimerRef.current = null;
+				setCopied(false);
+			}, 1800);
 		});
 	}, [text]);
+
+	useEffect(() => {
+		return () => {
+			if (resetCopiedTimerRef.current) {
+				clearTimeout(resetCopiedTimerRef.current);
+				resetCopiedTimerRef.current = null;
+			}
+		};
+	}, []);
+
 	return (
 		<button
 			aria-label={copied ? "Copied" : "Copy"}
@@ -61,7 +78,7 @@ const CopyButton = React.memo(({ text, className }: { text: string; className?: 
 CopyButton.displayName = "CopyButton";
 
 const buildMarkdownComponents = (focusMode: boolean): Components => {
-	const messageTextClass = focusMode ? "text-[15px] leading-7" : "text-sm leading-6";
+	const messageTextClass = focusMode ? "text-[15px] leading-6" : "text-sm leading-6";
 	return {
 		h1: ({ children, ...props }) => <h1 className="mb-2 mt-3 text-lg font-semibold" {...props}>{children}</h1>,
 		h2: ({ children, ...props }) => <h2 className="mb-2 mt-3 text-base font-semibold" {...props}>{children}</h2>,
@@ -131,7 +148,7 @@ const buildMarkdownComponents = (focusMode: boolean): Components => {
 				</table>
 			</div>
 		),
-		th: ({ children, ...props }) => <th className="border-b border-white/20 px-2 py-1 text-left text-xs font-semibold" {...props}>{children}</th>,
+		th: ({ children, ...props }) => <th className="align-top border-b border-white/20 px-2 py-1 text-left text-xs font-semibold" {...props}>{children}</th>,
 		td: ({ children, ...props }) => <td className="border-b border-white/10 px-2 py-1 align-top" {...props}>{children}</td>,
 	};
 };
@@ -333,13 +350,13 @@ export const ConversationPanel = ({
 		if (hasActiveSelection()) {
 			return;
 		}
-		scrollToBottom("auto");
 		if (typeof window === "undefined") {
+			scrollToBottom("auto");
 			return;
 		}
 
 		window.requestAnimationFrame(() => {
-			if (hasActiveSelection()) {
+			if (userScrolledUpRef.current || hasActiveSelection()) {
 				return;
 			}
 			scrollToBottom("auto");
@@ -372,9 +389,12 @@ export const ConversationPanel = ({
 					}
 				}, TOP_PAGINATION_DEBOUNCE_MS);
 			}
-		} else if (viewport.scrollTop > 32 && topPaginationTimerRef.current) {
-			clearTimeout(topPaginationTimerRef.current);
-			topPaginationTimerRef.current = null;
+		} else if (viewport.scrollTop > 32) {
+			topPaginationTriggeredRef.current = false;
+			if (topPaginationTimerRef.current) {
+				clearTimeout(topPaginationTimerRef.current);
+				topPaginationTimerRef.current = null;
+			}
 		}
 
 		if (messageWindowMode === "older" && viewport.scrollTop > 32) {
@@ -564,14 +584,21 @@ export const ConversationPanel = ({
 											{showRunDetails ? "Hide run details" : "Show run details"}
 										</button>
 									) : null}
-									{messageWindowMode === "older" && isLatestDirty ? (
-										<span
-											className="text-[11px] uppercase tracking-[0.18em] text-amber-200/90"
-											data-testid="conversation-latest-dirty-indicator"
-										>
-											Newer messages available
-										</span>
-									) : null}
+									<AnimatePresence>
+										{messageWindowMode === "older" && isLatestDirty ? (
+											<motion.span
+												animate={{ opacity: 1 }}
+												className="text-[11px] uppercase tracking-[0.18em] text-amber-200/90"
+												data-testid="conversation-latest-dirty-indicator"
+												exit={{ opacity: 0 }}
+												initial={{ opacity: 0 }}
+												key="newer-messages-badge"
+												transition={{ duration: 0.2 }}
+											>
+												Newer messages available
+											</motion.span>
+										) : null}
+									</AnimatePresence>
 								</div>
 							</div>
 						) : null}
@@ -645,7 +672,7 @@ export const ConversationPanel = ({
 												<motion.span
 													animate={shouldReduceMotion ? undefined : { opacity: [0.3, 1, 0.3] }}
 													className={cn("h-1.5 w-1.5 rounded-full", focusMode ? "bg-slate-300" : "bg-sky-100")}
-													transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY }}
+													transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY, repeatType: "mirror" }}
 												/>
 											</div>
 											<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>{streamingText}</p>
@@ -670,25 +697,32 @@ export const ConversationPanel = ({
 								</AnimatePresence>
 							</div>
 						</ScrollArea>
-						{!isAtBottom ? (
-							<button
-								aria-label="Scroll to latest message"
-								className={cn(
-									"absolute bottom-4 right-4 z-20 rounded-full border border-white/20 bg-slate-900/90 p-2 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.45)] transition hover:bg-slate-800/95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950",
-									focusMode ? "bg-slate-950/80" : "",
-								)}
-								onClick={() => {
-									if (messageWindowMode === "older") {
-										void onLoadLatestMessages?.();
-										return;
-									}
-									scrollToBottom();
-								}}
-								type="button"
-							>
-								<ChevronDown className="h-4 w-4" />
-							</button>
-						) : null}
+						<AnimatePresence>
+							{!isAtBottom ? (
+								<motion.button
+									animate={{ opacity: 1, scale: 1 }}
+									aria-label="Scroll to latest message"
+									className={cn(
+										"absolute bottom-4 right-4 z-20 rounded-full border border-white/20 bg-slate-900/90 p-2 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.45)] transition hover:bg-slate-800/95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/80 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950",
+										focusMode ? "bg-slate-950/80" : "",
+									)}
+									exit={{ opacity: 0, scale: 0.8 }}
+									initial={{ opacity: 0, scale: 0.8 }}
+									key="scroll-to-bottom-fab"
+									onClick={() => {
+										if (messageWindowMode === "older") {
+											void onLoadLatestMessages?.();
+											return;
+										}
+										scrollToBottom();
+									}}
+									transition={{ duration: 0.15 }}
+									type="button"
+								>
+									<ChevronDown className="h-4 w-4" />
+								</motion.button>
+							) : null}
+						</AnimatePresence>
 					</>
 				) : null}
 			</div>

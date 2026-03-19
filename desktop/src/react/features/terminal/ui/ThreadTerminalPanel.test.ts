@@ -1,7 +1,11 @@
 /* eslint-disable import/no-unresolved */
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "bun:test";
 
 import { SCROLL_BOTTOM_THRESHOLD, statusLabel } from "./ThreadTerminalPanel";
+
+const terminalSource = readFileSync(resolve(__dirname, "ThreadTerminalPanel.tsx"), "utf-8");
 
 /**
  * Pure-logic tests for the isAtBottom / auto-scroll behaviour introduced
@@ -75,5 +79,53 @@ describe("statusLabel", () => {
 
 	it("prefers Running over Loading when both are true", () => {
 		expect(statusLabel({ isExecuting: true, isLoading: true })).toBe("Running");
+	});
+});
+
+describe("[D-38] Terminal auto-scroll uses requestAnimationFrame debounce", () => {
+	it("declares a scrollRafIdRef to store the RAF handle", () => {
+		expect(terminalSource).toContain("scrollRafIdRef");
+	});
+
+	it("calls requestAnimationFrame to debounce scroll-to-bottom", () => {
+		expect(terminalSource).toContain("requestAnimationFrame(");
+	});
+
+	it("cancels the previous RAF before scheduling a new one", () => {
+		expect(terminalSource).toContain("cancelAnimationFrame(scrollRafIdRef.current)");
+	});
+
+	it("stores the RAF ID in the ref", () => {
+		expect(terminalSource).toContain("scrollRafIdRef.current = requestAnimationFrame(");
+	});
+
+	it("clears the RAF ID on cleanup", () => {
+		const cleanupMatch = terminalSource.match(
+			/return\s*\(\)\s*=>\s*\{[\s\S]*?cancelAnimationFrame\(scrollRafIdRef\.current\)[\s\S]*?scrollRafIdRef\.current\s*=\s*null/,
+		);
+		expect(cleanupMatch).not.toBeNull();
+	});
+
+	it("does not directly set scrollTop outside of RAF callback", () => {
+		const scrollEffect = terminalSource.match(
+			/useEffect\(\(\)\s*=>\s*\{[\s\S]*?scrollRafIdRef[\s\S]*?\}, \[items\]\)/,
+		);
+		expect(scrollEffect).not.toBeNull();
+		const effectBody = scrollEffect![0];
+		const directScrollAssignments = effectBody.match(/outputElement\.scrollTop\s*=/g);
+		const rafCallbacks = effectBody.match(/requestAnimationFrame\(/g);
+		expect(rafCallbacks).not.toBeNull();
+		expect(rafCallbacks!.length).toBeGreaterThan(0);
+		expect(directScrollAssignments).not.toBeNull();
+		const rafBlock = effectBody.match(/requestAnimationFrame\([\s\S]*?\n\t\t\}\)/);
+		expect(rafBlock).not.toBeNull();
+		expect(rafBlock![0]).toContain("outputElement.scrollTop = outputElement.scrollHeight");
+	});
+});
+
+describe("[D-47] Terminal input disabled affordance", () => {
+	it("adds disabled background and opacity styles to the terminal input", () => {
+		expect(terminalSource).toContain("disabled:bg-slate-950/50");
+		expect(terminalSource).toContain("disabled:opacity-60");
 	});
 });

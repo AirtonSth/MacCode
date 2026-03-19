@@ -39,6 +39,7 @@ export const ThreadTerminalPanel = ({
 	const [command, setCommand] = useState("");
 	const outputRef = useRef<HTMLDivElement | null>(null);
 	const userScrolledUpReference = useRef(false);
+	const scrollRafIdRef = useRef<number | null>(null);
 
 	useEffect(() => {
 		setCommand("");
@@ -58,17 +59,36 @@ export const ThreadTerminalPanel = ({
 	}, []);
 
 	useEffect(() => {
-		const outputElement = outputRef.current;
-
-		if (!outputElement) {
-			return;
-		}
-
 		if (userScrolledUpReference.current) {
 			return;
 		}
 
-		outputElement.scrollTop = outputElement.scrollHeight;
+		if (scrollRafIdRef.current !== null) {
+			cancelAnimationFrame(scrollRafIdRef.current);
+		}
+
+		scrollRafIdRef.current = requestAnimationFrame(() => {
+			scrollRafIdRef.current = null;
+			const outputElement = outputRef.current;
+
+			if (!outputElement) {
+				return;
+			}
+
+			if (userScrolledUpReference.current) {
+				return;
+			}
+
+			// eslint-disable-next-line functional/immutable-data
+			outputElement.scrollTop = outputElement.scrollHeight;
+		});
+
+		return () => {
+			if (scrollRafIdRef.current !== null) {
+				cancelAnimationFrame(scrollRafIdRef.current);
+				scrollRafIdRef.current = null;
+			}
+		};
 	}, [items]);
 
 	return (
@@ -126,7 +146,7 @@ export const ThreadTerminalPanel = ({
 					<div className="flex items-center gap-2">
 						<input
 							aria-label="Terminal command"
-							className="h-10 min-w-0 flex-1 rounded-md border border-white/10 bg-slate-900/80 px-3 font-mono text-sm text-slate-100 outline-none transition focus:border-sky-300/50"
+							className="h-10 min-w-0 flex-1 rounded-md border border-white/10 bg-slate-900/80 px-3 font-mono text-sm text-slate-100 outline-none transition focus:border-sky-300/50 disabled:cursor-not-allowed disabled:bg-slate-950/50 disabled:opacity-60"
 							disabled={isExecuting}
 							onChange={(event) => {
 								setCommand(event.target.value);

@@ -242,14 +242,6 @@ export const WorkspaceSelectionScreen = () => {
 		[clearAllProjectChats],
 	);
 
-	if (isHealthCheckPending || isHealthCheckError) {
-		return (
-			<View style={styles.root} testID="screen-workspaces-loading">
-				<ActivityIndicator color={palette.accent} style={styles.healthCheckSpinner} />
-			</View>
-		);
-	}
-
 	return (
 		<KeyboardAvoidingView
 			behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -429,6 +421,11 @@ export const WorkspaceSelectionScreen = () => {
 					void confirmRenameWorkspace();
 				}}
 			/>
+			{isHealthCheckPending || isHealthCheckError ? (
+				<View style={styles.healthCheckOverlay} pointerEvents="auto" testID="screen-workspaces-loading">
+					<ActivityIndicator color={palette.accent} style={styles.healthCheckSpinner} />
+				</View>
+			) : null}
 		</KeyboardAvoidingView>
 	);
 };
@@ -460,7 +457,16 @@ const styles = StyleSheet.create({
 		fontSize: 13,
 	},
 	healthCheckSpinner: {
-		flex: 1,
+	},
+	healthCheckOverlay: {
+		alignItems: "center",
+		backgroundColor: "rgba(13,15,20,0.72)",
+		bottom: 0,
+		justifyContent: "center",
+		left: 0,
+		position: "absolute",
+		right: 0,
+		top: 0,
 	},
 	fabButton: {
 		alignItems: "center",

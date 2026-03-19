@@ -429,3 +429,230 @@
 19. `[M-12]` Splash screen timing correto
 20. `[X-04]` Skeleton screens em todas as listas
 21. Restante dos P3
+
+---
+
+# V2 — Segunda Auditoria (2026-03-18)
+
+> Auditoria pos-implementacao das 74 melhorias. Foco em edge cases remanescentes, micro-interacoes, e polimento final.
+>
+> Status de verificacao em 2026-03-19:
+> - Desktop V2: implementacao local validada com `bun test` para todos os itens listados abaixo. Apenas `[D-50]` e `[D-56]` receberam prova E2E executada nesta rodada; os demais continuam sem check por falta de E2E.
+> - Mobile V2: implementacao local validada com `bun test` para os itens listados abaixo. A suite real `bun run --cwd mobile test:e2e:ios` compilou e instalou o app no simulador, iniciou o backend e abriu o app, mas travou dentro de `ios-thread-activity-flow.sh`; por isso nenhum item mobile foi marcado como concluido nesta rodada.
+> - Cross-platform V2: ainda pendente.
+
+---
+
+## DESKTOP — Novos Issues
+
+### P1 — High
+
+- [ ] **[D-36] GitBranchControl usa `mousedown` em vez de `pointerdown`** — `GitBranchControl.tsx:82`
+  - Nao captura stylus/touch events. Dropdown nao fecha em dispositivos touch.
+  - **Fix**: Trocar `mousedown` por `pointerdown` no event listener.
+
+- [ ] **[D-37] `forceScrollToBottom` usa dois RAFs encadeados causando race com scroll do usuario** — `ConversationPanel.tsx:420`
+  - Dois `requestAnimationFrame` em sequencia podem ser interrompidos por scroll manual entre frames.
+  - **Fix**: Combinar check + scroll em um unico RAF; verificar `userScrolledUpRef` antes de scrollar.
+
+- [ ] **[D-38] Terminal auto-scroll dispara a cada item sem debounce** — `ThreadTerminalPanel.tsx:60`
+  - Rapid terminal output causa multiplos renders + scrolls por segundo.
+  - **Fix**: Debounce scroll update para no maximo uma vez por frame via `requestAnimationFrame`.
+
+- [ ] **[D-39] StreamingTimeline auto-collapse timer nao cancela no unmount** — `StreamingTimeline.tsx:238`
+  - Se usuario troca de chat durante timer, callback pode disparar em item errado.
+  - **Fix**: Cancelar timer no cleanup do useEffect ou no unmount do componente.
+
+- [ ] **[D-57] WebSocket event handler nao memoizado com useCallback** — `App.tsx:1905`
+  - Re-renders do parent recriam handler; WS antigo pode disparar eventos para handler stale.
+  - **Fix**: Memoizar `handleWsEvent` e `handleWsState` com `useCallback` e deps estaveis.
+
+### P2 — Medium
+
+- [ ] **[D-40] Badge "Newer messages available" desaparece sem fade** — `ConversationPanel.tsx:567`
+  - Badge some instantaneamente ao clicar "load latest". Sem transicao de saida.
+  - **Fix**: Wrapping com `AnimatePresence` + `motion.div` com `exit={{ opacity: 0 }}`.
+
+- [ ] **[D-41] Botao scroll-to-bottom aparece/desaparece sem animacao** — `ConversationPanel.tsx:673`
+  - FAB de scroll aparece/desaparece instantaneamente sem fade.
+  - **Fix**: `AnimatePresence` + `motion.button` com transicao de opacity/scale.
+
+- [ ] **[D-42] Skeleton pulses nao sincronizados entre items** — `App.tsx:2815`
+  - Cada div com `animate-pulse` comeca em momento diferente; efeito caotico.
+  - **Fix**: Usar CSS animation delay sincronizado ou single shimmer global.
+
+- [ ] **[D-43] Selects de model/provider sem focus-visible** — `MessageComposer.tsx:372`
+  - Usuarios de teclado nao veem qual select esta focado.
+  - **Fix**: Adicionar `focus-visible:ring-2 focus-visible:ring-sky-400`.
+
+- [ ] **[D-45] CopyButton timer nao limpa no unmount** — `ConversationPanel.tsx:38`
+  - "Copied" state pode aparecer brevemente apos trocar de chat se timer ainda estiver ativo.
+  - **Fix**: Cleanup do timer no return do useEffect/unmount.
+
+- [ ] **[D-47] Terminal input sem feedback visual de disabled** — `ThreadTerminalPanel.tsx:127`
+  - `disabled={isExecuting}` remove interatividade mas visual nao muda; usuario acha que pode clicar.
+  - **Fix**: Adicionar `disabled:opacity-60 disabled:bg-slate-950/50`.
+
+- [ ] **[D-51] Error toast nao auto-dismiss** — `App.tsx:776`
+  - Erros acumulam-se no state infinitamente. Lista cresce sem limite.
+  - **Fix**: Auto-dismiss apos 6s com timer.
+
+- [x] **[D-56] Model dropdown mostra "No models" durante loading** — `MessageComposer.tsx:383`
+  - Antes do fetch, dropdown mostra "No models", depois popula. Mudanca abrupta.
+  - **Fix**: Mostrar skeleton options ou spinner durante loading.
+  - **Done**: Added `modelsLoading` state and "Loading models..." option. Tests: `desktop/src/react/features/composer/ui/MessageComposer.ux.test.ts`; E2E: `desktop/e2e/playwright/tests/ux-polish-playwright.spec.ts` (`[D-56] model select shows a loading label instead of an empty state`).
+
+### P3 — Low
+
+- [ ] **[D-44] StateLabel badge transition sem ease-out** — `StreamingTimeline.tsx:283`
+  - Transicao de cor usa ease default; `ease-out` seria mais fluido.
+  - **Fix**: Trocar para `transition-all duration-200 ease-out`.
+
+- [ ] **[D-46] Top pagination guard flag nao reseta ao scrollar de volta** — `ConversationPanel.tsx:410`
+  - `topPaginationTriggeredRef` nao reseta quando usuario scrolla para longe do topo.
+  - **Fix**: Resetar flag quando `scrollTop > 32`.
+
+- [ ] **[D-48] Sidebar resize sem feedback visual nos limites** — `App.tsx:724`
+  - Drag para alem dos bounds simplesmente para; sem snap/bounce feedback.
+  - **Fix**: Mudar cursor ou opacity quando no limite.
+
+- [x] **[D-50] Sem overlay visual durante resize da sidebar** — `App.tsx:744`
+  - Nenhum indicador visual de que sidebar esta sendo redimensionada.
+  - **Fix**: Overlay semi-transparente durante drag.
+  - **Done**: Added sidebar resize overlay plus resize-state visuals. Tests: `desktop/src/react/app/App.ux-v2.test.ts`; E2E: `desktop/e2e/playwright/tests/ux-polish-playwright.spec.ts` (`[D-50] sidebar resize shows and clears the overlay during drag`).
+
+- [ ] **[D-52] Focus mode vs normal mode com line-height diferente** — `ConversationPanel.tsx:64`
+  - Trocar modo causa shift sutil na altura do texto.
+  - **Fix**: Usar line-height consistente em ambos os modos.
+
+- [ ] **[D-53] Table headers sem align-top** — `ConversationPanel.tsx:127`
+  - `th` nao tem `align-top` como `td`; tabelas com conteudo alto desalinham.
+  - **Fix**: Adicionar `align-top` ao `th`.
+
+- [ ] **[D-54] Nome de projeto longo pode overflow no sidebar** — `App.tsx:2876`
+  - `min-w-0` pode estar faltando no parent flex; truncate nao funciona em todos os cenarios.
+  - **Fix**: Adicionar `min-w-0` no container pai.
+
+- [ ] **[D-55] Streaming dot animation pula entre ciclos** — `ConversationPanel.tsx:645`
+  - `repeat: POSITIVE_INFINITY` sem `repeatType` causa jump entre ciclos.
+  - **Fix**: Adicionar `repeatType="mirror"` para fade suave.
+
+---
+
+## MOBILE — Novos Issues
+
+### P1 — High
+
+- [ ] **[M-36] `scrollToEnd({ animated: false })` causa jump abrupto** — `chat-screen.tsx:431,742`
+  - Scroll instantaneo sem animacao ao mostrar/esconder teclado e ao carregar terminal.
+  - **Fix**: Usar `animated: true` para transicoes suaves.
+
+- [ ] **[M-37] ActiveThreadsBanner absoluto pode sobrepor conteudo em telas pequenas** — `active-threads-banner.tsx:52`
+  - `position: absolute` com `top: 0` pode cobrir input ou teclado em telas < 5".
+  - **Fix**: Adicionar `paddingTop` ao conteudo abaixo do banner ou usar position relative com height reservada.
+
+- [ ] **[M-38] Terminal scroll com setTimeout(0) — race com DOM render** — `chat-screen.tsx:742`
+  - `scrollToEnd` dispara antes do DOM atualizar. Terminal mostra topo por 16-33ms.
+  - **Fix**: Usar `onLayout` callback no container do terminal para scrollar apos render completo.
+
+- [ ] **[M-39] Keyboard listeners podem persistir apos unmount rapido** — `chat-screen.tsx:442`
+  - Navegacao rapida pode causar listeners duplicados ou orfaos.
+  - **Fix**: Guardar com `isFocused` do React Navigation ou limpar explicitamente.
+
+- [ ] **[M-40] TerminalOverlay zIndex conflita com modais** — `chat-screen.tsx:2590`
+  - Sem `zIndex` definido no overlay, modais podem abrir atras do terminal.
+  - **Fix**: Terminal `zIndex: 100`, modais `zIndex: 200`.
+
+- [ ] **[M-41] Provider change limpa model antes do novo fetch completar** — `use-workspace-shell.ts:607`
+  - `setSelectedModel` chamado incondicionalmente; selector fica vazio durante fetch.
+  - **Fix**: So chamar `setSelectedModel` se model atual nao existe no novo provider.
+
+### P2 — Medium
+
+- [ ] **[M-42] Drawer pode reabrir durante animacao de fechamento** — `chat-screen.tsx:794`
+  - `isDrawerAnimatingRef` checado no close mas nao no open. Tap rapido causa glitch visual.
+  - **Fix**: Adicionar `if (isDrawerAnimatingRef.current) return;` no handler de abertura.
+
+- [ ] **[M-43] Splash animation roda tempo completo mesmo se dados carregam instantaneamente** — `root-layout-content.tsx:96`
+  - ~580ms de animacao desnecessaria quando dados carregam em <50ms.
+  - **Fix**: Skip animacao ou reduzir duracao se dados ja estiverem prontos no mount.
+
+- [ ] **[M-44] Scroll handler escreve em ref a cada 16ms** — `chat-screen.tsx:676`
+  - `userScrolledUpRef.current = ...` a cada scroll frame pode causar micro-stutter.
+  - **Fix**: Debounce write para 200ms ou usar threshold com histerese.
+
+- [ ] **[M-45] Workspace health check substitui tela inteira por spinner** — `workspace-selection-screen.tsx:245`
+  - Conteudo desaparece sem transicao quando health check falha.
+  - **Fix**: Overlay semi-transparente com spinner em cima da lista ao inves de substituir.
+
+- [ ] **[M-46] Picker modal nao preserva scroll position** — `chat-screen.tsx:1256`
+  - Abrir picker sempre comeca no topo; usuario precisa scrollar novamente.
+  - **Fix**: Cachear offset por tipo de picker ou usar `initialScrollIndex`.
+  - **Status**: Implemented locally with per-picker scroll cache and restore-on-open logic. Local tests: `mobile/src/features/chat/ui/select-picker-modal.test.ts`. Pending mobile E2E before completion.
+
+- [ ] **[M-47] `placeholderData: createEmptyPage()` pode causar flash de empty state** — `use-messages-query.ts:118`
+  - Em re-entrada ao chat, empty page aparece brevemente antes dos dados reais.
+  - **Fix**: Usar `placeholderData` do cache anterior via `keepPreviousData` ou remover placeholder.
+
+### P3 — Low
+
+- [ ] **[M-48] Model name longo sem truncation no selector** — `chat-screen.tsx:1632`
+  - Nomes longos de modelo podem quebrar layout.
+  - **Fix**: Adicionar `numberOfLines={1}` e `ellipsizeMode="tail"`.
+
+- [ ] **[M-49] Attachments perdidos ao falhar envio de mensagem** — `chat-screen.tsx:771`
+  - Input limpa attachment paths mesmo quando send falha; usuario deve re-adicionar.
+  - **Fix**: So limpar input no callback de sucesso.
+  - **Status**: Current `submit()` flow clears the composer only when `sendMessage()` returns success. Local tests: `mobile/src/features/chat/ui/chat-screen-ux-v2.test.ts`. Pending mobile E2E before completion.
+
+- [ ] **[M-50] Terminal scroll position nao atualiza ao keyboard show/hide** — `chat-screen.tsx:741`
+  - Se teclado aparece durante terminal output, scroll pode ficar no meio.
+  - **Fix**: Re-scroll ao bottom apos evento de keyboard.
+
+---
+
+## CROSS-PLATFORM V2
+
+- [ ] **[X-06] Consistencia de transition timing** — Desktop usa 200ms/300ms misto; Mobile usa LayoutAnimation defaults.
+  - **Fix**: Padronizar duracoes: 150ms para micro-transitions, 250ms para modais, 400ms para page transitions.
+
+---
+
+## Resumo V2
+
+| Prioridade | Desktop | Mobile | Cross | Total |
+|------------|---------|--------|-------|-------|
+| P1 High | 5 | 6 | -- | **11** |
+| P2 Medium | 8 | 6 | -- | **14** |
+| P3 Low | 8 | 3 | 1 | **12** |
+| **Total** | **21** | **15** | **1** | **37** |
+
+---
+
+## Ordem de Ataque V2
+
+### Sprint 7 — Critical Fixes
+1. `[D-37]` Scroll race fix
+2. `[D-39]` Timer cleanup no unmount
+3. `[D-57]` WS handler memoization
+4. `[M-38]` Terminal scroll race
+5. `[M-39]` Keyboard listener cleanup
+6. `[M-40]` zIndex conflicts
+
+### Sprint 8 — Animation Polish
+7. `[D-40]` + `[D-41]` Fade transitions para badges/buttons
+8. `[D-42]` Skeleton sync
+9. `[M-36]` Scroll animado
+10. `[M-42]` Drawer animation guard
+11. `[M-43]` Splash skip
+
+### Sprint 9 — Edge Cases
+12. `[D-38]` Terminal debounce
+13. `[D-45]` CopyButton cleanup
+14. `[D-51]` Error auto-dismiss
+15. `[M-41]` Provider model preserve
+16. `[M-44]` Scroll debounce
+17. `[M-45]` Health check overlay
+
+### Sprint 10 — Polish
+18. Remaining P2/P3 items

@@ -8,4 +8,10 @@
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #2011 | 8:01 PM | 🔵 | Provider switching bug root cause identified | ~542 |
+
+### Mar 18, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #2214 | 10:39 PM | 🔴 | WebSocket error handling now triggers single reconnect instead of double | ~376 |
 </claude-mem-context>

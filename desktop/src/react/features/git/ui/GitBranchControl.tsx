@@ -59,7 +59,7 @@ export const GitBranchControl = ({
 			return;
 		}
 
-		const handlePointerDown = (event: MouseEvent) => {
+		const handlePointerDown = (event: PointerEvent) => {
 			if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
 				setIsOpen(false);
 				setSearchTerm("");
@@ -79,10 +79,10 @@ export const GitBranchControl = ({
 			}
 		};
 
-		window.addEventListener("mousedown", handlePointerDown);
+		window.addEventListener("pointerdown", handlePointerDown);
 		window.addEventListener("keydown", handleEscape);
 		return () => {
-			window.removeEventListener("mousedown", handlePointerDown);
+			window.removeEventListener("pointerdown", handlePointerDown);
 			window.removeEventListener("keydown", handleEscape);
 		};
 	}, [isOpen]);

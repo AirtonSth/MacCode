@@ -123,4 +123,122 @@ describe("D-20: top pagination debounce", () => {
 		);
 		expect(depEffectMatch).not.toBeNull();
 	});
+
+	test("trigger guard resets when the user scrolls away from the top", () => {
+		expect(source).toContain("topPaginationTriggeredRef.current = false;");
+		expect(source).toContain("} else if (viewport.scrollTop > 32) {");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// D-40: "Newer messages" badge disappears with fade animation
+// ---------------------------------------------------------------------------
+describe("D-40: newer messages badge fade animation", () => {
+	test("AnimatePresence wraps the newer-messages badge", () => {
+		const badgeBlock = source.match(
+			/<AnimatePresence>[\s\S]*?newer-messages-badge[\s\S]*?<\/AnimatePresence>/,
+		);
+		expect(badgeBlock).not.toBeNull();
+	});
+
+	test("badge uses motion.span for animation", () => {
+		const motionBadge = source.match(
+			/<motion\.span[\s\S]*?key="newer-messages-badge"/,
+		);
+		expect(motionBadge).not.toBeNull();
+	});
+
+	test("badge has exit opacity animation", () => {
+		const badgeBlock = source.match(
+			/<motion\.span[\s\S]*?newer-messages-badge[\s\S]*?\/>/s,
+		);
+		expect(badgeBlock).not.toBeNull();
+		expect(badgeBlock![0]).toContain("exit={{ opacity: 0 }}");
+	});
+
+	test("badge has initial opacity of 0", () => {
+		const badgeBlock = source.match(
+			/<motion\.span[\s\S]*?newer-messages-badge[\s\S]*?\/>/s,
+		);
+		expect(badgeBlock).not.toBeNull();
+		expect(badgeBlock![0]).toContain("initial={{ opacity: 0 }}");
+	});
+
+	test("badge preserves data-testid for testing", () => {
+		expect(source).toContain('data-testid="conversation-latest-dirty-indicator"');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// D-41: Scroll-to-bottom button appears/disappears with animation
+// ---------------------------------------------------------------------------
+describe("D-41: scroll-to-bottom button animation", () => {
+	test("AnimatePresence wraps the scroll-to-bottom button", () => {
+		const fabBlock = source.match(
+			/<AnimatePresence>[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/AnimatePresence>/,
+		);
+		expect(fabBlock).not.toBeNull();
+	});
+
+	test("button uses motion.button for animation", () => {
+		const motionButton = source.match(
+			/<motion\.button[\s\S]*?key="scroll-to-bottom-fab"/,
+		);
+		expect(motionButton).not.toBeNull();
+	});
+
+	test("button has scale and opacity in exit animation", () => {
+		const fabBlock = source.match(
+			/<motion\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/motion\.button>/s,
+		);
+		expect(fabBlock).not.toBeNull();
+		expect(fabBlock![0]).toContain("exit={{ opacity: 0, scale: 0.8 }}");
+	});
+
+	test("button has scale and opacity in initial state", () => {
+		const fabBlock = source.match(
+			/<motion\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/motion\.button>/s,
+		);
+		expect(fabBlock).not.toBeNull();
+		expect(fabBlock![0]).toContain("initial={{ opacity: 0, scale: 0.8 }}");
+	});
+
+	test("button animates to full opacity and scale", () => {
+		const fabBlock = source.match(
+			/<motion\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/motion\.button>/s,
+		);
+		expect(fabBlock).not.toBeNull();
+		expect(fabBlock![0]).toContain("animate={{ opacity: 1, scale: 1 }}");
+	});
+
+	test("button preserves scroll-to-latest aria-label", () => {
+		expect(source).toContain('aria-label="Scroll to latest message"');
+	});
+});
+
+describe("[D-45] Copy button timer cleanup", () => {
+	test("tracks the reset timer in a ref", () => {
+		expect(source).toContain("const resetCopiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)");
+	});
+
+	test("clears the timer on unmount", () => {
+		const cleanupMatch = source.match(
+			/useEffect\(\(\) => \{\s*return \(\) => \{\s*if \(resetCopiedTimerRef\.current\) \{\s*clearTimeout\(resetCopiedTimerRef\.current\);[\s\S]*?\}\s*\};\s*\}, \[\]\);/,
+		);
+		expect(cleanupMatch).not.toBeNull();
+	});
+});
+
+describe("[D-52/D-53/D-55] content polish", () => {
+	test("uses the same leading-6 line-height in focus and normal markdown paragraphs", () => {
+		expect(source).toContain('const messageTextClass = focusMode ? "text-[15px] leading-6" : "text-sm leading-6"');
+	});
+
+	test("aligns table headers to the top", () => {
+		expect(source).toContain('className="align-top border-b border-white/20 px-2 py-1 text-left text-xs font-semibold"');
+	});
+
+	test("uses mirror repeat type for the streaming activity dot", () => {
+		expect(source).toContain('repeatType: "mirror"');
+	});
 });

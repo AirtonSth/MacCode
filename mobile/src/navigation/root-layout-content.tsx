@@ -29,6 +29,7 @@ export const RootLayoutContent = () => {
 	const router = useRouter();
 	const { isLoaded: isConfigLoaded } = useApiConfig();
 	const { isLoaded: isSessionLoaded, setSessionRecord } = usePrivateSession();
+	const dataReadyOnMountRef = useRef(isConfigLoaded && isSessionLoaded);
 
 	const routePrivateAuthCompletionUrl = useCallback((rawUrl: string | null): boolean => {
 		if (!rawUrl) {
@@ -177,6 +178,7 @@ export const RootLayoutContent = () => {
 					onFinish={() => {
 						setIsLaunchSplashVisible(false);
 					}}
+					shouldSkipAnimation={dataReadyOnMountRef.current}
 				/>
 			) : null}
 		</QueryClientProvider>

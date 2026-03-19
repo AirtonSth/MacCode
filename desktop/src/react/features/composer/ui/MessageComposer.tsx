@@ -32,6 +32,7 @@ interface MessageComposerProps {
 	permissionMode: CodexPermissionMode;
 	onPermissionModeChange: (mode: CodexPermissionMode) => void;
 	availableModels: CodexModelDescriptor[];
+	modelsLoading?: boolean;
 	selectedModel: string | null;
 	onModelChange: (model: string) => void;
 	selectedProvider: SelectedProvider;
@@ -62,6 +63,7 @@ export const MessageComposer = ({
 	onForceStop,
 	stopping = false,
 	availableModels,
+	modelsLoading = false,
 	selectedModel,
 	onModelChange,
 	selectedProvider,
@@ -277,7 +279,8 @@ export const MessageComposer = ({
 	const buttonLabel = isRunning ? (stopping ? "Stopping..." : "Force Stop") : sending ? "Sending..." : "Send";
 	const composerTextClass = "text-sm leading-6 text-[#e5e7eb]";
 	const subtleSelectClass =
-		"h-6 appearance-none bg-transparent px-1 pr-4 text-xs leading-4 font-normal text-[#9a9da5] transition-colors hover:text-[#c8ccd6] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+		"h-6 appearance-none bg-transparent px-1 pr-4 text-xs font-normal leading-4 text-[#9a9da5] transition-colors hover:text-[#c8ccd6] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 focus-visible:ring-offset-2 focus-visible:ring-offset-[#181a1f] disabled:cursor-not-allowed disabled:opacity-50";
+	const showModelsLoadingState = modelsLoading && availableModels.length === 0;
 	const handlePrimaryAction = () => {
 		if (isRunning) {
 			if (forceStopDisabled) {
@@ -373,14 +376,15 @@ export const MessageComposer = ({
 							<select
 									aria-label="Model"
 									className={cn(subtleSelectClass, "min-w-[180px]")}
-								disabled={isInputLocked || availableModels.length === 0}
+								disabled={isInputLocked || showModelsLoadingState || availableModels.length === 0}
 									id={modelSelectId}
 									onChange={(event) => {
 										onModelChange(event.target.value);
 									}}
 									value={selectedModel ?? availableModels[0]?.model ?? ""}
 								>
-									{availableModels.length === 0 ? <option value="">No models</option> : null}
+									{showModelsLoadingState ? <option value="">Loading models...</option> : null}
+									{!showModelsLoadingState && availableModels.length === 0 ? <option value="">No models</option> : null}
 									{availableModels.map((model) => (
 										<option key={model.id} value={model.model}>
 											{model.displayName}

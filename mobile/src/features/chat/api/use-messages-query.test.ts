@@ -1,12 +1,13 @@
 /* eslint-disable import/no-unresolved */
 import { describe, expect, it } from "bun:test";
+import type { MessageDTO, MessagePageDTO } from "../../../shared/api/types";
 
-import {
+const {
 	appendMessageToMessagePage,
+	getPlaceholderMessagePage,
 	MESSAGE_PAGE_SIZE,
 	replaceVisibleMessagePage,
-} from "./use-messages-query";
-import type { MessageDTO, MessagePageDTO } from "../../../shared/api/types";
+} = await import("./message-page-utils");
 
 const makeMessage = (overrides: Partial<MessageDTO> = {}): MessageDTO => ({
 	chatId: "chat-1",
@@ -117,5 +118,35 @@ describe("replaceVisibleMessagePage", () => {
 
 		expect(result.messages).toHaveLength(1);
 		expect(result.messages[0].id).toBe("new");
+	});
+});
+
+describe("[M-47] placeholder data preserves previous visible messages", () => {
+	it("prefers the previous page when it exists", () => {
+		const previousPage: MessagePageDTO = {
+			...makeEmptyPage(),
+			messages: [makeMessage({ id: "previous" })],
+		};
+		const cachedPage: MessagePageDTO = {
+			...makeEmptyPage(),
+			messages: [makeMessage({ id: "cached" })],
+		};
+
+		const result = getPlaceholderMessagePage(previousPage, cachedPage);
+		expect(result?.messages[0]?.id).toBe("previous");
+	});
+
+	it("falls back to cached data when there is no previous page", () => {
+		const cachedPage: MessagePageDTO = {
+			...makeEmptyPage(),
+			messages: [makeMessage({ id: "cached" })],
+		};
+
+		const result = getPlaceholderMessagePage(undefined, cachedPage);
+		expect(result?.messages[0]?.id).toBe("cached");
+	});
+
+	it("returns undefined when neither source has data", () => {
+		expect(getPlaceholderMessagePage(undefined, undefined)).toBeUndefined();
 	});
 });

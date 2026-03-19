@@ -237,6 +237,8 @@ export const ChatScreen = () => {
 	const messageScrollRef = useRef<ScrollView | null>(null);
 	const previousLastMessageIdRef = useRef<string | null>(null);
 	const terminalScrollRef = useRef<ScrollView | null>(null);
+	const shouldScrollTerminalToEndRef = useRef<"animated" | "instant" | null>(null);
+	const terminalKeyboardScrollRafRef = useRef<number | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
 	const isDrawerAnimatingRef = useRef(false);
@@ -428,7 +430,7 @@ export const ChatScreen = () => {
 
 		if (!isKeyboardVisible) {
 			timer = setTimeout(() => {
-				selectorsScrollRef.current?.scrollToEnd({ animated: false });
+				selectorsScrollRef.current?.scrollToEnd({ animated: true });
 			}, 0);
 		}
 
@@ -440,23 +442,49 @@ export const ChatScreen = () => {
 	}, [isKeyboardVisible, availableModels.length, availableReasoningEfforts.length, availableBranches.length, permissionMode, selectedBranch]);
 
 	useEffect(() => {
+		const scheduleTerminalKeyboardScroll = () => {
+			if (!isTerminalOpen) {
+				return;
+			}
+
+			if (terminalKeyboardScrollRafRef.current !== null) {
+				cancelAnimationFrame(terminalKeyboardScrollRafRef.current);
+			}
+
+			terminalKeyboardScrollRafRef.current = requestAnimationFrame(() => {
+				terminalKeyboardScrollRafRef.current = null;
+				terminalScrollRef.current?.scrollToEnd({ animated: true });
+			});
+		};
+
+		if (!isFocused) {
+			return () => {
+				// intentional
+			};
+		}
 		const onShow = () => {
 			setIsKeyboardVisible(true);
 			setActivePicker(null);
 			setIsBranchModalOpen(false);
 			setIsGitCommitModalOpen(false);
+			scheduleTerminalKeyboardScroll();
 		};
 		const onHide = () => {
 			setIsKeyboardVisible(false);
+			scheduleTerminalKeyboardScroll();
 		};
 		const showSubscription = Keyboard.addListener("keyboardDidShow", onShow);
 		const hideSubscription = Keyboard.addListener("keyboardDidHide", onHide);
 
 		return () => {
+			if (terminalKeyboardScrollRafRef.current !== null) {
+				cancelAnimationFrame(terminalKeyboardScrollRafRef.current);
+				terminalKeyboardScrollRafRef.current = null;
+			}
 			showSubscription.remove();
 			hideSubscription.remove();
 		};
-	}, []);
+	}, [isFocused, isTerminalOpen]);
 
 	useEffect(() => {
 		if (!activeModel || availableReasoningEfforts.length === 0) {
@@ -686,8 +714,10 @@ export const ChatScreen = () => {
 			layoutMeasurement,
 		} = event.nativeEvent;
 		const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
-
-		userScrolledUpRef.current = distanceFromBottom > AUTO_SCROLL_BOTTOM_THRESHOLD;
+		const nextUserScrolledUp = distanceFromBottom > AUTO_SCROLL_BOTTOM_THRESHOLD;
+		if (userScrolledUpRef.current !== nextUserScrolledUp) {
+			userScrolledUpRef.current = nextUserScrolledUp;
+		}
 
 		if (isViewingOlderMessages && distanceFromBottom <= threshold) {
 			void loadLatestMessages();
@@ -738,9 +768,7 @@ export const ChatScreen = () => {
 					return;
 				}
 				setTerminalOutput(toTerminalTranscript(history.commands, history.entries));
-				setTimeout(() => {
-					terminalScrollRef.current?.scrollToEnd({ animated: false });
-				}, 0);
+				shouldScrollTerminalToEndRef.current = "animated";
 			} catch (error: unknown) {
 				if (!active) {
 					return;
@@ -789,6 +817,28 @@ export const ChatScreen = () => {
 			setInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
 		}
 		setIsFilePickerOpen(false);
+	};
+
+	const openDrawer = () => {
+		if (isDrawerAnimatingRef.current) {
+			return;
+		}
+		isDrawerAnimatingRef.current = true;
+		setIsDrawerOpen(true);
+		Animated.parallel([
+			Animated.timing(drawerOpacity, {
+				duration: 140,
+				toValue: 1,
+				useNativeDriver: true,
+			}),
+			Animated.timing(drawerTranslate, {
+				duration: 170,
+				toValue: 0,
+				useNativeDriver: true,
+			}),
+		]).start(() => {
+			isDrawerAnimatingRef.current = false;
+		});
 	};
 
 	const closeDrawer = () => {
@@ -993,9 +1043,7 @@ export const ChatScreen = () => {
 				return previous.length > 0 ? `${previous}\n\n${nextBlock}` : nextBlock;
 			});
 			setTerminalInput("");
-			setTimeout(() => {
-				terminalScrollRef.current?.scrollToEnd({ animated: true });
-			}, 0);
+			shouldScrollTerminalToEndRef.current = "animated";
 		} catch (error: unknown) {
 			setTerminalError(error instanceof Error ? error.message : "Unable to run terminal command.");
 		} finally {
@@ -1201,6 +1249,15 @@ export const ChatScreen = () => {
 		void runTerminalCommand();
 	}, [runTerminalCommand]);
 
+	const handleTerminalContentLayout = useCallback(() => {
+		const mode = shouldScrollTerminalToEndRef.current;
+		if (mode === null) {
+			return;
+		}
+		shouldScrollTerminalToEndRef.current = null;
+		terminalScrollRef.current?.scrollToEnd({ animated: mode === "animated" });
+	}, []);
+
 	const renderedMessages = useMemo(
 		() => messages.map((message) => {
 			const isUser = message.role === "user";
@@ -1401,17 +1458,28 @@ export const ChatScreen = () => {
 					goBackOr("/threads");
 				}}
 				right={(
-					<Pressable
-						accessibilityLabel="chat-permission-button"
-						accessibilityRole="button"
-						onPress={() => {
-							setActivePicker("permission");
-						}}
-						style={({ pressed }) => [styles.permissionIndicatorButton, pressed ? styles.permissionIndicatorButtonPressed : null]}
-						testID="chat-permission-button"
-					>
-						<View style={[styles.permissionIndicatorDot, { backgroundColor: permissionDotColor }]} />
-					</Pressable>
+					<View style={styles.headerActions}>
+						<Pressable
+							accessibilityLabel="chat-drawer-button"
+							accessibilityRole="button"
+							onPress={openDrawer}
+							style={({ pressed }) => [styles.permissionIndicatorButton, pressed ? styles.permissionIndicatorButtonPressed : null]}
+							testID="chat-drawer-button"
+						>
+							<Ionicons color={palette.text} name="menu-outline" size={18} />
+						</Pressable>
+						<Pressable
+							accessibilityLabel="chat-permission-button"
+							accessibilityRole="button"
+							onPress={() => {
+								setActivePicker("permission");
+							}}
+							style={({ pressed }) => [styles.permissionIndicatorButton, pressed ? styles.permissionIndicatorButtonPressed : null]}
+							testID="chat-permission-button"
+						>
+							<View style={[styles.permissionIndicatorDot, { backgroundColor: permissionDotColor }]} />
+						</Pressable>
+					</View>
 				)}
 				subtitle={selectedProject?.name ?? "No workspace selected"}
 				title={selectedChat?.title ?? "Chat"}
@@ -1629,7 +1697,7 @@ export const ChatScreen = () => {
 								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
 									Model
 								</Text>
-								<Text numberOfLines={1} style={styles.selectorButtonValue}>
+								<Text ellipsizeMode="tail" numberOfLines={1} style={styles.selectorButtonValue}>
 									{selectedModelName}
 								</Text>
 							</View>
@@ -1998,6 +2066,7 @@ export const ChatScreen = () => {
 					onCloseFilePicker={closeFilePicker}
 					onOpenFilePicker={openTerminalFilePicker}
 					onRun={handleRunTerminal}
+					onTerminalContentLayout={handleTerminalContentLayout}
 					selectedChatId={selectedChatId}
 					terminalError={terminalError}
 					terminalInput={terminalInput}
@@ -2460,6 +2529,11 @@ const styles = StyleSheet.create({
 	},
 	permissionIndicatorButtonPressed: {
 		backgroundColor: "rgba(255,255,255,0.08)",
+	},
+	headerActions: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
 	},
 	permissionIndicatorDot: {
 		borderRadius: 999,

@@ -4,11 +4,12 @@ import iconSource from "../../../assets/images/icon.png";
 
 interface AnimatedLaunchSplashProps {
 	onFinish: () => void;
+	shouldSkipAnimation?: boolean;
 }
 
 const OVERLAY_BG = "#0d0f14";
 
-export const AnimatedLaunchSplash = ({ onFinish }: AnimatedLaunchSplashProps) => {
+export const AnimatedLaunchSplash = ({ onFinish, shouldSkipAnimation = false }: AnimatedLaunchSplashProps) => {
 	const overlayOpacity = useRef(new Animated.Value(1)).current;
 	const iconOpacity = useRef(new Animated.Value(0)).current;
 	const iconScale = useRef(new Animated.Value(0.92)).current;
@@ -21,6 +22,11 @@ export const AnimatedLaunchSplash = ({ onFinish }: AnimatedLaunchSplashProps) =>
 	}, [onFinish]);
 
 	useEffect(() => {
+		if (shouldSkipAnimation) {
+			onFinishRef.current();
+			return undefined;
+		}
+
 		const sequence = Animated.sequence([
 			Animated.parallel([
 				Animated.timing(iconOpacity, {
@@ -82,7 +88,7 @@ export const AnimatedLaunchSplash = ({ onFinish }: AnimatedLaunchSplashProps) =>
 		return () => {
 			sequence.stop();
 		};
-	}, [glowOpacity, glowScale, iconOpacity, iconScale, overlayOpacity]);
+	}, [glowOpacity, glowScale, iconOpacity, iconScale, overlayOpacity, shouldSkipAnimation]);
 
 	return (
 		<Animated.View pointerEvents="none" style={[styles.overlay, { opacity: overlayOpacity }]}>

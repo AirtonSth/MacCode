@@ -86,3 +86,24 @@ describe("[D-33] Non-git-repository message is a hover tooltip", () => {
 		expect(gitBranchSource).not.toContain("This project is not a git repository");
 	});
 });
+
+describe("[D-36] GitBranchControl uses pointerdown instead of mousedown", () => {
+	it("registers a pointerdown event listener on window", () => {
+		expect(gitBranchSource).toContain('"pointerdown"');
+	});
+
+	it("does not use mousedown event listener", () => {
+		expect(gitBranchSource).not.toContain('"mousedown"');
+		expect(gitBranchSource).not.toContain("'mousedown'");
+	});
+
+	it("adds and removes pointerdown listener symmetrically", () => {
+		expect(gitBranchSource).toContain('window.addEventListener("pointerdown"');
+		expect(gitBranchSource).toContain('window.removeEventListener("pointerdown"');
+	});
+
+	it("types the handler parameter as PointerEvent instead of MouseEvent", () => {
+		expect(gitBranchSource).toContain("(event: PointerEvent)");
+		expect(gitBranchSource).not.toContain("(event: MouseEvent)");
+	});
+});

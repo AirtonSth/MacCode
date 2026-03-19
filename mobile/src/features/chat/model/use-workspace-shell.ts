@@ -8,9 +8,8 @@ import { useChatsQuery } from "../api/use-chats-query";
 import { useChatContextQuery } from "../api/use-chat-context-query";
 import { useCreateChatMutation } from "../api/use-create-chat-mutation";
 import { useDeleteChatMutation } from "../api/use-delete-chat-mutation";
+import { appendMessageToMessagePage, MESSAGE_PAGE_SIZE } from "../api/message-page-utils";
 import {
-	appendMessageToMessagePage,
-	MESSAGE_PAGE_SIZE,
 	useMessagesQuery,
 } from "../api/use-messages-query";
 import { useUpdateWorkspaceSelectionMutation } from "../../settings/api/use-update-workspace-selection-mutation";
@@ -610,9 +609,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			if (defaultModelDescriptor) {
 				setSelectedModel(defaultModelDescriptor.model);
 				setSelectedReasoningEffort(defaultModelDescriptor.defaultReasoningEffort ?? null);
+				persistSelection({
+					selectedChatId,
+					selectedModel: defaultModelDescriptor.model,
+					selectedProjectId,
+					selectedReasoningEffort: defaultModelDescriptor.defaultReasoningEffort ?? null,
+				});
 			}
 		}
-	}, [modelsQuery.data?.models, selectedModel]);
+	}, [modelsQuery.data?.models, persistSelection, selectedChatId, selectedModel, selectedProjectId]);
 
 	const streamTurnQuery = useQuery<StreamTurnState | null>({
 		gcTime: Number.POSITIVE_INFINITY,
@@ -2024,15 +2029,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const setSelectedProviderWithSync = useCallback(
 		(value: string) => {
 			setSelectedProvider(value);
-			setSelectedModel(null);
-			setSelectedReasoningEffort(null);
 			void queryClient.invalidateQueries({ queryKey: ["provider-models", value] });
 			persistSelection({
 				selectedProjectId,
 				selectedChatId,
 				selectedProvider: value,
-				selectedModel: null,
-				selectedReasoningEffort: null,
 			});
 		},
 		[persistSelection, queryClient, selectedChatId, selectedProjectId],

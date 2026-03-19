@@ -31,6 +31,7 @@ export interface TerminalOverlayProps {
 	onCloseFilePicker: () => void;
 	onOpenFilePicker: () => void;
 	onRun: () => void;
+	onTerminalContentLayout: () => void;
 	selectedChatId: string | null;
 	terminalError: string;
 	terminalInput: string;
@@ -71,6 +72,7 @@ export const TerminalOverlay = memo(function TerminalOverlay(props: TerminalOver
 					<ScrollView
 						contentContainerStyle={chatScreenStyles.terminalOutputContent}
 						contentInsetAdjustmentBehavior="automatic"
+						onContentSizeChange={props.onTerminalContentLayout}
 						ref={props.terminalScrollRef}
 						showsVerticalScrollIndicator={false}
 						style={chatScreenStyles.terminalOutput}
