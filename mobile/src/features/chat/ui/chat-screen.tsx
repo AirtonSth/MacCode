@@ -205,7 +205,6 @@ export const ChatScreen = () => {
 		},
 		[clearAllProjectChatsRaw],
 	);
-	const [input, setInput] = useState<string>("");
 	const [drawerSearchValue, setDrawerSearchValue] = useState<string>("");
 	const [activePicker, setActivePicker] = useState<ActivePicker | null>(null);
 	const [isWorkspacePickerOpen, setIsWorkspacePickerOpen] = useState<boolean>(false);
@@ -247,6 +246,8 @@ export const ChatScreen = () => {
 	const [workspaceNameInput, setWorkspaceNameInput] = useState<string>("");
 	const [workspaceToRename, setWorkspaceToRename] = useState<ProjectDTO | null>(null);
 	const [isRenamingWorkspace, setIsRenamingWorkspace] = useState<boolean>(false);
+	const [pendingChatAttachmentPaths, setPendingChatAttachmentPaths] = useState<string[] | null>(null);
+	const [chatComposerInput, setChatComposerInput] = useState<string>("");
 	const debugSelectionSignatureRef = useRef<string | null>(null);
 	const debugAutoSendSignatureRef = useRef<string | null>(null);
 	const debugProjectId = useMemo(
@@ -384,10 +385,11 @@ export const ChatScreen = () => {
 		isSending || isStopping || !selectedProjectId || selectedChatIsRunning;
 	const isForceStopDisabled =
 		isSending || isStopping || !selectedChatId || !selectedChatIsRunning;
-	const primaryActionDisabled = selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled;
-	const primaryActionPressedStyle = selectedChatIsRunning
+	const composerPrimaryActionDisabled = selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled;
+	const composerPrimaryActionPressedStyle = selectedChatIsRunning
 		? styles.forceStopActionPressed
 		: styles.primaryActionPressed;
+	const composerPrimaryActionIconColor = selectedChatIsRunning ? "#FFEDEE" : styles.primaryActionLabel.color;
 	const isResolvingThreadSelectionRaw = source === "thread-list" && !selectedChatId;
 	const [showResolvingSpinner, setShowResolvingSpinner] = useState(false);
 	const resolvingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -788,23 +790,15 @@ export const ChatScreen = () => {
 		};
 	}, [api, isTerminalOpen, selectedChatId]);
 
-	const submit = async () => {
-		const text = input.trim();
-		if (!text) {
-			return;
-		}
-
-		const sent = await sendMessage(text);
-		if (sent) {
-			setInput("");
-		}
-	};
-
 	const openFilePicker = useCallback((target: FilePickerTarget) => {
 		Keyboard.dismiss();
 		setFilePickerTarget(target);
 		setIsFilePickerOpen(true);
 	}, []);
+
+	const openChatFilePicker = useCallback(() => {
+		openFilePicker("chat");
+	}, [openFilePicker]);
 
 	const closeFilePicker = useCallback(() => {
 		setIsFilePickerOpen(false);
@@ -814,10 +808,58 @@ export const ChatScreen = () => {
 		if (filePickerTarget === "terminal") {
 			setTerminalInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
 		} else {
-			setInput((currentInput) => appendAttachmentPathsToMessage(currentInput, paths));
+			setPendingChatAttachmentPaths((currentPaths) => [...(currentPaths ?? []), ...paths]);
 		}
 		setIsFilePickerOpen(false);
 	};
+
+	const handleChatAttachmentPathsApplied = useCallback(() => {
+		setPendingChatAttachmentPaths(null);
+	}, []);
+
+	useEffect(() => {
+		if (!pendingChatAttachmentPaths || pendingChatAttachmentPaths.length === 0) {
+			return;
+		}
+
+		setChatComposerInput((currentInput) =>
+			appendAttachmentPathsToMessage(currentInput, pendingChatAttachmentPaths),
+		);
+		handleChatAttachmentPathsApplied();
+	}, [handleChatAttachmentPathsApplied, pendingChatAttachmentPaths]);
+
+	const handleSendMessage = useCallback(
+		async (text: string): Promise<boolean> => await sendMessage(text),
+		[sendMessage],
+	);
+
+	const handleForceStopActiveChat = useCallback(
+		async (): Promise<void> => {
+			await forceStopActiveChat();
+		},
+		[forceStopActiveChat],
+	);
+
+	const handleComposerSubmit = useCallback(async (): Promise<void> => {
+		const text = chatComposerInput.trim();
+		if (!text) {
+			return;
+		}
+
+		const sent = await handleSendMessage(text);
+		if (sent) {
+			setChatComposerInput("");
+		}
+	}, [chatComposerInput, handleSendMessage]);
+
+	const handleComposerPrimaryActionPress = useCallback(() => {
+		if (selectedChatIsRunning) {
+			void handleForceStopActiveChat();
+			return;
+		}
+
+		void handleComposerSubmit();
+	}, [handleComposerSubmit, handleForceStopActiveChat, selectedChatIsRunning]);
 
 	const openDrawer = () => {
 		if (isDrawerAnimatingRef.current) {
@@ -1591,12 +1633,10 @@ export const ChatScreen = () => {
 					</Text>
 				) : null}
 
-				<View style={styles.composerRow}>
+					<View style={styles.composerRow}>
 						<Pressable
 							disabled={isSendActionDisabled}
-							onPress={() => {
-								openFilePicker("chat");
-							}}
+							onPress={openChatFilePicker}
 							style={({ pressed }) => [
 								styles.attachAction,
 								pressed ? styles.attachActionPressed : null,
@@ -1604,57 +1644,46 @@ export const ChatScreen = () => {
 							]}
 							testID="chat-attach-button"
 						>
-						<MaterialIcons color={palette.text} name="add" size={22} />
-					</Pressable>
-
-					<TextInput
-						autoCapitalize="sentences"
-						multiline
-						onChangeText={setInput}
-						onSubmitEditing={() => {
-							void submit();
-						}}
-						placeholder="Message"
-						placeholderTextColor={palette.muted}
-						style={styles.composerInput}
-						testID="chat-input"
-						value={input}
-					/>
-
-						<Pressable
-							accessibilityLabel={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
-							accessibilityRole="button"
-							disabled={selectedChatIsRunning ? isForceStopDisabled : isSendActionDisabled}
-							onPress={() => {
-								if (selectedChatIsRunning) {
-									void forceStopActiveChat();
-									return;
-								}
-
-								void submit();
-							}}
-							style={({ pressed }) => [
-								styles.primaryAction,
-								selectedChatIsRunning ? styles.forceStopAction : null,
-								pressed ? primaryActionPressedStyle : null,
-								primaryActionDisabled ? styles.disabledButton : null,
-							]}
-							testID={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
-						>
-							{isStopping ? (
-								<ActivityIndicator color={selectedChatIsRunning ? "#FFEDEE" : styles.primaryActionLabel.color} size="small" />
-							) : (
-								<MaterialIcons
-									color={selectedChatIsRunning ? "#FFEDEE" : styles.primaryActionLabel.color}
-									name={selectedChatIsRunning ? "stop" : "send"}
-									size={20}
-								/>
-							)}
+							<MaterialIcons color={palette.text} name="add" size={22} />
 						</Pressable>
-				</View>
 
-				{!isKeyboardVisible ? (
-					<ScrollView
+						<TextInput
+							autoCapitalize="sentences"
+							multiline
+							onChangeText={setChatComposerInput}
+							onSubmitEditing={() => {
+								void handleComposerSubmit();
+							}}
+							placeholder="Message"
+							placeholderTextColor={palette.muted}
+							style={styles.composerInput}
+							testID="chat-input"
+							value={chatComposerInput}
+						/>
+
+							<Pressable
+								accessibilityLabel={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
+								accessibilityRole="button"
+								disabled={composerPrimaryActionDisabled}
+								onPress={handleComposerPrimaryActionPress}
+								style={({ pressed }) => [
+									styles.primaryAction,
+									selectedChatIsRunning ? styles.forceStopAction : null,
+									pressed ? composerPrimaryActionPressedStyle : null,
+									composerPrimaryActionDisabled ? styles.disabledButton : null,
+								]}
+								testID={selectedChatIsRunning ? "chat-force-stop-button" : "chat-send-button"}
+							>
+								{isStopping ? (
+									<ActivityIndicator color={composerPrimaryActionIconColor} size="small" />
+								) : (
+									<MaterialIcons color={composerPrimaryActionIconColor} name={selectedChatIsRunning ? "stop" : "send"} size={20} />
+								)}
+							</Pressable>
+						</View>
+
+					{!isKeyboardVisible ? (
+						<ScrollView
 						ref={selectorsScrollRef}
 						contentContainerStyle={[styles.selectorsScroller, { paddingBottom: iosSelectorPaddingBottom }]}
 						horizontal

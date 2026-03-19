@@ -14,8 +14,19 @@ interface RealtimeOptions {
 	createSocket?: (url: string, options?: { headers?: Record<string, string> }) => WebSocket;
 	onConnectionStateChange?: (state: ConnectionState) => void;
 	onEvent: (event: ServerWsEvent) => void;
+	onReliableMessageError?: (input: { chatId: string; message: string; requestId: string }) => void;
 	target: ActiveConnectionTarget;
 }
+
+interface QueuedClientEvent {
+	payload: ClientWsEvent;
+	queuedAt: number;
+	requestId: string | null;
+	state: "queued" | "sent_unacked";
+}
+
+const isReliableUserMessage = (payload: ClientWsEvent): payload is Extract<ClientWsEvent, { event: "user_message" }> =>
+	payload.event === "user_message";
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === "object" && value !== null;
@@ -299,6 +310,8 @@ export const buildRealtimeWebSocketHeaders = (target: ActiveConnectionTarget): R
 export const createRealtimeClient = (options: RealtimeOptions) => {
 	const reconnectBaseDelay = 300;
 	const reconnectMaxDelay = 4_000;
+	const reliableQueueLimit = 100;
+	const reliableQueueTtlMs = 120_000;
 
 	let socket: WebSocket | null = null;
 	let reconnectAttempts = 0;
@@ -310,7 +323,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 	let socketErrored = false;
 	const activeChats = new Set<string>();
 	let activeWorkspaceSubscription: { clientId?: string; lastSeq: number } | null = null;
-	const sendQueue: ClientWsEvent[] = [];
+	const sendQueue: QueuedClientEvent[] = [];
 
 	const notifyState = (state: ConnectionState) => {
 		options.onConnectionStateChange?.(state);
@@ -341,9 +354,9 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 	const getQueuedJoinChatIds = () => {
 		const joinedInQueue = new Set<string>();
 
-		for (const event of sendQueue) {
-			if (event.event === "join_chat") {
-				joinedInQueue.add(event.data.chatId);
+		for (const queued of sendQueue) {
+			if (queued.payload.event === "join_chat") {
+				joinedInQueue.add(queued.payload.data.chatId);
 			}
 		}
 
@@ -351,10 +364,58 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 	};
 
 	const hasQueuedWorkspaceJoin = () => {
-		return sendQueue.some((event) => event.event === "join_workspace");
+		return sendQueue.some((queued) => queued.payload.event === "join_workspace");
 	};
 
+	const emitReliableMessageError = (queued: QueuedClientEvent, fallbackMessage: string) => {
+		if (queued.payload.event !== "user_message" || !queued.requestId) {
+			return;
+		}
+
+		options.onReliableMessageError?.({
+			chatId: queued.payload.data.chatId,
+			message: fallbackMessage,
+			requestId: queued.requestId,
+		});
+	};
+
+	const dropExpiredReliableMessages = () => {
+		const now = Date.now();
+		for (let index = sendQueue.length - 1; index >= 0; index -= 1) {
+			const queued = sendQueue[index];
+			if (!queued || queued.payload.event !== "user_message") {
+				continue;
+			}
+
+			if (now - queued.queuedAt < reliableQueueTtlMs) {
+				continue;
+			}
+
+			sendQueue.splice(index, 1);
+			emitReliableMessageError(queued, "The request expired while the desktop was offline. Please resend it.");
+		}
+	};
+
+	const resetUnackedReliableMessagesForRetry = () => {
+		for (const queued of sendQueue) {
+			if (queued.payload.event === "user_message" && queued.state === "sent_unacked") {
+				queued.state = "queued";
+			}
+		}
+	};
+
+	const buildQueueEntry = (payload: ClientWsEvent): QueuedClientEvent => ({
+		payload,
+		queuedAt: Date.now(),
+		requestId: payload.event === "user_message"
+			? payload.data.requestId ?? null
+			: null,
+		state: "queued",
+	});
+
 	const enqueueMessage = (payload: ClientWsEvent) => {
+		dropExpiredReliableMessages();
+
 		if (payload.event === "join_chat") {
 			const queuedJoinChatIds = getQueuedJoinChatIds();
 			if (queuedJoinChatIds.has(payload.data.chatId)) {
@@ -365,29 +426,32 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		if (payload.event === "join_workspace") {
 			for (let index = sendQueue.length - 1; index >= 0; index -= 1) {
 				const queued = sendQueue[index];
-				if (queued?.event === "join_workspace") {
+				if (queued?.payload.event === "join_workspace") {
 					sendQueue.splice(index, 1);
 					break;
 				}
 			}
 		}
 
-		if (sendQueue.length >= 200) {
-			// Find the first non-subscription message to discard.
-			// Subscription messages (join_chat, join_workspace) are critical
-			// and must not be silently dropped.
-			const expendableIndex = sendQueue.findIndex(
-				(queued) => queued.event !== "join_chat" && queued.event !== "join_workspace",
-			);
-			if (expendableIndex !== -1) {
-				sendQueue.splice(expendableIndex, 1);
-			} else {
-				// All messages are subscriptions — drop the oldest one as a last resort.
-				sendQueue.shift();
+		if (isReliableUserMessage(payload)) {
+			const existingIndex = sendQueue.findIndex((queued) => queued.requestId === payload.data.requestId);
+			if (existingIndex !== -1) {
+				sendQueue[existingIndex] = buildQueueEntry(payload);
+				return;
 			}
 		}
 
-		sendQueue.push(payload);
+		if (sendQueue.length >= reliableQueueLimit) {
+			if (isReliableUserMessage(payload)) {
+				emitReliableMessageError(
+					buildQueueEntry(payload),
+					"The pending request queue is full. Please wait for current retries to finish.",
+				);
+			}
+			return;
+		}
+
+		sendQueue.push(buildQueueEntry(payload));
 	};
 
 	const flushQueue = () => {
@@ -395,18 +459,41 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			return;
 		}
 
-		while (sendQueue.length > 0) {
-			const payload = sendQueue.shift();
-
-			if (!payload) {
+		dropExpiredReliableMessages();
+		for (let index = 0; index < sendQueue.length;) {
+			const queued = sendQueue[index];
+			if (!queued) {
+				index += 1;
+				continue;
+			}
+			if (queued.payload.event === "user_message" && queued.state === "sent_unacked") {
+				index += 1;
 				continue;
 			}
 
 			try {
-				socket.send(JSON.stringify(payload));
+				socket.send(JSON.stringify(queued.payload));
+				if (queued.payload.event === "user_message") {
+					queued.state = "sent_unacked";
+					index += 1;
+					continue;
+				}
+
+				sendQueue.splice(index, 1);
 			} catch {
-				sendQueue.unshift(payload);
 				break;
+			}
+		}
+	};
+
+	const acknowledgeRequest = (requestId: string | null | undefined) => {
+		if (!requestId) {
+			return;
+		}
+
+		for (let index = sendQueue.length - 1; index >= 0; index -= 1) {
+			if (sendQueue[index]?.requestId === requestId) {
+				sendQueue.splice(index, 1);
 			}
 		}
 	};
@@ -501,6 +588,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		socket.onclose = () => {
 			isConnected = false;
 			isConnecting = false;
+			resetUnackedReliableMessagesForRetry();
 
 			if (!stopped) {
 				scheduleReconnect();
@@ -527,12 +615,33 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				return;
 			}
 
+			if (payload.event === "error" && payload.data.code === "connector_offline") {
+				resetUnackedReliableMessagesForRetry();
+				return;
+			}
+
+			if (payload.event === "error" && payload.data.code === "connector_reconnected") {
+				flushQueue();
+				return;
+			}
+
+			if (payload.event === "workspace_event") {
+				acknowledgeRequest(payload.data.requestId);
+			}
 			options.onEvent(payload);
 		};
 	};
 
 	const send = (payload: ClientWsEvent) => {
 		if (stopped) {
+			return;
+		}
+
+		if (payload.event === "user_message") {
+			enqueueMessage(payload);
+			if (socket && socket.readyState === WebSocket.OPEN && !socketErrored) {
+				flushQueue();
+			}
 			return;
 		}
 
@@ -594,6 +703,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				requestId?: string;
 			},
 		) => {
+			const requestId = options?.requestId ?? `ws-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
 			send({
 				data: {
 					chatId,
@@ -604,10 +714,11 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 					...(options?.projectId ? { projectId: options.projectId } : {}),
 					...(options?.provider ? { provider: options.provider } : {}),
 					...(options?.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
-					...(options?.requestId ? { requestId: options.requestId } : {}),
+					requestId,
 				},
 				event: "user_message",
 			});
 		},
+		acknowledgeRequest,
 	};
 };

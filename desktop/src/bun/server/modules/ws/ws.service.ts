@@ -91,6 +91,7 @@ const noopLiveActivityPushService: LiveActivityPushServiceContract = {
 export class WsService implements WsServiceContract {
 	private readonly runningChats = new Set<string>();
 	private readonly runningChatAbortControllers = new Map<string, AbortController>();
+	private readonly acceptedRequestIds = new Map<string, number>();
 
 	constructor(
 		private readonly chatRepository: ChatRepository,
@@ -298,6 +299,36 @@ export class WsService implements WsServiceContract {
 
 	async startUserMessage(input: WsServiceInput): Promise<void> {
 		const { chatId, clientId, emit, requestId, text } = input;
+		if (requestId && this.hasAcceptedRequest(chatId, requestId)) {
+			const snapshot = await this.chatRepository.findChatById(chatId);
+			if (snapshot) {
+				emit({
+					data: {
+						chatId,
+						diffAdded: snapshot.diffAdded,
+						diffRemoved: snapshot.diffRemoved,
+						isActive: snapshot.isActive,
+						status: snapshot.status,
+						updatedAt: snapshot.updatedAt,
+					},
+					event: "chat_updated",
+				});
+				if (snapshot.isActive) {
+					const streamSnapshot = await this.chatStreamSnapshots.getByChatId(chatId);
+					if (streamSnapshot && streamSnapshot.partialText.length > 0) {
+						emit({
+							data: {
+								chatId: streamSnapshot.chatId,
+								partialText: streamSnapshot.partialText,
+								updatedAt: streamSnapshot.updatedAt,
+							},
+							event: "assistant_snapshot",
+						});
+					}
+				}
+			}
+			return;
+		}
 		const chat = await this.chatRepository.findChatById(chatId);
 
 		if (!chat) {
@@ -360,6 +391,9 @@ export class WsService implements WsServiceContract {
 			requestId: requestId ?? null,
 		});
 		const runningUpdatedAt = runningChat?.updatedAt ?? new Date().toISOString();
+		if (requestId) {
+			this.markAcceptedRequest(chatId, requestId);
+		}
 		this.workspaceEvents?.append({
 			type: "chat_updated",
 			payload: {
@@ -526,6 +560,66 @@ export class WsService implements WsServiceContract {
 			this.chatStreamEvents.clearByChatId(chatId);
 			this.chatStreamSnapshots.clear(chatId);
 		}
+	}
+
+	private markAcceptedRequest(chatId: string, requestId: string): void {
+		this.acceptedRequestIds.set(`${chatId}:${requestId}`, Date.now());
+		if (this.acceptedRequestIds.size <= 512) {
+			return;
+		}
+
+		const cutoff = Date.now() - 10 * 60_000;
+		for (const [key, acceptedAt] of this.acceptedRequestIds) {
+			if (acceptedAt < cutoff) {
+				this.acceptedRequestIds.delete(key);
+			}
+		}
+	}
+
+	private hasAcceptedRequest(chatId: string, requestId: string): boolean {
+		const cacheKey = `${chatId}:${requestId}`;
+		if (this.acceptedRequestIds.has(cacheKey)) {
+			return true;
+		}
+
+		const recentEvents = this.workspaceEvents?.listAfterSeq(0, 5_000) ?? [];
+		for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
+			const event = recentEvents[index];
+			if (event.requestId !== requestId) {
+				continue;
+			}
+
+			if (event.type !== "message_created" && event.type !== "chat_updated") {
+				continue;
+			}
+
+			const payload = event.payload;
+			const payloadChatId = typeof payload.chatId === "string"
+				? payload.chatId
+				: (
+					typeof payload.chat === "object" &&
+					payload.chat !== null &&
+					"id" in payload.chat &&
+					typeof payload.chat.id === "string"
+				)
+					? payload.chat.id
+					: (
+						typeof payload.message === "object" &&
+						payload.message !== null &&
+						"chatId" in payload.message &&
+						typeof payload.message.chatId === "string"
+					)
+						? payload.message.chatId
+						: null;
+			if (payloadChatId !== chatId) {
+				continue;
+			}
+
+			this.acceptedRequestIds.set(cacheKey, Date.now());
+			return true;
+		}
+
+		return false;
 	}
 }
 

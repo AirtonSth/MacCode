@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // eslint-disable-next-line camelcase
-import { AppState, type AppStateStatus, unstable_batchedUpdates } from "react-native";
+import { AppState, Platform, type AppStateStatus, unstable_batchedUpdates } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
 import { useChatContextQuery } from "../api/use-chat-context-query";
@@ -189,7 +189,7 @@ const toLiveActivityStatusLineFromEvent = (event: AssistantEventPayload): string
 const resolveLiveActivitySubscriptionTransport = (input: {
 	liveActivityToken: string;
 	pushDeliveryToken: PushDeliveryToken | null;
-}): { pushToken: string; pushTokenType: "fcm" } | null => {
+}): { pushToken: string; pushTokenType: "apns" | "fcm" } | null => {
 	const normalizedLiveActivityToken = input.liveActivityToken.trim();
 	if (normalizedLiveActivityToken.length === 0) {
 		return null;
@@ -197,10 +197,17 @@ const resolveLiveActivitySubscriptionTransport = (input: {
 
 	const normalizedPushToken = input.pushDeliveryToken?.token.trim() ?? "";
 	const pushTokenType = input.pushDeliveryToken?.type;
-	if (normalizedPushToken.length > 0 && pushTokenType === "fcm") {
+	if (normalizedPushToken.length > 0 && (pushTokenType === "apns" || pushTokenType === "fcm")) {
 		return {
 			pushToken: normalizedPushToken,
 			pushTokenType,
+		};
+	}
+
+	if (Platform.OS === "ios") {
+		return {
+			pushToken: normalizedLiveActivityToken,
+			pushTokenType: "apns",
 		};
 	}
 
@@ -1100,7 +1107,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			if (!deliveryToken || deliveryToken.token.trim().length === 0) {
 				return;
 			}
-			if (deliveryToken.type !== "fcm") {
+			if (deliveryToken.type !== "apns" && deliveryToken.type !== "fcm") {
 				return;
 			}
 			try {
@@ -1824,6 +1831,19 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					handleServerEventRef.current(event);
 				});
 			},
+			onReliableMessageError: ({ chatId, message, requestId }) => {
+				void requestId;
+				pendingSendChatIdsRef.current.delete(chatId);
+				pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+				setSendingByChat((current) => ({
+					...current,
+					[chatId]: false,
+				}));
+				setLastError(message);
+				finishLiveActivity(chatId, {
+					outcome: "error",
+				});
+			},
 			target: config.activeTarget,
 		});
 
@@ -1835,7 +1855,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			realtime.disconnect();
 			realtimeRef.current = null;
 		};
-	}, [config.activeTarget, isActive]);
+	}, [config.activeTarget, finishLiveActivity, isActive]);
 
 	useEffect(() => {
 		if (!shouldEnableMessagesQuery || !selectedChatId || !realtimeRef.current) {

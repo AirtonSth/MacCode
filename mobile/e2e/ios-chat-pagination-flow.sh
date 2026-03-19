@@ -4,9 +4,13 @@ set -euo pipefail
 APP_NAME="${RC_APP_NAME:-io.remotecode}"
 SESSION_NAME="${RC_AD_SESSION:-rc-e2e-thread-activity}"
 BASE_URL="${RC_E2E_BASE_URL:-http://127.0.0.1:8835}"
+TOKEN="${RC_E2E_TOKEN:-local-dev-token}"
+MANUAL_CONNECTION_TARGET="${BASE_URL#*://}"
+MANUAL_CONNECTION_TARGET="${MANUAL_CONNECTION_TARGET%%/*}"
 STATE_PATH="${RC_IOS_E2E_STATE_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.ios-e2e-state.json}"
 AD_TIMEOUT_SECONDS="${RC_AD_TIMEOUT_SECONDS:-60}"
 AD_MAX_RETRIES="${RC_AD_MAX_RETRIES:-3}"
+IOS_SIMULATOR_UDID="${RC_IOS_SIMULATOR_UDID:-}"
 
 if [ -n "${AGENT_DEVICE_BIN:-}" ]; then
 	# shellcheck disable=SC2206
@@ -21,38 +25,21 @@ ad() {
 	local output=""
 
 	while true; do
-		local command=("${AD[@]}" --platform ios --session "${SESSION_NAME}" "$@")
-		local capture_file
-		capture_file="$(mktemp "${TMPDIR:-/tmp}/agent-device-capture.XXXXXX")"
+		local command=("${AD[@]}" --platform ios)
+		if [[ -n "${IOS_SIMULATOR_UDID}" ]]; then
+			command+=(--udid "${IOS_SIMULATOR_UDID}")
+		else
+			command+=(--session "${SESSION_NAME}")
+		fi
+		command+=("$@")
 		set +e
-		AD_EXPECT_TIMEOUT="${AD_TIMEOUT_SECONDS}" expect -f /dev/stdin -- "${command[@]}" >"${capture_file}" 2>&1 <<'EOF'
-set timeout $env(AD_EXPECT_TIMEOUT)
-set cmd $argv
-spawn -noecho {*}$cmd
-set child_pid [exp_pid -i $spawn_id]
-expect {
-	eof {}
-	timeout {
-		catch { close -i $spawn_id }
-		catch { exec kill -TERM $child_pid }
-		after 1000
-		catch { exec kill -KILL $child_pid }
-		puts stderr "agent-device command timed out after $env(AD_EXPECT_TIMEOUT)s: [join $cmd { }]"
-		exit 124
-	}
-}
-catch wait result
-set exit_code [lindex $result 3]
-if {$exit_code eq ""} {
-	set exit_code 0
-}
-exit $exit_code
-EOF
+		output="$(gtimeout "${AD_TIMEOUT_SECONDS}" "${command[@]}" 2>&1)"
 		status=$?
 		set -e
-		output="$(cat "${capture_file}" 2>/dev/null || true)"
-		rm -f "${capture_file}"
 		output="${output//$'\r'/}"
+		if [[ "${status}" -eq 124 ]]; then
+			echo "agent-device command timed out after ${AD_TIMEOUT_SECONDS}s: ${command[*]}" >&2
+		fi
 		if [[ "${status}" -eq 0 && "${output}" != *"Error (COMMAND_FAILED):"* && "${output}" != *"Error (NO_SESSION):"* ]]; then
 			if [[ -n "${output}" ]]; then
 				printf "%s\n" "${output}"
@@ -73,8 +60,20 @@ EOF
 	done
 }
 
+pause_ms() {
+	perl -e 'select(undef, undef, undef, ($ARGV[0] || 0) / 1000)' "$1"
+}
+
+build_auto_connect_deep_link() {
+	local encoded_base_url
+	local encoded_token
+	encoded_base_url="$(jq -rn --arg value "${BASE_URL}" '$value|@uri')"
+	encoded_token="$(jq -rn --arg value "${TOKEN}" '$value|@uri')"
+	printf 'remotecode-mobile:///settings?debugAutoConnect=1&debugBaseUrl=%s&debugToken=%s' "${encoded_base_url}" "${encoded_token}"
+}
+
 snapshot_json() {
-	ad snapshot --json
+	ad snapshot -i --json
 }
 
 full_snapshot_json() {
@@ -83,14 +82,7 @@ full_snapshot_json() {
 
 node_json_by_id() {
 	local test_id="$1"
-	local node_json
-	node_json="$(snapshot_json | jq -c --arg test_id "${test_id}" 'first(.data.nodes[] | select(.identifier? == $test_id)) // empty')"
-	if [[ -n "${node_json}" ]]; then
-		printf "%s\n" "${node_json}"
-		return 0
-	fi
-
-	full_snapshot_json | jq -c --arg test_id "${test_id}" 'first(.data.nodes[] | select(.identifier? == $test_id)) // empty'
+	snapshot_json | jq -c --arg test_id "${test_id}" 'first(.data.nodes[] | select(.identifier? == $test_id)) // empty'
 }
 
 node_json_by_label() {
@@ -114,28 +106,27 @@ node_center_from_json() {
 
 exists() {
 	local test_id="$1"
-	[[ -n "$(node_json_by_id "${test_id}")" ]]
+	local node_json
+	node_json="$(node_json_by_id "${test_id}" || true)"
+	[[ -n "${node_json}" ]]
 }
 
 click() {
 	local test_id="$1"
-	local node_json
-	node_json="$(node_json_by_id "${test_id}")"
-	if [[ -z "${node_json}" ]]; then
-		echo "Unable to find node for ${test_id}." >&2
-		return 1
+	ad find id "${test_id}" click >/dev/null
+}
+
+open_app() {
+	if [[ -n "${IOS_SIMULATOR_UDID}" ]]; then
+		local deep_link
+		deep_link="$(build_auto_connect_deep_link)"
+		xcrun simctl terminate "${IOS_SIMULATOR_UDID}" "${APP_NAME}" >/dev/null 2>&1 || true
+		xcrun simctl launch "${IOS_SIMULATOR_UDID}" "${APP_NAME}" >/dev/null
+		xcrun simctl openurl "${IOS_SIMULATOR_UDID}" "${deep_link}" >/dev/null
+		return 0
 	fi
 
-	local coords
-	coords="$(node_center_from_json "${node_json}")"
-	if [[ -z "${coords}" ]]; then
-		echo "Unable to resolve tap coordinates for ${test_id}." >&2
-		return 1
-	fi
-
-	local x y
-	read -r x y <<< "${coords}"
-	ad press "${x}" "${y}" >/dev/null
+	ad open "${APP_NAME}" >/dev/null
 }
 
 get_text() {
@@ -149,6 +140,13 @@ get_text() {
 	printf "%s\n" "${node_json}" | jq -r '.value // .label // ""'
 }
 
+fill() {
+	local test_id="$1"
+	local value="$2"
+	ad find id "${test_id}" fill "${value}" >/dev/null
+	dismiss_keyboard_tip_if_present
+}
+
 wait_for() {
 	local test_id="$1"
 	local timeout_ms="${2:-30000}"
@@ -160,7 +158,7 @@ wait_for() {
 			return 0
 		fi
 
-		ad wait 500 >/dev/null
+		pause_ms 500
 		elapsed=$((elapsed + 500))
 	done
 
@@ -179,7 +177,7 @@ wait_until_absent() {
 			return 0
 		fi
 
-		ad wait 500 >/dev/null
+		pause_ms 500
 		elapsed=$((elapsed + 500))
 	done
 
@@ -188,46 +186,45 @@ wait_until_absent() {
 }
 
 dismiss_alert_if_present() {
+	local label
 	local node_json
-	node_json="$(full_node_json_by_label "Don’t Allow")"
-	if [[ -z "${node_json}" ]]; then
-		node_json="$(full_node_json_by_label "Don't Allow")"
-	fi
-	if [[ -n "${node_json}" ]]; then
-		local coords
-		coords="$(node_center_from_json "${node_json}")"
-		if [[ -n "${coords}" ]]; then
-			local x y
-			read -r x y <<< "${coords}"
-			ad press "${x}" "${y}" >/dev/null 2>&1 || true
+	local center
+	for label in "Open" "Allow" "Continue"; do
+		node_json="$(node_json_by_label "${label}" || true)"
+		if [[ -z "${node_json}" ]]; then
+			continue
 		fi
-	fi
-	ad wait 400 >/dev/null
+		center="$(node_center_from_json "${node_json}" || true)"
+		if [[ -z "${center}" ]]; then
+			continue
+		fi
+		ad press ${center} >/dev/null 2>&1 || true
+		pause_ms 600
+		return 0
+	done
+
+	return 0
 }
 
 dismiss_keyboard_tip_if_present() {
 	local node_json
-	node_json="$(node_json_by_label "Continue")"
+	local center
+	node_json="$(node_json_by_label "Continue" || true)"
 	if [[ -z "${node_json}" ]]; then
 		return 0
 	fi
-
-	local coords
-	coords="$(node_center_from_json "${node_json}")"
-	if [[ -z "${coords}" ]]; then
+	center="$(node_center_from_json "${node_json}" || true)"
+	if [[ -z "${center}" ]]; then
 		return 0
 	fi
-
-	local x y
-	read -r x y <<< "${coords}"
-	ad press "${x}" "${y}" >/dev/null 2>&1 || true
-	ad wait 400 >/dev/null
+	ad press ${center} >/dev/null 2>&1 || true
+	pause_ms 400
 }
 
 tap_nav_back_if_present() {
 	if exists "nav-back"; then
 		click "nav-back"
-		ad wait 800 >/dev/null
+		pause_ms 800
 	fi
 }
 
@@ -237,7 +234,7 @@ wait_for_settings_screen() {
 		if exists "server-manual-connect" || exists "screen-workspaces" || exists "screen-threads" || exists "screen-chat"; then
 			return 0
 		fi
-		ad wait 1200 >/dev/null
+		pause_ms 1200
 	done
 
 	echo "Unable to reach the server connection screen." >&2
@@ -251,15 +248,15 @@ connect_and_open_workspaces() {
 	fi
 
 	echo "Connecting mobile app to e2e backend (${BASE_URL})..."
-	if ! exists "server-item-0" && exists "server-scan-button"; then
+	if exists "server-manual-connect"; then
+		fill "server-manual-base-url" "${MANUAL_CONNECTION_TARGET}"
+		click "server-manual-connect"
+	elif ! exists "server-item-0" && exists "server-scan-button"; then
 		click "server-scan-button"
 		wait_for "server-item-0" 20000
 	fi
-	if exists "server-item-0"; then
+	if ! exists "screen-workspaces" && ! exists "screen-threads" && exists "server-item-0"; then
 		click "server-item-0"
-	else
-		echo "Unable to discover the iOS e2e backend via LAN Discovery." >&2
-		return 1
 	fi
 	dismiss_alert_if_present
 	wait_for "screen-workspaces" 40000
@@ -273,17 +270,17 @@ ensure_threads_screen() {
 
 		if exists "screen-chat" || exists "screen-active-threads"; then
 			tap_nav_back_if_present
-			ad wait 1000 >/dev/null
+			pause_ms 1000
 			continue
 		fi
 
 		if exists "screen-workspaces" && exists "workspace-item-0"; then
 			click "workspace-item-0"
-			ad wait 1200 >/dev/null
+			pause_ms 1200
 			continue
 		fi
 
-		ad wait 1000 >/dev/null
+		pause_ms 1000
 	done
 
 	echo "Unable to reach screen-threads." >&2
@@ -321,16 +318,16 @@ scroll_until_message_visible() {
 		fi
 
 		ad scroll up 0.92 >/dev/null 2>&1 || true
-		ad wait 700 >/dev/null
+		pause_ms 700
 		if exists "chat-older-messages-loading"; then
-			ad wait 1200 >/dev/null
+			pause_ms 1200
 		fi
 		if exists "chat-message-row-${message_id}"; then
 			return 0
 		fi
 
 		ad scroll down 0.92 >/dev/null 2>&1 || true
-		ad wait 500 >/dev/null
+		pause_ms 500
 		elapsed=$((elapsed + 2400))
 	done
 
@@ -350,9 +347,9 @@ scroll_until_latest_restored() {
 		fi
 
 		ad scroll down 0.92 >/dev/null 2>&1 || true
-		ad wait 700 >/dev/null
+		pause_ms 700
 		ad scroll up 0.50 >/dev/null 2>&1 || true
-		ad wait 500 >/dev/null
+		pause_ms 500
 		elapsed=$((elapsed + 2400))
 	done
 
@@ -385,8 +382,8 @@ done < <(jq -r '.chats.paged.olderPageMessageIds[]' "${STATE_PATH}")
 SOCKET_MESSAGE="socket-pagination-check-$(date +%s)"
 
 echo "Opening RemoteCode on iOS simulator for pagination flow..."
-ad open "${APP_NAME}" >/dev/null
-ad wait 1600 >/dev/null
+open_app
+pause_ms 1600
 dismiss_alert_if_present
 
 connect_and_open_workspaces

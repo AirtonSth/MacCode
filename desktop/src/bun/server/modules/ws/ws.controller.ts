@@ -308,12 +308,27 @@ export class WsController {
 
 						const emit = this.createChatEmitter(chatId);
 						const text = typeof payload.data.text === "string" ? payload.data.text.trim() : "";
+						const requestId =
+							typeof payload.data.requestId === "string"
+								? payload.data.requestId.trim()
+								: "";
 						if (!text) {
 							(ws as BroadcastSocket).send({
 								data: {
 									chatId,
 									code: "validation_error",
 									message: "validation error: message text is required",
+								},
+								event: "error",
+							});
+							return;
+						}
+						if (!requestId) {
+							(ws as BroadcastSocket).send({
+								data: {
+									chatId,
+									code: "validation_error",
+									message: "validation error: requestId is required",
 								},
 								event: "error",
 							});
@@ -405,10 +420,7 @@ export class WsController {
 							permissionMode: permissionMode ?? undefined,
 							projectId: projectId ?? undefined,
 							provider: provider ?? undefined,
-							requestId:
-								typeof payload.data.requestId === "string"
-									? payload.data.requestId.trim() || undefined
-									: undefined,
+							requestId,
 							reasoningEffort: reasoningEffort ?? undefined,
 							text,
 						});

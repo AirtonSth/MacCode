@@ -257,6 +257,96 @@ test("WsService.startUserMessage blocks chat_running when already running", asyn
 	]);
 });
 
+test("WsService.startUserMessage deduplicates a replayed requestId", async () => {
+	const chat = createChat({
+		status: "completed",
+		updatedAt: "2026-03-19T12:00:00.000Z",
+	});
+
+	const chatRepository = {
+		findChatById: () => chat,
+	} as unknown as ChatRepository;
+
+	const messageRepository = {
+		createMessage: () => {
+			throw new Error("should not create duplicate messages");
+		},
+	} as unknown as MessageRepository;
+
+	const projectRepository = {
+		findProjectById: () => {
+			throw new Error("should not resolve project for duplicate request");
+		},
+	} as unknown as ProjectRepository;
+
+	const runner = {
+		run: async () => {
+			throw new Error("should not run duplicate request");
+		},
+	} as unknown as CodexProviderRunnerContract;
+
+	const workspaceEvents = {
+		append: () => {
+			throw new Error("should not append duplicate workspace events");
+		},
+		listAfterSeq: () => [
+			{
+				originClientId: null,
+				payload: {
+					message: {
+						chatId: "chat-id",
+						content: "hi",
+						createdAt: "2026-03-19T11:59:59.000Z",
+						id: "message-1",
+						role: "user",
+					},
+				},
+				requestId: "req-duplicate",
+				seq: 1,
+				ts: "2026-03-19T11:59:59.000Z",
+				type: "message_created",
+			},
+		],
+		subscribe: () => () => {
+			// no-op
+		},
+		publish: () => {
+			throw new Error("should not publish duplicate workspace events");
+		},
+	};
+
+	const service = new WsService(
+		chatRepository,
+		messageRepository,
+		projectRepository,
+		runner,
+		undefined,
+		workspaceEvents,
+	);
+	const collector = await collectEvents(() => {});
+
+	await service.startUserMessage({
+		chatId: "chat-id",
+		emit: collector.emit,
+		requestId: "req-duplicate",
+		text: "hi again",
+	});
+
+	expect(collector.events).toEqual([
+		{
+			data: {
+				chatId: "chat-id",
+				diffAdded: 0,
+				diffRemoved: 0,
+				isActive: false,
+				status: "completed",
+				updatedAt: "2026-03-19T12:00:00.000Z",
+			},
+			event: "chat_updated",
+		},
+	]);
+});
+
 test("WsService.startUserMessage allows concurrent runs for different chats", async () => {
 	const statusByChat = new Map<string, ChatDTO["status"]>([
 		["chat-a", "pending"],

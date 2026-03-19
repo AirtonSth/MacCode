@@ -1,88 +1,254 @@
-# Thread Activity Stabilization TODO
+# Production-Grade TODO
 
-## Scope
+Regenerated from scratch on 2026-03-19 from the current codebase only.
 
-Implement and validate end-to-end fixes across backend, desktop (ElectroBun), and mobile (iOS simulator) for:
+Principle:
+- This file is not a UX audit.
+- This file is the minimum work I believe is still required before calling the product production-grade for real users.
+- Items are ordered by release impact, not by convenience.
 
-1. Chat creation/send race causing `chat not found`.
-2. Persistent active-thread state while the agent is still working.
-3. Composer send action disabled while a thread is active.
-4. Active-thread badge/indicator in thread lists and sidebars.
-5. Thread reorder to top after sending.
-6. Mobile footer CTA showing active thread count and a dedicated active-threads screen.
+Completion rule:
+- Do not mark an item done without proof.
+- Acceptable proof: passing automated tests, passing typecheck/build, stable runtime behavior, and relevant E2E for user-facing flows.
 
-## Acceptance Criteria
+## Release Verdict
 
-- No `chat not found` after creating/sending in normal create-and-send flow.
-- Active thread state is persisted and reflected consistently across REST + WS + UI.
-- A `Working...` row with spinner is visible at the bottom of the active chat timeline.
-- Send action is disabled for active threads on desktop and mobile.
-- Active state is visible in desktop sidebar and mobile thread lists.
-- Sending a message moves that thread to the top in desktop and mobile lists.
-- Workspaces and Threads mobile screens show `X active threads` footer action when count > 0.
-- Tapping footer action opens a dedicated active-threads screen.
-- Every task has e2e proof, and no e2e test fails.
+Current recommendation:
+- Desktop: close to release-ready, but still needs a few structural and regression-hardening tasks.
+- Mobile: not production-grade yet.
+- Whole product: do not call it production-grade until the mobile release path is proven end to end.
 
-## Task Board
+## P0 Release Blockers
 
-- [x] T1 Backend: fix create/send race handling and prevent stale thread send target.
-- [x] T2 Backend: persist active-thread state and expose it via APIs/events.
-- [x] T3 Desktop: show active indicators + `Working...` bottom row + disable send when active.
-- [x] T4 Mobile: show active indicators + `Working...` bottom row + disable send when active.
-- [x] T5 Desktop & Mobile: reorder thread to top immediately after send/update.
-- [x] T6 Mobile: footer `X active threads` CTA on Workspaces/Threads + dedicated active-threads screen.
-- [x] T7 E2E Backend coverage for all backend behaviors above.
-- [x] T8 E2E Desktop (ElectroBun Playwright/CDP) coverage for all desktop behaviors above.
-- [x] T9 E2E Mobile (iOS simulator) coverage for all mobile behaviors above.
+### [ ] P0-1 Mobile iOS bootstrap must complete deterministically
+- Platform: Mobile
+- Why this blocks release:
+  - The app cannot be considered production-grade while the real startup and connect path is not proven stable.
+  - This is currently the biggest gap between code quality and release confidence.
+- What to change:
+  - Remove ambiguity in the mobile server-connect bootstrap path.
+  - Make the app choose one deterministic startup path for E2E and for first-run connection.
+  - Stop depending on fragile simulator-only interaction sequences for the initial connection handshake.
+- Expected implementation direction:
+  - Add a first-class test bootstrap mode in the app, not a pile of runner workarounds.
+  - Make initial local connection injectable by config/state before the UI path starts.
+  - If deep-link bootstrap is kept, make it a real supported path and prove it with tests.
+- Required proof:
+  - `mobile test:e2e:ios` green from clean state
+  - at least 3 consecutive green runs
+  - explicit proof that bootstrap reaches `workspaces -> threads -> chat`
 
-## Force Stop (New Scope)
+### [ ] P0-2 Mobile real E2E coverage must exist for the highest-risk flows
+- Platform: Mobile
+- Why this blocks release:
+  - Right now mobile still depends too much on code confidence instead of runtime proof.
+- What to change:
+  - Add or finish deterministic E2E for:
+    - app bootstrap/connect
+    - thread open
+    - message send
+    - pagination
+    - terminal open/close
+    - drawer open/close
+    - picker/modal open/close
+    - keyboard transitions
+- Required proof:
+  - passing iOS E2E suite
+  - one stress flow covering repeated overlay and navigation churn
 
-Implement and validate force interruption for active Codex threads:
+### [ ] P0-3 Mobile connection state must be simplified and hardened
+- Platform: Mobile
+- Why this blocks release:
+  - The current startup/connect behavior is too sensitive to UI state, discovery state, and simulator quirks.
+  - That is a bad release property even if local code is “mostly correct”.
+- What to change:
+  - Separate these concerns cleanly:
+    - persisted active config
+    - saved connections
+    - LAN discovery
+    - manual connect
+    - debug/test bootstrap
+  - Ensure one source of truth for “current backend target”.
+  - Ensure the app can recover from stale saved hostnames and old local hosts without getting stuck in `Connecting...`.
+- Required proof:
+  - unit/integration coverage for config resolution
+  - E2E proving a clean connect from known local config
 
-1. Backend endpoint to force-stop a running Codex chat execution.
-2. Runtime abort wiring so server can interrupt in-flight Codex process.
-3. Desktop composer send button morphs to red `Force Stop` while active.
-4. Mobile composer send button morphs to red `Force Stop` while active.
-5. E2E proof for backend, desktop (Playwright/ElectroBun), and iOS simulator.
+## P1 Must-Have Before Wide Launch
 
-## Force Stop Task Board
+### [ ] P1-1 Split mobile chat orchestration into smaller surfaces
+- Platform: Mobile
+- Why it matters:
+  - `chat-screen.tsx` still coordinates too much in one surface.
+  - That is a medium-term maintainability and performance risk.
+- What to change:
+  - Separate at least:
+    - composer/input path
+    - message list / pagination path
+    - drawer/project actions
+    - terminal overlay
+    - picker/modal orchestration
+- Exit criteria:
+  - lower rerender fan-out on interaction-heavy paths
+  - tests for each split path
+  - no behavior regressions in chat flow
 
-- [x] F1 Backend: add `POST /v1/chats/:id/stop` and runtime-aware stop semantics.
-- [x] F2 Backend: wire process abort for in-flight Codex run + stale-active cleanup path.
-- [x] F3 Desktop: send button becomes red `Force Stop` for active thread and calls backend stop.
-- [x] F4 Mobile: send button becomes red `Force Stop` for active thread and calls backend stop.
-- [x] F5 E2E: backend + desktop Playwright + iOS simulator coverage for force-stop flow.
+### [ ] P1-2 Add production-grade runtime observability for mobile and desktop
+- Platform: Both
+- Why it matters:
+  - Once users are live, silent connection failures and UI stalls become expensive to debug.
+- What to change:
+  - Add structured logs and lightweight metrics around:
+    - startup
+    - server connection attempts
+    - connection success/failure reason
+    - thread open latency
+    - send-message lifecycle
+    - stream start/stop
+    - terminal session open/close
+  - Add explicit error classification, not generic “Unable to connect”.
+- Exit criteria:
+  - logs identify failure stage precisely
+  - errors are grouped by actionable cause
 
-## Evidence Log
+### [ ] P1-3 Add regression guards for long-session reliability
+- Platform: Both
+- Why it matters:
+  - Production-grade means behavior stays stable after 30-120 minute sessions, not just first-use correctness.
+- What to change:
+  - Add stress/regression tests for:
+    - repeated thread switching
+    - repeated send/stop/send
+    - repeated overlay open/close
+    - repeated pagination
+    - terminal mount/unmount churn
+- Exit criteria:
+  - desktop stress proof remains green
+  - mobile stress proof exists and is green
 
-- 2026-03-05: `bun run typecheck:desktop` passed after integrating `isActive`/`projectId` changes.
-- 2026-03-05: `bun run typecheck:mobile` passed after integrating active-threads/mobile navigation changes.
-- 2026-03-05 (completed): Stabilizing iOS e2e navigation path so active-thread chat is opened from `Threads -> Active Threads -> Chat` before asserting return to `screen-threads`.
-- 2026-03-05 (completed): Added deterministic selector `thread-item-title-{index}` and polling assertion for reorder-to-top in iOS e2e flow.
-- 2026-03-05 (completed): Added `gtimeout` + retry wrapper for all `agent-device` calls in iOS flow to avoid hanging e2e runs.
-- 2026-03-05 (completed): Fixed mobile send-block race by treating selected thread as running when it appears in `activeThreads`, even before chat context finishes loading.
-- 2026-03-05 (completed): Replaced fragile `get text` assertion for blocked-send with `agent-device is text` predicate on `chat-input`.
-- 2026-03-05 (completed): Hardened iOS `ad()` wrapper to fail on stderr `Error (COMMAND_FAILED)` / `Error (NO_SESSION)` even when CLI exit status is 0.
-- 2026-03-05 (completed): Made `dismiss_alert_if_present` use a direct short-timeout call to avoid long `ios_runner_connect` retries during iOS e2e.
-- 2026-03-05 (completed): iOS e2e runner now creates a unique `RC_AD_SESSION` per run to avoid stale agent-device session state across retries.
-- 2026-03-05 (completed): iOS runner now closes stale `agent-device` sessions matching `rc-e2e-thread-activity*` before test start to prevent `DEVICE_IN_USE`.
-- 2026-03-05: `bun run typecheck:mobile` re-run passed after active-thread send-block race fix.
-- 2026-03-05: Backend e2e passed: `bun run --cwd desktop test:backend` => `125 pass / 0 fail` (includes stale chat target WS validation and active-thread API coverage).
-- 2026-03-05: Desktop Playwright e2e passed: `bun run --cwd desktop e2e:run:playwright` => `5 passed / 0 failed` (includes `thread-activity-playwright.spec.ts`).
-- 2026-03-05: ElectroBun CDP smoke passed: `bun run --cwd desktop automation:cdp-screenshot`; artifact `desktop/playwright-e2e/artifacts/electrobun-cdp-screenshot.png`; validated `1200x700`.
-- 2026-03-05: Playwright Electron MCP endpoint verified: `bun run --cwd desktop mcp:playwright-electron` => listening on `http://localhost:8931`.
-- 2026-03-05: iOS simulator e2e passed: `bun run --cwd mobile test:e2e:ios` => `iOS thread activity flow passed` and `iOS E2E suite completed.`
-- 2026-03-05: Force-stop backend contract added and validated in e2e: `POST /v1/chats/:id/stop` (`chat.controller.e2e.test.ts`) with stale-active cleanup + 404 behavior.
-- 2026-03-05: Backend test suite passed after force-stop implementation: `bun run --cwd desktop test:backend` => `132 pass / 0 fail`.
-- 2026-03-05: Desktop typecheck passed after force-stop UI/API integration: `bun run typecheck:desktop`.
-- 2026-03-05: Mobile typecheck passed after force-stop UI/API integration: `bun run typecheck:mobile`.
-- 2026-03-05: Desktop Playwright e2e passed with force-stop scenario: `bun run --cwd desktop e2e:run:playwright` => `5 passed / 0 failed` (includes `active thread shows Force Stop and issues stop request`).
-- 2026-03-05: ElectroBun CDP smoke re-run passed after stale process cleanup and fresh port: `ELECTROBUN_WINDOW_WIDTH=1200 ELECTROBUN_WINDOW_HEIGHT=700 ELECTROBUN_CDP_PORT=9555 bun run --cwd desktop automation:cdp-screenshot`; artifact `desktop/playwright-e2e/artifacts/electrobun-cdp-screenshot.png`.
-- 2026-03-05: iOS simulator e2e passed with force-stop flow updates: `bun run --cwd mobile test:e2e:ios` => `iOS thread activity flow passed` and `iOS E2E suite completed.`
+### [ ] P1-4 Harden async ordering and stale-response handling on mobile
+- Platform: Mobile
+- Why it matters:
+  - Mobile is still the higher-risk surface for race conditions and stale updates.
+- What to change:
+  - Review and tighten guards around:
+    - selection changes during fetch
+    - pagination during chat switch
+    - send/stop while stream state changes
+    - discovery/connect while settings state changes
+  - Prefer explicit request ownership and ignore stale responses deterministically.
+- Exit criteria:
+  - tests covering out-of-order responses
+  - no state contamination across chat/project switches
 
-## Final Validation Gate
+## P1 Desktop Hardening
 
-- [x] Backend e2e passing.
-- [x] Desktop ElectroBun e2e passing.
-- [x] Mobile iOS simulator e2e passing.
-- [x] All tasks checked complete with linked proof.
+### [ ] P1-5 Finish decomposing the desktop root shell
+- Platform: Desktop
+- Why it matters:
+  - The resize hot path is better, but `App.tsx` is still too broad.
+- What to change:
+  - Continue reducing root-shell responsibility for:
+    - terminal state
+    - git controls
+    - banners/errors
+    - conversation shell
+    - sidebar state
+  - Move coordination into narrower surfaces or dedicated hooks/components.
+- Exit criteria:
+  - smaller root render surface
+  - no new regressions in sidebar/thread/terminal behavior
+
+### [ ] P1-6 Add idle-performance and multi-tab consistency checks on desktop
+- Platform: Desktop
+- Why it matters:
+  - Production users will leave the app open for long periods.
+- What to change:
+  - Validate:
+    - idle CPU stays low
+    - websocket reconnect behavior is stable
+    - selection/store state does not drift after reconnection
+    - multiple desktop windows or sessions do not corrupt transient UI state
+- Exit criteria:
+  - repeatable smoke/regression checks
+  - no unexpected store growth or reconnect loops
+
+## P2 Important Cleanup
+
+### [ ] P2-1 Replace brittle mobile E2E script heuristics with supported test hooks
+- Platform: Mobile
+- Why it matters:
+  - The current script layer is doing too much product orchestration.
+- What to change:
+  - Add app-level test hooks for:
+    - deterministic connection bootstrap
+    - opening known project/chat
+    - dismissing first-run prompts
+    - forcing stable navigation start points
+- Exit criteria:
+  - smaller shell scripts
+  - fewer simulator-specific hacks
+
+### [ ] P2-2 Review secure storage and config migration paths
+- Platform: Mobile
+- Why it matters:
+  - First-run and upgrade paths are part of production quality.
+- What to change:
+  - Audit `ApiConfigStore` and related persistence for:
+    - migration correctness
+    - stale host/token cleanup
+    - safe fallback behavior
+    - explicit handling for invalid saved targets
+- Exit criteria:
+  - tests for migration and stale-config recovery
+
+### [ ] P2-3 Add targeted perf instrumentation hooks for desktop
+- Platform: Desktop
+- Why it matters:
+  - The current render stats are useful but narrow.
+- What to change:
+  - Keep production-safe debug hooks or internal perf probes for:
+    - sidebar drag
+    - thread switch
+    - send-message commit path
+    - terminal toggle
+- Exit criteria:
+  - actionable render/latency visibility in dev and CI smoke paths
+
+## P3 Nice-to-Have But Worthwhile
+
+### [ ] P3-1 Unify release smoke suites across desktop and mobile
+- Platform: Both
+- What to change:
+  - Define one release smoke command per platform.
+  - Each should cover the minimum user-critical flow from launch to active usage.
+
+### [ ] P3-2 Add explicit launch checklist artifacts
+- Platform: Both
+- What to change:
+  - Standardize:
+    - typecheck
+    - core unit/integration tests
+    - E2E smoke
+    - stress smoke
+    - release notes / known issues
+
+## Minimum Release Gate
+
+Do not call the product production-grade until all of these are true:
+
+- [ ] Mobile iOS bootstrap E2E passes reliably
+- [ ] Mobile chat/navigation stress E2E exists and passes
+- [ ] Mobile connection/bootstrap path is simplified and proven
+- [ ] Desktop root-shell decomposition is reduced beyond the current resize fix
+- [ ] Desktop and mobile both have release smoke commands
+- [ ] Observability is good enough to diagnose startup/connect/send failures in production
+
+## Practical Release Recommendation
+
+If shipping before all items above:
+
+- Desktop:
+  - acceptable for broader rollout after P1-5 and P1-6 are reasonably covered
+- Mobile:
+  - only acceptable for staged rollout or controlled beta until P0 is closed

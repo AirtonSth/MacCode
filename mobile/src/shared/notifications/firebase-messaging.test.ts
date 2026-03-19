@@ -6,6 +6,9 @@ const appState = {
 };
 
 const notificationsState = {
+	pushTokenListener: null as ((event: unknown) => void) | null,
+	devicePushTokenCalls: 0,
+	devicePushTokenResponses: [] as unknown[],
 	getPermissionsResponse: {
 		granted: false,
 		ios: {
@@ -21,15 +24,10 @@ const notificationsState = {
 	},
 };
 
-const messagingState = {
-	getTokenResponses: [] as unknown[],
-	getTokenCalls: 0,
-	isDeviceRegisteredForRemoteMessages: false,
-	onTokenRefreshListener: null as ((token: string) => void) | null,
-	registerDeviceForRemoteMessagesCalls: 0,
-};
-
 const resetNotificationsState = () => {
+	notificationsState.pushTokenListener = null;
+	notificationsState.devicePushTokenCalls = 0;
+	notificationsState.devicePushTokenResponses = [];
 	notificationsState.getPermissionsResponse = {
 		granted: false,
 		ios: {
@@ -45,13 +43,7 @@ const resetNotificationsState = () => {
 	};
 };
 
-const resetMessagingState = () => {
-	messagingState.getTokenResponses = [];
-	messagingState.getTokenCalls = 0;
-	messagingState.isDeviceRegisteredForRemoteMessages = false;
-	messagingState.onTokenRefreshListener = null;
-	messagingState.registerDeviceForRemoteMessagesCalls = 0;
-};
+const noopUnsubscribe = () => undefined;
 
 mock.module("react-native", () => ({
 	AppState: {
@@ -74,6 +66,20 @@ mock.module("expo-notifications", () => ({
 	IosAuthorizationStatus: {
 		PROVISIONAL: 3,
 	},
+	addPushTokenListener: (callback: (event: unknown) => void) => {
+		notificationsState.pushTokenListener = callback;
+		return {
+			remove: () => {
+				if (notificationsState.pushTokenListener === callback) {
+					notificationsState.pushTokenListener = null;
+				}
+			},
+		};
+	},
+	getDevicePushTokenAsync: async () => {
+		notificationsState.devicePushTokenCalls += 1;
+		return notificationsState.devicePushTokenResponses.shift() ?? null;
+	},
 	getPermissionsAsync: async () => notificationsState.getPermissionsResponse,
 	requestPermissionsAsync: async () => {
 		notificationsState.requestPermissionsCalls += 1;
@@ -86,25 +92,10 @@ mock.module("expo-notifications", () => ({
 
 mock.module("@react-native-firebase/messaging", () => ({
 	default: () => ({
-		get isDeviceRegisteredForRemoteMessages() {
-			return messagingState.isDeviceRegisteredForRemoteMessages;
-		},
-		getToken: async () => {
-			messagingState.getTokenCalls += 1;
-			return messagingState.getTokenResponses.shift() ?? null;
-		},
-		onTokenRefresh: (listener: (token: string) => void) => {
-			messagingState.onTokenRefreshListener = listener;
-			return () => {
-				if (messagingState.onTokenRefreshListener === listener) {
-					messagingState.onTokenRefreshListener = null;
-				}
-			};
-		},
-		registerDeviceForRemoteMessages: async () => {
-			messagingState.registerDeviceForRemoteMessagesCalls += 1;
-			messagingState.isDeviceRegisteredForRemoteMessages = true;
-		},
+		getAPNSToken: async () => null,
+		getToken: async () => null,
+		onTokenRefresh: () => noopUnsubscribe,
+		registerDeviceForRemoteMessages: async () => undefined,
 	}),
 }));
 
@@ -117,28 +108,32 @@ const {
 beforeEach(() => {
 	appState.currentState = "active";
 	resetNotificationsState();
-	resetMessagingState();
 	resetPushDeliveryTokenForTests();
 });
 
 describe("push delivery token resolution", () => {
-	test("returns the FCM token without requesting notification permission when direct token access already works", async () => {
-		messagingState.getTokenResponses = ["fcm-token-direct"];
+	test("returns the APNS token without requesting notification permission when direct token access already works", async () => {
+		notificationsState.devicePushTokenResponses = [{
+			data: "apns-token-direct",
+			type: "ios",
+		}];
 
 		const token = await ensurePushDeliveryToken();
 
 		expect(token).toEqual({
-			token: "fcm-token-direct",
-			type: "fcm",
+			token: "apns-token-direct",
+			type: "apns",
 		});
 		expect(notificationsState.requestPermissionsCalls).toBe(0);
-		expect(messagingState.registerDeviceForRemoteMessagesCalls).toBe(1);
 	});
 
-	test("retries the FCM token read immediately after permission is granted", async () => {
-		messagingState.getTokenResponses = [
+	test("retries the device token read immediately after permission is granted", async () => {
+		notificationsState.devicePushTokenResponses = [
 			null,
-			"fcm-token-after-permission",
+			{
+				data: "apns-token-after-permission",
+				type: "ios",
+			},
 		];
 		notificationsState.requestPermissionsResponse = {
 			granted: true,
@@ -150,25 +145,30 @@ describe("push delivery token resolution", () => {
 		const token = await ensurePushDeliveryToken();
 
 		expect(token).toEqual({
-			token: "fcm-token-after-permission",
-			type: "fcm",
+			token: "apns-token-after-permission",
+			type: "apns",
 		});
 		expect(notificationsState.requestPermissionsCalls).toBe(1);
-		expect(messagingState.getTokenCalls).toBe(2);
+		expect(notificationsState.devicePushTokenCalls).toBe(2);
 	});
 
-	test("publishes token refresh updates as FCM", () => {
+	test("publishes token refresh updates as APNS", () => {
 		const refreshedTokens: { token: string; type: string }[] = [];
 		const unsubscribe = subscribePushDeliveryTokenRefresh((token) => {
 			refreshedTokens.push(token);
 		});
 
-		messagingState.onTokenRefreshListener?.("fcm-token-refresh");
+		notificationsState.pushTokenListener?.({
+			data: {
+				token: "apns-token-refresh",
+				type: "ios",
+			},
+		});
 		unsubscribe();
 
 		expect(refreshedTokens).toEqual([{
-			token: "fcm-token-refresh",
-			type: "fcm",
+			token: "apns-token-refresh",
+			type: "apns",
 		}]);
 	});
 });

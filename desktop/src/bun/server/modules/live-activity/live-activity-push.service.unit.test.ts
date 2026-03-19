@@ -521,8 +521,9 @@ test("LiveActivityPushService prunes stale persisted subscriptions for the same 
 	expect(deliveries.filter((delivery) => delivery.event === "update")).toHaveLength(1);
 });
 
-test("LiveActivityPushService keeps subscriptions after permanent delivery failures", async () => {
+test("LiveActivityPushService drops subscriptions after permanent delivery failures", async () => {
 	let deliveries = 0;
+	const store = createInMemorySubscriptionStore();
 	const service = createLiveActivityPushServiceForTests(async () => {
 		deliveries += 1;
 		return {
@@ -530,7 +531,7 @@ test("LiveActivityPushService keeps subscriptions after permanent delivery failu
 			errorCode: "push/unsupported-token-type-apns",
 			shouldDropSubscription: true,
 		};
-	});
+	}, store);
 
 	service.onChatStarted({
 		chatId: "chat-keep",
@@ -556,7 +557,8 @@ test("LiveActivityPushService keeps subscriptions after permanent delivery failu
 		setTimeout(resolve, 25);
 	});
 
-	expect(deliveries).toBeGreaterThanOrEqual(2);
+	expect(deliveries).toBe(1);
+	expect(store.listAll()).toHaveLength(0);
 });
 
 test("createLiveActivityPushServiceFromEnvironment rejects subscriptions whose token type is not supported by backend capabilities", async () => {

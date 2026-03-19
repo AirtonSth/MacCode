@@ -17,6 +17,7 @@ export interface RelayConnectorOptions {
 		path: string;
 	}) => Promise<{
 		body: string | null;
+		bodyEncoding?: "utf8" | "base64";
 		headers: Record<string, string>;
 		status: number;
 	}>;
@@ -47,6 +48,18 @@ interface PendingRemoteClose {
 const normalizeUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
 const CONNECT_TIMEOUT_FLOOR_MS = 2_000;
 const RELAY_INACTIVITY_TIMEOUT_FLOOR_MS = 100;
+const isTextualContentType = (contentType: string | null): boolean => {
+	if (!contentType) {
+		return false;
+	}
+
+	const normalized = contentType.toLowerCase();
+	return normalized.startsWith("text/")
+		|| normalized.includes("application/json")
+		|| normalized.includes("application/javascript")
+		|| normalized.includes("application/xml")
+		|| normalized.includes("application/x-www-form-urlencoded");
+};
 
 const toWsBaseUrl = (value: string): string => {
 	const normalized = normalizeUrl(value);
@@ -289,6 +302,7 @@ export class RelayConnectorClient {
 
 			this.forwardToRelay({
 				body: response.body,
+				...(response.bodyEncoding ? { bodyEncoding: response.bodyEncoding } : {}),
 				headers: response.headers,
 				requestId,
 				status: response.status,

@@ -42,6 +42,7 @@ interface PrivateAccountServiceOptions {
 const DEFAULT_PUBLIC_WEB_URL = "https://remotecode.io";
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 15_000;
+const PRIVATE_STATE_CACHE_TTL_MS = 15_000;
 
 const PRIVATE_ACCOUNT_ERROR_MESSAGES: Record<string, string> = {
 	private_backend_unreachable: "Unable to connect. Is the computer able to access the url?",
@@ -113,6 +114,8 @@ export class PrivateAccountService {
 	private errorMessage: string | null = null;
 	private localApp: ServerApp | null = null;
 	private localServerBaseUrl: string | null = null;
+	private stateRefreshPromise: Promise<void> | null = null;
+	private lastStateRefreshAt = 0;
 	private reconnectAttemptCount = 0;
 	private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 	private relayClient: RelayConnectorClientContract;
@@ -171,8 +174,7 @@ export class PrivateAccountService {
 	public async getState(): Promise<PrivateAccountStateDto> {
 		if (this.session && this.connector) {
 			try {
-				await this.refreshSessionFromBackend();
-				await this.refreshConnectorState();
+				await this.refreshStateSnapshot();
 				if (this.localApp && this.localServerBaseUrl && (this.connectorRelayState === "idle" || this.connectorRelayState === "disconnected" || this.connectorRelayState === "error")) {
 					this.scheduleReconnect();
 				}
@@ -211,6 +213,7 @@ export class PrivateAccountService {
 				userId: this.session.user.id,
 			});
 			this.repository.saveSession(this.session);
+			this.lastStateRefreshAt = 0;
 			this.clearErrorMessage();
 			await this.ensureConnector(true);
 			return await this.getState();
@@ -285,6 +288,7 @@ export class PrivateAccountService {
 			completionToken,
 		}));
 		this.repository.saveSession(this.session);
+		this.lastStateRefreshAt = 0;
 		this.clearErrorMessage();
 		await this.ensureConnector(true);
 		return await this.getState();
@@ -305,6 +309,8 @@ export class PrivateAccountService {
 		this.connectorDto = null;
 		this.connectorRelayState = "idle";
 		this.clearErrorMessage();
+		this.stateRefreshPromise = null;
+		this.lastStateRefreshAt = 0;
 		this.reconnectAttemptCount = 0;
 		this.session = null;
 		this.repository.clearConnector();
@@ -417,6 +423,7 @@ export class PrivateAccountService {
 			connectorToken: maskTokenForLogs(this.connector.connectorToken),
 		});
 		this.repository.saveConnector(this.connector);
+		this.lastStateRefreshAt = 0;
 		await this.connectRelay();
 	}
 
@@ -475,6 +482,7 @@ export class PrivateAccountService {
 		path: string;
 	}): Promise<{
 		body: string | null;
+		bodyEncoding?: "utf8" | "base64";
 		headers: Record<string, string>;
 		status: number;
 	}> {
@@ -492,9 +500,32 @@ export class PrivateAccountService {
 			}),
 		);
 
+		const responseHeaders = Object.fromEntries(response.headers.entries());
+		const contentEncoding = response.headers.get("content-encoding");
+		const contentType = response.headers.get("content-type");
+		const isTextualContentType = contentType
+			? (
+				contentType.toLowerCase().startsWith("text/")
+				|| contentType.toLowerCase().includes("application/json")
+				|| contentType.toLowerCase().includes("application/javascript")
+				|| contentType.toLowerCase().includes("application/xml")
+				|| contentType.toLowerCase().includes("application/x-www-form-urlencoded")
+			)
+			: false;
+		const shouldRelayAsBinary = Boolean(contentEncoding) || !isTextualContentType;
+		if (shouldRelayAsBinary) {
+			const bodyBuffer = response.status === 204 ? null : Buffer.from(await response.arrayBuffer()).toString("base64");
+			return {
+				body: bodyBuffer,
+				bodyEncoding: "base64",
+				headers: responseHeaders,
+				status: response.status,
+			};
+		}
+
 		return {
 			body: response.status === 204 ? null : await response.text(),
-			headers: Object.fromEntries(response.headers.entries()),
+			headers: responseHeaders,
 			status: response.status,
 		};
 	}
@@ -515,6 +546,7 @@ export class PrivateAccountService {
 			refreshToken: this.session.refreshToken,
 		}));
 		this.repository.saveSession(this.session);
+		this.lastStateRefreshAt = 0;
 	}
 
 	private async refreshSessionFromBackend(): Promise<void> {
@@ -529,6 +561,31 @@ export class PrivateAccountService {
 			user: response.user,
 		});
 		this.repository.saveSession(this.session);
+		this.lastStateRefreshAt = 0;
+	}
+
+	private async refreshStateSnapshot(force = false): Promise<void> {
+		const now = Date.now();
+		if (!force && now - this.lastStateRefreshAt < PRIVATE_STATE_CACHE_TTL_MS) {
+			return;
+		}
+
+		if (this.stateRefreshPromise) {
+			await this.stateRefreshPromise;
+			return;
+		}
+
+		this.stateRefreshPromise = (async () => {
+			await this.refreshSessionFromBackend();
+			await this.refreshConnectorState();
+			this.lastStateRefreshAt = Date.now();
+		})();
+
+		try {
+			await this.stateRefreshPromise;
+		} finally {
+			this.stateRefreshPromise = null;
+		}
 	}
 
 	private scheduleReconnect(): void {

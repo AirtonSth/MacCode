@@ -36,6 +36,20 @@ cleanup() {
 	fi
 }
 
+cleanup_stale_ios_e2e_processes() {
+	local patterns=(
+		'/mobile/e2e/ios-thread-activity-flow.sh'
+		'/mobile/e2e/ios-chat-pagination-flow.sh'
+		'AgentDeviceRunnerUITests/RunnerTests/testCommand'
+		'agent-device --platform ios'
+	)
+
+	echo "Clearing stale iOS e2e worker processes..."
+	for pattern in "${patterns[@]}"; do
+		pkill -f "${pattern}" >/dev/null 2>&1 || true
+	done
+}
+
 resolve_simulator_udid() {
 	if [[ -n "${IOS_SIMULATOR_UDID}" ]]; then
 		printf "%s\n" "${IOS_SIMULATOR_UDID}"
@@ -66,6 +80,24 @@ resolve_simulator_udid() {
 ensure_simulator_booted() {
 	IOS_SIMULATOR_UDID="$(resolve_simulator_udid)"
 	echo "Using iOS simulator ${IOS_SIMULATOR_NAME} (${IOS_SIMULATOR_UDID})..."
+	booted_simulator_udids="$(
+		xcrun simctl list devices booted \
+			| awk '
+				match($0, /\(([0-9A-F-]+)\)/) {
+					print substr($0, RSTART + 1, RLENGTH - 2)
+				}
+			'
+	)"
+	if [[ -n "${booted_simulator_udids}" ]]; then
+		while IFS= read -r booted_udid; do
+			if [[ -z "${booted_udid}" || "${booted_udid}" == "${IOS_SIMULATOR_UDID}" ]]; then
+				continue
+			fi
+			echo "Shutting down competing booted simulator ${booted_udid}..."
+			xcrun simctl shutdown "${booted_udid}" >/dev/null 2>&1 || true
+		done <<< "${booted_simulator_udids}"
+	fi
+	xcrun simctl shutdown "${IOS_SIMULATOR_UDID}" >/dev/null 2>&1 || true
 	xcrun simctl boot "${IOS_SIMULATOR_UDID}" >/dev/null 2>&1 || true
 	open -a Simulator --args -CurrentDeviceUDID "${IOS_SIMULATOR_UDID}" >/dev/null 2>&1 || true
 	xcrun simctl bootstatus "${IOS_SIMULATOR_UDID}" -b >/dev/null
@@ -107,6 +139,14 @@ ensure_app_installed() {
 	fi
 
 	echo "Building RemoteCode (${IOS_CONFIGURATION}) for iOS simulator..."
+	if [[ "${IOS_FORCE_REBUILD}" == "1" ]]; then
+		xcodebuild \
+			-workspace "${IOS_WORKSPACE}" \
+			-scheme "${IOS_SCHEME}" \
+			-configuration "${IOS_CONFIGURATION}" \
+			-destination "$(simulator_destination)" \
+			clean > "${IOS_BUILD_LOG}" 2>&1
+	fi
 	if ! xcodebuild \
 		-workspace "${IOS_WORKSPACE}" \
 		-scheme "${IOS_SCHEME}" \
@@ -151,7 +191,28 @@ if [[ -n "${session_names}" ]]; then
 		fi
 		echo "Closing stale session: ${name}"
 		gtimeout 20 npx -y agent-device --platform ios --session "${name}" close "${APP_NAME}" >/dev/null 2>&1 || true
+		gtimeout 20 npx -y agent-device --platform ios --session "${name}" close >/dev/null 2>&1 || true
 	done <<< "${session_names}"
+fi
+
+remaining_session_names="$(
+	npx -y agent-device --platform ios session list --json 2>/dev/null \
+		| jq -r '.data.sessions[]?.name // empty' \
+		| rg '^rc-e2e-' -S || true
+)"
+if [[ -n "${remaining_session_names}" ]]; then
+	echo "Restarting agent-device daemon to clear stale rc-e2e sessions..."
+	stale_daemon_pids="$(pgrep -f 'agent-device/dist/src/daemon.js' || true)"
+	if [[ -n "${stale_daemon_pids}" ]]; then
+		while IFS= read -r daemon_pid; do
+			if [[ -z "${daemon_pid}" ]]; then
+				continue
+			fi
+			kill "${daemon_pid}" >/dev/null 2>&1 || true
+			wait "${daemon_pid}" >/dev/null 2>&1 || true
+		done <<< "${stale_daemon_pids}"
+	fi
+	sleep 1
 fi
 
 if [[ "${BASE_PORT}" =~ ^[0-9]+$ ]]; then
@@ -169,9 +230,11 @@ if [[ "${BASE_PORT}" =~ ^[0-9]+$ ]]; then
 	fi
 fi
 
+cleanup_stale_ios_e2e_processes
 ensure_simulator_booted
 ensure_app_installed
 grant_simulator_permissions
+export RC_IOS_SIMULATOR_UDID="${IOS_SIMULATOR_UDID}"
 
 FAKE_CODEX_DIR="$(mktemp -d "${TMPDIR:-/tmp}/remotecode-fake-codex.XXXXXX")"
 ln -sf "${SCRIPT_DIR}/fake-codex.sh" "${FAKE_CODEX_DIR}/codex"

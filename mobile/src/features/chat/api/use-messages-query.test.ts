@@ -6,6 +6,7 @@ const {
 	appendMessageToMessagePage,
 	getPlaceholderMessagePage,
 	MESSAGE_PAGE_SIZE,
+	normalizeMessagePage,
 	replaceVisibleMessagePage,
 } = await import("./message-page-utils");
 
@@ -118,6 +119,22 @@ describe("replaceVisibleMessagePage", () => {
 
 		expect(result.messages).toHaveLength(1);
 		expect(result.messages[0].id).toBe("new");
+	});
+});
+
+describe("normalizeMessagePage", () => {
+	it("returns an empty page for nullish inputs", () => {
+		expect(normalizeMessagePage(undefined)).toEqual(makeEmptyPage());
+		expect(normalizeMessagePage(null)).toEqual(makeEmptyPage());
+	});
+
+	it("normalizes legacy message arrays into a page payload", () => {
+		const legacyMessages = [makeMessage({ id: "legacy-1" })];
+
+		expect(normalizeMessagePage(legacyMessages)).toEqual({
+			...makeEmptyPage(),
+			messages: legacyMessages,
+		});
 	});
 });
 

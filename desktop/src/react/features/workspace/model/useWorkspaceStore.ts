@@ -347,6 +347,84 @@ const trimMessageWindow = (messages: MessageDTO[]): {
 	};
 };
 
+const pruneChatRecord = <T>(
+	record: Record<string, T>,
+	selectedChatId: string | null,
+	options?: {
+		shouldKeep?: (value: T) => boolean;
+	},
+): Record<string, T> => {
+	if (!selectedChatId) {
+		return {};
+	}
+
+	if (!Object.hasOwn(record, selectedChatId)) {
+		return {};
+	}
+
+	const value = record[selectedChatId];
+	if (value === undefined) {
+		return {};
+	}
+
+	if (options?.shouldKeep && !options.shouldKeep(value)) {
+		return {};
+	}
+
+	return {
+		[selectedChatId]: value,
+	};
+};
+
+const pruneTransientChatState = (
+	state: Pick<
+		WorkspaceState,
+		| "lastAssistantEventIdByChat"
+		| "sendingByChat"
+		| "streamHistoryByChat"
+		| "streamTurnsByChat"
+		| "streamingActiveByChat"
+		| "streamingByChat"
+	>,
+	selectedChatId: string | null,
+) => ({
+	lastAssistantEventIdByChat: pruneChatRecord(state.lastAssistantEventIdByChat, selectedChatId, {
+		shouldKeep: (value) => value > 0,
+	}),
+	sendingByChat: pruneChatRecord(state.sendingByChat, selectedChatId, {
+		shouldKeep: Boolean,
+	}),
+	streamHistoryByChat: pruneChatRecord(state.streamHistoryByChat, selectedChatId, {
+		shouldKeep: (value) => value.length > 0,
+	}),
+	streamTurnsByChat: pruneChatRecord(state.streamTurnsByChat, selectedChatId),
+	streamingActiveByChat: pruneChatRecord(state.streamingActiveByChat, selectedChatId, {
+		shouldKeep: Boolean,
+	}),
+	streamingByChat: pruneChatRecord(state.streamingByChat, selectedChatId, {
+		shouldKeep: (value) => value.trim().length > 0,
+	}),
+});
+
+export const getTransientChatStateCounts = (
+	state: Pick<
+		WorkspaceState,
+		| "lastAssistantEventIdByChat"
+		| "sendingByChat"
+		| "streamHistoryByChat"
+		| "streamTurnsByChat"
+		| "streamingActiveByChat"
+		| "streamingByChat"
+	>,
+) => ({
+	lastAssistantEventIds: Object.keys(state.lastAssistantEventIdByChat).length,
+	sending: Object.keys(state.sendingByChat).length,
+	streamHistory: Object.keys(state.streamHistoryByChat).length,
+	streamTurns: Object.keys(state.streamTurnsByChat).length,
+	streaming: Object.keys(state.streamingByChat).length,
+	streamingActive: Object.keys(state.streamingActiveByChat).length,
+});
+
 export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): WorkspaceState => {
 	switch (action.type) {
 		case "BOOTSTRAP_CONFIG":
@@ -475,6 +553,7 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 			const nextSelectedChatId = currentStillExists
 				? state.selectedChatId
 				: (sortedChats[0]?.id ?? null);
+			const nextTransientChatState = pruneTransientChatState(state, nextSelectedChatId);
 			return {
 				...state,
 				chats: sortedChats,
@@ -483,6 +562,7 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 				messageWindow: currentStillExists
 					? state.messageWindow
 					: createEmptyMessageWindow(nextSelectedChatId),
+				...nextTransientChatState,
 			};
 		}
 
@@ -552,6 +632,7 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 				...state,
 				selectedChatId: action.payload,
 				messageWindow: createEmptyMessageWindow(action.payload),
+				...pruneTransientChatState(state, action.payload),
 			};
 
 		case "RESET_SELECTED_CHAT":
@@ -575,6 +656,10 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 
 		case "SET_MESSAGE_WINDOW": {
 			const turns = normalizeTurnHistory(action.payload.turns);
+			const nextLastAssistantEventIdByChat =
+				action.payload.chatId && (state.lastAssistantEventIdByChat[action.payload.chatId] ?? 0) > 0
+					? { [action.payload.chatId]: state.lastAssistantEventIdByChat[action.payload.chatId] ?? 0 }
+					: {};
 			return {
 				...state,
 				messageWindow: {
@@ -587,13 +672,12 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 					turns,
 				},
 				messagesLoading: false,
+				...pruneTransientChatState(state, action.payload.chatId),
 				streamHistoryByChat: action.payload.chatId ? { [action.payload.chatId]: turns } : {},
 				streamTurnsByChat: action.payload.chatId
 					? { [action.payload.chatId]: turns.at(-1)?.status === "running" ? turns.at(-1) : undefined }
 					: {},
-				lastAssistantEventIdByChat: action.payload.chatId
-					? { [action.payload.chatId]: state.lastAssistantEventIdByChat[action.payload.chatId] ?? 0 }
-					: {},
+				lastAssistantEventIdByChat: nextLastAssistantEventIdByChat,
 			};
 		}
 
@@ -926,10 +1010,15 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 					...state.streamTurnsByChat,
 					[action.payload.chatId]: normalizedTurns.at(-1)?.status === "running" ? normalizedTurns.at(-1) : undefined,
 				},
-				lastAssistantEventIdByChat: {
-					...state.lastAssistantEventIdByChat,
-					[action.payload.chatId]: action.payload.lastEventId,
-				},
+				lastAssistantEventIdByChat:
+					action.payload.lastEventId > 0
+						? {
+							...state.lastAssistantEventIdByChat,
+							[action.payload.chatId]: action.payload.lastEventId,
+						}
+						: pruneChatRecord(state.lastAssistantEventIdByChat, state.selectedChatId, {
+							shouldKeep: (value) => value > 0,
+						}),
 			};
 
 		case "SET_STREAM_ITEM_EXPANDED": {

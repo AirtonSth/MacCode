@@ -115,6 +115,7 @@ codexTest(`WS emits intermediate thinking/tool deltas before assistant_done${ski
 			data: {
 				chatId,
 				permissionMode: "default",
+				requestId: "req-ws-codex-flow",
 				text: "Run exactly one shell command: pwd. After that, reply with exactly: ws-codex-flow-ok",
 			},
 			event: "user_message",
@@ -199,6 +200,7 @@ codexTest(`WS keeps codex thread context after websocket reconnect${skipReasonSu
 		firstSocket.send({
 			data: {
 				chatId,
+				requestId: "req-ws-thread-store",
 				text: `Remember this token for this thread: ${token}. Reply exactly: STORED ${token}`,
 			},
 			event: "user_message",
@@ -227,6 +229,7 @@ codexTest(`WS keeps codex thread context after websocket reconnect${skipReasonSu
 		secondSocket.send({
 			data: {
 				chatId,
+				requestId: "req-ws-thread-recall",
 				text: "What exact token did I ask you to remember earlier in this same thread? Reply with token only.",
 			},
 			event: "user_message",
@@ -289,6 +292,7 @@ test("WS emits validation error for invalid payload", async () => {
 				data: {
 					chatId: "missing",
 					permissionMode: "invalid-mode",
+					requestId: "req-invalid-mode",
 					text: "hello",
 				},
 				event: "user_message",
@@ -299,6 +303,7 @@ test("WS emits validation error for invalid payload", async () => {
 				data: {
 					chatId: "missing",
 					model: "   ",
+					requestId: "req-invalid-model",
 					text: "hello",
 				},
 				event: "user_message",
@@ -308,6 +313,7 @@ test("WS emits validation error for invalid payload", async () => {
 			JSON.stringify({
 				data: {
 					chatId: "missing",
+					requestId: "req-invalid-reasoning",
 					reasoningEffort: "super-high",
 					text: "hello",
 				},
@@ -355,6 +361,7 @@ test("WS rejects stale chat target when projectId does not match chat project", 
 			data: {
 				chatId,
 				projectId: secondProjectId,
+				requestId: "req-stale-target",
 				text: "This should be rejected as stale target.",
 			},
 			event: "user_message",

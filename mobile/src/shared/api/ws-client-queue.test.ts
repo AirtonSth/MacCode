@@ -6,7 +6,7 @@ import { createRealtimeClient } from "./ws-client";
 
 /**
  * [M-13] Messages sent between a WS error and reconnection must be queued.
- * [M-33] Queue overflow must prioritize subscription messages over user messages.
+ * [M-33] Queue overflow must fail explicitly once the reliable queue is full.
  */
 
 interface FakeSocket {
@@ -149,10 +149,66 @@ describe("[M-13] socketErrored flag queues messages on error", () => {
 
 		expect(directMessages.length).toBe(1);
 	});
+
+	test("workspace ack removes a reliable user message from the resend queue", () => {
+		const { factory, instances } = createFakeSocketFactory();
+
+		const client = createRealtimeClient({
+			createSocket: factory,
+			onEvent: () => {
+				// no-op
+			},
+			target: {
+				baseUrl: "http://127.0.0.1:8835",
+				kind: "local",
+				token: "tok",
+			},
+		});
+
+		client.connect();
+		const socket = instances[0];
+		expect(socket).toBeDefined();
+		socket.readyState = 1;
+		socket.onopen?.();
+
+		client.sendUserMessage("chat-ack", "hello", {
+			requestId: "req-ack",
+		});
+		expect(socket.sentPayloads.length).toBe(1);
+
+		socket.onmessage?.({
+			data: JSON.stringify({
+				data: {
+					originClientId: null,
+					payload: {
+						message: {
+							chatId: "chat-ack",
+							content: "hello",
+							createdAt: new Date().toISOString(),
+							id: "msg-1",
+							role: "user",
+						},
+					},
+					requestId: "req-ack",
+					seq: 1,
+					ts: new Date().toISOString(),
+					type: "message_created",
+				},
+				event: "workspace_event",
+			}),
+		});
+
+		client.sendJoinChat("chat-ack");
+		const userMessages = socket.sentPayloads
+			.map((raw) => JSON.parse(raw) as { data: { chatId?: string; requestId?: string }; event: string })
+			.filter((msg) => msg.event === "user_message" && msg.data.requestId === "req-ack");
+
+		expect(userMessages.length).toBe(1);
+	});
 });
 
-describe("[M-33] Queue overflow prioritizes subscription messages", () => {
-	test("queue limit is 200", async () => {
+describe("[M-33] Reliable queue bounds", () => {
+	test("queue limit is 100", async () => {
 		const { factory, instances } = createFakeSocketFactory();
 
 		const client = createRealtimeClient({
@@ -178,15 +234,15 @@ describe("[M-33] Queue overflow prioritizes subscription messages", () => {
 			client.sendUserMessage(`chat-${i}`, `msg-${i}`);
 		}
 
-		// Now open — all 150 should flush (old limit was 50)
+		// Now open — only the first 100 should flush because the queue is capped.
 		sock.readyState = 1;
 		sock.onopen?.();
 
 		const flushed = sock.sentPayloads.length;
-		expect(flushed).toBe(150);
+		expect(flushed).toBe(100);
 	});
 
-	test("subscription messages survive overflow eviction", () => {
+	test("subscription messages still flush when the reliable queue is full", () => {
 		const { factory, instances } = createFakeSocketFactory();
 
 		const client = createRealtimeClient({
@@ -210,8 +266,8 @@ describe("[M-33] Queue overflow prioritizes subscription messages", () => {
 		// Add a join_chat first
 		client.sendJoinChat("critical-chat");
 
-		// Fill the queue to 200 with user messages
-		for (let i = 0; i < 200; i += 1) {
+		// Fill the queue beyond capacity with user messages.
+		for (let i = 0; i < 150; i += 1) {
 			client.sendUserMessage(`chat-${i}`, `msg-${i}`);
 		}
 

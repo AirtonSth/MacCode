@@ -1,8 +1,7 @@
 import * as Notifications from "expo-notifications";
-import messaging from "@react-native-firebase/messaging";
 import { AppState, Platform, type AppStateStatus } from "react-native";
 
-export type PushDeliveryTokenType = "fcm";
+export type PushDeliveryTokenType = "apns" | "fcm";
 
 export interface PushDeliveryToken {
 	token: string;
@@ -84,6 +83,75 @@ const normalizeToken = (value: unknown): string | null => {
 	return normalized.length > 0 ? normalized : null;
 };
 
+const normalizePushDeliveryTokenType = (value: unknown): PushDeliveryTokenType | null => {
+	if (typeof value !== "string") {
+		return null;
+	}
+
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "android" || normalized === "fcm") {
+		return "fcm";
+	}
+
+	if (normalized === "ios" || normalized === "apns") {
+		return "apns";
+	}
+
+	return null;
+};
+
+const inferPushDeliveryTokenType = (): PushDeliveryTokenType => (
+	Platform.OS === "android" ? "fcm" : "apns"
+);
+
+const toPushDeliveryToken = (token: string, type: PushDeliveryTokenType | null): PushDeliveryToken => ({
+	token,
+	type: type ?? inferPushDeliveryTokenType(),
+});
+
+const extractPushDeliveryToken = (value: unknown): PushDeliveryToken | null => {
+	const directToken = normalizeToken(value);
+	if (directToken) {
+		return toPushDeliveryToken(directToken, null);
+	}
+
+	if (typeof value !== "object" || value === null) {
+		return null;
+	}
+
+	const entry = value as {
+		data?: unknown;
+		token?: unknown;
+		type?: unknown;
+	};
+
+	const directDataToken = normalizeToken(entry.data);
+	if (directDataToken) {
+		return toPushDeliveryToken(directDataToken, normalizePushDeliveryTokenType(entry.type));
+	}
+
+	if (typeof entry.data === "object" && entry.data !== null) {
+		const nested = entry.data as {
+			data?: unknown;
+			token?: unknown;
+			type?: unknown;
+		};
+		const nestedToken = normalizeToken(nested.token) ?? normalizeToken(nested.data);
+		if (nestedToken) {
+			const nestedType = normalizePushDeliveryTokenType(nested.type)
+				?? normalizePushDeliveryTokenType(entry.type);
+			return toPushDeliveryToken(nestedToken, nestedType);
+		}
+	}
+
+	const token = normalizeToken(entry.token);
+	if (!token) {
+		return null;
+	}
+
+	return toPushDeliveryToken(token, normalizePushDeliveryTokenType(entry.type));
+};
+
 const ensurePushPermission = async (): Promise<boolean> => {
 	const currentPermissions = await Notifications.getPermissionsAsync();
 	if (hasGrantedPermission(currentPermissions)) {
@@ -119,21 +187,21 @@ interface ResolvePushDeliveryTokenOptions {
 }
 
 const readPushDeliveryToken = async (): Promise<PushDeliveryToken | null> => {
-	const service = messaging();
-	if (Platform.OS === "ios" && !service.isDeviceRegisteredForRemoteMessages) {
-		await service.registerDeviceForRemoteMessages();
-	}
-
-	const token = normalizeToken(await service.getToken());
-	if (!token) {
-		log("failed to resolve fcm token");
+	const getDevicePushTokenAsync = (Notifications as unknown as {
+		getDevicePushTokenAsync?: () => Promise<unknown>;
+	}).getDevicePushTokenAsync;
+	if (typeof getDevicePushTokenAsync !== "function") {
+		log("getDevicePushTokenAsync unavailable");
 		return null;
 	}
 
-	return {
-		token,
-		type: "fcm",
-	};
+	const token = extractPushDeliveryToken(await getDevicePushTokenAsync());
+	if (!token) {
+		log("failed to extract token");
+		return null;
+	}
+
+	return token;
 };
 
 const resolvePushDeliveryTokenWithRetry = async (
@@ -240,17 +308,21 @@ export const ensurePushDeliveryToken = async (): Promise<PushDeliveryToken | nul
 export const subscribePushDeliveryTokenRefresh = (
 	listener: (token: PushDeliveryToken) => void,
 ): (() => void) => {
-	return messaging().onTokenRefresh((nextToken) => {
-		const normalizedToken = normalizeToken(nextToken);
-		if (!normalizedToken) {
+	const addPushTokenListener = (Notifications as unknown as {
+		addPushTokenListener?: (callback: (event: unknown) => void) => { remove: () => void };
+	}).addPushTokenListener;
+
+	if (typeof addPushTokenListener !== "function") {
+		return () => undefined;
+	}
+
+	const subscription = addPushTokenListener((event) => {
+		const token = extractPushDeliveryToken(event);
+		if (!token) {
 			log("token refresh event ignored");
 			return;
 		}
 
-		const token: PushDeliveryToken = {
-			token: normalizedToken,
-			type: "fcm",
-		};
 		cachedPushDeliveryToken = token;
 		log("token refreshed", {
 			token: toTokenPreview(token.token),
@@ -258,6 +330,10 @@ export const subscribePushDeliveryTokenRefresh = (
 		});
 		listener(token);
 	});
+
+	return () => {
+		subscription.remove();
+	};
 };
 
 export const ensureFirebaseMessagingToken = ensurePushDeliveryToken;

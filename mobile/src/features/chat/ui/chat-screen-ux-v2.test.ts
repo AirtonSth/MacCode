@@ -30,14 +30,25 @@ describe("[M-48] long model names truncate in the selector", () => {
 });
 
 describe("[M-49] composer input is only cleared after a successful send", () => {
-	it("checks the send result before clearing the input", () => {
-		const submitBlock = /const submit = async \(\) => \{[\s\S]*?\n\t\};/.exec(
+	it("checks the send result before clearing the input inside ChatComposer", () => {
+		const submitBlock = /const handleSubmit = useCallback\(async \(\) => \{[\s\S]*?\n\t\}, \[input, onSend\]\);/.exec(
 			source,
 		);
 		expect(submitBlock).not.toBeNull();
-		expect(submitBlock![0]).toContain("const sent = await sendMessage(text);");
+		expect(submitBlock![0]).toContain("const sent = await onSend(text);");
 		expect(submitBlock![0]).toContain("if (sent) {");
 		expect(submitBlock![0]).toContain("setInput(\"\");");
+	});
+});
+
+describe("[M-52] composer input state is isolated from the chat screen root", () => {
+	it("keeps the input state inside ChatComposer instead of ChatScreen", () => {
+		expect(source).toContain("const ChatComposer = memo((");
+		expect(source).toContain("const [input, setInput] = useState<string>(\"\");");
+
+		const chatScreenBlock = /export const ChatScreen = \(\) => \{[\s\S]*$/.exec(source);
+		expect(chatScreenBlock).not.toBeNull();
+		expect(chatScreenBlock![0]).not.toContain("const [input, setInput] = useState<string>(\"\");");
 	});
 });
 

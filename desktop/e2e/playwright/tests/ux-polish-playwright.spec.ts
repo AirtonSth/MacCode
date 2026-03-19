@@ -191,3 +191,60 @@ test("[D-50] sidebar resize shows and clears the overlay during drag", async ({ 
 	await page.mouse.up();
 	await expect(page.getByTestId("sidebar-resize-overlay")).toHaveCount(0);
 });
+
+test("[D-58] sidebar drag avoids root rerenders on pointer move", async ({ page }) => {
+	await page.goto("/");
+
+	await expect(page.getByLabel("Select Workspace 1")).toBeVisible();
+
+	const modelSelect = page.getByLabel("Model");
+	await expect
+		.poll(async () =>
+			await modelSelect.evaluate((element) =>
+				Array.from((element as HTMLSelectElement).options).map((option) => option.textContent ?? ""),
+			),
+		)
+		.toContain("GPT-5.3 Codex");
+
+	await page.waitForFunction(() => {
+		type RenderStats = {
+			getCounts: () => Record<string, number>;
+			reset: () => void;
+		};
+
+		return Boolean((window as Window & { __RC_RENDER_STATS__?: RenderStats }).__RC_RENDER_STATS__);
+	});
+
+	await page.evaluate(() => {
+		type RenderStats = {
+			getCounts: () => Record<string, number>;
+			reset: () => void;
+		};
+
+		(window as Window & { __RC_RENDER_STATS__?: RenderStats }).__RC_RENDER_STATS__?.reset();
+	});
+
+	const resizer = page.getByLabel("Resize sidebar");
+	const box = await resizer.boundingBox();
+	if (!box) {
+		throw new Error("sidebar_resizer_not_found");
+	}
+
+	await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+	await page.mouse.down();
+	await page.mouse.move(box.x + 24, box.y + box.height / 2);
+	await page.mouse.move(box.x + 48, box.y + box.height / 2);
+	await page.mouse.move(box.x + 72, box.y + box.height / 2);
+	await page.mouse.up();
+
+	const renderCounts = await page.evaluate(() => {
+		type RenderStats = {
+			getCounts: () => Record<string, number>;
+			reset: () => void;
+		};
+
+		return (window as Window & { __RC_RENDER_STATS__?: RenderStats }).__RC_RENDER_STATS__?.getCounts() ?? {};
+	});
+
+	expect(renderCounts["app-root"] ?? 0).toBeLessThanOrEqual(2);
+});

@@ -35,6 +35,7 @@ import {
 	type ProjectDTO,
 	type StreamTurnState,
 	createEmptyMessageWindow,
+	getTransientChatStateCounts,
 	sortChatsByUpdatedAtDesc,
 	useWorkspaceStore,
 } from "../features/workspace/model/useWorkspaceStore";
@@ -244,6 +245,14 @@ const clampSidebarWidth = (width: number): number => {
 	return Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, Math.round(bounded)));
 };
 
+const renderStatsState = {
+	counts: {} as Record<string, number>,
+};
+
+const bumpRenderStat = (name: string): void => {
+	renderStatsState.counts[name] = (renderStatsState.counts[name] ?? 0) + 1;
+};
+
 const parseSidebarWidth = (value: string | null): number => {
 	const parsed = Number.parseInt(value ?? "", 10);
 	if (Number.isNaN(parsed)) {
@@ -363,6 +372,7 @@ const isMessagePayload = (value: unknown): value is MessageDTO => {
 };
 
 const App = (): JSX.Element => {
+	bumpRenderStat("app-root");
 	const { dispatch, state } = useWorkspaceStore();
 	const shouldReduceMotion = useReducedMotion();
 	const wsRef = useRef<ReturnType<(typeof RemoteCodeRealtime)["createClient"]> | null>(null);
@@ -392,6 +402,7 @@ const App = (): JSX.Element => {
 	const messageWindowLoadQueuedRef = useRef<Map<string, MessageWindowLoadRequest>>(new Map());
 	const chatContextLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
 	const workspaceMenuRef = useRef<HTMLDivElement | null>(null);
+	const layoutShellRef = useRef<HTMLDivElement | null>(null);
 	const [stoppingByChat, setStoppingByChat] = useState<Record<string, boolean>>({});
 
 	const baseUrl = useMemo(() => {
@@ -449,6 +460,33 @@ const App = (): JSX.Element => {
 		? Boolean(state.sendingByChat[selectedChatId])
 		: false;
 	const selectedChatStopping = selectedChatId ? Boolean(stoppingByChat[selectedChatId]) : false;
+
+	useEffect(() => {
+		const debugGlobal = globalThis as typeof globalThis & {
+			__RC_TRANSIENT_CHAT_STATE__?: {
+				getCounts: () => ReturnType<typeof getTransientChatStateCounts>;
+			};
+			__RC_RENDER_STATS__?: {
+				getCounts: () => Record<string, number>;
+				reset: () => void;
+			};
+		};
+		debugGlobal.__RC_TRANSIENT_CHAT_STATE__ = {
+			getCounts: () => getTransientChatStateCounts(state),
+		};
+		debugGlobal.__RC_RENDER_STATS__ = {
+			getCounts: () => ({ ...renderStatsState.counts }),
+			reset: () => {
+				renderStatsState.counts = {};
+			},
+		};
+
+		return () => {
+			delete debugGlobal.__RC_TRANSIENT_CHAT_STATE__;
+			delete debugGlobal.__RC_RENDER_STATS__;
+		};
+	}, [state]);
+
 	const isChatActive = useCallback(
 		(chatId: string): boolean => activeChatIdsRef.current.has(chatId),
 		[],
@@ -539,7 +577,13 @@ const App = (): JSX.Element => {
 
 	useEffect(() => {
 		sidebarWidthRef.current = sidebarWidth;
+		layoutShellRef.current?.style.setProperty("--desktop-sidebar-width", `${sidebarWidth}px`);
 	}, [sidebarWidth]);
+
+	const applySidebarWidth = useCallback((width: number) => {
+		sidebarWidthRef.current = width;
+		layoutShellRef.current?.style.setProperty("--desktop-sidebar-width", `${width}px`);
+	}, []);
 
 	useEffect(() => {
 		if (!openWorkspaceMenuProjectId || typeof window === "undefined") {
@@ -739,8 +783,8 @@ const App = (): JSX.Element => {
 		const nextWidth = clampSidebarWidth(
 			sidebarResizeStartWidthRef.current + (event.clientX - sidebarResizeStartXRef.current),
 		);
-		setSidebarWidth(nextWidth);
-	}, []);
+		applySidebarWidth(nextWidth);
+	}, [applySidebarWidth]);
 
 	const startSidebarResize = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
 		event.preventDefault();
@@ -762,6 +806,7 @@ const App = (): JSX.Element => {
 			if (event.currentTarget.hasPointerCapture(event.pointerId)) {
 				event.currentTarget.releasePointerCapture(event.pointerId);
 			}
+			setSidebarWidth(sidebarWidthRef.current);
 			stopSidebarResize();
 		},
 		[stopSidebarResize],
@@ -2819,6 +2864,7 @@ const App = (): JSX.Element => {
 				) : null}
 				<div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_48%_84%,rgba(55,150,255,0.22),transparent_44%)]" />
 				<motion.div
+						ref={layoutShellRef}
 						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
 						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
 						className={cn(

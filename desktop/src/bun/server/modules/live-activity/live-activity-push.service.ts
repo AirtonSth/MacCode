@@ -12,7 +12,6 @@ import type {
 	PushToStartTokenStoreContract,
 	PushToStartTokenStored,
 } from "./live-activity-push.model";
-import { createApnsSender, loadApnsConfigFromEnvironment } from "./apns-sender";
 
 const PUSH_MIN_UPDATE_INTERVAL_MS = 3_000;
 const PUSH_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -743,7 +742,7 @@ const createNoopSender = (): LiveActivityPushSender => async () => ({
 	shouldDropSubscription: false,
 });
 
-const PRIVATE_BACKEND_PUSH_TIMEOUT_MS = 20_000;
+const PRIVATE_BACKEND_PUSH_TIMEOUT_MS = 5_000;
 
 const createPrivateBackendSender = (input: {
 	getConnectorCredentials: () => LiveActivityPushConnectorCredentials | null;
@@ -1173,6 +1172,17 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 	}
 
+	private dropSubscription(key: string, subscription: LiveActivitySubscription): void {
+		this.subscriptions.delete(key);
+		this.deletePersistedSubscription({
+			chatId: subscription.chatId,
+			chatTitle: subscription.chatTitle,
+			liveActivityToken: subscription.liveActivityToken,
+			pushToken: subscription.pushToken,
+			pushTokenType: subscription.pushTokenType,
+		});
+	}
+
 	private deletePersistedPushToStartToken(input: PushToStartTokenStored): void {
 		if (!this.pushToStartTokenStore) {
 			return;
@@ -1518,10 +1528,8 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 					return;
 				}
 				if (deliveryResult.shouldDropSubscription) {
-					hadTransientFailure = true;
-					retainedFailureCount += 1;
-					transientFailureCount += 1;
-					logLiveActivityWarn("permanent push delivery failure (subscription kept)", {
+					this.dropSubscription(key, subscription);
+					logLiveActivityWarn("permanent push delivery failure (subscription dropped)", {
 						chatId: GLOBAL_ACTIVITY_CHAT_ID,
 						event: deliveryEvent,
 						code: deliveryResult.errorCode ?? "unknown",
@@ -2112,41 +2120,14 @@ export const createLiveActivityPushServiceFromEnvironment = (
 		privateBackendUrl: input.privateBackendUrl,
 	});
 
-	const apnsConfig = loadApnsConfigFromEnvironment();
-	const apnsSend = apnsConfig ? createApnsSender(apnsConfig) : null;
-	const sender: LiveActivityPushSender = apnsSend
-		? async (deliveryInput) => {
-			// FCM tokens must go through the private backend; APNS direct only handles APNS tokens
-			if (deliveryInput.pushTokenType !== "apns") {
-				return await privateBackendSender(deliveryInput);
-			}
-			const apnsResult = await apnsSend({
-				contentState: deliveryInput.contentState,
-				event: deliveryInput.event,
-				liveActivityToken: deliveryInput.liveActivityToken,
-				timestampSeconds: deliveryInput.timestampSeconds,
-				attributesType: deliveryInput.attributesType,
-				attributes: deliveryInput.attributes,
-			});
-			if (apnsResult.delivered) {
-				return apnsResult;
-			}
-			// Fall back to private backend on APNS failure (not token-level errors)
-			if (!apnsResult.shouldDropSubscription) {
-				return await privateBackendSender(deliveryInput);
-			}
-			return apnsResult;
-		}
-		: privateBackendSender;
-
 	logLiveActivityInfo("service enabled", {
 		privateBackendUrl: input.privateBackendUrl,
-		apnsDirect: Boolean(apnsSend),
-		apnsSandbox: apnsConfig?.useSandbox ?? false,
+		apnsDirect: false,
+		apnsSandbox: false,
 	});
 
 	return new PrivateBackendLiveActivityPushService(
-		new LiveActivityPushService(sender, new Set(["apns", "fcm"]), input.subscriptionStore, input.pushToStartTokenStore),
+		new LiveActivityPushService(privateBackendSender, new Set(["apns", "fcm"]), input.subscriptionStore, input.pushToStartTokenStore),
 		input.getConnectorCredentials,
 		readStatus,
 	);

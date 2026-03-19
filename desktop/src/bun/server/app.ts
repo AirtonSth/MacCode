@@ -49,7 +49,8 @@ import { DatabaseBootstrap } from "./shared/db/db.bootstrap";
 import { DatabaseClientFactory } from "./shared/db/db.client";
 import { serverLogger } from "./shared/core/server-logger";
 
-const MIN_GZIP_PAYLOAD_BYTES = 1024;
+const MIN_GZIP_PAYLOAD_BYTES = 256;
+const GZIP_LEVEL = 9;
 
 const isGzipAccepted = (request: Request): boolean => {
 	const acceptEncoding = request.headers.get("accept-encoding");
@@ -133,7 +134,7 @@ const createGzipResponse = (
 	input.headers.set("vary", appendVaryValue(input.headers.get("vary"), "accept-encoding"));
 	input.headers.delete("content-length");
 
-	return new Response(gzipSync(body), {
+	return new Response(gzipSync(body, { level: GZIP_LEVEL }), {
 		headers: input.headers,
 		status: input.status,
 		statusText: input.statusText,

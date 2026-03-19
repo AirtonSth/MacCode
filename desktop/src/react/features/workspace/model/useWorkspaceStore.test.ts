@@ -385,6 +385,146 @@ test("RESET_SELECTED_PROJECT and RESET_SELECTED_CHAT clear state slices", () => 
 	expect(chatReset.streamTurnsByChat).toEqual({});
 });
 
+test("SET_MESSAGE_WINDOW prunes transient chat state to the visible chat", () => {
+	const initialState: WorkspaceState = {
+		...baseWorkspaceState(),
+		selectedChatId: "chat-2",
+		messageWindow: {
+			chatId: "chat-2",
+			hasMore: false,
+			latestDirty: false,
+			messages: [],
+			mode: "latest",
+			nextBeforeMessageId: null,
+			turns: [],
+		},
+		streamingByChat: {
+			"chat-1": "stale output",
+			"chat-2": "",
+		},
+		streamingActiveByChat: {
+			"chat-1": true,
+			"chat-2": false,
+		},
+		streamTurnsByChat: {
+			"chat-1": {
+				turnId: "turn-1",
+				status: "running",
+				itemsById: {},
+				itemOrder: [],
+				startedAtMs: Date.now(),
+				finishedAtMs: null,
+			},
+		},
+		streamHistoryByChat: {
+			"chat-1": [{
+				turnId: "turn-1",
+				status: "completed",
+				itemsById: {},
+				itemOrder: [],
+				startedAtMs: Date.now(),
+				finishedAtMs: Date.now(),
+			}],
+		},
+		lastAssistantEventIdByChat: {
+			"chat-1": 18,
+		},
+		sendingByChat: {
+			"chat-1": true,
+		},
+	};
+
+	const updated = workspaceReducer(initialState, {
+		type: "SET_MESSAGE_WINDOW",
+		payload: {
+			chatId: "chat-2",
+			hasMore: false,
+			latestDirty: false,
+			messages: [{
+				chatId: "chat-2",
+				content: "hello",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				id: "message-1",
+				role: "user",
+			}],
+			mode: "latest",
+			nextBeforeMessageId: null,
+			turns: [],
+		},
+	});
+
+	expect(updated.streamingByChat).toEqual({});
+	expect(updated.streamingActiveByChat).toEqual({});
+	expect(updated.streamTurnsByChat).toEqual({});
+	expect(updated.streamHistoryByChat).toEqual({ "chat-2": [] });
+	expect(updated.lastAssistantEventIdByChat).toEqual({});
+	expect(updated.sendingByChat).toEqual({});
+});
+
+test("SET_CHATS drops transient chat state for chats that are no longer selectable", () => {
+	const initialState: WorkspaceState = {
+		...baseWorkspaceState(),
+		selectedChatId: "chat-stale",
+		messageWindow: {
+			chatId: "chat-stale",
+			hasMore: false,
+			latestDirty: false,
+			messages: [],
+			mode: "latest",
+			nextBeforeMessageId: null,
+			turns: [],
+		},
+		streamingByChat: {
+			"chat-stale": "old output",
+			"chat-next": "keep me",
+		},
+		streamingActiveByChat: {
+			"chat-stale": true,
+			"chat-next": true,
+		},
+		streamHistoryByChat: {
+			"chat-stale": [{
+				turnId: "turn-old",
+				status: "completed",
+				itemsById: {},
+				itemOrder: [],
+				startedAtMs: Date.now(),
+				finishedAtMs: Date.now(),
+			}],
+			"chat-next": [{
+				turnId: "turn-next",
+				status: "completed",
+				itemsById: {},
+				itemOrder: [],
+				startedAtMs: Date.now(),
+				finishedAtMs: Date.now(),
+			}],
+		},
+	};
+
+	const updated = workspaceReducer(initialState, {
+		type: "SET_CHATS",
+		payload: [{
+			diffAdded: 0,
+			diffRemoved: 0,
+			id: "chat-next",
+			isActive: false,
+			projectId: "project-1",
+			provider: "fake",
+			status: "completed",
+			title: "Next Chat",
+			updatedAt: "2026-01-01T00:00:01.000Z",
+		}],
+	});
+
+	expect(updated.selectedChatId).toBe("chat-next");
+	expect(updated.streamingByChat).toEqual({ "chat-next": "keep me" });
+	expect(updated.streamingActiveByChat).toEqual({ "chat-next": true });
+	expect(updated.streamHistoryByChat).toEqual({
+		"chat-next": expect.any(Array),
+	});
+});
+
 test("assistant stream events append by target and keep item identity", () => {
 	const initial: WorkspaceState = {
 		...baseWorkspaceState(),

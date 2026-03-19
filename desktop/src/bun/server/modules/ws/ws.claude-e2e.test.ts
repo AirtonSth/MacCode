@@ -139,6 +139,7 @@ claudeTest(`Claude provider e2e: sends message, receives streaming events, creat
 				chatId,
 				permissionMode: "full",
 				model: "claude-haiku-4-5-20251001",
+				requestId: "req-claude-e2e",
 				text: "Reply with exactly: claude-e2e-ok",
 			},
 			event: "user_message",

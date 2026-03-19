@@ -2,16 +2,16 @@
   "baseUrl": "http://127.0.0.1:8835",
   "chats": {
     "active": {
-      "id": "bdcb1a03-0715-4e2e-b2ab-9fc20129fd23",
+      "id": "f24b62cf-28b9-4fed-a964-94aa89827674",
       "title": "Active Thread"
     },
     "idleBottom": {
-      "id": "9d114af8-e074-416c-b36c-b35ee010ba36",
+      "id": "904dfcbf-1464-4a51-bee5-31369e7b5293",
       "title": "Idle Bottom"
     },
     "paged": {
       "beforeMessageId": "message-08",
-      "id": "d28a291e-d985-46dd-84a4-bece44e13322",
+      "id": "ebafec0a-c3d2-44a2-a8ef-c6bb3bae4aa3",
       "latestPageMessageIds": [
         "message-08",
         "message-09",
@@ -29,9 +29,9 @@
       "title": "Paged Thread"
     },
     "idleTop": {
-      "id": "7affd98b-96d3-41e8-a405-a71d0f9749ee",
+      "id": "452f3185-1674-4a30-9175-7a608f7885f0",
       "title": "Idle Top"
     }
   },
-  "projectId": "a556fb6b-9cf1-4f05-b058-440ce921ca26"
+  "projectId": "91ecc4e8-77ed-4a4c-96cd-071168f69d23"
 }

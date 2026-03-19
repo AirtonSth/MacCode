@@ -8,8 +8,9 @@ import {
 	createEmptyPage,
 	getPlaceholderMessagePage,
 	MESSAGE_PAGE_SIZE,
-	normalizeMessagePage,
 } from "./message-page-utils";
+
+const normalizeQueryPage = (page: MessagePageDTO | undefined): MessagePageDTO => page ?? createEmptyPage();
 
 export const useMessagesQuery = (chatId: string | null, options?: { enabled?: boolean }) => {
 	const client = useRemoteCodeClient();
@@ -42,7 +43,7 @@ export const useMessagesQuery = (chatId: string | null, options?: { enabled?: bo
 	});
 
 	const page = useMemo(
-		() => normalizeMessagePage(query.data),
+		() => normalizeQueryPage(query.data),
 		[query.data],
 	);
 
