@@ -17,6 +17,7 @@ export interface ProjectDTO {
 	path: string;
 	isFavorite: boolean;
 	createdAt: string;
+	unreadFinishedThreadCount?: number;
 	updatedAt: string;
 }
 
@@ -24,6 +25,7 @@ export interface WorkspaceSummaryDTO {
 	id: string;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 }
 
 export interface ChatDTO {
@@ -31,14 +33,19 @@ export interface ChatDTO {
 	isActive: boolean;
 	projectId: string;
 	provider: "fake" | "codex" | "claude";
+	providerThreadId?: string | null;
 	title: string;
 	status: "pending" | "running" | "completed" | "failed";
 	diffAdded: number;
 	diffRemoved: number;
+	finishedAt?: string | null;
+	hasUnreadFinished?: boolean;
+	lastReadAt?: string | null;
 	updatedAt: string;
 }
 
 export interface ThreadSummaryDTO {
+	hasUnreadFinished?: boolean;
 	id: string;
 	isActive: boolean;
 	title: string;
@@ -57,6 +64,7 @@ export interface ProjectSummaryDTO {
 	id: string;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 }
 
 export interface ChatContextDTO {
@@ -284,6 +292,10 @@ interface RestListActiveThreadsResponse {
 }
 
 interface RestCreateChatResponse {
+	chat: ChatDTO;
+}
+
+interface RestUpdateChatResponse {
 	chat: ChatDTO;
 }
 
@@ -535,6 +547,16 @@ export const RemoteCodeApi = {
 					return payload.chat;
 				},
 
+				updateChat: async (chatId: string, input: { title: string }): Promise<ChatDTO> => {
+					const payload = await request<RestUpdateChatResponse>({
+						body: input,
+						method: "PATCH",
+						path: `/chats/${chatId}`,
+					});
+
+					return payload.chat;
+				},
+
 				getChatContext: async (chatId: string): Promise<ChatContextDTO> => {
 					return await request<RestChatContextResponse>({
 						method: "GET",
@@ -677,6 +699,15 @@ export const RemoteCodeApi = {
 					method: "DELETE",
 					path: `/chats/${id}`,
 				});
+			},
+
+			markChatRead: async (id: string): Promise<ChatDTO> => {
+				const payload = await request<{ chat: ChatDTO }>({
+					method: "POST",
+					path: `/chats/${id}/read`,
+				});
+
+				return payload.chat;
 			},
 
 			stopChat: async (id: string): Promise<StopChatResponseDTO> => {

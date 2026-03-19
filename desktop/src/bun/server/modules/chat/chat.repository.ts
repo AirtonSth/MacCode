@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { desc, eq, inArray, or } from "drizzle-orm";
+import { desc, eq, inArray, or, sql } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
 import { chats, projects } from "../../shared/db/db.schema";
@@ -9,10 +9,20 @@ import type {
 	ChatDTO,
 	ChatProvider,
 	ChatStatus,
+	RecentThreadSummaryDTO,
 	ThreadSummaryDTO,
 } from "../../types";
 
 export class ChatRepository {
+	private static readonly unreadFinishedExpression = sql<number>`
+		case
+			when ${chats.finishedAt} is not null
+				and (${chats.lastReadAt} is null or ${chats.lastReadAt} < ${chats.finishedAt})
+			then 1
+			else 0
+		end
+	`;
+
 	private readonly database: DrizzleDatabaseClient["orm"];
 
 	constructor(databaseClient: DrizzleDatabaseClient["orm"]) {
@@ -30,13 +40,21 @@ export class ChatRepository {
 	}
 
 	private static toChatDto(row: typeof chats.$inferSelect): ChatDTO {
+		const hasUnreadFinished =
+			row.finishedAt !== null &&
+			(row.lastReadAt === null || row.lastReadAt < row.finishedAt);
+
 		return {
 			diffAdded: ChatRepository.toNumber(row.diffAdded),
 			diffRemoved: ChatRepository.toNumber(row.diffRemoved),
+			finishedAt: row.finishedAt,
+			hasUnreadFinished,
 			id: row.id,
 			isActive: row.isActive === 1,
+			lastReadAt: row.lastReadAt,
 			projectId: row.projectId,
 			provider: ChatRepository.normalizeProvider(row.provider),
+			providerThreadId: row.providerThreadId,
 			status: row.status as ChatStatus,
 			title: row.title,
 			updatedAt: row.updatedAt,
@@ -44,12 +62,14 @@ export class ChatRepository {
 	}
 
 	private static toThreadSummaryDto(row: {
+		hasUnreadFinished: number;
 		id: string;
 		isActive: number;
 		title: string;
 		updatedAt: string;
 	}): ThreadSummaryDTO {
 		return {
+			hasUnreadFinished: row.hasUnreadFinished === 1,
 			id: row.id,
 			isActive: row.isActive === 1,
 			title: row.title,
@@ -73,6 +93,26 @@ export class ChatRepository {
 		};
 	}
 
+	private static toRecentThreadSummaryDto(row: {
+		hasUnreadFinished: number;
+		id: string;
+		isActive: number;
+		projectId: string;
+		projectName: string;
+		title: string;
+		updatedAt: string;
+	}): RecentThreadSummaryDTO {
+		return {
+			hasUnreadFinished: row.hasUnreadFinished === 1,
+			id: row.id,
+			isActive: row.isActive === 1,
+			projectId: row.projectId,
+			projectName: row.projectName,
+			title: row.title,
+			updatedAt: row.updatedAt,
+		};
+	}
+
 	createChat(projectId: string, title: string, provider: ChatProvider = "codex"): ChatDTO {
 		const now = new Date().toISOString();
 		const chatId = randomUUID();
@@ -82,8 +122,10 @@ export class ChatRepository {
 			.values({
 				diffAdded: 0,
 				diffRemoved: 0,
+				finishedAt: null,
 				id: chatId,
 				isActive: 0,
+				lastReadAt: null,
 				projectId,
 				provider,
 				providerThreadId: null,
@@ -136,6 +178,7 @@ export class ChatRepository {
 	getThreadSummariesByProjectId(projectId: string): ThreadSummaryDTO[] {
 		const rows = this.database
 			.select({
+				hasUnreadFinished: ChatRepository.unreadFinishedExpression,
 				id: chats.id,
 				isActive: chats.isActive,
 				title: chats.title,
@@ -144,7 +187,13 @@ export class ChatRepository {
 			.from(chats)
 			.where(eq(chats.projectId, projectId))
 			.orderBy(desc(chats.updatedAt))
-			.all() as Array<{ id: string; isActive: number; title: string; updatedAt: string }>;
+			.all() as Array<{
+				hasUnreadFinished: number;
+				id: string;
+				isActive: number;
+				title: string;
+				updatedAt: string;
+			}>;
 
 		return rows.map(ChatRepository.toThreadSummaryDto);
 	}
@@ -201,6 +250,34 @@ export class ChatRepository {
 		return rows.map(ChatRepository.toActiveThreadSummaryDto);
 	}
 
+	getRecentThreadSummaries(limit = 50): RecentThreadSummaryDTO[] {
+		const rows = this.database
+			.select({
+				hasUnreadFinished: ChatRepository.unreadFinishedExpression,
+				id: chats.id,
+				isActive: chats.isActive,
+				projectId: chats.projectId,
+				projectName: projects.name,
+				title: chats.title,
+				updatedAt: chats.updatedAt,
+			})
+			.from(chats)
+			.innerJoin(projects, eq(chats.projectId, projects.id))
+			.orderBy(desc(chats.updatedAt))
+			.limit(limit)
+			.all() as Array<{
+				hasUnreadFinished: number;
+				id: string;
+				isActive: number;
+				projectId: string;
+				projectName: string;
+				title: string;
+				updatedAt: string;
+			}>;
+
+		return rows.map(ChatRepository.toRecentThreadSummaryDto);
+	}
+
 	resetRuntimeActivityState(): number {
 		const result = this.database
 			.update(chats)
@@ -223,8 +300,25 @@ export class ChatRepository {
 
 	updateChat(
 		chatId: string,
-		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive" | "provider">>,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive" | "provider" | "title">>,
 	): ChatDTO | null {
+		const currentRow = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.id, chatId))
+			.all() as typeof chats.$inferSelect[];
+		const current = currentRow[0];
+		if (!current) {
+			return null;
+		}
+
+		const nextStatus = update.status ?? (current.status as ChatStatus);
+		const shouldResetFinishedAt = nextStatus === "pending" || nextStatus === "running";
+		const nextFinishedAt = shouldResetFinishedAt
+			? null
+			: current.finishedAt ?? new Date().toISOString();
+		const now = new Date().toISOString();
+
 		this.database
 			.update(chats)
 			.set({
@@ -233,7 +327,27 @@ export class ChatRepository {
 				...(update.diffRemoved === undefined ? {} : { diffRemoved: update.diffRemoved }),
 				...(update.isActive === undefined ? {} : { isActive: update.isActive ? 1 : 0 }),
 				...(update.provider === undefined ? {} : { provider: update.provider }),
-				updatedAt: new Date().toISOString(),
+				...(update.title === undefined ? {} : { title: update.title }),
+				finishedAt: nextFinishedAt,
+				updatedAt: now,
+			})
+			.where(eq(chats.id, chatId))
+			.run();
+
+		const rows = this.database
+			.select()
+			.from(chats)
+			.where(eq(chats.id, chatId))
+			.all() as typeof chats.$inferSelect[];
+
+		return rows[0] ? ChatRepository.toChatDto(rows[0]) : null;
+	}
+
+	markChatAsRead(chatId: string, readAt = new Date().toISOString()): ChatDTO | null {
+		this.database
+			.update(chats)
+			.set({
+				lastReadAt: readAt,
 			})
 			.where(eq(chats.id, chatId))
 			.run();

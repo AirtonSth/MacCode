@@ -12,8 +12,10 @@ export const projects = sqliteTable("projects", {
 export const chats = sqliteTable("chats", {
 	diffAdded: integer("diffAdded").notNull().default(0),
 	diffRemoved: integer("diffRemoved").notNull().default(0),
+	finishedAt: text("finishedAt"),
 	id: text("id").primaryKey(),
 	isActive: integer("isActive").notNull().default(0),
+	lastReadAt: text("lastReadAt"),
 	providerThreadId: text("providerThreadId"),
 
 	projectId: text("projectId")
@@ -161,6 +163,26 @@ export const pushToStartTokens = sqliteTable(
 	}),
 );
 
+export const threadCompletionPushSubscriptions = sqliteTable(
+	"thread_completion_push_subscriptions",
+	{
+		id: integer("id").primaryKey({ autoIncrement: true }),
+		chatId: text("chatId").notNull(),
+		chatTitle: text("chatTitle"),
+		pushToken: text("pushToken").notNull(),
+		pushTokenType: text("pushTokenType").notNull(),
+		updatedAt: text("updatedAt").notNull(),
+	},
+	(table) => ({
+		chatIdIndex: index("idx_thread_completion_push_chat_id").on(table.chatId),
+		uniqueChatDevice: uniqueIndex("idx_thread_completion_push_chat_device").on(
+			table.chatId,
+			table.pushTokenType,
+			table.pushToken,
+		),
+	}),
+);
+
 export type ChatRow = typeof chats.$inferSelect;
 
 export type MessageRow = typeof messages.$inferSelect;
@@ -175,6 +197,7 @@ export type ChatTurnSnapshotRow = typeof chatTurnSnapshots.$inferSelect;
 export type ServerMetadataRow = typeof serverMetadata.$inferSelect;
 export type LiveActivitySubscriptionRow = typeof liveActivitySubscriptions.$inferSelect;
 export type PushToStartTokenRow = typeof pushToStartTokens.$inferSelect;
+export type ThreadCompletionPushSubscriptionRow = typeof threadCompletionPushSubscriptions.$inferSelect;
 
 export class DatabaseSchema {
 	static readonly projects = projects;
@@ -202,4 +225,6 @@ export class DatabaseSchema {
 	static readonly liveActivitySubscriptions = liveActivitySubscriptions;
 
 	static readonly pushToStartTokens = pushToStartTokens;
+
+	static readonly threadCompletionPushSubscriptions = threadCompletionPushSubscriptions;
 }

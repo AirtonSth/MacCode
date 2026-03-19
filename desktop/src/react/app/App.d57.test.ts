@@ -64,3 +64,22 @@ describe("D-57: WS event handler ref indirection", () => {
 		expect(source).toContain("[baseUrl, handleWsEvent, handleWsState, token]");
 	});
 });
+
+describe("thread provider switching", () => {
+	test("syncs selectedProvider from the selected thread provider on chat change", () => {
+		expect(source).toContain("const selectedChatProviderThreadId = selectedChat?.providerThreadId?.trim() || null;");
+		expect(source).toContain("if (!isProviderSelectionLocked || !selectedChatProvider) {");
+		expect(source).toContain("lastProviderSyncChatIdRef.current === selectedChatId");
+		expect(source).toContain("setSelectedProvider(selectedChatProvider);");
+	});
+
+	test("blocks provider changes when the selected thread already has content", () => {
+		expect(source).toContain("const isProviderSelectionLocked = shouldLockProviderSelection({");
+		expect(source).toContain("if (isProviderSelectionLocked) {");
+		expect(source).toContain("providerLocked={isProviderSelectionLocked}");
+	});
+
+	test("sends follow-up messages using the user-selected provider", () => {
+		expect(source).toContain("selectedProvider ?? undefined,");
+	});
+});

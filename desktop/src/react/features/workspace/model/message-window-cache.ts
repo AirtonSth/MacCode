@@ -1,4 +1,19 @@
 import type { MessageDTO, MessagePageDTO } from "../../../shared/api/remotecode-http";
+import { createEmptyMessageWindow, type MessageWindowState } from "./useWorkspaceStore";
+
+export type MessageWindowCache = Record<string, MessageWindowState | undefined>;
+
+interface ResolveSelectedMessageWindowInput {
+	selectedChatId: string | null;
+	liveWindow: MessageWindowState;
+	cache: MessageWindowCache;
+}
+
+interface ResolvedSelectedMessageWindow {
+	window: MessageWindowState;
+	hasHydratedWindow: boolean;
+	isLiveWindow: boolean;
+}
 
 const sortMessagesAscending = (messages: MessageDTO[]): MessageDTO[] =>
 	[...messages].sort((left, right) => {
@@ -73,4 +88,59 @@ export const pruneBufferedMessages = (
 ): MessageDTO[] => {
 	const serverMessageIds = new Set(serverMessages.map((message) => message.id));
 	return bufferedMessages.filter((message) => !serverMessageIds.has(message.id));
+};
+
+export const cacheLatestMessageWindow = (
+	cache: MessageWindowCache,
+	messageWindow: MessageWindowState,
+): MessageWindowCache => {
+	if (!messageWindow.chatId || messageWindow.mode !== "latest") {
+		return cache;
+	}
+
+	if (cache[messageWindow.chatId] === messageWindow) {
+		return cache;
+	}
+
+	return {
+		...cache,
+		[messageWindow.chatId]: messageWindow,
+	};
+};
+
+export const resolveSelectedMessageWindow = ({
+	selectedChatId,
+	liveWindow,
+	cache,
+}: ResolveSelectedMessageWindowInput): ResolvedSelectedMessageWindow => {
+	if (!selectedChatId) {
+		return {
+			hasHydratedWindow: false,
+			isLiveWindow: false,
+			window: createEmptyMessageWindow(),
+		};
+	}
+
+	if (liveWindow.chatId === selectedChatId) {
+		return {
+			hasHydratedWindow: true,
+			isLiveWindow: true,
+			window: liveWindow,
+		};
+	}
+
+	const cachedWindow = cache[selectedChatId];
+	if (cachedWindow) {
+		return {
+			hasHydratedWindow: true,
+			isLiveWindow: false,
+			window: cachedWindow,
+		};
+	}
+
+	return {
+		hasHydratedWindow: false,
+		isLiveWindow: false,
+		window: createEmptyMessageWindow(selectedChatId),
+	};
 };

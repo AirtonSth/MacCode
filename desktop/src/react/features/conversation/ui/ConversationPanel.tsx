@@ -280,17 +280,23 @@ export const ConversationPanel = ({
 	}, [liveTurn, streamHistoryTurns]);
 	const hasHistoricalRunDetails = historicalTurns.length > 0;
 	const hasStreaming = hasStreamingTimeline || hasStreamingText;
-	const hasContent = hasMessages || hasStreaming || isWorking;
 	const [showRunDetails, setShowRunDetails] = useState(false);
+	const shouldForceRunDetails = !hasMessages && !hasStreaming && hasHistoricalRunDetails;
+	const showHistoricalTurns = showRunDetails || shouldForceRunDetails;
+	const hasContent = hasMessages || hasStreaming || hasHistoricalRunDetails || isWorking;
+	const showLoadingSkeleton = loading && !hasContent;
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const scrollViewportRef = useRef<HTMLDivElement>(null);
 	const topPaginationTriggeredRef = useRef(false);
 	const latestReloadTriggeredRef = useRef(false);
 	const olderWindowBottomArmRef = useRef(false);
+	const suppressTopPaginationUntilScrollRef = useRef(false);
+	const restoreLatestBottomRef = useRef(false);
 	const isAtBottomRef = useRef(true);
 	const userScrolledUpRef = useRef(false);
 	const lastScrollTopRef = useRef(0);
 	const topPaginationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const previousMessageWindowModeRef = useRef(messageWindowMode);
 	// Track chat switches to suppress enter/exit animations (D-19).
 	const prevChatIdRef = useRef<string | null | undefined>(chat?.id);
 	const isChatSwitchRef = useRef(false);
@@ -377,7 +383,8 @@ export const ConversationPanel = ({
 			messageWindowMode === "latest" &&
 			viewport.scrollTop <= 32 &&
 			!loading &&
-			!topPaginationTriggeredRef.current
+			!topPaginationTriggeredRef.current &&
+			!suppressTopPaginationUntilScrollRef.current
 		) {
 			if (!topPaginationTimerRef.current) {
 				topPaginationTimerRef.current = setTimeout(() => {
@@ -391,6 +398,7 @@ export const ConversationPanel = ({
 			}
 		} else if (viewport.scrollTop > 32) {
 			topPaginationTriggeredRef.current = false;
+			suppressTopPaginationUntilScrollRef.current = false;
 			if (topPaginationTimerRef.current) {
 				clearTimeout(topPaginationTimerRef.current);
 				topPaginationTimerRef.current = null;
@@ -410,9 +418,22 @@ export const ConversationPanel = ({
 			!latestReloadTriggeredRef.current
 		) {
 			latestReloadTriggeredRef.current = true;
+			restoreLatestBottomRef.current = true;
+			suppressTopPaginationUntilScrollRef.current = true;
 			void onLoadLatestMessages?.();
 		}
 	}, [hasOlderMessages, loading, messageWindowMode, onLoadLatestMessages, onLoadOlderMessages, updateIsAtBottom]);
+	useEffect(() => {
+		if (
+			previousMessageWindowModeRef.current === "older" &&
+			messageWindowMode === "latest"
+		) {
+			restoreLatestBottomRef.current = true;
+			suppressTopPaginationUntilScrollRef.current = true;
+		}
+		previousMessageWindowModeRef.current = messageWindowMode;
+	}, [messageWindowMode]);
+
 	useEffect(() => {
 		setIsAtBottom(true);
 		isAtBottomRef.current = true;
@@ -421,6 +442,8 @@ export const ConversationPanel = ({
 		topPaginationTriggeredRef.current = false;
 		latestReloadTriggeredRef.current = false;
 		olderWindowBottomArmRef.current = false;
+		suppressTopPaginationUntilScrollRef.current = false;
+		restoreLatestBottomRef.current = false;
 		if (topPaginationTimerRef.current) {
 			clearTimeout(topPaginationTimerRef.current);
 			topPaginationTimerRef.current = null;
@@ -455,7 +478,12 @@ export const ConversationPanel = ({
 			}
 			return;
 		}
-		if (isAtBottomRef.current && !userScrolledUpRef.current) {
+		if (restoreLatestBottomRef.current) {
+			restoreLatestBottomRef.current = false;
+			forceScrollToBottom();
+			return;
+		}
+		if (!userScrolledUpRef.current) {
 			forceScrollToBottom();
 		}
 	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messageWindowMode, messages, streamingText, updateIsAtBottom]);
@@ -510,7 +538,7 @@ export const ConversationPanel = ({
 			)}
 
 			<div className="relative flex min-h-0 flex-1 flex-col" style={{ minHeight: 200 }}>
-				{loading ? (
+				{showLoadingSkeleton ? (
 					<div className={cn("space-y-4", focusMode ? "px-4 py-3 sm:px-6" : "px-5 py-3")}>
 						<div className="flex items-start gap-3">
 							<div className="h-6 w-6 animate-pulse rounded-full bg-slate-600/30" />
@@ -568,7 +596,7 @@ export const ConversationPanel = ({
 						{hasHistoricalRunDetails || (messageWindowMode === "older" && isLatestDirty) ? (
 							<div className={cn("px-5 pt-3", focusMode ? "sm:px-6" : "")}>
 								<div className="flex flex-wrap items-center gap-2">
-									{hasHistoricalRunDetails ? (
+									{hasHistoricalRunDetails && !shouldForceRunDetails ? (
 										<button
 											className={cn(
 												"rounded-lg border px-2.5 py-1 text-xs transition",
@@ -635,7 +663,7 @@ export const ConversationPanel = ({
 										/>
 									) : null}
 
-									{showRunDetails
+									{showHistoricalTurns
 										? historicalTurns.map((turn) => (
 												<StreamingTimeline
 													focusMode={focusMode}
@@ -710,7 +738,10 @@ export const ConversationPanel = ({
 									initial={{ opacity: 0, scale: 0.8 }}
 									key="scroll-to-bottom-fab"
 									onClick={() => {
+										userScrolledUpRef.current = false;
 										if (messageWindowMode === "older") {
+											restoreLatestBottomRef.current = true;
+											suppressTopPaginationUntilScrollRef.current = true;
 											void onLoadLatestMessages?.();
 											return;
 										}

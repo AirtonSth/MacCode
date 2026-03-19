@@ -192,6 +192,7 @@ test("WsService.startUserMessage forwards lifecycle updates to live activity pus
 			started.push(input);
 		},
 		upsertSubscription: async () => true,
+		upsertThreadCompletionSubscription: async () => true,
 		registerPushToStartToken: async () => {},
 	};
 

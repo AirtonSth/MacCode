@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { CodexModelDescriptor, CodexModelsCatalog } from "../../shared/codex-model-config";
-import { fetchModelsForProvider } from "./provider-change";
+import { fetchModelsForProvider, shouldLockProviderSelection } from "./provider-change";
 
 const makeModel = (overrides: Partial<CodexModelDescriptor> = {}): CodexModelDescriptor => ({
 	defaultReasoningEffort: "medium",
@@ -151,5 +151,47 @@ describe("fetchModelsForProvider (D-14: no flash of empty models)", () => {
 		const selectedModelCall = calls.find((c) => c.fn === "setSelectedModel");
 		expect(selectedModelCall).toBeDefined();
 		expect(selectedModelCall!.arg).toBeNull();
+	});
+});
+
+describe("shouldLockProviderSelection", () => {
+	test("locks provider changes once messages exist in the selected thread", () => {
+		expect(shouldLockProviderSelection({
+			hasStreamingText: false,
+			hasStreamingTurn: false,
+			messageCount: 1,
+			providerThreadId: null,
+			turnCount: 0,
+		})).toBe(true);
+	});
+
+	test("locks provider changes while a streamed response is visible", () => {
+		expect(shouldLockProviderSelection({
+			hasStreamingText: true,
+			hasStreamingTurn: false,
+			messageCount: 0,
+			providerThreadId: null,
+			turnCount: 0,
+		})).toBe(true);
+	});
+
+	test("locks provider changes for hydrated threads with a persisted provider thread id", () => {
+		expect(shouldLockProviderSelection({
+			hasStreamingText: false,
+			hasStreamingTurn: false,
+			messageCount: 0,
+			providerThreadId: "thread-42",
+			turnCount: 0,
+		})).toBe(true);
+	});
+
+	test("keeps provider changes enabled for empty draft threads", () => {
+		expect(shouldLockProviderSelection({
+			hasStreamingText: false,
+			hasStreamingTurn: false,
+			messageCount: 0,
+			providerThreadId: null,
+			turnCount: 0,
+		})).toBe(false);
 	});
 });

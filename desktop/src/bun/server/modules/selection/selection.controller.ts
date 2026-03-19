@@ -5,6 +5,7 @@ import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config
 import type { ChatProvider } from "../../shared/core/server.types";
 import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
+import type { ChatServiceContract } from "../chat/chat.service";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import type { WorkspaceSelectionService } from "./selection.service";
 
@@ -23,12 +24,17 @@ const parseSelectedProvider = (value: unknown): ChatProvider | null => {
 };
 
 export class SelectionController {
-	static build(service: WorkspaceSelectionService, workspaceEvents?: WorkspaceEventsServiceContract) {
-		return new SelectionController(service, workspaceEvents).build();
+	static build(
+		service: WorkspaceSelectionService,
+		chatService: ChatServiceContract,
+		workspaceEvents?: WorkspaceEventsServiceContract,
+	) {
+		return new SelectionController(service, chatService, workspaceEvents).build();
 	}
 
 	constructor(
 		private readonly service: WorkspaceSelectionService,
+		private readonly chatService: ChatServiceContract,
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 	) {}
 
@@ -91,12 +97,31 @@ export class SelectionController {
 							return { error: "invalid selectedProvider" };
 						}
 
+						const selectedChat =
+							body.selectedChatId === null
+								? null
+								: await this.chatService.getChatById(body.selectedChatId);
+						const lockedChatProvider =
+							selectedChat?.provider === "codex" || selectedChat?.provider === "claude"
+								? selectedChat.provider
+								: null;
+						if (
+							lockedChatProvider
+							&& body.selectedProvider !== undefined
+							&& selectedProvider !== null
+							&& selectedProvider !== lockedChatProvider
+						) {
+							set.status = 400;
+
+							return { error: "cannot change provider after thread creation" };
+						}
+
 						const selection = await this.service.saveWorkspaceSelection({
 							selectedChatId: body.selectedChatId,
 							selectedProjectId: body.selectedProjectId,
 							permissionMode,
 							selectedModel,
-							selectedProvider: selectedProvider ?? null,
+							selectedProvider: lockedChatProvider ?? selectedProvider ?? null,
 							selectedReasoningEffort,
 						});
 						const metadata = readMutationRequestMetadata(request);
@@ -128,5 +153,6 @@ export class SelectionController {
 
 export const createSelectionController = (
 	service: WorkspaceSelectionService,
+	chatService: ChatServiceContract,
 	workspaceEvents?: WorkspaceEventsServiceContract,
-) => SelectionController.build(service, workspaceEvents);
+) => SelectionController.build(service, chatService, workspaceEvents);

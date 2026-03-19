@@ -50,7 +50,6 @@ export const ThreadSelectionScreen = () => {
 		deleteChat,
 		clearAllProjectChats,
 		isLoaded,
-		isActiveThreadsLoading,
 		isChatsLoading,
 		isChatsFetching,
 		isMessagesLoading,
@@ -377,11 +376,12 @@ export const ThreadSelectionScreen = () => {
 						) : (
 							visibleThreads.map((chat, index) => (
 								<SwipeableThreadItem
+									chat={chat}
+									hasUnreadFinished={chat.hasUnreadFinished}
 									isLoading={openingThreadId === chat.id}
 									index={index}
 									isWorking={activeThreadIds.has(chat.id)}
 									isSelected={chat.id === selectedChatId}
-									chat={chat}
 									key={chat.id}
 									onLongPress={() => {
 										setThreadActionTarget(chat);
@@ -406,9 +406,8 @@ export const ThreadSelectionScreen = () => {
 			</ScrollView>
 			<ActiveThreadsFooterCta
 				count={selectedProjectActiveThreadsCount}
-				isLoading={isActiveThreadsLoading}
 				onPress={() => {
-					push("/active-threads");
+					push("/recent-threads");
 				}}
 				testID="threads-active-threads-cta"
 			/>

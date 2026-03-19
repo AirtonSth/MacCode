@@ -10,7 +10,12 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(({ classNa
 			className,
 		)}
 		ref={ref}
-		style={{ WebkitUserSelect: "text", userSelect: "text", ...style }}
+		style={{
+			...({ WebkitAppRegion: "no-drag" } as React.CSSProperties),
+			WebkitUserSelect: "text",
+			userSelect: "text",
+			...style,
+		}}
 		{...props}
 	/>
 ));

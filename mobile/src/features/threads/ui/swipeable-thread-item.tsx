@@ -12,6 +12,7 @@ const palette = {
 
 interface SwipeableThreadItemProps {
 	chat: ChatDTO;
+	hasUnreadFinished?: boolean;
 	index: number;
 	isWorking?: boolean;
 	isSelected: boolean;
@@ -23,6 +24,7 @@ interface SwipeableThreadItemProps {
 
 export const SwipeableThreadItem = ({
 	chat,
+	hasUnreadFinished = false,
 	index,
 	isWorking = false,
 	isSelected,
@@ -93,6 +95,12 @@ export const SwipeableThreadItem = ({
 							{chat.title}
 						</Text>
 						<View style={styles.metaRow}>
+							{!isWorking && hasUnreadFinished ? (
+								<View style={styles.finishedBadge}>
+									<View style={styles.finishedDot} />
+									<Text style={styles.finishedBadgeLabel}>Finished</Text>
+								</View>
+							) : null}
 							<Text style={styles.rowMeta}>Updated {formatRelativeTime(chat.updatedAt)}</Text>
 						</View>
 					</View>
@@ -126,9 +134,34 @@ const styles = StyleSheet.create({
 		backgroundColor: "rgba(99,200,255,0.18)",
 		borderColor: "rgba(99,200,255,0.74)",
 	},
+	finishedBadge: {
+		alignItems: "center",
+		backgroundColor: "rgba(52,211,153,0.12)",
+		borderColor: "rgba(52,211,153,0.35)",
+		borderRadius: 999,
+		borderWidth: 1,
+		flexDirection: "row",
+		gap: 4,
+		paddingHorizontal: 6,
+		paddingVertical: 2,
+	},
+	finishedBadgeLabel: {
+		color: "#A7F3D0",
+		fontSize: 10,
+		fontWeight: "700",
+		textTransform: "uppercase",
+	},
+	finishedDot: {
+		backgroundColor: "#A7F3D0",
+		borderRadius: 999,
+		height: 6,
+		width: 6,
+	},
 	metaRow: {
 		alignItems: "center",
 		flexDirection: "row",
+		flexWrap: "wrap",
+		gap: 6,
 		paddingTop: 3,
 	},
 	rowContent: {

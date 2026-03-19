@@ -16,6 +16,7 @@ import type {
 	MessagePageDTO,
 	ProjectSummaryDTO,
 	ProjectDTO,
+	RecentThreadSummaryDTO,
 	ThreadSummaryDTO,
 	TerminalCommandDTO,
 	TerminalEntryDTO,
@@ -60,6 +61,10 @@ interface ListThreadsResponse {
 
 interface ListActiveThreadsResponse {
 	threads: ActiveThreadSummaryDTO[];
+}
+
+interface ListRecentThreadsResponse {
+	threads: RecentThreadSummaryDTO[];
 }
 
 interface CreateChatResponse {
@@ -109,6 +114,7 @@ export interface RemoteCodeClient {
 	createChat: (projectId: string, title?: string, provider?: string) => Promise<ChatDTO>;
 	createProject: (input: { name?: string; path: string }) => Promise<ProjectDTO>;
 	deleteChat: (chatId: string) => Promise<DeleteResponse>;
+	markChatRead: (chatId: string) => Promise<ChatDTO>;
 	stopChat: (chatId: string) => Promise<StopChatResponse>;
 	deleteProject: (projectId: string) => Promise<DeleteResponse>;
 	execTerminalCommand: (
@@ -131,6 +137,7 @@ export interface RemoteCodeClient {
 	listChats: (projectId: string) => Promise<ChatDTO[]>;
 	listThreadSummaries: (projectId: string) => Promise<ThreadSummaryDTO[]>;
 	listActiveThreads: () => Promise<ActiveThreadSummaryDTO[]>;
+	listRecentThreads: () => Promise<RecentThreadSummaryDTO[]>;
 	listWorkspaceSummaries: () => Promise<WorkspaceSummaryDTO[]>;
 	listMessagesPage: (
 		chatId: string,
@@ -144,6 +151,10 @@ export interface RemoteCodeClient {
 	upsertChatLiveActivitySubscription: (
 		chatId: string,
 		input: { chatTitle?: string; liveActivityToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
+	) => Promise<LiveActivitySubscriptionResponse>;
+	upsertThreadCompletionSubscription: (
+		chatId: string,
+		input: { chatTitle?: string; enabled: boolean; pushToken: string; pushTokenType: "apns" | "fcm" },
 	) => Promise<LiveActivitySubscriptionResponse>;
 	registerPushToStartToken: (
 		input: { pushToStartToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },
@@ -310,6 +321,15 @@ export const createRemoteCodeClient = (
 			});
 		},
 
+		async markChatRead(chatId: string) {
+			const payload = await request<{ chat: ChatDTO }>({
+				method: "POST",
+				path: `/chats/${chatId}/read`,
+			});
+
+			return payload.chat;
+		},
+
 		async stopChat(chatId: string) {
 			return await request<StopChatResponse>({
 				method: "POST",
@@ -450,6 +470,15 @@ export const createRemoteCodeClient = (
 			return payload.threads;
 		},
 
+		async listRecentThreads() {
+			const payload = await request<ListRecentThreadsResponse>({
+				method: "GET",
+				path: "/threads/recent",
+			});
+
+			return payload.threads;
+		},
+
 		async listMessagesPage(chatId: string, options?: { beforeMessageId?: string; limit?: number }) {
 			const query = new URLSearchParams();
 			if (typeof options?.beforeMessageId === "string" && options.beforeMessageId.trim().length > 0) {
@@ -526,6 +555,38 @@ export const createRemoteCodeClient = (
 					throw error;
 				}
 			},
+
+		async upsertThreadCompletionSubscription(
+			chatId: string,
+			input: { chatTitle?: string; enabled: boolean; pushToken: string; pushTokenType: "apns" | "fcm" },
+		) {
+			try {
+				return await request<LiveActivitySubscriptionResponse>({
+					method: "POST",
+					path: `/chats/${chatId}/thread-completion/subscription`,
+					body: input,
+				});
+			} catch (error) {
+				if (error instanceof RemoteCodeRequestError && error.status === 501) {
+					return {
+						enabled: false,
+						subscribed: false,
+					};
+				}
+				if (
+					error instanceof RemoteCodeRequestError
+					&& error.status === 404
+					&& error.message.trim().toLowerCase() !== "chat not found"
+				) {
+					return {
+						enabled: false,
+						subscribed: false,
+					};
+				}
+
+				throw error;
+			}
+		},
 
 		async registerPushToStartToken(
 			input: { pushToStartToken: string; pushToken: string; pushTokenType: "apns" | "fcm" },

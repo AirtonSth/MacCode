@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 
 import type { MessageDTO } from "./useWorkspaceStore";
-import { sendWorkspaceMessage } from "./send-message";
+import {
+	DEFAULT_DRAFT_THREAD_TITLE,
+	deriveThreadTitleFromMessage,
+	isPlaceholderThreadTitle,
+	sendWorkspaceMessage,
+} from "./send-message";
 
 type EventPayload = {
 	code?: string;
@@ -200,4 +205,23 @@ test("sendWorkspaceMessage does not send when websocket is not connected", async
 			message: "WebSocket client is not ready",
 		},
 	]);
+});
+
+test("deriveThreadTitleFromMessage uses the first non-empty line and trims it", () => {
+	expect(deriveThreadTitleFromMessage("\n   Fix the sidebar status badges   \nMore details below")).toBe(
+		"Fix the sidebar status badges",
+	);
+});
+
+test("deriveThreadTitleFromMessage truncates long titles", () => {
+	const title = deriveThreadTitleFromMessage("A".repeat(120), 24);
+	expect(title).toBe("AAAAAAAAAAAAAAAAAAAAA...");
+	expect(title.length).toBe(24);
+});
+
+test("isPlaceholderThreadTitle recognises legacy placeholders and rejects real first-message titles", () => {
+	expect(isPlaceholderThreadTitle("New thread")).toBe(true);
+	expect(isPlaceholderThreadTitle("New chat")).toBe(true);
+	expect(isPlaceholderThreadTitle(DEFAULT_DRAFT_THREAD_TITLE)).toBe(true);
+	expect(isPlaceholderThreadTitle("Refactor thread selection cache")).toBe(false);
 });

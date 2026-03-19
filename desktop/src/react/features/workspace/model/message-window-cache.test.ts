@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 
 import type { MessageDTO, MessagePageDTO } from "../../../shared/api/remotecode-http";
+import type { MessageWindowState } from "./useWorkspaceStore";
 import {
 	appendMessageToMessagePage,
+	cacheLatestMessageWindow,
 	mergeBufferedMessagesIntoPage,
 	pruneBufferedMessages,
+	resolveSelectedMessageWindow,
 } from "./message-window-cache";
 
 const createPage = (messages: MessageDTO[] = []): MessagePageDTO => ({
@@ -12,6 +15,17 @@ const createPage = (messages: MessageDTO[] = []): MessagePageDTO => ({
 	messages,
 	nextBeforeMessageId: null,
 	turns: [],
+});
+
+const createWindow = (overrides: Partial<MessageWindowState> = {}): MessageWindowState => ({
+	chatId: "chat-1",
+	hasMore: false,
+	latestDirty: false,
+	messages: [],
+	mode: "latest",
+	nextBeforeMessageId: null,
+	turns: [],
+	...overrides,
 });
 
 const createMessage = (input: {
@@ -73,4 +87,77 @@ test("pruneBufferedMessages removes entries that the server already persisted", 
 	expect(pruneBufferedMessages(bufferedMessages, persistedMessages)).toEqual([
 		bufferedMessages[1],
 	]);
+});
+
+test("cacheLatestMessageWindow stores latest windows by chat id", () => {
+	const messageWindow = createWindow({
+		messages: [createMessage({ createdAt: "2026-01-01T00:00:00.000Z", id: "msg-1" })],
+	});
+
+	expect(cacheLatestMessageWindow({}, messageWindow)).toEqual({
+		"chat-1": messageWindow,
+	});
+});
+
+test("cacheLatestMessageWindow ignores older windows", () => {
+	const olderWindow = createWindow({
+		mode: "older",
+		nextBeforeMessageId: "msg-1",
+	});
+
+	expect(cacheLatestMessageWindow({}, olderWindow)).toEqual({});
+});
+
+test("resolveSelectedMessageWindow prefers the live selected window", () => {
+	const liveWindow = createWindow({
+		chatId: "chat-2",
+		messages: [createMessage({ chatId: "chat-2", createdAt: "2026-01-01T00:00:00.000Z", id: "msg-2" })],
+	});
+	const cachedWindow = createWindow({
+		chatId: "chat-2",
+		messages: [createMessage({ chatId: "chat-2", createdAt: "2026-01-01T00:00:00.000Z", id: "msg-stale" })],
+	});
+
+	expect(resolveSelectedMessageWindow({
+		cache: { "chat-2": cachedWindow },
+		liveWindow,
+		selectedChatId: "chat-2",
+	})).toEqual({
+		hasHydratedWindow: true,
+		isLiveWindow: true,
+		window: liveWindow,
+	});
+});
+
+test("resolveSelectedMessageWindow falls back to the cached latest window while a new selection loads", () => {
+	const liveWindow = createWindow({
+		chatId: "chat-1",
+		messages: [createMessage({ createdAt: "2026-01-01T00:00:00.000Z", id: "msg-1" })],
+	});
+	const cachedWindow = createWindow({
+		chatId: "chat-2",
+		messages: [createMessage({ chatId: "chat-2", createdAt: "2026-01-01T00:00:00.000Z", id: "msg-2" })],
+	});
+
+	expect(resolveSelectedMessageWindow({
+		cache: { "chat-2": cachedWindow },
+		liveWindow,
+		selectedChatId: "chat-2",
+	})).toEqual({
+		hasHydratedWindow: true,
+		isLiveWindow: false,
+		window: cachedWindow,
+	});
+});
+
+test("resolveSelectedMessageWindow returns an empty pending window when the selected chat has not loaded yet", () => {
+	expect(resolveSelectedMessageWindow({
+		cache: {},
+		liveWindow: createWindow({ chatId: "chat-1" }),
+		selectedChatId: "chat-2",
+	})).toEqual({
+		hasHydratedWindow: false,
+		isLiveWindow: false,
+		window: createWindow({ chatId: "chat-2" }),
+	});
 });

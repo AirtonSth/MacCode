@@ -1,12 +1,26 @@
 import { randomUUID } from "node:crypto";
 
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
-import { projects } from "../../shared/db/db.schema";
+import { chats, projects } from "../../shared/db/db.schema";
 import type { ProjectDTO, WorkspaceSummaryDTO } from "../../types";
 
 export class ProjectRepository {
+	private static readonly unreadFinishedThreadCountExpression = sql<number>`
+		coalesce(
+			sum(
+				case
+					when ${chats.finishedAt} is not null
+						and (${chats.lastReadAt} is null or ${chats.lastReadAt} < ${chats.finishedAt})
+					then 1
+					else 0
+				end
+			),
+			0
+		)
+	`;
+
 	private static toBoolean(value: number | boolean | null | undefined): boolean {
 		if (value === true) {
 			return true;
@@ -26,15 +40,22 @@ export class ProjectRepository {
 			isFavorite: ProjectRepository.toBoolean(row.isFavorite as number | boolean | null | undefined),
 			name: row.name,
 			path: row.path,
+			unreadFinishedThreadCount: 0,
 			updatedAt: row.updatedAt,
 		};
 	}
 
-	private static toWorkspaceSummaryDto(row: { id: string; name: string; path: string }): WorkspaceSummaryDTO {
+	private static toWorkspaceSummaryDto(row: {
+		id: string;
+		name: string;
+		path: string;
+		unreadFinishedThreadCount: number;
+	}): WorkspaceSummaryDTO {
 		return {
 			id: row.id,
 			name: row.name,
 			path: row.path,
+			unreadFinishedThreadCount: row.unreadFinishedThreadCount,
 		};
 	}
 
@@ -113,10 +134,18 @@ export class ProjectRepository {
 				id: projects.id,
 				name: projects.name,
 				path: projects.path,
+				unreadFinishedThreadCount: ProjectRepository.unreadFinishedThreadCountExpression,
 			})
 			.from(projects)
+			.leftJoin(chats, eq(chats.projectId, projects.id))
+			.groupBy(projects.id)
 			.orderBy(desc(projects.updatedAt))
-			.all() as Array<{ id: string; name: string; path: string }>;
+			.all() as Array<{
+				id: string;
+				name: string;
+				path: string;
+				unreadFinishedThreadCount: number;
+			}>;
 
 		return rows.map(ProjectRepository.toWorkspaceSummaryDto);
 	}

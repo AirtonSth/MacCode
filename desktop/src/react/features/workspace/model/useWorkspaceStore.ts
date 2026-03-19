@@ -11,17 +11,22 @@ export interface ProjectDTO {
 	path: string;
 	isFavorite: boolean;
 	createdAt: string;
+	unreadFinishedThreadCount?: number;
 	updatedAt: string;
 }
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
 
 export interface ChatDTO {
+	finishedAt?: string | null;
+	hasUnreadFinished?: boolean;
 	id: string;
 	isActive: boolean;
+	lastReadAt?: string | null;
 	projectId: string;
 	title: string;
 	provider: "fake" | "codex" | "claude";
+	providerThreadId?: string | null;
 	status: ChatStatus;
 	diffAdded: number;
 	diffRemoved: number;

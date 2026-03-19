@@ -14,7 +14,13 @@ import { MessageRepository } from "./modules/message/message.repository";
 import { createChatTurnSnapshotRepository } from "./modules/message/chat-turn-snapshot.repository";
 import { MessageService } from "./modules/message/message.service";
 import { createLiveActivitySubscriptionRepository } from "./modules/live-activity/live-activity-subscription.repository";
+import type { LiveActivityPushServiceContract } from "./modules/live-activity/live-activity-push.model";
 import { createPushToStartTokenRepository } from "./modules/live-activity/push-to-start-token.repository";
+import { createThreadCompletionPushRepository } from "./modules/live-activity/thread-completion-push.repository";
+import {
+	createNoopThreadCompletionPushService,
+	createThreadCompletionPushServiceFromEnvironment,
+} from "./modules/live-activity/thread-completion-push.service";
 import {
 	createLiveActivityPushServiceFromEnvironment,
 	createNoopLiveActivityPushService,
@@ -167,6 +173,7 @@ export const ServerBootstrap = {
 		const privateAccountRepository = createPrivateAccountRepository(serverMetadataRepository);
 		const liveActivitySubscriptionRepository = createLiveActivitySubscriptionRepository(databaseClient.orm);
 		const pushToStartTokenRepository = createPushToStartTokenRepository(databaseClient.orm);
+		const threadCompletionPushRepository = createThreadCompletionPushRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
 		const chatService = new ChatService(chatRepository, projectRepository);
@@ -186,22 +193,55 @@ export const ServerBootstrap = {
 		});
 		const workspaceEventsService = createWorkspaceEventsService(workspaceEventsRepository);
 		const serverMetadataService = createServerMetadataService(serverMetadataRepository, listenPort);
+		const getConnectorCredentials = () => {
+			const connector = privateAccountRepository.readConnector();
+			if (!connector) return null;
+			return {
+				backendUrl: connector.backendUrl,
+				connectorId: connector.connectorId,
+				connectorToken: connector.connectorToken,
+			};
+		};
 		const liveActivityPushService = options?.disableLiveActivityPush
 			? createNoopLiveActivityPushService()
 			: createLiveActivityPushServiceFromEnvironment({
-				getConnectorCredentials: () => {
-					const connector = privateAccountRepository.readConnector();
-					if (!connector) return null;
-					return {
-						backendUrl: connector.backendUrl,
-						connectorId: connector.connectorId,
-						connectorToken: connector.connectorToken,
-					};
-				},
+				getConnectorCredentials,
 				privateBackendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 				subscriptionStore: liveActivitySubscriptionRepository,
 				pushToStartTokenStore: pushToStartTokenRepository,
-		});
+			});
+		const threadCompletionPushService = options?.disableLiveActivityPush
+			? createNoopThreadCompletionPushService()
+			: createThreadCompletionPushServiceFromEnvironment({
+				getConnectorCredentials,
+				privateBackendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
+				subscriptionStore: threadCompletionPushRepository,
+			});
+		const mobilePushService: LiveActivityPushServiceContract = {
+			getIsEnabled: () => liveActivityPushService.getIsEnabled(),
+			getSupportedPushTokenTypes: async () => await liveActivityPushService.getSupportedPushTokenTypes(),
+			onAssistantDelta: (chatId, delta) => {
+				liveActivityPushService.onAssistantDelta(chatId, delta);
+			},
+			onAssistantEvent: (chatId, event) => {
+				liveActivityPushService.onAssistantEvent(chatId, event);
+			},
+			onChatStarted: (input) => {
+				liveActivityPushService.onChatStarted(input);
+			},
+			onChatFinished: async (input) => {
+				await Promise.all([
+					liveActivityPushService.onChatFinished(input),
+					threadCompletionPushService.onChatFinished(input),
+				]);
+			},
+			upsertSubscription: async (input) => await liveActivityPushService.upsertSubscription(input),
+			upsertThreadCompletionSubscription: async (input) =>
+				await threadCompletionPushService.upsertSubscription(input),
+			registerPushToStartToken: async (input) => {
+				await liveActivityPushService.registerPushToStartToken(input);
+			},
+		};
 		const privateAccountService = createPrivateAccountService(privateAccountRepository, {
 			backendUrl: options?.privateBackendUrl ?? serverConfig.privateBackendUrl,
 			localServerToken: serverConfig.token,
@@ -216,7 +256,7 @@ export const ServerBootstrap = {
 			workspaceEventsService,
 			chatStreamSnapshotRepository,
 			chatStreamEventRepository,
-			liveActivityPushService,
+			mobilePushService,
 			chatTurnSnapshotRepository,
 		);
 		const codexModelsService = new CodexModelsService();
@@ -284,7 +324,7 @@ export const ServerBootstrap = {
 					.use(MessageController.build(messageService))
 					.use(GitController.build(gitService, workspaceEventsService))
 					.use(ProviderController.build(codexModelsService, claudeModelsService))
-					.use(SelectionController.build(workspaceSelectionService, workspaceEventsService))
+					.use(SelectionController.build(workspaceSelectionService, chatService, workspaceEventsService))
 					.use(PrivateAccountController.build(privateAccountService))
 					.use(TerminalController.build(terminalService, workspaceEventsService))
 					.use(FsController.build(fsService)),

@@ -315,14 +315,14 @@ test.describe("Desktop data minimization", () => {
 		expect(countRequests(apiMock.requests, "GET", "/v1/projects/project-1/threads")).toBe(1);
 		expect(countRequests(apiMock.requests, "GET", "/v1/projects/project-1/chats")).toBe(0);
 		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/context")).toBe(1);
-		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/messages", "?limit=5")).toBeGreaterThan(0);
+		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/messages", "?limit=25")).toBeGreaterThan(0);
 		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/messages", "")).toBe(0);
 		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/stream-events")).toBe(0);
 
 		const messageRequest = apiMock.requests.find(
 			(entry) => entry.method === "GET" && entry.path === "/v1/chats/chat-2/messages",
 		);
-		expect(messageRequest?.search).toBe("?limit=5");
+		expect(messageRequest?.search).toBe("?limit=25");
 		expect(messageRequest?.headers.authorization).toBe("Bearer remotecode.io-token");
 		expect(messageRequest?.headers["x-remotecode-client-id"]).toBeTruthy();
 		expect(messageRequest?.headers["x-remotecode-request-id"]).toBeTruthy();
@@ -346,7 +346,7 @@ test.describe("Desktop data minimization", () => {
 
 		await expect.poll(() => countRequests(apiMock.requests, "GET", "/v1/chats/chat-1/context")).toBe(1);
 		await expect
-			.poll(() => countRequests(apiMock.requests, "GET", "/v1/chats/chat-1/messages", "?limit=5"))
+			.poll(() => countRequests(apiMock.requests, "GET", "/v1/chats/chat-1/messages", "?limit=25"))
 			.toBeGreaterThan(0);
 		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-1/messages", "")).toBe(0);
 		await expect.poll(() => countRequests(apiMock.requests, "GET", "/v1/chats/chat-1/stream-events")).toBe(0);
@@ -372,7 +372,7 @@ test.describe("Desktop data minimization", () => {
 		await expect(page.getByLabel("Message input")).toBeVisible();
 
 		await expect
-			.poll(() => countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/messages", "?limit=5"))
+			.poll(() => countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/messages", "?limit=25"))
 			.toBeGreaterThan(0);
 		expect(countRequests(apiMock.requests, "GET", "/v1/chats/chat-2/messages", "")).toBe(0);
 		await expect

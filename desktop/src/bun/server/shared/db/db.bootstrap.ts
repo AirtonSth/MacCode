@@ -11,6 +11,8 @@ const chatsCreateSql = `
 		isActive INTEGER NOT NULL DEFAULT 0,
 		diffAdded INTEGER NOT NULL DEFAULT 0,
 		diffRemoved INTEGER NOT NULL DEFAULT 0,
+		finishedAt TEXT,
+		lastReadAt TEXT,
 		updatedAt TEXT NOT NULL
 	)
 `;
@@ -101,6 +103,17 @@ const liveActivitySubscriptionsCreateSql = `
 	)
 `;
 
+const threadCompletionPushSubscriptionsCreateSql = `
+	CREATE TABLE IF NOT EXISTS thread_completion_push_subscriptions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		chatId TEXT NOT NULL,
+		chatTitle TEXT,
+		pushToken TEXT NOT NULL,
+		pushTokenType TEXT NOT NULL CHECK(pushTokenType IN ('apns', 'fcm')),
+		updatedAt TEXT NOT NULL
+	)
+`;
+
 export class DatabaseBootstrap {
 	static initialize(database: Database): void {
 		this.enableForeignKeys(database);
@@ -118,6 +131,7 @@ export class DatabaseBootstrap {
 		this.createServerMetadataTable(database);
 		this.createOrMigrateLiveActivitySubscriptionsTable(database);
 		this.createPushToStartTokensTable(database);
+		this.createThreadCompletionPushSubscriptionsTable(database);
 		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
 	}
@@ -180,19 +194,32 @@ export class DatabaseBootstrap {
 	private static needsChatsMigration(database: Database): boolean {
 		const hasThreadColumn = this.hasColumn(database, "chats", "providerThreadId");
 		const hasIsActiveColumn = this.hasColumn(database, "chats", "isActive");
+		const hasFinishedAtColumn = this.hasColumn(database, "chats", "finishedAt");
+		const hasLastReadAtColumn = this.hasColumn(database, "chats", "lastReadAt");
 		const createSql = this.getTableDefinition(database, "chats");
 		const hasLegacyProviderConstraint = createSql.includes("CHECK(provider = 'fake')");
 		const missingClaudeProvider = !createSql.includes("'claude'");
-		return hasLegacyProviderConstraint || missingClaudeProvider || !hasThreadColumn || !hasIsActiveColumn;
+		return hasLegacyProviderConstraint
+			|| missingClaudeProvider
+			|| !hasThreadColumn
+			|| !hasIsActiveColumn
+			|| !hasFinishedAtColumn
+			|| !hasLastReadAtColumn;
 	}
 
 	private static rebuildChatsTable(database: Database): void {
 		const hasThreadColumn = this.hasColumn(database, "chats", "providerThreadId");
 		const hasIsActiveColumn = this.hasColumn(database, "chats", "isActive");
+		const hasFinishedAtColumn = this.hasColumn(database, "chats", "finishedAt");
+		const hasLastReadAtColumn = this.hasColumn(database, "chats", "lastReadAt");
 		const threadSelection = hasThreadColumn ? "providerThreadId" : "NULL";
 		const isActiveSelection = hasIsActiveColumn
 			? "COALESCE(isActive, CASE WHEN status = 'running' THEN 1 ELSE 0 END)"
 			: "CASE WHEN status = 'running' THEN 1 ELSE 0 END";
+		const finishedAtSelection = hasFinishedAtColumn
+			? "finishedAt"
+			: "CASE WHEN status IN ('completed', 'failed') THEN updatedAt ELSE NULL END";
+		const lastReadAtSelection = hasLastReadAtColumn ? "lastReadAt" : "NULL";
 
 		database.exec("PRAGMA foreign_keys = OFF;");
 		database.exec("BEGIN;");
@@ -209,6 +236,8 @@ export class DatabaseBootstrap {
 					isActive INTEGER NOT NULL DEFAULT 0,
 					diffAdded INTEGER NOT NULL DEFAULT 0,
 					diffRemoved INTEGER NOT NULL DEFAULT 0,
+					finishedAt TEXT,
+					lastReadAt TEXT,
 					updatedAt TEXT NOT NULL
 				)
 			`);
@@ -224,6 +253,8 @@ export class DatabaseBootstrap {
 					isActive,
 					diffAdded,
 					diffRemoved,
+					finishedAt,
+					lastReadAt,
 					updatedAt
 				)
 				SELECT
@@ -239,6 +270,8 @@ export class DatabaseBootstrap {
 					${isActiveSelection},
 					COALESCE(diffAdded, 0),
 					COALESCE(diffRemoved, 0),
+					${finishedAtSelection},
+					${lastReadAtSelection},
 					updatedAt
 				FROM chats
 			`);
@@ -480,6 +513,10 @@ export class DatabaseBootstrap {
 		`);
 	}
 
+	private static createThreadCompletionPushSubscriptionsTable(database: Database): void {
+		database.exec(threadCompletionPushSubscriptionsCreateSql);
+	}
+
 	private static dropLegacyTerminalSessionsTable(database: Database): void {
 		if (!this.hasTable(database, "terminal_sessions")) {
 			return;
@@ -532,6 +569,12 @@ export class DatabaseBootstrap {
 		);
 		database.exec(
 			"CREATE UNIQUE INDEX IF NOT EXISTS idx_push_to_start_tokens_device ON push_to_start_tokens(pushTokenType, pushToken)",
+		);
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_thread_completion_push_chat_id ON thread_completion_push_subscriptions(chatId)",
+		);
+		database.exec(
+			"CREATE UNIQUE INDEX IF NOT EXISTS idx_thread_completion_push_chat_device ON thread_completion_push_subscriptions(chatId, pushTokenType, pushToken)",
 		);
 	}
 }

@@ -47,7 +47,6 @@ export const WorkspaceSelectionScreen = () => {
 		deleteProject,
 		clearAllProjectChats,
 		isLoaded,
-		isActiveThreadsLoading,
 		isChatsLoading,
 		projects,
 		renameProject,
@@ -248,7 +247,26 @@ export const WorkspaceSelectionScreen = () => {
 			style={styles.root}
 			testID="screen-workspaces"
 		>
-			<IosStackHeader subtitle="Select workspace" title="Workspaces" />
+			<IosStackHeader
+				right={
+					<Pressable
+						hitSlop={10}
+						onPress={() => {
+							push("/recent-threads");
+						}}
+						style={({ pressed }) => [
+							styles.recentButton,
+							pressed ? styles.recentButtonPressed : null,
+						]}
+						testID="workspaces-recent-button"
+					>
+						<Text style={styles.recentButtonLabel}>Recent</Text>
+					</Pressable>
+				}
+				shouldShowBack={false}
+				subtitle="Select workspace"
+				title="Workspaces"
+			/>
 
 			<ScrollView
 				contentContainerStyle={styles.content}
@@ -300,6 +318,7 @@ export const WorkspaceSelectionScreen = () => {
 									}}
 									project={project}
 									rowTestID={`workspace-item-${String(index)}`}
+									unreadFinishedThreadCount={project.unreadFinishedThreadCount}
 								/>
 							))
 						)}
@@ -316,9 +335,8 @@ export const WorkspaceSelectionScreen = () => {
 			</ScrollView>
 			<ActiveThreadsFooterCta
 				count={activeThreadsCount}
-				isLoading={isActiveThreadsLoading}
 				onPress={() => {
-					push("/active-threads");
+					push("/recent-threads");
 				}}
 				testID="workspaces-active-threads-cta"
 			/>
@@ -532,6 +550,21 @@ const styles = StyleSheet.create({
 		borderWidth: 1,
 		gap: 8,
 		padding: 10,
+	},
+	recentButton: {
+		alignItems: "center",
+		borderRadius: 10,
+		justifyContent: "center",
+		paddingHorizontal: 10,
+		paddingVertical: 6,
+	},
+	recentButtonLabel: {
+		color: palette.accent,
+		fontSize: 14,
+		fontWeight: "600",
+	},
+	recentButtonPressed: {
+		backgroundColor: "rgba(255,255,255,0.08)",
 	},
 	root: {
 		backgroundColor: palette.background,

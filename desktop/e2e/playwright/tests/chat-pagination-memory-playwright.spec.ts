@@ -279,7 +279,7 @@ const countLatestPageRequests = (entries: RequestLogEntry[]): number =>
 		(entry) =>
 			entry.method === "GET"
 			&& entry.path === "/v1/chats/chat-1/messages"
-			&& entry.search === "?limit=5",
+			&& entry.search === "?limit=25",
 	).length;
 
 const conversationRows = (page: Page) => page.locator('[data-testid^="conversation-message-row-"]');
@@ -324,7 +324,7 @@ test("chat pagination keeps one rendered page and reloads latest only after leav
 					entry.method === "GET"
 					&& entry.path === "/v1/chats/chat-1/messages"
 					&& entry.search.includes("beforeMessageId=message-08")
-					&& entry.search.includes("limit=5"),
+					&& entry.search.includes("limit=25"),
 			),
 		)
 		.toBe(true);
@@ -423,7 +423,7 @@ test("optimistic send is replaced by assistant_done refresh without duplicating 
 	await page.getByLabel("Message input").press("Enter");
 
 	await expect(page.getByText(optimisticMessage)).toHaveCount(1);
-	await expect(conversationRows(page)).toHaveCount(5);
+	await expect(conversationRows(page)).toHaveCount(6);
 
 	await expect
 		.poll(async () => {

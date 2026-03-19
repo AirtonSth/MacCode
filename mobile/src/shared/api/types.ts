@@ -4,6 +4,7 @@ export interface ProjectDTO {
 	path: string;
 	isFavorite: boolean;
 	createdAt: string;
+	unreadFinishedThreadCount?: number;
 	updatedAt: string;
 }
 
@@ -11,12 +12,14 @@ export interface WorkspaceSummaryDTO {
 	id: string;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 }
 
 export interface ProjectSummaryDTO {
 	id: string;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 }
 
 export type ChatStatus = "pending" | "running" | "completed" | "failed";
@@ -26,14 +29,19 @@ export interface ChatDTO {
 	isActive: boolean;
 	projectId: string;
 	provider: "fake" | "codex" | "claude";
+	providerThreadId?: string | null;
 	title: string;
 	status: ChatStatus;
 	diffAdded: number;
 	diffRemoved: number;
+	finishedAt?: string | null;
+	hasUnreadFinished?: boolean;
+	lastReadAt?: string | null;
 	updatedAt: string;
 }
 
 export interface ThreadSummaryDTO {
+	hasUnreadFinished?: boolean;
 	id: string;
 	isActive: boolean;
 	title: string;
@@ -42,6 +50,16 @@ export interface ThreadSummaryDTO {
 
 export interface ActiveThreadSummaryDTO {
 	id: string;
+	projectId: string;
+	projectName: string;
+	title: string;
+	updatedAt: string;
+}
+
+export interface RecentThreadSummaryDTO {
+	hasUnreadFinished?: boolean;
+	id: string;
+	isActive: boolean;
 	projectId: string;
 	projectName: string;
 	title: string;
@@ -258,6 +276,7 @@ export interface ChatUpdatedEvent {
 		diffAdded: number;
 		diffRemoved: number;
 		isActive: boolean;
+		providerThreadId?: string | null;
 		status: ChatStatus;
 		updatedAt: string;
 	};

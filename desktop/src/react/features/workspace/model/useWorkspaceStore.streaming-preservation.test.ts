@@ -77,8 +77,8 @@ const makeTurn = (turnId: string, status: "running" | "completed" | "failed" = "
 	finishedAtMs: status === "running" ? null : 2000,
 });
 
-describe("SET_SELECTED_CHAT streaming state preservation", () => {
-	test("preserves streaming state for ALL chats when switching", () => {
+describe("SET_SELECTED_CHAT transient chat state pruning", () => {
+	test("keeps only the newly selected chat transient state when switching", () => {
 		const initialState: WorkspaceState = {
 			...baseWorkspaceState(),
 			selectedChatId: "chat-A",
@@ -131,28 +131,19 @@ describe("SET_SELECTED_CHAT streaming state preservation", () => {
 		});
 
 		expect(updated.streamingByChat).toEqual({
-			"chat-A": "partial response for A",
 			"chat-B": "partial response for B",
 		});
-		expect(updated.streamingActiveByChat).toEqual({
-			"chat-A": true,
-			"chat-B": false,
-		});
+		expect(updated.streamingActiveByChat).toEqual({});
 		expect(updated.streamTurnsByChat).toEqual({
-			"chat-A": makeTurn("turn-a1"),
 			"chat-B": makeTurn("turn-b1", "completed"),
 		});
 		expect(updated.lastAssistantEventIdByChat).toEqual({
-			"chat-A": 10,
 			"chat-B": 5,
 		});
-		expect(updated.sendingByChat).toEqual({
-			"chat-A": true,
-			"chat-B": false,
-		});
+		expect(updated.sendingByChat).toEqual({});
 	});
 
-	test("preserves streamHistoryByChat when switching chats", () => {
+	test("keeps only streamHistoryByChat entries for the newly selected chat", () => {
 		const historyA: StreamTurnState[] = [
 			makeTurn("turn-a1", "completed"),
 			makeTurn("turn-a2", "completed"),
@@ -184,10 +175,8 @@ describe("SET_SELECTED_CHAT streaming state preservation", () => {
 			payload: "chat-B",
 		});
 
-		expect(updated.streamHistoryByChat["chat-A"]).toEqual(historyA);
 		expect(updated.streamHistoryByChat["chat-B"]).toEqual(historyB);
 		expect(updated.streamHistoryByChat).toEqual({
-			"chat-A": historyA,
 			"chat-B": historyB,
 		});
 	});

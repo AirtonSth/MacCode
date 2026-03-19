@@ -43,3 +43,28 @@ describe("[D-56] Model dropdown avoids a premature empty state while loading", (
 		expect(composerSource).toContain('<option value="">Loading models...</option>');
 	});
 });
+
+describe("[D-64] Provider stays fixed once a thread already has messages", () => {
+	it("accepts a dedicated providerLocked prop", () => {
+		expect(composerSource).toContain("providerLocked?: boolean");
+		expect(composerSource).toContain("providerLocked = false");
+	});
+
+	it("disables only the provider select when providerLocked is true", () => {
+		expect(composerSource).toContain("disabled={isInputLocked || providerLocked}");
+	});
+});
+
+describe("[D-63] textarea respects composition and native editing shortcuts", () => {
+	it("guards Enter-send while the user is composing accented characters", () => {
+		expect(composerSource).toContain("event.nativeEvent.isComposing");
+		expect(composerSource).toContain('event.key === "Dead"');
+		expect(composerSource).toContain('event.key === "Process"');
+	});
+
+	it("adds explicit fallback handling for select-all and paste", () => {
+		expect(composerSource).toContain("textareaRef.current?.select()");
+		expect(composerSource).toContain("navigator.clipboard.readText()");
+		expect(composerSource).toContain("replaceComposerSelection(clipboardText)");
+	});
+});

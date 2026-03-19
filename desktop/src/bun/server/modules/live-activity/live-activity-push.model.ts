@@ -55,6 +55,27 @@ export interface PushToStartTokenStoreContract {
 	deleteByPushToken(pushToken: string, pushTokenType: LiveActivityPushTokenType): void;
 }
 
+export interface ThreadCompletionPushSubscriptionInput {
+	chatId: string;
+	chatTitle?: string;
+	pushToken: string;
+	pushTokenType: LiveActivityPushTokenType;
+}
+
+export interface ThreadCompletionPushSubscriptionMutationInput extends ThreadCompletionPushSubscriptionInput {
+	enabled: boolean;
+}
+
+export interface ThreadCompletionPushStoredSubscription extends ThreadCompletionPushSubscriptionInput {
+	updatedAt: string;
+}
+
+export interface ThreadCompletionPushSubscriptionStoreContract {
+	deleteExact(input: ThreadCompletionPushSubscriptionInput): void;
+	listAll(): ThreadCompletionPushStoredSubscription[];
+	upsert(input: ThreadCompletionPushSubscriptionInput): ThreadCompletionPushStoredSubscription;
+}
+
 export interface LiveActivityPushServiceContract {
 	getIsEnabled(): boolean;
 	getSupportedPushTokenTypes(): Promise<ReadonlySet<LiveActivityPushTokenType>>;
@@ -63,5 +84,6 @@ export interface LiveActivityPushServiceContract {
 	onChatStarted(input: LiveActivityPushStartInput): void;
 	onChatFinished(input: LiveActivityPushFinishInput): Promise<void>;
 	upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean>;
+	upsertThreadCompletionSubscription(input: ThreadCompletionPushSubscriptionMutationInput): Promise<boolean>;
 	registerPushToStartToken(input: PushToStartTokenInput): Promise<void>;
 }

@@ -21,4 +21,13 @@ describe("[M-41] provider change preserves the selected model until new models r
 		);
 		expect(modelsEffectBlock).not.toBeNull();
 	});
+
+	it("locks provider changes only after the selected thread has a provider thread id", () => {
+		expect(source).toContain("const selectedChatProviderThreadId = useMemo(");
+		expect(source).toContain("const isProviderLocked = selectedChatProviderThreadId !== null;");
+		expect(source).toContain("if (selectedChatProviderThreadId) {");
+		expect(source).toContain("const effectiveProvider = selectedChatProviderThreadId");
+		expect(source).toContain("? selectedChatProvider ?? undefined");
+		expect(source).toContain(": selectedProvider ?? undefined;");
+	});
 });

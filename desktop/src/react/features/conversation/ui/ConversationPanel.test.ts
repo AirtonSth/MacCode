@@ -27,7 +27,7 @@ describe("D-18: scroll-to-bottom threshold", () => {
 	});
 
 	test("auto-scroll is gated by userScrolledUpRef", () => {
-		expect(source).toContain("isAtBottomRef.current && !userScrolledUpRef.current");
+		expect(source).toContain("!userScrolledUpRef.current");
 	});
 
 	test("userScrolledUpRef is reset when at bottom", () => {
@@ -240,5 +240,22 @@ describe("[D-52/D-53/D-55] content polish", () => {
 
 	test("uses mirror repeat type for the streaming activity dot", () => {
 		expect(source).toContain('repeatType: "mirror"');
+	});
+});
+
+describe("[D-63/D-64] resilient conversation hydration", () => {
+	test("only renders the loading skeleton when there is no visible content yet", () => {
+		expect(source).toContain("const showLoadingSkeleton = loading && !hasContent;");
+		expect(source).toContain("{showLoadingSkeleton ? (");
+	});
+
+	test("treats historical run details as real content", () => {
+		expect(source).toContain("const hasContent = hasMessages || hasStreaming || hasHistoricalRunDetails || isWorking;");
+	});
+
+	test("forces historical turn details open when they are the only content", () => {
+		expect(source).toContain("const shouldForceRunDetails = !hasMessages && !hasStreaming && hasHistoricalRunDetails;");
+		expect(source).toContain("const showHistoricalTurns = showRunDetails || shouldForceRunDetails;");
+		expect(source).toContain("{showHistoricalTurns");
 	});
 });

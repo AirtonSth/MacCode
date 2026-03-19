@@ -36,6 +36,7 @@ interface MessageComposerProps {
 	selectedModel: string | null;
 	onModelChange: (model: string) => void;
 	selectedProvider: SelectedProvider;
+	providerLocked?: boolean;
 	onProviderChange: (provider: SelectedProvider) => void;
 	availableReasoningEfforts: CodexReasoningEffort[];
 	selectedReasoningEffort: CodexReasoningEffort | null;
@@ -67,6 +68,7 @@ export const MessageComposer = ({
 	selectedModel,
 	onModelChange,
 	selectedProvider,
+	providerLocked = false,
 	onProviderChange,
 	availableReasoningEfforts,
 	selectedReasoningEffort,
@@ -88,6 +90,7 @@ export const MessageComposer = ({
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const [isDraggingPaths, setIsDraggingPaths] = useState(false);
+	const [isComposing, setIsComposing] = useState(false);
 	const shouldReduceMotion = useReducedMotion();
 	const isRunning = chatStatus === "running";
 	const isInputLocked = disabled || sending || isRunning;
@@ -241,6 +244,27 @@ export const MessageComposer = ({
 		}
 	};
 
+	const replaceComposerSelection = (nextText: string) => {
+		const textarea = textareaRef.current;
+		if (!textarea) {
+			setValue((currentValue) => `${currentValue}${nextText}`);
+			return;
+		}
+
+		const selectionStart = textarea.selectionStart ?? textarea.value.length;
+		const selectionEnd = textarea.selectionEnd ?? textarea.value.length;
+		setValue((currentValue) => `${currentValue.slice(0, selectionStart)}${nextText}${currentValue.slice(selectionEnd)}`);
+		if (validationError) {
+			setValidationError(null);
+		}
+
+		requestAnimationFrame(() => {
+			const cursor = selectionStart + nextText.length;
+			textarea.focus();
+			textarea.setSelectionRange(cursor, cursor);
+		});
+	};
+
 	useLayoutEffect(() => {
 		const textarea = textareaRef.current;
 		if (!textarea) {
@@ -254,6 +278,35 @@ export const MessageComposer = ({
 	}, [value]);
 
 	const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+		if (isComposing || event.nativeEvent.isComposing || event.key === "Dead" || event.key === "Process") {
+			return;
+		}
+
+		if (event.metaKey || event.ctrlKey) {
+			const shortcutKey = event.key.toLowerCase();
+			if (shortcutKey === "a") {
+				event.preventDefault();
+				textareaRef.current?.select();
+				return;
+			}
+
+			if (shortcutKey === "v") {
+				event.preventDefault();
+				void navigator.clipboard.readText().then((clipboardText) => {
+					if (clipboardText.length === 0) {
+						return;
+					}
+
+					replaceComposerSelection(clipboardText);
+				}).catch(() => {
+					// Keep native fallback best-effort in runtimes without clipboard access.
+				});
+				return;
+			}
+
+			return;
+		}
+
 		if (event.key !== "Enter") {
 			return;
 		}
@@ -327,6 +380,12 @@ export const MessageComposer = ({
 						disabled={isInputLocked}
 						maxLength={MAX_MESSAGE_LENGTH}
 						onChange={handleInputChange}
+						onCompositionEnd={() => {
+							setIsComposing(false);
+						}}
+						onCompositionStart={() => {
+							setIsComposing(true);
+						}}
 						onKeyDown={handleInputKeyDown}
 						placeholder={
 							disabled
@@ -356,10 +415,10 @@ export const MessageComposer = ({
 							</Button>
 
 							<div className="relative shrink-0">
-							<select
+								<select
 									aria-label="Provider"
 									className={cn(subtleSelectClass, "min-w-[68px]")}
-								disabled={isInputLocked}
+									disabled={isInputLocked || providerLocked}
 									id={focusMode ? "provider-focus" : "provider"}
 									onChange={(event) => {
 										onProviderChange(event.target.value as SelectedProvider);

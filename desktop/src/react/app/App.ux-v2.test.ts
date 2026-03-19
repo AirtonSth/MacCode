@@ -34,3 +34,34 @@ describe("[D-51] errors auto-dismiss after 6 seconds", () => {
 		expect(appSource).toContain("dispatch({ payload: error.id, type: \"REMOVE_ERROR\" });");
 	});
 });
+
+describe("[D-61/D-62] thread title and activity persistence polish", () => {
+	it("uses a neutral draft title instead of the legacy New thread placeholder", () => {
+		expect(appSource).toContain("DEFAULT_DRAFT_THREAD_TITLE");
+		expect(appSource).not.toContain('title: "New thread"');
+	});
+
+	it("keeps working state tied to cached thread activity while a thread reloads", () => {
+		expect(appSource).toContain("const cachedSelectedChat = useMemo(() => {");
+		expect(appSource).toContain("activeThreadChat.isActive");
+		expect(appSource).toContain("state.streamingActiveByChat[activeThreadChat.id]");
+	});
+
+	it("resolves the visible message window from the mobile-style query cache while a selected thread reloads", () => {
+		expect(appSource).toContain("const messagesQuery = useMessagesQuery(api, selectedChatId");
+		expect(appSource).toContain("const visibleMessages = messagesQuery.messages;");
+		expect(appSource).toContain("messagesQuery.isPlaceholderData");
+		expect(appSource).toContain("mapChatTurnsToStreamTurns(messagesQuery.page.turns ?? [])");
+	});
+
+	it("keeps the thread-opening spinner until the selected window is actually hydrated", () => {
+		expect(appSource).toContain("setOpeningThreadId(chatId);");
+		expect(appSource).toContain("!messagesQuery.isPlaceholderData");
+		expect(appSource).toContain("messagesQuery.fetchStatus !== \"fetching\"");
+	});
+
+	it("renders the sidebar thread status indicator in a dedicated left column", () => {
+		expect(appSource).toContain("grid-cols-[auto_minmax(0,1fr)_auto]");
+		expect(appSource).toContain("getThreadStatusTooltip");
+	});
+});

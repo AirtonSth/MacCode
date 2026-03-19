@@ -214,6 +214,28 @@ const resolveLiveActivitySubscriptionTransport = (input: {
 	return null;
 };
 
+const toPushSignature = (input: { pushToken: string; pushTokenType: "apns" | "fcm" }): string =>
+	`${input.pushTokenType}::${input.pushToken}`;
+
+const parsePushSignature = (
+	signature: string,
+): { pushToken: string; pushTokenType: "apns" | "fcm" } | null => {
+	const [pushTokenType, ...pushTokenParts] = signature.split("::");
+	if ((pushTokenType !== "apns" && pushTokenType !== "fcm") || pushTokenParts.length === 0) {
+		return null;
+	}
+
+	const pushToken = pushTokenParts.join("::").trim();
+	if (pushToken.length === 0) {
+		return null;
+	}
+
+	return {
+		pushToken,
+		pushTokenType,
+	};
+};
+
 const isPlaceholderThreadTitle = (title: string): boolean => {
 	const normalized = title.trim().toLowerCase();
 	return normalized === "new thread" || normalized === "new chat";
@@ -383,25 +405,35 @@ const parseWorkspaceEventMessage = (payload: Record<string, unknown> | null): Me
 	};
 };
 
-const toProjectDtoFromSummary = (project: { id: string; name: string; path: string }): ProjectDTO => ({
+const toProjectDtoFromSummary = (project: {
+	id: string;
+	name: string;
+	path: string;
+	unreadFinishedThreadCount?: number;
+}): ProjectDTO => ({
 	createdAt: "",
 	id: project.id,
 	isFavorite: false,
 	name: project.name,
 	path: project.path,
+	unreadFinishedThreadCount: project.unreadFinishedThreadCount ?? 0,
 	updatedAt: "",
 });
 
 const toChatDtoFromThreadSummary = (
-	chat: { id: string; isActive: boolean; title: string; updatedAt: string },
+	chat: { hasUnreadFinished?: boolean; id: string; isActive: boolean; title: string; updatedAt: string },
 	projectId: string | null,
 ): ChatDTO => ({
 	diffAdded: 0,
 	diffRemoved: 0,
+	finishedAt: null,
+	hasUnreadFinished: chat.hasUnreadFinished,
 	id: chat.id,
 	isActive: chat.isActive,
+	lastReadAt: null,
 	projectId: projectId ?? "",
 	provider: "codex",
+	providerThreadId: null,
 	status: chat.isActive ? "running" : "pending",
 	title: chat.title,
 	updatedAt: chat.updatedAt,
@@ -409,7 +441,7 @@ const toChatDtoFromThreadSummary = (
 
 type ThreadListChatEntry =
 	| ChatDTO
-	| { id: string; isActive?: boolean; title: string; updatedAt: string };
+	| { hasUnreadFinished?: boolean; id: string; isActive?: boolean; title: string; updatedAt: string };
 
 const sortThreadListChatEntries = <T extends ThreadListChatEntry>(entries: T[]): T[] => (
 	Array.from(entries).sort(
@@ -508,6 +540,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const pushDeliveryTokenRef = useRef<PushDeliveryToken | null>(null);
 	const liveActivityTokenByChatRef = useRef<Record<string, string>>({});
 	const registeredLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
+	const registeredThreadCompletionPushSignatureByChatRef = useRef<Record<string, string>>({});
 	const pendingLiveActivitySignatureByChatRef = useRef<Record<string, string>>({});
 	const structuredLiveActivityPreviewByChatRef = useRef<Record<string, true>>({});
 	const backgroundStreamPreviewByChatRef = useRef<Record<string, string>>({});
@@ -604,6 +637,39 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		invalidateWorkspaceQuery(queryKeys.projectGitBranches(activeProjectId));
 	}, [invalidateWorkspaceQuery]);
 
+	const syncReadStateForChat = useCallback(
+		async (chatId: string, projectId: string | null) => {
+			try {
+				const chat = await client.markChatRead(chatId);
+				queryClient.setQueryData<ChatContextDTO>(
+					queryKeys.chatContext(chatId),
+					(current) => (
+						current
+							? {
+								...current,
+								chat: {
+									...current.chat,
+									finishedAt: chat.finishedAt,
+									hasUnreadFinished: chat.hasUnreadFinished,
+									lastReadAt: chat.lastReadAt,
+								},
+							}
+							: current
+					),
+				);
+				invalidateWorkspaceQuery(queryKeys.projects);
+				invalidateWorkspaceQuery(queryKeys.recentThreads);
+				invalidateWorkspaceQuery(queryKeys.activeThreads);
+				if (projectId) {
+					invalidateWorkspaceQuery(queryKeys.chats(projectId));
+				}
+			} catch {
+				// Keep read-sync best-effort to avoid noisy UX while navigating.
+			}
+		},
+		[client, invalidateWorkspaceQuery, queryClient],
+	);
+
 	const streamTurnQuery = useQuery<StreamTurnState | null>({
 		gcTime: Number.POSITIVE_INFINITY,
 		initialData: null,
@@ -613,7 +679,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	});
 
 	const projects = useMemo<ProjectDTO[]>(() => {
-		const rawProjects = (projectsQuery.data ?? []) as (ProjectDTO | { id: string; name: string; path: string })[];
+		const rawProjects = (projectsQuery.data ?? []) as (ProjectDTO | {
+			id: string;
+			name: string;
+			path: string;
+			unreadFinishedThreadCount: number;
+		})[];
 		return rawProjects.map((project) => (
 			"isFavorite" in project
 				? project
@@ -623,13 +694,14 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const chats = useMemo<ChatDTO[]>(() => {
 		const rawChats = (chatsQuery.data ?? []) as (| ChatDTO
-			| { id: string; isActive?: boolean; title: string; updatedAt: string })[];
+			| { hasUnreadFinished?: boolean; id: string; isActive?: boolean; title: string; updatedAt: string })[];
 		return rawChats.map((chat) => (
 			"projectId" in chat
 				? chat
 				: toChatDtoFromThreadSummary(
 					{
 						...chat,
+						hasUnreadFinished: chat.hasUnreadFinished ?? false,
 						isActive: chat.isActive ?? false,
 					},
 					selectedProjectId,
@@ -641,6 +713,24 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		return Boolean(chats.find((chat) => chat.id === selectedChatId)?.isActive) ||
 			Boolean(chatContextQuery.data?.chat.isActive);
 	}, [chatContextQuery.data?.chat.isActive, chats, selectedChatId]);
+	const selectedChatProvider = useMemo(
+		() => {
+			const chatFromContext = scope === "chat" ? chatContextQuery.data?.chat ?? null : null;
+			const chatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
+			const provider = (chatFromContext ?? chatFromList)?.provider;
+			return provider === "codex" || provider === "claude" ? provider : null;
+		},
+		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
+	);
+	const selectedChatProviderThreadId = useMemo(
+		() => {
+			const chatFromContext = scope === "chat" ? chatContextQuery.data?.chat ?? null : null;
+			const chatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
+			const threadId = (chatFromContext ?? chatFromList)?.providerThreadId;
+			return typeof threadId === "string" && threadId.trim().length > 0 ? threadId.trim() : null;
+		},
+		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
+	);
 
 	useEffect(() => {
 		if (!selectionQuery.data) {
@@ -897,6 +987,84 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			clearStructuredLiveActivityPreview(chatId);
 		}, [clearStructuredLiveActivityPreview]);
 
+	const clearThreadCompletionPushSubscriptionState = useCallback((chatId: string) => {
+		registeredThreadCompletionPushSignatureByChatRef.current = omitRecordKey(
+			registeredThreadCompletionPushSignatureByChatRef.current,
+			chatId,
+		);
+	}, []);
+
+	const setThreadCompletionPushSubscription = useCallback(
+		async (chatId: string, enabled: boolean) => {
+			const registeredSignature =
+				registeredThreadCompletionPushSignatureByChatRef.current[chatId] ?? null;
+			const currentPushToken = pushDeliveryTokenRef.current?.token.trim() ?? "";
+			const currentPushTokenType = pushDeliveryTokenRef.current?.type;
+			const currentSignature = (
+				currentPushToken.length > 0
+				&& (currentPushTokenType === "apns" || currentPushTokenType === "fcm")
+			)
+				? toPushSignature({
+					pushToken: currentPushToken,
+					pushTokenType: currentPushTokenType,
+				})
+				: null;
+
+			if (enabled && registeredSignature === currentSignature && currentSignature !== null) {
+				return;
+			}
+			if (!enabled && registeredSignature === null) {
+				return;
+			}
+
+			if (registeredSignature && (!enabled || registeredSignature !== currentSignature)) {
+				const previousTransport = parsePushSignature(registeredSignature);
+				if (previousTransport) {
+					try {
+						await client.upsertThreadCompletionSubscription(chatId, {
+							enabled: false,
+							pushToken: previousTransport.pushToken,
+							pushTokenType: previousTransport.pushTokenType,
+						});
+					} catch {
+						// Ignore stale subscription cleanup failures.
+					}
+				}
+				clearThreadCompletionPushSubscriptionState(chatId);
+			}
+
+			if (!enabled || currentSignature === null || currentPushTokenType === undefined) {
+				return;
+			}
+
+			try {
+				const result = await client.upsertThreadCompletionSubscription(chatId, {
+					chatTitle: resolveChatTitle(chatId),
+					enabled: true,
+					pushToken: currentPushToken,
+					pushTokenType: currentPushTokenType,
+				});
+				if (!result.enabled || !result.subscribed) {
+					return;
+				}
+				registeredThreadCompletionPushSignatureByChatRef.current = {
+					...registeredThreadCompletionPushSignatureByChatRef.current,
+					[chatId]: currentSignature,
+				};
+			} catch {
+				// Ignore remote push fallback registration failures.
+			}
+		},
+		[clearThreadCompletionPushSubscriptionState, client, resolveChatTitle],
+	);
+
+	const syncThreadCompletionPushSubscriptions = useCallback(() => {
+		for (const chatId of pendingCompletionNotificationChatIdsRef.current) {
+			const hasLiveActivity = isThreadLiveActivityEnabled() && hasActiveLiveActivityEntry(chatId);
+			void setThreadCompletionPushSubscription(chatId, !hasLiveActivity);
+		}
+	}, [setThreadCompletionPushSubscription]);
+
 	const scheduleLiveActivitySubscriptionRetry = useCallback((input: { chatId?: string; reason: string }) => {
 		if (liveActivitySubscriptionRetryTimeoutRef.current) {
 			return;
@@ -920,6 +1088,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+			void setThreadCompletionPushSubscription(chatId, false);
 			if (isThreadLiveActivityEnabled() && hasActiveLiveActivityEntry(chatId)) {
 				return;
 			}
@@ -937,7 +1106,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				}
 			})();
 		},
-		[resolveChatTitle],
+		[resolveChatTitle, setThreadCompletionPushSubscription],
 	);
 
 	const flushLiveActivitySubscriptions = useCallback(() => {
@@ -1151,6 +1320,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				pushTokenType: token.type,
 			});
 			flushLiveActivitySubscriptions();
+			syncThreadCompletionPushSubscriptions();
 
 			// Register push-to-start token immediately once push delivery token is available.
 			void syncPushToStartToken();
@@ -1201,6 +1371,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 			logLiveActivitySubscription("retrying live activity subscriptions on foreground");
 			flushLiveActivitySubscriptionsRef.current();
+			syncThreadCompletionPushSubscriptions();
 		});
 
 		return () => {
@@ -1209,7 +1380,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			unsubscribePushToStart();
 			appStateSubscription.remove();
 		};
-	}, [client, flushLiveActivitySubscriptions]);
+	}, [client, flushLiveActivitySubscriptions, syncThreadCompletionPushSubscriptions]);
 
 	useEffect(() => {
 		return () => {
@@ -1589,6 +1760,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 									diffAdded: event.data.diffAdded,
 									diffRemoved: event.data.diffRemoved,
 									isActive: event.data.isActive,
+									providerThreadId: event.data.providerThreadId ?? null,
 									status: event.data.status,
 									updatedAt: event.data.updatedAt,
 								},
@@ -1663,8 +1835,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				const isSelfOriginatedWorkspaceEvent =
 					event.data.originClientId !== null &&
 					event.data.originClientId === clientIdRef.current;
+				const shouldIgnoreWorkspaceEvent =
+					isSelfOriginatedWorkspaceEvent && event.data.type !== "message_created";
 
-				if (isSelfOriginatedWorkspaceEvent) {
+				if (shouldIgnoreWorkspaceEvent) {
 					return;
 				}
 
@@ -1673,6 +1847,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					case "chat_deleted":
 					case "chat_updated": {
 						invalidateWorkspaceQuery(queryKeys.activeThreads);
+						invalidateWorkspaceQuery(queryKeys.projects);
+						invalidateWorkspaceQuery(queryKeys.recentThreads);
 						if (activeChatId && workspaceChatId && workspaceChatId === activeChatId) {
 							invalidateWorkspaceQuery(queryKeys.chatContext(activeChatId));
 						}
@@ -1835,6 +2011,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				void requestId;
 				pendingSendChatIdsRef.current.delete(chatId);
 				pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+				void setThreadCompletionPushSubscription(chatId, false);
 				setSendingByChat((current) => ({
 					...current,
 					[chatId]: false,
@@ -1855,7 +2032,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			realtime.disconnect();
 			realtimeRef.current = null;
 		};
-	}, [config.activeTarget, finishLiveActivity, isActive]);
+	}, [config.activeTarget, finishLiveActivity, isActive, setThreadCompletionPushSubscription]);
 
 	useEffect(() => {
 		if (!shouldEnableMessagesQuery || !selectedChatId || !realtimeRef.current) {
@@ -2048,6 +2225,10 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const setSelectedProviderWithSync = useCallback(
 		(value: string) => {
+			if (selectedChatProviderThreadId) {
+				return;
+			}
+
 			setSelectedProvider(value);
 			void queryClient.invalidateQueries({ queryKey: ["provider-models", value] });
 			persistSelection({
@@ -2056,7 +2237,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				selectedProvider: value,
 			});
 		},
-		[persistSelection, queryClient, selectedChatId, selectedProjectId],
+		[persistSelection, queryClient, selectedChatId, selectedChatProviderThreadId, selectedProjectId],
 	);
 
 	const selectProjectById = useCallback(
@@ -2142,6 +2323,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			await deleteChatMutation.mutateAsync(chatId);
 			pendingSendChatIdsRef.current.delete(chatId);
 			pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+			void setThreadCompletionPushSubscription(chatId, false);
 			clearLiveActivitySubscriptionState(chatId);
 			await clearThreadLiveActivity({
 				chatId,
@@ -2155,7 +2337,14 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				});
 			}
 		},
-		[clearLiveActivitySubscriptionState, deleteChatMutation, persistSelection, selectedChatId, selectedProjectId],
+		[
+			clearLiveActivitySubscriptionState,
+			deleteChatMutation,
+			persistSelection,
+			selectedChatId,
+			selectedProjectId,
+			setThreadCompletionPushSubscription,
+		],
 	);
 
 	const createChat = useCallback(
@@ -2205,13 +2394,21 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				});
 			}
 			if (selectedChatIdRef.current) {
+				void setThreadCompletionPushSubscription(selectedChatIdRef.current, false);
 				clearLiveActivitySubscriptionState(selectedChatIdRef.current);
 				await clearThreadLiveActivity({
 					chatId: selectedChatIdRef.current,
 				});
 			}
 		},
-		[clearLiveActivitySubscriptionState, client, persistSelection, queryClient, selectedProjectId],
+		[
+			clearLiveActivitySubscriptionState,
+			client,
+			persistSelection,
+			queryClient,
+			selectedProjectId,
+			setThreadCompletionPushSubscription,
+		],
 	);
 
 	const clearAllProjectChats = useCallback(
@@ -2411,17 +2608,21 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						chatTitle: replacementChat?.title ?? selectedChat?.title ?? fallbackChat?.title,
 						statusLine: "Running",
 					});
+					void setThreadCompletionPushSubscription(activeChatId, !liveActivityStarted);
 					if (!liveActivityStarted) {
 						void ensureLocalNotificationPermission();
 					}
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
+			const effectiveProvider = selectedChatProviderThreadId
+				? selectedChatProvider ?? undefined
+				: selectedProvider ?? undefined;
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {
 				clientId: clientIdRef.current,
 				model: selectedModel ?? undefined,
 				permissionMode,
 				projectId: activeProjectId,
-				provider: selectedProvider ?? undefined,
+				provider: effectiveProvider,
 				reasoningEffort: selectedReasoningEffort ?? undefined,
 				requestId: toRequestId(),
 			});
@@ -2440,6 +2641,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			if (selected) {
 				pendingSendChatIdsRef.current.delete(selected);
 				pendingCompletionNotificationChatIdsRef.current.delete(selected);
+				void setThreadCompletionPushSubscription(selected, false);
 				setSendingByChat((current) => ({
 					...current,
 					[selected]: false,
@@ -2545,6 +2747,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					[chatId]: false,
 				}));
 				pendingCompletionNotificationChatIdsRef.current.delete(chatId);
+				void setThreadCompletionPushSubscription(chatId, false);
 				finishLiveActivity(chatId, {
 					outcome: "error",
 				});
@@ -2578,6 +2781,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		finishLiveActivity,
 		invalidateWorkspaceQuery,
 		queryClient,
+		setThreadCompletionPushSubscription,
 		shouldEnableChatsQuery,
 	]);
 
@@ -2670,6 +2874,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		},
 		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
 	);
+	const isProviderLocked = selectedChatProviderThreadId !== null;
 	const trackedLiveActivityChats = useMemo(
 		() => resolveTrackedLiveActivityChats({
 			activeThreads: activeThreadsQuery.data ?? [],
@@ -2678,6 +2883,54 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}),
 		[activeThreadsQuery.data, selectedChat, selectedChatId],
 	);
+
+	useEffect(() => {
+		if (!selectedChatProviderThreadId || !selectedChatProvider || selectedProvider === selectedChatProvider) {
+			return;
+		}
+
+		setSelectedProvider(selectedChatProvider);
+		void queryClient.invalidateQueries({ queryKey: ["provider-models", selectedChatProvider] });
+		persistSelection({
+			selectedChatId,
+			selectedProjectId,
+			selectedProvider: selectedChatProvider,
+		});
+	}, [
+		persistSelection,
+		queryClient,
+		selectedChatId,
+		selectedChatProvider,
+		selectedChatProviderThreadId,
+		selectedProjectId,
+		selectedProvider,
+	]);
+
+	const lastMarkedReadSignatureRef = useRef<string | null>(null);
+	const selectedChatReadSignature = selectedChatId
+		? `${selectedChatId}:${selectedChat?.status ?? "missing"}:${selectedChat?.updatedAt ?? "none"}`
+		: null;
+
+	useEffect(() => {
+		if (!isActive || scope !== "chat" || !selectedChatId || !selectedProjectId) {
+			lastMarkedReadSignatureRef.current = null;
+			return;
+		}
+
+		if (lastMarkedReadSignatureRef.current === selectedChatReadSignature) {
+			return;
+		}
+
+		lastMarkedReadSignatureRef.current = selectedChatReadSignature;
+		void syncReadStateForChat(selectedChatId, selectedProjectId);
+	}, [
+		isActive,
+		scope,
+		selectedChatId,
+		selectedChatReadSignature,
+		selectedProjectId,
+		syncReadStateForChat,
+	]);
 
 	useEffect(() => {
 		if (!selectedChatId || !selectedChat) {
@@ -2720,6 +2973,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 			for (const removedChatId of reconciliation.removedChatIds) {
 				pendingCompletionNotificationChatIdsRef.current.delete(removedChatId);
+				void setThreadCompletionPushSubscription(removedChatId, false);
 				clearLiveActivitySubscriptionState(removedChatId);
 				void clearThreadLiveActivity({
 					chatId: removedChatId,
@@ -2733,10 +2987,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					continue;
 				}
 
-				void startRunningLiveActivity(trackedChat.chatId, {
-					chatTitle: trackedChat.chatTitle,
-					statusLine: runningStatus,
-				});
+				void (async () => {
+					const liveActivityStarted = await startRunningLiveActivity(trackedChat.chatId, {
+						chatTitle: trackedChat.chatTitle,
+						statusLine: runningStatus,
+					});
+					void setThreadCompletionPushSubscription(trackedChat.chatId, !liveActivityStarted);
+				})();
 			}
 
 			trackedLiveActivityChatIdsRef.current = new Set(
@@ -2747,7 +3004,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		return () => {
 			cancelled = true;
 		};
-	}, [clearLiveActivitySubscriptionState, startRunningLiveActivity, trackedLiveActivityChats]);
+	}, [
+		clearLiveActivitySubscriptionState,
+		setThreadCompletionPushSubscription,
+		startRunningLiveActivity,
+		trackedLiveActivityChats,
+	]);
 
 	const streamingText = selectedChatId ? streamingTextByChat[selectedChatId] ?? "" : "";
 	const streamHistoryTurns = useMemo(
@@ -2818,6 +3080,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		permissionMode,
 		projects,
 		renameProject,
+		isProviderLocked,
 		selectedModel,
 		selectedProvider,
 		selectedReasoningEffort,

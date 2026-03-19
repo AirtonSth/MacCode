@@ -21,6 +21,7 @@ interface SwipeableWorkspaceItemProps {
 	onOpenWorkspace: () => void;
 	project: ProjectDTO;
 	rowTestID: string;
+	unreadFinishedThreadCount?: number;
 	rowBackgroundColor?: string;
 	rowBorderColor?: string;
 	selectedRowBackgroundColor?: string;
@@ -34,6 +35,7 @@ export const SwipeableWorkspaceItem = ({
 	onOpenWorkspace,
 	project,
 	rowTestID,
+	unreadFinishedThreadCount = 0,
 	rowBackgroundColor = defaultRowBackgroundColor,
 	rowBorderColor = defaultRowBorderColor,
 	selectedRowBackgroundColor = defaultSelectedRowBackgroundColor,
@@ -95,9 +97,16 @@ export const SwipeableWorkspaceItem = ({
 		>
 			<View style={styles.rowContent}>
 				<View style={styles.rowText}>
-					<Text numberOfLines={1} style={styles.rowTitle}>
-						{project.name}
-					</Text>
+					<View style={styles.titleRow}>
+						<Text numberOfLines={1} style={styles.rowTitle}>
+							{project.name}
+						</Text>
+						{unreadFinishedThreadCount > 0 ? (
+							<View style={styles.unreadBadge}>
+								<Text style={styles.unreadBadgeLabel}>{unreadFinishedThreadCount}</Text>
+							</View>
+						) : null}
+					</View>
 					<Text numberOfLines={1} style={styles.rowMeta}>
 						{project.path}
 					</Text>
@@ -145,5 +154,26 @@ const styles = StyleSheet.create({
 		color: "#F1F4FA",
 		fontSize: 15,
 		fontWeight: "600",
+	},
+	titleRow: {
+		alignItems: "center",
+		flexDirection: "row",
+		gap: 8,
+	},
+	unreadBadge: {
+		alignItems: "center",
+		backgroundColor: "rgba(52,211,153,0.14)",
+		borderColor: "rgba(52,211,153,0.38)",
+		borderRadius: 999,
+		borderWidth: 1,
+		justifyContent: "center",
+		minWidth: 20,
+		paddingHorizontal: 6,
+		paddingVertical: 1,
+	},
+	unreadBadgeLabel: {
+		color: "#A7F3D0",
+		fontSize: 10,
+		fontWeight: "700",
 	},
 });

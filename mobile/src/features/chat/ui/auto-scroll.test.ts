@@ -19,12 +19,28 @@ const computeDistanceFromBottom = (
 	layoutHeight: number,
 ): number => contentHeight - (offsetY + layoutHeight);
 
-/** Mirrors the flag assignment: `userScrolledUpRef.current = distance > threshold`. */
-const shouldFlagUserScrolledUp = (
+/**
+ * Mirrors the flag assignment: only flag as scrolled up when the user actively
+ * scrolled upward (offset decreased) AND is not at bottom.
+ */
+const shouldFlagUserScrolledUp = (input: {
+	contentHeight: number;
+	layoutHeight: number;
+	offsetY: number;
+	previousOffsetY: number;
+}): boolean => {
+	const distance = computeDistanceFromBottom(input.contentHeight, input.offsetY, input.layoutHeight);
+	const atBottom = distance <= AUTO_SCROLL_BOTTOM_THRESHOLD;
+	const scrolledUp = input.offsetY < input.previousOffsetY;
+	return scrolledUp && !atBottom;
+};
+
+/** Mirrors the flag clear: reset when user reaches the bottom. */
+const shouldClearFlag = (
 	contentHeight: number,
 	offsetY: number,
 	layoutHeight: number,
-): boolean => computeDistanceFromBottom(contentHeight, offsetY, layoutHeight) > AUTO_SCROLL_BOTTOM_THRESHOLD;
+): boolean => computeDistanceFromBottom(contentHeight, offsetY, layoutHeight) <= AUTO_SCROLL_BOTTOM_THRESHOLD;
 
 /** Mirrors the auto-scroll guard: scroll only when the flag is false. */
 const shouldAutoScroll = (input: {
@@ -44,9 +60,6 @@ const shouldAutoScroll = (input: {
 	return !input.userScrolledUp;
 };
 
-/** Mirrors the reset logic: when streaming ends, the flag resets to false. */
-const shouldResetFlag = (hasStreaming: boolean): boolean => !hasStreaming;
-
 describe("AUTO_SCROLL_BOTTOM_THRESHOLD", () => {
 	it("is a positive number", () => {
 		expect(AUTO_SCROLL_BOTTOM_THRESHOLD).toBeGreaterThan(0);
@@ -58,34 +71,69 @@ describe("AUTO_SCROLL_BOTTOM_THRESHOLD", () => {
 });
 
 describe("shouldFlagUserScrolledUp", () => {
-	it("returns false when scrolled to the bottom", () => {
-		// contentHeight=2000, offsetY=1400, layoutHeight=600 => distance=0
-		expect(shouldFlagUserScrolledUp(2000, 1400, 600)).toBe(false);
+	it("returns false when content grows but user did not scroll", () => {
+		// Content grew from 2000 to 2500, offset unchanged at 1400, layout 600
+		// distance = 2500 - (1400+600) = 500, but offset didn't decrease
+		expect(shouldFlagUserScrolledUp({
+			contentHeight: 2500,
+			layoutHeight: 600,
+			offsetY: 1400,
+			previousOffsetY: 1400,
+		})).toBe(false);
 	});
 
-	it("returns false when within the threshold", () => {
-		// distance = 2000 - (1360 + 600) = 40
-		expect(shouldFlagUserScrolledUp(2000, 1360, 600)).toBe(false);
+	it("returns true when user actively scrolled up beyond threshold", () => {
+		// User scrolled from offset 1400 to 1000, content 2000, layout 600
+		// distance = 2000 - (1000+600) = 400, scrolledUp = true
+		expect(shouldFlagUserScrolledUp({
+			contentHeight: 2000,
+			layoutHeight: 600,
+			offsetY: 1000,
+			previousOffsetY: 1400,
+		})).toBe(true);
 	});
 
-	it("returns false when exactly at threshold boundary", () => {
-		// distance = 2000 - (1352 + 600) = 48, NOT > 48
-		expect(shouldFlagUserScrolledUp(2000, 1352, 600)).toBe(false);
+	it("returns false when user scrolled up but is still at bottom", () => {
+		// offset decreased slightly but still at bottom
+		// distance = 2000 - (1380+600) = 20
+		expect(shouldFlagUserScrolledUp({
+			contentHeight: 2000,
+			layoutHeight: 600,
+			offsetY: 1380,
+			previousOffsetY: 1400,
+		})).toBe(false);
 	});
 
-	it("returns true when scrolled up beyond the threshold", () => {
-		// distance = 2000 - (1300 + 600) = 100
-		expect(shouldFlagUserScrolledUp(2000, 1300, 600)).toBe(true);
-	});
-
-	it("returns true when scrolled to the very top of long content", () => {
-		// distance = 5000 - (0 + 600) = 4400
-		expect(shouldFlagUserScrolledUp(5000, 0, 600)).toBe(true);
+	it("returns false when scrolling down (offset increased)", () => {
+		expect(shouldFlagUserScrolledUp({
+			contentHeight: 5000,
+			layoutHeight: 600,
+			offsetY: 1500,
+			previousOffsetY: 1000,
+		})).toBe(false);
 	});
 
 	it("returns false when content fits the viewport", () => {
-		// contentHeight=600, offsetY=0, layoutHeight=600 => distance=0
-		expect(shouldFlagUserScrolledUp(600, 0, 600)).toBe(false);
+		expect(shouldFlagUserScrolledUp({
+			contentHeight: 600,
+			layoutHeight: 600,
+			offsetY: 0,
+			previousOffsetY: 0,
+		})).toBe(false);
+	});
+});
+
+describe("shouldClearFlag", () => {
+	it("returns true when at bottom", () => {
+		expect(shouldClearFlag(2000, 1400, 600)).toBe(true);
+	});
+
+	it("returns true when within threshold", () => {
+		expect(shouldClearFlag(2000, 1360, 600)).toBe(true);
+	});
+
+	it("returns false when scrolled beyond threshold", () => {
+		expect(shouldClearFlag(2000, 1300, 600)).toBe(false);
 	});
 });
 
@@ -145,59 +193,55 @@ describe("shouldAutoScroll", () => {
 	});
 });
 
-describe("shouldResetFlag (streaming end)", () => {
-	it("returns true when streaming has ended", () => {
-		expect(shouldResetFlag(false)).toBe(true);
-	});
-
-	it("returns false while streaming is active", () => {
-		expect(shouldResetFlag(true)).toBe(false);
-	});
-});
-
 describe("end-to-end scenario: user scrolls up during streaming", () => {
-	it("prevents auto-scroll while scrolled up, resumes after streaming ends", () => {
-		// Step 1: Streaming starts, user is at bottom
+	it("prevents auto-scroll while scrolled up, resumes when user scrolls back to bottom", () => {
 		let userScrolledUp = false;
-		const hasStreaming = true;
 
-		// Auto-scroll should fire
+		// Step 1: Streaming starts, user is at bottom — auto-scroll fires
 		expect(shouldAutoScroll({
 			hasNewTailMessage: false,
-			hasStreaming,
+			hasStreaming: true,
 			isViewingOlderMessages: false,
 			userScrolledUp,
 		})).toBe(true);
 
-		// Step 2: User scrolls up manually
-		userScrolledUp = shouldFlagUserScrolledUp(5000, 1000, 600);
+		// Step 2: User actively scrolls up
+		userScrolledUp = shouldFlagUserScrolledUp({
+			contentHeight: 5000,
+			layoutHeight: 600,
+			offsetY: 1000,
+			previousOffsetY: 2000,
+		});
 		expect(userScrolledUp).toBe(true);
 
 		// Auto-scroll should be suppressed
 		expect(shouldAutoScroll({
 			hasNewTailMessage: false,
-			hasStreaming,
+			hasStreaming: true,
 			isViewingOlderMessages: false,
 			userScrolledUp,
 		})).toBe(false);
 
-		// Step 3: Streaming ends — flag resets
-		const streamingEnded = !hasStreaming; // false (still streaming in this scenario)
-		// Simulate streaming actually ending:
-		const nowStreaming = false;
-		if (shouldResetFlag(nowStreaming)) {
+		// Step 3: Streaming ends — flag does NOT reset (user must scroll to bottom)
+		expect(shouldAutoScroll({
+			hasNewTailMessage: true,
+			hasStreaming: false,
+			isViewingOlderMessages: false,
+			userScrolledUp,
+		})).toBe(false);
+
+		// Step 4: User scrolls back to bottom — flag clears
+		if (shouldClearFlag(5000, 4400, 600)) {
 			userScrolledUp = false;
 		}
 		expect(userScrolledUp).toBe(false);
 
-		// Step 4: Next message arrives — auto-scroll fires again
+		// Step 5: Next message arrives — auto-scroll fires again
 		expect(shouldAutoScroll({
 			hasNewTailMessage: true,
 			hasStreaming: false,
 			isViewingOlderMessages: false,
 			userScrolledUp,
 		})).toBe(true);
-
-		void streamingEnded; // suppress unused variable
 	});
 });

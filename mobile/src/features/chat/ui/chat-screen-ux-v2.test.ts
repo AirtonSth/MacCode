@@ -5,10 +5,10 @@ import { describe, expect, it } from "bun:test";
 
 const source = readFileSync(resolve(__dirname, "chat-screen.tsx"), "utf8");
 
-describe("[M-44] message scroll ref updates are gated by threshold changes", () => {
-	it("compares the next userScrolledUp state before writing to the ref", () => {
-		expect(source).toContain("const nextUserScrolledUp = distanceFromBottom > AUTO_SCROLL_BOTTOM_THRESHOLD;");
-		expect(source).toContain("if (userScrolledUpRef.current !== nextUserScrolledUp)");
+describe("[M-44] message scroll uses direction-based detection", () => {
+	it("only flags user as scrolled up when actively scrolling up and not at bottom", () => {
+		expect(source).toContain("const scrolledUp = contentOffset.y < lastScrollOffsetYRef.current;");
+		expect(source).toContain("if (scrolledUp && !atBottom)");
 	});
 });
 

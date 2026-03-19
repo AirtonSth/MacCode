@@ -72,6 +72,34 @@ describe("createRemoteCodeClient live activity subscription contract", () => {
 		expect(caughtError).toBeInstanceOf(RemoteCodeRequestError);
 	});
 
+	test("treats a generic 404 as a disabled thread completion route for backward compatibility", async () => {
+		globalThis.fetch = mock(async () => new Response(JSON.stringify({
+			error: "not found",
+		}), {
+			headers: {
+				"content-type": "application/json",
+			},
+			status: 404,
+			statusText: "Not Found",
+		})) as unknown as typeof fetch;
+
+		const client = createRemoteCodeClient({
+			baseUrl: "http://127.0.0.1:8835",
+			token: "remotecode.io-token",
+		});
+
+		const result = await client.upsertThreadCompletionSubscription("chat-1", {
+			enabled: true,
+			pushToken: "fcm-token",
+			pushTokenType: "fcm",
+		});
+
+		expect(result).toEqual({
+			enabled: false,
+			subscribed: false,
+		});
+	});
+
 	test("adds the connector header for private proxied requests", async () => {
 		let connectorIdHeader = "";
 		let authorizationHeader = "";

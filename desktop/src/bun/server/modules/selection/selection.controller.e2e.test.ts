@@ -123,6 +123,44 @@ test("PATCH /v1/selection requires project when chat is selected", async () => {
 	}
 });
 
+test("PATCH /v1/selection rejects provider changes for an existing thread", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-selection-provider-lock-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	let server:
+		| Awaited<ReturnType<typeof createBackendServer>>
+		| undefined;
+
+	try {
+		server = await createBackendServer({ databasePath, port: 0 });
+		const client = createEdenClient({ baseUrl: `http://127.0.0.1:${toPort(server.server)}` });
+
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({
+			provider: "claude",
+			title: "Locked provider thread",
+		});
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		const invalid = await client.v1.selection.patch({
+			selectedChatId: chatId,
+			selectedProjectId: projectId,
+			selectedProvider: "codex",
+		});
+		const errorPayload =
+			invalid.error && "value" in invalid.error ? (invalid.error as { value: { error?: string } }).value : undefined;
+
+		expect(invalid.status).toBe(400);
+		expect(errorPayload?.error).toBe("cannot change provider after thread creation");
+	} finally {
+		if (server) {
+			await server.app.stop(true);
+			server.db.close();
+		}
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
 test("deleting a selected thread clears selectedChatId in sqlite", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-selection-delete-thread-"));
 	const databasePath = join(root, "remodecode.sqlite");

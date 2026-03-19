@@ -157,6 +157,7 @@ export const ChatScreen = () => {
 		deleteProject,
 		forceStopActiveChat,
 		hasOlderMessages,
+		isProviderLocked,
 		isLoaded,
 		isChatsLoading,
 		isLoadingOlderMessages,
@@ -235,6 +236,8 @@ export const ChatScreen = () => {
 	const queryClient = useQueryClient();
 	const messageScrollRef = useRef<ScrollView | null>(null);
 	const previousLastMessageIdRef = useRef<string | null>(null);
+	const lastScrollOffsetYRef = useRef<number>(0);
+	const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 	const terminalScrollRef = useRef<ScrollView | null>(null);
 	const shouldScrollTerminalToEndRef = useRef<"animated" | "instant" | null>(null);
 	const terminalKeyboardScrollRafRef = useRef<number | null>(null);
@@ -513,11 +516,6 @@ export const ChatScreen = () => {
 			messageScrollRef.current?.scrollToEnd({ animated: true });
 		}
 
-		// When streaming ends, reset the flag so the next message scrolls normally
-		if (!hasStreaming) {
-			userScrolledUpRef.current = false;
-		}
-
 		previousLastMessageIdRef.current = nextLastMessageId;
 	}, [hasStreamingText, isViewingOlderMessages, messages, streamingTurn]);
 
@@ -716,9 +714,20 @@ export const ChatScreen = () => {
 			layoutMeasurement,
 		} = event.nativeEvent;
 		const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
-		const nextUserScrolledUp = distanceFromBottom > AUTO_SCROLL_BOTTOM_THRESHOLD;
-		if (userScrolledUpRef.current !== nextUserScrolledUp) {
-			userScrolledUpRef.current = nextUserScrolledUp;
+		const atBottom = distanceFromBottom <= AUTO_SCROLL_BOTTOM_THRESHOLD;
+
+		// Only mark as scrolled up when user actively scrolled up (offset decreased),
+		// not when content grew and pushed them away from the bottom.
+		const scrolledUp = contentOffset.y < lastScrollOffsetYRef.current;
+		lastScrollOffsetYRef.current = contentOffset.y;
+
+		if (scrolledUp && !atBottom) {
+			userScrolledUpRef.current = true;
+			setShowScrollToBottom(true);
+		}
+		if (atBottom) {
+			userScrolledUpRef.current = false;
+			setShowScrollToBottom(false);
 		}
 
 		if (isViewingOlderMessages && distanceFromBottom <= threshold) {
@@ -1627,6 +1636,20 @@ export const ChatScreen = () => {
 						) : null}
 					</ScrollView>
 
+				{showScrollToBottom && !isViewingOlderMessages ? (
+					<Pressable
+						onPress={() => {
+							userScrolledUpRef.current = false;
+							setShowScrollToBottom(false);
+							messageScrollRef.current?.scrollToEnd({ animated: true });
+						}}
+						style={styles.scrollToBottomButton}
+						testID="chat-scroll-to-bottom"
+					>
+						<MaterialIcons color={palette.text} name="keyboard-arrow-down" size={24} />
+					</Pressable>
+				) : null}
+
 				{lastError ? (
 					<Text selectable style={styles.errorText}>
 						{lastError}
@@ -1691,12 +1714,14 @@ export const ChatScreen = () => {
 						style={styles.selectorsRow}
 					>
 						<Pressable
+							disabled={isProviderLocked}
 							onPress={() => {
 								setActivePicker("provider");
 							}}
 							style={({ pressed }) => [
 								styles.selectorButton,
-								pressed ? styles.selectorButtonPressed : null,
+								isProviderLocked ? styles.selectorButtonDisabled : null,
+								pressed && !isProviderLocked ? styles.selectorButtonPressed : null,
 							]}
 							testID="chat-provider-picker-button"
 						>
@@ -2600,6 +2625,19 @@ const styles = StyleSheet.create({
 	},
 	messages: {
 		flex: 1,
+	},
+	scrollToBottomButton: {
+		alignItems: "center",
+		backgroundColor: "rgba(30, 41, 59, 0.92)",
+		borderColor: "rgba(255, 255, 255, 0.15)",
+		borderRadius: 20,
+		borderWidth: 1,
+		bottom: 8,
+		height: 40,
+		justifyContent: "center",
+		position: "absolute",
+		right: 12,
+		width: 40,
 	},
 	messagesLoading: {
 		alignItems: "center",

@@ -164,6 +164,7 @@ export const RootLayoutContent = () => {
 				<Stack.Screen name="workspaces" options={{ headerShown: false }} />
 				<Stack.Screen name="threads" options={{ headerShown: false }} />
 				<Stack.Screen name="active-threads" options={{ headerShown: false }} />
+				<Stack.Screen name="recent-threads" options={{ headerShown: false }} />
 				<Stack.Screen name="chat" options={{ headerShown: false }} />
 				<Stack.Screen name="settings" options={{ headerShown: false }} />
 			</Stack>

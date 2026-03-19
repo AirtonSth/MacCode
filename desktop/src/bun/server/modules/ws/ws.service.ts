@@ -17,6 +17,7 @@ import type {
 	LiveActivityPushStartInput,
 	LiveActivityPushSubscriptionInput,
 	PushToStartTokenInput,
+	ThreadCompletionPushSubscriptionMutationInput,
 } from "../live-activity/live-activity-push.model";
 import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
@@ -83,6 +84,7 @@ const noopLiveActivityPushService: LiveActivityPushServiceContract = {
 		// no-op
 	},
 	upsertSubscription: async () => false,
+	upsertThreadCompletionSubscription: async () => false,
 	registerPushToStartToken: async () => {
 		// no-op
 	},
@@ -116,6 +118,12 @@ export class WsService implements WsServiceContract {
 
 	async upsertLiveActivityPushSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
 		return await this.liveActivityPushService.upsertSubscription(input);
+	}
+
+	async upsertThreadCompletionPushSubscription(
+		input: ThreadCompletionPushSubscriptionMutationInput,
+	): Promise<boolean> {
+		return await this.liveActivityPushService.upsertThreadCompletionSubscription(input);
 	}
 
 	async registerPushToStartToken(input: PushToStartTokenInput): Promise<void> {
@@ -181,6 +189,7 @@ export class WsService implements WsServiceContract {
 				diffAdded: updatedChat.diffAdded,
 				diffRemoved: updatedChat.diffRemoved,
 				isActive: updatedChat.isActive,
+				providerThreadId: updatedChat.providerThreadId ?? null,
 				status: updatedChat.status,
 				updatedAt: updatedChat.updatedAt,
 			},
@@ -192,7 +201,9 @@ export class WsService implements WsServiceContract {
 				chatId,
 				diffAdded: updatedChat.diffAdded,
 				diffRemoved: updatedChat.diffRemoved,
+				hasUnreadFinished: updatedChat.hasUnreadFinished,
 				isActive: updatedChat.isActive,
+				projectId: updatedChat.projectId,
 				status: updatedChat.status,
 				updatedAt: updatedChat.updatedAt,
 			},
@@ -264,7 +275,9 @@ export class WsService implements WsServiceContract {
 					chatId: updatedChat.id,
 					diffAdded: updatedChat.diffAdded,
 					diffRemoved: updatedChat.diffRemoved,
+					hasUnreadFinished: updatedChat.hasUnreadFinished,
 					isActive: updatedChat.isActive,
+					projectId: updatedChat.projectId,
 					status: updatedChat.status,
 					updatedAt: updatedChat.updatedAt,
 				},
@@ -400,7 +413,9 @@ export class WsService implements WsServiceContract {
 				chatId,
 				diffAdded: 0,
 				diffRemoved: 0,
+				hasUnreadFinished: runningChat?.hasUnreadFinished ?? false,
 				isActive: true,
+				projectId: chat.projectId,
 				status: "running",
 				updatedAt: runningUpdatedAt,
 			},
@@ -413,6 +428,7 @@ export class WsService implements WsServiceContract {
 				diffAdded: 0,
 				diffRemoved: 0,
 				isActive: true,
+				providerThreadId: runningChat?.providerThreadId ?? chat.providerThreadId ?? null,
 				status: "running",
 				updatedAt: runningUpdatedAt,
 			},

@@ -48,3 +48,34 @@ test("chat service requires project and lists chats by updatedAt desc", async ()
 		rmSync(root, { force: true, recursive: true });
 	}
 });
+
+test("chat service marks completed threads unread until markChatAsRead", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-chat-service-read-state-"));
+	const path = join(root, "remodecode.sqlite");
+	const client = await createDatabaseClient(path);
+
+	try {
+		initializeDatabaseSchema(client.sqlite);
+
+		const projectRepository = createProjectRepository(client.orm);
+		const chatRepository = createChatRepository(client.orm);
+		const service = createChatService({ chat: chatRepository, project: projectRepository });
+		const project = await projectRepository.createProject("/tmp", "tmp");
+		const chat = await service.createChat(project.id, "Read me");
+
+		if (!chat) {
+			throw new Error("chat creation failed");
+		}
+
+		const completed = await service.updateChat(chat.id, { status: "completed" });
+		expect(completed?.finishedAt).toBeTruthy();
+		expect(completed?.hasUnreadFinished).toBe(true);
+
+		const read = await service.markChatAsRead(chat.id);
+		expect(read?.hasUnreadFinished).toBe(false);
+		expect(read?.lastReadAt).toBeTruthy();
+	} finally {
+		client.close();
+		rmSync(root, { force: true, recursive: true });
+	}
+});

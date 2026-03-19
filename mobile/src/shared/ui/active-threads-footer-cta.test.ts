@@ -96,7 +96,6 @@ describe("ActiveThreadsFooterCta", () => {
 	test("always renders (no null return) so fade-out animation can play", () => {
 		ActiveThreadsFooterCta({
 			count: 0,
-			isLoading: false,
 			onPress: () => undefined,
 			testID: "test-cta",
 		});
@@ -110,7 +109,6 @@ describe("ActiveThreadsFooterCta", () => {
 	test("renders visible when count > 0 and animates to opacity 1", () => {
 		ActiveThreadsFooterCta({
 			count: 3,
-			isLoading: false,
 			onPress: () => undefined,
 			testID: "test-cta",
 		});
@@ -123,7 +121,6 @@ describe("ActiveThreadsFooterCta", () => {
 	test("animation starts from opacity 0", () => {
 		ActiveThreadsFooterCta({
 			count: 5,
-			isLoading: false,
 			onPress: () => undefined,
 			testID: "test-cta",
 		});
@@ -132,22 +129,20 @@ describe("ActiveThreadsFooterCta", () => {
 		expect(latestAnimatedValue).toBe(0);
 	});
 
-	test("renders visible when isLoading is true even with count 0", () => {
+	test("stays hidden when count is 0", () => {
 		ActiveThreadsFooterCta({
 			count: 0,
-			isLoading: true,
 			onPress: () => undefined,
 			testID: "test-cta",
 		});
 
 		expect(animationState.timingCalls.length).toBe(1);
-		expect(animationState.timingCalls[0].toValue).toBe(1);
+		expect(animationState.timingCalls[0].toValue).toBe(0);
 	});
 
 	test("fade animation uses 200ms duration", () => {
 		ActiveThreadsFooterCta({
 			count: 2,
-			isLoading: false,
 			onPress: () => undefined,
 			testID: "test-cta",
 		});

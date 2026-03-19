@@ -34,6 +34,7 @@ test("POST /v1/projects/:id/chats creates pending chat and lists by project orde
 				id: string;
 				projectId: string;
 				provider: string;
+				providerThreadId?: string | null;
 				status: "pending" | "running" | "completed" | "failed";
 				title: string;
 				updatedAt: string;
@@ -42,6 +43,7 @@ test("POST /v1/projects/:id/chats creates pending chat and lists by project orde
 
 		expect(first.status).toBe(201);
 		expect(firstChat.provider).toBe("codex");
+		expect(firstChat.providerThreadId).toBeNull();
 		expect(firstChat.status).toBe("pending");
 
 		const second = await client.v1.projects({ id: projectId }).chats.post({
@@ -54,6 +56,7 @@ test("POST /v1/projects/:id/chats creates pending chat and lists by project orde
 				id: string;
 				projectId: string;
 				provider: string;
+				providerThreadId?: string | null;
 				status: "pending" | "running" | "completed" | "failed";
 				title: string;
 				updatedAt: string;
@@ -61,6 +64,7 @@ test("POST /v1/projects/:id/chats creates pending chat and lists by project orde
 		}).chat;
 
 		expect(second.status).toBe(201);
+		expect(secondChat.providerThreadId).toBeNull();
 		expect(secondChat.status).toBe("pending");
 
 		const list = await client.v1.projects({ id: projectId }).chats.get();
@@ -159,14 +163,118 @@ test("GET /v1/projects/:id/threads returns lightweight thread summaries", async 
 		await client.v1.projects({ id: projectId }).chats.post({ title: "Second" });
 
 		const list = await client.v1.projects({ id: projectId }).threads.get();
-		const payload = list.data as { threads: Array<{ id: string; isActive: boolean; title: string; updatedAt: string }> };
+		const payload = list.data as {
+			threads: Array<{ hasUnreadFinished?: boolean; id: string; isActive: boolean; title: string; updatedAt: string }>;
+		};
 
 		expect(list.status).toBe(200);
 		expect(payload.threads.length).toBe(2);
 		for (const thread of payload.threads) {
-			expect(Object.keys(thread as unknown as Record<string, unknown>).sort()).toEqual(["id", "isActive", "title", "updatedAt"]);
+			expect(Object.keys(thread as unknown as Record<string, unknown>).sort()).toEqual([
+				"hasUnreadFinished",
+				"id",
+				"isActive",
+				"title",
+				"updatedAt",
+			]);
 		}
 	} finally {
+		await cleanup();
+	}
+});
+
+test("PATCH /v1/chats/:id updates the persisted thread title", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const created = await client.v1.projects({ id: projectId }).chats.post({
+			title: "Untitled conversation",
+		});
+		const chatId = (created.data as { chat: { id: string } }).chat.id;
+
+		const updated = await client.v1.chats({ id: chatId }).patch({
+			title: "Use first message as thread title",
+		});
+		const updatedChat = (updated.data as { chat: { id: string; title: string } }).chat;
+
+		expect(updated.status).toBe(200);
+		expect(updatedChat.id).toBe(chatId);
+		expect(updatedChat.title).toBe("Use first message as thread title");
+
+		const context = await client.v1.chats({ id: chatId }).context.get();
+		const contextChat = (context.data as { chat: { title: string } }).chat;
+		expect(contextChat.title).toBe("Use first message as thread title");
+	} finally {
+		await cleanup();
+	}
+});
+
+test("completed unread threads surface in workspace/thread lists and clear after POST /v1/chats/:id/read", async () => {
+	const { cleanup, client, databasePath } = await createTestServer();
+	const sqlite = new Database(databasePath);
+	const workspacePath = mkdtempSync(join(tmpdir(), "thread-read-state-workspace-"));
+
+	try {
+		const project = await client.v1.projects.post({ path: workspacePath });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: projectId }).chats.post({ title: "Unread finish" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		sqlite.prepare(
+			"UPDATE chats SET status = ?, isActive = ?, finishedAt = ?, lastReadAt = ?, updatedAt = ? WHERE id = ?",
+		).run(
+			"completed",
+			0,
+			"2026-01-01T00:00:03.000Z",
+			null,
+			"2026-01-01T00:00:03.000Z",
+			chatId,
+		);
+
+		const workspaceList = await client.v1.projects.workspaces.get();
+		const workspacePayload = workspaceList.data as {
+			workspaces: Array<{ id: string; unreadFinishedThreadCount?: number }>;
+		};
+		expect(workspacePayload.workspaces.find((workspace) => workspace.id === projectId)?.unreadFinishedThreadCount).toBe(1);
+
+		const threadsBeforeRead = await client.v1.projects({ id: projectId }).threads.get();
+		const threadsBeforeReadPayload = threadsBeforeRead.data as {
+			threads: Array<{ hasUnreadFinished?: boolean; id: string }>;
+		};
+		expect(threadsBeforeReadPayload.threads.find((thread) => thread.id === chatId)?.hasUnreadFinished).toBe(true);
+
+		const recentBeforeRead = await client.v1.threads.recent.get();
+		const recentBeforeReadPayload = recentBeforeRead.data as {
+			threads: Array<{ hasUnreadFinished?: boolean; id: string }>;
+		};
+		expect(recentBeforeReadPayload.threads.find((thread) => thread.id === chatId)?.hasUnreadFinished).toBe(true);
+
+		const readResponse = await client.v1.chats({ id: chatId }).read.post({});
+		const readPayload = readResponse.data as {
+			chat: { hasUnreadFinished?: boolean; id: string; lastReadAt?: string | null };
+		};
+		expect(readPayload.chat.id).toBe(chatId);
+		expect(readPayload.chat.hasUnreadFinished).toBe(false);
+		expect(readPayload.chat.lastReadAt).toBeTruthy();
+
+		const workspaceListAfterRead = await client.v1.projects.workspaces.get();
+		const workspaceAfterReadPayload = workspaceListAfterRead.data as {
+			workspaces: Array<{ id: string; unreadFinishedThreadCount?: number }>;
+		};
+		expect(
+			workspaceAfterReadPayload.workspaces.find((workspace) => workspace.id === projectId)?.unreadFinishedThreadCount,
+		).toBe(0);
+
+		const threadsAfterRead = await client.v1.projects({ id: projectId }).threads.get();
+		const threadsAfterReadPayload = threadsAfterRead.data as {
+			threads: Array<{ hasUnreadFinished?: boolean; id: string }>;
+		};
+		expect(threadsAfterReadPayload.threads.find((thread) => thread.id === chatId)?.hasUnreadFinished).toBe(false);
+	} finally {
+		sqlite.close();
+		rmSync(workspacePath, { force: true, recursive: true });
 		await cleanup();
 	}
 });
@@ -453,6 +561,41 @@ test("POST /v1/chats/:id/live-activity/subscription returns 400 when pushTokenTy
 	}
 });
 
+test("POST /v1/chats/:id/thread-completion/subscription returns disabled when backend push is not configured", async () => {
+	const { cleanup, client, baseUrl } = await createTestServer({
+		disableLiveActivityPush: true,
+	});
+
+	try {
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const createdChat = await client.v1.projects({ id: projectId }).chats.post({ title: "Completion Push" });
+		const chatId = (createdChat.data as { chat: { id: string } }).chat.id;
+
+		const response = await fetch(`${baseUrl}/v1/chats/${chatId}/thread-completion/subscription`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${serverConfig.token}`,
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				enabled: true,
+				pushToken: "fcm-token",
+				pushTokenType: "fcm",
+			}),
+		});
+		const payload = await response.json() as { enabled: boolean; subscribed: boolean };
+
+		expect(response.status).toBe(200);
+		expect(payload).toEqual({
+			enabled: false,
+			subscribed: false,
+		});
+	} finally {
+		await cleanup();
+	}
+});
+
 test("GET /v1/chats/:id/context returns chat and project context", async () => {
 	const { cleanup, client } = await createTestServer();
 
@@ -467,22 +610,26 @@ test("GET /v1/chats/:id/context returns chat and project context", async () => {
 			chat: {
 				id: string;
 				projectId: string;
+				providerThreadId?: string | null;
 				title: string;
 			};
 			project: {
 				id: string;
 				name: string;
 				path: string;
+				unreadFinishedThreadCount?: number;
 			};
 		};
 
 		expect(context.status).toBe(200);
 		expect(contextPayload.chat.id).toBe(chatId);
 		expect(contextPayload.chat.projectId).toBe(projectPayload.id);
+		expect(contextPayload.chat.providerThreadId).toBeNull();
 		expect(contextPayload.project).toEqual({
 			id: projectPayload.id,
 			name: projectPayload.name,
 			path: projectPayload.path,
+			unreadFinishedThreadCount: 0,
 		});
 	} finally {
 		await cleanup();

@@ -66,10 +66,12 @@
 		user-select: text;
 	}
 
+	input,
 	textarea,
-	input[type="text"],
-	input[type="search"],
+	select,
+	button,
 	[contenteditable] {
+		-webkit-app-region: no-drag;
 		-webkit-user-select: text;
 		user-select: text;
 	}

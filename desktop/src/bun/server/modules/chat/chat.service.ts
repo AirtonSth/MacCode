@@ -4,6 +4,7 @@ import type {
 	ChatDTO,
 	ChatProvider,
 	ProjectSummaryDTO,
+	RecentThreadSummaryDTO,
 	ThreadSummaryDTO,
 } from "../../types";
 import type { ProjectRepository } from "../project/project.repository";
@@ -17,10 +18,12 @@ export interface ChatServiceContract {
 	listThreadSummariesByProjectId: (projectId: string) => Promise<ThreadSummaryDTO[] | null>;
 	listActiveThreads: () => Promise<ActiveThreadSummaryDTO[]>;
 	listActiveThreadsByIds: (chatIds: string[]) => Promise<ActiveThreadSummaryDTO[]>;
+	listRecentThreads: () => Promise<RecentThreadSummaryDTO[]>;
 	updateChat: (
 		chatId: string,
-		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive" | "title">>,
 	) => Promise<ChatDTO | null>;
+	markChatAsRead: (chatId: string) => Promise<ChatDTO | null>;
 	deleteChat: (id: string) => Promise<boolean>;
 }
 
@@ -49,6 +52,7 @@ export class ChatService implements ChatServiceContract {
 			id: project.id,
 			name: project.name,
 			path: project.path,
+			unreadFinishedThreadCount: project.unreadFinishedThreadCount,
 		};
 
 		return {
@@ -97,9 +101,13 @@ async createChat(projectId: string, title: string, provider?: ChatProvider): Pro
 		return this.chatRepository.getThreadSummariesByIds(chatIds);
 	}
 
+	async listRecentThreads(): Promise<RecentThreadSummaryDTO[]> {
+		return this.chatRepository.getRecentThreadSummaries();
+	}
+
 	async updateChat(
 		chatId: string,
-		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive">>,
+		update: Partial<Pick<ChatDTO, "status" | "diffAdded" | "diffRemoved" | "isActive" | "title">>,
 	): Promise<ChatDTO | null> {
 		const current = await this.chatRepository.findChatById(chatId);
 
@@ -112,9 +120,14 @@ async createChat(projectId: string, title: string, provider?: ChatProvider): Pro
 			diffRemoved: update.diffRemoved ?? current.diffRemoved,
 			isActive: update.isActive ?? current.isActive,
 			status: update.status ?? current.status,
+			title: update.title ?? current.title,
 		};
 
 		return this.chatRepository.updateChat(chatId, merged);
+	}
+
+	async markChatAsRead(chatId: string): Promise<ChatDTO | null> {
+		return this.chatRepository.markChatAsRead(chatId);
 	}
 
 	async deleteChat(id: string): Promise<boolean> {

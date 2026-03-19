@@ -2,6 +2,42 @@ import type { MessageDTO } from "./useWorkspaceStore";
 
 type ErrorSource = "rest" | "ws";
 
+export const DEFAULT_DRAFT_THREAD_TITLE = "Untitled conversation";
+
+const PLACEHOLDER_THREAD_TITLES = new Set([
+	"new chat",
+	"new thread",
+	DEFAULT_DRAFT_THREAD_TITLE.toLowerCase(),
+]);
+
+const normalizeTitleText = (value: string): string => value.trim().replace(/\s+/gu, " ");
+
+export const deriveThreadTitleFromMessage = (text: string, maxLength = 72): string => {
+	const firstLine = text
+		.split(/\r?\n/gu)
+		.map(normalizeTitleText)
+		.find((line) => line.length > 0);
+
+	const normalized = firstLine ?? normalizeTitleText(text);
+	if (normalized.length === 0) {
+		return DEFAULT_DRAFT_THREAD_TITLE;
+	}
+
+	if (normalized.length <= maxLength) {
+		return normalized;
+	}
+
+	return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+};
+
+export const isPlaceholderThreadTitle = (title: string | null | undefined): boolean => {
+	if (typeof title !== "string") {
+		return true;
+	}
+
+	return PLACEHOLDER_THREAD_TITLES.has(normalizeTitleText(title).toLowerCase());
+};
+
 export interface SendMessageInput {
 	selectedProjectId: string | null;
 	selectedChatId: string | null;

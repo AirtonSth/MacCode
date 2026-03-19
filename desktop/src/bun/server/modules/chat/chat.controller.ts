@@ -4,7 +4,11 @@ import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
 import type { ChatProvider } from "../../shared/core/server.types";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
-import type { LiveActivityPushSubscriptionInput, PushToStartTokenInput } from "../live-activity/live-activity-push.model";
+import type {
+	LiveActivityPushSubscriptionInput,
+	PushToStartTokenInput,
+	ThreadCompletionPushSubscriptionMutationInput,
+} from "../live-activity/live-activity-push.model";
 import type { ChatService } from "./chat.service";
 
 const VALID_CHAT_PROVIDERS = new Set<string>(["codex", "claude"]);
@@ -48,6 +52,7 @@ interface LiveActivitySubscriptionReader {
 	getLiveActivityPushIsEnabled: () => boolean;
 	getLiveActivityPushSupportedTokenTypes: () => Promise<ReadonlySet<"apns" | "fcm">>;
 	upsertLiveActivityPushSubscription: (input: LiveActivityPushSubscriptionInput) => Promise<boolean>;
+	upsertThreadCompletionPushSubscription: (input: ThreadCompletionPushSubscriptionMutationInput) => Promise<boolean>;
 	registerPushToStartToken: (input: PushToStartTokenInput) => Promise<void>;
 }
 
@@ -73,6 +78,10 @@ export class ChatController {
 			.use(withRestAuth())
 			.get("/threads/active", async () => {
 				const threads = await this.service.listActiveThreads();
+				return { threads };
+			})
+			.get("/threads/recent", async () => {
+				const threads = await this.service.listRecentThreads();
 				return { threads };
 			})
 			.get("/threads/active/runtime", async () => {
@@ -103,6 +112,32 @@ export class ChatController {
 					state: result.state,
 					stopped: result.state === "stale_cleared" || result.state === "stopping",
 				};
+			})
+			.post("/chats/:id/read", async ({ params: parameters, request, set }) => {
+				const chat = await this.service.markChatAsRead(parameters.id);
+				if (!chat) {
+					set.status = 404;
+					return { error: "chat not found" };
+				}
+
+				const metadata = readMutationRequestMetadata(request);
+				this.workspaceEvents?.append({
+					type: "chat_updated",
+					payload: {
+						chatId: chat.id,
+						diffAdded: chat.diffAdded,
+						diffRemoved: chat.diffRemoved,
+						hasUnreadFinished: chat.hasUnreadFinished,
+						isActive: chat.isActive,
+						projectId: chat.projectId,
+						status: chat.status,
+						updatedAt: chat.updatedAt,
+					},
+					originClientId: metadata.clientId,
+					requestId: metadata.requestId,
+				});
+
+				return { chat };
 			})
 			.post(
 				"/chats/:id/live-activity/subscription",
@@ -221,6 +256,67 @@ export class ChatController {
 				},
 			)
 			.post(
+				"/chats/:id/thread-completion/subscription",
+				async ({ body, params: parameters, set }) => {
+					const liveActivitySubscriptionReader = this.liveActivitySubscriptionReader;
+					const pushToken = body.pushToken.trim();
+					const pushTokenType = body.pushTokenType;
+					const supportedPushTokenTypes = liveActivitySubscriptionReader
+						? await liveActivitySubscriptionReader.getLiveActivityPushSupportedTokenTypes()
+						: new Set<"apns" | "fcm">();
+					const enabled = (liveActivitySubscriptionReader?.getLiveActivityPushIsEnabled() ?? false)
+						&& supportedPushTokenTypes.size > 0;
+
+					if (pushToken.length === 0 || (pushTokenType !== "apns" && pushTokenType !== "fcm")) {
+						set.status = 400;
+						return {
+							error: "invalid thread completion subscription payload",
+						};
+					}
+
+					const chat = await this.service.getChatById(parameters.id);
+					if (!chat) {
+						set.status = 404;
+						return { error: "chat not found" };
+					}
+
+					if (!liveActivitySubscriptionReader || !enabled) {
+						return {
+							enabled: false,
+							subscribed: false,
+						};
+					}
+
+					if (!supportedPushTokenTypes.has(pushTokenType)) {
+						return {
+							enabled: true,
+							subscribed: false,
+						};
+					}
+
+					const subscribed = await liveActivitySubscriptionReader.upsertThreadCompletionPushSubscription({
+						chatId: parameters.id,
+						chatTitle: body.chatTitle?.trim() || chat.title,
+						enabled: body.enabled,
+						pushToken,
+						pushTokenType,
+					});
+
+					return {
+						enabled: true,
+						subscribed,
+					};
+				},
+				{
+					body: t.Object({
+						chatTitle: t.Optional(t.String()),
+						enabled: t.Boolean(),
+						pushToken: t.String(),
+						pushTokenType: t.Union([t.Literal("apns"), t.Literal("fcm")]),
+					}),
+				},
+			)
+			.post(
 				"/live-activity/push-to-start-token",
 				async ({ body, set }) => {
 					const liveActivitySubscriptionReader = this.liveActivitySubscriptionReader;
@@ -298,7 +394,7 @@ export class ChatController {
 			.post(
 				"/projects/:id/chats",
 				async ({ body, params: parameters, request, set }) => {
-					const title = body.title?.trim() || "New chat";
+					const title = body.title?.trim() || "Untitled conversation";
 					const provider = body.provider ? parseChatProvider(body.provider) : undefined;
 					if (body.provider && provider === null) {
 						set.status = 400;
@@ -330,6 +426,47 @@ export class ChatController {
 					body: t.Object({
 						title: t.Optional(t.String()),
 						provider: t.Optional(t.String()),
+					}),
+				},
+			)
+			.patch(
+				"/chats/:id",
+				async ({ body, params: parameters, request, set }) => {
+					const title = body.title?.trim();
+					if (!title) {
+						set.status = 400;
+						return { error: "title is required" };
+					}
+
+					const chat = await this.service.updateChat(parameters.id, { title });
+					if (!chat) {
+						set.status = 404;
+						return { error: "chat not found" };
+					}
+
+					const metadata = readMutationRequestMetadata(request);
+					this.workspaceEvents?.append({
+						type: "chat_updated",
+						payload: {
+							chatId: chat.id,
+							diffAdded: chat.diffAdded,
+							diffRemoved: chat.diffRemoved,
+							hasUnreadFinished: chat.hasUnreadFinished,
+							isActive: chat.isActive,
+							projectId: chat.projectId,
+							status: chat.status,
+							title: chat.title,
+							updatedAt: chat.updatedAt,
+						},
+						originClientId: metadata.clientId,
+						requestId: metadata.requestId,
+					});
+
+					return { chat };
+				},
+				{
+					body: t.Object({
+						title: t.Optional(t.String()),
 					}),
 				},
 			)

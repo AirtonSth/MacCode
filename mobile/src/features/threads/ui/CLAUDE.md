@@ -8,4 +8,13 @@
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #2166 | 9:41 PM | 🟣 | Active threads visibility and quick access in desktop and mobile | ~652 |
+
+### Mar 19, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #2333 | 3:15 PM | 🔵 | Automated Agent Investigation of Active Threads Bug | ~481 |
+| #2330 | 3:14 PM | 🔵 | Thread List Loading Pattern (M-11) | ~372 |
+| #2329 | 3:12 PM | 🔵 | Thread Selection Race Condition Mitigations | ~334 |
+| #2328 | " | 🔵 | Previous Active Threads Loading Bug Fix (M-31) | ~306 |
 </claude-mem-context>

@@ -9,10 +9,14 @@ import type {
 export interface ChatDTO {
 	diffAdded: number;
 	diffRemoved: number;
+	finishedAt?: string | null;
+	hasUnreadFinished?: boolean;
 	id: string;
 	isActive: boolean;
+	lastReadAt?: string | null;
 	projectId: string;
 	provider: ChatProvider;
+	providerThreadId?: string | null;
 	status: ChatStatus;
 	title: string;
 	updatedAt: string;
@@ -22,9 +26,11 @@ export interface WorkspaceSummaryDTO {
 	id: string;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 }
 
 export interface ThreadSummaryDTO {
+	hasUnreadFinished?: boolean;
 	id: string;
 	isActive: boolean;
 	title: string;
@@ -39,10 +45,21 @@ export interface ActiveThreadSummaryDTO {
 	updatedAt: string;
 }
 
+export interface RecentThreadSummaryDTO {
+	hasUnreadFinished?: boolean;
+	id: string;
+	isActive: boolean;
+	projectId: string;
+	projectName: string;
+	title: string;
+	updatedAt: string;
+}
+
 export interface ProjectSummaryDTO {
 	id: string;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 }
 
 export interface ChatContextDTO {
@@ -262,6 +279,7 @@ export interface ProjectDTO {
 	isFavorite: boolean;
 	name: string;
 	path: string;
+	unreadFinishedThreadCount?: number;
 	updatedAt: string;
 }
 
@@ -327,6 +345,7 @@ export type ServerWsEvent =
 				diffAdded: number;
 				diffRemoved: number;
 				isActive: boolean;
+				providerThreadId?: string | null;
 				status: ChatStatus;
 				updatedAt: string;
 			};

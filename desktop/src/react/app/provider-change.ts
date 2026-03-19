@@ -14,6 +14,14 @@ export interface ProviderChangeApi {
 	listCodexModels: () => Promise<CodexModelsCatalog>;
 }
 
+export interface ProviderSelectionLockState {
+	providerThreadId: string | null;
+	messageCount: number;
+	turnCount: number;
+	hasStreamingText: boolean;
+	hasStreamingTurn: boolean;
+}
+
 /**
  * Fetches models for a provider and updates state only once the fetch resolves.
  * Previous provider's models stay visible until new ones arrive (D-14).
@@ -44,4 +52,14 @@ export const fetchModelsForProvider = async (
 	} finally {
 		callbacks.setHasLoadedCodexModels(true);
 	}
+};
+
+export const shouldLockProviderSelection = (state: ProviderSelectionLockState): boolean => {
+	return Boolean(
+		state.providerThreadId
+		|| state.messageCount > 0
+		|| state.turnCount > 0
+		|| state.hasStreamingText
+		|| state.hasStreamingTurn,
+	);
 };

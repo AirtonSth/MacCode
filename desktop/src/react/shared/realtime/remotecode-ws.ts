@@ -81,6 +81,7 @@ export interface ChatUpdatedEvent {
 		diffAdded: number;
 		diffRemoved: number;
 		isActive: boolean;
+		providerThreadId?: string | null;
 		status: "pending" | "running" | "completed" | "failed";
 		updatedAt: string;
 	};
@@ -342,6 +343,7 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				diffAdded: data.diffAdded,
 				diffRemoved: data.diffRemoved,
 				isActive: typeof data.isActive === "boolean" ? data.isActive : false,
+				providerThreadId: isString(data.providerThreadId) ? data.providerThreadId : null,
 				status: data.status,
 				updatedAt: data.updatedAt,
 			},

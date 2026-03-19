@@ -239,6 +239,7 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 				diffAdded: data.diffAdded,
 				diffRemoved: data.diffRemoved,
 				isActive: typeof data.isActive === "boolean" ? data.isActive : false,
+				providerThreadId: isString(data.providerThreadId) ? data.providerThreadId : null,
 				status: data.status,
 				updatedAt: data.updatedAt,
 			},

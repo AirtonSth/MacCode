@@ -3,7 +3,6 @@ import { ActivityIndicator, Animated, Pressable, StyleSheet, Text, View } from "
 
 const palette = {
 	accent: "#63C8FF",
-	background: "#0D0F14",
 	text: "#F1F4FA",
 };
 const footerCtaHeight = 58;
@@ -11,19 +10,17 @@ const FADE_DURATION = 200;
 
 interface ActiveThreadsFooterCtaProps {
 	count: number;
-	isLoading?: boolean;
 	onPress: () => void;
 	testID: string;
 }
 
 export const ActiveThreadsFooterCta = ({
 	count,
-	isLoading = false,
 	onPress,
 	testID,
 }: ActiveThreadsFooterCtaProps) => {
 	const fadeAnim = useRef(new Animated.Value(0)).current;
-	const isVisible = count > 0 || isLoading;
+	const isVisible = count > 0;
 
 	useEffect(() => {
 		Animated.timing(fadeAnim, {
@@ -33,7 +30,7 @@ export const ActiveThreadsFooterCta = ({
 		}).start();
 	}, [isVisible, fadeAnim]);
 
-	const label = isLoading ? "Loading active threads..." : `${String(count)} active threads`;
+	const label = `${String(count)} active thread${count === 1 ? "" : "s"}`;
 
 	return (
 		<Animated.View
@@ -46,16 +43,10 @@ export const ActiveThreadsFooterCta = ({
 				style={({ pressed }) => [styles.button, pressed ? styles.buttonPressed : null]}
 				testID={testID}
 			>
-				{isLoading ? (
-					<ActivityIndicator color={palette.background} size="small" />
-				) : (
-					<>
-						<View style={styles.badge}>
-							<ActivityIndicator color={palette.accent} size={10} />
-						</View>
-						<Text style={styles.label}>{label}</Text>
-					</>
-				)}
+				<View style={styles.badge}>
+					<ActivityIndicator color={palette.accent} size={10} />
+				</View>
+				<Text style={styles.label}>{label}</Text>
 			</Pressable>
 		</Animated.View>
 	);

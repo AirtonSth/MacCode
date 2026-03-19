@@ -164,6 +164,7 @@ export interface ChatUpdatedServerEvent {
 		diffAdded: number;
 		diffRemoved: number;
 		isActive: boolean;
+		providerThreadId?: string | null;
 		status: "pending" | "running" | "completed" | "failed";
 		updatedAt: string;
 	};

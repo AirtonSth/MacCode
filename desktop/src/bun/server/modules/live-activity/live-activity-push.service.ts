@@ -972,6 +972,10 @@ class NoopLiveActivityPushService implements LiveActivityPushServiceContract {
 		return false;
 	}
 
+	async upsertThreadCompletionSubscription(): Promise<boolean> {
+		return false;
+	}
+
 	async registerPushToStartToken(): Promise<void> {}
 }
 
@@ -2021,6 +2025,10 @@ export class LiveActivityPushService implements LiveActivityPushServiceContract 
 		}
 		return true;
 	}
+
+	async upsertThreadCompletionSubscription(): Promise<boolean> {
+		return false;
+	}
 }
 
 class PrivateBackendLiveActivityPushService implements LiveActivityPushServiceContract {
@@ -2097,6 +2105,10 @@ class PrivateBackendLiveActivityPushService implements LiveActivityPushServiceCo
 	async upsertSubscription(input: LiveActivityPushSubscriptionInput): Promise<boolean> {
 		await this.getCapabilities();
 		return await this.delegate.upsertSubscription(input);
+	}
+
+	async upsertThreadCompletionSubscription(): Promise<boolean> {
+		return false;
 	}
 
 	async registerPushToStartToken(input: PushToStartTokenInput): Promise<void> {
