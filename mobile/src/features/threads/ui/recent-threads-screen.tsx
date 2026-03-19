@@ -55,7 +55,7 @@ export const RecentThreadsScreen = () => {
 	}, [recentThreadsQuery.data, searchValue]);
 
 	const renderThreadStatusBadge = (thread: {
-		hasUnreadFinished: boolean;
+		hasUnreadFinished?: boolean;
 		isActive: boolean;
 	}) => {
 		if (thread.isActive) {
