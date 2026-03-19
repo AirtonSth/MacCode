@@ -355,7 +355,7 @@ const ParallaxController = ({
 }) => {
 	useFrame((_, delta) => {
 		if (!groupRef.current) return;
-		const pointer = pointerRef.current;
+		const pointer = pointerRef.current ?? { horizontal: 0, vertical: 0 };
 		const targetX = reducedMotion ? 0 : pointer.horizontal * 0.18;
 		const targetY = reducedMotion ? 0 : pointer.vertical * 0.12;
 		const targetRotY = reducedMotion ? 0 : pointer.horizontal * 0.05;
