@@ -1,5 +1,5 @@
 import { type CSSProperties, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import {
 	Folder,
 	FolderSearch,
@@ -3325,24 +3325,37 @@ const App = (): JSX.Element => {
 												</div>
 											</div>
 
-											{isTerminalOpen && state.selectedChatId ? (
-												<div className="shrink-0 border-t border-white/10">
-													<div className="h-[42vh] min-h-[220px]">
-														<ThreadTerminalPanel
-															chatId={state.selectedChatId}
-															className="h-full rounded-none border-0"
-															error={selectedThreadTerminal?.error ?? null}
-															isExecuting={Boolean(selectedThreadTerminal?.isExecuting)}
-															isLoading={Boolean(selectedThreadTerminal?.isLoading)}
-															items={selectedThreadTerminal?.items ?? []}
-															key={state.selectedChatId}
-															onRun={(command) => {
-																void handleTerminalRun(command);
-															}}
-														/>
-													</div>
-												</div>
-											) : null}
+											<AnimatePresence initial={false}>
+												{isTerminalOpen && state.selectedChatId ? (
+													<motion.div
+														animate={{ height: "auto" }}
+														className="shrink-0 overflow-hidden border-t border-white/10"
+														exit={{ height: 0 }}
+														initial={{ height: 0 }}
+														key="terminal-panel"
+														transition={
+															shouldReduceMotion
+																? { duration: 0 }
+																: { duration: 0.3, ease: [0.4, 0, 0.2, 1] }
+														}
+													>
+														<div className="h-[42vh] min-h-[220px]">
+															<ThreadTerminalPanel
+																chatId={state.selectedChatId}
+																className="h-full rounded-none border-0"
+																error={selectedThreadTerminal?.error ?? null}
+																isExecuting={Boolean(selectedThreadTerminal?.isExecuting)}
+																isLoading={Boolean(selectedThreadTerminal?.isLoading)}
+																items={selectedThreadTerminal?.items ?? []}
+																key={state.selectedChatId}
+																onRun={(command) => {
+																	void handleTerminalRun(command);
+																}}
+															/>
+														</div>
+													</motion.div>
+												) : null}
+											</AnimatePresence>
 										</section>
 									) : (
 							<motion.div

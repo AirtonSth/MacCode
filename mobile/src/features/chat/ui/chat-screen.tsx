@@ -40,6 +40,7 @@ import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
 import { WorkspaceRenameModal } from "../../workspaces/ui/workspace-rename-modal";
 
+import { ActiveThreadsBanner } from "./active-threads-banner";
 import { AUTO_SCROLL_BOTTOM_THRESHOLD } from "./auto-scroll-constants";
 
 const drawerWidth = 308;
@@ -1373,25 +1374,8 @@ export const ChatScreen = () => {
 				title={selectedChat?.title ?? "Chat"}
 			/>
 
-			{otherActiveThreadsCount > 0 ? (
-				<Pressable
-					accessibilityRole="button"
-					onPress={() => {
-						push("/active-threads");
-					}}
-					style={({ pressed }) => [styles.activeThreadsBanner, pressed ? styles.activeThreadsBannerPressed : null]}
-					testID="chat-active-threads-banner"
-				>
-					<ActivityIndicator color={palette.accent} size={10} />
-					<Text style={styles.activeThreadsBannerText}>
-						{otherActiveThreadsCount === 1
-							? "1 other active thread"
-							: `${String(otherActiveThreadsCount)} other active threads`}
-					</Text>
-				</Pressable>
-			) : null}
-
 			<View style={styles.body}>
+				<ActiveThreadsBanner count={otherActiveThreadsCount} onPress={() => { push("/active-threads"); }} />
 					<ScrollView
 						contentContainerStyle={styles.messagesContent}
 						contentInsetAdjustmentBehavior="automatic"
@@ -2829,25 +2813,6 @@ const styles = StyleSheet.create({
 		fontFamily: Platform.select({ ios: "Menlo", default: "monospace" }),
 		fontSize: 13,
 		lineHeight: 20,
-	},
-	activeThreadsBanner: {
-		alignItems: "center",
-		backgroundColor: "rgba(99,200,255,0.10)",
-		borderBottomColor: "rgba(99,200,255,0.25)",
-		borderBottomWidth: 1,
-		flexDirection: "row",
-		gap: 8,
-		justifyContent: "center",
-		paddingHorizontal: 14,
-		paddingVertical: 8,
-	},
-	activeThreadsBannerPressed: {
-		opacity: 0.7,
-	},
-	activeThreadsBannerText: {
-		color: "#9FDBFF",
-		fontSize: 12,
-		fontWeight: "600",
 	},
 	workingIndicator: {
 		alignItems: "center",

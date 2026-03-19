@@ -1,12 +1,11 @@
 import { MaterialIcons } from "@expo/vector-icons";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { AccessibilityInfo, Pressable, StyleSheet, Text, View } from "react-native";
+import { AccessibilityInfo, LayoutAnimation, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { AssistantStreamItemState } from "../../../shared/api/types";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import type { StreamItem, StreamTurnState } from "../model/stream-turn-state";
-
-const TOOL_AUTO_EXPAND_MS = 2_000;
+import { TOOL_AUTO_EXPAND_MS } from "./streaming-timeline-constants";
 
 interface StreamingTimelineProps {
 	turn: StreamTurnState;
@@ -160,6 +159,7 @@ const renderTimelineItem = (
 					<Pressable
 						accessibilityLabel={item.isExpanded ? "Collapse stream item" : "Expand stream item"}
 						onPress={() => {
+							LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
 							const nextExpanded = !item.isExpanded;
 							onSetItemExpanded(item.id, nextExpanded, true);
 							if (nextExpanded && item.state === "collapsed") {
@@ -270,6 +270,7 @@ const StreamingTimelineComponent = ({
 
 			const timeoutId = setTimeout(() => {
 				autoExpandTimersRef.current.delete(item.id);
+				LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
 				onSetItemExpandedRef.current(item.id, true, false);
 			}, TOOL_AUTO_EXPAND_MS);
 			timers.set(item.id, timeoutId);

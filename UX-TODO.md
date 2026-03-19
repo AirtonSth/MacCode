@@ -56,9 +56,10 @@
   - Tres estados condicionais com alturas completamente diferentes. Transicao entre eles causa salto visual.
   - **Fix**: Usar skeleton screens que mantenham a mesma estrutura visual do estado final. Ou reservar espaco minimo.
 
-- [ ] **[D-09] Auto-expand de tool items causa layout jump apos 2s** — `StreamingTimeline.tsx:181`
+- [x] **[D-09] Auto-expand de tool items causa layout jump apos 2s** — `StreamingTimeline.tsx:181`
   - `setTimeout(2000)` expande itens de tool sem animacao. Tudo abaixo pula para baixo.
   - **Fix**: Animar a expansao com `motion.div` (height transition). Considerar nao auto-expandir se o scroll nao esta no bottom.
+  - **Done**: Replaced `motion.pre` with `motion.div` wrapper + `overflow: hidden` + Material cubic-bezier easing (0.25s). Tests: `StreamingTimeline.test.ts` (6 tests).
 
 - [ ] **[D-10] Items colapsam abruptamente quando completam** — `StreamingTimeline.tsx:808`
   - Itens auto-expandidos colapsam instantaneamente quando `state` muda de "running" para "completed".
@@ -69,9 +70,10 @@
   - **Fix**: Checar se o usuario esta no bottom (similar ao `isAtBottomRef` do ConversationPanel). So auto-scroll se estiver.
   - **Done**: Added isAtBottom check with 48px threshold. Tests: `ThreadTerminalPanel.test.ts` (12 tests pass)
 
-- [ ] **[D-12] Terminal panel abre/fecha causando layout shift de 42vh** — `App.tsx:3190`
+- [x] **[D-12] Terminal panel abre/fecha causando layout shift de 42vh** — `App.tsx:3190`
   - Toggle do terminal insere/remove um div de `42vh min-h-[220px]`. A area de conversa encolhe dramaticamente.
   - **Fix**: Animar a abertura/fechamento. Ou usar um painel resizable com drag handle.
+  - **Done**: Wrapped in `AnimatePresence` + `motion.div` with height 0→auto animation, `overflow-hidden`, 0.3s cubic-bezier. Respects reduced motion. Tests: `TerminalPanelAnimation.test.ts` (6 tests).
 
 - [ ] **[D-13] Google Fonts import bloqueia render (FOUT)** — `index.css:1`
   - `@import url("fonts.googleapis.com/...")` e render-blocking. Texto renderiza em fonte fallback, depois pula para Manrope.
@@ -194,18 +196,20 @@
   - Componente re-renderiza inteiro em qualquer mudanca de estado. Keyboard input pode laggear.
   - **Fix**: Extrair sub-componentes memoizados (drawer, terminal, modais). Ou usar `useReducer` para estado local.
 
-- [ ] **[M-08] Banner de active threads causa layout shift** — `chat-screen.tsx:1362`
+- [x] **[M-08] Banner de active threads causa layout shift** — `chat-screen.tsx:1362`
   - Banner aparece/desaparece baseado em poll de 2.5s. Toda a area de mensagem pula 30-40px.
   - **Fix**: Reservar espaco fixo para o banner. Ou anima-lo com height transition. Ou posicionar como overlay.
+  - **Done**: Converted banner to absolute overlay with fade animation (200ms). Always renders with `pointerEvents="none"` when hidden. Tests: `active-threads-footer-cta.test.ts` (5 tests).
 
 - [x] **[M-09] Auto-scroll briga com scroll manual durante streaming** — `chat-screen.tsx:464`
   - Cada update de streaming rola para bottom. Impossivel ler mensagens anteriores durante resposta ativa.
   - **Fix**: Detectar scroll manual e pausar auto-scroll. Mostrar FAB "Scroll to bottom" para retornar.
   - **Done**: Added userScrolledUpRef with 48px threshold. Auto-scroll paused when user scrolls up. Tests: `auto-scroll.test.ts` (17 tests pass)
 
-- [ ] **[M-10] Tool auto-expand sem animacao causa layout jump** — `streamingTimeline.tsx:245`
+- [x] **[M-10] Tool auto-expand sem animacao causa layout jump** — `streamingTimeline.tsx:245`
   - Apos 2s, tool item expande instantaneamente. Conteudo abaixo pula.
   - **Fix**: Usar `LayoutAnimation` do React Native para animar a expansao. Ou `Animated` com height interpolation.
+  - **Done**: Added `LayoutAnimation.configureNext(easeInEaseOut)` before both auto-expand and manual toggle. Tests: `streamingTimeline.test.ts` (20 tests, 69 assertions).
 
 - [x] **[M-11] Thread list inteira substituida por spinner durante refetch** — `thread-selection-screen.tsx:160`
   - `shouldShowThreadsLoading` em refetch mostra spinner no lugar da lista. Lista desaparece e reaparece.

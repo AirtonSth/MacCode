@@ -33,7 +33,18 @@ interface StreamingTimelineRowProps {
 	onSetItemState: (itemId: string, state: AssistantStreamItemState) => void;
 }
 
-const TOOL_AUTO_EXPAND_MS = 2_000;
+export const TOOL_AUTO_EXPAND_MS = 2_000;
+
+/**
+ * Shared animation configuration for the tool-detail expand/collapse motion.
+ * Extracted so tests can verify the values without rendering.
+ */
+export const DETAIL_EXPAND_TRANSITION = {
+	duration: 0.25,
+	ease: [0.4, 0, 0.2, 1] as readonly [number, number, number, number],
+} as const;
+
+export const DETAIL_EXPAND_WRAPPER_STYLE = { overflow: "hidden" as const };
 
 const getItemIcon = (item: StreamItem) => {
 	if (item.type === "tool") {
@@ -256,16 +267,21 @@ const StreamingTimelineRow = ({
 
 					<AnimatePresence initial={false}>
 						{showExpandedDetails ? (
-							<motion.pre
+							<motion.div
 								animate={shouldReduceMotion ? undefined : { opacity: 1, height: "auto" }}
-								className={cn(
-									"mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/80 p-2.5 text-[12px] leading-5 text-slate-100",
-								)}
 								exit={shouldReduceMotion ? undefined : { opacity: 0, height: 0 }}
 								initial={shouldReduceMotion ? undefined : { opacity: 0, height: 0 }}
+								style={DETAIL_EXPAND_WRAPPER_STYLE}
+								transition={DETAIL_EXPAND_TRANSITION}
 							>
-								{detailText}
-							</motion.pre>
+								<pre
+									className={cn(
+										"mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/80 p-2.5 text-[12px] leading-5 text-slate-100",
+									)}
+								>
+									{detailText}
+								</pre>
+							</motion.div>
 						) : null}
 					</AnimatePresence>
 				</div>

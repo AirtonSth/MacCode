@@ -1,4 +1,5 @@
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { useEffect, useRef } from "react";
+import { ActivityIndicator, Animated, Pressable, StyleSheet, Text, View } from "react-native";
 
 const palette = {
 	accent: "#63C8FF",
@@ -6,6 +7,7 @@ const palette = {
 	text: "#F1F4FA",
 };
 const footerCtaHeight = 58;
+const FADE_DURATION = 200;
 
 interface ActiveThreadsFooterCtaProps {
 	count: number;
@@ -20,14 +22,24 @@ export const ActiveThreadsFooterCta = ({
 	onPress,
 	testID,
 }: ActiveThreadsFooterCtaProps) => {
-	if (count <= 0 && !isLoading) {
-		return null;
-	}
+	const fadeAnim = useRef(new Animated.Value(0)).current;
+	const isVisible = count > 0 || isLoading;
+
+	useEffect(() => {
+		Animated.timing(fadeAnim, {
+			toValue: isVisible ? 1 : 0,
+			duration: FADE_DURATION,
+			useNativeDriver: true,
+		}).start();
+	}, [isVisible, fadeAnim]);
 
 	const label = isLoading ? "Loading active threads..." : `${String(count)} active threads`;
 
 	return (
-		<View style={styles.container}>
+		<Animated.View
+			pointerEvents={isVisible ? "auto" : "none"}
+			style={[styles.container, { opacity: fadeAnim }]}
+		>
 			<Pressable
 				accessibilityRole="button"
 				onPress={onPress}
@@ -45,7 +57,7 @@ export const ActiveThreadsFooterCta = ({
 					</>
 				)}
 			</Pressable>
-		</View>
+		</Animated.View>
 	);
 };
 
