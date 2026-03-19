@@ -17,9 +17,10 @@
 
 ### P0 — Critical
 
-- [ ] **[D-01] Waterfall de estados vazios no boot** — `App.tsx`
+- [x] **[D-01] Waterfall de estados vazios no boot** — `App.tsx`
   - `handleBootstrap()` dispara `SET_PROJECTS` → `SET_SELECTED_PROJECT` → effect carrega chats → effect carrega messages. Cada etapa zera o estado anterior, gerando 3-4 repinturas: sidebar vazia → projetos → chat list vazia → chats → messages vazias → mensagens.
   - **Fix**: Carregar projects + chats + messages em uma unica operacao batch e despachar um unico `BOOTSTRAP_COMPLETE` com todos os dados.
+  - **Done**: Added `BOOTSTRAP_COMPLETE` reducer action. Tests: `useWorkspaceStore.bootstrap.test.ts` (4 tests pass)
 
 ### P1 — High
 
@@ -43,9 +44,10 @@
   - Quando um turn completa, TODOS os itens colapsam, mesmo os que o usuario abriu para ler output de tool.
   - **Fix**: Respeitar flag `expandedByUser`. So colapsar itens que foram auto-expandidos.
 
-- [ ] **[D-07] Loading states inicializam como `false` causando flash de empty state** — `useWorkspaceStore.ts:1109`
+- [x] **[D-07] Loading states inicializam como `false` causando flash de empty state** — `useWorkspaceStore.ts:1109`
   - `projectsLoading: false`, `chatsLoading: false`, `messagesLoading: false` no initial state. UI mostra "No workspaces yet" por 1 frame antes de mostrar o loading spinner.
   - **Fix**: Inicializar loading states como `true` (ou criar estado "initial" distinto de "idle").
+  - **Done**: Initial state now has `projectsLoading: true, chatsLoading: true, messagesLoading: true`. Tests: `useWorkspaceStore.bootstrap.test.ts`
 
 - [ ] **[D-08] Layout shift entre empty state / loading / content no ConversationPanel** — `ConversationPanel.tsx:426`
   - Tres estados condicionais com alturas completamente diferentes. Transicao entre eles causa salto visual.
@@ -155,13 +157,15 @@
 
 ### P0 — Critical
 
-- [ ] **[M-01] WebSocket reconecta a cada mudanca de identidade do `handleServerEvent`** — `use-workspace-shell.ts:1795`
+- [x] **[M-01] WebSocket reconecta a cada mudanca de identidade do `handleServerEvent`** — `use-workspace-shell.ts:1795`
   - `handleServerEvent` esta nas deps do effect que cria o WS client. Como `handleServerEvent` e recriado frequentemente (depende de muitos callbacks/state), o WS e destruido e recriado repetidamente. Conexao cai e reconecta causando flicker no estado de conexao e possivel perda de mensagens.
   - **Fix**: Mover `handleServerEvent` para um `useRef` e acessar `.current` dentro do effect. Remover da dependency array.
+  - **Done**: Added `handleServerEventRef` and `handleConnectionStateChangeRef`. Effect deps reduced to `[config.activeTarget, isActive]`. Tests: `ws-reconnect-stability.test.ts` (2 tests pass)
 
-- [ ] **[M-02] Streaming text desaparece antes da mensagem final carregar (gap de ate 1.25s)** — `use-workspace-shell.ts:1495`
+- [x] **[M-02] Streaming text desaparece antes da mensagem final carregar (gap de ate 1.25s)** — `use-workspace-shell.ts:1495`
   - No `assistant_done`, streaming text e zerado imediatamente. O retry loop (`trySyncMessages`, 5x com 250ms) tenta buscar a mensagem persistida. Durante esse gap, o usuario ve a resposta sumir.
   - **Fix**: Manter streaming text visivel como fallback ate a mensagem final chegar. So limpar apos confirmacao do fetch.
+  - **Done**: `clearStreamingText()` now called only inside `trySyncMessages` at each exit point. Tests: `streaming-text-persistence.test.ts` (4 tests pass)
 
 ### P1 — High
 
@@ -209,9 +213,10 @@
   - `onerror` nao fecha o socket. Mensagens enviadas entre o erro e a reconexao falham silenciosamente.
   - **Fix**: Fechar socket explicitamente em `onerror`. Enfileirar mensagens durante reconexao.
 
-- [ ] **[M-14] `onFinish` instavel reinicia animacao do splash** — `animated-launch-splash.tsx:80`
+- [x] **[M-14] `onFinish` instavel reinicia animacao do splash** — `animated-launch-splash.tsx:80`
   - `onFinish` em deps do `useEffect`. Parent re-render cria nova referencia -> effect re-executa -> animacao reinicia.
   - **Fix**: Usar `useRef` para `onFinish` callback. Ou memoizar com `useCallback` no parent.
+  - **Done**: Added `onFinishRef` pattern. `onFinish` removed from effect deps. Tests: `animated-launch-splash.test.tsx` (3 tests pass)
 
 - [ ] **[M-15] Apenas 5 mensagens visiveis por vez** — `use-messages-query.ts:8`
   - `MESSAGE_PAGE_SIZE = 5`. Mensagens antigas somem. Scroll para cima necessario para ver historico.

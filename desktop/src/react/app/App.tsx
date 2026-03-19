@@ -34,6 +34,8 @@ import {
 	type MessageDTO,
 	type ProjectDTO,
 	type StreamTurnState,
+	createEmptyMessageWindow,
+	sortChatsByUpdatedAtDesc,
 	useWorkspaceStore,
 } from "../features/workspace/model/useWorkspaceStore";
 import { sendWorkspaceMessage } from "../features/workspace/model/send-message";
@@ -377,6 +379,7 @@ const App = (): JSX.Element => {
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
 	const activeChatIdsRef = useRef<Set<string>>(new Set());
+	const bootstrapDoneRef = useRef<boolean>(false);
 	const projectsLoadInFlightRef = useRef<Promise<void> | null>(null);
 	const projectsLoadQueuedRef = useRef<boolean>(false);
 	const chatsLoadInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
@@ -1738,27 +1741,162 @@ const App = (): JSX.Element => {
 			[dispatch],
 	);
 
-	const handleBootstrap = useCallback(() => {
+	const handleBootstrap = useCallback(async () => {
 		dispatch({
 			payload: { baseUrl, token },
 			type: "BOOTSTRAP_CONFIG",
 		});
-		return Promise.all([loadProjects(), loadCodexModels()]);
-	}, [baseUrl, dispatch, loadCodexModels, loadProjects, token]);
+
+		try {
+			const [projects, selection] = await Promise.all([
+				api.listWorkspaceSummaries().then((workspaces) =>
+					workspaces.map(toProjectDtoFromWorkspaceSummary),
+				),
+				api.getWorkspaceSelection().catch(() => ({
+					selectedChatId: null,
+					selectedProjectId: null,
+					permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
+					selectedModel: null,
+					selectedReasoningEffort: null,
+				})),
+			]);
+
+			const hasProjectSelection = selection.selectedProjectId
+				? projects.some((project) => project.id === selection.selectedProjectId)
+				: false;
+			const selectedProjectId = hasProjectSelection
+				? selection.selectedProjectId
+				: projects[0]?.id ?? null;
+			const preferredChatId = hasProjectSelection ? selection.selectedChatId : null;
+			const nextPermissionMode =
+				parseCodexPermissionMode(selection.permissionMode) ?? DEFAULT_CODEX_PERMISSION_MODE;
+			const nextSelectedModel =
+				typeof selection.selectedModel === "string" && selection.selectedModel.trim().length > 0
+					? selection.selectedModel.trim()
+					: null;
+			const nextSelectedReasoningEffort =
+				parseCodexReasoningEffort(selection.selectedReasoningEffort) ?? null;
+
+			let chats: ChatDTO[] = [];
+			if (selectedProjectId) {
+				try {
+					chats = sortChatsByUpdatedAtDesc(
+						(await api.listThreadSummaries(selectedProjectId)).map((chat) =>
+							toChatDtoFromThreadSummary(chat, selectedProjectId),
+						),
+					);
+				} catch {
+					// chats remain empty on failure — non-fatal
+				}
+			}
+
+			const hasPreferredChat = preferredChatId
+				? chats.some((chat) => chat.id === preferredChatId)
+				: false;
+			const selectedChatId = hasPreferredChat
+				? preferredChatId
+				: chats[0]?.id ?? null;
+
+			let messageWindow = createEmptyMessageWindow(selectedChatId);
+			if (selectedChatId) {
+				try {
+					const messagePage = await api.listMessagesPage(selectedChatId, {
+						limit: MESSAGE_PAGE_SIZE,
+					});
+					const pageTurns = cloneChatTurnSnapshots(messagePage.turns);
+					messageWindow = {
+						chatId: selectedChatId,
+						hasMore: messagePage.hasMore,
+						latestDirty: false,
+						messages: messagePage.messages,
+						mode: "latest",
+						nextBeforeMessageId: messagePage.nextBeforeMessageId,
+						turns: pageTurns,
+					};
+				} catch {
+					// message window remains empty on failure — non-fatal
+				}
+			}
+
+			persistedSelectedChatIdRef.current = preferredChatId;
+			selectedProjectIdRef.current = selectedProjectId;
+			selectedChatIdRef.current = selectedChatId;
+
+			dispatch({
+				payload: {
+					projects,
+					selectedProjectId,
+					chats,
+					selectedChatId,
+					messageWindow,
+				},
+				type: "BOOTSTRAP_COMPLETE",
+			});
+
+			setPermissionMode(nextPermissionMode);
+			setSelectedModel(nextSelectedModel);
+			setSelectedReasoningEffort(nextSelectedReasoningEffort);
+			clearRestErrors();
+
+			if (
+				selection.selectedProjectId !== selectedProjectId ||
+				selection.selectedChatId !== selectedChatId ||
+				selection.permissionMode !== nextPermissionMode ||
+				(selection.selectedModel ?? null) !== nextSelectedModel ||
+				(selection.selectedReasoningEffort ?? null) !== nextSelectedReasoningEffort
+			) {
+				await persistWorkspaceSelection(selectedProjectId, selectedChatId, {
+					permissionMode: nextPermissionMode,
+					selectedModel: nextSelectedModel,
+					selectedReasoningEffort: nextSelectedReasoningEffort,
+				});
+			}
+		} catch (error) {
+			addError(
+				formatApiErrorMessage(error, "Unable to load projects"),
+				"rest",
+				formatApiErrorCode(error),
+			);
+			dispatch({ payload: false, type: "SET_PROJECTS_LOADING" });
+			dispatch({ payload: false, type: "SET_CHATS_LOADING" });
+			dispatch({ payload: false, type: "SET_MESSAGE_WINDOW_LOADING" });
+		} finally {
+			bootstrapDoneRef.current = true;
+		}
+	}, [
+		addError,
+		api,
+		baseUrl,
+		clearRestErrors,
+		dispatch,
+		formatApiErrorCode,
+		formatApiErrorMessage,
+		persistWorkspaceSelection,
+		token,
+	]);
 
 	useEffect(() => {
-		void handleBootstrap();
-	}, [handleBootstrap]);
+		void Promise.all([handleBootstrap(), loadCodexModels()]);
+	}, [handleBootstrap, loadCodexModels]);
 
 	useEffect(() => {
+		if (!bootstrapDoneRef.current) {
+			return;
+		}
 		void loadChatsForProject(state.selectedProjectId, persistedSelectedChatIdRef.current);
 	}, [loadChatsForProject, state.selectedProjectId]);
 
 	useEffect(() => {
+		if (!bootstrapDoneRef.current) {
+			return;
+		}
 		void loadMessagesForChat(state.selectedChatId, { kind: "latest" });
 	}, [loadMessagesForChat, state.selectedChatId]);
 
 	useEffect(() => {
+		if (!bootstrapDoneRef.current) {
+			return;
+		}
 		void loadChatContext(state.selectedChatId);
 	}, [loadChatContext, state.selectedChatId]);
 

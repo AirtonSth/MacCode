@@ -1492,10 +1492,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					notifyMessageCompletion(chatId, "completed");
 					return;
 				}
-				setStreamingTextByChat((current) => ({
-					...current,
-					[chatId]: "",
-				}));
+
+				// [M-02] Streaming text kept visible as fallback until final message loads.
 				queryClient.setQueryData<StreamTurnState | null>(
 					queryKeys.streamTurn(chatId),
 					null,
@@ -1505,8 +1503,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				void (async () => {
 					const maxAttempts = 5;
 					const retryDelayMs = 250;
+					const clearStreamingText = () => {
+						setStreamingTextByChat((current) => ({
+							...current,
+							[chatId]: "",
+						}));
+					};
 					const trySyncMessages = async (attempt: number): Promise<void> => {
 						if (!isViewingLatestMessages(chatId)) {
+							clearStreamingText();
 							markLatestMessagesDirty(chatId);
 							return;
 						}
@@ -1520,6 +1525,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 									queryKeys.messages(chatId),
 									latestPage,
 								);
+								clearStreamingText();
 								setLatestDirtyByChat((current) => ({
 									...current,
 									[chatId]: false,
@@ -1531,6 +1537,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 						}
 
 						if (attempt >= maxAttempts) {
+							clearStreamingText();
 							if (isViewingLatestMessages(chatId)) {
 								void queryClient.invalidateQueries({ queryKey: queryKeys.messages(chatId) });
 							} else {
@@ -1792,6 +1799,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 	}, [shouldEnableMessagesQuery]);
 
+	// --- [M-01] Stable refs for WS callbacks to prevent reconnect on identity change ---
+	const handleServerEventRef = useRef(handleServerEvent);
+	handleServerEventRef.current = handleServerEvent;
+	const handleConnectionStateChangeRef = useRef(handleConnectionStateChange);
+	handleConnectionStateChangeRef.current = handleConnectionStateChange;
+
 	useEffect(function handleWorkspaceRealtimeEffect() {
 		if (!isActive) {
 			setConnectionState("idle");
@@ -1799,8 +1812,8 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const realtime = createRealtimeClient({
-			onConnectionStateChange: handleConnectionStateChange,
-			onEvent: handleServerEvent,
+			onConnectionStateChange: (state: ConnectionState) => { handleConnectionStateChangeRef.current(state); },
+			onEvent: (event: ServerWsEvent) => { handleServerEventRef.current(event); },
 			target: config.activeTarget,
 		});
 
@@ -1812,7 +1825,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			realtime.disconnect();
 			realtimeRef.current = null;
 		};
-	}, [config.activeTarget, handleConnectionStateChange, handleServerEvent, isActive]);
+	}, [config.activeTarget, isActive]);
 
 	useEffect(() => {
 		if (!shouldEnableMessagesQuery || !selectedChatId || !realtimeRef.current) {

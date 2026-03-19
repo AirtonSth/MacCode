@@ -107,6 +107,16 @@ export interface WorkspaceState {
 
 export type WorkspaceAction =
 	| { type: "BOOTSTRAP_CONFIG"; payload: { baseUrl: string; token: string } }
+	| {
+			type: "BOOTSTRAP_COMPLETE";
+			payload: {
+				projects: ProjectDTO[];
+				selectedProjectId: string | null;
+				chats: ChatDTO[];
+				selectedChatId: string | null;
+				messageWindow: MessageWindowState;
+			};
+	  }
 	| { type: "SET_PROJECTS_LOADING"; payload: boolean }
 	| { type: "SET_PROJECTS"; payload: ProjectDTO[] }
 	| { type: "UPSERT_PROJECT"; payload: ProjectDTO }
@@ -159,7 +169,7 @@ export type WorkspaceAction =
 
 const formatErrorId = () => `err-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
-const sortChatsByUpdatedAtDesc = (chats: ChatDTO[]): ChatDTO[] =>
+export const sortChatsByUpdatedAtDesc = (chats: ChatDTO[]): ChatDTO[] =>
 	[...chats].sort((a, b) => {
 		if (a.updatedAt > b.updatedAt) return -1;
 		if (a.updatedAt < b.updatedAt) return 1;
@@ -268,7 +278,7 @@ const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
 
 const MESSAGE_WINDOW_PAGE_SIZE = 5;
 
-const createEmptyMessageWindow = (chatId: string | null = null): MessageWindowState => ({
+export const createEmptyMessageWindow = (chatId: string | null = null): MessageWindowState => ({
 	chatId,
 	messages: [],
 	hasMore: false,
@@ -320,13 +330,32 @@ const trimMessageWindow = (messages: MessageDTO[]): {
 	};
 };
 
-const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): WorkspaceState => {
+export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction): WorkspaceState => {
 	switch (action.type) {
 		case "BOOTSTRAP_CONFIG":
 			return {
 				...state,
 				baseUrl: action.payload.baseUrl,
 				token: action.payload.token,
+			};
+
+		case "BOOTSTRAP_COMPLETE":
+			return {
+				...state,
+				projects: action.payload.projects,
+				selectedProjectId: action.payload.selectedProjectId,
+				chats: action.payload.chats,
+				selectedChatId: action.payload.selectedChatId,
+				messageWindow: action.payload.messageWindow,
+				projectsLoading: false,
+				chatsLoading: false,
+				messagesLoading: false,
+				streamingByChat: {},
+				streamingActiveByChat: {},
+				streamTurnsByChat: {},
+				streamHistoryByChat: {},
+				lastAssistantEventIdByChat: {},
+				sendingByChat: {},
 			};
 
 		case "SET_PROJECTS_LOADING":
@@ -1106,9 +1135,9 @@ export const useWorkspaceStore = () => {
 		isSendingMessage: false,
 		isCreatingProject: false,
 		isCreatingChat: false,
-		projectsLoading: false,
-		chatsLoading: false,
-		messagesLoading: false,
+		projectsLoading: true,
+		chatsLoading: true,
+		messagesLoading: true,
 		connectionError: null,
 		connectionState: "idle",
 		errors: [],

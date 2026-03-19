@@ -15,6 +15,11 @@ export const AnimatedLaunchSplash = ({ onFinish }: AnimatedLaunchSplashProps) =>
 	const glowOpacity = useRef(new Animated.Value(0)).current;
 	const glowScale = useRef(new Animated.Value(0.82)).current;
 
+	const onFinishRef = useRef(onFinish);
+	useEffect(() => {
+		onFinishRef.current = onFinish;
+	}, [onFinish]);
+
 	useEffect(() => {
 		const sequence = Animated.sequence([
 			Animated.parallel([
@@ -71,13 +76,13 @@ export const AnimatedLaunchSplash = ({ onFinish }: AnimatedLaunchSplashProps) =>
 				return;
 			}
 
-			onFinish();
+			onFinishRef.current();
 		});
 
 		return () => {
 			sequence.stop();
 		};
-	}, [glowOpacity, glowScale, iconOpacity, iconScale, onFinish, overlayOpacity]);
+	}, [glowOpacity, glowScale, iconOpacity, iconScale, overlayOpacity]);
 
 	return (
 		<Animated.View pointerEvents="none" style={[styles.overlay, { opacity: overlayOpacity }]}>
