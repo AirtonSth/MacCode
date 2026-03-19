@@ -60,12 +60,12 @@ codexTest(`GET /v1/chats/:id/messages returns messages in ascending createdAt or
 		ws.send(JSON.stringify({ data: { chatId }, event: "join_chat" }));
 		await new Promise((resolve) => setTimeout(resolve, 20));
 
-		ws.send(
-			JSON.stringify({
-				data: { chatId, text: "message test" },
-				event: "user_message",
-			}),
-		);
+			ws.send(
+				JSON.stringify({
+					data: { chatId, requestId: "req-message-order", text: "message test" },
+					event: "user_message",
+				}),
+			);
 
 		await waitForCondition(() =>
 			events.some((item) => {
