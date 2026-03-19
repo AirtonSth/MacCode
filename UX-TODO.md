@@ -43,9 +43,10 @@
   - **Fix**: `UPSERT_CHAT` deve apenas adicionar/atualizar na lista. Selecao automatica so se for resultado de acao explicita do usuario.
   - **Done**: UPSERT_CHAT only changes selection when selectedChatId is null. Tests: `useWorkspaceStore.selection.test.ts` (3 tests pass)
 
-- [ ] **[D-06] `collapseTurnItems` fecha itens que o usuario expandiu manualmente** — `useWorkspaceStore.ts:244`
+- [x] **[D-06] `collapseTurnItems` fecha itens que o usuario expandiu manualmente** — `useWorkspaceStore.ts:244`
   - Quando um turn completa, TODOS os itens colapsam, mesmo os que o usuario abriu para ler output de tool.
   - **Fix**: Respeitar flag `expandedByUser`. So colapsar itens que foram auto-expandidos.
+  - **Done**: `collapseTurnItems` now checks `expandedByUser` before collapsing. User-expanded items keep state "completed" instead of "collapsed". Tests: `useWorkspaceStore.collapse.test.ts` (8 tests).
 
 - [x] **[D-07] Loading states inicializam como `false` causando flash de empty state** — `useWorkspaceStore.ts:1109`
   - `projectsLoading: false`, `chatsLoading: false`, `messagesLoading: false` no initial state. UI mostra "No workspaces yet" por 1 frame antes de mostrar o loading spinner.
@@ -61,9 +62,10 @@
   - **Fix**: Animar a expansao com `motion.div` (height transition). Considerar nao auto-expandir se o scroll nao esta no bottom.
   - **Done**: Replaced `motion.pre` with `motion.div` wrapper + `overflow: hidden` + Material cubic-bezier easing (0.25s). Tests: `StreamingTimeline.test.ts` (6 tests).
 
-- [ ] **[D-10] Items colapsam abruptamente quando completam** — `StreamingTimeline.tsx:808`
+- [x] **[D-10] Items colapsam abruptamente quando completam** — `StreamingTimeline.tsx:808`
   - Itens auto-expandidos colapsam instantaneamente quando `state` muda de "running" para "completed".
   - **Fix**: Manter expandido por default quando completa. Ou animar o colapso. Respeitar `expandedByUser`.
+  - **Done**: Added 600ms delayed auto-collapse for non-user items on running→completed transition. User-expanded items never auto-collapse.
 
 - [x] **[D-11] Terminal auto-scroll ignora posicao do usuario** — `ThreadTerminalPanel.tsx:44`
   - `useEffect([items])` sempre rola para o bottom. Impossivel ler output anterior durante streaming.
@@ -134,17 +136,20 @@
 - [ ] **[D-26] "Working..." indicator pisca em turns rapidos** — `ConversationPanel.tsx:573`
   - Fade-in -> imediato fade-out quando `isWorking` flipa rapido. Usar debounce para mostrar.
 
-- [ ] **[D-27] State badges mudam sem transicao** — `StreamingTimeline.tsx:237`
+- [x] **[D-27] State badges mudam sem transicao** — `StreamingTimeline.tsx:237`
   - Cor e texto snappam de "running" (azul) para "completed" (verde). Adicionar transition CSS.
+  - **Done**: Added `transition-all duration-200` to badge span.
 
-- [ ] **[D-28] Shimmer text "materializa" ao completar** — `StreamingTimeline.tsx:231`
+- [x] **[D-28] Shimmer text "materializa" ao completar** — `StreamingTimeline.tsx:231`
   - `color: transparent` -> `color: normal` em 1 frame. Usar fade transition.
+  - **Done**: Added `transition: color 0.3s ease` to `.loading-shimmer-pure-text`.
 
 - [ ] **[D-29] Status text do composer muda abruptamente** — `MessageComposer.tsx:262`
   - Texto alterna entre estados sem transicao. Usar crossfade.
 
-- [ ] **[D-30] Send button muda cor abruptamente** — `MessageComposer.tsx:433`
+- [x] **[D-30] Send button muda cor abruptamente** — `MessageComposer.tsx:433`
   - Cinza -> vermelho instantaneo. Usar `transition-colors`.
+  - **Done**: Added `transition-colors duration-200` to send/stop button.
 
 - [ ] **[D-31] Git branch dropdown sem animacao** — `GitBranchControl.tsx:171`
   - Pop-in/pop-out instantaneo. Usar AnimatePresence ou CSS transition.
@@ -155,8 +160,9 @@
 - [ ] **[D-33] Mensagem persistente "Not a git repository"** — `GitBranchControl.tsx:307`
   - Texto de erro sempre visivel para projetos non-git. Considerar ocultar ou usar tooltip.
 
-- [ ] **[D-34] Shimmer animation usa `steps(48)`** — `index.css:122`
+- [x] **[D-34] Shimmer animation usa `steps(48)`** — `index.css:122`
   - Shimmer fica choppy/pixelado. Considerar usar `linear` ou `ease` para smooth sweep.
+  - **Done**: Changed `steps(48, end)` to `linear` for smooth shimmer.
 
 ---
 
@@ -218,9 +224,10 @@
   - **Fix**: Usar `isFetching` vs `isLoading` (TanStack Query distinction). Mostrar spinner overlay sem remover a lista. Ou confiar no cache.
   - **Done**: Added `isBackgroundRefetching` flag distinguishing initial load from background refetch. During refetch, list stays visible at opacity 0.7 with subtle spinner. Tests: `thread-loading-behavior.test.ts` (10 tests, 28 assertions).
 
-- [ ] **[M-12] Splash screen esconde antes do conteudo estar pronto** — `root-layout-content.tsx:88`
+- [x] **[M-12] Splash screen esconde antes do conteudo estar pronto** — `root-layout-content.tsx:88`
   - `SplashScreen.hideAsync()` e chamado no mount sem esperar dados. Animacao splash (~244ms) pode terminar antes da primeira tela renderizar.
   - **Fix**: So chamar `SplashScreen.hideAsync()` quando `isConfigLoaded && isSessionLoaded`. Estender animacao se necessario.
+  - **Done**: Gated `SplashScreen.hideAsync()` on `isConfigLoaded && isSessionLoaded`. Tests: `splash-screen-readiness.test.ts` (6 tests).
 
 - [ ] **[M-13] Mensagens perdidas entre erro WS e reconexao** — `ws-client.ts:500`
   - `onerror` nao fecha o socket. Mensagens enviadas entre o erro e a reconexao falham silenciosamente.
@@ -269,9 +276,10 @@
   - `setDiscoveredServers([])` no inicio do scan. Lista some, depois repopula.
   - **Fix**: Manter resultados anteriores durante scan. Substituir atomicamente quando novos resultados chegarem.
 
-- [ ] **[M-24] Double reconnect em onerror + onclose** — `ws-client.ts:488`
+- [x] **[M-24] Double reconnect em onerror + onclose** — `ws-client.ts:488`
   - Ambos chamam `scheduleReconnect()`. Pode incrementar `reconnectAttempts` 2x, dobrando o backoff.
   - **Fix**: Usar flag para deduplicate. `onerror` deve marcar estado mas so `onclose` agenda reconexao.
+  - **Done**: `onerror` now calls `closeSocket()` instead of `scheduleReconnect()`. Only `onclose` reconnects. Tests: `ws-client-reconnect.test.ts` (5 tests).
 
 - [ ] **[M-25] Render cache invalida quando callbacks mudam de identity** — `streamingTimeline.tsx:295`
   - Comparacao de referencia de callbacks. Se parent re-renderiza sem memoizar, toda a lista re-renderiza.

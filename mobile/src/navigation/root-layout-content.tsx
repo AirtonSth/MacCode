@@ -8,6 +8,7 @@ import {
 	exchangePrivateAuthCompletion,
 	parsePrivateAuthCompletionInput,
 } from "@/shared/api/private-auth-completion";
+import { useApiConfig } from "@/shared/api/api-config-provider";
 import { usePrivateSession } from "@/shared/api/private-session-provider";
 import { queryClient } from "@/shared/api/query-client";
 import {
@@ -24,7 +25,8 @@ export const RootLayoutContent = () => {
 	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);
 	const lastHandledPrivateUrlRef = useRef<string | null>(null);
 	const router = useRouter();
-	const { setSessionRecord } = usePrivateSession();
+	const { isLoaded: isConfigLoaded } = useApiConfig();
+	const { isLoaded: isSessionLoaded, setSessionRecord } = usePrivateSession();
 
 	const routePrivateAuthCompletionUrl = useCallback((rawUrl: string | null): boolean => {
 		if (!rawUrl) {
@@ -87,6 +89,10 @@ export const RootLayoutContent = () => {
 	}, [routePrivateAuthCompletionUrl]);
 
 	useEffect(() => {
+		if (!isConfigLoaded || !isSessionLoaded) {
+			return;
+		}
+
 		void (async () => {
 			try {
 				await SplashScreen.hideAsync();
@@ -94,7 +100,7 @@ export const RootLayoutContent = () => {
 				// Ignore native splash hide failures.
 			}
 		})();
-	}, []);
+	}, [isConfigLoaded, isSessionLoaded]);
 
 	useEffect(() => {
 		void (async () => {

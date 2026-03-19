@@ -433,7 +433,7 @@ export const MessageComposer = ({
 							<Button
 								aria-label={buttonLabel}
 								className={cn(
-									"h-8 w-8 shrink-0 rounded-full p-0 shadow-none",
+									"h-8 w-8 shrink-0 rounded-full p-0 shadow-none transition-colors duration-200",
 									isRunning
 										? "bg-rose-500 text-rose-50 hover:bg-rose-400"
 										: "bg-[#aeb2bb] text-[#181a20] hover:bg-[#c0c5ce]",

@@ -498,8 +498,9 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		};
 
 		socket.onerror = () => {
-			notifyState("reconnecting");
-			scheduleReconnect();
+			// Close the socket so `onclose` fires exactly once and handles reconnect.
+			// This prevents a double-reconnect cycle (onerror + onclose both scheduling).
+			closeSocket();
 		};
 
 		socket.onmessage = (message) => {

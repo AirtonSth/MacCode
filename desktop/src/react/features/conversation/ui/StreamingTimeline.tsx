@@ -8,7 +8,7 @@ import {
 	ListTodo,
 	Sparkles,
 } from "lucide-react";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -34,6 +34,7 @@ interface StreamingTimelineRowProps {
 }
 
 export const TOOL_AUTO_EXPAND_MS = 2_000;
+export const AUTO_COLLAPSE_DELAY_MS = 600;
 
 /**
  * Shared animation configuration for the tool-detail expand/collapse motion.
@@ -189,6 +190,8 @@ const StreamingTimelineRow = ({
 		[focusMode],
 	);
 
+	const prevStateRef = useRef(item.state);
+
 	useEffect(() => {
 		if (item.type !== "tool" || shouldReduceMotion) {
 			return;
@@ -213,6 +216,38 @@ const StreamingTimelineRow = ({
 		item.type,
 		onSetItemExpanded,
 		shouldReduceMotion,
+	]);
+
+	useEffect(() => {
+		const wasRunning = prevStateRef.current === "running";
+		prevStateRef.current = item.state;
+
+		if (!wasRunning) {
+			return;
+		}
+
+		const justCompleted = item.state === "completed" || item.state === "collapsed";
+		if (!justCompleted) {
+			return;
+		}
+
+		if (item.expandedByUser || !item.isExpanded) {
+			return;
+		}
+
+		const timer = setTimeout(() => {
+			onSetItemExpanded(item.id, false, false);
+		}, AUTO_COLLAPSE_DELAY_MS);
+
+		return () => {
+			clearTimeout(timer);
+		};
+	}, [
+		item.expandedByUser,
+		item.id,
+		item.isExpanded,
+		item.state,
+		onSetItemExpanded,
 	]);
 
 	if (item.type === "assistant_message") {
@@ -247,7 +282,7 @@ const StreamingTimelineRow = ({
 						</p>
 						<span
 							className={cn(
-								"mt-0.5 rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-[0.16em]",
+								"mt-0.5 rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-[0.16em] transition-all duration-200",
 								item.state === "failed" || item.state === "cancelled"
 									? "border-rose-300/35 bg-rose-400/10 text-rose-100"
 									: item.state === "completed" || item.state === "preview" || item.state === "collapsed"

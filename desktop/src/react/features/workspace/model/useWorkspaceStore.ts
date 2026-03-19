@@ -256,18 +256,35 @@ const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
 		turn.itemOrder
 			.map((itemId) => [itemId, turn.itemsById[itemId]] as const)
 			.filter((entry): entry is readonly [string, StreamItem] => Boolean(entry[1]))
-			.map(([itemId, item]) => [
-				itemId,
-				{
-					...item,
-					state:
-						item.state === "failed" || item.state === "cancelled"
-							? item.state
-							: "collapsed",
-					isExpanded: false,
-					expandedByUser: false,
-				},
-			]),
+			.map(([itemId, item]) => {
+				if (item.expandedByUser) {
+					return [
+						itemId,
+						{
+							...item,
+							state:
+								item.state === "failed" || item.state === "cancelled"
+									? item.state
+									: "completed",
+							isExpanded: true,
+							expandedByUser: true,
+						},
+					];
+				}
+
+				return [
+					itemId,
+					{
+						...item,
+						state:
+							item.state === "failed" || item.state === "cancelled"
+								? item.state
+								: "collapsed",
+						isExpanded: false,
+						expandedByUser: false,
+					},
+				];
+			}),
 	) as Record<string, StreamItem>;
 
 	return {

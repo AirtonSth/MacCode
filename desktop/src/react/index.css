@@ -131,7 +131,8 @@
 		background-clip: text;
 		-webkit-background-clip: text;
 		color: transparent;
-		animation: loading-shimmer 1.8s steps(48, end) infinite;
+		transition: color 0.3s ease;
+		animation: loading-shimmer 1.8s linear infinite;
 	}
 
 }
