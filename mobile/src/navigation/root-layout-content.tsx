@@ -1,26 +1,25 @@
-/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
 import { Stack, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, StyleSheet, View } from "react-native";
+import { QueryClientProvider } from "@tanstack/react-query";
 
 import {
 	exchangePrivateAuthCompletion,
 	parsePrivateAuthCompletionInput,
-} from "@/shared/api/private-auth-completion";
-import { useApiConfig } from "@/shared/api/api-config-provider";
-import { usePrivateSession } from "@/shared/api/private-session-provider";
-import { queryClient } from "@/shared/api/query-client";
+} from "../shared/api/private-auth-completion";
+import { useApiConfig } from "../shared/api/api-config-provider";
+import { usePrivateSession } from "../shared/api/private-session-provider";
+import { queryClient } from "../shared/api/query-client";
 import {
 	dismissTerminalLiveActivity,
 	initializeThreadLiveActivityManager,
-} from "@/shared/live-activity/thread-live-activity";
-import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
-import { ForegroundInsomniaMode } from "@/shared/runtime/foreground-insomnia-mode";
-import { theme } from "@/shared/theme/tokens";
-import { AnimatedLaunchSplash } from "@/shared/ui/animated-launch-splash";
-import { QueryClientProvider } from "@tanstack/react-query";
+} from "../shared/live-activity/thread-live-activity";
+import { initializeLocalNotifications } from "../shared/notifications/local-notifications";
+import { ForegroundInsomniaMode } from "../shared/runtime/foreground-insomnia-mode";
+import { theme } from "../shared/theme/tokens";
+import { AnimatedLaunchSplash } from "../shared/ui/animated-launch-splash";
 
 export const RootLayoutContent = () => {
 	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);

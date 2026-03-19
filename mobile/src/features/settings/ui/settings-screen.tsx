@@ -23,7 +23,7 @@ import { createRemoteCodeClient, isRemoteCodeUnauthorizedError } from "../../../
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
 import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import { PrivateAccountSection } from "./private-account-section";
-import { buildSavedConnectionItems } from "./settings-screen.model";
+import { buildSavedConnectionItems, type SavedConnectionListItem } from "./settings-screen.model";
 
 type StatusTone = "error" | "neutral" | "success";
 type SettingsScreenSearchParam = string | string[] | undefined;
@@ -628,12 +628,12 @@ export const SettingsScreen = () => {
 							{isScanning ? <ActivityIndicator color={palette.text} size="small" /> : <Text style={styles.secondaryLabel}>Scan</Text>}
 						</Pressable>
 					</View>
-					<FlatList
+					<FlatList<SavedConnectionListItem>
 						data={savedConnectionItems}
 						keyExtractor={(item) => item.key}
 						renderItem={({ item, index }) => {
 							if (item.kind === "saved-connection") {
-										const connection = item.connection;
+										const connection: SavedConnection = item.connection;
 										const connectionKey = item.key;
 										const statusBadge = item.connectionStatusBadge;
 										const isConnecting = Boolean(isConnectingBySavedKey[connectionKey]);
@@ -649,7 +649,6 @@ export const SettingsScreen = () => {
 											}
 
 											ignoreSavedPressByKeyRef.current.add(connectionKey);
-											// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
 											setSavedConnectionActionTarget(connection);
 										}}
 										onPress={() => {
@@ -658,7 +657,6 @@ export const SettingsScreen = () => {
 												return;
 											}
 
-											// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
 											void connectSavedConnection(connection);
 										}}
 										onPressOut={() => {
@@ -721,17 +719,14 @@ export const SettingsScreen = () => {
 
 							if (item.kind === "discovered-server") {
 								 
-								const server = item.server;
-								// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+								const server: DiscoveredServer = item.server;
 								const isConnecting = Boolean(isConnectingByServerId[server.serverId]);
 
 								return (
 									<Pressable
-										// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
 										accessibilityLabel={`Connect server ${server.hostname}:${String(server.port)}`}
 										disabled={isConnecting}
 										onPress={() => {
-											// eslint-disable-next-line @typescript-eslint/no-unsafe-argument
 											void connectDiscoveredServer(server);
 										}}
 										style={({ pressed }) => [
