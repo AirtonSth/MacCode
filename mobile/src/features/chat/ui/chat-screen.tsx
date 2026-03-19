@@ -15,7 +15,6 @@ import {
 	Platform,
 	Pressable,
 	ScrollView,
-	Switch,
 	StyleSheet,
 	Text,
 	TextInput,
@@ -42,6 +41,9 @@ import { WorkspaceRenameModal } from "../../workspaces/ui/workspace-rename-modal
 
 import { ActiveThreadsBanner } from "./active-threads-banner";
 import { AUTO_SCROLL_BOTTOM_THRESHOLD } from "./auto-scroll-constants";
+import { GitCommitModalMemo } from "./git-commit-modal-memo";
+import { SelectPickerModal } from "./select-picker-modal";
+import { TerminalOverlay } from "./terminal-overlay";
 
 const drawerWidth = 308;
 
@@ -91,26 +93,6 @@ const coalesceSearchParam = (...values: ChatScreenSearchParam[]): string | null 
 	}
 
 	return null;
-};
-
-const getSelectModalTitle = (activePicker: ActivePicker | null): string => {
-	switch (activePicker) {
-		case "model": {
-			return "Select model";
-		}
-		case "permission": {
-			return "Select permission";
-		}
-		case "provider": {
-			return "Select provider";
-		}
-		case "reasoning": {
-			return "Select reasoning";
-		}
-		default: {
-			return "Select option";
-		}
-	}
 };
 
 const toTerminalTranscript = (
@@ -257,6 +239,7 @@ export const ChatScreen = () => {
 	const terminalScrollRef = useRef<ScrollView | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
+	const isDrawerAnimatingRef = useRef(false);
 	const [drawerWorkspaceActionTarget, setDrawerWorkspaceActionTarget] = useState<ProjectDTO | null>(null);
 	const [openingWorkspaceId, setOpeningWorkspaceId] = useState<string | null>(null);
 	const [workspaceNameInput, setWorkspaceNameInput] = useState<string>("");
@@ -403,7 +386,28 @@ export const ChatScreen = () => {
 	const primaryActionPressedStyle = selectedChatIsRunning
 		? styles.forceStopActionPressed
 		: styles.primaryActionPressed;
-	const isResolvingThreadSelection = source === "thread-list" && !selectedChatId;
+	const isResolvingThreadSelectionRaw = source === "thread-list" && !selectedChatId;
+	const [showResolvingSpinner, setShowResolvingSpinner] = useState(false);
+	const resolvingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+	useEffect(() => {
+		if (isResolvingThreadSelectionRaw) {
+			resolvingTimerRef.current = setTimeout(() => {
+				setShowResolvingSpinner(true);
+			}, 200);
+		} else {
+			setShowResolvingSpinner(false);
+		}
+
+		return () => {
+			if (resolvingTimerRef.current !== null) {
+				clearTimeout(resolvingTimerRef.current);
+				resolvingTimerRef.current = null;
+			}
+		};
+	}, [isResolvingThreadSelectionRaw]);
+
+	const isResolvingThreadSelection = isResolvingThreadSelectionRaw && showResolvingSpinner;
 	const showMessageHistoryLoading =
 		Boolean(selectedChatId) &&
 		isMessagesLoading &&
@@ -690,30 +694,24 @@ export const ChatScreen = () => {
 		}
 	}, [hasOlderMessages, isLoadingOlderMessages, isViewingOlderMessages, loadLatestMessages, loadOlderMessages]);
 
-	useEffect(() => {
-		let timer: ReturnType<typeof setTimeout> | null = null;
+	const shouldRedirectAway = isConfigLoaded && isLoaded && !serverHealthQuery.isPending && (
+		serverHealthQuery.isError ||
+		!selectedProjectId ||
+		(!selectedChatId && source !== "thread-list" && source !== "terminal")
+	);
 
+	useEffect(() => {
 		if (isConfigLoaded && isLoaded && !serverHealthQuery.isPending) {
 			if (serverHealthQuery.isError) {
 				replace("/settings");
 			} else if (!selectedProjectId) {
 				replace("/workspaces");
 			} else if (!selectedChatId && source !== "thread-list" && source !== "terminal") {
-				timer = setTimeout(() => {
-					if (!selectedChatId) {
-						replace("/threads");
-					}
-				}, 180);
+				replace("/threads");
 			} else {
-				timer = null;
+				// Chat is loaded and valid — no redirect needed.
 			}
 		}
-
-		return () => {
-			if (timer !== null) {
-				clearTimeout(timer);
-			}
-		};
 	}, [
 		isConfigLoaded,
 		isLoaded,
@@ -774,15 +772,15 @@ export const ChatScreen = () => {
 		}
 	};
 
-	const openFilePicker = (target: FilePickerTarget) => {
+	const openFilePicker = useCallback((target: FilePickerTarget) => {
 		Keyboard.dismiss();
 		setFilePickerTarget(target);
 		setIsFilePickerOpen(true);
-	};
+	}, []);
 
-	const closeFilePicker = () => {
+	const closeFilePicker = useCallback(() => {
 		setIsFilePickerOpen(false);
-	};
+	}, []);
 
 	const handleAddAttachmentPaths = (paths: string[]) => {
 		if (filePickerTarget === "terminal") {
@@ -794,6 +792,10 @@ export const ChatScreen = () => {
 	};
 
 	const closeDrawer = () => {
+		if (isDrawerAnimatingRef.current) {
+			return;
+		}
+		isDrawerAnimatingRef.current = true;
 		Animated.parallel([
 			Animated.timing(drawerOpacity, {
 				duration: 140,
@@ -808,6 +810,7 @@ export const ChatScreen = () => {
 		]).start(() => {
 			setIsDrawerOpen(false);
 			setDrawerWorkspaceActionTarget(null);
+			isDrawerAnimatingRef.current = false;
 		});
 	};
 
@@ -828,6 +831,10 @@ export const ChatScreen = () => {
 	}, [isChatsLoading, openingWorkspaceId, selectedProjectId]);
 
 	const closeDrawerThen = (onClosed: () => void) => {
+		if (isDrawerAnimatingRef.current) {
+			return;
+		}
+		isDrawerAnimatingRef.current = true;
 		Animated.parallel([
 			Animated.timing(drawerOpacity, {
 				duration: 140,
@@ -842,6 +849,7 @@ export const ChatScreen = () => {
 		]).start(() => {
 			setIsDrawerOpen(false);
 			setDrawerWorkspaceActionTarget(null);
+			isDrawerAnimatingRef.current = false;
 			onClosed();
 		});
 	};
@@ -968,7 +976,7 @@ export const ChatScreen = () => {
 		}
 	}, [renameProject, workspaceNameInput, workspaceToRename]);
 
-	const runTerminalCommand = async () => {
+	const runTerminalCommand = useCallback(async () => {
 		const command = terminalInput.trim();
 		if (!selectedChatId || command.length === 0) {
 			return;
@@ -993,7 +1001,7 @@ export const ChatScreen = () => {
 		} finally {
 			setIsTerminalRunning(false);
 		}
-	};
+	}, [api, selectedChatId, terminalInput]);
 
 	const isBranchActionPending = isBranchCheckoutPending || isBranchCreatePending;
 	const isBranchPickerDisabled = !selectedProjectId || isBranchActionPending;
@@ -1165,6 +1173,33 @@ export const ChatScreen = () => {
 		},
 		[setStreamItemState],
 	);
+
+	const closeGitCommitModal = useCallback(() => {
+		setIsGitCommitModalOpen(false);
+	}, []);
+
+	const handleGitCommitAction = useCallback(
+		(action: GitCommitAction) => {
+			void handleGitCommit(action);
+		},
+		[handleGitCommit],
+	);
+
+	const closeActivePicker = useCallback(() => {
+		setActivePicker(null);
+	}, []);
+
+	const closeTerminalOverlay = useCallback(() => {
+		setIsTerminalOpen(false);
+	}, []);
+
+	const openTerminalFilePicker = useCallback(() => {
+		openFilePicker("terminal");
+	}, [openFilePicker]);
+
+	const handleRunTerminal = useCallback(() => {
+		void runTerminalCommand();
+	}, [runTerminalCommand]);
 
 	const renderedMessages = useMemo(
 		() => messages.map((message) => {
@@ -1346,6 +1381,14 @@ export const ChatScreen = () => {
 		setPicker,
 	]);
 
+	if (shouldRedirectAway) {
+		return (
+			<View style={styles.root} testID="screen-chat-redirecting">
+				<ActivityIndicator color={palette.accent} size="small" />
+			</View>
+		);
+	}
+
 	return (
 		<KeyboardAvoidingView
 			behavior={Platform.OS === "ios" ? "padding" : "height"}
@@ -1440,7 +1483,7 @@ export const ChatScreen = () => {
 
 					{renderedMessages}
 
-						{hasStreamingText && !hasStreamingItems && (selectedChatIsRunning || isSending) ? (
+						{hasStreamingText && (selectedChatIsRunning || isSending) && (!hasStreamingItems || !liveTurn || liveTurn.itemOrder.length === 0) ? (
 							<View style={[styles.messageRow, styles.messageRowAssistant]}>
 								<View style={styles.assistantMessageContent}>
 									<MessageMarkdown
@@ -1722,156 +1765,26 @@ export const ChatScreen = () => {
 				isVisible={isBranchModalOpen}
 			/>
 
-			<Modal
-				animationType="fade"
-				onRequestClose={() => {
-					if (isGitCommitPending) {
-						return;
-					}
-					setIsGitCommitModalOpen(false);
-				}}
-				transparent
-				visible={isGitCommitModalOpen}
-			>
-				<Pressable
-					onPress={() => {
-						if (isGitCommitPending) {
-							return;
-						}
-						setIsGitCommitModalOpen(false);
-					}}
-					style={styles.gitCommitModalBackdrop}
-					testID="chat-git-commit-modal-backdrop"
-				>
-				<Pressable
-					onPress={() => {
-						// no-op
-					}}
-					style={styles.gitCommitModalPanel}
-					testID="chat-git-commit-modal"
-				>
-						<View style={styles.gitCommitModalHeader}>
-							<Text style={styles.gitCommitModalTitle}>
-								{isGitCommitPending ? "Committing changes..." : "Commit your changes"}
-							</Text>
-							<Pressable
-								accessibilityLabel="Close commit modal"
-								disabled={isGitCommitPending}
-								onPress={() => {
-									setIsGitCommitModalOpen(false);
-								}}
-								style={({ pressed }) => [
-									styles.gitCommitCloseButton,
-									isGitCommitPending ? styles.disabledButton : null,
-									pressed && !isGitCommitPending ? styles.gitCommitCloseButtonPressed : null,
-								]}
-							>
-								<MaterialIcons color={palette.muted} name="close" size={18} />
-							</Pressable>
-						</View>
-						<View style={styles.gitCommitInfoRow}>
-							<Text style={styles.gitCommitInfoLabel}>Branch</Text>
-							<Text numberOfLines={1} style={styles.gitCommitInfoValue}>
-								{gitCurrentBranch ?? "Detached"}
-							</Text>
-						</View>
-						<View style={styles.gitCommitInfoRow}>
-							<Text style={styles.gitCommitInfoLabel}>Changes</Text>
-							<Text style={styles.gitCommitInfoValue}>
-								{String(gitChangedFiles)} ·{" "}
-								<Text style={styles.gitCommitAdded}>+{String(gitStatusQuery.data?.added ?? 0)}</Text> /{" "}
-								<Text style={styles.gitCommitRemoved}>-{String(gitStatusQuery.data?.removed ?? 0)}</Text>
-							</Text>
-						</View>
+			<GitCommitModalMemo
+				gitChangedFiles={gitChangedFiles}
+				gitCommitError={gitCommitError}
+				gitCommitIncludeUnstaged={gitCommitIncludeUnstaged}
+				gitCommitMessage={gitCommitMessage}
+				gitCurrentBranch={gitCurrentBranch}
+				gitStatusData={gitStatusQuery.data}
+				isGitCommitPending={isGitCommitPending}
+				isVisible={isGitCommitModalOpen}
+				onChangeIncludeUnstaged={setGitCommitIncludeUnstaged}
+				onChangeMessage={setGitCommitMessage}
+				onClose={closeGitCommitModal}
+				onCommit={handleGitCommitAction}
+			/>
 
-						<View style={styles.gitCommitSwitchRow}>
-							<Text style={styles.gitCommitSwitchLabel}>Include unstaged</Text>
-							<Switch
-								disabled={isGitCommitPending}
-								onValueChange={setGitCommitIncludeUnstaged}
-								testID="chat-git-commit-include-unstaged"
-								thumbColor="#ffffff"
-								trackColor={{ false: "rgba(148,163,184,0.38)", true: "rgba(99,200,255,0.85)" }}
-								value={gitCommitIncludeUnstaged}
-							/>
-						</View>
-
-						<TextInput
-							editable={!isGitCommitPending}
-							onChangeText={setGitCommitMessage}
-							placeholder="Leave blank to autogenerate commit message"
-							placeholderTextColor={palette.muted}
-							style={styles.gitCommitMessageInput}
-							testID="chat-git-commit-message-input"
-							value={gitCommitMessage}
-						/>
-
-						<View style={styles.gitCommitActionRow}>
-							<Pressable
-								disabled={isGitCommitPending || gitChangedFiles <= 0}
-								onPress={() => {
-									void handleGitCommit("commit");
-								}}
-								style={({ pressed }) => [
-									styles.gitCommitChoiceButton,
-									pressed ? styles.gitCommitChoiceButtonPressed : null,
-									isGitCommitPending || gitChangedFiles <= 0 ? styles.disabledButton : null,
-								]}
-								testID="chat-git-commit-action-commit"
-							>
-								<Text style={styles.gitCommitChoiceLabel}>Commit</Text>
-							</Pressable>
-							<Pressable
-								disabled={isGitCommitPending || gitChangedFiles <= 0}
-								onPress={() => {
-									void handleGitCommit("push");
-								}}
-								style={({ pressed }) => [
-									styles.gitCommitChoiceButton,
-									styles.gitCommitFooterPrimaryButton,
-									pressed ? styles.gitCommitFooterPrimaryButtonPressed : null,
-									isGitCommitPending || gitChangedFiles <= 0 ? styles.disabledButton : null,
-								]}
-								testID="chat-git-commit-action-push"
-							>
-								<Text style={styles.gitCommitChoiceLabel}>Commit + Push</Text>
-							</Pressable>
-						</View>
-
-						{gitCommitError ? <Text style={styles.gitCommitError}>{gitCommitError}</Text> : null}
-
-					</Pressable>
-				</Pressable>
-			</Modal>
-
-			<Modal
-				animationType="fade"
-				onRequestClose={() => {
-					setActivePicker(null);
-				}}
-				transparent
-				visible={activePicker !== null}
-			>
-				<Pressable
-					onPress={() => {
-						setActivePicker(null);
-					}}
-					style={styles.selectModalBackdrop}
-					testID="chat-select-modal-backdrop"
-				>
-					<Pressable
-						onPress={() => {
-							// no-op
-						}}
-						style={styles.selectModalPanel}
-					>
-							<Text style={styles.selectModalTitle}>{getSelectModalTitle(activePicker)}</Text>
-							<ScrollView contentContainerStyle={styles.selectModalList} showsVerticalScrollIndicator={false}>
-								{activePickerOptions}
-							</ScrollView>
-						</Pressable>
-					</Pressable>
-			</Modal>
+			<SelectPickerModal
+				activePicker={activePicker}
+				onClose={closeActivePicker}
+				options={activePickerOptions}
+			/>
 
 			<DesktopFilePickerModal
 				client={api}
@@ -2072,108 +1985,25 @@ export const ChatScreen = () => {
 					isVisible={drawerWorkspaceActionTarget !== null}
 				/>
 
-				<Modal
-					animationType="slide"
-					onRequestClose={() => {
-						setIsTerminalOpen(false);
-					}}
-					presentationStyle="fullScreen"
-					visible={isTerminalOpen}
-				>
-				<KeyboardAvoidingView
-					behavior={Platform.OS === "ios" ? "padding" : "height"}
-					style={styles.terminalRoot}
-					testID="terminal-modal"
-				>
-					<IosStackHeader
-						onBack={() => {
-							setIsTerminalOpen(false);
-						}}
-						subtitle={selectedChat?.title ?? "No thread selected"}
-						title="Terminal"
-					/>
-
-					<View
-						style={[
-							styles.terminalBody,
-							{
-								paddingLeft: Math.max(12, terminalInsets.left),
-								paddingRight: Math.max(12, terminalInsets.right),
-								paddingBottom: Math.max(16, terminalInsets.bottom),
-							},
-						]}
-					>
-						<ScrollView
-							contentContainerStyle={styles.terminalOutputContent}
-							contentInsetAdjustmentBehavior="automatic"
-							ref={terminalScrollRef}
-							showsVerticalScrollIndicator={false}
-							style={styles.terminalOutput}
-						>
-							{isTerminalLoading ? <Text style={styles.terminalMeta}>Loading history...</Text> : null}
-							<Text selectable style={styles.terminalText}>
-								{terminalOutput || "No terminal output yet."}
-							</Text>
-						</ScrollView>
-
-						{terminalError.length > 0 ? (
-							<Text selectable style={styles.errorText}>
-								{terminalError}
-							</Text>
-						) : null}
-
-						<View style={styles.terminalComposer}>
-							<Pressable
-								disabled={isTerminalRunning || !selectedChatId}
-								onPress={() => {
-									openFilePicker("terminal");
-								}}
-								style={({ pressed }) => [
-									styles.attachAction,
-									pressed ? styles.attachActionPressed : null,
-									isTerminalRunning || !selectedChatId ? styles.disabledButton : null,
-								]}
-								testID="terminal-attach-button"
-							>
-								<MaterialIcons color={palette.text} name="add" size={22} />
-							</Pressable>
-							<TextInput
-								autoCapitalize="none"
-								onChangeText={setTerminalInput}
-								onSubmitEditing={() => {
-									void runTerminalCommand();
-								}}
-								placeholder="Run command"
-								placeholderTextColor={palette.muted}
-								style={styles.composerInput}
-								testID="terminal-command-input"
-								value={terminalInput}
-							/>
-							<Pressable
-								disabled={isTerminalRunning || !selectedChatId}
-								onPress={() => {
-									void runTerminalCommand();
-								}}
-								style={({ pressed }) => [
-									styles.primaryAction,
-									pressed ? styles.primaryActionPressed : null,
-									isTerminalRunning || !selectedChatId ? styles.disabledButton : null,
-								]}
-								testID="terminal-run-button"
-							>
-								<Text style={styles.primaryActionLabel}>{isTerminalRunning ? "..." : "Run"}</Text>
-							</Pressable>
-						</View>
-					</View>
-
-					<DesktopFilePickerModal
-						client={api}
-						isVisible={isTerminalFilePickerVisible}
-						onAddPaths={handleAddAttachmentPaths}
-						onClose={closeFilePicker}
-					/>
-				</KeyboardAvoidingView>
-			</Modal>
+				<TerminalOverlay
+					api={api}
+					chatTitle={selectedChat?.title}
+					isTerminalFilePickerVisible={isTerminalFilePickerVisible}
+					isTerminalLoading={isTerminalLoading}
+					isTerminalOpen={isTerminalOpen}
+					isTerminalRunning={isTerminalRunning}
+					onAddPaths={handleAddAttachmentPaths}
+					onChangeInput={setTerminalInput}
+					onClose={closeTerminalOverlay}
+					onCloseFilePicker={closeFilePicker}
+					onOpenFilePicker={openTerminalFilePicker}
+					onRun={handleRunTerminal}
+					selectedChatId={selectedChatId}
+					terminalError={terminalError}
+					terminalInput={terminalInput}
+					terminalOutput={terminalOutput}
+					terminalScrollRef={terminalScrollRef}
+				/>
 		</KeyboardAvoidingView>
 	);
 };

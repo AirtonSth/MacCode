@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { Check, ChevronDown, GitBranch, Loader2, Plus, Search } from "lucide-react";
 
 import type { GitBranchDTO } from "../../../shared/api/remotecode-http";
@@ -92,13 +93,13 @@ export const GitBranchControl = ({
 		}
 
 		setErrorMessage(null);
+		setIsOpen(false);
+		setSearchTerm("");
+		setIsCreateMode(false);
+		setNewBranchName("");
 		setIsSubmitting(true);
 		try {
 			await Promise.resolve(onCheckoutBranch(branch));
-			setIsOpen(false);
-			setSearchTerm("");
-			setIsCreateMode(false);
-			setNewBranchName("");
 		} catch (error) {
 			setErrorMessage(error instanceof Error ? error.message : "Unable to checkout branch.");
 		} finally {
@@ -132,7 +133,7 @@ export const GitBranchControl = ({
 	};
 
 	return (
-		<div className="relative shrink-0" ref={containerRef}>
+		<div className="group relative shrink-0" ref={containerRef}>
 			<div className="flex items-center gap-2">
 				<button
 					aria-expanded={isOpen}
@@ -168,8 +169,16 @@ export const GitBranchControl = ({
 				{isLoading || isSubmitting ? <Loader2 className="h-5 w-5 animate-spin text-[#959ba6]" /> : null}
 			</div>
 
+			<AnimatePresence>
 			{isOpen ? (
-				<div className="absolute bottom-[calc(100%+8px)] right-0 z-[70] w-[min(320px,calc(100vw-2.5rem))] rounded-2xl border border-white/12 bg-[linear-gradient(160deg,rgba(29,31,36,0.96),rgba(21,23,28,0.96))] p-2.5 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-lg">
+				<motion.div
+					key="git-branch-dropdown"
+					initial={{ opacity: 0, y: 4 }}
+					animate={{ opacity: 1, y: 0 }}
+					exit={{ opacity: 0, y: 4 }}
+					transition={{ duration: 0.15, ease: [0.4, 0, 0.2, 1] }}
+					className="absolute bottom-[calc(100%+8px)] right-0 z-[70] w-[min(320px,calc(100vw-2.5rem))] rounded-2xl border border-white/12 bg-[linear-gradient(160deg,rgba(29,31,36,0.96),rgba(21,23,28,0.96))] p-2.5 shadow-[0_18px_48px_rgba(0,0,0,0.42)] backdrop-blur-lg"
+				>
 					<div className="rounded-xl bg-white/[0.05] px-2.5 py-1.5">
 						<div className="flex items-center gap-2 text-[#9ca1ab]">
 							<Search className="h-3.5 w-3.5" />
@@ -201,7 +210,7 @@ export const GitBranchControl = ({
 								return (
 									<button
 										className={cn(
-											"w-full rounded-lg px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60",
+											"w-full rounded-lg px-2 py-1.5 text-left transition-[color,background-color,opacity] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 disabled:opacity-50",
 											isCurrent ? "bg-white/[0.03]" : "hover:bg-white/[0.04]",
 										)}
 										key={branch}
@@ -301,11 +310,17 @@ export const GitBranchControl = ({
 					</div>
 
 					{errorMessage ? <p className="px-1.5 pt-1.5 text-[11px] text-rose-300">{errorMessage}</p> : null}
-				</div>
+				</motion.div>
 			) : null}
+			</AnimatePresence>
 
 			{isGitRepository === false ? (
-				<p className="pt-1 text-[11px] text-rose-300">This project is not a git repository.</p>
+				<p
+					className="pointer-events-none absolute bottom-[calc(100%+4px)] right-0 z-[60] whitespace-nowrap rounded-lg border border-white/10 bg-[#1c1e23] px-2 py-1 text-[11px] text-[#9ca1aa] opacity-0 shadow-lg transition-opacity duration-200 group-hover:opacity-100"
+					role="tooltip"
+				>
+					Not a git repository
+				</p>
 			) : null}
 		</div>
 	);

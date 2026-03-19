@@ -1,5 +1,5 @@
 import { MaterialIcons } from "@expo/vector-icons";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccessibilityInfo, LayoutAnimation, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { AssistantStreamItemState } from "../../../shared/api/types";
@@ -15,8 +15,6 @@ interface StreamingTimelineProps {
 
 interface CachedRenderedItem {
 	item: StreamItem;
-	onSetItemExpanded: (itemId: string, expanded: boolean, byUser: boolean) => void;
-	onSetItemState: (itemId: string, state: AssistantStreamItemState) => void;
 	element: JSX.Element;
 }
 
@@ -199,6 +197,7 @@ const StreamingTimelineComponent = ({
 	const autoExpandTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 	const itemRenderCacheRef = useRef<Map<string, CachedRenderedItem>>(new Map());
 	const onSetItemExpandedRef = useRef(onSetItemExpanded);
+	const onSetItemStateRef = useRef(onSetItemState);
 
 	const items = useMemo(
 		() =>
@@ -211,6 +210,10 @@ const StreamingTimelineComponent = ({
 	useEffect(() => {
 		onSetItemExpandedRef.current = onSetItemExpanded;
 	}, [onSetItemExpanded]);
+
+	useEffect(() => {
+		onSetItemStateRef.current = onSetItemState;
+	}, [onSetItemState]);
 
 	useEffect(() => {
 		let active = true;
@@ -293,6 +296,22 @@ const StreamingTimelineComponent = ({
 		itemRenderCacheRef.current.clear();
 	}, []);
 
+	// [M-25] Stable ref-wrapped callbacks so the render cache only
+	// invalidates when item *data* changes, not when the parent
+	// re-renders with new callback identities.
+	const stableOnSetItemExpanded = useCallback(
+		(itemId: string, expanded: boolean, byUser: boolean) => {
+			onSetItemExpandedRef.current(itemId, expanded, byUser);
+		},
+		[],
+	);
+	const stableOnSetItemState = useCallback(
+		(itemId: string, state: AssistantStreamItemState) => {
+			onSetItemStateRef.current(itemId, state);
+		},
+		[],
+	);
+
 	const renderedItems = useMemo(() => {
 		const previousCache = itemRenderCacheRef.current;
 		const nextCache = new Map<string, CachedRenderedItem>();
@@ -300,22 +319,17 @@ const StreamingTimelineComponent = ({
 
 		for (const item of items) {
 			const cached = previousCache.get(item.id);
-			if (
-				cached &&
-				cached.item === item &&
-				cached.onSetItemExpanded === onSetItemExpanded &&
-				cached.onSetItemState === onSetItemState
-			) {
+
+			// Only compare item data — callbacks are stable refs.
+			if (cached && cached.item === item) {
 				nextCache.set(item.id, cached);
 				nextItems.push(cached.element);
 				continue;
 			}
 
-			const element = renderTimelineItem(item, onSetItemExpanded, onSetItemState);
+			const element = renderTimelineItem(item, stableOnSetItemExpanded, stableOnSetItemState);
 			const nextCached: CachedRenderedItem = {
 				item,
-				onSetItemExpanded,
-				onSetItemState,
 				element,
 			};
 			nextCache.set(item.id, nextCached);
@@ -324,7 +338,7 @@ const StreamingTimelineComponent = ({
 
 		itemRenderCacheRef.current = nextCache;
 		return nextItems;
-	}, [items, onSetItemExpanded, onSetItemState]);
+	}, [items, stableOnSetItemExpanded, stableOnSetItemState]);
 
 	if (renderedItems.length === 0) {
 		return null;

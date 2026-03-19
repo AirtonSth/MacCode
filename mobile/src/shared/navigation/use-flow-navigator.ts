@@ -9,6 +9,8 @@ export type AppFlowTarget =
 		params?: Record<string, string>;
 	};
 
+const PENDING_ROUTE_TIMEOUT_MS = 3000;
+
 const getPathname = (target: AppFlowTarget): AppFlowRoute => {
 	return typeof target === "string" ? target : target.pathname;
 };
@@ -17,12 +19,28 @@ export const useFlowNavigator = () => {
 	const router = useRouter();
 	const pathname = usePathname();
 	const pendingRouteRef = useRef<AppFlowRoute | null>(null);
+	const pendingRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
 	useEffect(() => {
 		if (pendingRouteRef.current === pathname) {
 			pendingRouteRef.current = null;
+			if (pendingRouteTimerRef.current) {
+				clearTimeout(pendingRouteTimerRef.current);
+				pendingRouteTimerRef.current = null;
+			}
 		}
 	}, [pathname]);
+
+	const setPendingRoute = useCallback((route: AppFlowRoute) => {
+		pendingRouteRef.current = route;
+		if (pendingRouteTimerRef.current) {
+			clearTimeout(pendingRouteTimerRef.current);
+		}
+		pendingRouteTimerRef.current = setTimeout(() => {
+			pendingRouteRef.current = null;
+			pendingRouteTimerRef.current = null;
+		}, PENDING_ROUTE_TIMEOUT_MS);
+	}, []);
 
 	const replace = useCallback((target: AppFlowTarget): boolean => {
 		const route = getPathname(target);
@@ -30,7 +48,7 @@ export const useFlowNavigator = () => {
 			return false;
 		}
 
-		pendingRouteRef.current = route;
+		setPendingRoute(route);
 		if (typeof target === "string") {
 			router.replace(target);
 		} else {
@@ -40,7 +58,7 @@ export const useFlowNavigator = () => {
 			} satisfies Href);
 		}
 		return true;
-	}, [pathname, router]);
+	}, [pathname, router, setPendingRoute]);
 
 	const push = useCallback((target: AppFlowTarget): boolean => {
 		const route = getPathname(target);
@@ -48,7 +66,7 @@ export const useFlowNavigator = () => {
 			return false;
 		}
 
-		pendingRouteRef.current = route;
+		setPendingRoute(route);
 		if (typeof target === "string") {
 			router.push(target);
 		} else {
@@ -58,7 +76,7 @@ export const useFlowNavigator = () => {
 			} satisfies Href);
 		}
 		return true;
-	}, [pathname, router]);
+	}, [pathname, router, setPendingRoute]);
 
 	const goBackOr = useCallback((fallback: AppFlowTarget): boolean => {
 		if (router.canGoBack()) {

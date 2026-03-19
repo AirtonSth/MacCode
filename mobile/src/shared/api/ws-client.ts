@@ -307,6 +307,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 	let isConnecting = false;
 	let reconnectScheduled = false;
 	let isConnected = false;
+	let socketErrored = false;
 	const activeChats = new Set<string>();
 	let activeWorkspaceSubscription: { clientId?: string; lastSeq: number } | null = null;
 	const sendQueue: ClientWsEvent[] = [];
@@ -371,8 +372,19 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			}
 		}
 
-		if (sendQueue.length >= 50) {
-			sendQueue.shift();
+		if (sendQueue.length >= 200) {
+			// Find the first non-subscription message to discard.
+			// Subscription messages (join_chat, join_workspace) are critical
+			// and must not be silently dropped.
+			const expendableIndex = sendQueue.findIndex(
+				(queued) => queued.event !== "join_chat" && queued.event !== "join_workspace",
+			);
+			if (expendableIndex !== -1) {
+				sendQueue.splice(expendableIndex, 1);
+			} else {
+				// All messages are subscriptions — drop the oldest one as a last resort.
+				sendQueue.shift();
+			}
 		}
 
 		sendQueue.push(payload);
@@ -456,6 +468,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 
 		socket.onopen = () => {
 			isConnected = true;
+			socketErrored = false;
 			reconnectAttempts = 0;
 			isConnecting = false;
 			clearReconnectTimeout();
@@ -498,6 +511,10 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		};
 
 		socket.onerror = () => {
+			// Mark socket as errored so that send() queues messages instead of
+			// writing to a broken pipe (M-13).
+			socketErrored = true;
+
 			// Close the socket so `onclose` fires exactly once and handles reconnect.
 			// This prevents a double-reconnect cycle (onerror + onclose both scheduling).
 			closeSocket();
@@ -519,7 +536,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			return;
 		}
 
-		if (!socket || socket.readyState !== WebSocket.OPEN) {
+		if (!socket || socket.readyState !== WebSocket.OPEN || socketErrored) {
 			enqueueMessage(payload);
 			return;
 		}

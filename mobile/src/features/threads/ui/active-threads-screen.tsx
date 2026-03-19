@@ -31,11 +31,14 @@ export const ActiveThreadsScreen = () => {
 	const {
 		activeThreads,
 		isActiveThreadsLoading,
+		isLoaded,
 		selectChatById,
 	} = useWorkspaceShell({
 		isActive: isFocused,
 		scope: "threads",
 	});
+
+	const shouldShowLoading = !isLoaded || isActiveThreadsLoading;
 
 	const visibleThreads = useMemo(
 		() =>
@@ -65,13 +68,13 @@ export const ActiveThreadsScreen = () => {
 				contentInsetAdjustmentBehavior="automatic"
 				showsVerticalScrollIndicator={false}
 			>
-				{isActiveThreadsLoading ? (
+				{shouldShowLoading ? (
 					<View style={styles.loading}>
 						<ActivityIndicator color={palette.accent} />
 					</View>
 				) : null}
 
-				{!isActiveThreadsLoading && visibleThreads.length === 0 ? (
+				{!shouldShowLoading && visibleThreads.length === 0 ? (
 					<Text style={styles.emptyState} testID="active-threads-empty-state">
 						No active thread right now.
 					</Text>

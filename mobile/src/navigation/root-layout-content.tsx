@@ -3,6 +3,7 @@ import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
 import { Stack, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ActivityIndicator, StyleSheet, View } from "react-native";
 
 import {
 	exchangePrivateAuthCompletion,
@@ -23,6 +24,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 
 export const RootLayoutContent = () => {
 	const [isLaunchSplashVisible, setIsLaunchSplashVisible] = useState(true);
+	const [isProcessingDeepLink, setIsProcessingDeepLink] = useState(false);
 	const lastHandledPrivateUrlRef = useRef<string | null>(null);
 	const router = useRouter();
 	const { isLoaded: isConfigLoaded } = useApiConfig();
@@ -49,6 +51,7 @@ export const RootLayoutContent = () => {
 		}
 
 		lastHandledPrivateUrlRef.current = rawUrl;
+		setIsProcessingDeepLink(true);
 		void (async () => {
 			try {
 				const sessionRecord = await exchangePrivateAuthCompletion({
@@ -63,6 +66,8 @@ export const RootLayoutContent = () => {
 					},
 					pathname: "/settings" as never,
 				});
+			} finally {
+				setIsProcessingDeepLink(false);
 			}
 		})();
 
@@ -162,6 +167,11 @@ export const RootLayoutContent = () => {
 				<Stack.Screen name="chat" options={{ headerShown: false }} />
 				<Stack.Screen name="settings" options={{ headerShown: false }} />
 			</Stack>
+			{isProcessingDeepLink ? (
+				<View style={deepLinkStyles.overlay} testID="deep-link-loading-overlay">
+					<ActivityIndicator color="#63C8FF" size="large" />
+				</View>
+			) : null}
 			{isLaunchSplashVisible ? (
 				<AnimatedLaunchSplash
 					onFinish={() => {
@@ -172,3 +182,13 @@ export const RootLayoutContent = () => {
 		</QueryClientProvider>
 	);
 };
+
+const deepLinkStyles = StyleSheet.create({
+	overlay: {
+		...StyleSheet.absoluteFill,
+		alignItems: "center",
+		backgroundColor: "rgba(13,15,20,0.85)",
+		justifyContent: "center",
+		zIndex: 900,
+	},
+});

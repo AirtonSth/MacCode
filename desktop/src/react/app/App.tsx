@@ -63,6 +63,7 @@ import {
 	type ConnectionState,
 	type ServerWsEvent,
 } from "../shared/realtime/remotecode-ws";
+import { fetchModelsForProvider } from "./provider-change";
 
 const FALLBACK_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 const MESSAGE_PAGE_SIZE = 5;
@@ -2268,27 +2269,13 @@ const App = (): JSX.Element => {
 			if (typeof window !== "undefined") {
 				window.localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
 			}
-			setSelectedModel(null);
-			setSelectedReasoningEffort(null);
-			setAvailableModels([]);
-			setHasLoadedCodexModels(false);
-			void (async () => {
-				try {
-					const catalog = provider === "claude"
-						? await api.listClaudeModels()
-						: await api.listCodexModels();
-					setAvailableModels(catalog.models);
-					const defaultModel = catalog.models.find((m) => m.isDefault) ?? catalog.models[0];
-					if (defaultModel) {
-						setSelectedModel(defaultModel.model);
-						setSelectedReasoningEffort(defaultModel.defaultReasoningEffort);
-					}
-				} catch {
-					// models will be empty until next load
-				} finally {
-					setHasLoadedCodexModels(true);
-				}
-			})();
+			// Keep previous provider's models visible until new ones load (D-14).
+			void fetchModelsForProvider(provider, api, {
+				setAvailableModels,
+				setHasLoadedCodexModels,
+				setSelectedModel,
+				setSelectedReasoningEffort,
+			});
 		},
 		[api],
 	);

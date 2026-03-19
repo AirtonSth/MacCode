@@ -1,5 +1,17 @@
 @import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap");
 
+@font-face {
+	font-family: "Manrope";
+	font-display: swap;
+	src: local("Manrope");
+}
+
+@font-face {
+	font-family: "Plus Jakarta Sans";
+	font-display: swap;
+	src: local("Plus Jakarta Sans");
+}
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -154,7 +166,6 @@
 		animation-duration: 0.001ms !important;
 		animation-iteration-count: 1 !important;
 		scroll-behavior: auto !important;
-		transition-duration: 0.001ms !important;
 	}
 
 	.loading-shimmer-pure-text {

@@ -419,3 +419,83 @@ describe("end-to-end scenario: tool auto-expand then manual collapse", () => {
 		expect(shouldScheduleAutoExpand(collapsedByUser)).toBe(false);
 	});
 });
+
+describe("[M-25] render cache invalidation", () => {
+	/**
+	 * Mirrors the CachedRenderedItem comparison logic after the fix.
+	 * The cache now only compares item identity, not callback identity.
+	 */
+	interface CachedEntry {
+		item: MinimalStreamItem;
+		element: string; // simplified stand-in for JSX.Element
+	}
+
+	const shouldReuseCachedEntry = (
+		cached: CachedEntry | undefined,
+		nextItem: MinimalStreamItem,
+	): boolean => {
+		if (!cached) {
+			return false;
+		}
+
+		// [M-25] Only compare item data, not callback references.
+		return cached.item === nextItem;
+	};
+
+	it("reuses cache when item reference is unchanged", () => {
+		const item: MinimalStreamItem = {
+			id: "tool-1",
+			type: "tool",
+			state: "running",
+			isExpanded: false,
+			expandedByUser: false,
+		};
+
+		const cached: CachedEntry = { item, element: "<rendered />" };
+		expect(shouldReuseCachedEntry(cached, item)).toBe(true);
+	});
+
+	it("invalidates cache when item reference changes (new data)", () => {
+		const item: MinimalStreamItem = {
+			id: "tool-1",
+			type: "tool",
+			state: "running",
+			isExpanded: false,
+			expandedByUser: false,
+		};
+
+		const cached: CachedEntry = { item, element: "<rendered />" };
+		const updatedItem: MinimalStreamItem = { ...item, state: "completed" };
+
+		expect(shouldReuseCachedEntry(cached, updatedItem)).toBe(false);
+	});
+
+	it("does NOT invalidate cache when only callback identity changes", () => {
+		const item: MinimalStreamItem = {
+			id: "tool-1",
+			type: "tool",
+			state: "running",
+			isExpanded: false,
+			expandedByUser: false,
+		};
+
+		// Simulate a cache entry with one callback identity
+		const cached: CachedEntry = { item, element: "<rendered />" };
+
+		// Even though the "callback" would be a new reference in the real
+		// component, the cache comparison only checks the item.
+		expect(shouldReuseCachedEntry(cached, item)).toBe(true);
+	});
+
+	it("returns false for undefined cache entry", () => {
+		const item: MinimalStreamItem = {
+			id: "tool-new",
+			type: "tool",
+			state: "running",
+			isExpanded: false,
+			expandedByUser: false,
+		};
+
+		expect(shouldReuseCachedEntry(undefined, item)).toBe(false);
+	});
+});

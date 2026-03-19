@@ -1,0 +1,47 @@
+import type { CodexModelDescriptor, CodexModelsCatalog, CodexReasoningEffort } from "../../shared/codex-model-config";
+
+export type SelectedProvider = "codex" | "claude";
+
+export interface ProviderChangeCallbacks {
+	setAvailableModels: (models: CodexModelDescriptor[]) => void;
+	setHasLoadedCodexModels: (loaded: boolean) => void;
+	setSelectedModel: (model: string | null) => void;
+	setSelectedReasoningEffort: (effort: CodexReasoningEffort | null) => void;
+}
+
+export interface ProviderChangeApi {
+	listClaudeModels: () => Promise<CodexModelsCatalog>;
+	listCodexModels: () => Promise<CodexModelsCatalog>;
+}
+
+/**
+ * Fetches models for a provider and updates state only once the fetch resolves.
+ * Previous provider's models stay visible until new ones arrive (D-14).
+ */
+export const fetchModelsForProvider = async (
+	provider: SelectedProvider,
+	api: ProviderChangeApi,
+	callbacks: ProviderChangeCallbacks,
+): Promise<void> => {
+	callbacks.setHasLoadedCodexModels(false);
+	try {
+		const catalog = provider === "claude"
+			? await api.listClaudeModels()
+			: await api.listCodexModels();
+		callbacks.setAvailableModels(catalog.models);
+		const defaultModel = catalog.models.find((m) => m.isDefault) ?? catalog.models[0];
+		if (defaultModel) {
+			callbacks.setSelectedModel(defaultModel.model);
+			callbacks.setSelectedReasoningEffort(defaultModel.defaultReasoningEffort);
+		} else {
+			callbacks.setSelectedModel(null);
+			callbacks.setSelectedReasoningEffort(null);
+		}
+	} catch {
+		callbacks.setAvailableModels([]);
+		callbacks.setSelectedModel(null);
+		callbacks.setSelectedReasoningEffort(null);
+	} finally {
+		callbacks.setHasLoadedCodexModels(true);
+	}
+};

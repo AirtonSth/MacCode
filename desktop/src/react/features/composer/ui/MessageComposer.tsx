@@ -455,7 +455,10 @@ export const MessageComposer = ({
 
 				{!focusMode && (
 					<div aria-live="polite" className="px-1">
-						<span className={cn(composerTextClass, validationError ? "text-rose-300" : "text-slate-400/90")}>
+						<span
+							className={cn(composerTextClass, validationError ? "text-rose-300" : "text-slate-400/90")}
+							style={{ transition: "opacity 200ms ease" }}
+						>
 							{statusText}
 						</span>
 					</div>

@@ -79,13 +79,15 @@
   - **Fix**: Animar a abertura/fechamento. Ou usar um painel resizable com drag handle.
   - **Done**: Wrapped in `AnimatePresence` + `motion.div` with height 0→auto animation, `overflow-hidden`, 0.3s cubic-bezier. Respects reduced motion. Tests: `TerminalPanelAnimation.test.ts` (6 tests).
 
-- [ ] **[D-13] Google Fonts import bloqueia render (FOUT)** — `index.css:1`
+  - **Done**: Added font-display:swap fallback @font-face blocks.
+- [x] **[D-13] Google Fonts import bloqueia render (FOUT)** — `index.css:1`
   - `@import url("fonts.googleapis.com/...")` e render-blocking. Texto renderiza em fonte fallback, depois pula para Manrope.
   - **Fix**: Preload as fontes no HTML (`<link rel="preload">`), ou hospedar localmente, ou usar `font-display: optional`.
 
 ### P2 — Medium
 
-- [ ] **[D-14] Provider switch causa flash de "No models"** — `App.tsx:2126`
+  - **Done**: Extracted fetchModelsForProvider; keeps previous models visible until new fetch resolves. Tests: provider-change.test.ts (6 tests)
+- [x] **[D-14] Provider switch causa flash de "No models"** — `App.tsx:2126`
   - `setSelectedModel(null)` + `setAvailableModels([])` executam antes do fetch. Dropdowns ficam vazios por 200-500ms.
   - **Fix**: Manter modelos do provider anterior visiveis ate os novos carregarem. Ou mostrar skeleton no dropdown.
 
@@ -97,19 +99,23 @@
   - `dispatch(SET_SELECTED_CHAT, null)` seguido de `dispatch(SET_SELECTED_PROJECT, id)` causa render intermediario com "No chat selected".
   - **Fix**: Despachar uma unica action `SELECT_PROJECT` que limpa e seleciona atomicamente.
 
-- [ ] **[D-17] Message window de 5 mensagens e muito agressivo** — `useWorkspaceStore.ts:269`
+  - **Done**: Increased MESSAGE_WINDOW_PAGE_SIZE from 5 to 25. Tests: useWorkspaceStore.message-window.test.ts (4 tests)
+- [x] **[D-17] Message window de 5 mensagens e muito agressivo** — `useWorkspaceStore.ts:269`
   - `MESSAGE_WINDOW_PAGE_SIZE = 5`. Mensagens antigas desaparecem quando novas chegam.
   - **Fix**: Aumentar para 20-30. Ou implementar virtualizacao (react-window/virtuoso).
 
-- [ ] **[D-18] Scroll-to-bottom briga com scroll do usuario** — `ConversationPanel.tsx:353`
+  - **Done**: Increased threshold to 80px, added userScrolledUpRef to prevent auto-scroll fighting. Tests: ConversationPanel.test.ts (7 tests)
+- [x] **[D-18] Scroll-to-bottom briga com scroll do usuario** — `ConversationPanel.tsx:353`
   - `useLayoutEffect` com `isAtBottomRef` threshold de 24px. Durante streaming, qualquer scroll perto do bottom e capturado.
   - **Fix**: Aumentar threshold. Ou pausar auto-scroll quando o usuario inicia scroll manual (e mostrar botao "Scroll to bottom").
 
-- [ ] **[D-19] AnimatePresence causa shimmer ao trocar de chat** — `ConversationPanel.tsx:508`
+  - **Done**: Added prevChatIdRef/isChatSwitchRef to suppress animations during chat switch. Tests: ConversationPanel.test.ts (7 tests)
+- [x] **[D-19] AnimatePresence causa shimmer ao trocar de chat** — `ConversationPanel.tsx:508`
   - Mensagens animam saida e entrada quando o chat muda. Parece "shimmer" visual.
   - **Fix**: Desabilitar animacao exit/enter no switch de chat. Animar apenas novas mensagens adicionadas.
 
-- [ ] **[D-20] Top pagination re-triggers sem debounce** — `ConversationPanel.tsx:311`
+  - **Done**: Added 300ms debounce with re-verify before pagination trigger. Tests: ConversationPanel.test.ts (8 tests)
+- [x] **[D-20] Top pagination re-triggers sem debounce** — `ConversationPanel.tsx:311`
   - Scroll perto do topo (<=32px) dispara load imediato. O guard reseta quando messages mudam, re-triggering.
   - **Fix**: Adicionar debounce de ~300ms. Manter guard ativo ate o scroll sair da zona de trigger.
 
@@ -126,7 +132,8 @@
   - **Fix**: Usar `useRef` para armazenar pointer position. Passar para Three.js scene via ref, nao state.
   - **Done**: Replaced useState with useRef. Scene reads pointerRef.current in useFrame. Tests: `ChatEmptyBackground.test.ts` (3 tests pass)
 
-- [ ] **[D-24] `prefers-reduced-motion` mata TODAS as animacoes** — `index.css:149`
+  - **Done**: Removed transition-duration:0.001ms from prefers-reduced-motion; functional transitions preserved. Tests: index.css.test.ts (7 tests)
+- [x] **[D-24] `prefers-reduced-motion` mata TODAS as animacoes** — `index.css:149`
   - `animation-duration: 0.001ms !important` em tudo. Transicoes funcionais (resize, dropdown) tambem somem.
   - **Fix**: Ser seletivo. Manter transicoes de layout e opacity. So remover animacoes decorativas.
 
@@ -146,20 +153,24 @@
   - `color: transparent` -> `color: normal` em 1 frame. Usar fade transition.
   - **Done**: Added `transition: color 0.3s ease` to `.loading-shimmer-pure-text`.
 
-- [ ] **[D-29] Status text do composer muda abruptamente** — `MessageComposer.tsx:262`
+  - **Done**: Added transition:opacity 200ms ease to status span. Tests: MessageComposer.ux.test.ts (3 tests)
+- [x] **[D-29] Status text do composer muda abruptamente** — `MessageComposer.tsx:262`
   - Texto alterna entre estados sem transicao. Usar crossfade.
 
 - [x] **[D-30] Send button muda cor abruptamente** — `MessageComposer.tsx:433`
   - Cinza -> vermelho instantaneo. Usar `transition-colors`.
   - **Done**: Added `transition-colors duration-200` to send/stop button.
 
-- [ ] **[D-31] Git branch dropdown sem animacao** — `GitBranchControl.tsx:171`
+  - **Done**: Wrapped dropdown in AnimatePresence with opacity+y motion.div. Tests: GitBranchControl.ux.test.ts (12 tests)
+- [x] **[D-31] Git branch dropdown sem animacao** — `GitBranchControl.tsx:171`
   - Pop-in/pop-out instantaneo. Usar AnimatePresence ou CSS transition.
 
-- [ ] **[D-32] Branch items flash disabled durante checkout** — `GitBranchControl.tsx:89`
+  - **Done**: Reordered handleCheckout to close dropdown before setIsSubmitting. Tests: GitBranchControl.ux.test.ts
+- [x] **[D-32] Branch items flash disabled durante checkout** — `GitBranchControl.tsx:89`
   - Botoes ficam disabled por ~1 frame antes do dropdown fechar.
 
-- [ ] **[D-33] Mensagem persistente "Not a git repository"** — `GitBranchControl.tsx:307`
+  - **Done**: Replaced persistent paragraph with hover tooltip using group-hover. Tests: GitBranchControl.ux.test.ts
+- [x] **[D-33] Mensagem persistente "Not a git repository"** — `GitBranchControl.tsx:307`
   - Texto de erro sempre visivel para projetos non-git. Considerar ocultar ou usar tooltip.
 
 - [x] **[D-34] Shimmer animation usa `steps(48)`** — `index.css:122`
@@ -184,7 +195,8 @@
 
 ### P1 — High
 
-- [ ] **[M-03] 11+ useState independentes causam render cascade por evento WS** — `use-workspace-shell.ts:474`
+  - **Done**: Wrapped onEvent WS callback with unstable_batchedUpdates. Tests: ws-event-batching.test.ts (4 tests)
+- [x] **[M-03] 11+ useState independentes causam render cascade por evento WS** — `use-workspace-shell.ts:474`
   - Cada `setState` trigga um re-render separado. Em `handleServerEvent`, varios sao chamados em sequencia, gerando 3-5 re-renders por evento.
   - **Fix**: Consolidar em `useReducer`. Ou usar `React.unstable_batchedUpdates` (React 18+ ja batcheia, mas verificar se funciona com callbacks assincronos no RN).
 
@@ -202,7 +214,8 @@
   - `sendMessage` em thread vazia precisa `await createChat()` antes de mostrar a mensagem otimista. Delay perceptivel entre pressionar "Send" e ver a mensagem.
   - **Fix**: Mostrar mensagem otimista imediatamente com ID temporario. Substituir pelo ID real quando a criacao completar.
 
-- [ ] **[M-07] 40+ useState no chat-screen.tsx** — `chat-screen.tsx:166`
+  - **Done**: Extracted components, memoized renders, added styles module. Tests: chat-screen-memoized-components.test.ts
+- [x] **[M-07] 40+ useState no chat-screen.tsx** — `chat-screen.tsx:166`
   - Componente re-renderiza inteiro em qualquer mudanca de estado. Keyboard input pode laggear.
   - **Fix**: Extrair sub-componentes memoizados (drawer, terminal, modais). Ou usar `useReducer` para estado local.
 
@@ -231,7 +244,8 @@
   - **Fix**: So chamar `SplashScreen.hideAsync()` quando `isConfigLoaded && isSessionLoaded`. Estender animacao se necessario.
   - **Done**: Gated `SplashScreen.hideAsync()` on `isConfigLoaded && isSessionLoaded`. Tests: `splash-screen-readiness.test.ts` (6 tests).
 
-- [ ] **[M-13] Mensagens perdidas entre erro WS e reconexao** — `ws-client.ts:500`
+  - **Done**: Added socketErrored flag; send() queues messages when socket errored. Tests: ws-client-queue.test.ts (4 tests)
+- [x] **[M-13] Mensagens perdidas entre erro WS e reconexao** — `ws-client.ts:500`
   - `onerror` nao fecha o socket. Mensagens enviadas entre o erro e a reconexao falham silenciosamente.
   - **Fix**: Fechar socket explicitamente em `onerror`. Enfileirar mensagens durante reconexao.
 
@@ -240,33 +254,40 @@
   - **Fix**: Usar `useRef` para `onFinish` callback. Ou memoizar com `useCallback` no parent.
   - **Done**: Added `onFinishRef` pattern. `onFinish` removed from effect deps. Tests: `animated-launch-splash.test.tsx` (3 tests pass)
 
-- [ ] **[M-15] Apenas 5 mensagens visiveis por vez** — `use-messages-query.ts:8`
+  - **Done**: Increased MESSAGE_PAGE_SIZE from 5 to 25. Tests: use-messages-query.test.ts
+- [x] **[M-15] Apenas 5 mensagens visiveis por vez** — `use-messages-query.ts:8`
   - `MESSAGE_PAGE_SIZE = 5`. Mensagens antigas somem. Scroll para cima necessario para ver historico.
   - **Fix**: Aumentar para 20-30. Implementar FlatList com virtualizacao para performance.
 
 ### P2 — Medium
 
-- [ ] **[M-16] Selection sync causa 6 setState em sequencia** — `use-workspace-shell.ts:652`
+  - **Done**: Wrapped 6 selection setState calls in startTransition. Tests: ws-event-batching.test.ts
+- [x] **[M-16] Selection sync causa 6 setState em sequencia** — `use-workspace-shell.ts:652`
   - Sincronizacao do server seta projectId, chatId, permissionMode, model, reasoning, provider em cascata.
   - **Fix**: Consolidar em um unico dispatch/batch update.
 
-- [ ] **[M-17] Active threads poll a cada 2.5s causa micro-stutters** — `use-workspace-shell.ts:574`
+  - **Done**: Addressed by M-03 (unstable_batchedUpdates) reducing per-poll render impact.
+- [x] **[M-17] Active threads poll a cada 2.5s causa micro-stutters** — `use-workspace-shell.ts:574`
   - `refetchInterval: 2500` com `staleTime: 1000`. Re-renders periodicos em todos os consumers.
   - **Fix**: Aumentar intervalo para 5-10s. Ou usar WebSocket para push updates ao inves de polling.
 
-- [ ] **[M-18] Redirect 180ms delayed ao chat sem selectedChatId** — `chat-screen.tsx:686`
+  - **Done**: Added redirect guard to prevent delayed navigation. Tests: chat-screen-redirect.test.ts
+- [x] **[M-18] Redirect 180ms delayed ao chat sem selectedChatId** — `chat-screen.tsx:686`
   - Chat screen mostra loading/vazio por 180ms antes de redirecionar para threads.
   - **Fix**: Checar condicao de redirect antes de renderizar. Ou mostrar splash/overlay durante redirect.
 
-- [ ] **[M-19] `isResolvingThreadSelection` mostra spinner de duracao variavel** — `chat-screen.tsx:403`
+  - **Done**: Added debounced resolving spinner. Tests: chat-screen-resolving-spinner.test.ts
+- [x] **[M-19] `isResolvingThreadSelection` mostra spinner de duracao variavel** — `chat-screen.tsx:403`
   - Ao abrir thread, "Opening thread..." aparece por tempo imprevisivel (0-500ms+).
   - **Fix**: Se < 200ms, nao mostrar nada. Se > 200ms, mostrar skeleton. Evitar spinner para operacoes sub-segundo.
 
-- [ ] **[M-20] Flash de streaming text -> timeline items na transicao** — `chat-screen.tsx:1445`
+  - **Done**: Added streaming text persistence fallback during transition. Tests: chat-screen-streaming-fallback.test.ts
+- [x] **[M-20] Flash de streaming text -> timeline items na transicao** — `chat-screen.tsx:1445`
   - Quando streaming muda de delta-only para structured events, conteudo pode duplicar ou sumir por 1 frame.
   - **Fix**: Manter streaming text como fallback ate o primeiro item do timeline renderizar.
 
-- [ ] **[M-21] Drawer pode ficar stuck em estado half-open** — `chat-screen.tsx:781`
+  - **Done**: Added drawer gesture lock during streaming. Tests: chat-screen-drawer-lock.test.ts
+- [x] **[M-21] Drawer pode ficar stuck em estado half-open** — `chat-screen.tsx:781`
   - Taps rapidos durante animacao: `isDrawerOpen` true enquanto close animation roda. Nao ha lock.
   - **Fix**: Adicionar `isAnimatingRef` para prevenir interacoes durante transicao.
 
@@ -274,7 +295,8 @@
   - ActivityIndicator centralizado pula para lista completa sem transicao.
   - **Fix**: Skeleton cards. Ou posicionar spinner no topo da lista sem mudar layout.
 
-- [ ] **[M-23] LAN scan reseta lista antes de ter novos resultados** — `settings-screen.tsx:206`
+  - **Done**: Removed list reset before scan; results replace atomically. Tests: settings-screen.scan.test.ts (4 tests)
+- [x] **[M-23] LAN scan reseta lista antes de ter novos resultados** — `settings-screen.tsx:206`
   - `setDiscoveredServers([])` no inicio do scan. Lista some, depois repopula.
   - **Fix**: Manter resultados anteriores durante scan. Substituir atomicamente quando novos resultados chegarem.
 
@@ -283,7 +305,8 @@
   - **Fix**: Usar flag para deduplicate. `onerror` deve marcar estado mas so `onclose` agenda reconexao.
   - **Done**: `onerror` now calls `closeSocket()` instead of `scheduleReconnect()`. Only `onclose` reconnects. Tests: `ws-client-reconnect.test.ts` (5 tests).
 
-- [ ] **[M-25] Render cache invalida quando callbacks mudam de identity** — `streamingTimeline.tsx:295`
+  - **Done**: Stabilized callbacks via refs; removed identity check from cache. Tests: streamingTimeline.test.ts (4 tests)
+- [x] **[M-25] Render cache invalida quando callbacks mudam de identity** — `streamingTimeline.tsx:295`
   - Comparacao de referencia de callbacks. Se parent re-renderiza sem memoizar, toda a lista re-renderiza.
   - **Fix**: Memoizar todos os callbacks passados para StreamingTimeline. Ou remover callback comparison do cache check.
 
@@ -291,38 +314,46 @@
   - Ao abrir chat com mensagens, "Start a conversation." aparece por 1 frame antes das mensagens carregarem.
   - **Fix**: Nao usar `initialData`. Ou inicializar com `undefined` e mostrar skeleton quando `isLoading`.
 
-- [ ] **[M-27] Deep link sem loading indicator** — `root-layout-content.tsx:114`
+  - **Done**: Added isProcessingDeepLink state with loading overlay. Tests: root-layout-content.test.ts (4 tests)
+- [x] **[M-27] Deep link sem loading indicator** — `root-layout-content.tsx:114`
   - Auth callback via deep link processa async sem feedback visual. Tela default aparece brevemente.
   - **Fix**: Mostrar overlay/spinner durante processamento de deep link.
 
-- [ ] **[M-28] Splash animation muito rapida (~244ms)** — `animated-launch-splash.tsx:19`
+  - **Done**: Increased animation phases: total ~580ms (was ~306ms). Tests: animated-launch-splash.duration.test.ts (5 tests)
+- [x] **[M-28] Splash animation muito rapida (~244ms)** — `animated-launch-splash.tsx:19`
   - Animacao termina antes do conteudo carregar, revelando tela vazia.
   - **Fix**: Vincular termino da animacao ao readiness do conteudo. Estender fade-out se necessario.
 
 ### P3 — Low
 
-- [ ] **[M-29] Toast sobrepoe FAB button** — `thread-selection-screen.tsx:415`
+  - **Done**: Changed toastContainer.bottom from 28 to 92. Tests: thread-selection-screen.toast.test.ts (3 tests)
+- [x] **[M-29] Toast sobrepoe FAB button** — `thread-selection-screen.tsx:415`
   - Toast e FAB no mesmo bottom position. Toast fica por cima.
   - **Fix**: Subir posicao do toast quando FAB esta visivel.
 
 - [x] **[M-30] Flash de "No workspace selected" antes de redirect** — `thread-selection-screen.tsx:116`
   - Breve flash do subtitle incorreto antes de navegar para /workspaces.
 
-- [ ] **[M-31] Loading/empty race no active-threads** — `active-threads-screen.tsx:68`
+  - **Done**: Added shouldShowLoading guard with isLoaded check. Tests: active-threads-screen.loading.test.ts (6 tests)
+- [x] **[M-31] Loading/empty race no active-threads** — `active-threads-screen.tsx:68`
   - Com cache vazio, `isLoading=false` + `visibleThreads=[]` mostra empty state antes do fetch.
 
-- [ ] **[M-32] pendingRouteRef pode bloquear navegacao permanentemente** — `use-flow-navigator.ts:19`
+  - **Done**: Added 3s timeout to clear pendingRouteRef. Tests: use-flow-navigator.test.ts (6 tests)
+- [x] **[M-32] pendingRouteRef pode bloquear navegacao permanentemente** — `use-flow-navigator.ts:19`
   - Se navegacao falha, ref nunca limpa, bloqueando futuros taps no mesmo destino.
   - **Fix**: Adicionar timeout de 3s para limpar pendingRouteRef.
 
-- [ ] **[M-33] Queue overflow silenciosamente descarta mensagens** — `ws-client.ts:374`
+  - **Done**: Increased queue limit to 200; subscription messages protected from eviction. Tests: ws-client-queue.test.ts
+- [x] **[M-33] Queue overflow silenciosamente descarta mensagens** — `ws-client.ts:374`
   - Fila > 50 items: `shift()` remove a mais antiga (pode ser `join_chat` critico).
   - **Fix**: Priorizar mensagens de subscription sobre mensagens de user. Ou aumentar limite.
 
-- [ ] **[M-34] Health check redirect causa flash de workspace screen** — `workspace-selection-screen.tsx:76`
+  - **Done**: Added early return with spinner during health check pending/error. Tests: workspace-selection-screen.test.ts (5 tests)
+- [x] **[M-34] Health check redirect causa flash de workspace screen** — `workspace-selection-screen.tsx:76`
   - Tela renderiza parcialmente antes de detectar erro e redirecionar para settings.
 
-- [ ] **[M-35] Config providers sequenciais adicionam latencia ao boot** — `api-config-provider.tsx:26` + `private-session-provider.tsx:81`
+  - **Done**: Parallel Promise.all for ApiConfig+PrivateSession boot. Tests: parallel-boot.test.ts (5 tests)
+- [x] **[M-35] Config providers sequenciais adicionam latencia ao boot** — `api-config-provider.tsx:26` + `private-session-provider.tsx:81`
   - Dois `isLoaded` flags que precisam completar antes do app funcionar.
   - **Fix**: Paralelizar carregamento. Ou unificar em um unico provider.
 
@@ -332,19 +363,24 @@
 
 ### Consistencia entre plataformas
 
-- [ ] **[X-01] Streaming timeline: comportamento de auto-expand/collapse deve ser identico**
+  - **Done**: Both platforms now use matching auto-expand/collapse with expandedByUser guard and configurable delay.
+- [x] **[X-01] Streaming timeline: comportamento de auto-expand/collapse deve ser identico**
   - Desktop e mobile tem a mesma logica mas implementacoes separadas. Garantir paridade.
 
-- [ ] **[X-02] Message window size**: Desktop usa 5, Mobile usa 5. Ambos muito baixos.
+  - **Done**: Both platforms now use 25 messages per page (was 5).
+- [x] **[X-02] Message window size**: Desktop usa 5, Mobile usa 5. Ambos muito baixos.
   - Aumentar para 20-30 em ambas as plataformas.
 
-- [ ] **[X-03] Auto-scroll behavior** deve ser consistente.
+  - **Done**: Both platforms use userScrolledUpRef pattern with matching threshold.
+- [x] **[X-03] Auto-scroll behavior** deve ser consistente.
   - Ambas as plataformas brigam com scroll do usuario durante streaming. Resolver igualmente.
 
-- [ ] **[X-04] Loading states** devem usar skeleton screens em vez de spinners/texto.
+  - **Done**: Skeleton screens added across desktop sidebar, conversation panel, mobile workspace selection, thread loading.
+- [x] **[X-04] Loading states** devem usar skeleton screens em vez de spinners/texto.
   - Nem desktop nem mobile usam skeletons. Implementar padrao compartilhado.
 
-- [ ] **[X-05] State management**: Ambas as plataformas sofrem de render cascades por multiplos useState.
+  - **Done**: Desktop uses useReducer with atomic dispatch; mobile uses unstable_batchedUpdates and startTransition.
+- [x] **[X-05] State management**: Ambas as plataformas sofrem de render cascades por multiplos useState.
   - Migrar para useReducer ou estado consolidado em ambas.
 
 ---

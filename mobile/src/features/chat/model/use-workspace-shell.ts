@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppState, type AppStateStatus } from "react-native";
+
+// eslint-disable-next-line camelcase
+import { AppState, type AppStateStatus, unstable_batchedUpdates } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
 import { useChatContextQuery } from "../api/use-chat-context-query";
@@ -656,28 +658,34 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const normalizedSelection = normalizeSelection(selectionQuery.data);
-		setSelectedProjectId((current) => (
-			current === normalizedSelection.selectedProjectId ? current : normalizedSelection.selectedProjectId
-		));
-		setSelectedChatId((current) => (
-			current === normalizedSelection.selectedChatId ? current : normalizedSelection.selectedChatId
-		));
-		setPermissionMode((current) => (
-			current === normalizedSelection.permissionMode ? current : normalizedSelection.permissionMode
-		));
-		setSelectedModel((current) => (
-			current === normalizedSelection.selectedModel ? current : normalizedSelection.selectedModel
-		));
-		setSelectedReasoningEffort((current) => (
-			current === normalizedSelection.selectedReasoningEffort
-				? current
-				: normalizedSelection.selectedReasoningEffort
-		));
-		if (normalizedSelection.selectedProvider) {
-			setSelectedProvider((current) => (
-				current === normalizedSelection.selectedProvider ? current : (normalizedSelection.selectedProvider ?? current)
+
+		// [M-16] Batch the 6 selection setState calls inside startTransition
+		// so React treats them as a single low-priority update and avoids
+		// 6 sequential re-renders.
+		startTransition(() => {
+			setSelectedProjectId((current) => (
+				current === normalizedSelection.selectedProjectId ? current : normalizedSelection.selectedProjectId
 			));
-		}
+			setSelectedChatId((current) => (
+				current === normalizedSelection.selectedChatId ? current : normalizedSelection.selectedChatId
+			));
+			setPermissionMode((current) => (
+				current === normalizedSelection.permissionMode ? current : normalizedSelection.permissionMode
+			));
+			setSelectedModel((current) => (
+				current === normalizedSelection.selectedModel ? current : normalizedSelection.selectedModel
+			));
+			setSelectedReasoningEffort((current) => (
+				current === normalizedSelection.selectedReasoningEffort
+					? current
+					: normalizedSelection.selectedReasoningEffort
+			));
+			if (normalizedSelection.selectedProvider) {
+				setSelectedProvider((current) => (
+					current === normalizedSelection.selectedProvider ? current : (normalizedSelection.selectedProvider ?? current)
+				));
+			}
+		});
 	}, [selectionQuery.data]);
 
 	useEffect(() => {
@@ -1823,7 +1831,16 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 		const realtime = createRealtimeClient({
 			onConnectionStateChange: (state: ConnectionState) => { handleConnectionStateChangeRef.current(state); },
-			onEvent: (event: ServerWsEvent) => { handleServerEventRef.current(event); },
+
+			// [M-03] Wrap the WS event handler in unstable_batchedUpdates so
+			// that multiple setState calls within a single event (e.g. error,
+			// assistant_done) are committed as a single React render instead
+			// of triggering a cascade of re-renders.
+			onEvent: (event: ServerWsEvent) => {
+				unstable_batchedUpdates(() => {
+					handleServerEventRef.current(event);
+				});
+			},
 			target: config.activeTarget,
 		});
 

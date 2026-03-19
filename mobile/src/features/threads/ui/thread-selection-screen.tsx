@@ -605,7 +605,7 @@ const styles = StyleSheet.create({
 		position: "absolute",
 		right: 16,
 		alignItems: "center",
-		bottom: 28,
+		bottom: 92,
 		display: "flex",
 		zIndex: 50,
 	},

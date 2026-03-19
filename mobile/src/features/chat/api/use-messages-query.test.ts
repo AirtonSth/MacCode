@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 
 import {
 	appendMessageToMessagePage,
+	MESSAGE_PAGE_SIZE,
 	replaceVisibleMessagePage,
 } from "./use-messages-query";
 import type { MessageDTO, MessagePageDTO } from "../../../shared/api/types";
@@ -67,6 +68,38 @@ describe("appendMessageToMessagePage", () => {
 
 		expect(result.messages).toHaveLength(1);
 		expect(result.messages[0].chatId).toBe("temp-chat-12345");
+	});
+});
+
+describe("[M-15] MESSAGE_PAGE_SIZE", () => {
+	it("equals 25 so that a reasonable number of messages are visible", () => {
+		expect(MESSAGE_PAGE_SIZE).toBe(25);
+	});
+
+	it("retains all messages when page has fewer than PAGE_SIZE entries", () => {
+		const page = Array.from({ length: 20 }, (ignore, i) =>
+			makeMessage({ id: `m-${i}`, createdAt: `2025-01-01T00:${String(i).padStart(2, "0")}:00Z` }),
+		).reduce<MessagePageDTO | undefined>(
+			(acc, msg) => appendMessageToMessagePage(acc, msg),
+			undefined,
+		);
+
+		expect(page).toBeDefined();
+		expect(page!.messages).toHaveLength(20);
+		expect(page!.hasMore).toBe(false);
+	});
+
+	it("trims older messages and sets hasMore when exceeding PAGE_SIZE", () => {
+		const page = Array.from({ length: MESSAGE_PAGE_SIZE + 5 }, (ignore, i) =>
+			makeMessage({ id: `m-${i}`, createdAt: `2025-01-01T00:${String(i).padStart(2, "0")}:00Z` }),
+		).reduce<MessagePageDTO | undefined>(
+			(acc, msg) => appendMessageToMessagePage(acc, msg),
+			undefined,
+		);
+
+		expect(page).toBeDefined();
+		expect(page!.messages).toHaveLength(MESSAGE_PAGE_SIZE);
+		expect(page!.hasMore).toBe(true);
 	});
 });
 

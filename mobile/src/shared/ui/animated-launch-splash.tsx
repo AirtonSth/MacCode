@@ -24,46 +24,46 @@ export const AnimatedLaunchSplash = ({ onFinish }: AnimatedLaunchSplashProps) =>
 		const sequence = Animated.sequence([
 			Animated.parallel([
 				Animated.timing(iconOpacity, {
-					duration: 88,
+					duration: 180,
 					easing: Easing.out(Easing.quad),
 					toValue: 1,
 					useNativeDriver: true,
 				}),
 				Animated.timing(iconScale, {
-					duration: 140,
+					duration: 260,
 					easing: Easing.out(Easing.cubic),
 					toValue: 1,
 					useNativeDriver: true,
 				}),
 				Animated.timing(glowOpacity, {
-					duration: 110,
+					duration: 200,
 					easing: Easing.out(Easing.quad),
 					toValue: 1,
 					useNativeDriver: true,
 				}),
 				Animated.timing(glowScale, {
-					duration: 150,
+					duration: 280,
 					easing: Easing.out(Easing.cubic),
 					toValue: 1,
 					useNativeDriver: true,
 				}),
 			]),
-			Animated.delay(36),
+			Animated.delay(100),
 			Animated.parallel([
 				Animated.timing(overlayOpacity, {
-					duration: 120,
+					duration: 200,
 					easing: Easing.in(Easing.quad),
 					toValue: 0,
 					useNativeDriver: true,
 				}),
 				Animated.timing(iconScale, {
-					duration: 120,
+					duration: 200,
 					easing: Easing.out(Easing.quad),
 					toValue: 1.04,
 					useNativeDriver: true,
 				}),
 				Animated.timing(glowOpacity, {
-					duration: 104,
+					duration: 180,
 					easing: Easing.in(Easing.quad),
 					toValue: 0,
 					useNativeDriver: true,

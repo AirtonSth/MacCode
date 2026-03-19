@@ -293,7 +293,7 @@ const collapseTurnItems = (turn: StreamTurnState): StreamTurnState => {
 	};
 };
 
-const MESSAGE_WINDOW_PAGE_SIZE = 5;
+const MESSAGE_WINDOW_PAGE_SIZE = 25;
 
 export const createEmptyMessageWindow = (chatId: string | null = null): MessageWindowState => ({
 	chatId,

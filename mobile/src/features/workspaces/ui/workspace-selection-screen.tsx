@@ -72,9 +72,11 @@ export const WorkspaceSelectionScreen = () => {
 	const [errorMessage, setErrorMessage] = useState<string>("");
 
 	const serverHealthQuery = useServerHealthQuery();
+	const isHealthCheckPending = !isConfigLoaded || !isLoaded || serverHealthQuery.isPending;
+	const isHealthCheckError = isConfigLoaded && isLoaded && !serverHealthQuery.isPending && serverHealthQuery.isError;
 
 	useEffect(() => {
-		if (!isConfigLoaded || !isLoaded || serverHealthQuery.isPending) {
+		if (isHealthCheckPending) {
 			return;
 		}
 
@@ -83,6 +85,7 @@ export const WorkspaceSelectionScreen = () => {
 		}
 	}, [
 		isConfigLoaded,
+		isHealthCheckPending,
 		isLoaded,
 		replace,
 		serverHealthQuery.isError,
@@ -238,6 +241,14 @@ export const WorkspaceSelectionScreen = () => {
 		},
 		[clearAllProjectChats],
 	);
+
+	if (isHealthCheckPending || isHealthCheckError) {
+		return (
+			<View style={styles.root} testID="screen-workspaces-loading">
+				<ActivityIndicator color={palette.accent} style={styles.healthCheckSpinner} />
+			</View>
+		);
+	}
 
 	return (
 		<KeyboardAvoidingView
@@ -447,6 +458,9 @@ const styles = StyleSheet.create({
 	errorText: {
 		color: palette.text,
 		fontSize: 13,
+	},
+	healthCheckSpinner: {
+		flex: 1,
 	},
 	fabButton: {
 		alignItems: "center",

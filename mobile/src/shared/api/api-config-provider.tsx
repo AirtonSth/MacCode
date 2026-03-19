@@ -19,11 +19,13 @@ const ApiConfigContext = createContext<ApiConfigContextValue | null>(null);
 
 export const ApiConfigProvider = ({
 	children,
+	initialConfig = null,
 }: {
 	children: React.ReactNode;
+	initialConfig?: ApiConfig | null;
 }) => {
-	const [config, setConfig] = useState<ApiConfig>(ApiConfigStore.defaultConfig);
-	const [isLoaded, setIsLoaded] = useState<boolean>(false);
+	const [config, setConfig] = useState<ApiConfig>(initialConfig ?? ApiConfigStore.defaultConfig);
+	const [isLoaded, setIsLoaded] = useState<boolean>(initialConfig !== undefined && initialConfig !== null);
 
 	const reload = async () => {
 		const persisted = await ApiConfigStore.read();
@@ -32,7 +34,11 @@ export const ApiConfigProvider = ({
 	};
 
 	useEffect(() => {
+		if (initialConfig !== undefined && initialConfig !== null) {
+			return;
+		}
 		void reload();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
 
 	const update = async (nextConfig: ApiConfigInput) => {

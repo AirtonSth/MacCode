@@ -65,12 +65,17 @@ const PrivateSessionContext = createContext<PrivateSessionContextValue | null>(n
 
 export const PrivateSessionProvider = ({
 	children,
+	initialSessionRecord = null,
 }: {
 	children: React.ReactNode;
+	initialSessionRecord?: PersistedPrivateSessionRecord | null;
 }) => {
+	const hasInitialData = initialSessionRecord !== undefined;
 	const { config, update } = useApiConfig();
-	const [isLoaded, setIsLoaded] = useState(false);
-	const [sessionRecordState, setSessionRecordState] = useState<PersistedPrivateSessionRecord | null>(null);
+	const [isLoaded, setIsLoaded] = useState(hasInitialData);
+	const [sessionRecordState, setSessionRecordState] = useState<PersistedPrivateSessionRecord | null>(
+		hasInitialData ? initialSessionRecord : null,
+	);
 
 	const reload = useCallback(async () => {
 		const state = await PrivateSessionStore.read();
@@ -79,8 +84,11 @@ export const PrivateSessionProvider = ({
 	}, []);
 
 	useEffect(() => {
+		if (hasInitialData) {
+			return;
+		}
 		void reload();
-	}, [reload]);
+	}, [hasInitialData, reload]);
 
 	const setSessionRecord = useCallback(async (input: PersistedPrivateSessionRecord) => {
 		const persisted = await PrivateSessionStore.saveSessionRecord(input);

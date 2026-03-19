@@ -13,6 +13,12 @@ import { StreamingTimeline } from "./StreamingTimeline";
 
 const remarkPlugins = [remarkGfm];
 
+/** Threshold (px) for considering the viewport "at the bottom" (D-18). */
+export const SCROLL_BOTTOM_THRESHOLD_PX = 80;
+
+/** Debounce delay (ms) before top-pagination fires (D-20). */
+export const TOP_PAGINATION_DEBOUNCE_MS = 300;
+
 const extractTextFromChildren = (children: React.ReactNode): string => {
 	if (typeof children === "string") return children;
 	if (typeof children === "number") return String(children);
@@ -137,10 +143,11 @@ interface MessageBubbleProps {
 	message: MessageDTO;
 	focusMode: boolean;
 	shouldReduceMotion: boolean;
+	disableAnimation?: boolean;
 }
 
-const MessageBubble = React.memo(({ message, focusMode, shouldReduceMotion }: MessageBubbleProps) => {
-	const bubbleMotion = shouldReduceMotion
+const MessageBubble = React.memo(({ message, focusMode, shouldReduceMotion, disableAnimation }: MessageBubbleProps) => {
+	const bubbleMotion = shouldReduceMotion || disableAnimation
 		? {}
 		: {
 				animate: { opacity: 1, y: 0 },
@@ -264,7 +271,23 @@ export const ConversationPanel = ({
 	const latestReloadTriggeredRef = useRef(false);
 	const olderWindowBottomArmRef = useRef(false);
 	const isAtBottomRef = useRef(true);
-	const bubbleMotion = shouldReduceMotion
+	const userScrolledUpRef = useRef(false);
+	const lastScrollTopRef = useRef(0);
+	const topPaginationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// Track chat switches to suppress enter/exit animations (D-19).
+	const prevChatIdRef = useRef<string | null | undefined>(chat?.id);
+	const isChatSwitchRef = useRef(false);
+	if (prevChatIdRef.current !== chat?.id) {
+		isChatSwitchRef.current = true;
+		prevChatIdRef.current = chat?.id;
+	}
+	// Clear the flag after the first render following a chat switch.
+	useEffect(() => {
+		if (isChatSwitchRef.current) {
+			isChatSwitchRef.current = false;
+		}
+	});
+	const bubbleMotion = shouldReduceMotion || isChatSwitchRef.current
 		? {}
 		: {
 				animate: { opacity: 1, y: 0 },
@@ -291,7 +314,18 @@ export const ConversationPanel = ({
 			return;
 		}
 		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-		const atBottom = distanceFromBottom <= 24;
+		const atBottom = distanceFromBottom <= SCROLL_BOTTOM_THRESHOLD_PX;
+
+		// Detect user scrolling up during streaming (D-18).
+		const scrolledUp = viewport.scrollTop < lastScrollTopRef.current;
+		lastScrollTopRef.current = viewport.scrollTop;
+		if (scrolledUp && !atBottom) {
+			userScrolledUpRef.current = true;
+		}
+		if (atBottom) {
+			userScrolledUpRef.current = false;
+		}
+
 		isAtBottomRef.current = atBottom;
 		setIsAtBottom(atBottom);
 	}, []);
@@ -320,6 +354,7 @@ export const ConversationPanel = ({
 
 		updateIsAtBottom();
 
+		// D-20: debounce top pagination to avoid re-triggering.
 		if (
 			hasOlderMessages &&
 			messageWindowMode === "latest" &&
@@ -327,8 +362,19 @@ export const ConversationPanel = ({
 			!loading &&
 			!topPaginationTriggeredRef.current
 		) {
-			topPaginationTriggeredRef.current = true;
-			void onLoadOlderMessages?.();
+			if (!topPaginationTimerRef.current) {
+				topPaginationTimerRef.current = setTimeout(() => {
+					topPaginationTimerRef.current = null;
+					const vp = scrollViewportRef.current;
+					if (vp && vp.scrollTop <= 32 && !topPaginationTriggeredRef.current) {
+						topPaginationTriggeredRef.current = true;
+						void onLoadOlderMessages?.();
+					}
+				}, TOP_PAGINATION_DEBOUNCE_MS);
+			}
+		} else if (viewport.scrollTop > 32 && topPaginationTimerRef.current) {
+			clearTimeout(topPaginationTimerRef.current);
+			topPaginationTimerRef.current = null;
 		}
 
 		if (messageWindowMode === "older" && viewport.scrollTop > 32) {
@@ -350,16 +396,25 @@ export const ConversationPanel = ({
 	useEffect(() => {
 		setIsAtBottom(true);
 		isAtBottomRef.current = true;
+		userScrolledUpRef.current = false;
 		setShowRunDetails(false);
 		topPaginationTriggeredRef.current = false;
 		latestReloadTriggeredRef.current = false;
 		olderWindowBottomArmRef.current = false;
+		if (topPaginationTimerRef.current) {
+			clearTimeout(topPaginationTimerRef.current);
+			topPaginationTimerRef.current = null;
+		}
 	}, [chat?.id]);
 
 	useEffect(() => {
 		topPaginationTriggeredRef.current = false;
 		latestReloadTriggeredRef.current = false;
 		olderWindowBottomArmRef.current = false;
+		if (topPaginationTimerRef.current) {
+			clearTimeout(topPaginationTimerRef.current);
+			topPaginationTimerRef.current = null;
+		}
 	}, [loading, messageWindowMode, messages]);
 
 	useLayoutEffect(() => {
@@ -380,7 +435,7 @@ export const ConversationPanel = ({
 			}
 			return;
 		}
-		if (isAtBottomRef.current) {
+		if (isAtBottomRef.current && !userScrolledUpRef.current) {
 			forceScrollToBottom();
 		}
 	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messageWindowMode, messages, streamingText, updateIsAtBottom]);
@@ -538,6 +593,7 @@ export const ConversationPanel = ({
 											message={message}
 											focusMode={focusMode}
 											shouldReduceMotion={shouldReduceMotion}
+											disableAnimation={isChatSwitchRef.current}
 										/>
 									))}
 

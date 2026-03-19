@@ -5,7 +5,7 @@ import { queryKeys } from "../../../shared/api/query-keys";
 import { useRemoteCodeClient } from "../../../shared/api/use-remotecode-client";
 import type { MessageDTO, MessagePageDTO } from "../../../shared/api/types";
 
-export const MESSAGE_PAGE_SIZE = 5;
+export const MESSAGE_PAGE_SIZE = 25;
 
 const createEmptyPage = (): MessagePageDTO => ({
 	hasMore: false,
