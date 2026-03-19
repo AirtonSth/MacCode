@@ -101,10 +101,7 @@ export class SelectionController {
 							body.selectedChatId === null
 								? null
 								: await this.chatService.getChatById(body.selectedChatId);
-						const lockedChatProvider =
-							selectedChat?.provider === "codex" || selectedChat?.provider === "claude"
-								? selectedChat.provider
-								: null;
+						const lockedChatProvider = selectedChat?.provider === "claude" ? "claude" : null;
 						if (
 							lockedChatProvider
 							&& body.selectedProvider !== undefined
