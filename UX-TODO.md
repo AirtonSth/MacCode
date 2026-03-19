@@ -180,13 +180,15 @@
   - Cada `setState` trigga um re-render separado. Em `handleServerEvent`, varios sao chamados em sequencia, gerando 3-5 re-renders por evento.
   - **Fix**: Consolidar em `useReducer`. Ou usar `React.unstable_batchedUpdates` (React 18+ ja batcheia, mas verificar se funciona com callbacks assincronos no RN).
 
-- [ ] **[M-04] Switch de chat causa cascata de 10+ state updates e query removals** — `use-workspace-shell.ts:690`
+- [x] **[M-04] Switch de chat causa cascata de 10+ state updates e query removals** — `use-workspace-shell.ts:690`
   - Remove queries, limpa 5+ states, seta novos valores. Gera frames intermediarios com UI vazia.
   - **Fix**: Fazer toda a limpeza/setup em uma unica transicao atomica. Ou manter dados do chat anterior ate os novos estarem prontos (cross-fade).
+  - **Done**: Deferred query removal via `queueMicrotask` + wrapped `selectChatById` state updates in `startTransition`. Tests: `use-workspace-shell.chat-switch.test.ts` (10 tests).
 
-- [ ] **[M-05] Foreground handler dispara 5+ query invalidations simultaneas** — `use-workspace-shell.ts:1825`
+- [x] **[M-05] Foreground handler dispara 5+ query invalidations simultaneas** — `use-workspace-shell.ts:1825`
   - App volta do background -> invalida activeThreads, chats, chatContext, messages + syncMissedEvents. Respostas chegam em tempos diferentes, UI "se acomoda" por 0.5-2s.
   - **Fix**: Agrupar invalidacoes. Ou usar flag `isRestoringFromBackground` para mostrar um overlay suave durante a sincronizacao.
+  - **Done**: Batched all refetches into `Promise.all` with `isRestoringFromBackground` flag. Flag resets in `.finally()`. Tests: `use-workspace-shell.foreground-restore.test.ts` (8 tests).
 
 - [ ] **[M-06] Delay na criacao de chat ao enviar mensagem** — `use-workspace-shell.ts:2230`
   - `sendMessage` em thread vazia precisa `await createChat()` antes de mostrar a mensagem otimista. Delay perceptivel entre pressionar "Send" e ver a mensagem.

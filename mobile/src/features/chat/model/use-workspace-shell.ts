@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 import { useChatsQuery } from "../api/use-chats-query";
@@ -509,6 +509,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	});
 	const lastAssistantEventIdByChatRef = useRef<Record<string, number>>({});
 	const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+	const [isRestoringFromBackground, setIsRestoringFromBackground] = useState(false);
 	const clientIdRef = useRef<string>(`mobile-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`);
 	const client = useRemoteCodeClient();
 	const projectsQuery = useProjectsQuery({
@@ -689,26 +690,35 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	useEffect(() => {
 		const previousChatId = previousSelectedChatIdRef.current;
-			if (previousChatId && previousChatId !== selectedChatId) {
+		if (previousChatId && previousChatId !== selectedChatId) {
+			// M-04: Defer query removal so it does not clear cached data while
+			// the new chat's queries are still mounting.  By scheduling the
+			// removal in a microtask, React commits the new chat UI first and
+			// the old cache entries are evicted only after the frame is
+			// painted, preventing an intermediate empty-UI flash.
+			const staleId = previousChatId;
+			queueMicrotask(() => {
 				queryClient.removeQueries({
 					exact: true,
-					queryKey: queryKeys.messages(previousChatId),
+					queryKey: queryKeys.messages(staleId),
 				});
 				queryClient.removeQueries({
 					exact: true,
-					queryKey: queryKeys.streamTurn(previousChatId),
+					queryKey: queryKeys.streamTurn(staleId),
 				});
-				lastAssistantEventIdByChatRef.current = omitRecordKey(
-					lastAssistantEventIdByChatRef.current,
-					previousChatId,
-				);
-				structuredLiveActivityPreviewByChatRef.current = omitRecordKey(
-					structuredLiveActivityPreviewByChatRef.current,
-					previousChatId,
-				);
-				setStreamingTextByChat((current) => {
-					if (!(previousChatId in current)) {
-						return current;
+			});
+
+			lastAssistantEventIdByChatRef.current = omitRecordKey(
+				lastAssistantEventIdByChatRef.current,
+				previousChatId,
+			);
+			structuredLiveActivityPreviewByChatRef.current = omitRecordKey(
+				structuredLiveActivityPreviewByChatRef.current,
+				previousChatId,
+			);
+			setStreamingTextByChat((current) => {
+				if (!(previousChatId in current)) {
+					return current;
 				}
 
 				const { [previousChatId]: ignored, ...next } = current;
@@ -1855,30 +1865,41 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 			realtimeRef.current?.connect();
 			realtimeRef.current?.sendJoinWorkspace(lastWorkspaceSeqRef.current, clientIdRef.current);
-			void queryClient.invalidateQueries({
-				queryKey: queryKeys.activeThreads,
-			});
 
 			const activeProjectId = selectedProjectIdRef.current;
-			if (activeProjectId && shouldEnableChatsQuery) {
-				void queryClient.invalidateQueries({
-					queryKey: queryKeys.chats(activeProjectId),
-				});
-			}
-
 			const activeChatId = selectedChatIdRef.current;
-			if (!activeChatId || !shouldEnableMessagesQuery) {
-				return;
+			const hasChatContext = Boolean(activeChatId) && shouldEnableMessagesQuery;
+
+			if (hasChatContext && activeChatId) {
+				realtimeRef.current?.sendJoinChat(activeChatId);
 			}
 
-			realtimeRef.current?.sendJoinChat(activeChatId);
-			void queryClient.invalidateQueries({
-				queryKey: queryKeys.chatContext(activeChatId),
+			// [M-05] Batch all foreground query refetches into a single coordinated
+			// restore so the UI settles in one pass instead of trickling in over 0.5-2s.
+			setIsRestoringFromBackground(true);
+
+			const refetchPromises: Promise<unknown>[] = [
+				queryClient.refetchQueries({ queryKey: queryKeys.activeThreads }),
+			];
+
+			if (activeProjectId && shouldEnableChatsQuery) {
+				refetchPromises.push(
+					queryClient.refetchQueries({ queryKey: queryKeys.chats(activeProjectId) }),
+				);
+			}
+
+			if (hasChatContext && activeChatId) {
+				refetchPromises.push(
+					queryClient.refetchQueries({ queryKey: queryKeys.chatContext(activeChatId) }),
+					queryClient.refetchQueries({ queryKey: queryKeys.messages(activeChatId) }),
+					syncMissedAssistantEventsForChat(activeChatId),
+				);
+			}
+
+			// eslint-disable-next-line promise/prefer-await-to-then -- fire-and-forget inside non-async AppState callback
+			void Promise.all(refetchPromises).finally(() => {
+				setIsRestoringFromBackground(false);
 			});
-			void queryClient.invalidateQueries({
-				queryKey: queryKeys.messages(activeChatId),
-			});
-		void syncMissedAssistantEventsForChat(activeChatId);
 		});
 
 		// eslint-disable-next-line @typescript-eslint/consistent-return
@@ -2038,9 +2059,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			if (!nextProjectId) {
 				return;
 			}
-			setSelectedProjectId(nextProjectId ?? null);
-			setSelectedChatId(normalizedChatId);
-			setLastError(null);
+
+			// M-04: Wrap state updates in startTransition so React keeps the
+			// previous chat visible until the new chat's content is ready,
+			// avoiding intermediate frames with empty UI.
+			startTransition(() => {
+				setSelectedProjectId(nextProjectId ?? null);
+				setSelectedChatId(normalizedChatId);
+				setLastError(null);
+			});
 
 			persistSelection({
 				selectedChatId: normalizedChatId,
@@ -2708,6 +2735,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		isChatsFetching,
 		isMessagesLoading,
 		isActiveThreadsLoading,
+		isRestoringFromBackground,
 		isSending,
 		isStopping,
 		lastError,
