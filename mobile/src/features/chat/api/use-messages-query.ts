@@ -115,7 +115,7 @@ export const useMessagesQuery = (chatId: string | null, options?: { enabled?: bo
 
 	const query = useQuery<MessagePageDTO>({
 		enabled: Boolean(chatId) && enabled,
-		initialData: createEmptyPage(),
+		placeholderData: createEmptyPage(),
 		queryFn: async () => {
 			if (!chatId) {
 				return createEmptyPage();

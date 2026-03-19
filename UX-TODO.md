@@ -29,9 +29,10 @@
   - **Fix**: Preservar streaming state do chat anterior; limpar apenas o chat que esta sendo deselecionado.
   - **Done**: Removed 6 streaming map resets from SET_SELECTED_CHAT. Tests: `useWorkspaceStore.streaming-preservation.test.ts` (4 tests pass)
 
-- [ ] **[D-03] Fade-in de 320ms no layout principal atrasa first paint** — `App.tsx:2611`
+- [x] **[D-03] Fade-in de 320ms no layout principal atrasa first paint** — `App.tsx:2611`
   - `motion.div` com `initial={{ opacity: 0, y: 12 }}` e duracao de 320ms mantem o app invisivel durante o bootstrap.
   - **Fix**: Remover ou reduzir a animacao de entrada do shell. Mostrar o layout imediatamente com skeleton states.
+  - **Done**: Reduced to 100ms with initial opacity 0.8/y:4. Near-instant first paint.
 
 - [x] **[D-04] `SET_CHATS` sempre auto-seleciona o 1o chat e reseta messageWindow** — `useWorkspaceStore.ts:424`
   - Qualquer refresh da lista de chats (incluindo via WebSocket `chat_created`) reseta a conversa visivel.
@@ -53,9 +54,10 @@
   - **Fix**: Inicializar loading states como `true` (ou criar estado "initial" distinto de "idle").
   - **Done**: Initial state now has `projectsLoading: true, chatsLoading: true, messagesLoading: true`. Tests: `useWorkspaceStore.bootstrap.test.ts`
 
-- [ ] **[D-08] Layout shift entre empty state / loading / content no ConversationPanel** — `ConversationPanel.tsx:426`
+- [x] **[D-08] Layout shift entre empty state / loading / content no ConversationPanel** — `ConversationPanel.tsx:426`
   - Tres estados condicionais com alturas completamente diferentes. Transicao entre eles causa salto visual.
   - **Fix**: Usar skeleton screens que mantenham a mesma estrutura visual do estado final. Ou reservar espaco minimo.
+  - **Done**: Added minHeight:200 container + skeleton placeholder with animated pulse bars matching message layout.
 
 - [x] **[D-09] Auto-expand de tool items causa layout jump apos 2s** — `StreamingTimeline.tsx:181`
   - `setTimeout(2000)` expande itens de tool sem animacao. Tudo abaixo pula para baixo.
@@ -87,11 +89,11 @@
   - `setSelectedModel(null)` + `setAvailableModels([])` executam antes do fetch. Dropdowns ficam vazios por 200-500ms.
   - **Fix**: Manter modelos do provider anterior visiveis ate os novos carregarem. Ou mostrar skeleton no dropdown.
 
-- [ ] **[D-15] Sem skeleton screen no sidebar** — `App.tsx:2679`
+- [x] **[D-15] Sem skeleton screen no sidebar** — `App.tsx:2679`
   - "Loading workspaces..." como texto simples, depois pula para lista completa.
   - **Fix**: Skeleton cards na sidebar matching o layout final.
 
-- [ ] **[D-16] Double dispatch em `handleSelectProject`** — `App.tsx:2212`
+- [x] **[D-16] Double dispatch em `handleSelectProject`** — `App.tsx:2212`
   - `dispatch(SET_SELECTED_CHAT, null)` seguido de `dispatch(SET_SELECTED_PROJECT, id)` causa render intermediario com "No chat selected".
   - **Fix**: Despachar uma unica action `SELECT_PROJECT` que limpa e seleciona atomicamente.
 
@@ -111,11 +113,11 @@
   - Scroll perto do topo (<=32px) dispara load imediato. O guard reseta quando messages mudam, re-triggering.
   - **Fix**: Adicionar debounce de ~300ms. Manter guard ativo ate o scroll sair da zona de trigger.
 
-- [ ] **[D-21] Textarea double-reflow por keystroke** — `MessageComposer.tsx:242`
+- [x] **[D-21] Textarea double-reflow por keystroke** — `MessageComposer.tsx:242`
   - `height = "auto"` -> reflow -> `height = scrollHeight` -> reflow. Duas forced layouts por tecla.
   - **Fix**: Usar `scrollHeight` sem resetar para `"auto"` primeiro. Ou usar `ResizeObserver`.
 
-- [ ] **[D-22] Three.js canvas: flash de nada antes do WebGL** — `ChatEmptyBackground.tsx:22`
+- [x] **[D-22] Three.js canvas: flash de nada antes do WebGL** — `ChatEmptyBackground.tsx:22`
   - `ready=false` -> retorna `null` por 1 frame. Depois inicializa WebGL (50-200ms de stutter).
   - **Fix**: Mostrar fallback estatico (gradiente CSS) enquanto WebGL carrega. Fade-in o canvas.
 
@@ -130,10 +132,10 @@
 
 ### P3 — Low
 
-- [ ] **[D-25] Spinner flash em `openingProjectId`** — `App.tsx:2261`
+- [x] **[D-25] Spinner flash em `openingProjectId`** — `App.tsx:2261`
   - Loader aparece por ~1 frame se a API responder rapido. Adicionar delay minimo (150ms) para exibir spinner.
 
-- [ ] **[D-26] "Working..." indicator pisca em turns rapidos** — `ConversationPanel.tsx:573`
+- [x] **[D-26] "Working..." indicator pisca em turns rapidos** — `ConversationPanel.tsx:573`
   - Fade-in -> imediato fade-out quando `isWorking` flipa rapido. Usar debounce para mostrar.
 
 - [x] **[D-27] State badges mudam sem transicao** — `StreamingTimeline.tsx:237`
@@ -196,7 +198,7 @@
   - **Fix**: Agrupar invalidacoes. Ou usar flag `isRestoringFromBackground` para mostrar um overlay suave durante a sincronizacao.
   - **Done**: Batched all refetches into `Promise.all` with `isRestoringFromBackground` flag. Flag resets in `.finally()`. Tests: `use-workspace-shell.foreground-restore.test.ts` (8 tests).
 
-- [ ] **[M-06] Delay na criacao de chat ao enviar mensagem** — `use-workspace-shell.ts:2230`
+- [x] **[M-06] Delay na criacao de chat ao enviar mensagem** — `use-workspace-shell.ts:2230`
   - `sendMessage` em thread vazia precisa `await createChat()` antes de mostrar a mensagem otimista. Delay perceptivel entre pressionar "Send" e ver a mensagem.
   - **Fix**: Mostrar mensagem otimista imediatamente com ID temporario. Substituir pelo ID real quando a criacao completar.
 
@@ -268,7 +270,7 @@
   - Taps rapidos durante animacao: `isDrawerOpen` true enquanto close animation roda. Nao ha lock.
   - **Fix**: Adicionar `isAnimatingRef` para prevenir interacoes durante transicao.
 
-- [ ] **[M-22] Layout shift na workspace selection (spinner -> lista)** — `workspace-selection-screen.tsx:268`
+- [x] **[M-22] Layout shift na workspace selection (spinner -> lista)** — `workspace-selection-screen.tsx:268`
   - ActivityIndicator centralizado pula para lista completa sem transicao.
   - **Fix**: Skeleton cards. Ou posicionar spinner no topo da lista sem mudar layout.
 
@@ -285,7 +287,7 @@
   - Comparacao de referencia de callbacks. Se parent re-renderiza sem memoizar, toda a lista re-renderiza.
   - **Fix**: Memoizar todos os callbacks passados para StreamingTimeline. Ou remover callback comparison do cache check.
 
-- [ ] **[M-26] `initialData: createEmptyPage()` causa flash de empty state** — `use-messages-query.ts:118`
+- [x] **[M-26] `initialData: createEmptyPage()` causa flash de empty state** — `use-messages-query.ts:118`
   - Ao abrir chat com mensagens, "Start a conversation." aparece por 1 frame antes das mensagens carregarem.
   - **Fix**: Nao usar `initialData`. Ou inicializar com `undefined` e mostrar skeleton quando `isLoading`.
 
@@ -303,7 +305,7 @@
   - Toast e FAB no mesmo bottom position. Toast fica por cima.
   - **Fix**: Subir posicao do toast quando FAB esta visivel.
 
-- [ ] **[M-30] Flash de "No workspace selected" antes de redirect** — `thread-selection-screen.tsx:116`
+- [x] **[M-30] Flash de "No workspace selected" antes de redirect** — `thread-selection-screen.tsx:116`
   - Breve flash do subtitle incorreto antes de navegar para /workspaces.
 
 - [ ] **[M-31] Loading/empty race no active-threads** — `active-threads-screen.tsx:68`

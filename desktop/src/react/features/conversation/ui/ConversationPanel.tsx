@@ -230,6 +230,18 @@ export const ConversationPanel = ({
 	onSetStreamItemState,
 	focusMode = false,
 }: ConversationPanelProps): JSX.Element => {
+	const [debouncedIsWorking, setDebouncedIsWorking] = useState(false);
+	useEffect(() => {
+		if (!isWorking) {
+			setDebouncedIsWorking(false);
+			return;
+		}
+		const timer = setTimeout(() => {
+			setDebouncedIsWorking(true);
+		}, 150);
+		return () => clearTimeout(timer);
+	}, [isWorking]);
+
 	const shouldReduceMotion = Boolean(useReducedMotion());
 	const hasMessages = messages.length > 0;
 	const hasStreamingTimeline = Boolean(streamingTurn && streamingTurn.itemOrder.length > 0);
@@ -422,11 +434,25 @@ export const ConversationPanel = ({
 				</header>
 			)}
 
-			<div className="relative flex min-h-0 flex-1 flex-col">
+			<div className="relative flex min-h-0 flex-1 flex-col" style={{ minHeight: 200 }}>
 				{loading ? (
-					<p className={cn("text-xs text-slate-300/80", focusMode ? "px-4 py-3 sm:px-6" : "px-5 py-3")}>
-						Loading messages...
-					</p>
+					<div className={cn("space-y-4", focusMode ? "px-4 py-3 sm:px-6" : "px-5 py-3")}>
+						<div className="flex items-start gap-3">
+							<div className="h-6 w-6 animate-pulse rounded-full bg-slate-600/30" />
+							<div className="flex-1 space-y-2">
+								<div className="h-3 w-3/4 animate-pulse rounded bg-slate-600/30" />
+								<div className="h-3 w-1/2 animate-pulse rounded bg-slate-600/30" />
+							</div>
+						</div>
+						<div className="flex items-start gap-3">
+							<div className="h-6 w-6 animate-pulse rounded-full bg-slate-600/30" />
+							<div className="flex-1 space-y-2">
+								<div className="h-3 w-2/3 animate-pulse rounded bg-slate-600/30" />
+								<div className="h-3 w-5/6 animate-pulse rounded bg-slate-600/30" />
+								<div className="h-3 w-1/3 animate-pulse rounded bg-slate-600/30" />
+							</div>
+						</div>
+					</div>
 				) : null}
 
 				{hasRestError ? (
@@ -570,7 +596,7 @@ export const ConversationPanel = ({
 										</motion.article>
 									) : null}
 
-									{isWorking ? (
+									{debouncedIsWorking ? (
 										<motion.article
 											{...bubbleMotion}
 											aria-label="working-indicator"

@@ -2267,16 +2267,50 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				await loadLatestMessages();
 			}
 			const selectedChatHasNoMessages = messagesQuery.messages.length === 0;
-			const replacementChat =
+			const needsReplacementChat =
 				selectedChat &&
 				selectedChatHasNoMessages &&
-				isPlaceholderThreadTitle(selectedChat.title)
-					? await createChat(text)
-					: null;
+				isPlaceholderThreadTitle(selectedChat.title);
+			const needsFallbackChat = !needsReplacementChat && !selectedChat;
+
+			// Show the optimistic message immediately using a temporary or existing chat ID.
+			const tempChatId = needsFallbackChat
+				? `temp-chat-${Date.now()}`
+				: (selectedChat?.id ?? null);
+			const optimisticChatId = tempChatId ?? `temp-chat-${Date.now()}`;
+
+			const nextMessage: MessageDTO = {
+				chatId: optimisticChatId,
+				content: text,
+				createdAt: new Date().toISOString(),
+				id: `user-${Date.now()}`,
+				role: "user",
+			};
+
+			// Show the user message in the UI while chat creation is in-flight.
+			queryClient.setQueryData<MessagePageDTO>(
+				queryKeys.messages(optimisticChatId),
+				(current) => appendMessageToMessagePage(current, nextMessage),
+			);
+			setMessageWindowModeByChat((current) => ({
+				...current,
+				[optimisticChatId]: "latest",
+			}));
+			setLatestDirtyByChat((current) => ({
+				...current,
+				[optimisticChatId]: false,
+			}));
+			setLastError(null);
+
+			// Now create the chat if needed (network call).
+			const replacementChat = needsReplacementChat
+				? await createChat(text)
+				: null;
 			const placeholderChatIdToDelete =
 				replacementChat && selectedChat ? selectedChat.id : null;
-			const fallbackChat =
-				replacementChat || selectedChat ? null : await createChat(text);
+			const fallbackChat = needsFallbackChat
+				? await createChat(text)
+				: null;
 			const activeChatId =
 				replacementChat?.id ??
 				selectedChat?.id ??
@@ -2284,22 +2318,31 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				null;
 
 			if (!activeChatId) {
+				// Clean up the optimistic message if chat creation failed.
+				queryClient.removeQueries({ queryKey: queryKeys.messages(optimisticChatId) });
 				return false;
 			}
 			lastSendAttemptChatIdRef.current = activeChatId;
 
-			const nextMessage: MessageDTO = {
-				chatId: activeChatId,
-				content: text,
-				createdAt: new Date().toISOString(),
-				id: `user-${Date.now()}`,
-				role: "user",
-			};
+			// If we used a temporary chat ID, migrate the optimistic message to the real chat.
+			if (optimisticChatId !== activeChatId) {
+				const optimisticData = queryClient.getQueryData<MessagePageDTO>(
+					queryKeys.messages(optimisticChatId),
+				);
+				if (optimisticData) {
+					const migratedMessages = optimisticData.messages.map((msg) => ({
+						...msg,
+						chatId: activeChatId,
+					}));
+					queryClient.setQueryData<MessagePageDTO>(
+						queryKeys.messages(activeChatId),
+						{ ...optimisticData, messages: migratedMessages },
+					);
+					queryClient.removeQueries({ queryKey: queryKeys.messages(optimisticChatId) });
+				}
+				nextMessage.chatId = activeChatId;
+			}
 
-			queryClient.setQueryData<MessagePageDTO>(
-				queryKeys.messages(activeChatId),
-				(current) => appendMessageToMessagePage(current, nextMessage),
-			);
 			queryClient.setQueryData<ThreadListChatEntry[]>(
 				queryKeys.chats(activeProjectId),
 				(current) => moveChatToFrontOfThreadList(
@@ -2313,20 +2356,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 					activeProjectId,
 				),
 			);
-			setMessageWindowModeByChat((current) => ({
-				...current,
-				[activeChatId]: "latest",
-			}));
-			setLatestDirtyByChat((current) => ({
-				...current,
-				[activeChatId]: false,
-			}));
 			queryClient.setQueryData(queryKeys.streamTurn(activeChatId), null);
 			setStreamingTextByChat((current) => ({
 				...current,
 				[activeChatId]: "",
 			}));
-			setLastError(null);
 			setSendingByChat((current) => ({
 				...current,
 				[activeChatId]: true,

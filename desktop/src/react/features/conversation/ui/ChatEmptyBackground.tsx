@@ -39,12 +39,12 @@ export const ChatEmptyBackground = ({ reducedMotion }: { reducedMotion: boolean 
 	if (!ready) return null;
 
 	return (
-		<div className="pointer-events-none absolute inset-0 overflow-hidden rounded-2xl">
+		<div className="pointer-events-none absolute inset-0 overflow-hidden rounded-2xl" style={{ backgroundColor: "#05070c" }}>
 			{/* @ts-expect-error mixed @types/react versions in workspace affect Canvas JSX typing */}
 			<Canvas
 				camera={{ far: 18, fov: 34, near: 0.1, position: [0, 0.1, 8.4] }}
 				dpr={[1, 1.5]}
-				gl={{ alpha: true, antialias: true, powerPreference: "high-performance" }}
+				gl={{ alpha: false, antialias: true, powerPreference: "high-performance" }}
 				style={{ position: "absolute", inset: 0 }}
 			>
 				<RemoteFlowScene pointerRef={pointerRef} reducedMotion={reducedMotion} />

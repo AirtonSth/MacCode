@@ -161,6 +161,11 @@ export const ThreadSelectionScreen = () => {
 	const shouldShowThreadsLoading = !isLoaded || isChatsLoading;
 	const isBackgroundRefetching = !shouldShowThreadsLoading && isChatsFetching;
 	const effectiveErrorMessage = errorMessage.length > 0 ? errorMessage : (chatsErrorMessage ?? "");
+	const isRedirectPending =
+		isConfigLoaded &&
+		isLoaded &&
+		!serverHealthQuery.isPending &&
+		(!selectedProjectId || serverHealthQuery.isError);
 
 	useEffect(() => {
 		if (!openingThreadId) {
@@ -291,6 +296,14 @@ export const ThreadSelectionScreen = () => {
 			});
 		}
 	};
+
+	if (isRedirectPending) {
+		return (
+			<View style={styles.root} testID="screen-threads-redirecting">
+				<ActivityIndicator color={palette.accent} style={styles.redirectSpinner} />
+			</View>
+		);
+	}
 
 	return (
 		<KeyboardAvoidingView
@@ -517,6 +530,9 @@ const styles = StyleSheet.create({
 	loading: {
 		alignItems: "center",
 		paddingVertical: 20,
+	},
+	redirectSpinner: {
+		flex: 1,
 	},
 	fabButton: {
 		alignItems: "center",

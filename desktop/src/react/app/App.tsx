@@ -460,6 +460,7 @@ const App = (): JSX.Element => {
 	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
 	const [projectThreadsOpen, setProjectThreadsOpen] = useState<Record<string, boolean>>({});
 	const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
+	const [visibleOpeningProjectId, setVisibleOpeningProjectId] = useState<string | null>(null);
 	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
 	const [openWorkspaceMenuProjectId, setOpenWorkspaceMenuProjectId] = useState<string | null>(null);
 	const [isActiveThreadsOpen, setIsActiveThreadsOpen] = useState(false);
@@ -2347,7 +2348,6 @@ const App = (): JSX.Element => {
 				[projectId]: true,
 			}));
 
-			dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
 			dispatch({ payload: projectId, type: "SET_SELECTED_PROJECT" });
 			selectedProjectIdRef.current = projectId;
 			selectedChatIdRef.current = null;
@@ -2411,6 +2411,17 @@ const App = (): JSX.Element => {
 
 		setOpeningProjectId(null);
 	}, [openingProjectId, state.chatsLoading, state.selectedProjectId]);
+
+	useEffect(() => {
+		if (!openingProjectId) {
+			setVisibleOpeningProjectId(null);
+			return;
+		}
+		const timer = setTimeout(() => {
+			setVisibleOpeningProjectId(openingProjectId);
+		}, 150);
+		return () => clearTimeout(timer);
+	}, [openingProjectId]);
 
 	useEffect(() => {
 		if (!openingThreadId) {
@@ -2755,8 +2766,8 @@ const App = (): JSX.Element => {
 								? "grid-cols-[var(--desktop-sidebar-width)_8px_minmax(0,1fr)] max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
 								: "grid-cols-[minmax(0,1fr)]",
 							)}
-							initial={shouldReduceMotion ? undefined : { opacity: 0, y: 12 }}
-							transition={{ duration: 0.32, ease: "easeOut" }}
+							initial={shouldReduceMotion ? undefined : { opacity: 0.8, y: 4 }}
+							transition={{ duration: 0.1, ease: "easeOut" }}
 						>
 						<span className="noise-mask" />
 
@@ -2815,7 +2826,21 @@ const App = (): JSX.Element => {
 									<ScrollArea className="mt-1 min-h-0 flex-1 pr-0.5">
 										<div className="space-y-1 pb-1">
 											{state.projectsLoading ? (
-												<p className="px-2 py-1.5 text-[11px] text-slate-400">Loading workspaces...</p>
+												<div className="space-y-3 px-2 py-1.5">
+													<div className="flex items-center gap-2">
+														<div className="h-3.5 w-3.5 shrink-0 animate-pulse rounded bg-slate-600/40" />
+														<div className="h-3 w-24 animate-pulse rounded bg-slate-600/40" />
+													</div>
+													<div className="ml-5 space-y-2">
+														<div className="h-2.5 w-32 animate-pulse rounded bg-slate-700/30" />
+														<div className="h-2.5 w-28 animate-pulse rounded bg-slate-700/30" />
+														<div className="h-2.5 w-36 animate-pulse rounded bg-slate-700/30" />
+													</div>
+													<div className="flex items-center gap-2">
+														<div className="h-3.5 w-3.5 shrink-0 animate-pulse rounded bg-slate-600/40" />
+														<div className="h-3 w-20 animate-pulse rounded bg-slate-600/40" />
+													</div>
+												</div>
 											) : state.projects.length === 0 ? (
 												<p className="rounded-md border border-dashed border-white/10 px-2.5 py-3 text-[11px] text-slate-400">
 													No workspaces yet. Open a project folder to begin.
@@ -2856,7 +2881,7 @@ const App = (): JSX.Element => {
 																tabIndex={0}
 																>
 																	<span className="inline-flex min-w-0 items-center gap-1.5">
-																		{project.id === openingProjectId ? (
+																		{project.id === visibleOpeningProjectId ? (
 																			<Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-sky-300" />
 																		) : (
 																			<Folder className="h-3.5 w-3.5 shrink-0 text-slate-400/90" />

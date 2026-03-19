@@ -266,8 +266,16 @@ export const WorkspaceSelectionScreen = () => {
 				</View>
 
 				{!isLoaded ? (
-					<View style={styles.loading}>
-						<ActivityIndicator color={palette.accent} />
+					<View style={styles.list} testID="workspaces-skeleton">
+						{[0, 1, 2].map((idx) => (
+							<View key={idx} style={styles.skeletonRow}>
+								<View style={styles.skeletonTitle} />
+								<View style={styles.skeletonSubtitle} />
+							</View>
+						))}
+						<View style={styles.skeletonSpinner}>
+							<ActivityIndicator color={palette.muted} size="small" />
+						</View>
 					</View>
 				) : (
 					<View style={styles.list}>
@@ -476,10 +484,26 @@ const styles = StyleSheet.create({
 		paddingHorizontal: 12,
 		paddingVertical: 8,
 	},
-	loading: {
+	skeletonRow: {
+		gap: 8,
+		paddingHorizontal: 10,
+		paddingVertical: 14,
+	},
+	skeletonTitle: {
+		backgroundColor: "rgba(255,255,255,0.06)",
+		borderRadius: 6,
+		height: 14,
+		width: "55%",
+	},
+	skeletonSubtitle: {
+		backgroundColor: "rgba(255,255,255,0.04)",
+		borderRadius: 5,
+		height: 11,
+		width: "35%",
+	},
+	skeletonSpinner: {
 		alignItems: "center",
-		justifyContent: "center",
-		paddingVertical: 22,
+		paddingVertical: 6,
 	},
 	list: {
 		backgroundColor: "#12161E",

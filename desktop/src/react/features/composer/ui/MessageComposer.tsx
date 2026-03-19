@@ -244,8 +244,11 @@ export const MessageComposer = ({
 		if (!textarea) {
 			return;
 		}
-		textarea.style.height = "auto";
-		textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+		const rafId = requestAnimationFrame(() => {
+			textarea.style.height = "auto";
+			textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+		});
+		return () => cancelAnimationFrame(rafId);
 	}, [value]);
 
 	const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
