@@ -11,8 +11,12 @@ describe("[M-42] self-originated message_created workspace events still update t
 		expect(source).toContain('isSelfOriginatedWorkspaceEvent && event.data.type !== "message_created"');
 	});
 
+	it("reconciles self-originated user message_created events instead of blindly appending them", () => {
+		expect(source).toContain("reconcileSelfOriginatedUserMessage(current, workspaceMessage)");
+	});
+
 	it("still handles the message_created branch after the self-origin check", () => {
-		const workspaceEventBlock = /if \(event\.event === "workspace_event"\) \{[\s\S]*?case "message_created": \{[\s\S]*?appendMessageToMessagePage/.exec(
+		const workspaceEventBlock = /if \(event\.event === "workspace_event"\) \{[\s\S]*?case "message_created": \{[\s\S]*?(?:appendMessageToMessagePage|reconcileSelfOriginatedUserMessage)/.exec(
 			source,
 		);
 		expect(workspaceEventBlock).not.toBeNull();

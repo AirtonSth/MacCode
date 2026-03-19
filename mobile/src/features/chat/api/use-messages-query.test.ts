@@ -7,6 +7,7 @@ const {
 	getPlaceholderMessagePage,
 	MESSAGE_PAGE_SIZE,
 	normalizeMessagePage,
+	reconcileSelfOriginatedUserMessage,
 	replaceVisibleMessagePage,
 } = await import("./message-page-utils");
 
@@ -70,6 +71,68 @@ describe("appendMessageToMessagePage", () => {
 
 		expect(result.messages).toHaveLength(1);
 		expect(result.messages[0].chatId).toBe("temp-chat-12345");
+	});
+});
+
+describe("reconcileSelfOriginatedUserMessage", () => {
+	it("replaces the optimistic user message with the confirmed server message", () => {
+		const optimistic = makeMessage({
+			chatId: "chat-1",
+			content: "hello",
+			createdAt: "2025-01-01T00:00:00Z",
+			id: "user-123",
+			role: "user",
+		});
+		const page: MessagePageDTO = {
+			...makeEmptyPage(),
+			messages: [optimistic],
+		};
+		const confirmed = makeMessage({
+			chatId: "chat-1",
+			content: "hello",
+			createdAt: "2025-01-01T00:00:01Z",
+			id: "srv-1",
+			role: "user",
+		});
+
+		const result = reconcileSelfOriginatedUserMessage(page, confirmed);
+
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0]).toEqual(confirmed);
+	});
+
+	it("appends the confirmed user message when there is no optimistic match", () => {
+		const page: MessagePageDTO = {
+			...makeEmptyPage(),
+			messages: [makeMessage({ createdAt: "2025-01-01T00:00:00Z", id: "msg-1", role: "assistant" })],
+		};
+		const confirmed = makeMessage({
+			chatId: "chat-1",
+			content: "hello",
+			createdAt: "2025-01-01T00:00:01Z",
+			id: "srv-1",
+			role: "user",
+		});
+
+		const result = reconcileSelfOriginatedUserMessage(page, confirmed);
+
+		expect(result.messages).toHaveLength(2);
+		expect(result.messages.some((message) => message.id === confirmed.id)).toBe(true);
+	});
+
+	it("falls back to a normal append for assistant messages", () => {
+		const confirmed = makeMessage({
+			chatId: "chat-1",
+			content: "done",
+			createdAt: "2025-01-01T00:00:01Z",
+			id: "srv-2",
+			role: "assistant",
+		});
+
+		const result = reconcileSelfOriginatedUserMessage(undefined, confirmed);
+
+		expect(result.messages).toHaveLength(1);
+		expect(result.messages[0]).toEqual(confirmed);
 	});
 });
 

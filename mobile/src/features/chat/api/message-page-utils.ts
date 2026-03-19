@@ -97,6 +97,41 @@ export const appendMessageToMessagePage = (
 	};
 };
 
+export const reconcileSelfOriginatedUserMessage = (
+	page: MessagePageDTO | undefined,
+	confirmedMessage: MessageDTO,
+): MessagePageDTO => {
+	if (confirmedMessage.role !== "user") {
+		return appendMessageToMessagePage(page, confirmedMessage);
+	}
+
+	const normalizedPage = normalizeMessagePage(page);
+	const optimisticIndex = normalizedPage.messages.findIndex((entry) => (
+		entry.id.startsWith("user-")
+		&& entry.role === "user"
+		&& entry.chatId === confirmedMessage.chatId
+		&& entry.content === confirmedMessage.content
+	));
+	if (optimisticIndex === -1) {
+		return appendMessageToMessagePage(normalizedPage, confirmedMessage);
+	}
+
+	const nextMessages = Array.from(normalizedPage.messages);
+	nextMessages[optimisticIndex] = confirmedMessage;
+	const trimmedPage = trimMessagePage(sortMessagesAscending(nextMessages));
+	const oldestVisibleMessageId = trimmedPage.messages[0]?.id ?? null;
+
+	return {
+		...normalizedPage,
+		hasMore: normalizedPage.hasMore || trimmedPage.hasTrimmedOlderMessages,
+		messages: trimmedPage.messages,
+		nextBeforeMessageId:
+			normalizedPage.hasMore || trimmedPage.hasTrimmedOlderMessages
+				? oldestVisibleMessageId
+				: normalizedPage.nextBeforeMessageId,
+	};
+};
+
 export const replaceVisibleMessagePage = (
 	current: MessagePageDTO | undefined,
 	page: MessagePageDTO,
