@@ -9,6 +9,7 @@ import type { CodexProviderRunnerContract } from "../provider/codex-provider-run
 import type { ProjectRepository } from "../project/project.repository";
 import type { ChatStreamEventRepositoryContract } from "./chat-stream-event.repository";
 import type { ChatStreamSnapshotRepositoryContract } from "./chat-stream-snapshot.repository";
+import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
 import { WsService } from "./ws.service";
 
 const createChat = (overrides: Partial<ChatDTO> = {}): ChatDTO => ({
@@ -285,7 +286,7 @@ test("WsService.startUserMessage deduplicates a replayed requestId", async () =>
 		},
 	} as unknown as CodexProviderRunnerContract;
 
-	const workspaceEvents = {
+	const workspaceEvents: WorkspaceEventsServiceContract = {
 		append: () => {
 			throw new Error("should not append duplicate workspace events");
 		},
@@ -304,7 +305,7 @@ test("WsService.startUserMessage deduplicates a replayed requestId", async () =>
 				requestId: "req-duplicate",
 				seq: 1,
 				ts: "2026-03-19T11:59:59.000Z",
-				type: "message_created",
+				type: "message_created" as const,
 			},
 		],
 		subscribe: () => () => {
