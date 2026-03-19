@@ -346,15 +346,16 @@ const StatusNodes = ({
 
 const ParallaxController = ({
 	groupRef,
-	pointer,
+	pointerRef,
 	reducedMotion,
 }: {
 	groupRef: RefObject<Group | null>;
-	pointer: { horizontal: number; vertical: number };
+	pointerRef: RefObject<{ horizontal: number; vertical: number }>;
 	reducedMotion: boolean;
 }) => {
 	useFrame((_, delta) => {
 		if (!groupRef.current) return;
+		const pointer = pointerRef.current;
 		const targetX = reducedMotion ? 0 : pointer.horizontal * 0.18;
 		const targetY = reducedMotion ? 0 : pointer.vertical * 0.12;
 		const targetRotY = reducedMotion ? 0 : pointer.horizontal * 0.05;
@@ -378,10 +379,10 @@ const ParallaxController = ({
 };
 
 export const RemoteFlowScene = ({
-	pointer,
+	pointerRef,
 	reducedMotion,
 }: {
-	pointer: { horizontal: number; vertical: number };
+	pointerRef: RefObject<{ horizontal: number; vertical: number }>;
 	reducedMotion: boolean;
 }) => {
 	const groupRef = useRef<Group>(null);
@@ -413,7 +414,7 @@ export const RemoteFlowScene = ({
 				<TravelingPulses intensity={intensity} paths={paths} pulses={pulses} reducedMotion={reducedMotion} />
 				<StatusNodes intensity={intensity} nodes={nodes} paths={paths} reducedMotion={reducedMotion} />
 			</group>
-			<ParallaxController groupRef={groupRef} pointer={pointer} reducedMotion={reducedMotion} />
+			<ParallaxController groupRef={groupRef} pointerRef={pointerRef} reducedMotion={reducedMotion} />
 		</>
 	);
 };

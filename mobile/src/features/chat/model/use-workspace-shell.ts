@@ -2664,6 +2664,11 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		Boolean(selectedProjectId) &&
 		shouldEnableChatsQuery &&
 		(chatsQuery.isPending || (chatsQuery.fetchStatus === "fetching" && !hasChatsData));
+	const isChatsFetching =
+		Boolean(selectedProjectId) &&
+		shouldEnableChatsQuery &&
+		chatsQuery.fetchStatus === "fetching" &&
+		hasChatsData;
 	let chatsErrorMessage: string | null = null;
 	if (shouldEnableChatsQuery && chatsQuery.isError) {
 		chatsErrorMessage = chatsQuery.error instanceof Error
@@ -2700,6 +2705,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		isLoadingOlderMessages: shouldEnableMessagesQuery ? messagesQuery.isLoadingOlderMessages : false,
 		isViewingOlderMessages: messageWindowMode === "older",
 		isChatsLoading,
+		isChatsFetching,
 		isMessagesLoading,
 		isActiveThreadsLoading,
 		isSending,

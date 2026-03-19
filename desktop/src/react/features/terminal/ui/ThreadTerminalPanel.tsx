@@ -1,7 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { cn } from "../../../lib/utils";
 import type { TerminalDisplayItem } from "../model/useThreadTerminalSession";
+
+export const SCROLL_BOTTOM_THRESHOLD = 48;
 
 interface ThreadTerminalPanelProps {
 	chatId: string;
@@ -36,14 +38,33 @@ export const ThreadTerminalPanel = ({
 }: ThreadTerminalPanelProps): JSX.Element => {
 	const [command, setCommand] = useState("");
 	const outputRef = useRef<HTMLDivElement | null>(null);
+	const userScrolledUpReference = useRef(false);
 
 	useEffect(() => {
 		setCommand("");
 	}, [chatId]);
 
+	const handleOutputScroll = useCallback(() => {
+		const element = outputRef.current;
+
+		if (!element) {
+			return;
+		}
+
+		const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+
+		// eslint-disable-next-line functional/immutable-data
+		userScrolledUpReference.current = distanceFromBottom > SCROLL_BOTTOM_THRESHOLD;
+	}, []);
+
 	useEffect(() => {
 		const outputElement = outputRef.current;
+
 		if (!outputElement) {
+			return;
+		}
+
+		if (userScrolledUpReference.current) {
 			return;
 		}
 
@@ -66,7 +87,7 @@ export const ThreadTerminalPanel = ({
 			</header>
 
 			<div className="min-h-0 flex-1 overflow-hidden">
-				<div className="h-full overflow-y-auto px-3 py-2" ref={outputRef}>
+				<div className="h-full overflow-y-auto px-3 py-2" onScroll={handleOutputScroll} ref={outputRef}>
 					{items.length === 0 ? (
 						<p className="font-mono text-xs text-slate-500">No terminal history yet.</p>
 					) : (

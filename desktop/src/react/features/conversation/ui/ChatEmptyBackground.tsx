@@ -1,8 +1,8 @@
 import { Canvas } from "@react-three/fiber";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { RemoteFlowScene } from "./remote-flow-scene";
 
-interface Pointer {
+export interface Pointer {
 	horizontal: number;
 	vertical: number;
 }
@@ -18,17 +18,18 @@ const canUseWebgl = (): boolean => {
 	}
 };
 
+export const createPointerRef = () => ({ current: { horizontal: 0, vertical: 0 } as Pointer });
+
 export const ChatEmptyBackground = ({ reducedMotion }: { reducedMotion: boolean }) => {
 	const [ready, setReady] = useState(false);
-	const [pointer, setPointer] = useState<Pointer>({ horizontal: 0, vertical: 0 });
+	const pointerRef = useRef<Pointer>({ horizontal: 0, vertical: 0 });
 
 	useEffect(() => {
 		setReady(canUseWebgl());
 
 		const onPointerMove = (e: MouseEvent) => {
-			const h = (e.clientX / window.innerWidth - 0.5) * 2;
-			const v = (e.clientY / window.innerHeight - 0.5) * -2;
-			setPointer({ horizontal: h, vertical: v });
+			pointerRef.current.horizontal = (e.clientX / window.innerWidth - 0.5) * 2;
+			pointerRef.current.vertical = (e.clientY / window.innerHeight - 0.5) * -2;
 		};
 
 		window.addEventListener("pointermove", onPointerMove, { passive: true });
@@ -46,7 +47,7 @@ export const ChatEmptyBackground = ({ reducedMotion }: { reducedMotion: boolean 
 				gl={{ alpha: true, antialias: true, powerPreference: "high-performance" }}
 				style={{ position: "absolute", inset: 0 }}
 			>
-				<RemoteFlowScene pointer={pointer} reducedMotion={reducedMotion} />
+				<RemoteFlowScene pointerRef={pointerRef} reducedMotion={reducedMotion} />
 			</Canvas>
 			<div
 				className="absolute inset-0"

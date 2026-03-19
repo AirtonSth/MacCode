@@ -24,21 +24,24 @@
 
 ### P1 — High
 
-- [ ] **[D-02] `SET_SELECTED_CHAT` apaga streaming state de TODOS os chats** — `useWorkspaceStore.ts:488`
+- [x] **[D-02] `SET_SELECTED_CHAT` apaga streaming state de TODOS os chats** — `useWorkspaceStore.ts:488`
   - Trocar de chat zera `streamingByChat`, `streamHistoryByChat`, etc. para todos os chats (nao so o anterior). Ao voltar, o usuario perde todo o contexto de streaming.
   - **Fix**: Preservar streaming state do chat anterior; limpar apenas o chat que esta sendo deselecionado.
+  - **Done**: Removed 6 streaming map resets from SET_SELECTED_CHAT. Tests: `useWorkspaceStore.streaming-preservation.test.ts` (4 tests pass)
 
 - [ ] **[D-03] Fade-in de 320ms no layout principal atrasa first paint** — `App.tsx:2611`
   - `motion.div` com `initial={{ opacity: 0, y: 12 }}` e duracao de 320ms mantem o app invisivel durante o bootstrap.
   - **Fix**: Remover ou reduzir a animacao de entrada do shell. Mostrar o layout imediatamente com skeleton states.
 
-- [ ] **[D-04] `SET_CHATS` sempre auto-seleciona o 1o chat e reseta messageWindow** — `useWorkspaceStore.ts:424`
+- [x] **[D-04] `SET_CHATS` sempre auto-seleciona o 1o chat e reseta messageWindow** — `useWorkspaceStore.ts:424`
   - Qualquer refresh da lista de chats (incluindo via WebSocket `chat_created`) reseta a conversa visivel.
   - **Fix**: Preservar `selectedChatId` se ele ainda existir na lista atualizada. So mudar se o chat selecionado foi removido.
+  - **Done**: SET_CHATS now preserves selection when chat exists in new list. Tests: `useWorkspaceStore.selection.test.ts` (5 tests pass)
 
-- [ ] **[D-05] `UPSERT_CHAT` forca selecao para o chat atualizado** — `useWorkspaceStore.ts:435`
+- [x] **[D-05] `UPSERT_CHAT` forca selecao para o chat atualizado** — `useWorkspaceStore.ts:435`
   - Se outro cliente cria um chat, o usuario e arrancado da conversa atual.
   - **Fix**: `UPSERT_CHAT` deve apenas adicionar/atualizar na lista. Selecao automatica so se for resultado de acao explicita do usuario.
+  - **Done**: UPSERT_CHAT only changes selection when selectedChatId is null. Tests: `useWorkspaceStore.selection.test.ts` (3 tests pass)
 
 - [ ] **[D-06] `collapseTurnItems` fecha itens que o usuario expandiu manualmente** — `useWorkspaceStore.ts:244`
   - Quando um turn completa, TODOS os itens colapsam, mesmo os que o usuario abriu para ler output de tool.
@@ -61,9 +64,10 @@
   - Itens auto-expandidos colapsam instantaneamente quando `state` muda de "running" para "completed".
   - **Fix**: Manter expandido por default quando completa. Ou animar o colapso. Respeitar `expandedByUser`.
 
-- [ ] **[D-11] Terminal auto-scroll ignora posicao do usuario** — `ThreadTerminalPanel.tsx:44`
+- [x] **[D-11] Terminal auto-scroll ignora posicao do usuario** — `ThreadTerminalPanel.tsx:44`
   - `useEffect([items])` sempre rola para o bottom. Impossivel ler output anterior durante streaming.
   - **Fix**: Checar se o usuario esta no bottom (similar ao `isAtBottomRef` do ConversationPanel). So auto-scroll se estiver.
+  - **Done**: Added isAtBottom check with 48px threshold. Tests: `ThreadTerminalPanel.test.ts` (12 tests pass)
 
 - [ ] **[D-12] Terminal panel abre/fecha causando layout shift de 42vh** — `App.tsx:3190`
   - Toggle do terminal insere/remove um div de `42vh min-h-[220px]`. A area de conversa encolhe dramaticamente.
@@ -111,9 +115,10 @@
   - `ready=false` -> retorna `null` por 1 frame. Depois inicializa WebGL (50-200ms de stutter).
   - **Fix**: Mostrar fallback estatico (gradiente CSS) enquanto WebGL carrega. Fade-in o canvas.
 
-- [ ] **[D-23] Pointer listener no Three.js causa re-renders excessivos** — `ChatEmptyBackground.tsx:28`
+- [x] **[D-23] Pointer listener no Three.js causa re-renders excessivos** — `ChatEmptyBackground.tsx:28`
   - `setPointer` em cada `pointermove` (60fps). React re-renderiza o componente inteiro.
   - **Fix**: Usar `useRef` para armazenar pointer position. Passar para Three.js scene via ref, nao state.
+  - **Done**: Replaced useState with useRef. Scene reads pointerRef.current in useFrame. Tests: `ChatEmptyBackground.test.ts` (3 tests pass)
 
 - [ ] **[D-24] `prefers-reduced-motion` mata TODAS as animacoes** — `index.css:149`
   - `animation-duration: 0.001ms !important` em tudo. Transicoes funcionais (resize, dropdown) tambem somem.
@@ -193,17 +198,19 @@
   - Banner aparece/desaparece baseado em poll de 2.5s. Toda a area de mensagem pula 30-40px.
   - **Fix**: Reservar espaco fixo para o banner. Ou anima-lo com height transition. Ou posicionar como overlay.
 
-- [ ] **[M-09] Auto-scroll briga com scroll manual durante streaming** — `chat-screen.tsx:464`
+- [x] **[M-09] Auto-scroll briga com scroll manual durante streaming** — `chat-screen.tsx:464`
   - Cada update de streaming rola para bottom. Impossivel ler mensagens anteriores durante resposta ativa.
   - **Fix**: Detectar scroll manual e pausar auto-scroll. Mostrar FAB "Scroll to bottom" para retornar.
+  - **Done**: Added userScrolledUpRef with 48px threshold. Auto-scroll paused when user scrolls up. Tests: `auto-scroll.test.ts` (17 tests pass)
 
 - [ ] **[M-10] Tool auto-expand sem animacao causa layout jump** — `streamingTimeline.tsx:245`
   - Apos 2s, tool item expande instantaneamente. Conteudo abaixo pula.
   - **Fix**: Usar `LayoutAnimation` do React Native para animar a expansao. Ou `Animated` com height interpolation.
 
-- [ ] **[M-11] Thread list inteira substituida por spinner durante refetch** — `thread-selection-screen.tsx:160`
+- [x] **[M-11] Thread list inteira substituida por spinner durante refetch** — `thread-selection-screen.tsx:160`
   - `shouldShowThreadsLoading` em refetch mostra spinner no lugar da lista. Lista desaparece e reaparece.
   - **Fix**: Usar `isFetching` vs `isLoading` (TanStack Query distinction). Mostrar spinner overlay sem remover a lista. Ou confiar no cache.
+  - **Done**: Added `isBackgroundRefetching` flag distinguishing initial load from background refetch. During refetch, list stays visible at opacity 0.7 with subtle spinner. Tests: `thread-loading-behavior.test.ts` (10 tests, 28 assertions).
 
 - [ ] **[M-12] Splash screen esconde antes do conteudo estar pronto** — `root-layout-content.tsx:88`
   - `SplashScreen.hideAsync()` e chamado no mount sem esperar dados. Animacao splash (~244ms) pode terminar antes da primeira tela renderizar.

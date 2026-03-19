@@ -52,6 +52,7 @@ export const ThreadSelectionScreen = () => {
 		isLoaded,
 		isActiveThreadsLoading,
 		isChatsLoading,
+		isChatsFetching,
 		isMessagesLoading,
 		selectChat,
 		selectedChatId,
@@ -158,6 +159,7 @@ export const ThreadSelectionScreen = () => {
 		[activeThreads, selectedProjectId],
 	);
 	const shouldShowThreadsLoading = !isLoaded || isChatsLoading;
+	const isBackgroundRefetching = !shouldShowThreadsLoading && isChatsFetching;
 	const effectiveErrorMessage = errorMessage.length > 0 ? errorMessage : (chatsErrorMessage ?? "");
 
 	useEffect(() => {
@@ -347,11 +349,16 @@ export const ThreadSelectionScreen = () => {
 				</View>
 
 				{shouldShowThreadsLoading ? (
-					<View style={styles.loading}>
+					<View style={styles.loading} testID="threads-full-spinner">
 						<ActivityIndicator color={palette.accent} />
 					</View>
 				) : (
-					<View style={styles.list}>
+					<View style={isBackgroundRefetching ? styles.listRefetching : styles.list} testID="threads-list">
+						{isBackgroundRefetching ? (
+							<View style={styles.refetchIndicator} testID="threads-refetch-indicator">
+								<ActivityIndicator color={palette.muted} size="small" />
+							</View>
+						) : null}
 						{visibleThreads.length === 0 ? (
 							<Text style={styles.supportText}>No thread found.</Text>
 						) : (
@@ -493,6 +500,19 @@ const styles = StyleSheet.create({
 		borderWidth: 1,
 		gap: 8,
 		padding: 10,
+	},
+	listRefetching: {
+		backgroundColor: "#12161E",
+		borderColor: palette.border,
+		borderRadius: 14,
+		borderWidth: 1,
+		gap: 8,
+		opacity: 0.7,
+		padding: 10,
+	},
+	refetchIndicator: {
+		alignItems: "center",
+		paddingVertical: 4,
 	},
 	loading: {
 		alignItems: "center",

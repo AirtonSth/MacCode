@@ -40,6 +40,8 @@ import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { SwipeableWorkspaceItem } from "../../workspaces/ui/swipeable-workspace-item";
 import { WorkspaceRenameModal } from "../../workspaces/ui/workspace-rename-modal";
 
+import { AUTO_SCROLL_BOTTOM_THRESHOLD } from "./auto-scroll-constants";
+
 const drawerWidth = 308;
 
 const palette = {
@@ -471,9 +473,16 @@ export const ChatScreen = () => {
 		const previousLastMessageId = previousLastMessageIdRef.current;
 		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
 		const hasStreaming = hasStreamingText || Boolean(streamingTurn);
-		if (hasNewTailMessage || hasStreaming) {
+
+		if ((hasNewTailMessage || hasStreaming) && !userScrolledUpRef.current) {
 			messageScrollRef.current?.scrollToEnd({ animated: true });
 		}
+
+		// When streaming ends, reset the flag so the next message scrolls normally
+		if (!hasStreaming) {
+			userScrolledUpRef.current = false;
+		}
+
 		previousLastMessageIdRef.current = nextLastMessageId;
 	}, [hasStreamingText, isViewingOlderMessages, messages, streamingTurn]);
 
@@ -657,6 +666,8 @@ export const ChatScreen = () => {
 		selectedProjectId,
 	]);
 
+	const userScrolledUpRef = useRef(false);
+
 	const handleMessageScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
 		const threshold = 32;
 		if (hasOlderMessages && !isLoadingOlderMessages && event.nativeEvent.contentOffset.y <= threshold) {
@@ -670,6 +681,9 @@ export const ChatScreen = () => {
 			layoutMeasurement,
 		} = event.nativeEvent;
 		const distanceFromBottom = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+
+		userScrolledUpRef.current = distanceFromBottom > AUTO_SCROLL_BOTTOM_THRESHOLD;
+
 		if (isViewingOlderMessages && distanceFromBottom <= threshold) {
 			void loadLatestMessages();
 		}

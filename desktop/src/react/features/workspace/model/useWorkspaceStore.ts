@@ -452,25 +452,41 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 
 		case "SET_CHATS": {
 			const sortedChats = sortChatsByUpdatedAtDesc(action.payload);
+			const currentStillExists =
+				state.selectedChatId !== null &&
+				sortedChats.some((chat) => chat.id === state.selectedChatId);
+			const nextSelectedChatId = currentStillExists
+				? state.selectedChatId
+				: (sortedChats[0]?.id ?? null);
 			return {
 				...state,
 				chats: sortedChats,
 				chatsLoading: false,
-				selectedChatId: sortedChats[0]?.id ?? null,
-				messageWindow: createEmptyMessageWindow(sortedChats[0]?.id ?? null),
+				selectedChatId: nextSelectedChatId,
+				messageWindow: currentStillExists
+					? state.messageWindow
+					: createEmptyMessageWindow(nextSelectedChatId),
 			};
 		}
 
-		case "UPSERT_CHAT":
+		case "UPSERT_CHAT": {
+			const updatedChats = sortChatsByUpdatedAtDesc([
+				...state.chats.filter((chat) => chat.id !== action.payload.id),
+				action.payload,
+			]);
+			if (state.selectedChatId !== null) {
+				return {
+					...state,
+					chats: updatedChats,
+				};
+			}
 			return {
 				...state,
-				chats: sortChatsByUpdatedAtDesc([
-					...state.chats.filter((chat) => chat.id !== action.payload.id),
-					action.payload,
-				]),
+				chats: updatedChats,
 				selectedChatId: action.payload.id,
 				messageWindow: createEmptyMessageWindow(action.payload.id),
 			};
+		}
 
 		case "UPDATE_CHAT":
 			return {
@@ -519,12 +535,6 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 				...state,
 				selectedChatId: action.payload,
 				messageWindow: createEmptyMessageWindow(action.payload),
-				streamingByChat: {},
-				streamingActiveByChat: action.payload ? { [action.payload]: false } : {},
-				streamTurnsByChat: {},
-				streamHistoryByChat: {},
-				lastAssistantEventIdByChat: {},
-				sendingByChat: {},
 			};
 
 		case "RESET_SELECTED_CHAT":
