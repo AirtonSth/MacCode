@@ -597,28 +597,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		invalidateWorkspaceQuery(queryKeys.projectGitBranches(activeProjectId));
 	}, [invalidateWorkspaceQuery]);
 
-	useEffect(() => {
-		const models = modelsQuery.data?.models ?? [];
-		if (models.length === 0) {
-			return;
-		}
-
-		const isCurrentModelValid = selectedModel !== null && models.some((m) => m.model === selectedModel);
-		if (!isCurrentModelValid) {
-			const defaultModelDescriptor = models.find((item) => item.isDefault) ?? models[0] ?? null;
-			if (defaultModelDescriptor) {
-				setSelectedModel(defaultModelDescriptor.model);
-				setSelectedReasoningEffort(defaultModelDescriptor.defaultReasoningEffort ?? null);
-				persistSelection({
-					selectedChatId,
-					selectedModel: defaultModelDescriptor.model,
-					selectedProjectId,
-					selectedReasoningEffort: defaultModelDescriptor.defaultReasoningEffort ?? null,
-				});
-			}
-		}
-	}, [modelsQuery.data?.models, persistSelection, selectedChatId, selectedModel, selectedProjectId]);
-
 	const streamTurnQuery = useQuery<StreamTurnState | null>({
 		gcTime: Number.POSITIVE_INFINITY,
 		initialData: null,
@@ -1989,6 +1967,28 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		},
 		[permissionMode, queryClient, selectedModel, selectedProvider, selectedReasoningEffort, updateSelectionMutation],
 	);
+
+	useEffect(() => {
+		const models = modelsQuery.data?.models ?? [];
+		if (models.length === 0) {
+			return;
+		}
+
+		const isCurrentModelValid = selectedModel !== null && models.some((model) => model.model === selectedModel);
+		if (!isCurrentModelValid) {
+			const defaultModelDescriptor = models.find((item) => item.isDefault) ?? models[0] ?? null;
+			if (defaultModelDescriptor) {
+				setSelectedModel(defaultModelDescriptor.model);
+				setSelectedReasoningEffort(defaultModelDescriptor.defaultReasoningEffort ?? null);
+				persistSelection({
+					selectedChatId,
+					selectedModel: defaultModelDescriptor.model,
+					selectedProjectId,
+					selectedReasoningEffort: defaultModelDescriptor.defaultReasoningEffort ?? null,
+				});
+			}
+		}
+	}, [modelsQuery.data?.models, persistSelection, selectedChatId, selectedModel, selectedProjectId]);
 
 	const setPermissionModeWithSync = useCallback(
 		(value: string) => {

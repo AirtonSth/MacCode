@@ -221,10 +221,10 @@ describe("[M-05] Foreground restore batching", () => {
 	test("flag lifecycle: inactive -> active also triggers restore", () => {
 		let isRestoring = false;
 
-		const previous = "inactive";
-		const next = "active";
-		const shouldRestore =
-			(previous === "background" || previous === "inactive") && next === "active";
+			const previous: "background" | "inactive" = "inactive";
+			const next: "active" | "background" = "active";
+			const shouldRestore =
+				(["background", "inactive"] as const).includes(previous) && next === "active";
 
 		if (shouldRestore) {
 			isRestoring = true;

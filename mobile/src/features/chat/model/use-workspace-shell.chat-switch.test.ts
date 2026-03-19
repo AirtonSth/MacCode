@@ -203,8 +203,8 @@ describe("[M-04] Chat switch does not produce intermediate empty-UI frames", () 
 			streamTurn: (chatId: string) => ["stream-turn", chatId],
 		};
 
-		const previousChatId = "chat-old";
-		const selectedChatId = "chat-new";
+		const previousChatId: string | null = "chat-old";
+		const selectedChatId: string | null = "chat-new";
 		const staleId = previousChatId;
 
 		// Simulate the effect: selectedChatId has changed

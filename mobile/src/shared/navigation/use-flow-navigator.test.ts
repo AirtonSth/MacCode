@@ -27,7 +27,7 @@ const setPendingRoute = (state: NavigationState, route: string): NavigationState
 		clearTimeout(state.pendingTimer);
 	}
 
-	const next = { ...state, pendingRoute: route };
+	const next: NavigationState = { ...state, pendingRoute: route };
 	next.pendingTimer = setTimeout(() => {
 		next.pendingRoute = null;
 		next.pendingTimer = null;
