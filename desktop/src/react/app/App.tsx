@@ -8,8 +8,10 @@ import {
 	MoreHorizontal,
 	MessageSquareText,
 	PanelLeft,
+	Plus,
 	SquareTerminal,
 	Trash2,
+	Zap,
 } from "lucide-react";
 
 import { Electroview } from "electrobun/view";
@@ -446,12 +448,19 @@ const App = (): JSX.Element => {
 	);
 	const isSelectedThreadWorking = activeThreadChat ? isChatActive(activeThreadChat.id) : false;
 
+	const activeChats = useMemo(
+		() => state.chats.filter((chat) => chat.isActive),
+		[state.chats],
+	);
+
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
 	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
 	const [projectThreadsOpen, setProjectThreadsOpen] = useState<Record<string, boolean>>({});
 	const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
 	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
 	const [openWorkspaceMenuProjectId, setOpenWorkspaceMenuProjectId] = useState<string | null>(null);
+	const [isActiveThreadsOpen, setIsActiveThreadsOpen] = useState(false);
+	const activeThreadsMenuRef = useRef<HTMLDivElement | null>(null);
 	const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
 		if (typeof window === "undefined") {
 			return DEFAULT_SIDEBAR_WIDTH;
@@ -552,6 +561,31 @@ const App = (): JSX.Element => {
 			setOpenWorkspaceMenuProjectId(null);
 		}
 	}, [openWorkspaceMenuProjectId, state.projects]);
+
+	useEffect(() => {
+		if (!isActiveThreadsOpen || typeof window === "undefined") {
+			return;
+		}
+
+		const handlePointerDown = (event: PointerEvent) => {
+			if (!activeThreadsMenuRef.current) {
+				return;
+			}
+
+			if (!(event.target instanceof Node)) {
+				return;
+			}
+
+			if (!activeThreadsMenuRef.current.contains(event.target)) {
+				setIsActiveThreadsOpen(false);
+			}
+		};
+
+		window.addEventListener("pointerdown", handlePointerDown);
+		return () => {
+			window.removeEventListener("pointerdown", handlePointerDown);
+		};
+	}, [isActiveThreadsOpen]);
 
 	useEffect(() => {
 		permissionModeRef.current = permissionMode;
@@ -1819,6 +1853,47 @@ const App = (): JSX.Element => {
 			],
 		);
 
+	const handleCreateChatForProject = useCallback(
+		async (projectId: string) => {
+			if (projectId !== selectedProjectIdRef.current) {
+				dispatch({ payload: null, type: "SET_SELECTED_CHAT" });
+				dispatch({ payload: projectId, type: "SET_SELECTED_PROJECT" });
+				selectedProjectIdRef.current = projectId;
+				selectedChatIdRef.current = null;
+				persistedSelectedChatIdRef.current = null;
+				setProjectThreadsOpen((current) => ({ ...current, [projectId]: true }));
+			}
+
+			dispatch({ payload: true, type: "SET_CREATING_CHAT" });
+			try {
+				const chat = await api.createChat(projectId, "New thread", selectedProviderRef.current);
+				dispatch({ payload: chat, type: "UPSERT_CHAT" });
+				selectedProjectIdRef.current = projectId;
+				selectedChatIdRef.current = chat.id;
+				persistedSelectedChatIdRef.current = chat.id;
+				await persistWorkspaceSelection(projectId, chat.id);
+				clearRestErrors();
+			} catch (error) {
+				addError(
+					formatApiErrorMessage(error, "Unable to create chat"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			} finally {
+				dispatch({ payload: false, type: "SET_CREATING_CHAT" });
+			}
+		},
+		[
+			addError,
+			api,
+			clearRestErrors,
+			dispatch,
+			formatApiErrorCode,
+			formatApiErrorMessage,
+			persistWorkspaceSelection,
+		],
+	);
+
 	const handleSendMessage = useCallback(
 		async (text: string) => {
 			if (selectedChat?.isActive) {
@@ -2658,7 +2733,7 @@ const App = (): JSX.Element => {
 																		</span>
 																	</span>
 																<div
-																	className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] justify-end"
+																	className="relative ml-auto flex min-h-[1.25rem] min-w-[3rem] items-center justify-end gap-0.5"
 																	ref={(node) => {
 																		if (openWorkspaceMenuProjectId === project.id) {
 																			workspaceMenuRef.current = node;
@@ -2668,9 +2743,29 @@ const App = (): JSX.Element => {
 																	<Tooltip>
 																		<TooltipTrigger asChild>
 																			<Button
+																				aria-label={`New thread in ${project.name}`}
+																				className={cn(
+																					"pointer-events-none z-10 flex h-6 w-6 items-center justify-center rounded-md border border-transparent text-slate-300 opacity-0 transition-opacity hover:border-white/15 hover:text-slate-100 group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto",
+																				)}
+																				onClick={(event) => {
+																					event.stopPropagation();
+																					void handleCreateChatForProject(project.id);
+																				}}
+																				size="icon"
+																				type="button"
+																				variant="ghost"
+																			>
+																				<Plus className="h-3.5 w-3.5" />
+																			</Button>
+																		</TooltipTrigger>
+																		<TooltipContent>New thread</TooltipContent>
+																	</Tooltip>
+																	<Tooltip>
+																		<TooltipTrigger asChild>
+																			<Button
 																				aria-label={`Workspace options for ${project.name}`}
 																				className={cn(
-																					"pointer-events-none absolute right-0 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md border border-transparent text-slate-300 opacity-0 transition-opacity hover:border-white/15 hover:text-slate-100 group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto",
+																					"pointer-events-none z-10 flex h-6 w-6 items-center justify-center rounded-md border border-transparent text-slate-300 opacity-0 transition-opacity hover:border-white/15 hover:text-slate-100 group-hover:opacity-100 group-hover:pointer-events-auto focus-visible:opacity-100 focus-visible:pointer-events-auto",
 																					openWorkspaceMenuProjectId === project.id
 																						? "opacity-100 pointer-events-auto"
 																						: "",
@@ -2819,6 +2914,53 @@ const App = (): JSX.Element => {
 											)}
 										</div>
 									</ScrollArea>
+								{activeChats.length > 0 ? (
+									<div className="relative px-2 pb-1.5 pt-1" ref={activeThreadsMenuRef}>
+										<button
+											className="flex w-full items-center gap-2 rounded-lg border border-white/8 bg-white/[0.04] px-2.5 py-2 text-left transition hover:bg-white/[0.07]"
+											onClick={() => {
+												setIsActiveThreadsOpen((current) => !current);
+											}}
+											type="button"
+										>
+											<span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-sky-500/15">
+												<Zap className="h-3 w-3 text-sky-300" />
+											</span>
+											<span className="min-w-0 flex-1 truncate text-[12px] font-medium text-slate-200">
+												{activeChats.length === 1
+													? "1 active thread"
+													: `${activeChats.length} active threads`}
+											</span>
+											<Loader2 className="h-3 w-3 shrink-0 animate-spin text-sky-300/70" />
+										</button>
+										{isActiveThreadsOpen ? (
+											<div className="absolute bottom-[calc(100%+4px)] left-2 right-2 z-30 overflow-hidden rounded-lg border border-white/15 bg-[#1a1f2a] py-1 shadow-[0_14px_30px_rgba(0,0,0,0.5)]">
+												<div className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-[0.08em] text-slate-400">
+													Active Threads
+												</div>
+												{activeChats.map((chat) => (
+													<button
+														className={cn(
+															"flex w-full items-center gap-2 px-3 py-2 text-left text-[12px] transition hover:bg-white/[0.06]",
+															state.selectedChatId === chat.id
+																? "bg-white/[0.05] text-slate-100"
+																: "text-slate-200",
+														)}
+														key={chat.id}
+														onClick={() => {
+															void handleSelectChat(chat.id);
+															setIsActiveThreadsOpen(false);
+														}}
+														type="button"
+													>
+														<Loader2 className="h-3 w-3 shrink-0 animate-spin text-sky-300" />
+														<span className="min-w-0 flex-1 truncate">{chat.title}</span>
+													</button>
+												))}
+											</div>
+										) : null}
+									</div>
+								) : null}
 								<PrivateAccountSidebarFooter openExternalUrl={handleOpenExternalUrl} />
 								</aside>
 

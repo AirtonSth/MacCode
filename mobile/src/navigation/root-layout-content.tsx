@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access */
 import * as Linking from "expo-linking";
 import * as SplashScreen from "expo-splash-screen";
 import { Stack, useRouter } from "expo-router";
@@ -9,7 +10,10 @@ import {
 } from "@/shared/api/private-auth-completion";
 import { usePrivateSession } from "@/shared/api/private-session-provider";
 import { queryClient } from "@/shared/api/query-client";
-import { initializeThreadLiveActivityManager } from "@/shared/live-activity/thread-live-activity";
+import {
+	dismissTerminalLiveActivity,
+	initializeThreadLiveActivityManager,
+} from "@/shared/live-activity/thread-live-activity";
 import { initializeLocalNotifications } from "@/shared/notifications/local-notifications";
 import { ForegroundInsomniaMode } from "@/shared/runtime/foreground-insomnia-mode";
 import { theme } from "@/shared/theme/tokens";
@@ -65,6 +69,11 @@ export const RootLayoutContent = () => {
 
 	const routePrivateUrl = useCallback((rawUrl: string | null) => {
 		if (!rawUrl) {
+			return;
+		}
+
+		if (rawUrl.includes("://active-threads")) {
+			void dismissTerminalLiveActivity();
 			return;
 		}
 

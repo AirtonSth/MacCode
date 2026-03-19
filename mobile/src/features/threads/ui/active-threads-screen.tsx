@@ -32,7 +32,6 @@ export const ActiveThreadsScreen = () => {
 		activeThreads,
 		isActiveThreadsLoading,
 		selectChatById,
-		selectProjectById,
 	} = useWorkspaceShell({
 		isActive: isFocused,
 		scope: "threads",
@@ -82,12 +81,14 @@ export const ActiveThreadsScreen = () => {
 					<Pressable
 						key={thread.id}
 						onPress={() => {
-							selectProjectById(thread.projectId);
 							selectChatById({
 								chatId: thread.id,
 								projectId: thread.projectId,
 							});
-							push("/chat");
+							push({
+								pathname: "/chat",
+								params: { source: "thread-list" },
+							});
 						}}
 						style={({ pressed }) => [styles.item, pressed ? styles.itemPressed : null]}
 						testID={`active-thread-item-${String(index)}`}

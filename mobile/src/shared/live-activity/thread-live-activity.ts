@@ -3,6 +3,7 @@ import * as Haptics from "expo-haptics";
 import { Platform, type AppStateStatus } from "react-native";
 
 import {
+	endNativeLiveActivity,
 	getCurrentNativeLiveActivityInfo,
 	getNativePushToStartToken,
 	isNativeLiveActivityBridgeAvailable,
@@ -1308,6 +1309,29 @@ export const clearThreadLiveActivity = async (input: { chatId: string }): Promis
 	await reconcileRenderedState({
 		force: true,
 	});
+};
+
+export const dismissTerminalLiveActivity = async (): Promise<void> => {
+	if (!canUseLiveActivities() || !renderedEntry) {
+		return;
+	}
+
+	if (!isTerminalPhase(renderedEntry.state.phase)) {
+		return;
+	}
+
+	clearEntryFlush();
+	clearHeartbeat();
+	renderedEntry = null;
+	try {
+		await endNativeLiveActivity(null);
+	} catch {
+		// Best-effort dismissal.
+	}
+	trackedChats.clear();
+	nextTrackedChatSequence = 1;
+	sessionWorstOutcome = null;
+	await persistManagerState();
 };
 
 export const onThreadLiveActivityAppStateChanged = async (nextState: AppStateStatus): Promise<void> => {
