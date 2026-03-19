@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { desc, eq } from "drizzle-orm";
 
 import type { DrizzleDatabaseClient } from "../../shared/db/db.client";
-import { chats, projects } from "../../shared/db/db.schema";
+import { projects } from "../../shared/db/db.schema";
 import type { ProjectDTO, WorkspaceSummaryDTO } from "../../types";
 
 export class ProjectRepository {
