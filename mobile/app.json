@@ -31,6 +31,9 @@
           "fetch",
           "processing",
           "remote-notification"
+        ],
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "$(PRODUCT_BUNDLE_IDENTIFIER)"
         ]
       }
     },
