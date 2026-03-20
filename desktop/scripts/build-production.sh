@@ -98,7 +98,7 @@ echo ""
 
 # ── Step 1: Install dependencies ──
 echo "→ Installing dependencies..."
-bun install --frozen-lockfile 2>/dev/null || bun install
+bun install 2>/dev/null || bun install
 
 # ── Step 2: Type check ──
 echo "→ Running type check..."
