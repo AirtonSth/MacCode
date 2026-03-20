@@ -440,6 +440,7 @@ const AppContent = (): JSX.Element => {
 	const workspaceClientIdRef = useRef<string>(resolveWebSocketClientId());
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const pendingSendChatIdsRef = useRef<Set<string>>(new Set());
+	const optimisticUserMessageIdRef = useRef<string | null>(null);
 	const activeChatIdsRef = useRef<Set<string>>(new Set());
 	const previousActiveChatIdsRef = useRef<Set<string>>(new Set());
 	const bootstrapDoneRef = useRef<boolean>(false);
@@ -1980,9 +1981,17 @@ const AppContent = (): JSX.Element => {
 							if (isMessagePayload(messagePayload)) {
 								if (messagePayload.chatId === selectedChatIdRef.current) {
 									if (isViewingLatestMessages(messagePayload.chatId)) {
+										const optimisticId = messagePayload.role === "user" ? optimisticUserMessageIdRef.current : null;
+										if (optimisticId) {
+											optimisticUserMessageIdRef.current = null;
+										}
 										queryClient.setQueryData<MessagePageDTO>(
 											queryKeys.messages(messagePayload.chatId),
-											(current) => appendMessageToMessagePage(current, messagePayload),
+											(current) => {
+												const next = appendMessageToMessagePage(current, messagePayload);
+												if (!optimisticId) return next;
+												return { ...next, messages: next.messages.filter((m) => m.id !== optimisticId) };
+											},
 										);
 									} else {
 										markLatestMessagesDirty(messagePayload.chatId);
@@ -2477,6 +2486,7 @@ const AppContent = (): JSX.Element => {
 				id: crypto.randomUUID(),
 				role: "user",
 			};
+			optimisticUserMessageIdRef.current = nextMessage.id;
 
 			queryClient.setQueryData<MessagePageDTO>(
 				queryKeys.messages(optimisticChatId),

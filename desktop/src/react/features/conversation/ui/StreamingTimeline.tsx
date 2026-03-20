@@ -378,6 +378,18 @@ export const StreamingTimeline = ({
 			{turn.itemOrder
 				.map((itemId) => turn.itemsById[itemId])
 				.filter((item): item is StreamItem => Boolean(item))
+				.filter((item) => {
+					// Hide completed reasoning items with no visible content — they appear as empty "Thinking..." placeholders.
+					if (
+						item.type === "reasoning" &&
+						item.state !== "running" &&
+						item.summary.trim().length === 0 &&
+						item.body.trim().length === 0
+					) {
+						return false;
+					}
+					return true;
+				})
 				.map((item) => (
 					<StreamingTimelineRow
 						focusMode={focusMode}
