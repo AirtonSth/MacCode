@@ -14,6 +14,12 @@ interface ApiMock {
 	route: (route: Route) => Promise<void>;
 }
 
+interface WorkspaceState {
+	id: string;
+	name: string;
+	path: string;
+}
+
 const installMockWebSocket = async (page: Page) => {
 	await page.addInitScript(`
 		(() => {
@@ -309,6 +315,201 @@ const createApiMock = (options: {
 	return { requests, route };
 };
 
+const createMultiWorkspaceApiMock = (options: {
+	chatsByProjectId: Record<string, ChatState[]>;
+	selectedChatId: string | null;
+	selectedProjectId: string;
+	workspaces: WorkspaceState[];
+}): ApiMock => {
+	const requests: Array<{ method: string; path: string }> = [];
+	const chatsByProjectId = Object.fromEntries(
+		Object.entries(options.chatsByProjectId).map(([projectId, chats]) => [projectId, [...chats]]),
+	) as Record<string, ChatState[]>;
+	let selectedChatId = options.selectedChatId;
+	let selectedProjectId = options.selectedProjectId;
+
+	const json = (body: unknown, status = 200) => ({
+		body: JSON.stringify(body),
+		contentType: "application/json",
+		status,
+	});
+
+	const parsePath = (url: URL): string => url.pathname.replace(/\/+$/, "");
+
+	const route = async (intercept: Route): Promise<void> => {
+		const request = intercept.request();
+		const method = request.method().toUpperCase();
+		const url = new URL(request.url());
+		const path = parsePath(url);
+
+		requests.push({ method, path });
+
+		if (method === "GET" && path === "/v1/projects/workspaces") {
+			await intercept.fulfill(
+				json({
+					workspaces: options.workspaces,
+				}),
+			);
+			return;
+		}
+
+		if (method === "GET" && path === "/v1/selection") {
+			await intercept.fulfill(
+				json({
+					permissionMode: "default",
+					selectedChatId,
+					selectedModel: "gpt-5.3-codex",
+					selectedProjectId,
+					selectedReasoningEffort: "medium",
+				}),
+			);
+			return;
+		}
+
+		if (method === "PATCH" && path === "/v1/selection") {
+			const payload = request.postDataJSON() as {
+				selectedChatId?: string | null;
+				selectedProjectId?: string | null;
+			};
+			if (Object.hasOwn(payload, "selectedProjectId") && typeof payload.selectedProjectId === "string") {
+				selectedProjectId = payload.selectedProjectId;
+			}
+			if (Object.hasOwn(payload, "selectedChatId")) {
+				selectedChatId = payload.selectedChatId ?? null;
+			}
+
+			await intercept.fulfill(
+				json({
+					permissionMode: "default",
+					selectedChatId,
+					selectedModel: "gpt-5.3-codex",
+					selectedProjectId,
+					selectedReasoningEffort: "medium",
+				}),
+			);
+			return;
+		}
+
+		const projectThreadsMatch = /^\/v1\/projects\/([^/]+)\/threads$/.exec(path);
+		if (method === "GET" && projectThreadsMatch) {
+			const projectId = projectThreadsMatch[1];
+			const chats = chatsByProjectId[projectId] ?? [];
+			await intercept.fulfill(
+				json({
+					threads: chats.map((chat) => ({
+						id: chat.id,
+						isActive: chat.isActive,
+						title: chat.title,
+						updatedAt: chat.updatedAt,
+					})),
+				}),
+			);
+			return;
+		}
+
+		const chatContextMatch = /^\/v1\/chats\/([^/]+)\/context$/.exec(path);
+		if (method === "GET" && chatContextMatch) {
+			const chatId = chatContextMatch[1];
+			const entry = Object.entries(chatsByProjectId).find(([, chats]) =>
+				chats.some((chat) => chat.id === chatId),
+			);
+			const projectId = entry?.[0] ?? null;
+			const chat = entry?.[1].find((item) => item.id === chatId);
+			const workspace = options.workspaces.find((item) => item.id === projectId);
+
+			if (!chat || !projectId || !workspace) {
+				await intercept.fulfill(json({ error: "chat not found" }, 404));
+				return;
+			}
+
+			await intercept.fulfill(
+				json({
+					chat: {
+						diffAdded: 0,
+						diffRemoved: 0,
+						id: chat.id,
+						isActive: chat.isActive,
+						projectId,
+						provider: "codex",
+						status: chat.status,
+						title: chat.title,
+						updatedAt: chat.updatedAt,
+					},
+					project: workspace,
+				}),
+			);
+			return;
+		}
+
+		const messagesMatch = /^\/v1\/chats\/([^/]+)\/messages$/.exec(path);
+		if (method === "GET" && messagesMatch) {
+			await intercept.fulfill(json({
+				hasMore: false,
+				messages: [],
+				nextBeforeMessageId: null,
+				turns: [],
+			}));
+			return;
+		}
+
+		const streamEventsMatch = /^\/v1\/chats\/([^/]+)\/stream-events$/.exec(path);
+		if (method === "GET" && streamEventsMatch) {
+			await intercept.fulfill(json({ events: [], hasMore: false, nextAfterId: null }));
+			return;
+		}
+
+		const projectGitStatusMatch = /^\/v1\/projects\/([^/]+)\/git\/status$/.exec(path);
+		if (method === "GET" && projectGitStatusMatch) {
+			await intercept.fulfill(
+				json({
+					added: 0,
+					ahead: 0,
+					behind: 0,
+					changedFiles: 0,
+					conflictedFiles: 0,
+					currentBranch: null,
+					isDetachedHead: false,
+					isRepo: false,
+					removed: 0,
+					stagedFiles: 0,
+					unstagedFiles: 0,
+					untrackedFiles: 0,
+				}),
+			);
+			return;
+		}
+
+		const projectGitBranchesMatch = /^\/v1\/projects\/([^/]+)\/git\/branches$/.exec(path);
+		if (method === "GET" && projectGitBranchesMatch) {
+			await intercept.fulfill(json({ branches: [], currentBranch: null }));
+			return;
+		}
+
+		if (method === "GET" && path === "/v1/providers/codex/models") {
+			await intercept.fulfill(
+				json({
+					models: [
+						{
+							defaultReasoningEffort: "medium",
+							displayName: "GPT-5.3 Codex",
+							id: "gpt-5.3-codex",
+							isDefault: true,
+							model: "gpt-5.3-codex",
+							supportedReasoningEfforts: [{ reasoningEffort: "medium" }],
+						},
+					],
+					nextCursor: null,
+				}),
+			);
+			return;
+		}
+
+		await intercept.fulfill(json({ error: "route not mocked" }, 501));
+	};
+
+	return { requests, route };
+};
+
 const getThreadOrderLabels = async (page: Page): Promise<string[]> =>
 	await page.locator('.codex-sidebar [aria-label^="Open "]').evaluateAll((nodes) =>
 		nodes
@@ -402,6 +603,51 @@ test("sending from an older idle thread moves it to top immediately", async ({ p
 	await expect
 		.poll(async () => (await getThreadOrderLabels(page))[0])
 		.toBe("Open Idle Bottom");
+});
+
+test("active thread remains in the active threads footer after switching workspaces", async ({ page }) => {
+	const apiMock = createMultiWorkspaceApiMock({
+		chatsByProjectId: {
+			"project-1": [
+				{
+					id: "chat-active",
+					isActive: true,
+					status: "running",
+					title: "Active Thread",
+					updatedAt: "2026-01-01T00:00:03.000Z",
+				},
+			],
+			"project-2": [
+				{
+					id: "chat-idle",
+					isActive: false,
+					status: "completed",
+					title: "Idle Thread",
+					updatedAt: "2026-01-01T00:00:02.000Z",
+				},
+			],
+		},
+		selectedChatId: "chat-active",
+		selectedProjectId: "project-1",
+		workspaces: [
+			{ id: "project-1", name: "Workspace 1", path: "/tmp/workspace-1" },
+			{ id: "project-2", name: "Workspace 2", path: "/tmp/workspace-2" },
+		],
+	});
+
+	await installMockWebSocket(page);
+	await page.route("**/v1/**", apiMock.route);
+	await page.goto("/");
+
+	const activeThreadsButton = page.getByRole("button", { name: /1 active thread/i });
+	await expect(activeThreadsButton).toBeVisible();
+
+	await page.getByLabel("Select Workspace 2").click();
+	await expect(page.getByLabel("Open Idle Thread")).toBeVisible();
+	await expect(activeThreadsButton).toBeVisible();
+
+	await activeThreadsButton.click();
+	await expect(page.getByRole("button", { name: "Active Thread", exact: true })).toBeVisible();
 });
 
 test("create-and-send from draft creates one chat and does not surface chat-not-found", async ({ page }) => {

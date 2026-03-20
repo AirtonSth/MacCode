@@ -262,6 +262,33 @@ const getThreadStatusTooltip = (chat: Pick<ChatDTO, "hasUnreadFinished" | "isAct
 	return null;
 };
 
+const collectKnownChats = (options: {
+	cachedChatsByProjectId: Record<string, ChatDTO[]>;
+	currentChats: ChatDTO[];
+	selectedProjectId: string | null;
+}): ChatDTO[] => {
+	const chatsById = new Map<string, ChatDTO>();
+
+	for (const chat of options.currentChats) {
+		chatsById.set(chat.id, chat);
+	}
+
+	for (const [projectId, chats] of Object.entries(options.cachedChatsByProjectId)) {
+		if (projectId === options.selectedProjectId) {
+			continue;
+		}
+
+		for (const chat of chats) {
+			const current = chatsById.get(chat.id);
+			if (!current || current.updatedAt < chat.updatedAt) {
+				chatsById.set(chat.id, chat);
+			}
+		}
+	}
+
+	return sortChatsByUpdatedAtDesc([...chatsById.values()]);
+};
+
 const clampSidebarWidth = (width: number): number => {
 	const bounded = Number.isFinite(width) ? width : DEFAULT_SIDEBAR_WIDTH;
 	return Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, Math.round(bounded)));
@@ -473,6 +500,14 @@ const AppContent = (): JSX.Element => {
 		[state.selectedProjectId],
 	);
 	const activeThreadChat = selectedChat ?? draftThreadChat;
+	const knownChats = useMemo(
+		() => collectKnownChats({
+			cachedChatsByProjectId: projectChatsCacheRef.current,
+			currentChats: state.chats,
+			selectedProjectId: state.selectedProjectId,
+		}),
+		[state.chats, state.projects, state.selectedProjectId],
+	);
 
 	const selectedChatId = state.selectedChatId;
 	const messagesQuery = useMessagesQuery(api, selectedChatId, {
@@ -564,8 +599,8 @@ const AppContent = (): JSX.Element => {
 		: false;
 
 	const activeChats = useMemo(
-		() => state.chats.filter((chat) => chat.isActive),
-		[state.chats],
+		() => knownChats.filter((chat) => isChatActive(chat.id)),
+		[isChatActive, knownChats],
 	);
 
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
@@ -771,7 +806,7 @@ const AppContent = (): JSX.Element => {
 
 	useEffect(() => {
 		const nextActiveChatIds = new Set<string>();
-		for (const chat of state.chats) {
+		for (const chat of knownChats) {
 			if (chat.isActive) {
 				nextActiveChatIds.add(chat.id);
 			}
@@ -787,13 +822,13 @@ const AppContent = (): JSX.Element => {
 			}
 		}
 		activeChatIdsRef.current = nextActiveChatIds;
-	}, [state.chats, state.sendingByChat, state.streamingActiveByChat]);
+	}, [knownChats, state.sendingByChat, state.streamingActiveByChat]);
 
 	useEffect(() => {
 		const previousActiveChatIds = previousActiveChatIdsRef.current;
 		const currentActiveChatIds = new Set(activeChatIdsRef.current);
 
-		for (const chat of state.chats) {
+		for (const chat of knownChats) {
 			if (!previousActiveChatIds.has(chat.id) || currentActiveChatIds.has(chat.id)) {
 				continue;
 			}
@@ -805,7 +840,7 @@ const AppContent = (): JSX.Element => {
 		}
 
 		previousActiveChatIdsRef.current = currentActiveChatIds;
-	}, [state.chats, state.sendingByChat, state.streamingActiveByChat]);
+	}, [knownChats, state.sendingByChat, state.streamingActiveByChat]);
 
 	useEffect(() => {
 		if (typeof window === "undefined") {
