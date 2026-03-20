@@ -19,6 +19,7 @@ import { Electroview } from "electrobun/view";
 import { Button } from "../components/ui/button";
 import { ScrollArea } from "../components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
+import { LavaLampBackground } from "../components/ui/lava-lamp-background";
 import { MessageComposer } from "../features/composer/ui/MessageComposer";
 import { ConversationPanel } from "../features/conversation/ui/ConversationPanel";
 import { GitQuickControl } from "../features/git/ui/GitQuickControl";
@@ -3288,7 +3289,7 @@ const AppContent = (): JSX.Element => {
 							transition={{ duration: 0.1, ease: "easeOut" }}
 						>
 						<span className="noise-mask" />
-						{isSidebarResizing ? (
+							{isSidebarResizing ? (
 							<div
 								className="pointer-events-none absolute inset-0 z-20 bg-slate-950/12 backdrop-blur-[1px]"
 								data-testid="sidebar-resize-overlay"
@@ -3305,7 +3306,12 @@ const AppContent = (): JSX.Element => {
 											boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 18px 38px rgba(0, 0, 0, 0.35)",
 										}}
 									>
-									<div className="relative flex items-center justify-between px-1.5 pb-2 pt-1">
+									{!shouldReduceMotion && <LavaLampBackground mode={
+									Object.values(state.streamingActiveByChat).some(Boolean)
+									|| Object.values(state.sendingByChat).some(Boolean)
+										? "active" : "idle"
+								} />}
+									<div className="relative z-[2] flex items-center justify-between px-1.5 pb-2 pt-1">
 										<h2 className="text-[19px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
 										<div className="relative z-10 flex items-center gap-0.5">
 											<Tooltip>
@@ -3347,7 +3353,7 @@ const AppContent = (): JSX.Element => {
 										</div>
 									</div>
 
-									<ScrollArea className="mt-1 min-h-0 flex-1 pr-0.5">
+									<ScrollArea className="relative z-[2] mt-1 min-h-0 flex-1 pr-0.5">
 										<div className="space-y-1 pb-1">
 											{state.projectsLoading ? (
 												<div className="space-y-3 px-2 py-1.5">

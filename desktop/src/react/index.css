@@ -156,6 +156,153 @@
 
 }
 
+/* ── Lava Lamp Background ── */
+
+.lava-lamp-container {
+	position: absolute;
+	inset: 0;
+	z-index: 1;
+	pointer-events: none;
+	overflow: hidden;
+	border-radius: inherit;
+}
+
+/* Hover detected on parent aside, targets the lava container within */
+.codex-sidebar:hover .lava-lamp-container .lava-blob {
+	opacity: calc(var(--blob-opacity) * 1.25);
+}
+
+.lava-blob {
+	position: absolute;
+	left: var(--blob-x);
+	top: var(--blob-y);
+	width: var(--blob-size);
+	aspect-ratio: 1;
+	border-radius: 50%;
+	background: radial-gradient(circle at 40% 40%, var(--blob-color), transparent 70%);
+	filter: blur(var(--blob-blur));
+	opacity: var(--blob-opacity);
+	will-change: transform, opacity;
+	transform: translate3d(-50%, -50%, 0);
+	transition: opacity 1.5s ease;
+}
+
+/* Low FPS: pause animations, reduce blur */
+.lava-lamp-container[data-low-fps] .lava-blob {
+	animation-play-state: paused !important;
+	filter: blur(calc(var(--blob-blur) * 0.5));
+	opacity: calc(var(--blob-opacity) * 0.6);
+}
+
+/* 5 unique blob movement patterns — organic, non-repeating feel */
+
+@keyframes lava-drift-0 {
+	0%, 100% {
+		transform: translate3d(-50%, -50%, 0) scale(1);
+	}
+	15% {
+		transform: translate3d(calc(-50% + 80px), calc(-50% + 100px), 0) scale(1.15);
+	}
+	35% {
+		transform: translate3d(calc(-50% - 60px), calc(-50% + 150px), 0) scale(0.85);
+	}
+	55% {
+		transform: translate3d(calc(-50% + 90px), calc(-50% - 80px), 0) scale(1.2);
+	}
+	75% {
+		transform: translate3d(calc(-50% - 70px), calc(-50% + 60px), 0) scale(0.9);
+	}
+}
+
+@keyframes lava-drift-1 {
+	0%, 100% {
+		transform: translate3d(-50%, -50%, 0) scale(1);
+	}
+	20% {
+		transform: translate3d(calc(-50% - 90px), calc(-50% - 70px), 0) scale(1.18);
+	}
+	40% {
+		transform: translate3d(calc(-50% + 70px), calc(-50% - 120px), 0) scale(0.88);
+	}
+	60% {
+		transform: translate3d(calc(-50% - 50px), calc(-50% + 100px), 0) scale(1.12);
+	}
+	80% {
+		transform: translate3d(calc(-50% + 85px), calc(-50% + 50px), 0) scale(0.92);
+	}
+}
+
+@keyframes lava-drift-2 {
+	0%, 100% {
+		transform: translate3d(-50%, -50%, 0) scale(1);
+	}
+	18% {
+		transform: translate3d(calc(-50% + 60px), calc(-50% - 90px), 0) scale(1.1);
+	}
+	38% {
+		transform: translate3d(calc(-50% - 80px), calc(-50% + 80px), 0) scale(1.2);
+	}
+	58% {
+		transform: translate3d(calc(-50% + 100px), calc(-50% + 120px), 0) scale(0.88);
+	}
+	78% {
+		transform: translate3d(calc(-50% - 50px), calc(-50% - 100px), 0) scale(1.05);
+	}
+}
+
+@keyframes lava-drift-3 {
+	0%, 100% {
+		transform: translate3d(-50%, -50%, 0) scale(1);
+	}
+	22% {
+		transform: translate3d(calc(-50% - 70px), calc(-50% + 90px), 0) scale(0.9);
+	}
+	42% {
+		transform: translate3d(calc(-50% + 80px), calc(-50% - 110px), 0) scale(1.15);
+	}
+	62% {
+		transform: translate3d(calc(-50% - 100px), calc(-50% - 50px), 0) scale(1.05);
+	}
+	82% {
+		transform: translate3d(calc(-50% + 60px), calc(-50% + 100px), 0) scale(0.88);
+	}
+}
+
+@keyframes lava-drift-4 {
+	0%, 100% {
+		transform: translate3d(-50%, -50%, 0) scale(1);
+	}
+	16% {
+		transform: translate3d(calc(-50% + 50px), calc(-50% + 120px), 0) scale(1.12);
+	}
+	36% {
+		transform: translate3d(calc(-50% - 90px), calc(-50% - 80px), 0) scale(0.9);
+	}
+	56% {
+		transform: translate3d(calc(-50% + 110px), calc(-50% + 40px), 0) scale(1.18);
+	}
+	76% {
+		transform: translate3d(calc(-50% - 60px), calc(-50% - 110px), 0) scale(0.95);
+	}
+}
+
+/* Combined drift + hue shift per blob variant */
+.lava-blob-v0 { animation: lava-drift-0 var(--blob-duration) cubic-bezier(0.4, 0, 0.6, 1) var(--blob-delay) infinite,   lava-hue-shift-warm 8s ease-in-out infinite; }
+.lava-blob-v1 { animation: lava-drift-1 var(--blob-duration) cubic-bezier(0.35, 0, 0.65, 1) var(--blob-delay) infinite, lava-hue-shift-cool 7s ease-in-out -1s infinite; }
+.lava-blob-v2 { animation: lava-drift-2 var(--blob-duration) cubic-bezier(0.45, 0, 0.55, 1) var(--blob-delay) infinite, lava-hue-shift-warm 9s ease-in-out -2s infinite; }
+.lava-blob-v3 { animation: lava-drift-3 var(--blob-duration) cubic-bezier(0.38, 0, 0.62, 1) var(--blob-delay) infinite, lava-hue-shift-cool 6s ease-in-out -0.5s infinite; }
+.lava-blob-v4 { animation: lava-drift-4 var(--blob-duration) cubic-bezier(0.42, 0, 0.58, 1) var(--blob-delay) infinite, lava-hue-shift-warm 7s ease-in-out -1.5s infinite; }
+
+@keyframes lava-hue-shift-warm {
+	0%, 100% { filter: blur(var(--blob-blur)) hue-rotate(0deg); }
+	50% { filter: blur(var(--blob-blur)) hue-rotate(30deg); }
+}
+
+@keyframes lava-hue-shift-cool {
+	0%, 100% { filter: blur(var(--blob-blur)) hue-rotate(0deg); }
+	50% { filter: blur(var(--blob-blur)) hue-rotate(-25deg); }
+}
+
 @keyframes loading-shimmer {
 	0% {
 		background-position: 140% 0;
@@ -180,5 +327,9 @@
 		color: inherit !important;
 		background: none !important;
 		-webkit-text-fill-color: currentColor;
+	}
+
+	.lava-blob {
+		animation: none !important;
 	}
 }
