@@ -435,14 +435,15 @@ export const MessageComposer = ({
 							<select
 									aria-label="Model"
 									className={cn(subtleSelectClass, "min-w-[180px]")}
-								disabled={isInputLocked || showModelsLoadingState || availableModels.length === 0}
+								disabled={isInputLocked || modelsLoading || availableModels.length === 0}
 									id={modelSelectId}
 									onChange={(event) => {
 										onModelChange(event.target.value);
 									}}
-									value={selectedModel ?? availableModels[0]?.model ?? ""}
+									value={selectedModel ?? ""}
 								>
-									{showModelsLoadingState ? <option value="">Loading models...</option> : null}
+									{modelsLoading ? <option value="">Loading models...</option> : null}
+									{!modelsLoading && selectedModel === null ? <option value="">Select model</option> : null}
 									{!showModelsLoadingState && availableModels.length === 0 ? <option value="">No models</option> : null}
 									{availableModels.map((model) => (
 										<option key={model.id} value={model.model}>

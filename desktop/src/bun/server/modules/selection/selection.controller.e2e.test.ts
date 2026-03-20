@@ -1,11 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { expect, test } from "bun:test";
 
 import { createBackendServer } from "../../app";
 import { createEdenClient } from "../../eden-client";
+import { DatabaseClientFactory } from "../../shared/db/db.client";
+import { messages } from "../../shared/db/db.schema";
 
 const toPort = (server: unknown): number => {
 	if (!server || typeof server !== "object") {
@@ -152,6 +155,120 @@ test("PATCH /v1/selection rejects provider changes for an existing thread", asyn
 
 		expect(invalid.status).toBe(400);
 		expect(errorPayload?.error).toBe("cannot change provider after thread creation");
+	} finally {
+		if (server) {
+			await server.app.stop(true);
+			server.db.close();
+		}
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("PATCH /v1/selection rejects provider changes for codex threads once content exists", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-selection-codex-provider-lock-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	let server:
+		| Awaited<ReturnType<typeof createBackendServer>>
+		| undefined;
+	let databaseClient:
+		| Awaited<ReturnType<typeof DatabaseClientFactory.create>>
+		| undefined;
+
+	try {
+		server = await createBackendServer({ databasePath, port: 0 });
+		databaseClient = await DatabaseClientFactory.create(databasePath);
+		const client = createEdenClient({ baseUrl: `http://127.0.0.1:${toPort(server.server)}` });
+
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+		const chat = await client.v1.projects({ id: projectId }).chats.post({
+			provider: "codex",
+			title: "Existing codex thread",
+		});
+		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+
+		await databaseClient.orm.insert(messages).values({
+			chatId,
+			content: "hello world",
+			createdAt: new Date().toISOString(),
+			id: randomUUID(),
+			role: "user",
+		});
+
+		const invalid = await client.v1.selection.patch({
+			selectedChatId: chatId,
+			selectedProjectId: projectId,
+			selectedProvider: "claude",
+		});
+		const errorPayload =
+			invalid.error && "value" in invalid.error ? (invalid.error as { value: { error?: string } }).value : undefined;
+
+		expect(invalid.status).toBe(400);
+		expect(errorPayload?.error).toBe("cannot change provider after thread creation");
+	} finally {
+		if (databaseClient) {
+			databaseClient.close();
+		}
+		if (server) {
+			await server.app.stop(true);
+			server.db.close();
+		}
+		rmSync(root, { force: true, recursive: true });
+	}
+});
+
+test("PATCH /v1/selection clears stale model and reasoning when provider changes", async () => {
+	const root = mkdtempSync(join(tmpdir(), "remotecode-selection-provider-model-reset-"));
+	const databasePath = join(root, "remodecode.sqlite");
+	let server:
+		| Awaited<ReturnType<typeof createBackendServer>>
+		| undefined;
+
+	try {
+		server = await createBackendServer({ databasePath, port: 0 });
+		const client = createEdenClient({ baseUrl: `http://127.0.0.1:${toPort(server.server)}` });
+
+		const project = await client.v1.projects.post({ path: "/tmp" });
+		const projectId = (project.data as { project: { id: string } }).project.id;
+
+		const initial = await client.v1.selection.patch({
+			selectedChatId: null,
+			selectedProjectId: projectId,
+			selectedModel: "gpt-5.3-codex",
+			selectedProvider: "codex",
+			selectedReasoningEffort: "high",
+		});
+		const initialSelection = initial.data as {
+			selectedChatId: string | null;
+			selectedModel: string | null;
+			selectedProjectId: string | null;
+			selectedProvider: string | null;
+			selectedReasoningEffort: string | null;
+		};
+
+		expect(initial.status).toBe(200);
+		expect(initialSelection.selectedProvider).toBe("codex");
+		expect(initialSelection.selectedModel).toBe("gpt-5.3-codex");
+		expect(initialSelection.selectedReasoningEffort).toBe("high");
+
+		const updated = await client.v1.selection.patch({
+			selectedChatId: null,
+			selectedProjectId: projectId,
+			selectedProvider: "claude",
+		});
+		const updatedSelection = updated.data as {
+			selectedChatId: string | null;
+			selectedModel: string | null;
+			selectedProjectId: string | null;
+			selectedProvider: string | null;
+			selectedReasoningEffort: string | null;
+		};
+
+		expect(updated.status).toBe(200);
+		expect(updatedSelection.selectedProjectId).toBe(projectId);
+		expect(updatedSelection.selectedProvider).toBe("claude");
+		expect(updatedSelection.selectedModel).toBeNull();
+		expect(updatedSelection.selectedReasoningEffort).toBeNull();
 	} finally {
 		if (server) {
 			await server.app.stop(true);

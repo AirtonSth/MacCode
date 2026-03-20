@@ -37,6 +37,7 @@ test("RemoteCodeApi returns workspace selection from GET /v1/selection", async (
 					selectedProjectId: "project-1",
 					permissionMode: "plan",
 					selectedModel: "gpt-5.3-codex",
+					selectedProvider: "codex",
 					selectedReasoningEffort: "high",
 				},
 			});
@@ -56,6 +57,7 @@ test("RemoteCodeApi returns workspace selection from GET /v1/selection", async (
 				selectedProjectId: "project-1",
 				permissionMode: "plan",
 				selectedModel: "gpt-5.3-codex",
+				selectedProvider: "codex",
 				selectedReasoningEffort: "high",
 			});
 	} finally {
@@ -279,6 +281,7 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 					selectedProjectId: "project-2",
 					permissionMode: "full",
 					selectedModel: "gpt-5.3-codex-spark",
+					selectedProvider: "claude",
 					selectedReasoningEffort: "xhigh",
 				},
 			});
@@ -294,6 +297,7 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 				selectedProjectId: "project-2",
 				permissionMode: "full",
 				selectedModel: "gpt-5.3-codex-spark",
+				selectedProvider: "claude",
 				selectedReasoningEffort: "xhigh",
 			});
 
@@ -304,6 +308,7 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 					selectedProjectId: "project-2",
 					permissionMode: "full",
 					selectedModel: "gpt-5.3-codex-spark",
+					selectedProvider: "claude",
 					selectedReasoningEffort: "xhigh",
 				}),
 			);
@@ -312,6 +317,7 @@ test("RemoteCodeApi persists workspace selection with PATCH /v1/selection", asyn
 				selectedProjectId: "project-2",
 				permissionMode: "full",
 				selectedModel: "gpt-5.3-codex-spark",
+				selectedProvider: "claude",
 				selectedReasoningEffort: "xhigh",
 			});
 	} finally {

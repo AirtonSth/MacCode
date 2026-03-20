@@ -324,7 +324,7 @@ export const ServerBootstrap = {
 					.use(MessageController.build(messageService))
 					.use(GitController.build(gitService, workspaceEventsService))
 					.use(ProviderController.build(codexModelsService, claudeModelsService))
-					.use(SelectionController.build(workspaceSelectionService, chatService, workspaceEventsService))
+					.use(SelectionController.build(workspaceSelectionService, chatService, messageService, workspaceEventsService))
 					.use(PrivateAccountController.build(privateAccountService))
 					.use(TerminalController.build(terminalService, workspaceEventsService))
 					.use(FsController.build(fsService)),

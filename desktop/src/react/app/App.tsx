@@ -75,7 +75,7 @@ import {
 	type ConnectionState,
 	type ServerWsEvent,
 } from "../shared/realtime/remotecode-ws";
-import { fetchModelsForProvider, shouldLockProviderSelection } from "./provider-change";
+import { listModelsForProvider, shouldLockProviderSelection } from "./provider-change";
 
 const FALLBACK_TIMESTAMP = "1970-01-01T00:00:00.000Z";
 const createDesktopQueryClient = (): QueryClient => new QueryClient({
@@ -781,15 +781,11 @@ const AppContent = (): JSX.Element => {
 		}
 
 		setSelectedProvider(selectedChatProvider);
+		setSelectedModel(null);
+		setSelectedReasoningEffort(null);
 		if (typeof window !== "undefined") {
 			window.localStorage.setItem(PROVIDER_STORAGE_KEY, selectedChatProvider);
 		}
-		void fetchModelsForProvider(selectedChatProvider, api, {
-			setAvailableModels,
-			setHasLoadedCodexModels,
-			setSelectedModel,
-			setSelectedReasoningEffort,
-		});
 	}, [api, isProviderSelectionLocked, selectedChatId, selectedChatProvider, selectedProvider]);
 
 	useEffect(() => {
@@ -887,6 +883,18 @@ const AppContent = (): JSX.Element => {
 			// Ignore storage failures in restricted environments
 		}
 	}, [selectedReasoningEffort]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		try {
+			window.localStorage.setItem(PROVIDER_STORAGE_KEY, selectedProvider);
+		} catch {
+			// Ignore storage failures in restricted environments
+		}
+	}, [selectedProvider]);
 
 	useEffect(() => {
 		if (!hasLoadedCodexModels || availableModels.length === 0) {
@@ -1041,6 +1049,41 @@ const AppContent = (): JSX.Element => {
 		return error instanceof Error ? error.message : fallback;
 	}, []);
 
+	useEffect(() => {
+		let cancelled = false;
+
+		setHasLoadedCodexModels(false);
+		void (async () => {
+			try {
+				const catalog = await listModelsForProvider(selectedProvider, api);
+				if (cancelled) {
+					return;
+				}
+
+				setAvailableModels(catalog.models);
+				clearRestErrors();
+			} catch (error) {
+				if (cancelled) {
+					return;
+				}
+
+				addError(
+					formatApiErrorMessage(error, "Unable to load models"),
+					"rest",
+					formatApiErrorCode(error),
+				);
+			} finally {
+				if (!cancelled) {
+					setHasLoadedCodexModels(true);
+				}
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+		};
+	}, [addError, api, clearRestErrors, formatApiErrorCode, formatApiErrorMessage, selectedProvider]);
+
 	const {
 		state: projectGitState,
 		checkoutBranch,
@@ -1088,6 +1131,7 @@ const AppContent = (): JSX.Element => {
 			overrides?: {
 				permissionMode?: CodexPermissionMode;
 				selectedModel?: string | null;
+				selectedProvider?: SelectedProvider | null;
 				selectedReasoningEffort?: CodexReasoningEffort | null;
 			},
 		) => {
@@ -1097,6 +1141,7 @@ const AppContent = (): JSX.Element => {
 						selectedProjectId,
 						permissionMode: overrides?.permissionMode ?? permissionModeRef.current,
 						selectedModel: overrides?.selectedModel ?? selectedModelRef.current,
+						selectedProvider: overrides?.selectedProvider ?? selectedProviderRef.current,
 						selectedReasoningEffort:
 							overrides?.selectedReasoningEffort ?? selectedReasoningEffortRef.current,
 					});
@@ -1546,11 +1591,12 @@ const AppContent = (): JSX.Element => {
 					api.listWorkspaceSummaries().then((workspaces) =>
 						workspaces.map(toProjectDtoFromWorkspaceSummary),
 					),
-					api.getWorkspaceSelection().catch(() => ({
-						selectedChatId: null,
-						selectedProjectId: null,
+				api.getWorkspaceSelection().catch(() => ({
+					selectedChatId: null,
+					selectedProjectId: null,
 					permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
 					selectedModel: null,
+					selectedProvider: null,
 					selectedReasoningEffort: null,
 				})),
 			]);
@@ -1565,6 +1611,8 @@ const AppContent = (): JSX.Element => {
 				typeof selection.selectedModel === "string" && selection.selectedModel.trim().length > 0
 					? selection.selectedModel.trim()
 					: null;
+			const nextSelectedProvider =
+				isValidProvider(selection.selectedProvider) ? selection.selectedProvider : selectedProviderRef.current;
 			const nextSelectedReasoningEffort =
 				parseCodexReasoningEffort(selection.selectedReasoningEffort) ?? null;
 
@@ -1573,6 +1621,7 @@ const AppContent = (): JSX.Element => {
 			dispatch({ payload: selectedProjectId, type: "SET_SELECTED_PROJECT" });
 			setPermissionMode(nextPermissionMode);
 			setSelectedModel(nextSelectedModel);
+			setSelectedProvider(nextSelectedProvider);
 			setSelectedReasoningEffort(nextSelectedReasoningEffort);
 			clearRestErrors();
 
@@ -1581,11 +1630,13 @@ const AppContent = (): JSX.Element => {
 				selection.selectedChatId !== selectedChatId ||
 				selection.permissionMode !== nextPermissionMode ||
 				(selection.selectedModel ?? null) !== nextSelectedModel ||
+				(selection.selectedProvider ?? null) !== nextSelectedProvider ||
 				(selection.selectedReasoningEffort ?? null) !== nextSelectedReasoningEffort
 			) {
 				await persistWorkspaceSelection(selectedProjectId, selectedChatId, {
 					permissionMode: nextPermissionMode,
 					selectedModel: nextSelectedModel,
+					selectedProvider: nextSelectedProvider,
 					selectedReasoningEffort: nextSelectedReasoningEffort,
 				});
 			}
@@ -1658,25 +1709,6 @@ const AppContent = (): JSX.Element => {
 		},
 		[loadProjects, refreshProjectThreadCache],
 	);
-
-	const loadCodexModels = useCallback(async () => {
-		try {
-			const provider = selectedProviderRef.current;
-			const catalog = provider === "claude"
-				? await api.listClaudeModels()
-				: await api.listCodexModels();
-			setAvailableModels(catalog.models);
-			clearRestErrors();
-		} catch (error) {
-			addError(
-				formatApiErrorMessage(error, "Unable to load models"),
-				"rest",
-				formatApiErrorCode(error),
-			);
-		} finally {
-			setHasLoadedCodexModels(true);
-		}
-	}, [addError, api, clearRestErrors, formatApiErrorCode, formatApiErrorMessage]);
 
 	const handleWsEventImpl = useCallback(
 		async (event: ServerWsEvent) => {
@@ -2058,6 +2090,7 @@ const AppContent = (): JSX.Element => {
 					selectedProjectId: null,
 					permissionMode: DEFAULT_CODEX_PERMISSION_MODE,
 					selectedModel: null,
+					selectedProvider: null,
 					selectedReasoningEffort: null,
 				})),
 			]);
@@ -2075,6 +2108,8 @@ const AppContent = (): JSX.Element => {
 				typeof selection.selectedModel === "string" && selection.selectedModel.trim().length > 0
 					? selection.selectedModel.trim()
 					: null;
+			const nextSelectedProvider =
+				isValidProvider(selection.selectedProvider) ? selection.selectedProvider : selectedProviderRef.current;
 			const nextSelectedReasoningEffort =
 				parseCodexReasoningEffort(selection.selectedReasoningEffort) ?? null;
 
@@ -2117,6 +2152,7 @@ const AppContent = (): JSX.Element => {
 
 			setPermissionMode(nextPermissionMode);
 			setSelectedModel(nextSelectedModel);
+			setSelectedProvider(nextSelectedProvider);
 			setSelectedReasoningEffort(nextSelectedReasoningEffort);
 			clearRestErrors();
 
@@ -2125,11 +2161,13 @@ const AppContent = (): JSX.Element => {
 				selection.selectedChatId !== selectedChatId ||
 				selection.permissionMode !== nextPermissionMode ||
 				(selection.selectedModel ?? null) !== nextSelectedModel ||
+				(selection.selectedProvider ?? null) !== nextSelectedProvider ||
 				(selection.selectedReasoningEffort ?? null) !== nextSelectedReasoningEffort
 			) {
 				await persistWorkspaceSelection(selectedProjectId, selectedChatId, {
 					permissionMode: nextPermissionMode,
 					selectedModel: nextSelectedModel,
+					selectedProvider: nextSelectedProvider,
 					selectedReasoningEffort: nextSelectedReasoningEffort,
 				});
 			}
@@ -2158,8 +2196,8 @@ const AppContent = (): JSX.Element => {
 	]);
 
 	useEffect(() => {
-		void Promise.all([handleBootstrap(), loadCodexModels()]);
-	}, [handleBootstrap, loadCodexModels]);
+		void handleBootstrap();
+	}, [handleBootstrap]);
 
 	useEffect(() => {
 		if (!bootstrapDoneRef.current) {
@@ -2655,6 +2693,7 @@ const AppContent = (): JSX.Element => {
 		(overrides: {
 			permissionMode?: CodexPermissionMode;
 			selectedModel?: string | null;
+			selectedProvider?: SelectedProvider | null;
 			selectedReasoningEffort?: CodexReasoningEffort | null;
 		}) => {
 			const selectedProjectId = selectedProjectIdRef.current;
@@ -2712,18 +2751,19 @@ const AppContent = (): JSX.Element => {
 			}
 
 			setSelectedProvider(provider);
+			setSelectedModel(null);
+			setSelectedReasoningEffort(null);
 			if (typeof window !== "undefined") {
 				window.localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
 			}
-			// Keep previous provider's models visible until new ones load (D-14).
-			void fetchModelsForProvider(provider, api, {
-				setAvailableModels,
-				setHasLoadedCodexModels,
-				setSelectedModel,
-				setSelectedReasoningEffort,
+			setHasLoadedCodexModels(false);
+			persistCurrentSelectionPreferences({
+				selectedModel: null,
+				selectedProvider: provider,
+				selectedReasoningEffort: null,
 			});
 		},
-		[api, isProviderSelectionLocked],
+		[isProviderSelectionLocked, persistCurrentSelectionPreferences],
 	);
 
 	const handleSetStreamItemExpanded = useCallback(

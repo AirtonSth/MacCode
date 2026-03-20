@@ -268,7 +268,7 @@ ensure_threads_screen() {
 			return 0
 		fi
 
-		if exists "screen-chat" || exists "screen-active-threads"; then
+		if exists "screen-chat" || exists "screen-recent-threads"; then
 			tap_nav_back_if_present
 			pause_ms 1000
 			continue

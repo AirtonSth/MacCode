@@ -22,6 +22,15 @@ export interface ProviderSelectionLockState {
 	hasStreamingTurn: boolean;
 }
 
+export const listModelsForProvider = async (
+	provider: SelectedProvider,
+	api: ProviderChangeApi,
+): Promise<CodexModelsCatalog> => {
+	return provider === "claude"
+		? await api.listClaudeModels()
+		: await api.listCodexModels();
+};
+
 /**
  * Fetches models for a provider and updates state only once the fetch resolves.
  * Previous provider's models stay visible until new ones arrive (D-14).
@@ -33,9 +42,7 @@ export const fetchModelsForProvider = async (
 ): Promise<void> => {
 	callbacks.setHasLoadedCodexModels(false);
 	try {
-		const catalog = provider === "claude"
-			? await api.listClaudeModels()
-			: await api.listCodexModels();
+		const catalog = await listModelsForProvider(provider, api);
 		callbacks.setAvailableModels(catalog.models);
 		const defaultModel = catalog.models.find((m) => m.isDefault) ?? catalog.models[0];
 		if (defaultModel) {

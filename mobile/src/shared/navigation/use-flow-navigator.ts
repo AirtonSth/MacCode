@@ -1,7 +1,7 @@
 import { type Href, usePathname, useRouter } from "expo-router";
 import { useCallback, useEffect, useRef } from "react";
 
-export type AppFlowRoute = "/workspaces" | "/threads" | "/active-threads" | "/recent-threads" | "/chat" | "/settings";
+export type AppFlowRoute = "/workspaces" | "/threads" | "/recent-threads" | "/chat" | "/settings";
 export type AppFlowTarget =
 	| AppFlowRoute
 	| {

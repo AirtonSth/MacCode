@@ -1,5 +1,5 @@
-import { ActiveThreadsScreen } from "../src/features/threads/ui/active-threads-screen";
+import { Redirect } from "expo-router";
 
 export default function ActiveThreadsRoute() {
-	return <ActiveThreadsScreen />;
+	return <Redirect href="/recent-threads" />;
 }

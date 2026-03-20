@@ -736,12 +736,22 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		},
 		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
 	);
+	const selectedChatTitle = useMemo(
+		() => {
+			const chatFromContext = scope === "chat" ? chatContextQuery.data?.chat ?? null : null;
+			const chatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
+			const title = (chatFromContext ?? chatFromList)?.title;
+			return typeof title === "string" ? title : null;
+		},
+		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
+	);
 	const isProviderLocked = useMemo(
 		() => shouldLockProviderSelection({
 			hasStreamingText: selectedChatId ? (streamingTextByChat[selectedChatId] ?? "").trim().length > 0 : false,
 			hasStreamingTurn: streamTurnQuery.data !== null,
 			messageCount: messagesQuery.page.messages.length,
 			providerThreadId: selectedChatProviderThreadId,
+			threadTitle: selectedChatTitle,
 			turnCount: messagesQuery.page.turns.length,
 		}),
 		[
@@ -749,6 +759,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			messagesQuery.page.turns.length,
 			selectedChatId,
 			selectedChatProviderThreadId,
+			selectedChatTitle,
 			streamTurnQuery.data,
 			streamingTextByChat,
 		],

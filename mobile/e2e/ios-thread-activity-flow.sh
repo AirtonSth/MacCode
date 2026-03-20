@@ -323,7 +323,7 @@ ensure_threads_screen() {
 			continue
 		fi
 
-		if exists "screen-active-threads"; then
+		if exists "screen-recent-threads"; then
 			tap_nav_back_if_present
 			pause_ms 1000
 			continue

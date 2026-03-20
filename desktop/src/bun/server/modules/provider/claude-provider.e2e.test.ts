@@ -136,13 +136,10 @@ describe("Claude Provider E2E", () => {
 		const projectRes = await post("/projects", { path: mkdtempSync(join(tmpdir(), "remotecode-sel-prov-")) });
 		const project = ((await projectRes.json()) as { project: { id: string } }).project;
 
-		const chatRes = await post(`/projects/${project.id}/chats`, { title: "t" });
-		const chat = ((await chatRes.json()) as { chat: { id: string } }).chat;
-
 		const patchRes = await fetch(`${baseUrl}/v1/selection`, {
 			body: JSON.stringify({
 				selectedProjectId: project.id,
-				selectedChatId: chat.id,
+				selectedChatId: null,
 				selectedProvider: "claude",
 			}),
 			headers: createAuthHeaders(),

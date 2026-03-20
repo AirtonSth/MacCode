@@ -42,6 +42,7 @@ import { WorkspaceRenameModal } from "../../workspaces/ui/workspace-rename-modal
 import { ActiveThreadsBanner } from "./active-threads-banner";
 import { AUTO_SCROLL_BOTTOM_THRESHOLD } from "./auto-scroll-constants";
 import { GitCommitModalMemo } from "./git-commit-modal-memo";
+import { resolveMessageAutoScroll, shouldScrollOnMessageContentSizeChange } from "./message-auto-scroll";
 import { SelectPickerModal } from "./select-picker-modal";
 import { TerminalOverlay } from "./terminal-overlay";
 
@@ -236,6 +237,8 @@ export const ChatScreen = () => {
 	const queryClient = useQueryClient();
 	const messageScrollRef = useRef<ScrollView | null>(null);
 	const previousLastMessageIdRef = useRef<string | null>(null);
+	const shouldPinMessagesToBottomRef = useRef(false);
+	const shouldScrollMessagesToEndRef = useRef(false);
 	const lastScrollOffsetYRef = useRef<number>(0);
 	const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 	const terminalScrollRef = useRef<ScrollView | null>(null);
@@ -502,22 +505,24 @@ export const ChatScreen = () => {
 	}, [activeModel, availableReasoningEfforts, selectedReasoningEffort, setSelectedReasoningEffort]);
 
 	useEffect(() => {
-		if (isViewingOlderMessages) {
-			previousLastMessageIdRef.current = messages.at(-1)?.id ?? null;
-			return;
-		}
-
 		const nextLastMessageId = messages.at(-1)?.id ?? null;
-		const previousLastMessageId = previousLastMessageIdRef.current;
-		const hasNewTailMessage = nextLastMessageId !== null && nextLastMessageId !== previousLastMessageId;
-		const hasStreaming = hasStreamingText || Boolean(streamingTurn);
+		const autoScroll = resolveMessageAutoScroll({
+			hasStreamingTurn: Boolean(streamingTurn),
+			isViewingOlderMessages,
+			nextLastMessageId,
+			previousLastMessageId: previousLastMessageIdRef.current,
+			streamingText,
+			userScrolledUp: userScrolledUpRef.current,
+		});
+		shouldPinMessagesToBottomRef.current = autoScroll.shouldPinToBottom;
+		shouldScrollMessagesToEndRef.current = autoScroll.shouldRequestScroll;
 
-		if ((hasNewTailMessage || hasStreaming) && !userScrolledUpRef.current) {
+		if (autoScroll.shouldRequestScroll) {
 			messageScrollRef.current?.scrollToEnd({ animated: true });
 		}
 
-		previousLastMessageIdRef.current = nextLastMessageId;
-	}, [hasStreamingText, isViewingOlderMessages, messages, streamingTurn]);
+		previousLastMessageIdRef.current = autoScroll.nextLastMessageId;
+	}, [isViewingOlderMessages, messages, streamingText, streamingTurn]);
 
 	useEffect(() => {
 		setShowRunDetails(false);
@@ -525,6 +530,11 @@ export const ChatScreen = () => {
 
 	useEffect(() => {
 		previousLastMessageIdRef.current = null;
+		shouldPinMessagesToBottomRef.current = false;
+		shouldScrollMessagesToEndRef.current = false;
+		lastScrollOffsetYRef.current = 0;
+		userScrolledUpRef.current = false;
+		setShowScrollToBottom(false);
 	}, [selectedChatId]);
 
 	useEffect(() => {
@@ -701,6 +711,21 @@ export const ChatScreen = () => {
 
 	const userScrolledUpRef = useRef(false);
 
+	const handleMessageContentSizeChange = useCallback(() => {
+		const shouldScroll = shouldScrollOnMessageContentSizeChange({
+			hasPendingScroll: shouldScrollMessagesToEndRef.current,
+			isViewingOlderMessages,
+			shouldPinToBottom: shouldPinMessagesToBottomRef.current,
+			userScrolledUp: userScrolledUpRef.current,
+		});
+		if (!shouldScroll) {
+			return;
+		}
+
+		shouldScrollMessagesToEndRef.current = false;
+		messageScrollRef.current?.scrollToEnd({ animated: true });
+	}, [isViewingOlderMessages]);
+
 	const handleMessageScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
 		const threshold = 32;
 		if (hasOlderMessages && !isLoadingOlderMessages && event.nativeEvent.contentOffset.y <= threshold) {
@@ -723,17 +748,28 @@ export const ChatScreen = () => {
 
 		if (scrolledUp && !atBottom) {
 			userScrolledUpRef.current = true;
+			shouldPinMessagesToBottomRef.current = false;
+			shouldScrollMessagesToEndRef.current = false;
 			setShowScrollToBottom(true);
 		}
 		if (atBottom) {
 			userScrolledUpRef.current = false;
+			shouldPinMessagesToBottomRef.current = hasStreamingText || Boolean(streamingTurn);
 			setShowScrollToBottom(false);
 		}
 
 		if (isViewingOlderMessages && distanceFromBottom <= threshold) {
 			void loadLatestMessages();
 		}
-	}, [hasOlderMessages, isLoadingOlderMessages, isViewingOlderMessages, loadLatestMessages, loadOlderMessages]);
+	}, [
+		hasOlderMessages,
+		hasStreamingText,
+		isLoadingOlderMessages,
+		isViewingOlderMessages,
+		loadLatestMessages,
+		loadOlderMessages,
+		streamingTurn,
+	]);
 
 	const shouldRedirectAway = isConfigLoaded && isLoaded && !serverHealthQuery.isPending && (
 		serverHealthQuery.isError ||
@@ -1537,22 +1573,28 @@ export const ChatScreen = () => {
 			/>
 
 			<View style={styles.body}>
-				<ActiveThreadsBanner count={otherActiveThreadsCount} onPress={() => { push("/active-threads"); }} />
-					<ScrollView
-						contentContainerStyle={styles.messagesContent}
-						contentInsetAdjustmentBehavior="automatic"
-						maintainVisibleContentPosition={isViewingOlderMessages ? undefined : { minIndexForVisible: 0 }}
-						onScroll={handleMessageScroll}
-						ref={messageScrollRef}
-						scrollEventThrottle={16}
-						showsVerticalScrollIndicator={false}
-						style={styles.messages}
-						testID="chat-message-list"
-					>
-						<View testID="chat-message-window-mode">
-							<Text style={styles.visuallyHidden}>{isViewingOlderMessages ? "older" : "latest"}</Text>
-						</View>
-						{shouldShowMessagesLoading ? (
+				<ActiveThreadsBanner
+					count={otherActiveThreadsCount}
+					onPress={() => {
+						push("/recent-threads");
+					}}
+				/>
+				<ScrollView
+					contentContainerStyle={styles.messagesContent}
+					contentInsetAdjustmentBehavior="automatic"
+					maintainVisibleContentPosition={isViewingOlderMessages ? undefined : { minIndexForVisible: 0 }}
+					onContentSizeChange={handleMessageContentSizeChange}
+					onScroll={handleMessageScroll}
+					ref={messageScrollRef}
+					scrollEventThrottle={16}
+					showsVerticalScrollIndicator={false}
+					style={styles.messages}
+					testID="chat-message-list"
+				>
+					<View testID="chat-message-window-mode">
+						<Text style={styles.visuallyHidden}>{isViewingOlderMessages ? "older" : "latest"}</Text>
+					</View>
+					{shouldShowMessagesLoading ? (
 							<View style={styles.messagesLoading} testID="chat-messages-loading">
 								<ActivityIndicator color={palette.accent} size="small" />
 								<Text style={styles.messagesLoadingLabel}>

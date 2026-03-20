@@ -127,6 +127,7 @@ export interface WorkspaceSelection {
 	selectedChatId: string | null;
 	permissionMode: CodexPermissionMode;
 	selectedModel: string | null;
+	selectedProvider: "codex" | "claude" | null;
 	selectedReasoningEffort: CodexReasoningEffort | null;
 }
 
@@ -314,6 +315,7 @@ interface RestWorkspaceSelectionResponse {
 	selectedChatId: string | null;
 	permissionMode: CodexPermissionMode;
 	selectedModel: string | null;
+	selectedProvider: "codex" | "claude" | null;
 	selectedReasoningEffort: CodexReasoningEffort | null;
 }
 
@@ -637,17 +639,18 @@ export const RemoteCodeApi = {
 				});
 			},
 
-				updateWorkspaceSelection: async (
-					input: {
-						selectedProjectId: string | null;
-						selectedChatId: string | null;
-						permissionMode?: CodexPermissionMode;
-						selectedModel?: string | null;
-						selectedReasoningEffort?: CodexReasoningEffort | null;
-					},
-				): Promise<WorkspaceSelection> => {
-					const payload = await request<RestWorkspaceSelectionResponse>({
-						body: input,
+			updateWorkspaceSelection: async (
+				input: {
+					selectedProjectId: string | null;
+					selectedChatId: string | null;
+					permissionMode?: CodexPermissionMode;
+					selectedModel?: string | null;
+					selectedProvider?: "codex" | "claude" | null;
+					selectedReasoningEffort?: CodexReasoningEffort | null;
+				},
+			): Promise<WorkspaceSelection> => {
+				const payload = await request<RestWorkspaceSelectionResponse>({
+					body: input,
 					method: "PATCH",
 					path: "/selection",
 				});

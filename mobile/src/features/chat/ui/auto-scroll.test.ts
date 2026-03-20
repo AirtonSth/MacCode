@@ -2,6 +2,10 @@
 import { describe, expect, it } from "bun:test";
 
 import { AUTO_SCROLL_BOTTOM_THRESHOLD } from "./auto-scroll-constants";
+import {
+	resolveMessageAutoScroll,
+	shouldScrollOnMessageContentSizeChange,
+} from "./message-auto-scroll";
 
 /**
  * Pure-logic tests for the userScrolledUp flag auto-scroll behaviour
@@ -41,24 +45,6 @@ const shouldClearFlag = (
 	offsetY: number,
 	layoutHeight: number,
 ): boolean => computeDistanceFromBottom(contentHeight, offsetY, layoutHeight) <= AUTO_SCROLL_BOTTOM_THRESHOLD;
-
-/** Mirrors the auto-scroll guard: scroll only when the flag is false. */
-const shouldAutoScroll = (input: {
-	hasNewTailMessage: boolean;
-	hasStreaming: boolean;
-	isViewingOlderMessages: boolean;
-	userScrolledUp: boolean;
-}): boolean => {
-	if (input.isViewingOlderMessages) {
-		return false;
-	}
-
-	if (!input.hasNewTailMessage && !input.hasStreaming) {
-		return false;
-	}
-
-	return !input.userScrolledUp;
-};
 
 describe("AUTO_SCROLL_BOTTOM_THRESHOLD", () => {
 	it("is a positive number", () => {
@@ -137,58 +123,116 @@ describe("shouldClearFlag", () => {
 	});
 });
 
-describe("shouldAutoScroll", () => {
+describe("resolveMessageAutoScroll", () => {
 	it("returns true for new message when user is at bottom", () => {
-		expect(shouldAutoScroll({
-			hasNewTailMessage: true,
-			hasStreaming: false,
+		expect(resolveMessageAutoScroll({
+			hasStreamingTurn: false,
 			isViewingOlderMessages: false,
+			nextLastMessageId: "message-2",
+			previousLastMessageId: "message-1",
+			streamingText: "",
 			userScrolledUp: false,
-		})).toBe(true);
+		}).shouldRequestScroll).toBe(true);
 	});
 
 	it("returns true during streaming when user is at bottom", () => {
-		expect(shouldAutoScroll({
-			hasNewTailMessage: false,
-			hasStreaming: true,
+		const result = resolveMessageAutoScroll({
+			hasStreamingTurn: false,
 			isViewingOlderMessages: false,
+			nextLastMessageId: "message-1",
+			previousLastMessageId: "message-1",
+			streamingText: "Thinking...",
+			userScrolledUp: false,
+		});
+		expect(result.shouldRequestScroll).toBe(true);
+		expect(result.shouldPinToBottom).toBe(true);
+	});
+
+	it("returns false during streaming when user has scrolled up", () => {
+		expect(resolveMessageAutoScroll({
+			hasStreamingTurn: true,
+			isViewingOlderMessages: false,
+			nextLastMessageId: "message-1",
+			previousLastMessageId: "message-1",
+			streamingText: "",
+			userScrolledUp: true,
+		}).shouldRequestScroll).toBe(false);
+	});
+
+	it("returns false for new message when user has scrolled up", () => {
+		const result = resolveMessageAutoScroll({
+			hasStreamingTurn: false,
+			isViewingOlderMessages: false,
+			nextLastMessageId: "message-2",
+			previousLastMessageId: "message-1",
+			streamingText: "",
+			userScrolledUp: true,
+		});
+		expect(result.shouldRequestScroll).toBe(false);
+		expect(result.shouldPinToBottom).toBe(false);
+	});
+
+	it("returns false when viewing older messages regardless of flag", () => {
+		const result = resolveMessageAutoScroll({
+			hasStreamingTurn: true,
+			isViewingOlderMessages: true,
+			nextLastMessageId: "message-2",
+			previousLastMessageId: "message-1",
+			streamingText: "Still streaming",
+			userScrolledUp: false,
+		});
+		expect(result.shouldRequestScroll).toBe(false);
+		expect(result.shouldPinToBottom).toBe(false);
+	});
+
+	it("returns false when there is nothing new to scroll to", () => {
+		expect(resolveMessageAutoScroll({
+			hasStreamingTurn: false,
+			isViewingOlderMessages: false,
+			nextLastMessageId: "message-1",
+			previousLastMessageId: "message-1",
+			streamingText: "",
+			userScrolledUp: false,
+		}).shouldRequestScroll).toBe(false);
+	});
+
+	it("keeps requesting scroll when streamingText changes but the tail message id does not", () => {
+		expect(resolveMessageAutoScroll({
+			hasStreamingTurn: false,
+			isViewingOlderMessages: false,
+			nextLastMessageId: "message-1",
+			previousLastMessageId: "message-1",
+			streamingText: "partial response",
+			userScrolledUp: false,
+		}).shouldRequestScroll).toBe(true);
+	});
+});
+
+describe("shouldScrollOnMessageContentSizeChange", () => {
+	it("keeps the transcript pinned while streaming content keeps growing", () => {
+		expect(shouldScrollOnMessageContentSizeChange({
+			hasPendingScroll: false,
+			isViewingOlderMessages: false,
+			shouldPinToBottom: true,
 			userScrolledUp: false,
 		})).toBe(true);
 	});
 
-	it("returns false during streaming when user has scrolled up", () => {
-		expect(shouldAutoScroll({
-			hasNewTailMessage: false,
-			hasStreaming: true,
-			isViewingOlderMessages: false,
-			userScrolledUp: true,
-		})).toBe(false);
-	});
-
-	it("returns false for new message when user has scrolled up", () => {
-		expect(shouldAutoScroll({
-			hasNewTailMessage: true,
-			hasStreaming: false,
-			isViewingOlderMessages: false,
-			userScrolledUp: true,
-		})).toBe(false);
-	});
-
-	it("returns false when viewing older messages regardless of flag", () => {
-		expect(shouldAutoScroll({
-			hasNewTailMessage: true,
-			hasStreaming: true,
+	it("does not scroll when the user is reading older content", () => {
+		expect(shouldScrollOnMessageContentSizeChange({
+			hasPendingScroll: true,
 			isViewingOlderMessages: true,
+			shouldPinToBottom: true,
 			userScrolledUp: false,
 		})).toBe(false);
 	});
 
-	it("returns false when there is nothing new to scroll to", () => {
-		expect(shouldAutoScroll({
-			hasNewTailMessage: false,
-			hasStreaming: false,
+	it("does not scroll when the user manually scrolled up", () => {
+		expect(shouldScrollOnMessageContentSizeChange({
+			hasPendingScroll: true,
 			isViewingOlderMessages: false,
-			userScrolledUp: false,
+			shouldPinToBottom: true,
+			userScrolledUp: true,
 		})).toBe(false);
 	});
 });
@@ -198,10 +242,20 @@ describe("end-to-end scenario: user scrolls up during streaming", () => {
 		let userScrolledUp = false;
 
 		// Step 1: Streaming starts, user is at bottom — auto-scroll fires
-		expect(shouldAutoScroll({
-			hasNewTailMessage: false,
-			hasStreaming: true,
+		let autoScroll = resolveMessageAutoScroll({
+			hasStreamingTurn: false,
 			isViewingOlderMessages: false,
+			nextLastMessageId: "message-1",
+			previousLastMessageId: "message-1",
+			streamingText: "Streaming response...",
+			userScrolledUp,
+		});
+		expect(autoScroll.shouldRequestScroll).toBe(true);
+		expect(autoScroll.shouldPinToBottom).toBe(true);
+		expect(shouldScrollOnMessageContentSizeChange({
+			hasPendingScroll: false,
+			isViewingOlderMessages: false,
+			shouldPinToBottom: autoScroll.shouldPinToBottom,
 			userScrolledUp,
 		})).toBe(true);
 
@@ -215,20 +269,31 @@ describe("end-to-end scenario: user scrolls up during streaming", () => {
 		expect(userScrolledUp).toBe(true);
 
 		// Auto-scroll should be suppressed
-		expect(shouldAutoScroll({
-			hasNewTailMessage: false,
-			hasStreaming: true,
+		autoScroll = resolveMessageAutoScroll({
+			hasStreamingTurn: false,
 			isViewingOlderMessages: false,
+			nextLastMessageId: "message-1",
+			previousLastMessageId: "message-1",
+			streamingText: "Streaming response...",
+			userScrolledUp,
+		});
+		expect(autoScroll.shouldRequestScroll).toBe(false);
+		expect(shouldScrollOnMessageContentSizeChange({
+			hasPendingScroll: true,
+			isViewingOlderMessages: false,
+			shouldPinToBottom: true,
 			userScrolledUp,
 		})).toBe(false);
 
 		// Step 3: Streaming ends — flag does NOT reset (user must scroll to bottom)
-		expect(shouldAutoScroll({
-			hasNewTailMessage: true,
-			hasStreaming: false,
+		expect(resolveMessageAutoScroll({
+			hasStreamingTurn: false,
 			isViewingOlderMessages: false,
+			nextLastMessageId: "message-2",
+			previousLastMessageId: "message-1",
+			streamingText: "",
 			userScrolledUp,
-		})).toBe(false);
+		}).shouldRequestScroll).toBe(false);
 
 		// Step 4: User scrolls back to bottom — flag clears
 		if (shouldClearFlag(5000, 4400, 600)) {
@@ -237,11 +302,13 @@ describe("end-to-end scenario: user scrolls up during streaming", () => {
 		expect(userScrolledUp).toBe(false);
 
 		// Step 5: Next message arrives — auto-scroll fires again
-		expect(shouldAutoScroll({
-			hasNewTailMessage: true,
-			hasStreaming: false,
+		expect(resolveMessageAutoScroll({
+			hasStreamingTurn: false,
 			isViewingOlderMessages: false,
+			nextLastMessageId: "message-3",
+			previousLastMessageId: "message-2",
+			streamingText: "",
 			userScrolledUp,
-		})).toBe(true);
+		}).shouldRequestScroll).toBe(true);
 	});
 });

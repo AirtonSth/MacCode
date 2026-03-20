@@ -1,40 +1,67 @@
 import { Elysia, t } from "elysia";
 
-import { parseCodexPermissionMode } from "../../../../shared/codex-permission-mode";
-import { parseCodexReasoningEffort } from "../../../../shared/codex-model-config";
-import type { ChatProvider } from "../../shared/core/server.types";
 import { withRestAuth } from "../../shared/auth/auth.service";
 import { readMutationRequestMetadata } from "../../shared/core/request-context";
 import type { ChatServiceContract } from "../chat/chat.service";
+import type { MessageServiceContract } from "../message/message.service";
 import type { WorkspaceEventsServiceContract } from "../workspace-events/workspace-events.model";
+import { normalizeSelectionPreferences } from "./selection-preferences";
 import type { WorkspaceSelectionService } from "./selection.service";
 
-const VALID_PROVIDERS = new Set<string>(["codex", "claude"]);
-
-const parseSelectedProvider = (value: unknown): ChatProvider | null => {
-	if (value === null || value === undefined) {
-		return null;
-	}
-
+const normalizeProviderThreadId = (value: string | null | undefined): string | null => {
 	if (typeof value !== "string") {
 		return null;
 	}
 
-	return VALID_PROVIDERS.has(value) ? (value as ChatProvider) : null;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : null;
+};
+
+const isPlaceholderThreadTitle = (value: string | null | undefined): boolean => {
+	if (typeof value !== "string") {
+		return false;
+	}
+
+	const normalized = value.trim().toLowerCase();
+	return normalized === "new thread" || normalized === "new chat";
+};
+
+const shouldLockProviderSelection = (input: {
+	hasStreamingText: boolean;
+	hasStreamingTurn: boolean;
+	messageCount: number;
+	providerThreadId: string | null;
+	threadTitle: string | null;
+	turnCount: number;
+}): boolean => {
+	return Boolean(
+		normalizeProviderThreadId(input.providerThreadId)
+		|| input.messageCount > 0
+		|| input.turnCount > 0
+		|| input.hasStreamingText
+		|| input.hasStreamingTurn
+		|| (
+			typeof input.threadTitle === "string"
+			&& input.threadTitle.trim().length > 0
+			&& !isPlaceholderThreadTitle(input.threadTitle)
+		)
+	);
 };
 
 export class SelectionController {
 	static build(
 		service: WorkspaceSelectionService,
 		chatService: ChatServiceContract,
+		messageService: MessageServiceContract,
 		workspaceEvents?: WorkspaceEventsServiceContract,
 	) {
-		return new SelectionController(service, chatService, workspaceEvents).build();
+		return new SelectionController(service, chatService, messageService, workspaceEvents).build();
 	}
 
 	constructor(
 		private readonly service: WorkspaceSelectionService,
 		private readonly chatService: ChatServiceContract,
+		private readonly messageService: MessageServiceContract,
 		private readonly workspaceEvents?: WorkspaceEventsServiceContract,
 	) {}
 
@@ -46,82 +73,75 @@ export class SelectionController {
 
 				return selection;
 			})
-				.patch(
-					"/selection",
-					async ({ body, request, set }) => {
-						if (body.selectedProjectId === null && body.selectedChatId !== null) {
-							set.status = 400;
+			.patch(
+				"/selection",
+				async ({ body, request, set }) => {
+					if (body.selectedProjectId === null && body.selectedChatId !== null) {
+						set.status = 400;
 
-							return { error: "selectedChatId requires a selectedProjectId" };
-						}
+						return { error: "selectedChatId requires a selectedProjectId" };
+					}
 
-						const current = await this.service.getWorkspaceSelection();
-						const permissionMode =
-							body.permissionMode === undefined
-								? current.permissionMode
-								: parseCodexPermissionMode(body.permissionMode);
-						if (permissionMode === null) {
-							set.status = 400;
+					const current = await this.service.getWorkspaceSelection();
 
-							return { error: "invalid permissionMode" };
-						}
+					const selectedChat =
+						body.selectedChatId === null
+							? null
+							: await this.chatService.getChatById(body.selectedChatId);
+					const selectedChatMessages =
+						body.selectedChatId === null
+							? null
+							: await this.messageService.listByChatId(body.selectedChatId);
+					const lockedChatProvider =
+						selectedChat
+						&& shouldLockProviderSelection({
+							hasStreamingText: selectedChat.isActive,
+							hasStreamingTurn: selectedChat.isActive,
+							messageCount: selectedChatMessages?.messages.length ?? 0,
+							providerThreadId: selectedChat.providerThreadId ?? null,
+							threadTitle: selectedChat.title,
+							turnCount: selectedChatMessages?.turns.length ?? 0,
+						})
+							? selectedChat.provider
+							: null;
 
-						const selectedModel =
-							body.selectedModel === undefined
-								? current.selectedModel
-								: typeof body.selectedModel === "string" && body.selectedModel.trim().length > 0
-									? body.selectedModel.trim()
-									: null;
+					const normalizedPreferences = normalizeSelectionPreferences({
+						current,
+						lockedProvider: lockedChatProvider,
+						payload: body,
+					});
+					if (!normalizedPreferences.ok) {
+						set.status = 400;
 
-						const selectedReasoningEffort =
-							body.selectedReasoningEffort === undefined
-								? current.selectedReasoningEffort
-								: body.selectedReasoningEffort === null || body.selectedReasoningEffort === ""
-									? null
-									: parseCodexReasoningEffort(body.selectedReasoningEffort);
-						if (selectedReasoningEffort === null && body.selectedReasoningEffort !== undefined && body.selectedReasoningEffort !== null && body.selectedReasoningEffort !== "") {
-							set.status = 400;
+						return { error: normalizedPreferences.error };
+					}
+					if (
+						lockedChatProvider
+						&& body.selectedProvider !== undefined
+						&& body.selectedProvider !== null
+						&& body.selectedProvider !== lockedChatProvider
+					) {
+						set.status = 400;
 
-							return { error: "invalid selectedReasoningEffort" };
-						}
+						return { error: "cannot change provider after thread creation" };
+					}
 
-						const selectedProvider =
-							body.selectedProvider === undefined
-								? current.selectedProvider
-								: body.selectedProvider === null
-									? null
-									: parseSelectedProvider(body.selectedProvider);
-						if (body.selectedProvider !== undefined && body.selectedProvider !== null && selectedProvider === null) {
-							set.status = 400;
+					const {
+						permissionMode,
+						selectedModel,
+						selectedProvider,
+						selectedReasoningEffort,
+					} = normalizedPreferences.value;
 
-							return { error: "invalid selectedProvider" };
-						}
-
-						const selectedChat =
-							body.selectedChatId === null
-								? null
-								: await this.chatService.getChatById(body.selectedChatId);
-						const lockedChatProvider = selectedChat?.provider === "claude" ? "claude" : null;
-						if (
-							lockedChatProvider
-							&& body.selectedProvider !== undefined
-							&& selectedProvider !== null
-							&& selectedProvider !== lockedChatProvider
-						) {
-							set.status = 400;
-
-							return { error: "cannot change provider after thread creation" };
-						}
-
-						const selection = await this.service.saveWorkspaceSelection({
-							selectedChatId: body.selectedChatId,
-							selectedProjectId: body.selectedProjectId,
-							permissionMode,
-							selectedModel,
-							selectedProvider: lockedChatProvider ?? selectedProvider ?? null,
-							selectedReasoningEffort,
-						});
-						const metadata = readMutationRequestMetadata(request);
+					const selection = await this.service.saveWorkspaceSelection({
+						selectedChatId: body.selectedChatId,
+						selectedProjectId: body.selectedProjectId,
+						permissionMode,
+						selectedModel,
+						selectedProvider,
+						selectedReasoningEffort,
+					});
+					const metadata = readMutationRequestMetadata(request);
 
 					this.workspaceEvents?.append({
 						type: "selection_updated",
@@ -134,22 +154,23 @@ export class SelectionController {
 
 					return selection;
 				},
-					{
-						body: t.Object({
-							selectedChatId: t.Nullable(t.String()),
-							selectedProjectId: t.Nullable(t.String()),
-							permissionMode: t.Optional(t.String()),
-							selectedModel: t.Optional(t.Nullable(t.String())),
-							selectedProvider: t.Optional(t.Nullable(t.String())),
-							selectedReasoningEffort: t.Optional(t.Nullable(t.String())),
-						}),
-					},
-				);
+				{
+					body: t.Object({
+						selectedChatId: t.Nullable(t.String()),
+						selectedProjectId: t.Nullable(t.String()),
+						permissionMode: t.Optional(t.String()),
+						selectedModel: t.Optional(t.Nullable(t.String())),
+						selectedProvider: t.Optional(t.Nullable(t.String())),
+						selectedReasoningEffort: t.Optional(t.Nullable(t.String())),
+					}),
+				},
+			);
 	}
 }
 
 export const createSelectionController = (
 	service: WorkspaceSelectionService,
 	chatService: ChatServiceContract,
+	messageService: MessageServiceContract,
 	workspaceEvents?: WorkspaceEventsServiceContract,
-) => SelectionController.build(service, chatService, workspaceEvents);
+) => SelectionController.build(service, chatService, messageService, workspaceEvents);

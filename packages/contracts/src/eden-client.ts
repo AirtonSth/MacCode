@@ -100,6 +100,7 @@ export interface EdenClient {
 						selectedProjectId: string | null;
 						permissionMode?: string;
 						selectedModel?: string | null;
+						selectedProvider?: string | null;
 						selectedReasoningEffort?: string | null;
 					} & MutationRequestMetadata,
 				) => Promise<unknown>;
