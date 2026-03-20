@@ -72,7 +72,15 @@ import {
 	resolveLiveActivitySubscriptionError,
 	resolveLiveActivitySubscriptionResponse,
 } from "./live-activity-subscription";
-import { shouldLockProviderSelection } from "./provider-selection";
+import {
+	applyDesktopProviderChange,
+	isSelectedProvider,
+	mergePersistedSelectionPatch,
+	type SelectedProvider,
+	shouldLockProviderSelection,
+	shouldSyncProviderScopedSelectionFromServer,
+	syncLockedProviderSelectionFromDesktop,
+} from "./provider-selection";
 import {
 	reconcileTrackedLiveActivityChats,
 	resolveTrackedLiveActivityChats,
@@ -308,11 +316,7 @@ const normalizeSelection = (
 ): WorkspaceSelectionDTO => {
 	const selectedProjectId = selection.selectedProjectId;
 	const selectedChatId = selectedProjectId && typeof selection.selectedChatId === "string" ? selection.selectedChatId : null;
-	const validProviders = ["codex", "claude"] as const;
-	const selectedProvider =
-		typeof selection.selectedProvider === "string" && (validProviders as readonly string[]).includes(selection.selectedProvider)
-			? selection.selectedProvider
-			: null;
+	const selectedProvider = isSelectedProvider(selection.selectedProvider) ? selection.selectedProvider : null;
 
 	return {
 		selectedProjectId,
@@ -530,9 +534,16 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<string | null>(
 		initialSelection.selectedReasoningEffort,
 	);
-	const [selectedProvider, setSelectedProvider] = useState<string>(
-		initialSelection.selectedProvider ?? "codex",
+	const [selectedProvider, setSelectedProvider] = useState<SelectedProvider>(
+		isSelectedProvider(initialSelection.selectedProvider) ? initialSelection.selectedProvider : "codex",
 	);
+
+	// Provider is locally authoritative after initial hydration, matching desktop
+	// behavior.  The server response must never overwrite a user-initiated
+	// provider switch — otherwise PATCH failures (e.g. locked-chat 400s) cause
+	// the UI to revert to the previous provider after a few seconds.
+	const isProviderHydratedRef = useRef(isSelectedProvider(initialSelection.selectedProvider));
+	const lastProviderSyncChatIdRef = useRef<string | null>(null);
 	const realtimeRef = useRef<ReturnType<typeof createRealtimeClient> | null>(null);
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
@@ -723,7 +734,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			const chatFromContext = scope === "chat" ? chatContextQuery.data?.chat ?? null : null;
 			const chatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
 			const provider = (chatFromContext ?? chatFromList)?.provider;
-			return provider === "codex" || provider === "claude" ? provider : null;
+			return isSelectedProvider(provider) ? provider : null;
 		},
 		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
 	);
@@ -736,22 +747,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		},
 		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
 	);
-	const selectedChatTitle = useMemo(
-		() => {
-			const chatFromContext = scope === "chat" ? chatContextQuery.data?.chat ?? null : null;
-			const chatFromList = chats.find((chat) => chat.id === selectedChatId) ?? null;
-			const title = (chatFromContext ?? chatFromList)?.title;
-			return typeof title === "string" ? title : null;
-		},
-		[chats, chatContextQuery.data?.chat, scope, selectedChatId],
-	);
 	const isProviderLocked = useMemo(
 		() => shouldLockProviderSelection({
 			hasStreamingText: selectedChatId ? (streamingTextByChat[selectedChatId] ?? "").trim().length > 0 : false,
 			hasStreamingTurn: streamTurnQuery.data !== null,
 			messageCount: messagesQuery.page.messages.length,
 			providerThreadId: selectedChatProviderThreadId,
-			threadTitle: selectedChatTitle,
 			turnCount: messagesQuery.page.turns.length,
 		}),
 		[
@@ -759,7 +760,6 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			messagesQuery.page.turns.length,
 			selectedChatId,
 			selectedChatProviderThreadId,
-			selectedChatTitle,
 			streamTurnQuery.data,
 			streamingTextByChat,
 		],
@@ -771,6 +771,13 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		}
 
 		const normalizedSelection = normalizeSelection(selectionQuery.data);
+		const shouldSyncProviderScopedSelection = shouldSyncProviderScopedSelectionFromServer({
+			isProviderHydrated: isProviderHydratedRef.current,
+			localSelectedProvider: selectedProvider,
+			serverSelectedProvider: isSelectedProvider(normalizedSelection.selectedProvider)
+				? normalizedSelection.selectedProvider
+				: null,
+		});
 
 		// [M-16] Batch the 6 selection setState calls inside startTransition
 		// so React treats them as a single low-priority update and avoids
@@ -785,21 +792,30 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			setPermissionMode((current) => (
 				current === normalizedSelection.permissionMode ? current : normalizedSelection.permissionMode
 			));
-			setSelectedModel((current) => (
-				current === normalizedSelection.selectedModel ? current : normalizedSelection.selectedModel
-			));
-			setSelectedReasoningEffort((current) => (
-				current === normalizedSelection.selectedReasoningEffort
-					? current
-					: normalizedSelection.selectedReasoningEffort
-			));
-			if (normalizedSelection.selectedProvider) {
+			if (shouldSyncProviderScopedSelection) {
+				setSelectedModel((current) => (
+					current === normalizedSelection.selectedModel ? current : normalizedSelection.selectedModel
+				));
+				setSelectedReasoningEffort((current) => (
+					current === normalizedSelection.selectedReasoningEffort
+						? current
+						: normalizedSelection.selectedReasoningEffort
+				));
+			}
+
+			// Provider is locally authoritative: only hydrate once from the
+			// server (cold start with empty cache).  After hydration, provider
+			// changes come exclusively from user actions or locked-chat sync,
+			// never from server refetches — matching desktop behaviour.
+			if (!isProviderHydratedRef.current && isSelectedProvider(normalizedSelection.selectedProvider)) {
+				isProviderHydratedRef.current = true;
+				const nextProvider = normalizedSelection.selectedProvider;
 				setSelectedProvider((current) => (
-					current === normalizedSelection.selectedProvider ? current : (normalizedSelection.selectedProvider ?? current)
+					current === nextProvider ? current : nextProvider
 				));
 			}
 		});
-	}, [selectionQuery.data]);
+	}, [selectedProvider, selectionQuery.data]);
 
 	useEffect(() => {
 		selectedProjectIdRef.current = selectedProjectId;
@@ -2178,19 +2194,19 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		(input: {
 			selectedProjectId: string | null;
 			selectedChatId: string | null;
-			permissionMode?: string | null;
+			permissionMode?: string;
 			selectedModel?: string | null;
-			selectedProvider?: string | null;
+			selectedProvider?: SelectedProvider;
 			selectedReasoningEffort?: string | null;
 		}) => {
-			const nextSelection = normalizeSelection({
-				selectedProjectId: input.selectedProjectId,
-				selectedChatId: input.selectedChatId,
-				permissionMode: input.permissionMode ?? permissionMode,
-				selectedModel: input.selectedModel ?? selectedModel,
-				selectedProvider: input.selectedProvider ?? selectedProvider,
-				selectedReasoningEffort: input.selectedReasoningEffort ?? selectedReasoningEffort,
-			});
+			const nextSelection = normalizeSelection(mergePersistedSelectionPatch({
+				permissionMode,
+				selectedChatId,
+				selectedModel,
+				selectedProjectId,
+				selectedProvider,
+				selectedReasoningEffort,
+			}, input));
 			queryClient.setQueryData(queryKeys.selection, nextSelection);
 
 			updateSelectionMutation.mutate(nextSelection, {
@@ -2199,7 +2215,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				},
 			});
 		},
-		[permissionMode, queryClient, selectedModel, selectedProvider, selectedReasoningEffort, updateSelectionMutation],
+		[permissionMode, queryClient, selectedChatId, selectedModel, selectedProjectId, selectedProvider, selectedReasoningEffort, updateSelectionMutation],
 	);
 
 	useEffect(() => {
@@ -2262,19 +2278,35 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const setSelectedProviderWithSync = useCallback(
 		(value: string) => {
-			if (isProviderLocked) {
+			if (isProviderLocked || !isSelectedProvider(value)) {
 				return;
 			}
 
-			setSelectedProvider(value);
-			void queryClient.invalidateQueries({ queryKey: ["provider-models", value] });
+			const nextSelection = applyDesktopProviderChange({
+				selectedModel,
+				selectedProvider,
+				selectedReasoningEffort,
+			}, value);
+			setSelectedProvider(nextSelection.selectedProvider);
+			setSelectedModel(nextSelection.selectedModel);
+			setSelectedReasoningEffort(nextSelection.selectedReasoningEffort);
 			persistSelection({
 				selectedProjectId,
 				selectedChatId,
-				selectedProvider: value,
+				selectedModel: nextSelection.selectedModel,
+				selectedProvider: nextSelection.selectedProvider,
+				selectedReasoningEffort: nextSelection.selectedReasoningEffort,
 			});
 		},
-		[isProviderLocked, persistSelection, queryClient, selectedChatId, selectedProjectId],
+		[
+			isProviderLocked,
+			persistSelection,
+			selectedChatId,
+			selectedModel,
+			selectedProjectId,
+			selectedProvider,
+			selectedReasoningEffort,
+		],
 	);
 
 	const selectProjectById = useCallback(
@@ -2651,15 +2683,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 			}
 
 			realtimeRef.current?.sendJoinChat(activeChatId);
-			const effectiveProvider = isProviderLocked
-				? selectedChatProvider ?? undefined
-				: selectedProvider ?? undefined;
 			realtimeRef.current?.sendUserMessage(activeChatId, text, {
 				clientId: clientIdRef.current,
 				model: selectedModel ?? undefined,
 				permissionMode,
 				projectId: activeProjectId,
-				provider: effectiveProvider,
+				provider: selectedProvider ?? undefined,
 				reasoningEffort: selectedReasoningEffort ?? undefined,
 				requestId: toRequestId(),
 			});
@@ -2921,25 +2950,30 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	);
 
 	useEffect(() => {
-		if (!isProviderLocked || !selectedChatProvider || selectedProvider === selectedChatProvider) {
+		const syncResult = syncLockedProviderSelectionFromDesktop({
+			isProviderLocked,
+			lastSyncedChatId: lastProviderSyncChatIdRef.current,
+			selectedChatId,
+			selectedChatProvider,
+			selectedModel,
+			selectedProvider,
+			selectedReasoningEffort,
+		});
+		lastProviderSyncChatIdRef.current = syncResult.nextLastSyncedChatId;
+		if (!syncResult.nextSelection) {
 			return;
 		}
 
-		setSelectedProvider(selectedChatProvider);
-		void queryClient.invalidateQueries({ queryKey: ["provider-models", selectedChatProvider] });
-		persistSelection({
-			selectedChatId,
-			selectedProjectId,
-			selectedProvider: selectedChatProvider,
-		});
+		setSelectedProvider(syncResult.nextSelection.selectedProvider);
+		setSelectedModel(syncResult.nextSelection.selectedModel);
+		setSelectedReasoningEffort(syncResult.nextSelection.selectedReasoningEffort);
 	}, [
-		persistSelection,
 		isProviderLocked,
-		queryClient,
 		selectedChatId,
 		selectedChatProvider,
-		selectedProjectId,
+		selectedModel,
 		selectedProvider,
+		selectedReasoningEffort,
 	]);
 
 	const lastMarkedReadSignatureRef = useRef<string | null>(null);
