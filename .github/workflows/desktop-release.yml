@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+      - "[0-9]*"
   workflow_dispatch:
     inputs:
       version:
@@ -227,8 +228,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.value }}
-          name: RemoteCode v${{ steps.version.outputs.value }}
+          tag_name: ${{ github.ref_name }}
+          name: RemoteCode ${{ steps.version.outputs.value }}
           draft: false
           prerelease: ${{ steps.build-env.outputs.prerelease }}
           generate_release_notes: true

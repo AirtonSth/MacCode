@@ -43,6 +43,7 @@
     "drizzle-kit": "^0.30.4",
     "drizzle-orm": "^0.39.3",
     "electrobun": "1.14.4",
+    "@sinclair/typebox": "^0.34.15",
     "elysia": "^1.4.9",
     "framer-motion": "^11.15.0",
     "lucide-react": "^0.468.0",
