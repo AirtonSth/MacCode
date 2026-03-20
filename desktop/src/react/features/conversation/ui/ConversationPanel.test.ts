@@ -256,6 +256,11 @@ describe("[D-63/D-64] resilient conversation hydration", () => {
 	test("forces historical turn details open when they are the only content", () => {
 		expect(source).toContain("const shouldForceRunDetails = !hasMessages && !hasStreaming && hasHistoricalRunDetails;");
 		expect(source).toContain("const showHistoricalTurns = showRunDetails || shouldForceRunDetails;");
-		expect(source).toContain("{showHistoricalTurns");
+	});
+
+	test("merges messages and historical turns chronologically", () => {
+		expect(source).toContain("const mergedItems = useMemo(");
+		expect(source).toContain("items.sort((a, b) => a.sortMs - b.sortMs)");
+		expect(source).toContain("mergedItems.map(");
 	});
 });

@@ -177,7 +177,7 @@ const MessageBubble = React.memo(({ message, focusMode, shouldReduceMotion, disa
 	return (
 		<motion.article
 			className={cn(
-				"group/msg relative select-text",
+				"group/msg relative select-text break-words",
 				focusMode
 					? message.role === "user"
 						? "ml-auto w-fit max-w-[min(86%,40rem)] rounded-[1.35rem] border border-white/10 bg-white/[0.06] px-4 py-3 text-[15px] leading-7 text-slate-100 shadow-[0_10px_30px_rgba(2,6,23,0.16)]"
@@ -280,9 +280,30 @@ export const ConversationPanel = ({
 	}, [liveTurn, streamHistoryTurns]);
 	const hasHistoricalRunDetails = historicalTurns.length > 0;
 	const hasStreaming = hasStreamingTimeline || hasStreamingText;
-	const [showRunDetails, setShowRunDetails] = useState(false);
+	const [showRunDetails, setShowRunDetails] = useState(true);
 	const shouldForceRunDetails = !hasMessages && !hasStreaming && hasHistoricalRunDetails;
 	const showHistoricalTurns = showRunDetails || shouldForceRunDetails;
+	const mergedItems = useMemo(() => {
+		type Item =
+			| { kind: "message"; message: MessageDTO; sortMs: number }
+			| { kind: "turn"; turn: StreamTurnState; sortMs: number };
+		const items: Item[] = messages.map((m) => ({
+			kind: "message" as const,
+			message: m,
+			sortMs: new Date(m.createdAt).getTime(),
+		}));
+		if (showHistoricalTurns) {
+			for (const t of historicalTurns) {
+				items.push({
+					kind: "turn" as const,
+					turn: t,
+					sortMs: t.startedAtMs,
+				});
+			}
+		}
+		items.sort((a, b) => a.sortMs - b.sortMs);
+		return items;
+	}, [messages, historicalTurns, showHistoricalTurns]);
 	const hasContent = hasMessages || hasStreaming || hasHistoricalRunDetails || isWorking;
 	const showLoadingSkeleton = loading && !hasContent;
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -642,15 +663,26 @@ export const ConversationPanel = ({
 									{messageWindowMode}
 								</span>
 								<AnimatePresence initial={false}>
-									{messages.map((message) => (
-										<MessageBubble
-											key={message.id}
-											message={message}
-											focusMode={focusMode}
-											shouldReduceMotion={shouldReduceMotion}
-											disableAnimation={isChatSwitchRef.current}
-										/>
-									))}
+									{mergedItems.map((item) =>
+										item.kind === "message" ? (
+											<MessageBubble
+												key={item.message.id}
+												message={item.message}
+												focusMode={focusMode}
+												shouldReduceMotion={shouldReduceMotion}
+												disableAnimation={isChatSwitchRef.current}
+											/>
+										) : (
+											<StreamingTimeline
+												focusMode={focusMode}
+												key={`stream-turn-${item.turn.turnId}`}
+												onSetItemExpanded={onSetStreamItemExpanded}
+												onSetItemState={onSetStreamItemState}
+												shouldReduceMotion={shouldReduceMotion}
+												turn={item.turn}
+											/>
+										),
+									)}
 
 									{liveTurn ? (
 										<StreamingTimeline
@@ -663,23 +695,10 @@ export const ConversationPanel = ({
 										/>
 									) : null}
 
-									{showHistoricalTurns
-										? historicalTurns.map((turn) => (
-												<StreamingTimeline
-													focusMode={focusMode}
-													key={`stream-turn-${turn.turnId}`}
-													onSetItemExpanded={onSetStreamItemExpanded}
-													onSetItemState={onSetStreamItemState}
-													shouldReduceMotion={shouldReduceMotion}
-													turn={turn}
-												/>
-											))
-										: null}
-
 									{streamingText && !hasStreamingTimeline ? (
 										<motion.article
 											className={cn(
-												"select-text",
+												"select-text break-words",
 												focusMode
 													? "w-full py-4 text-[15px] leading-7 text-slate-100"
 													: "mr-auto max-w-[85ch] rounded-2xl border border-sky-200/20 bg-sky-500/10 px-4 py-3 text-sky-50 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",

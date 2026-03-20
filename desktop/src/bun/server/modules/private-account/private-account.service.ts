@@ -150,7 +150,7 @@ export class PrivateAccountService {
 				if (state === "connected") {
 					this.reconnectAttemptCount = 0;
 					this.clearReconnect();
-					this.clearErrorMessage("relay");
+					this.clearErrorMessage();
 					return;
 				}
 
@@ -175,6 +175,7 @@ export class PrivateAccountService {
 		if (this.session && this.connector) {
 			try {
 				await this.refreshStateSnapshot();
+				this.clearErrorMessage("state");
 				if (this.localApp && this.localServerBaseUrl && (this.connectorRelayState === "idle" || this.connectorRelayState === "disconnected" || this.connectorRelayState === "error")) {
 					this.scheduleReconnect();
 				}
