@@ -50,9 +50,9 @@ jobs:
           # --ignore-scripts avoids running postinstall shell scripts (Expo/mobile)
           # that fail on Windows. Desktop build doesn't need them.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            bun install --frozen-lockfile --ignore-scripts
+            bun install --ignore-scripts
           else
-            bun install --frozen-lockfile
+            bun install
           fi
 
       - name: Resolve version
