@@ -5,6 +5,7 @@ import { serverConfig } from "./server/config";
 import { maskTokenForLogs, serverLogger } from "./server/shared/core/server-logger";
 import { startMdnsBroadcast } from "./network/mdns";
 import { checkForUpdates } from "./updater/check-update";
+import { resolveShellPath } from "./server/platform/resolve-shell-path";
 
 const APP_VERSION = "0.0.1";
 
@@ -289,6 +290,11 @@ serverLogger.banner("Desktop Server Boot", {
 	host: serverConfig.host,
 	localToken: maskTokenForLogs(serverConfig.token),
 	port: serverConfig.port,
+});
+
+await resolveShellPath();
+serverLogger.info("desktop-bootstrap", "Shell PATH resolved", {
+	path: (process.env.PATH ?? "").split(":").length + " entries",
 });
 
 const backendHandle = await createBackendServer({ port: serverConfig.port });

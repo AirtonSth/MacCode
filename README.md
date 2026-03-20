@@ -31,24 +31,20 @@ Everything syncs in real-time between your PC and phone, so you're free to move 
 
 ### Desktop App
 
-- **Download**: Get the latest release from [GitHub Releases](https://github.com/samuelfaj/remotecode.io/releases).
+- **Download**: Get the latest release from [https://remotecode.io/](https://remotecode.io/).
 - **Build from Source**: Clone the repo and follow the build instructions in `desktop/README.md`.
 
 ### Mobile App
 
-- **iOS**: Download from the [App Store](https://apps.apple.com/app/remotecode).
-- **Android**: Download from [Google Play](https://play.google.com/store/apps/details?id=io.remotecode).
-
-### Backend and Frontend
-
-For development or custom setups, see the `backend/` and `frontend/` directories for setup instructions.
+- **iOS**: Download from the [App Store](https://remotecode.io).
+- **Android**: Download from [Google Play](https://remotecode.io/).
 
 ## Usage
 
 1. Launch the RemoteCode desktop app on your computer.
-2. Ensure your AI coding tool (e.g., Claude Code) is running.
+2. Ensure your AI coding tool (e.g., Claude Code) is installed.
 3. Open the RemoteCode mobile app on your device.
-4. Connect the mobile app to the desktop server (usually automatic via local network).
+4. Connect the mobile app to the desktop server (usually automatic via local network or login).
 5. Start coding remotely!
 
 ## Contributing
