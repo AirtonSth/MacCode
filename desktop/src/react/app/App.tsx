@@ -611,6 +611,7 @@ const AppContent = (): JSX.Element => {
 	const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
 	const [visibleOpeningProjectId, setVisibleOpeningProjectId] = useState<string | null>(null);
 	const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
+	const [composerFocusRequestId, setComposerFocusRequestId] = useState(0);
 	const [openWorkspaceMenuProjectId, setOpenWorkspaceMenuProjectId] = useState<string | null>(null);
 	const [isActiveThreadsOpen, setIsActiveThreadsOpen] = useState(false);
 	const activeThreadsMenuRef = useRef<HTMLDivElement | null>(null);
@@ -2345,12 +2346,12 @@ const AppContent = (): JSX.Element => {
 			}
 
 			setProjectThreadsOpen((current) => ({ ...current, [state.selectedProjectId!]: true }));
-			setExpandedProjectThreads((current) => ({ ...current, [state.selectedProjectId!]: true }));
 			dispatch({ payload: true, type: "SET_CREATING_CHAT" });
 			try {
 				const chat = await api.createChat(state.selectedProjectId, title, selectedProviderRef.current);
 				dispatch({ payload: chat, type: "UPSERT_CHAT" });
 				dispatch({ payload: chat.id, type: "SET_SELECTED_CHAT" });
+				setComposerFocusRequestId((current) => current + 1);
 				selectedProjectIdRef.current = state.selectedProjectId;
 				selectedChatIdRef.current = chat.id;
 				persistedSelectedChatIdRef.current = chat.id;
@@ -2391,12 +2392,13 @@ const AppContent = (): JSX.Element => {
 				setProjectThreadsOpen((current) => ({ ...current, [projectId]: true }));
 			}
 			setProjectThreadsOpen((current) => ({ ...current, [projectId]: true }));
-			setExpandedProjectThreads((current) => ({ ...current, [projectId]: true }));
 
 			dispatch({ payload: true, type: "SET_CREATING_CHAT" });
 			try {
 				const chat = await api.createChat(projectId, DEFAULT_DRAFT_THREAD_TITLE, selectedProviderRef.current);
 				dispatch({ payload: chat, type: "UPSERT_CHAT" });
+				dispatch({ payload: chat.id, type: "SET_SELECTED_CHAT" });
+				setComposerFocusRequestId((current) => current + 1);
 				selectedProjectIdRef.current = projectId;
 				selectedChatIdRef.current = chat.id;
 				persistedSelectedChatIdRef.current = chat.id;
@@ -2877,11 +2879,13 @@ const AppContent = (): JSX.Element => {
 	const handleSelectChat = useCallback(
 		async (chatId: string) => {
 			if (chatId === state.selectedChatId) {
+				setComposerFocusRequestId((current) => current + 1);
 				return;
 			}
 
 			setOpeningThreadId(chatId);
 			dispatch({ payload: chatId, type: "SET_SELECTED_CHAT" });
+			setComposerFocusRequestId((current) => current + 1);
 			selectedChatIdRef.current = chatId;
 			persistedSelectedChatIdRef.current = chatId;
 			await persistWorkspaceSelection(state.selectedProjectId, chatId);
@@ -3903,6 +3907,7 @@ const AppContent = (): JSX.Element => {
 														chatStatus={isSelectedThreadWorking ? "running" : activeThreadChat?.status ?? null}
 														disabled={!state.selectedProjectId}
 														focusMode
+														focusRequestId={composerFocusRequestId}
 														isGitLoading={projectGitState.loading}
 														isGitRepository={
 															selectedProject ? projectGitState.status?.isRepo ?? null : false

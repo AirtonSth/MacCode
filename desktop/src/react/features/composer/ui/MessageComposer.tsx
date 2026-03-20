@@ -1,4 +1,4 @@
-import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useLayoutEffect, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
 import { ArrowUp, ChevronDown, Loader2, Plus, Square } from "lucide-react";
 import { Button } from "../../../components/ui/button";
@@ -14,6 +14,7 @@ import {
 	extractAttachmentPathsFromPickerResult,
 	normalizeAttachmentPath,
 } from "../model/attachment-paths";
+import { normalizeDeadKeyCompositionValue } from "../model/dead-key-normalization";
 import {
 	formatCodexReasoningEffortLabel,
 	type CodexModelDescriptor,
@@ -52,6 +53,7 @@ interface MessageComposerProps {
 	onCreateBranch?: (name: string) => Promise<void> | void;
 	onPickContextPaths?: () => Promise<unknown> | unknown;
 	focusMode?: boolean;
+	focusRequestId?: number;
 }
 
 const MAX_MESSAGE_LENGTH = 4000;
@@ -84,10 +86,14 @@ export const MessageComposer = ({
 	onCreateBranch,
 	onPickContextPaths,
 	focusMode = false,
+	focusRequestId = 0,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 	const fileInputRef = useRef<HTMLInputElement>(null);
+	const appliedFocusRequestIdRef = useRef(0);
+	const deadKeySequenceRef = useRef(false);
+	const isComposingRef = useRef(false);
 	const [validationError, setValidationError] = useState<string | null>(null);
 	const [isDraggingPaths, setIsDraggingPaths] = useState(false);
 	const [isComposing, setIsComposing] = useState(false);
@@ -238,34 +244,20 @@ export const MessageComposer = ({
 	};
 
 	const handleInputChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
-		setValue(event.target.value);
+		const nextValue = normalizeDeadKeyCompositionValue(event.target.value);
+		event.target.value = nextValue;
+
+		setValue(nextValue);
 		if (validationError) {
 			setValidationError(null);
 		}
-	};
-
-	const replaceComposerSelection = (nextText: string) => {
-		const textarea = textareaRef.current;
-		if (!textarea) {
-			setValue((currentValue) => `${currentValue}${nextText}`);
-			return;
-		}
-
-		const selectionStart = textarea.selectionStart ?? textarea.value.length;
-		const selectionEnd = textarea.selectionEnd ?? textarea.value.length;
-		setValue((currentValue) => `${currentValue.slice(0, selectionStart)}${nextText}${currentValue.slice(selectionEnd)}`);
-		if (validationError) {
-			setValidationError(null);
-		}
-
-		requestAnimationFrame(() => {
-			const cursor = selectionStart + nextText.length;
-			textarea.focus();
-			textarea.setSelectionRange(cursor, cursor);
-		});
 	};
 
 	useLayoutEffect(() => {
+		if (isComposing) {
+			return;
+		}
+
 		const textarea = textareaRef.current;
 		if (!textarea) {
 			return;
@@ -275,10 +267,27 @@ export const MessageComposer = ({
 			textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
 		});
 		return () => cancelAnimationFrame(rafId);
-	}, [value]);
+	}, [isComposing, value]);
+
+	useEffect(() => {
+		if (focusRequestId <= appliedFocusRequestIdRef.current || isInputLocked) {
+			return;
+		}
+
+		appliedFocusRequestIdRef.current = focusRequestId;
+		const rafId = requestAnimationFrame(() => {
+			textareaRef.current?.focus({ preventScroll: true });
+		});
+		return () => cancelAnimationFrame(rafId);
+	}, [focusRequestId, isInputLocked]);
 
 	const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-		if (isComposing || event.nativeEvent.isComposing || event.key === "Dead" || event.key === "Process") {
+		if (event.key === "Dead" || event.key === "Process") {
+			deadKeySequenceRef.current = true;
+			return;
+		}
+
+		if (isComposing || isComposingRef.current || event.nativeEvent.isComposing) {
 			return;
 		}
 
@@ -287,20 +296,6 @@ export const MessageComposer = ({
 			if (shortcutKey === "a") {
 				event.preventDefault();
 				textareaRef.current?.select();
-				return;
-			}
-
-			if (shortcutKey === "v") {
-				event.preventDefault();
-				void navigator.clipboard.readText().then((clipboardText) => {
-					if (clipboardText.length === 0) {
-						return;
-					}
-
-					replaceComposerSelection(clipboardText);
-				}).catch(() => {
-					// Keep native fallback best-effort in runtimes without clipboard access.
-				});
 				return;
 			}
 
@@ -381,9 +376,13 @@ export const MessageComposer = ({
 						maxLength={MAX_MESSAGE_LENGTH}
 						onChange={handleInputChange}
 						onCompositionEnd={() => {
+							deadKeySequenceRef.current = false;
+							isComposingRef.current = false;
 							setIsComposing(false);
 						}}
 						onCompositionStart={() => {
+							deadKeySequenceRef.current = true;
+							isComposingRef.current = true;
 							setIsComposing(true);
 						}}
 						onKeyDown={handleInputKeyDown}

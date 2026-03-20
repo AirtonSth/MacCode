@@ -62,9 +62,25 @@ describe("[D-63] textarea respects composition and native editing shortcuts", ()
 		expect(composerSource).toContain('event.key === "Process"');
 	});
 
-	it("adds explicit fallback handling for select-all and paste", () => {
+	it("keeps the select-all fallback without overriding native paste", () => {
 		expect(composerSource).toContain("textareaRef.current?.select()");
-		expect(composerSource).toContain("navigator.clipboard.readText()");
-		expect(composerSource).toContain("replaceComposerSelection(clipboardText)");
+		expect(composerSource).not.toContain("navigator.clipboard.readText()");
+	});
+});
+
+describe("[D-66] composer focus can be requested after thread selection", () => {
+	it("accepts a focus request id prop and focuses the textarea when it changes", () => {
+		expect(composerSource).toContain("focusRequestId?: number");
+		expect(composerSource).toContain("textareaRef.current?.focus({ preventScroll: true })");
+	});
+});
+
+describe("[D-68] composer normalizes duplicated dead-key accents", () => {
+	it("imports the dead-key normalization helper", () => {
+		expect(composerSource).toContain('normalizeDeadKeyCompositionValue');
+	});
+
+	it("skips textarea resize mutations while composing", () => {
+		expect(composerSource).toContain("if (isComposing) {");
 	});
 });
