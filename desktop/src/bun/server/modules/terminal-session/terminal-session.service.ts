@@ -2,7 +2,7 @@ import { spawn as spawnChildProcess, type ChildProcessByStdio } from "node:child
 import { randomUUID } from "node:crypto";
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { constants as osConstants, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -29,7 +29,7 @@ import type { TerminalSessionRepository } from "./terminal-session.repository";
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 const DEFAULT_SCROLLBACK = 5_000;
-const PYTHON_BRIDGE_CANDIDATE_PATH = fileURLToPath(new URL("./pty_session_bridge.py", import.meta.url));
+const PYTHON_BRIDGE_CANDIDATE_PATH = join(dirname(fileURLToPath(import.meta.url)), "pty_session_bridge.py");
 const TERMINAL_LOG_SCOPE = "terminal-session";
 const PYTHON_BRIDGE_SOURCE = `#!/usr/bin/env python3
 
@@ -308,10 +308,11 @@ const resolveLauncherCwd = (): string => {
 	return "/";
 };
 
-const buildTerminalEnvironment = (shell: string): Record<string, string> => {
-	const env: Record<string, string> = {
+const buildTerminalEnvironment = (shell: string): NodeJS.ProcessEnv => {
+	const env: NodeJS.ProcessEnv = {
 		HOME: process.env.HOME?.trim() || "/",
 		PATH: process.env.PATH?.trim() || "/usr/bin:/bin:/usr/sbin:/sbin",
+		NODE_ENV: process.env.NODE_ENV ?? "development",
 		SHELL: shell,
 		TERM: "xterm-256color",
 	};
