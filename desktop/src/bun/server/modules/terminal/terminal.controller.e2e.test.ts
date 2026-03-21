@@ -200,7 +200,7 @@ test("GET /v1/chats/:id/terminal keeps history after server restart with same sq
 		expect(execResult.body.command?.status).toBe("completed");
 
 		await backend.app.stop(true);
-		backend.db.close();
+		await backend.db.close();
 
 		backend = await createBackendServer({ databasePath, port: 0 });
 		baseUrl = `http://127.0.0.1:${resolvePort(backend.server)}`;
@@ -212,7 +212,7 @@ test("GET /v1/chats/:id/terminal keeps history after server restart with same sq
 		expect(history.body.entries?.some((entry) => entry.data.includes("restart-ok"))).toBe(true);
 	} finally {
 		await backend.app.stop(true);
-		backend.db.close();
+		await backend.db.close();
 		rmSync(root, { force: true, recursive: true });
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}

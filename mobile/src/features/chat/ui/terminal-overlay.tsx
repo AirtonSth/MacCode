@@ -1,42 +1,37 @@
-import { MaterialIcons } from "@expo/vector-icons";
-import { memo, type RefObject } from "react";
+import { memo } from "react";
 import {
 	KeyboardAvoidingView,
 	Modal,
 	Platform,
-	Pressable,
-	ScrollView,
-	Text,
-	TextInput,
 	View,
 } from "react-native";
 
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import type { TerminalViewport } from "@remotecode/contracts";
+
 import type { RemoteCodeClient } from "../../../shared/api/remotecode-client";
 import { IosStackHeader } from "../../../shared/ui/ios-stack-header";
+import type { TerminalPtyChatState } from "../model/use-terminal-pty-session";
 import { DesktopFilePickerModal } from "./desktop-file-picker-modal";
-import { chatScreenPalette, chatScreenStyles } from "./chat-screen-styles";
+import { chatScreenStyles } from "./chat-screen-styles";
+import { TerminalNativePanel } from "./terminal-native-panel";
 
 export interface TerminalOverlayProps {
 	api: RemoteCodeClient;
+	chatId: string | null;
 	chatTitle: string | undefined;
 	isTerminalFilePickerVisible: boolean;
-	isTerminalLoading: boolean;
 	isTerminalOpen: boolean;
-	isTerminalRunning: boolean;
 	onAddPaths: (paths: string[]) => void;
-	onChangeInput: (text: string) => void;
 	onClose: () => void;
 	onCloseFilePicker: () => void;
+	onInput: (data: string) => void;
+	onInterrupt: () => void;
 	onOpenFilePicker: () => void;
-	onRun: () => void;
-	onTerminalContentLayout: () => void;
-	selectedChatId: string | null;
-	terminalError: string;
-	terminalInput: string;
-	terminalOutput: string;
-	terminalScrollRef: RefObject<ScrollView | null>;
+	onResize: (viewport: TerminalViewport) => void;
+	onRestart: () => void;
+	state: TerminalPtyChatState | null;
 }
 
 // eslint-disable-next-line total-functions/no-unsafe-readonly-mutable-assignment
@@ -69,60 +64,15 @@ export const TerminalOverlay = memo(function TerminalOverlay(props: TerminalOver
 						},
 					]}
 				>
-					<ScrollView
-						contentContainerStyle={chatScreenStyles.terminalOutputContent}
-						contentInsetAdjustmentBehavior="automatic"
-						onContentSizeChange={props.onTerminalContentLayout}
-						ref={props.terminalScrollRef}
-						showsVerticalScrollIndicator={false}
-						style={chatScreenStyles.terminalOutput}
-					>
-						{props.isTerminalLoading ? <Text style={chatScreenStyles.terminalMeta}>Loading history...</Text> : null}
-						<Text selectable style={chatScreenStyles.terminalText}>
-							{props.terminalOutput || "No terminal output yet."}
-						</Text>
-					</ScrollView>
-					{props.terminalError.length > 0 ? (
-						<Text selectable style={chatScreenStyles.errorText}>
-							{props.terminalError}
-						</Text>
-					) : null}
-					<View style={chatScreenStyles.terminalComposer}>
-						<Pressable
-							disabled={props.isTerminalRunning || !props.selectedChatId}
-							onPress={props.onOpenFilePicker}
-							style={({ pressed }) => [
-								chatScreenStyles.attachAction,
-								pressed ? chatScreenStyles.attachActionPressed : null,
-								props.isTerminalRunning || !props.selectedChatId ? chatScreenStyles.disabledButton : null,
-							]}
-							testID="terminal-attach-button"
-						>
-							<MaterialIcons color={chatScreenPalette.text} name="add" size={22} />
-						</Pressable>
-						<TextInput
-							autoCapitalize="none"
-							onChangeText={props.onChangeInput}
-							onSubmitEditing={props.onRun}
-							placeholder="Run command"
-							placeholderTextColor={chatScreenPalette.muted}
-							style={chatScreenStyles.composerInput}
-							testID="terminal-command-input"
-							value={props.terminalInput}
-						/>
-						<Pressable
-							disabled={props.isTerminalRunning || !props.selectedChatId}
-							onPress={props.onRun}
-							style={({ pressed }) => [
-								chatScreenStyles.primaryAction,
-								pressed ? chatScreenStyles.primaryActionPressed : null,
-								props.isTerminalRunning || !props.selectedChatId ? chatScreenStyles.disabledButton : null,
-							]}
-							testID="terminal-run-button"
-						>
-							<Text style={chatScreenStyles.primaryActionLabel}>{props.isTerminalRunning ? "..." : "Run"}</Text>
-						</Pressable>
-					</View>
+					<TerminalNativePanel
+						chatId={props.chatId}
+						onInput={props.onInput}
+						onInterrupt={props.onInterrupt}
+						onOpenFilePicker={props.onOpenFilePicker}
+						onResize={props.onResize}
+						onRestart={props.onRestart}
+						state={props.state}
+					/>
 				</View>
 				<DesktopFilePickerModal
 					client={props.api}

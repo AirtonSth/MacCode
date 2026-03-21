@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, test } from "node:test";
 
-import { buildRealtimeWebSocketHeaders, buildRealtimeWebSocketUrl, createRealtimeClient } from "./ws-client";
+import {
+	buildRealtimeWebSocketHeaders,
+	buildRealtimeWebSocketUrl,
+	createRealtimeClient,
+	parseServerWsEvent,
+} from "./ws-client";
 
 interface SentPayload {
 	data: Record<string, unknown>;
@@ -159,6 +164,42 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 		assert.equal(workspaceMessages[0]?.data.clientId, "client-b");
 	});
 
+	test("re-subscribes terminal sessions after reconnect with the latest viewport", async () => {
+		const realtime = createRealtimeClient({
+			onEvent: () => {
+				// no-op
+			},
+			target: {
+				baseUrl: "http://127.0.0.1:8835",
+				kind: "local",
+				token: "token",
+			},
+		});
+
+		realtime.connect();
+		const firstSocket = MockWebSocket?.instances[0];
+		assert.ok(firstSocket, "missing first websocket");
+		firstSocket.openConnection();
+
+		realtime.sendJoinTerminalSession("chat-terminal", { cols: 84, rows: 22 });
+		realtime.sendTerminalResize("chat-terminal", { cols: 120, rows: 30 });
+		firstSocket.sentPayloads.length = 0;
+		firstSocket.close();
+
+		await delay(350);
+		const secondSocket = MockWebSocket?.instances[1];
+		assert.ok(secondSocket, "missing reconnected websocket");
+		secondSocket.openConnection();
+
+		const terminalMessages = toPayloads(secondSocket).filter((payload) => payload.event === "join_terminal_session");
+		assert.equal(terminalMessages.length, 1);
+		assert.deepEqual(terminalMessages[0]?.data, {
+			chatId: "chat-terminal",
+			cols: 120,
+			rows: 30,
+		});
+	});
+
 	test("sends only the latest queued join_workspace after reconnect", async () => {
 		const realtime = createRealtimeClient({
 			onEvent: () => {
@@ -217,5 +258,43 @@ describe("createRealtimeClient workspace subscription resilience", () => {
 			connectorId: "con_1",
 			kind: "private",
 		}), "wss://private.remotecode.io:8787/v1/ws?accessToken=private-access-token&connectorId=con_1");
+	});
+
+	test("parses terminal snapshot events", () => {
+		const event = parseServerWsEvent(JSON.stringify({
+			data: {
+				chatId: "chat-terminal",
+				cols: 120,
+				cwd: "/tmp/project",
+				exitCode: null,
+				exitedAt: null,
+				rows: 30,
+				seq: 7,
+				sessionId: "sess_123",
+				shell: "/bin/zsh",
+				snapshot: "$ pwd\r\n/tmp/project\r\n",
+				startedAt: "2026-03-21T10:00:00.000Z",
+				status: "running",
+			},
+			event: "terminal_session_snapshot",
+		}));
+
+		assert.deepEqual(event, {
+			data: {
+				chatId: "chat-terminal",
+				cols: 120,
+				cwd: "/tmp/project",
+				exitCode: null,
+				exitedAt: null,
+				rows: 30,
+				seq: 7,
+				sessionId: "sess_123",
+				shell: "/bin/zsh",
+				snapshot: "$ pwd\r\n/tmp/project\r\n",
+				startedAt: "2026-03-21T10:00:00.000Z",
+				status: "running",
+			},
+			event: "terminal_session_snapshot",
+		});
 	});
 });

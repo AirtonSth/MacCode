@@ -22,13 +22,37 @@ export type {
 	FsListResponseDto,
 	FsRootDto,
 	FsRootsResponseDto,
+	ClientJoinTerminalSessionEvent,
+	ClientLeaveTerminalSessionEvent,
+	ClientTerminalInputEvent,
+	ClientTerminalResizeEvent,
+	ClientTerminalRestartEvent,
+	ClientTerminalSignalEvent,
 	MutationMetadata,
 	ServerWsEvent,
+	TerminalOutputServerEvent,
+	TerminalSessionSnapshotDto,
+	TerminalSessionSnapshotServerEvent,
+	TerminalSessionStateDto,
+	TerminalSessionStateServerEvent,
+	TerminalSessionStatus,
 	WorkspaceEventEnvelope,
 	WorkspaceEventType,
 	WorkspaceServerEvent,
 	WsErrorServerEvent,
 } from "./protocol";
+export {
+	createInitialTerminalSessionState,
+	createTerminalSessionController,
+} from "./terminal-session-controller";
+export type {
+	TerminalSessionChatState,
+	TerminalSessionController,
+	TerminalSessionControllerDependencies,
+	TerminalSessionOutputChunk,
+	TerminalSessionState,
+	TerminalViewport,
+} from "./terminal-session-controller";
 export { createPrivateClient, PrivateApiError } from "./private-client";
 export type {
 	PrivateAccountStateDto,

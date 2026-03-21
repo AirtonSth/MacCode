@@ -147,6 +147,17 @@ const toObjectMessage = (raw: unknown): unknown => {
 		return parseJsonString(raw);
 	}
 
+	if (raw instanceof ArrayBuffer) {
+		const text = new TextDecoder().decode(raw);
+		return parseJsonString(text);
+	}
+
+	if (ArrayBuffer.isView(raw)) {
+		const chunk = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+		const text = new TextDecoder().decode(chunk);
+		return parseJsonString(text);
+	}
+
 	return raw;
 };
 
@@ -259,6 +270,90 @@ export const parseServerWsEvent = (raw: unknown): ServerWsEvent | null => {
 	}
 
 	if (
+		event === "terminal_session_snapshot" &&
+		isString(chatId) &&
+		isNumber(data.cols) &&
+		isString(data.cwd) &&
+		(data.exitCode === null || isNumber(data.exitCode)) &&
+		(data.exitedAt === null || isString(data.exitedAt)) &&
+		isNumber(data.rows) &&
+		isNumber(data.seq) &&
+		isString(data.sessionId) &&
+		isString(data.shell) &&
+		isString(data.snapshot) &&
+		isString(data.startedAt) &&
+		(data.status === "running" || data.status === "exited")
+	) {
+		return {
+			data: {
+				chatId,
+				cols: data.cols,
+				cwd: data.cwd,
+				exitCode: data.exitCode,
+				exitedAt: data.exitedAt,
+				rows: data.rows,
+				seq: data.seq,
+				sessionId: data.sessionId,
+				shell: data.shell,
+				snapshot: data.snapshot,
+				startedAt: data.startedAt,
+				status: data.status,
+			},
+			event: "terminal_session_snapshot",
+		};
+	}
+
+	if (
+		event === "terminal_output" &&
+		isString(chatId) &&
+		isString(data.data) &&
+		isNumber(data.seq) &&
+		isString(data.sessionId)
+	) {
+		return {
+			data: {
+				chatId,
+				data: data.data,
+				seq: data.seq,
+				sessionId: data.sessionId,
+			},
+			event: "terminal_output",
+		};
+	}
+
+	if (
+		event === "terminal_session_state" &&
+		isString(chatId) &&
+		isNumber(data.cols) &&
+		isString(data.cwd) &&
+		(data.exitCode === null || isNumber(data.exitCode)) &&
+		(data.exitedAt === null || isString(data.exitedAt)) &&
+		isNumber(data.rows) &&
+		isNumber(data.seq) &&
+		isString(data.sessionId) &&
+		isString(data.shell) &&
+		isString(data.startedAt) &&
+		(data.status === "running" || data.status === "exited")
+	) {
+		return {
+			data: {
+				chatId,
+				cols: data.cols,
+				cwd: data.cwd,
+				exitCode: data.exitCode,
+				exitedAt: data.exitedAt,
+				rows: data.rows,
+				seq: data.seq,
+				sessionId: data.sessionId,
+				shell: data.shell,
+				startedAt: data.startedAt,
+				status: data.status,
+			},
+			event: "terminal_session_state",
+		};
+	}
+
+	if (
 		event === "workspace_event" &&
 		isNumber(data.seq) &&
 		isString(data.ts) &&
@@ -323,6 +418,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 	let isConnected = false;
 	let socketErrored = false;
 	const activeChats = new Set<string>();
+	const activeTerminalChats = new Map<string, { cols?: number; rows?: number }>();
 	let activeWorkspaceSubscription: { clientId?: string; lastSeq: number } | null = null;
 	const sendQueue: QueuedClientEvent[] = [];
 
@@ -357,6 +453,18 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 
 		for (const queued of sendQueue) {
 			if (queued.payload.event === "join_chat") {
+				joinedInQueue.add(queued.payload.data.chatId);
+			}
+		}
+
+		return joinedInQueue;
+	};
+
+	const getQueuedJoinTerminalChatIds = () => {
+		const joinedInQueue = new Set<string>();
+
+		for (const queued of sendQueue) {
+			if (queued.payload.event === "join_terminal_session") {
 				joinedInQueue.add(queued.payload.data.chatId);
 			}
 		}
@@ -430,6 +538,18 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 				if (queued?.payload.event === "join_workspace") {
 					sendQueue.splice(index, 1);
 					break;
+				}
+			}
+		}
+
+		if (payload.event === "join_terminal_session") {
+			for (let index = sendQueue.length - 1; index >= 0; index -= 1) {
+				const queued = sendQueue[index];
+				if (
+					queued?.payload.event === "join_terminal_session" &&
+					queued.payload.data.chatId === payload.data.chatId
+				) {
+					sendQueue.splice(index, 1);
 				}
 			}
 		}
@@ -564,6 +684,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 
 			const queuedJoinChatIds = getQueuedJoinChatIds();
 			const queuedWorkspaceJoin = hasQueuedWorkspaceJoin();
+			const queuedJoinTerminalChatIds = getQueuedJoinTerminalChatIds();
 			flushQueue();
 
 			for (const chatId of activeChats) {
@@ -583,6 +704,23 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 
 			if (activeWorkspaceSubscription && !queuedWorkspaceJoin) {
 				sendWorkspaceJoinNow(activeWorkspaceSubscription);
+			}
+
+			for (const [chatId, viewport] of activeTerminalChats.entries()) {
+				if (queuedJoinTerminalChatIds.has(chatId)) {
+					continue;
+				}
+
+				socket?.send(
+					JSON.stringify({
+						data: {
+							chatId,
+							...(viewport.cols ? { cols: viewport.cols } : {}),
+							...(viewport.rows ? { rows: viewport.rows } : {}),
+						},
+						event: "join_terminal_session",
+					}),
+				);
 			}
 		};
 
@@ -690,6 +828,64 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 					event: "join_workspace",
 				});
 			}
+		},
+		sendJoinTerminalSession: (chatId: string, viewport?: { cols?: number; rows?: number }) => {
+			activeTerminalChats.set(chatId, {
+				cols: viewport?.cols,
+				rows: viewport?.rows,
+			});
+			send({
+				data: {
+					chatId,
+					...(viewport?.cols ? { cols: viewport.cols } : {}),
+					...(viewport?.rows ? { rows: viewport.rows } : {}),
+				},
+				event: "join_terminal_session",
+			});
+		},
+		sendLeaveTerminalSession: (chatId: string) => {
+			activeTerminalChats.delete(chatId);
+			send({
+				data: { chatId },
+				event: "leave_terminal_session",
+			});
+		},
+		sendTerminalInput: (chatId: string, data: string) => {
+			send({
+				data: { chatId, data },
+				event: "terminal_input",
+			});
+		},
+		sendTerminalResize: (chatId: string, viewport: { cols: number; rows: number }) => {
+			activeTerminalChats.set(chatId, viewport);
+			send({
+				data: {
+					chatId,
+					cols: viewport.cols,
+					rows: viewport.rows,
+				},
+				event: "terminal_resize",
+			});
+		},
+		sendTerminalSignal: (chatId: string, signal: "SIGINT" | "SIGTERM") => {
+			send({
+				data: { chatId, signal },
+				event: "terminal_signal",
+			});
+		},
+		sendTerminalRestart: (chatId: string, viewport?: { cols?: number; rows?: number }) => {
+			activeTerminalChats.set(chatId, {
+				cols: viewport?.cols,
+				rows: viewport?.rows,
+			});
+			send({
+				data: {
+					chatId,
+					...(viewport?.cols ? { cols: viewport.cols } : {}),
+					...(viewport?.rows ? { rows: viewport.rows } : {}),
+				},
+				event: "terminal_restart",
+			});
 		},
 		sendUserMessage: (
 			chatId: string,

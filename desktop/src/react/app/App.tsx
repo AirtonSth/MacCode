@@ -25,8 +25,8 @@ import { ConversationPanel } from "../features/conversation/ui/ConversationPanel
 import { GitQuickControl } from "../features/git/ui/GitQuickControl";
 import { useProjectGit } from "../features/git/model/useProjectGit";
 import { PrivateAccountSidebarFooter } from "../features/private-account/ui/private-account-sidebar-footer";
-import { useThreadTerminalSession } from "../features/terminal/model/useThreadTerminalSession";
-import { ThreadTerminalPanel } from "../features/terminal/ui/ThreadTerminalPanel";
+import { useThreadTerminalPtySession } from "../features/terminal/model/useThreadTerminalPtySession";
+import { ThreadTerminalPtyPanel } from "../features/terminal/ui/ThreadTerminalPtyPanel";
 import {
 	type ChatDTO,
 	type MessageDTO,
@@ -1102,19 +1102,30 @@ const AppContent = (): JSX.Element => {
 
 	const {
 		state: terminalState,
+		applyServerEvent: applyTerminalEvent,
+		restart: restartTerminalSession,
+		sendInput: sendTerminalInput,
+		sendResize: sendTerminalResize,
+		sendSignal: sendTerminalSignal,
 		setOpen: setTerminalOpen,
-		syncHistory: syncTerminalHistory,
-		runCommand: runTerminalCommand,
-	} = useThreadTerminalSession({
-		execCommand: async (chatId, input) => {
-			return await api.execTerminalCommand(chatId, input);
+	} = useThreadTerminalPtySession({
+		join: (chatId, viewport) => {
+			wsRef.current?.sendJoinTerminalSession(chatId, viewport);
 		},
-		historyLimit: 1_000,
-		getHistory: async (chatId, options) => {
-			return await api.getTerminalHistory(chatId, options);
+		leave: (chatId) => {
+			wsRef.current?.sendLeaveTerminalSession(chatId);
 		},
-		onError: (message) => {
-			addError(message, "rest", "terminal_error");
+		restart: (chatId, viewport) => {
+			wsRef.current?.sendTerminalRestart(chatId, viewport);
+		},
+		sendInput: (chatId, data) => {
+			wsRef.current?.sendTerminalInput(chatId, data);
+		},
+		sendResize: (chatId, viewport) => {
+			wsRef.current?.sendTerminalResize(chatId, viewport);
+		},
+		sendSignal: (chatId, signal) => {
+			wsRef.current?.sendTerminalSignal(chatId, signal);
 		},
 	});
 
@@ -2015,25 +2026,20 @@ const AppContent = (): JSX.Element => {
 								void refreshProjectGit();
 							}
 							break;
-						case "terminal_command_started":
-						case "terminal_entry_appended":
-						case "terminal_command_finished":
-							if (
-								chatId &&
-								chatId === selectedChatIdRef.current &&
-								terminalOpenByChatRef.current[chatId]
-							) {
-								await syncTerminalHistory(chatId);
-							}
-							break;
 					}
 
 					break;
 				}
+				case "terminal_session_snapshot":
+				case "terminal_output":
+				case "terminal_session_state":
+					applyTerminalEvent(event);
+					break;
 			}
 		},
 		[
 			addError,
+			applyTerminalEvent,
 			clearStreamingStateForChat,
 			dispatch,
 			isViewingLatestMessages,
@@ -2045,7 +2051,6 @@ const AppContent = (): JSX.Element => {
 			refreshUnreadThreadState,
 			refreshProjectGit,
 			syncFinalMessagesAfterDone,
-			syncTerminalHistory,
 		],
 	);
 
@@ -2302,16 +2307,12 @@ const AppContent = (): JSX.Element => {
 			if (activeChatIdsRef.current.has(state.selectedChatId) && isViewingLatestMessages(state.selectedChatId)) {
 				void syncMissedAssistantEventsForChat(state.selectedChatId);
 			}
-			if (terminalOpenByChatRef.current[state.selectedChatId]) {
-				void syncTerminalHistory(state.selectedChatId);
-			}
 		}
 	}, [
 		isViewingLatestMessages,
 		state.connectionState,
 		state.selectedChatId,
 		syncMissedAssistantEventsForChat,
-		syncTerminalHistory,
 	]);
 
 	const handleCreateProject = useCallback(
@@ -3255,21 +3256,7 @@ const AppContent = (): JSX.Element => {
 
 		const nextOpen = !Boolean(terminalOpenByChatRef.current[state.selectedChatId]);
 		setTerminalOpen(state.selectedChatId, nextOpen);
-		if (nextOpen) {
-			void syncTerminalHistory(state.selectedChatId);
-		}
-	}, [setTerminalOpen, state.selectedChatId, syncTerminalHistory]);
-
-	const handleTerminalRun = useCallback(
-		async (command: string) => {
-			if (!state.selectedChatId) {
-				return;
-			}
-
-			await runTerminalCommand(state.selectedChatId, command);
-		},
-		[runTerminalCommand, state.selectedChatId],
-	);
+	}, [setTerminalOpen, state.selectedChatId]);
 
 	const isThreadFocusMode = Boolean(activeThreadChat && state.selectedProjectId);
 	const selectedThreadTerminal = state.selectedChatId
@@ -3769,6 +3756,7 @@ const AppContent = (): JSX.Element => {
 																		? "bg-sky-400/10 text-sky-100"
 																		: "text-slate-200",
 																)}
+																data-testid="desktop-terminal-toggle"
 																onClick={handleToggleTerminal}
 																size="icon"
 																type="button"
@@ -3936,7 +3924,7 @@ const AppContent = (): JSX.Element => {
 											</div>
 
 											<AnimatePresence initial={false}>
-												{isTerminalOpen && state.selectedChatId ? (
+												{isTerminalOpen && state.selectedChatId && selectedThreadTerminal ? (
 													<motion.div
 														animate={{ height: "auto" }}
 														className="shrink-0 overflow-hidden border-t border-white/10"
@@ -3950,17 +3938,28 @@ const AppContent = (): JSX.Element => {
 														}
 													>
 														<div className="h-[42vh] min-h-[220px]">
-															<ThreadTerminalPanel
+															<ThreadTerminalPtyPanel
 																chatId={state.selectedChatId}
 																className="h-full rounded-none border-0"
-																error={selectedThreadTerminal?.error ?? null}
-																isExecuting={Boolean(selectedThreadTerminal?.isExecuting)}
-																isLoading={Boolean(selectedThreadTerminal?.isLoading)}
-																items={selectedThreadTerminal?.items ?? []}
 																key={state.selectedChatId}
-																onRun={(command) => {
-																	void handleTerminalRun(command);
+																onInput={(data) => {
+																	sendTerminalInput(state.selectedChatId!, data);
 																}}
+																onInterrupt={() => {
+																	sendTerminalSignal(state.selectedChatId!, "SIGINT");
+																}}
+																onResize={(viewport) => {
+																	sendTerminalResize(state.selectedChatId!, viewport);
+																}}
+																onRestart={() => {
+																	restartTerminalSession(state.selectedChatId!, selectedThreadTerminal
+																		? {
+																			cols: selectedThreadTerminal.cols,
+																			rows: selectedThreadTerminal.rows,
+																		}
+																		: undefined);
+																}}
+																state={selectedThreadTerminal}
 															/>
 														</div>
 													</motion.div>

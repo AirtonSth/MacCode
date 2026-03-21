@@ -2,16 +2,16 @@
   "baseUrl": "http://127.0.0.1:8835",
   "chats": {
     "active": {
-      "id": "f24b62cf-28b9-4fed-a964-94aa89827674",
+      "id": "db38260e-0365-4f4f-9907-cdc1b561ff7f",
       "title": "Active Thread"
     },
     "idleBottom": {
-      "id": "904dfcbf-1464-4a51-bee5-31369e7b5293",
+      "id": "1cf05746-91e5-4227-9972-ef6cb64c628e",
       "title": "Idle Bottom"
     },
     "paged": {
       "beforeMessageId": "message-08",
-      "id": "ebafec0a-c3d2-44a2-a8ef-c6bb3bae4aa3",
+      "id": "8f3a539b-e63c-41c7-8597-25f6bb582116",
       "latestPageMessageIds": [
         "message-08",
         "message-09",
@@ -29,9 +29,13 @@
       "title": "Paged Thread"
     },
     "idleTop": {
-      "id": "452f3185-1674-4a30-9175-7a608f7885f0",
+      "id": "7b20d943-79fa-4c84-91a6-eaf3b16bd7fe",
       "title": "Idle Top"
     }
   },
-  "projectId": "91ecc4e8-77ed-4a4c-96cd-071168f69d23"
+  "projectId": "45d739f7-1d17-4a63-96f3-319c8f3320f2",
+  "terminal": {
+    "expectedInitialCwd": "/private/var/folders/ml/j50g8bm51j53_h5fvlc1jzvw0000gn/T/remotecode-ios-e2e-workspace-3f0GQG/parent/project",
+    "expectedParentCwd": "/private/var/folders/ml/j50g8bm51j53_h5fvlc1jzvw0000gn/T/remotecode-ios-e2e-workspace-3f0GQG/parent"
+  }
 }

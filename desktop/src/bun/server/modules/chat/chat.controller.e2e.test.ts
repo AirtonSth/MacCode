@@ -111,7 +111,7 @@ test("server restart clears stale active/running chats when no codex run is actu
 		}
 
 		await firstServer.app.stop(true);
-		firstServer.db.close();
+		await firstServer.db.close();
 		firstServer = undefined;
 
 		secondServer = await createBackendServer({ databasePath, port: 0 });
@@ -141,11 +141,11 @@ test("server restart clears stale active/running chats when no codex run is actu
 	} finally {
 		if (firstServer) {
 			await firstServer.app.stop(true);
-			firstServer.db.close();
+			await firstServer.db.close();
 		}
 		if (secondServer) {
 			await secondServer.app.stop(true);
-			secondServer.db.close();
+			await secondServer.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 		rmSync(workspacePath, { force: true, recursive: true });

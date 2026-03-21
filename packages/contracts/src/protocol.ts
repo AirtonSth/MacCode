@@ -53,6 +53,37 @@ export interface FsListResponseDto {
 	path: string;
 }
 
+export type TerminalSessionStatus = "running" | "exited";
+
+export interface TerminalSessionSnapshotDto {
+	chatId: string;
+	cols: number;
+	cwd: string;
+	exitCode: number | null;
+	exitedAt: string | null;
+	rows: number;
+	seq: number;
+	sessionId: string;
+	shell: string;
+	snapshot: string;
+	startedAt: string;
+	status: TerminalSessionStatus;
+}
+
+export interface TerminalSessionStateDto {
+	chatId: string;
+	cols: number;
+	cwd: string;
+	exitCode: number | null;
+	exitedAt: string | null;
+	rows: number;
+	seq: number;
+	sessionId: string;
+	shell: string;
+	startedAt: string;
+	status: TerminalSessionStatus;
+}
+
 export type WorkspaceEventType =
 	| "project_created"
 	| "project_updated"
@@ -107,10 +138,66 @@ export interface ClientMessageEvent {
 	event: "user_message";
 }
 
+export interface ClientJoinTerminalSessionEvent {
+	data: {
+		chatId: string;
+		cols?: number;
+		rows?: number;
+	};
+	event: "join_terminal_session";
+}
+
+export interface ClientLeaveTerminalSessionEvent {
+	data: {
+		chatId: string;
+	};
+	event: "leave_terminal_session";
+}
+
+export interface ClientTerminalInputEvent {
+	data: {
+		chatId: string;
+		data: string;
+	};
+	event: "terminal_input";
+}
+
+export interface ClientTerminalResizeEvent {
+	data: {
+		chatId: string;
+		cols: number;
+		rows: number;
+	};
+	event: "terminal_resize";
+}
+
+export interface ClientTerminalSignalEvent {
+	data: {
+		chatId: string;
+		signal: "SIGINT" | "SIGTERM";
+	};
+	event: "terminal_signal";
+}
+
+export interface ClientTerminalRestartEvent {
+	data: {
+		chatId: string;
+		cols?: number;
+		rows?: number;
+	};
+	event: "terminal_restart";
+}
+
 export type ClientWsEvent =
 	| ClientJoinChatEvent
 	| ClientJoinWorkspaceEvent
-	| ClientMessageEvent;
+	| ClientMessageEvent
+	| ClientJoinTerminalSessionEvent
+	| ClientLeaveTerminalSessionEvent
+	| ClientTerminalInputEvent
+	| ClientTerminalResizeEvent
+	| ClientTerminalSignalEvent
+	| ClientTerminalRestartEvent;
 
 export interface AssistantDeltaServerEvent {
 	data: {
@@ -180,6 +267,26 @@ export interface WsErrorServerEvent {
 	event: "error";
 }
 
+export interface TerminalSessionSnapshotServerEvent {
+	data: TerminalSessionSnapshotDto;
+	event: "terminal_session_snapshot";
+}
+
+export interface TerminalOutputServerEvent {
+	data: {
+		chatId: string;
+		data: string;
+		seq: number;
+		sessionId: string;
+	};
+	event: "terminal_output";
+}
+
+export interface TerminalSessionStateServerEvent {
+	data: TerminalSessionStateDto;
+	event: "terminal_session_state";
+}
+
 export type ServerWsEvent =
 	| AssistantDeltaServerEvent
 	| AssistantDoneServerEvent
@@ -187,4 +294,7 @@ export type ServerWsEvent =
 	| AssistantStructuredServerEvent
 	| ChatUpdatedServerEvent
 	| WsErrorServerEvent
-	| WorkspaceServerEvent;
+	| WorkspaceServerEvent
+	| TerminalSessionSnapshotServerEvent
+	| TerminalOutputServerEvent
+	| TerminalSessionStateServerEvent;

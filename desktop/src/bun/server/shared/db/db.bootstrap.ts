@@ -43,6 +43,24 @@ const terminalEntriesCreateSql = `
 	)
 `;
 
+const terminalSessionsCreateSql = `
+	CREATE TABLE IF NOT EXISTS terminal_sessions (
+		chatId TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+		sessionId TEXT NOT NULL,
+		status TEXT NOT NULL CHECK(status IN ('running', 'exited')),
+		shell TEXT NOT NULL,
+		cwd TEXT NOT NULL,
+		cols INTEGER NOT NULL,
+		rows INTEGER NOT NULL,
+		seq INTEGER NOT NULL,
+		snapshot TEXT NOT NULL,
+		startedAt TEXT NOT NULL,
+		exitCode INTEGER,
+		exitedAt TEXT,
+		updatedAt TEXT NOT NULL
+	)
+`;
+
 const workspaceEventsCreateSql = `
 	CREATE TABLE IF NOT EXISTS workspace_events (
 		seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +142,7 @@ export class DatabaseBootstrap {
 		this.createWorkspaceSelectionTable(database);
 		this.createTerminalCommandsTable(database);
 		this.createOrMigrateTerminalEntriesTable(database);
+		this.createOrMigrateTerminalSessionsTable(database);
 		this.createWorkspaceEventsTable(database);
 		this.createChatStreamSnapshotsTable(database);
 		this.createChatStreamEventsTable(database);
@@ -132,7 +151,6 @@ export class DatabaseBootstrap {
 		this.createOrMigrateLiveActivitySubscriptionsTable(database);
 		this.createPushToStartTokensTable(database);
 		this.createThreadCompletionPushSubscriptionsTable(database);
-		this.dropLegacyTerminalSessionsTable(database);
 		this.createIndexes(database);
 	}
 
@@ -380,6 +398,119 @@ export class DatabaseBootstrap {
 		}
 	}
 
+	private static createOrMigrateTerminalSessionsTable(database: Database): void {
+		if (!this.hasTable(database, "terminal_sessions")) {
+			database.exec(terminalSessionsCreateSql);
+			return;
+		}
+
+		const requiredColumns = [
+			"chatId",
+			"sessionId",
+			"status",
+			"shell",
+			"cwd",
+			"cols",
+			"rows",
+			"seq",
+			"snapshot",
+			"startedAt",
+			"exitCode",
+			"exitedAt",
+			"updatedAt",
+		];
+		const hasAllColumns = requiredColumns.every((column) => this.hasColumn(database, "terminal_sessions", column));
+		const hasCurrentStatusConstraint = this.getTableDefinition(database, "terminal_sessions")
+			.includes("CHECK(status IN ('running', 'exited'))");
+
+		if (hasAllColumns && hasCurrentStatusConstraint) {
+			return;
+		}
+
+		database.exec("PRAGMA foreign_keys = OFF;");
+		database.exec("BEGIN;");
+
+		try {
+			database.exec(`
+				CREATE TABLE terminal_sessions_next (
+					chatId TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+					sessionId TEXT NOT NULL,
+					status TEXT NOT NULL CHECK(status IN ('running', 'exited')),
+					shell TEXT NOT NULL,
+					cwd TEXT NOT NULL,
+					cols INTEGER NOT NULL,
+					rows INTEGER NOT NULL,
+					seq INTEGER NOT NULL,
+					snapshot TEXT NOT NULL,
+					startedAt TEXT NOT NULL,
+					exitCode INTEGER,
+					exitedAt TEXT,
+					updatedAt TEXT NOT NULL
+				)
+			`);
+
+			const hasLegacyChatId = this.hasColumn(database, "terminal_sessions", "chatId");
+			const hasLegacyId = this.hasColumn(database, "terminal_sessions", "id");
+			if (hasLegacyChatId) {
+				const legacyStatus = this.hasColumn(database, "terminal_sessions", "status") ? "status" : "'exited'";
+				const legacyShell = this.hasColumn(database, "terminal_sessions", "shell") ? "shell" : "'/bin/sh'";
+				const legacyCwd = this.hasColumn(database, "terminal_sessions", "cwd") ? "cwd" : "''";
+				const legacyStartedAt = this.hasColumn(database, "terminal_sessions", "startedAt")
+					? "startedAt"
+					: "CURRENT_TIMESTAMP";
+				const legacyExitCode = this.hasColumn(database, "terminal_sessions", "exitCode") ? "exitCode" : "NULL";
+				const legacyExitedAt = this.hasColumn(database, "terminal_sessions", "exitedAt") ? "exitedAt" : "NULL";
+				const legacyUpdatedAt = this.hasColumn(database, "terminal_sessions", "updatedAt")
+					? "updatedAt"
+					: this.hasColumn(database, "terminal_sessions", "lastActivityAt")
+						? "lastActivityAt"
+						: "CURRENT_TIMESTAMP";
+
+				database.exec(`
+					INSERT INTO terminal_sessions_next (
+						chatId,
+						sessionId,
+						status,
+						shell,
+						cwd,
+						cols,
+						rows,
+						seq,
+						snapshot,
+						startedAt,
+						exitCode,
+						exitedAt,
+						updatedAt
+					)
+					SELECT
+						chatId,
+						${hasLegacyId ? "id" : "chatId"},
+						CASE WHEN ${legacyStatus} = 'running' THEN 'running' ELSE 'exited' END,
+						${legacyShell},
+						${legacyCwd},
+						80,
+						24,
+						0,
+						'',
+						${legacyStartedAt},
+						${legacyExitCode},
+						${legacyExitedAt},
+						${legacyUpdatedAt}
+					FROM terminal_sessions
+				`);
+			}
+
+			database.exec("DROP TABLE terminal_sessions;");
+			database.exec("ALTER TABLE terminal_sessions_next RENAME TO terminal_sessions;");
+			database.exec("COMMIT;");
+		} catch (error) {
+			database.exec("ROLLBACK;");
+			throw error;
+		} finally {
+			database.exec("PRAGMA foreign_keys = ON;");
+		}
+	}
+
 	private static createWorkspaceEventsTable(database: Database): void {
 		database.exec(workspaceEventsCreateSql);
 	}
@@ -517,16 +648,6 @@ export class DatabaseBootstrap {
 		database.exec(threadCompletionPushSubscriptionsCreateSql);
 	}
 
-	private static dropLegacyTerminalSessionsTable(database: Database): void {
-		if (!this.hasTable(database, "terminal_sessions")) {
-			return;
-		}
-
-		database.exec("PRAGMA foreign_keys = OFF;");
-		database.exec("DROP TABLE terminal_sessions;");
-		database.exec("PRAGMA foreign_keys = ON;");
-	}
-
 	private static createIndexes(database: Database): void {
 		database.exec("CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_chats_project ON chats(projectId, updatedAt DESC)");
@@ -542,6 +663,9 @@ export class DatabaseBootstrap {
 		);
 		database.exec(
 			"CREATE INDEX IF NOT EXISTS idx_terminal_entries_command_id ON terminal_entries(commandId, id ASC)",
+		);
+		database.exec(
+			"CREATE INDEX IF NOT EXISTS idx_terminal_sessions_updated_at ON terminal_sessions(updatedAt DESC)",
 		);
 		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_events_seq ON workspace_events(seq ASC)");
 		database.exec("CREATE INDEX IF NOT EXISTS idx_workspace_events_created_at ON workspace_events(createdAt ASC)");

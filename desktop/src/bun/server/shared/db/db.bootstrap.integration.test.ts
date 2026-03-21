@@ -288,7 +288,7 @@ test("DB initialization migrates legacy chats schema and preserves data", async 
 	}
 });
 
-test("DB initialization rebuilds legacy terminal tables to REST terminal schema", async () => {
+test("DB initialization rebuilds legacy terminal tables to current schemas", async () => {
 	const root = mkdtempSync(join(tmpdir(), "remotecode-db-terminal-migrate-"));
 	const databasePath = join(root, "remodecode.sqlite");
 	const client = await createDatabaseClient(databasePath);
@@ -360,10 +360,30 @@ test("DB initialization rebuilds legacy terminal tables to REST terminal schema"
 
 		initializeDatabaseSchema(client.sqlite);
 
-		const hasLegacySessionsTable = client.sqlite
-			.prepare("SELECT COUNT(1) AS count FROM sqlite_master WHERE type = 'table' AND name = 'terminal_sessions'")
-			.get() as { count: number };
-		expect(hasLegacySessionsTable.count).toBe(0);
+		const terminalSessionColumns = client.sqlite
+			.prepare("PRAGMA table_info(terminal_sessions)")
+			.all()
+			.map((row) => (row as { name: string }).name);
+
+		expect(terminalSessionColumns).toEqual(
+			expect.arrayContaining([
+				"chatId",
+				"sessionId",
+				"status",
+				"shell",
+				"cwd",
+				"cols",
+				"rows",
+				"seq",
+				"snapshot",
+				"startedAt",
+				"exitCode",
+				"exitedAt",
+				"updatedAt",
+			]),
+		);
+		expect(terminalSessionColumns).not.toContain("id");
+		expect(terminalSessionColumns).not.toContain("lastActivityAt");
 
 		const terminalEntryColumns = client.sqlite
 			.prepare("PRAGMA table_info(terminal_entries)")

@@ -46,7 +46,7 @@ export const TestServerFactory = {
 
 			cleanup: async () => {
 				await backend.app.stop(true);
-				backend.db.close();
+				await backend.db.close();
 				rmSync(root, { force: true, recursive: true });
 			},
 

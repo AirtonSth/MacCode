@@ -237,6 +237,37 @@ export interface TerminalEntryDTO {
 	createdAt: string;
 }
 
+export type TerminalSessionStatus = "running" | "exited";
+
+export interface TerminalSessionSnapshotDTO {
+	chatId: string;
+	cols: number;
+	cwd: string;
+	exitCode: number | null;
+	exitedAt: string | null;
+	rows: number;
+	seq: number;
+	sessionId: string;
+	shell: string;
+	snapshot: string;
+	startedAt: string;
+	status: TerminalSessionStatus;
+}
+
+export interface TerminalSessionStateDTO {
+	chatId: string;
+	cols: number;
+	cwd: string;
+	exitCode: number | null;
+	exitedAt: string | null;
+	rows: number;
+	seq: number;
+	sessionId: string;
+	shell: string;
+	startedAt: string;
+	status: TerminalSessionStatus;
+}
+
 export interface AssistantDeltaEvent {
 	data: {
 		chatId: string;
@@ -283,6 +314,26 @@ export interface ChatUpdatedEvent {
 	event: "chat_updated";
 }
 
+export interface TerminalSessionSnapshotEvent {
+	data: TerminalSessionSnapshotDTO;
+	event: "terminal_session_snapshot";
+}
+
+export interface TerminalOutputEvent {
+	data: {
+		chatId: string;
+		data: string;
+		seq: number;
+		sessionId: string;
+	};
+	event: "terminal_output";
+}
+
+export interface TerminalSessionStateEvent {
+	data: TerminalSessionStateDTO;
+	event: "terminal_session_state";
+}
+
 export interface WorkspaceEventEnvelope {
 	seq: number;
 	ts: string;
@@ -312,6 +363,9 @@ export type ServerWsEvent =
 	| AssistantSnapshotEvent
 	| AssistantEvent
 	| ChatUpdatedEvent
+	| TerminalSessionSnapshotEvent
+	| TerminalOutputEvent
+	| TerminalSessionStateEvent
 	| WorkspaceEvent
 	| WsErrorEvent;
 
@@ -345,7 +399,66 @@ export interface ClientJoinWorkspaceEvent {
 	event: "join_workspace";
 }
 
-export type ClientWsEvent = ClientJoinEvent | ClientJoinWorkspaceEvent | ClientMessageEvent;
+export interface ClientJoinTerminalSessionEvent {
+	data: {
+		chatId: string;
+		cols?: number;
+		rows?: number;
+	};
+	event: "join_terminal_session";
+}
+
+export interface ClientLeaveTerminalSessionEvent {
+	data: {
+		chatId: string;
+	};
+	event: "leave_terminal_session";
+}
+
+export interface ClientTerminalInputEvent {
+	data: {
+		chatId: string;
+		data: string;
+	};
+	event: "terminal_input";
+}
+
+export interface ClientTerminalResizeEvent {
+	data: {
+		chatId: string;
+		cols: number;
+		rows: number;
+	};
+	event: "terminal_resize";
+}
+
+export interface ClientTerminalSignalEvent {
+	data: {
+		chatId: string;
+		signal: "SIGINT" | "SIGTERM";
+	};
+	event: "terminal_signal";
+}
+
+export interface ClientTerminalRestartEvent {
+	data: {
+		chatId: string;
+		cols?: number;
+		rows?: number;
+	};
+	event: "terminal_restart";
+}
+
+export type ClientWsEvent =
+	| ClientJoinEvent
+	| ClientJoinWorkspaceEvent
+	| ClientMessageEvent
+	| ClientJoinTerminalSessionEvent
+	| ClientLeaveTerminalSessionEvent
+	| ClientTerminalInputEvent
+	| ClientTerminalResizeEvent
+	| ClientTerminalSignalEvent
+	| ClientTerminalRestartEvent;
 
 export type AssistantStreamItemType = "reasoning" | "tool" | "plan" | "assistant_message";
 export type AssistantStreamItemState = "running" | "preview" | "collapsed" | "completed" | "failed" | "cancelled";

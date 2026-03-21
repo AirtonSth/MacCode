@@ -26,6 +26,7 @@ import { GlassPanel } from "../../../shared/ui/glass-panel";
 import { MessageMarkdown } from "../../../shared/ui/markdown-message";
 import { useWorkspaceShell } from "../model/use-workspace-shell";
 import { StreamingTimeline } from "./streamingTimeline";
+import { TerminalNativePanel } from "./terminal-native-panel";
 
 const styles = StyleSheet.create({
 	composerInput: {
@@ -62,6 +63,7 @@ export const WorkspaceScreen = () => {
 		projects,
 		selectedModel,
 		selectedReasoningEffort,
+		restartTerminalSession,
 		selectChat,
 		selectProject,
 		setPermissionMode,
@@ -73,8 +75,13 @@ export const WorkspaceScreen = () => {
 		selectedChatId,
 		selectedProjectId,
 		sendMessage,
+		sendTerminalInput,
+		sendTerminalResize,
+		sendTerminalSignal,
+		setTerminalOpen,
 		streamingText,
 		streamingTurn,
+		terminalSession,
 		toggleFavorite,
 	} = useWorkspaceShell({
 		isActive: isFocused,
@@ -95,13 +102,12 @@ export const WorkspaceScreen = () => {
 	const [gitSummary, setGitSummary] = useState<string>("Git status unavailable");
 	const [gitBranchInput, setGitBranchInput] = useState<string>("");
 	const [gitCommitMessage, setGitCommitMessage] = useState<string>("");
-	const [terminalInput, setTerminalInput] = useState<string>("");
-	const [terminalOutput, setTerminalOutput] = useState<string>("");
 	const dimensions = useWindowDimensions();
 	const isWide = dimensions.width >= 960;
 	const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(isWide);
 	const messagesScrollRef = useRef<ScrollView | null>(null);
 	const previousLastMessageIdRef = useRef<string | null>(null);
+	const previousTerminalChatIdRef = useRef<string | null>(null);
 	const favoriteProjects = useMemo(
 		() => projects.filter((project) => project.isFavorite),
 		[projects],
@@ -132,6 +138,27 @@ export const WorkspaceScreen = () => {
 	useEffect(() => {
 		previousLastMessageIdRef.current = null;
 	}, [selectedChatId]);
+
+	useEffect(() => {
+		const previousChatId = previousTerminalChatIdRef.current;
+		if (previousChatId && previousChatId !== selectedChatId) {
+			setTerminalOpen(previousChatId, false);
+		}
+
+		if (selectedChatId) {
+			setTerminalOpen(selectedChatId, isFocused);
+		}
+
+		previousTerminalChatIdRef.current = selectedChatId;
+	}, [isFocused, selectedChatId, setTerminalOpen]);
+
+	useEffect(() => {
+		return () => {
+			if (previousTerminalChatIdRef.current) {
+				setTerminalOpen(previousTerminalChatIdRef.current, false);
+			}
+		};
+	}, [setTerminalOpen]);
 
 	const handleMessagesScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
 		const threshold = 32;
@@ -235,17 +262,37 @@ export const WorkspaceScreen = () => {
 		await handleRefreshGit();
 	};
 
-	const handleTerminalRun = async () => {
-		const command = terminalInput.trim();
-		if (!selectedChatId || command.length === 0) {
+	const handleTerminalInput = useCallback((data: string) => {
+		if (!selectedChatId) {
 			return;
 		}
 
-		const result = await api.execTerminalCommand(selectedChatId, { command });
-		const transcript = result.entries.map((entry) => `[${entry.stream}] ${entry.data}`).join("");
-		setTerminalOutput((current) => `${current}\\n$ ${command}\\n${transcript}`.trim());
-		setTerminalInput("");
-	};
+		sendTerminalInput(selectedChatId, data);
+	}, [selectedChatId, sendTerminalInput]);
+
+	const handleTerminalResize = useCallback((viewport: { cols: number; rows: number }) => {
+		if (!selectedChatId) {
+			return;
+		}
+
+		sendTerminalResize(selectedChatId, viewport);
+	}, [selectedChatId, sendTerminalResize]);
+
+	const handleInterruptTerminal = useCallback(() => {
+		if (!selectedChatId) {
+			return;
+		}
+
+		sendTerminalSignal(selectedChatId, "SIGINT");
+	}, [selectedChatId, sendTerminalSignal]);
+
+	const handleRestartTerminal = useCallback(() => {
+		if (!selectedChatId) {
+			return;
+		}
+
+		restartTerminalSession(selectedChatId);
+	}, [restartTerminalSession, selectedChatId]);
 
 	return (
 		<KeyboardAvoidingView
@@ -1071,32 +1118,17 @@ export const WorkspaceScreen = () => {
 							<Text style={{ color: theme.colors.textPrimary, fontSize: 14, fontWeight: "700" }}>
 								Terminal
 							</Text>
-							<TextInput
-								autoCapitalize="none"
-								onChangeText={setTerminalInput}
-								placeholder="Run command"
-								placeholderTextColor={theme.colors.muted}
-								style={{
-									backgroundColor: "rgba(255,255,255,0.04)",
-									borderColor: theme.colors.borderSoft,
-									borderRadius: theme.borderRadius.chip,
-									borderWidth: 1,
-									color: theme.colors.textPrimary,
-									fontSize: 12,
-									paddingHorizontal: 10,
-									paddingVertical: 8,
-								}}
-								value={terminalInput}
-							/>
-							<GhostButton
-								label="Run Command"
-								onPress={() => {
-									void handleTerminalRun();
-								}}
-							/>
-							<Text selectable style={{ color: theme.colors.muted, fontSize: 12 }}>
-								{terminalOutput.length > 0 ? terminalOutput : "No terminal output yet."}
-							</Text>
+							<View style={{ minHeight: 280 }}>
+								<TerminalNativePanel
+									chatId={selectedChatId}
+									onInput={handleTerminalInput}
+									onInterrupt={handleInterruptTerminal}
+									onOpenFilePicker={null}
+									onResize={handleTerminalResize}
+									onRestart={handleRestartTerminal}
+									state={terminalSession}
+								/>
+							</View>
 						</View>
 					</GlassPanel>
 				</View>

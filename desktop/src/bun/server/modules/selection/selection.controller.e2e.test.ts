@@ -63,7 +63,7 @@ test("selection persists across server restarts with shared sqlite", async () =>
 		expect(saved.selectedReasoningEffort).toBe("high");
 
 		await firstServer.app.stop(true);
-		firstServer.db.close();
+		await firstServer.db.close();
 		firstServer = undefined;
 
 		secondServer = await createBackendServer({ databasePath, port: 0 });
@@ -87,11 +87,11 @@ test("selection persists across server restarts with shared sqlite", async () =>
 	} finally {
 		if (firstServer) {
 			await firstServer.app.stop(true);
-			firstServer.db.close();
+			await firstServer.db.close();
 		}
 		if (secondServer) {
 			await secondServer.app.stop(true);
-			secondServer.db.close();
+			await secondServer.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}
@@ -120,7 +120,7 @@ test("PATCH /v1/selection requires project when chat is selected", async () => {
 	} finally {
 		if (server) {
 			await server.app.stop(true);
-			server.db.close();
+			await server.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}
@@ -158,7 +158,7 @@ test("PATCH /v1/selection rejects provider changes for an existing thread", asyn
 	} finally {
 		if (server) {
 			await server.app.stop(true);
-			server.db.close();
+			await server.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}
@@ -211,7 +211,7 @@ test("PATCH /v1/selection rejects provider changes for codex threads once conten
 		}
 		if (server) {
 			await server.app.stop(true);
-			server.db.close();
+			await server.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}
@@ -272,7 +272,7 @@ test("PATCH /v1/selection clears stale model and reasoning when provider changes
 	} finally {
 		if (server) {
 			await server.app.stop(true);
-			server.db.close();
+			await server.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}
@@ -333,7 +333,7 @@ test("deleting a selected thread clears selectedChatId in sqlite", async () => {
 	} finally {
 		if (server) {
 			await server.app.stop(true);
-			server.db.close();
+			await server.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}
@@ -391,7 +391,7 @@ test("deleting a selected workspace clears selectedProjectId in sqlite", async (
 	} finally {
 		if (server) {
 			await server.app.stop(true);
-			server.db.close();
+			await server.db.close();
 		}
 		rmSync(root, { force: true, recursive: true });
 	}

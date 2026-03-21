@@ -21,6 +21,8 @@ IOS_SIMULATOR_UDID="${RC_IOS_SIMULATOR_UDID:-}"
 IOS_SIMULATOR_ARCH="${RC_IOS_SIMULATOR_ARCH:-arm64}"
 IOS_BUILD_LOG="${TMPDIR:-/tmp}/remotecode-ios-e2e-build.log"
 IOS_FORCE_REBUILD="${RC_IOS_FORCE_REBUILD:-1}"
+IOS_E2E_FLOWS="${RC_IOS_E2E_FLOWS:-thread-activity,chat-pagination,terminal}"
+STATE_PATH="${RC_IOS_E2E_STATE_PATH:-${SCRIPT_DIR}/.ios-e2e-state.json}"
 
 if [[ -z "${RC_AD_SESSION:-}" ]]; then
 	export RC_AD_SESSION="${SESSION_PREFIX}-$(date +%s)"
@@ -242,8 +244,28 @@ chmod +x "${SCRIPT_DIR}/fake-codex.sh" "${FAKE_CODEX_DIR}/codex"
 export PATH="${FAKE_CODEX_DIR}:${PATH}"
 
 echo "Starting deterministic iOS e2e backend..."
+rm -f "${STATE_PATH}"
 bun run "${SCRIPT_DIR}/start-ios-e2e-backend.ts" > "${BACKEND_LOG}" 2>&1 &
 BACKEND_PID="$!"
+
+echo "Waiting for iOS e2e state file..."
+attempt=0
+until [[ -f "${STATE_PATH}" ]]; do
+	attempt=$((attempt + 1))
+	if [[ "${attempt}" -ge 60 ]]; then
+		echo "Timed out waiting for iOS e2e state file." >&2
+		tail -n 120 "${BACKEND_LOG}" >&2 || true
+		exit 1
+	fi
+	sleep 1
+done
+
+BASE_URL="$(jq -r '.baseUrl' "${STATE_PATH}")"
+if [[ -z "${BASE_URL}" || "${BASE_URL}" == "null" ]]; then
+	echo "Unable to resolve iOS e2e backend baseUrl from ${STATE_PATH}." >&2
+	tail -n 120 "${BACKEND_LOG}" >&2 || true
+	exit 1
+fi
 
 echo "Waiting for backend health at ${BASE_URL}..."
 attempt=0
@@ -260,9 +282,18 @@ done
 
 echo "Running iOS thread activity flow..."
 echo "Using agent-device session: ${RC_AD_SESSION}"
-bash "${SCRIPT_DIR}/ios-thread-activity-flow.sh"
+if [[ ",${IOS_E2E_FLOWS}," == *",thread-activity,"* ]]; then
+	bash "${SCRIPT_DIR}/ios-thread-activity-flow.sh"
+fi
 
 echo "Running iOS chat pagination flow..."
-bash "${SCRIPT_DIR}/ios-chat-pagination-flow.sh"
+if [[ ",${IOS_E2E_FLOWS}," == *",chat-pagination,"* ]]; then
+	bash "${SCRIPT_DIR}/ios-chat-pagination-flow.sh"
+fi
+
+echo "Running iOS terminal flow..."
+if [[ ",${IOS_E2E_FLOWS}," == *",terminal,"* ]]; then
+	bash "${SCRIPT_DIR}/ios-terminal-flow.sh"
+fi
 
 echo "iOS E2E suite completed."

@@ -85,6 +85,7 @@ import {
 	reconcileTrackedLiveActivityChats,
 	resolveTrackedLiveActivityChats,
 } from "./live-activity-tracking";
+import { useTerminalPtySession } from "./use-terminal-pty-session";
 
 type WorkspaceShellScope = "legacy" | "workspaces" | "threads" | "chat";
 
@@ -545,6 +546,26 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const isProviderHydratedRef = useRef(isSelectedProvider(initialSelection.selectedProvider));
 	const lastProviderSyncChatIdRef = useRef<string | null>(null);
 	const realtimeRef = useRef<ReturnType<typeof createRealtimeClient> | null>(null);
+	const terminalSession = useTerminalPtySession({
+		join: (chatId, viewport) => {
+			realtimeRef.current?.sendJoinTerminalSession(chatId, viewport);
+		},
+		leave: (chatId) => {
+			realtimeRef.current?.sendLeaveTerminalSession(chatId);
+		},
+		restart: (chatId, viewport) => {
+			realtimeRef.current?.sendTerminalRestart(chatId, viewport);
+		},
+		sendInput: (chatId, data) => {
+			realtimeRef.current?.sendTerminalInput(chatId, data);
+		},
+		sendResize: (chatId, viewport) => {
+			realtimeRef.current?.sendTerminalResize(chatId, viewport);
+		},
+		sendSignal: (chatId, signal) => {
+			realtimeRef.current?.sendTerminalSignal(chatId, signal);
+		},
+	});
 	const lastWorkspaceSeqRef = useRef<number>(0);
 	const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
 	const selectedChatIdRef = useRef<string | null>(selectedChatId);
@@ -1540,6 +1561,15 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 
 	const handleServerEvent = useCallback(
 		(event: ServerWsEvent) => {
+			if (
+				event.event === "terminal_session_snapshot" ||
+				event.event === "terminal_output" ||
+				event.event === "terminal_session_state"
+			) {
+				terminalSession.applyServerEvent(event);
+				return;
+			}
+
 			const isBackgroundAppState = appStateRef.current === "background" || appStateRef.current === "inactive";
 
 			const clearSendingForChat = (chatId: string) => {
@@ -2014,6 +2044,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 				setSendingByChat,
 				shouldEnableChatsQuery,
 				startRunningLiveActivity,
+				terminalSession,
 				updateRunningLiveActivity,
 			],
 	);
@@ -3118,6 +3149,7 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 	const hasSelectionSnapshot = selectionQuery.data !== undefined || selectionQuery.isFetched;
 	const activeThreads = activeThreadsQuery.data ?? [];
 	const isActiveThreadsLoading = activeThreadsQuery.isPending && activeThreads.length === 0;
+	const selectedTerminalSession = selectedChatId ? terminalSession.state.chats[selectedChatId] ?? null : null;
 
 	return {
 		activeThreads,
@@ -3173,6 +3205,12 @@ export const useWorkspaceShell = (options?: UseWorkspaceShellOptions) => {
 		streamHistoryTurns,
 		streamingText,
 		streamingTurn: streamTurnQuery.data ?? null,
+		terminalSession: selectedTerminalSession,
+		restartTerminalSession: terminalSession.restart,
+		sendTerminalInput: terminalSession.sendInput,
+		sendTerminalResize: terminalSession.sendResize,
+		sendTerminalSignal: terminalSession.sendSignal,
+		setTerminalOpen: terminalSession.setOpen,
 		toggleFavorite,
 	};
 };

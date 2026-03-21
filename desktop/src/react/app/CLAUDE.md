@@ -8,4 +8,15 @@
 | ID | Time | T | Title | Read |
 |----|------|---|-------|------|
 | #2166 | 9:41 PM | 🟣 | Active threads visibility and quick access in desktop and mobile | ~652 |
+
+### Mar 20, 2026
+
+| ID | Time | T | Title | Read |
+|----|------|---|-------|------|
+| #2491 | 5:41 PM | ✅ | Removed active mode fullscreen lava lamp from layout shell | ~374 |
+| #2490 | 5:39 PM | 🟣 | Implemented dual-mode lava lamp: idle sidebar vs active fullscreen | ~537 |
+| #2489 | 5:38 PM | ✅ | Added relative positioning to main grid container for full-screen lava lamp effect | ~421 |
+| #2488 | 5:37 PM | 🟣 | Added conditional active-mode lava lamp background to main conversation area | ~372 |
+| #2481 | 5:25 PM | 🔴 | Extended z-index fix to sidebar ScrollArea for lava lamp layering | ~263 |
+| #2480 | " | 🔴 | Fixed z-index layering for lava lamp background in sidebar | ~296 |
 </claude-mem-context>

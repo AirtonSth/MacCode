@@ -206,7 +206,7 @@ test("desktop private-account browser routes hand off to the web flow and localh
 		if (backendHandle) {
 			await backendHandle.privateAccountService.logout();
 			await backendHandle.app.stop(true);
-			backendHandle.db.close();
+			await backendHandle.db.close();
 		}
 		await privateApp.stop(true);
 		rmSync(root, { force: true, recursive: true });

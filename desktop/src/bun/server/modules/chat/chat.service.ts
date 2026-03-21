@@ -27,10 +27,15 @@ export interface ChatServiceContract {
 	deleteChat: (id: string) => Promise<boolean>;
 }
 
+interface ChatServiceHooks {
+	onDeleteChat?: (chatId: string) => Promise<void>;
+}
+
 export class ChatService implements ChatServiceContract {
 	constructor(
 		private readonly chatRepository: ChatRepository,
 		private readonly projectRepository: ProjectRepository,
+		private readonly hooks: ChatServiceHooks = {},
 	) {}
 
 	async getChatById(chatId: string): Promise<ChatDTO | null> {
@@ -61,7 +66,7 @@ export class ChatService implements ChatServiceContract {
 		};
 	}
 
-async createChat(projectId: string, title: string, provider?: ChatProvider): Promise<ChatDTO | null> {
+	async createChat(projectId: string, title: string, provider?: ChatProvider): Promise<ChatDTO | null> {
 		const project = await this.projectRepository.findProjectById(projectId);
 
 		if (!project) {
@@ -70,8 +75,6 @@ async createChat(projectId: string, title: string, provider?: ChatProvider): Pro
 
 		return this.chatRepository.createChat(projectId, title, provider);
 	}
-
-	
 
 	async listByProjectId(projectId: string): Promise<ChatDTO[] | null> {
 		const project = await this.projectRepository.findProjectById(projectId);
@@ -131,6 +134,7 @@ async createChat(projectId: string, title: string, provider?: ChatProvider): Pro
 	}
 
 	async deleteChat(id: string): Promise<boolean> {
+		await this.hooks.onDeleteChat?.(id);
 		return this.chatRepository.deleteChat(id);
 	}
 }
@@ -138,4 +142,4 @@ async createChat(projectId: string, title: string, provider?: ChatProvider): Pro
 export const createChatService = (repositories: {
 	chat: ChatRepository;
 	project: ProjectRepository;
-}) => new ChatService(repositories.chat, repositories.project);
+}, hooks?: ChatServiceHooks) => new ChatService(repositories.chat, repositories.project, hooks);

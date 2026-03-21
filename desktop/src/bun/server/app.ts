@@ -45,6 +45,8 @@ import { createPrivateAccountService } from "./modules/private-account/private-a
 import { TerminalController } from "./modules/terminal/terminal.controller";
 import { createTerminalRepository } from "./modules/terminal/terminal.repository";
 import { createTerminalService } from "./modules/terminal/terminal.service";
+import { createTerminalSessionRepository } from "./modules/terminal-session/terminal-session.repository";
+import { createTerminalSessionService } from "./modules/terminal-session/terminal-session.service";
 import { createWorkspaceEventsRepository } from "./modules/workspace-events/workspace-events.repository";
 import { createWorkspaceEventsService } from "./modules/workspace-events/workspace-events.service";
 import { createChatStreamEventRepository } from "./modules/ws/chat-stream-event.repository";
@@ -166,6 +168,7 @@ export const ServerBootstrap = {
 		chatRepository.resetRuntimeActivityState();
 		const workspaceSelectionRepository = createSelectionRepository(databaseClient.orm);
 		const terminalRepository = createTerminalRepository(databaseClient.orm);
+		const terminalSessionRepository = createTerminalSessionRepository(databaseClient.orm);
 		const workspaceEventsRepository = createWorkspaceEventsRepository(databaseClient.orm);
 		const chatStreamEventRepository = createChatStreamEventRepository(databaseClient.orm);
 		const chatStreamSnapshotRepository = createChatStreamSnapshotRepository(databaseClient.orm);
@@ -176,7 +179,16 @@ export const ServerBootstrap = {
 		const threadCompletionPushRepository = createThreadCompletionPushRepository(databaseClient.orm);
 
 		const projectService = new ProjectService(projectRepository);
-		const chatService = new ChatService(chatRepository, projectRepository);
+		const terminalSessionService = createTerminalSessionService({
+			chat: chatRepository,
+			project: projectRepository,
+			terminalSession: terminalSessionRepository,
+		});
+		const chatService = new ChatService(chatRepository, projectRepository, {
+			onDeleteChat: async (chatId) => {
+				await terminalSessionService.cleanupChat(chatId);
+			},
+		});
 		const messageService = new MessageService(
 			chatRepository,
 			messageRepository,
@@ -329,14 +341,15 @@ export const ServerBootstrap = {
 					.use(TerminalController.build(terminalService, workspaceEventsService))
 					.use(FsController.build(fsService)),
 			)
-			.use(WsController.build(wsService, workspaceEventsService));
+			.use(WsController.build(wsService, workspaceEventsService, terminalSessionService));
 
 		return {
 			app,
 			privateAccountService,
 
 			db: {
-				close: () => {
+				close: async () => {
+					await terminalSessionService.shutdown();
 					databaseClient.close();
 				},
 			},
@@ -398,7 +411,7 @@ export const buildServerApp = async (databasePath?: string) =>
 export interface BackendHandle {
 	app: Awaited<ReturnType<typeof buildServerApp>>["app"];
 	db: {
-		close: () => void;
+		close: () => Promise<void>;
 	};
 	privateAccountService: Awaited<ReturnType<typeof buildServerApp>>["privateAccountService"];
 	server: unknown;

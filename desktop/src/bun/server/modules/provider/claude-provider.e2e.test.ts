@@ -53,8 +53,8 @@ describe("Claude Provider E2E", () => {
 		root = result.root;
 	});
 
-	afterAll(() => {
-		testServer?.db.close();
+	afterAll(async () => {
+		await testServer?.db.close();
 		if (root) {
 			rmSync(root, { force: true, recursive: true });
 		}

@@ -3,6 +3,8 @@ set -euo pipefail
 
 APP_NAME="${RC_APP_NAME:-RemoteCode}"
 SESSION_NAME="${RC_AD_SESSION:-rc-e2e-terminal}"
+STATE_PATH="${RC_IOS_E2E_STATE_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.ios-e2e-state.json}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -n "${AGENT_DEVICE_BIN:-}" ]; then
 	# shellcheck disable=SC2206
@@ -34,6 +36,11 @@ fill() {
 get_text() {
 	local test_id="$1"
 	ad get text "id=\"${test_id}\""
+}
+
+type_text() {
+	local value="$1"
+	ad type "${value}" >/dev/null
 }
 
 wait_for() {
@@ -92,47 +99,61 @@ ad wait 1200 >/dev/null
 
 ensure_chat
 
-echo "Opening desktop file picker from chat composer..."
-fill "chat-input" "draft message stays here"
-click "chat-attach-button"
-wait_for "chat-file-picker-modal"
-wait_for "chat-file-picker-root-0"
-click "chat-file-picker-root-0"
-ad wait 600 >/dev/null
-
-if exists "chat-file-picker-directory-entry-0"; then
-	click "chat-file-picker-directory-entry-0"
-	ad wait 600 >/dev/null
-fi
-
-click "chat-file-picker-select-folder-button"
-click "chat-file-picker-add-button"
-ad wait 800 >/dev/null
-
-if exists "chat-file-picker-modal"; then
-	echo "File picker modal did not close after add action" >&2
-	exit 1
-fi
-
-composer_value="$(get_text "chat-input" | tr -d '\r' || true)"
-if [[ -z "${composer_value}" ]]; then
-	echo "Composer is empty after selecting desktop path" >&2
-	exit 1
-fi
-
-if [[ "${composer_value}" != *"/"* && "${composer_value}" != *"\\"* ]]; then
-	echo "Composer value does not contain an absolute path: ${composer_value}" >&2
-	exit 1
-fi
-
 echo "Opening terminal modal..."
 click "chat-terminal-open-button"
 wait_for "terminal-modal"
+wait_for "terminal-session-cwd"
 
-echo "Running terminal command..."
-fill "terminal-command-input" "echo remotecode-ios-e2e"
-click "terminal-run-button"
+expected_initial_cwd="$(jq -r '.terminal.expectedInitialCwd' "${STATE_PATH}")"
+expected_parent_cwd="$(jq -r '.terminal.expectedParentCwd' "${STATE_PATH}")"
+current_cwd="$(get_text "terminal-session-cwd" | tr -d '\r' || true)"
+
+if [[ "${current_cwd}" != "${expected_initial_cwd}" ]]; then
+	echo "Unexpected initial terminal cwd: ${current_cwd} (expected ${expected_initial_cwd})" >&2
+	exit 1
+fi
+
+echo "Changing directory inside the PTY session..."
+click "terminal-surface"
+type_text $'cd ..\n'
+ad wait 1200 >/dev/null
+updated_cwd="$(get_text "terminal-session-cwd" | tr -d '\r' || true)"
+if [[ "${updated_cwd}" != "${expected_parent_cwd}" ]]; then
+	echo "Terminal cwd did not change after cd ..: ${updated_cwd} (expected ${expected_parent_cwd})" >&2
+	exit 1
+fi
+
+echo "Starting long-running command from mobile terminal..."
+click "terminal-surface"
+type_text $'while true; do printf '\''RC_MOBILE_TICK\\n'\''; sleep 1; done\n'
+bun run "${SCRIPT_DIR}/terminal-session-observer.ts" wait-output "RC_MOBILE_TICK" "RC_MOBILE_TICK" 20000
+
+echo "Interrupting long-running command from mobile terminal..."
+click "terminal-interrupt-button"
+ad wait 1000 >/dev/null
+
+echo "Verifying the shell stays alive after interrupt..."
+bun run "${SCRIPT_DIR}/terminal-session-observer.ts" roundtrip $'echo RC_MOBILE_AFTER_INTERRUPT\n' "RC_MOBILE_AFTER_INTERRUPT" 20000
+
+echo "Closing and reopening terminal modal..."
+click "nav-back"
+wait_for "screen-chat"
+click "chat-terminal-open-button"
+wait_for "terminal-modal"
+reopened_cwd="$(get_text "terminal-session-cwd" | tr -d '\r' || true)"
+if [[ "${reopened_cwd}" != "${expected_parent_cwd}" ]]; then
+	echo "Terminal cwd was not preserved after closing and reopening: ${reopened_cwd}" >&2
+	exit 1
+fi
+
+echo "Restarting terminal session..."
+click "terminal-restart-button"
 ad wait 1500 >/dev/null
+restarted_cwd="$(get_text "terminal-session-cwd" | tr -d '\r' || true)"
+if [[ "${restarted_cwd}" != "${expected_initial_cwd}" ]]; then
+	echo "Terminal restart did not restore the initial cwd: ${restarted_cwd}" >&2
+	exit 1
+fi
 
 echo "Closing terminal modal..."
 click "nav-back"

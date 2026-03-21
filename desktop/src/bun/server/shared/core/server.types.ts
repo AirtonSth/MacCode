@@ -122,7 +122,66 @@ export interface ClientMessageEvent {
 	event: "user_message";
 }
 
-export type ClientWsEvent = ClientJoinEvent | ClientJoinWorkspaceEvent | ClientMessageEvent;
+export interface ClientJoinTerminalSessionEvent {
+	data: {
+		chatId: string;
+		cols?: number;
+		rows?: number;
+	};
+	event: "join_terminal_session";
+}
+
+export interface ClientLeaveTerminalSessionEvent {
+	data: {
+		chatId: string;
+	};
+	event: "leave_terminal_session";
+}
+
+export interface ClientTerminalInputEvent {
+	data: {
+		chatId: string;
+		data: string;
+	};
+	event: "terminal_input";
+}
+
+export interface ClientTerminalResizeEvent {
+	data: {
+		chatId: string;
+		cols: number;
+		rows: number;
+	};
+	event: "terminal_resize";
+}
+
+export interface ClientTerminalSignalEvent {
+	data: {
+		chatId: string;
+		signal: "SIGINT" | "SIGTERM";
+	};
+	event: "terminal_signal";
+}
+
+export interface ClientTerminalRestartEvent {
+	data: {
+		chatId: string;
+		cols?: number;
+		rows?: number;
+	};
+	event: "terminal_restart";
+}
+
+export type ClientWsEvent =
+	| ClientJoinEvent
+	| ClientJoinWorkspaceEvent
+	| ClientMessageEvent
+	| ClientJoinTerminalSessionEvent
+	| ClientLeaveTerminalSessionEvent
+	| ClientTerminalInputEvent
+	| ClientTerminalResizeEvent
+	| ClientTerminalSignalEvent
+	| ClientTerminalRestartEvent;
 
 export interface ErrorPayload {
 	error: string;
@@ -285,6 +344,8 @@ export interface ProjectDTO {
 
 export type TerminalCommandStatus = "running" | "completed" | "failed" | "timeout";
 
+export type TerminalSessionStatus = "running" | "exited";
+
 export interface TerminalCommandDTO {
 	chatId: string;
 	command: string;
@@ -308,6 +369,35 @@ export interface TerminalEntryDTO {
 }
 
 export type TerminalEntryStream = TerminalEntryDTO["stream"];
+
+export interface TerminalSessionSnapshotDTO {
+	chatId: string;
+	cols: number;
+	cwd: string;
+	exitCode: number | null;
+	exitedAt: string | null;
+	rows: number;
+	seq: number;
+	sessionId: string;
+	shell: string;
+	snapshot: string;
+	startedAt: string;
+	status: TerminalSessionStatus;
+}
+
+export interface TerminalSessionStateDTO {
+	chatId: string;
+	cols: number;
+	cwd: string;
+	exitCode: number | null;
+	exitedAt: string | null;
+	rows: number;
+	seq: number;
+	sessionId: string;
+	shell: string;
+	startedAt: string;
+	status: TerminalSessionStatus;
+}
 
 export type ServerWsEvent =
 	| {
@@ -354,6 +444,23 @@ export type ServerWsEvent =
 	| {
 			data: WorkspaceEventEnvelope;
 			event: "workspace_event";
+	  }
+	| {
+			data: TerminalSessionSnapshotDTO;
+			event: "terminal_session_snapshot";
+	  }
+	| {
+			data: {
+				chatId: string;
+				data: string;
+				seq: number;
+				sessionId: string;
+			};
+			event: "terminal_output";
+	  }
+	| {
+			data: TerminalSessionStateDTO;
+			event: "terminal_session_state";
 	  }
 	| {
 			data: {

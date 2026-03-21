@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,12 +8,18 @@ import type { BackendHandle } from "../../desktop/src/bun/server/app";
 import { createBackendServer } from "../../desktop/src/bun/server/app";
 
 const token = process.env.RC_E2E_TOKEN ?? "local-dev-token";
-const port = Number(process.env.RC_E2E_PORT ?? 8835);
+const port = Number(process.env.RC_E2E_PORT ?? 0);
 
 const rootPath = mkdtempSync(join(tmpdir(), "remotecode-ios-e2e-"));
 const databasePath = join(rootPath, "remodecode.sqlite");
-const workspacePath = mkdtempSync(join(tmpdir(), "remotecode-ios-e2e-workspace-"));
+const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ios-e2e-workspace-"));
+const workspaceParentPath = join(workspaceRoot, "parent");
+const workspacePath = join(workspaceParentPath, "project");
 const statePath = join(import.meta.dir, ".ios-e2e-state.json");
+
+mkdirSync(workspacePath, { recursive: true });
+const canonicalWorkspaceParentPath = realpathSync(workspaceParentPath);
+const canonicalWorkspacePath = realpathSync(workspacePath);
 
 let backend: BackendHandle | null = null;
 
@@ -76,7 +82,7 @@ const cleanup = async () => {
 	}
 
 	rmSync(rootPath, { force: true, recursive: true });
-	rmSync(workspacePath, { force: true, recursive: true });
+	rmSync(workspaceRoot, { force: true, recursive: true });
 };
 
 const bootstrap = async () => {
@@ -85,7 +91,8 @@ const bootstrap = async () => {
 		port,
 	});
 
-	const baseUrl = `http://127.0.0.1:${String(port)}`;
+	const actualPort = (backend.server as { port?: number } | null)?.port ?? port;
+	const baseUrl = `http://127.0.0.1:${String(actualPort)}`;
 
 	const createdProject = await requestJson<{ created: boolean; project: { id: string } }>(
 		baseUrl,
@@ -239,6 +246,10 @@ const bootstrap = async () => {
 					},
 				},
 				projectId,
+				terminal: {
+					expectedInitialCwd: canonicalWorkspacePath,
+					expectedParentCwd: canonicalWorkspaceParentPath,
+				},
 			},
 			null,
 			2,
