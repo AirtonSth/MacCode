@@ -68,6 +68,13 @@ describe("[D-63] textarea respects composition and native editing shortcuts", ()
 	});
 });
 
+describe("[D-69] textarea scrolls after reaching its max height", () => {
+	it("allows vertical overflow on the message textarea instead of hiding it", () => {
+		expect(composerSource).toContain("overflow-y-auto");
+		expect(composerSource).not.toContain("overflow-hidden");
+	});
+});
+
 describe("[D-66] composer focus can be requested after thread selection", () => {
 	it("accepts a focus request id prop and focuses the textarea when it changes", () => {
 		expect(composerSource).toContain("focusRequestId?: number");

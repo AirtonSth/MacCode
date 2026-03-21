@@ -3263,6 +3263,7 @@ const AppContent = (): JSX.Element => {
 		? terminalState.chats[state.selectedChatId] ?? null
 		: null;
 	const isTerminalOpen = Boolean(selectedThreadTerminal?.isOpen);
+	const isTerminalActive = selectedThreadTerminal?.status === "running";
 	const sidebarToggleLabel = isSidebarVisible ? "Hide sidebar" : "Show sidebar";
 	const threadPanelBgClass = isThreadFocusMode ? "bg-[#13161b]" : "bg-slate-950/35";
 	return (
@@ -3762,7 +3763,15 @@ const AppContent = (): JSX.Element => {
 																type="button"
 																variant="ghost"
 															>
-																<SquareTerminal className="h-4 w-4" />
+																<span className="relative inline-flex items-center justify-center">
+																	<SquareTerminal className="h-4 w-4" />
+																	{isTerminalActive ? (
+																		<span
+																			className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border border-[#13161b] bg-emerald-400"
+																			data-testid="desktop-terminal-active-badge"
+																		/>
+																	) : null}
+																</span>
 																<span className="sr-only">
 																	{isTerminalOpen ? "Hide terminal" : "Show terminal"}
 																</span>

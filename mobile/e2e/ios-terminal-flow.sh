@@ -49,6 +49,24 @@ wait_for() {
 	ad wait "id=\"${test_id}\"" "${timeout_ms}" >/dev/null
 }
 
+wait_until_absent() {
+	local test_id="$1"
+	local timeout_ms="${2:-20000}"
+	local elapsed=0
+
+	while [ "${elapsed}" -lt "${timeout_ms}" ]; do
+		if ! exists "${test_id}"; then
+			return 0
+		fi
+
+		ad wait 500 >/dev/null
+		elapsed=$((elapsed + 500))
+	done
+
+	echo "Expected ${test_id} to disappear within ${timeout_ms}ms." >&2
+	return 1
+}
+
 open_chat_from_threads() {
 	for _ in 1 2 3; do
 		if exists "screen-chat"; then
@@ -99,9 +117,9 @@ ad wait 1200 >/dev/null
 
 ensure_chat
 
-echo "Opening terminal modal..."
+echo "Opening inline terminal panel..."
 click "chat-terminal-open-button"
-wait_for "terminal-modal"
+wait_for "terminal-inline-panel"
 wait_for "terminal-session-cwd"
 
 expected_initial_cwd="$(jq -r '.terminal.expectedInitialCwd' "${STATE_PATH}")"
@@ -127,6 +145,7 @@ echo "Starting long-running command from mobile terminal..."
 click "terminal-surface"
 type_text $'while true; do printf '\''RC_MOBILE_TICK\\n'\''; sleep 1; done\n'
 bun run "${SCRIPT_DIR}/terminal-session-observer.ts" wait-output "RC_MOBILE_TICK" "RC_MOBILE_TICK" 20000
+wait_for "chat-terminal-active-badge"
 
 echo "Interrupting long-running command from mobile terminal..."
 click "terminal-interrupt-button"
@@ -135,11 +154,11 @@ ad wait 1000 >/dev/null
 echo "Verifying the shell stays alive after interrupt..."
 bun run "${SCRIPT_DIR}/terminal-session-observer.ts" roundtrip $'echo RC_MOBILE_AFTER_INTERRUPT\n' "RC_MOBILE_AFTER_INTERRUPT" 20000
 
-echo "Closing and reopening terminal modal..."
-click "nav-back"
-wait_for "screen-chat"
+echo "Closing and reopening inline terminal panel..."
 click "chat-terminal-open-button"
-wait_for "terminal-modal"
+wait_until_absent "terminal-inline-panel"
+click "chat-terminal-open-button"
+wait_for "terminal-inline-panel"
 reopened_cwd="$(get_text "terminal-session-cwd" | tr -d '\r' || true)"
 if [[ "${reopened_cwd}" != "${expected_parent_cwd}" ]]; then
 	echo "Terminal cwd was not preserved after closing and reopening: ${reopened_cwd}" >&2
@@ -155,9 +174,9 @@ if [[ "${restarted_cwd}" != "${expected_initial_cwd}" ]]; then
 	exit 1
 fi
 
-echo "Closing terminal modal..."
-click "nav-back"
-wait_for "screen-chat"
+echo "Closing inline terminal panel..."
+click "chat-terminal-open-button"
+wait_until_absent "terminal-inline-panel"
 
-echo "Terminal modal flow passed."
+echo "Terminal inline flow passed."
 ad close >/dev/null || true

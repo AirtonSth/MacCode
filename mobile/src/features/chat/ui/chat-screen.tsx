@@ -18,6 +18,7 @@ import {
 	StyleSheet,
 	Text,
 	TextInput,
+	useWindowDimensions,
 	View,
 } from "react-native";
 
@@ -44,7 +45,7 @@ import { AUTO_SCROLL_BOTTOM_THRESHOLD } from "./auto-scroll-constants";
 import { GitCommitModalMemo } from "./git-commit-modal-memo";
 import { resolveMessageAutoScroll, shouldScrollOnMessageContentSizeChange } from "./message-auto-scroll";
 import { SelectPickerModal } from "./select-picker-modal";
-import { TerminalOverlay } from "./terminal-overlay";
+import { TerminalNativePanel } from "./terminal-native-panel";
 
 const drawerWidth = 308;
 
@@ -187,7 +188,6 @@ export const ChatScreen = () => {
 	const [isCreatingWorkspaceFromDrawer, setIsCreatingWorkspaceFromDrawer] = useState<boolean>(false);
 	const [drawerWorkspaceError, setDrawerWorkspaceError] = useState<string>("");
 	const [optimisticDeletedWorkspaceIds, setOptimisticDeletedWorkspaceIds] = useState<Set<string>>(new Set());
-	const [isTerminalOpen, setIsTerminalOpen] = useState<boolean>(false);
 	const [isFilePickerOpen, setIsFilePickerOpen] = useState<boolean>(false);
 	const [filePickerTarget, setFilePickerTarget] = useState<FilePickerTarget>("chat");
 	const [isKeyboardVisible, setIsKeyboardVisible] = useState<boolean>(false);
@@ -202,6 +202,7 @@ export const ChatScreen = () => {
 	const [showRunDetails, setShowRunDetails] = useState<boolean>(false);
 	const selectorsScrollRef = useRef<ScrollView | null>(null);
 	const terminalInsets = useSafeAreaInsets();
+	const windowDimensions = useWindowDimensions();
 	const iosSelectorPaddingBottom = Platform.OS === "ios" ? Math.max(16, terminalInsets.bottom) : 0;
 	const queryClient = useQueryClient();
 	const messageScrollRef = useRef<ScrollView | null>(null);
@@ -210,7 +211,6 @@ export const ChatScreen = () => {
 	const shouldScrollMessagesToEndRef = useRef(false);
 	const lastScrollOffsetYRef = useRef<number>(0);
 	const [showScrollToBottom, setShowScrollToBottom] = useState(false);
-	const previousTerminalChatIdRef = useRef<string | null>(null);
 	const drawerTranslate = useRef<Animated.Value>(new Animated.Value(-drawerWidth)).current;
 	const drawerOpacity = useRef<Animated.Value>(new Animated.Value(0)).current;
 	const isDrawerAnimatingRef = useRef(false);
@@ -296,8 +296,9 @@ export const ChatScreen = () => {
 	const selectedBranch = gitCurrentBranch ?? "No branch";
 	const isGitRepository = gitStatusQuery.data?.isRepo ?? false;
 	const gitChangedFiles = gitStatusQuery.data?.changedFiles ?? 0;
+	const isTerminalOpen = Boolean(terminalSession?.isOpen);
+	const isTerminalActive = terminalSession?.status === "running";
 	const isChatFilePickerVisible = isFilePickerOpen && filePickerTarget === "chat";
-	const isTerminalFilePickerVisible = isFilePickerOpen && filePickerTarget === "terminal" && isTerminalOpen;
 	const availableBranches = useMemo(
 		() => gitBranchesQuery.data?.branches ?? [],
 		[gitBranchesQuery.data?.branches],
@@ -399,6 +400,10 @@ export const ChatScreen = () => {
 		!hasStreamingText &&
 		!hasStreamingItems &&
 		!selectedChatIsRunning;
+	const terminalPanelHeight = useMemo(() => {
+		const preferredHeight = Math.round(windowDimensions.height * 0.42);
+		return Math.max(220, Math.min(preferredHeight, 420));
+	}, [windowDimensions.height]);
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | null = null;
@@ -773,27 +778,6 @@ export const ChatScreen = () => {
 		}
 		setIsFilePickerOpen(false);
 	};
-
-	useEffect(() => {
-		const previousChatId = previousTerminalChatIdRef.current;
-		if (previousChatId && previousChatId !== selectedChatId) {
-			setTerminalOpen(previousChatId, false);
-		}
-
-		if (selectedChatId) {
-			setTerminalOpen(selectedChatId, isTerminalOpen);
-		}
-
-		previousTerminalChatIdRef.current = selectedChatId;
-	}, [isTerminalOpen, selectedChatId, setTerminalOpen]);
-
-	useEffect(() => {
-		return () => {
-			if (previousTerminalChatIdRef.current) {
-				setTerminalOpen(previousTerminalChatIdRef.current, false);
-			}
-		};
-	}, [setTerminalOpen]);
 
 	const handleChatAttachmentPathsApplied = useCallback(() => {
 		setPendingChatAttachmentPaths(null);
@@ -1268,9 +1252,14 @@ export const ChatScreen = () => {
 		setActivePicker(null);
 	}, []);
 
-	const closeTerminalOverlay = useCallback(() => {
-		setIsTerminalOpen(false);
-	}, []);
+	const handleToggleTerminal = useCallback(() => {
+		if (!selectedChatId) {
+			return;
+		}
+
+		Keyboard.dismiss();
+		setTerminalOpen(selectedChatId, !isTerminalOpen);
+	}, [isTerminalOpen, selectedChatId, setTerminalOpen]);
 
 	const openTerminalFilePicker = useCallback(() => {
 		openFilePicker("terminal");
@@ -1680,166 +1669,206 @@ export const ChatScreen = () => {
 
 					{!isKeyboardVisible ? (
 						<ScrollView
-						ref={selectorsScrollRef}
-						contentContainerStyle={[styles.selectorsScroller, { paddingBottom: iosSelectorPaddingBottom }]}
-						horizontal
-						showsHorizontalScrollIndicator={false}
-						style={styles.selectorsRow}
-					>
-						<Pressable
-							disabled={isProviderLocked}
-							onPress={() => {
-								setActivePicker("provider");
-							}}
-							style={({ pressed }) => [
-								styles.selectorButton,
-								isProviderLocked ? styles.selectorButtonDisabled : null,
-								pressed && !isProviderLocked ? styles.selectorButtonPressed : null,
+							ref={selectorsScrollRef}
+							contentContainerStyle={[
+								styles.selectorsScroller,
+								{ paddingBottom: isTerminalOpen ? 8 : iosSelectorPaddingBottom },
 							]}
-							testID="chat-provider-picker-button"
+							horizontal
+							showsHorizontalScrollIndicator={false}
+							style={styles.selectorsRow}
 						>
-							<View style={styles.selectorButtonContent}>
-								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
-									Provider
-								</Text>
-								<Text numberOfLines={1} style={styles.selectorButtonValue}>
-									{selectedProvider === "claude" ? "Claude Code" : "Codex"}
-								</Text>
-							</View>
-							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
-						</Pressable>
-						<Pressable
-							disabled={availableModels.length === 0}
-							onPress={() => {
-								setActivePicker("model");
-							}}
-							style={({ pressed }) => [
-								styles.selectorButton,
-								availableModels.length === 0 ? styles.selectorButtonDisabled : null,
-								pressed && availableModels.length > 0 ? styles.selectorButtonPressed : null,
-							]}
-							testID="chat-model-picker-button"
-						>
-							<View style={styles.selectorButtonContent}>
-								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
-									Model
-								</Text>
-								<Text ellipsizeMode="tail" numberOfLines={1} style={styles.selectorButtonValue}>
-									{selectedModelName}
-								</Text>
-							</View>
-							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
-						</Pressable>
-						<Pressable
-							disabled={availableReasoningEfforts.length === 0}
-							onPress={() => {
-								setActivePicker("reasoning");
-							}}
-							style={({ pressed }) => [
-								styles.selectorButton,
-								availableReasoningEfforts.length === 0 ? styles.selectorButtonDisabled : null,
-								pressed && availableReasoningEfforts.length > 0 ? styles.selectorButtonPressed : null,
-							]}
-							testID="chat-reasoning-picker-button"
-						>
-							<View style={styles.selectorButtonContent}>
-								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
-									Reasoning
-								</Text>
-								<Text numberOfLines={1} style={styles.selectorButtonValue}>
-									{selectedReasoningLabel}
-								</Text>
-							</View>
-							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
-						</Pressable>
-						<Pressable
-							onPress={() => {
-								setActivePicker("permission");
-							}}
-							style={({ pressed }) => [
-								styles.selectorButton,
-								pressed ? styles.selectorButtonPressed : null,
-							]}
-							testID="chat-permission-picker-button"
-						>
-							<View style={styles.selectorButtonContent}>
-								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
-									Permission
-								</Text>
-								<Text numberOfLines={1} style={styles.selectorButtonValue}>
-									{permissionLabel}
-								</Text>
-							</View>
-							<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
-						</Pressable>
-						<Pressable
-							disabled={isBranchPickerDisabled}
-							onPress={() => {
-								if (!selectedProjectId || isBranchActionPending) {
-									return;
-								}
-								setIsBranchModalOpen(true);
-							}}
-							style={({ pressed }) => [
-								styles.selectorButton,
-								isBranchPickerDisabled ? styles.selectorButtonDisabled : null,
-								pressed && !isBranchPickerDisabled ? styles.selectorButtonPressed : null,
-							]}
-						>
-							<View style={styles.selectorButtonContent}>
-								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
-									Branch
-								</Text>
-								<Text numberOfLines={1} style={styles.selectorButtonValue}>
-									{selectedBranch}
-								</Text>
-							</View>
+							<Pressable
+								disabled={isProviderLocked}
+								onPress={() => {
+									setActivePicker("provider");
+								}}
+								style={({ pressed }) => [
+									styles.selectorButton,
+									isProviderLocked ? styles.selectorButtonDisabled : null,
+									pressed && !isProviderLocked ? styles.selectorButtonPressed : null,
+								]}
+								testID="chat-provider-picker-button"
+							>
+								<View style={styles.selectorButtonContent}>
+									<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+										Provider
+									</Text>
+									<Text numberOfLines={1} style={styles.selectorButtonValue}>
+										{selectedProvider === "claude" ? "Claude Code" : "Codex"}
+									</Text>
+								</View>
 								<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
-						</Pressable>
-						<Pressable
-							disabled={isGitCommitDisabled}
-							onPress={() => {
-								if (isGitCommitDisabled) {
-									return;
-								}
-								setGitCommitError("");
-								setGitCommitMessage("");
-								setGitCommitIncludeUnstaged(true);
-								setIsGitCommitModalOpen(true);
-							}}
-							style={[
-								styles.selectorButton,
-								isGitCommitDisabled ? styles.selectorButtonDisabled : null,
-							]}
-							testID="chat-git-diff-indicator"
-						>
-							<View style={styles.selectorButtonContent}>
-								<Text numberOfLines={1} style={styles.selectorButtonLabel}>
-									Git
-								</Text>
-							<Text numberOfLines={1} style={styles.selectorButtonValue}>
-								<Text style={{ color: "#34d399" }}>
-									+{String(isGitRepository ? (gitStatusQuery.data?.added ?? 0) : 0)}
-								</Text>{" "}
-								/{" "}
-								<Text style={{ color: "#fb7185" }}>
-									-{String(isGitRepository ? (gitStatusQuery.data?.removed ?? 0) : 0)}
-								</Text>
-							</Text>
-							</View>
-						</Pressable>
-						<Pressable
-							accessibilityLabel="chat-terminal-open-button"
-							accessibilityRole="button"
-							onPress={() => {
-								setIsTerminalOpen(true);
-							}}
-							style={({ pressed }) => [styles.selectorButton, styles.terminalShortcutButton, pressed ? styles.selectorButtonPressed : null]}
-							testID="chat-terminal-open-button"
-						>
-							<MaterialIcons color={palette.text} name="terminal" size={20} />
-						</Pressable>
-					</ScrollView>
+							</Pressable>
+							<Pressable
+								disabled={availableModels.length === 0}
+								onPress={() => {
+									setActivePicker("model");
+								}}
+								style={({ pressed }) => [
+									styles.selectorButton,
+									availableModels.length === 0 ? styles.selectorButtonDisabled : null,
+									pressed && availableModels.length > 0 ? styles.selectorButtonPressed : null,
+								]}
+								testID="chat-model-picker-button"
+							>
+								<View style={styles.selectorButtonContent}>
+									<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+										Model
+									</Text>
+									<Text ellipsizeMode="tail" numberOfLines={1} style={styles.selectorButtonValue}>
+										{selectedModelName}
+									</Text>
+								</View>
+								<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+							</Pressable>
+							<Pressable
+								disabled={availableReasoningEfforts.length === 0}
+								onPress={() => {
+									setActivePicker("reasoning");
+								}}
+								style={({ pressed }) => [
+									styles.selectorButton,
+									availableReasoningEfforts.length === 0 ? styles.selectorButtonDisabled : null,
+									pressed && availableReasoningEfforts.length > 0 ? styles.selectorButtonPressed : null,
+								]}
+								testID="chat-reasoning-picker-button"
+							>
+								<View style={styles.selectorButtonContent}>
+									<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+										Reasoning
+									</Text>
+									<Text numberOfLines={1} style={styles.selectorButtonValue}>
+										{selectedReasoningLabel}
+									</Text>
+								</View>
+								<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+							</Pressable>
+							<Pressable
+								onPress={() => {
+									setActivePicker("permission");
+								}}
+								style={({ pressed }) => [
+									styles.selectorButton,
+									pressed ? styles.selectorButtonPressed : null,
+								]}
+								testID="chat-permission-picker-button"
+							>
+								<View style={styles.selectorButtonContent}>
+									<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+										Permission
+									</Text>
+									<Text numberOfLines={1} style={styles.selectorButtonValue}>
+										{permissionLabel}
+									</Text>
+								</View>
+								<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+							</Pressable>
+							<Pressable
+								disabled={isBranchPickerDisabled}
+								onPress={() => {
+									if (!selectedProjectId || isBranchActionPending) {
+										return;
+									}
+									setIsBranchModalOpen(true);
+								}}
+								style={({ pressed }) => [
+									styles.selectorButton,
+									isBranchPickerDisabled ? styles.selectorButtonDisabled : null,
+									pressed && !isBranchPickerDisabled ? styles.selectorButtonPressed : null,
+								]}
+							>
+								<View style={styles.selectorButtonContent}>
+									<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+										Branch
+									</Text>
+									<Text numberOfLines={1} style={styles.selectorButtonValue}>
+										{selectedBranch}
+									</Text>
+								</View>
+								<MaterialIcons color={palette.muted} name="arrow-drop-down" size={18} />
+							</Pressable>
+							<Pressable
+								disabled={isGitCommitDisabled}
+								onPress={() => {
+									if (isGitCommitDisabled) {
+										return;
+									}
+									setGitCommitError("");
+									setGitCommitMessage("");
+									setGitCommitIncludeUnstaged(true);
+									setIsGitCommitModalOpen(true);
+								}}
+								style={[
+									styles.selectorButton,
+									isGitCommitDisabled ? styles.selectorButtonDisabled : null,
+								]}
+								testID="chat-git-diff-indicator"
+							>
+								<View style={styles.selectorButtonContent}>
+									<Text numberOfLines={1} style={styles.selectorButtonLabel}>
+										Git
+									</Text>
+									<Text numberOfLines={1} style={styles.selectorButtonValue}>
+										<Text style={{ color: "#34d399" }}>
+											+{String(isGitRepository ? (gitStatusQuery.data?.added ?? 0) : 0)}
+										</Text>{" "}
+										/{" "}
+										<Text style={{ color: "#fb7185" }}>
+											-{String(isGitRepository ? (gitStatusQuery.data?.removed ?? 0) : 0)}
+										</Text>
+									</Text>
+								</View>
+							</Pressable>
+							<Pressable
+								accessibilityLabel={isTerminalOpen ? "chat-terminal-close-button" : "chat-terminal-open-button"}
+								accessibilityRole="button"
+								disabled={!selectedChatId}
+								onPress={handleToggleTerminal}
+								style={({ pressed }) => [
+									styles.selectorButton,
+									styles.terminalShortcutButton,
+									isTerminalOpen ? styles.terminalShortcutButtonActive : null,
+									pressed && selectedChatId ? styles.selectorButtonPressed : null,
+									!selectedChatId ? styles.selectorButtonDisabled : null,
+								]}
+								testID="chat-terminal-open-button"
+							>
+								<View style={styles.terminalShortcutIconWrap}>
+									<MaterialIcons
+										color={isTerminalOpen ? palette.accent : palette.text}
+										name="terminal"
+										size={20}
+									/>
+									{isTerminalActive ? (
+										<View style={styles.terminalShortcutBadge} testID="chat-terminal-active-badge" />
+									) : null}
+								</View>
+							</Pressable>
+						</ScrollView>
+					) : null}
+
+				{isTerminalOpen && selectedChatId ? (
+					<View
+						style={[
+							styles.terminalInlinePanel,
+							{
+								height: terminalPanelHeight + Math.max(8, terminalInsets.bottom),
+								paddingBottom: Math.max(8, terminalInsets.bottom),
+							},
+						]}
+						testID="terminal-inline-panel"
+					>
+						<TerminalNativePanel
+							chatId={selectedChatId}
+							onInput={handleTerminalInput}
+							onInterrupt={handleInterruptTerminal}
+							onOpenFilePicker={openTerminalFilePicker}
+							onResize={handleTerminalResize}
+							onRestart={handleRestartTerminal}
+							state={terminalSession}
+						/>
+					</View>
 				) : null}
 			</View>
 
@@ -2080,22 +2109,6 @@ export const ChatScreen = () => {
 					isVisible={drawerWorkspaceActionTarget !== null}
 				/>
 
-				<TerminalOverlay
-					api={api}
-					chatId={selectedChatId}
-					chatTitle={selectedChat?.title}
-					isTerminalFilePickerVisible={isTerminalFilePickerVisible}
-					isTerminalOpen={isTerminalOpen}
-					onAddPaths={handleAddAttachmentPaths}
-					onClose={closeTerminalOverlay}
-					onCloseFilePicker={closeFilePicker}
-					onInput={handleTerminalInput}
-					onInterrupt={handleInterruptTerminal}
-					onOpenFilePicker={openTerminalFilePicker}
-					onResize={handleTerminalResize}
-					onRestart={handleRestartTerminal}
-					state={terminalSession}
-				/>
 		</KeyboardAvoidingView>
 	);
 };
@@ -2193,6 +2206,31 @@ const styles = StyleSheet.create({
 		width: 44,
 		minWidth: 44,
 		paddingHorizontal: 0,
+	},
+	terminalShortcutButtonActive: {
+		backgroundColor: "rgba(99,200,255,0.12)",
+		borderColor: "rgba(99,200,255,0.42)",
+	},
+	terminalShortcutIconWrap: {
+		alignItems: "center",
+		justifyContent: "center",
+	},
+	terminalShortcutBadge: {
+		backgroundColor: "#22c55e",
+		borderColor: palette.background,
+		borderRadius: 999,
+		borderWidth: 2,
+		height: 12,
+		position: "absolute",
+		right: -4,
+		top: -3,
+		width: 12,
+	},
+	terminalInlinePanel: {
+		borderTopColor: palette.border,
+		borderTopWidth: 1,
+		marginTop: 4,
+		paddingTop: 10,
 	},
 	selectorsRow: {
 		flexDirection: "row",
