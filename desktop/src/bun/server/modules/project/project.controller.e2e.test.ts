@@ -118,6 +118,46 @@ test("GET /v1/projects/workspaces returns lightweight workspace summaries", asyn
 	}
 });
 
+test("GET /v1/projects returns full workspace records", async () => {
+	const { cleanup, client } = await createTestServer();
+
+	try {
+		const firstCreate = await client.v1.projects.post({ name: "alpha", path: "/tmp" });
+		const secondCreate = await client.v1.projects.post({ name: "beta", path: "/var" });
+		const firstId = (firstCreate.data as { project: { id: string } }).project.id;
+		const secondId = (secondCreate.data as { project: { id: string } }).project.id;
+
+		const response = await client.v1.projects.get();
+		const payload = response.data as {
+			projects: Array<{
+				createdAt: string;
+				id: string;
+				isFavorite: boolean;
+				name: string;
+				path: string;
+				updatedAt: string;
+			}>;
+		};
+
+		expect(response.status).toBe(200);
+		expect(payload.projects.some((project) => project.id === firstId)).toBe(true);
+		expect(payload.projects.some((project) => project.id === secondId)).toBe(true);
+		for (const project of payload.projects) {
+			expect(Object.keys(project as unknown as Record<string, unknown>).sort()).toEqual([
+				"createdAt",
+				"id",
+				"isFavorite",
+				"name",
+				"path",
+				"unreadFinishedThreadCount",
+				"updatedAt",
+			]);
+		}
+	} finally {
+		await cleanup();
+	}
+});
+
 test("POST /v1/projects returns 400 for invalid path", async () => {
 	const { cleanup, client } = await createTestServer();
 
