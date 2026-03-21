@@ -140,6 +140,25 @@ const sleep = async (durationMs: number): Promise<void> => {
 	});
 };
 
+const closeTerminalSocket = async (
+	socket: Awaited<ReturnType<typeof createEdenWsClient>> | undefined,
+): Promise<void> => {
+	if (!socket) {
+		return;
+	}
+
+	if (socket.ws.readyState === WebSocket.CLOSED) {
+		return;
+	}
+
+	await new Promise<void>((resolve) => {
+		socket.ws.addEventListener("close", () => {
+			resolve();
+		}, { once: true });
+		socket.close();
+	});
+};
+
 test("terminal websocket session preserves cwd changes across commands", async () => {
 	const workspaceRoot = mkdtempSync(join(tmpdir(), "remotecode-ws-terminal-cwd-"));
 	const resolvedWorkspaceRoot = realpathSync(workspaceRoot);
@@ -147,15 +166,17 @@ test("terminal websocket session preserves cwd changes across commands", async (
 	const expectedParent = dirname(resolvedWorkspaceRoot);
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
+	let events: TerminalServerEvent[] = [];
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal cwd" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
-		const events: TerminalServerEvent[] = [];
+		events = [];
 		bindTerminalEvents(ws, chatId, events);
 
 		ws.send({
@@ -187,9 +208,26 @@ test("terminal websocket session preserves cwd changes across commands", async (
 			event: "terminal_input",
 		});
 		await waitForTerminalText(events, `__PWD2__${expectedParent}__`);
+
+		ws.send({
+			data: { chatId, data: "exit\r" },
+			event: "terminal_input",
+		});
+		await waitForCondition(
+			() =>
+				events.some(
+					(event) =>
+						event.event === "terminal_session_state"
+						&& event.data.status === "exited",
+				),
+			10_000,
+			"terminal exited state",
+		);
+		await sleep(100);
 	} finally {
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
 }, 20_000);
@@ -199,12 +237,13 @@ test("terminal websocket stays running after join without immediate input", asyn
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal idle" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const events: TerminalServerEvent[] = [];
@@ -230,9 +269,25 @@ test("terminal websocket stays running after join without immediate input", asyn
 					&& event.data.status === "exited",
 			),
 		).toBe(false);
+
+		ws.send({
+			data: { chatId, data: "exit\r" },
+			event: "terminal_input",
+		});
+		await waitForCondition(
+			() =>
+				events.some(
+					(event) =>
+						event.event === "terminal_session_state"
+						&& event.data.status === "exited",
+				),
+			10_000,
+			"idle terminal exited state",
+		);
 	} finally {
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
 }, 20_000);
@@ -242,12 +297,13 @@ test("terminal websocket streams long-running output and SIGINT keeps the shell 
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal stream" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const events: TerminalServerEvent[] = [];
@@ -285,9 +341,25 @@ test("terminal websocket streams long-running output and SIGINT keeps the shell 
 		});
 
 		await waitForTerminalText(events, "__AFTER_INT__");
+
+		ws.send({
+			data: { chatId, data: "exit\r" },
+			event: "terminal_input",
+		});
+		await waitForCondition(
+			() =>
+				events.some(
+					(event) =>
+						event.event === "terminal_session_state"
+						&& event.data.status === "exited",
+				),
+			10_000,
+			"stream terminal exited state",
+		);
 	} finally {
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
 }, 20_000);
@@ -298,12 +370,13 @@ test("terminal websocket reconnect restores snapshot without replaying old chunk
 
 	let firstSocket: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
 	let secondSocket: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal reconnect" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		firstSocket = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const firstEvents: TerminalServerEvent[] = [];
@@ -324,7 +397,6 @@ test("terminal websocket reconnect restores snapshot without replaying old chunk
 			event: "terminal_input",
 		});
 		await waitForTerminalText(firstEvents, "__SNAP_A__");
-		firstSocket.close();
 
 		secondSocket = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const secondEvents: TerminalServerEvent[] = [];
@@ -378,9 +450,10 @@ test("terminal websocket reconnect restores snapshot without replaying old chunk
 			database.close();
 		}
 	} finally {
-		firstSocket?.close();
-		secondSocket?.close();
+		await closeTerminalSocket(firstSocket);
+		await closeTerminalSocket(secondSocket);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
 }, 20_000);
@@ -402,12 +475,13 @@ test("terminal websocket starts when only PYTHON fallback is configured", async 
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal python fallback" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const events: TerminalServerEvent[] = [];
@@ -430,6 +504,21 @@ test("terminal websocket starts when only PYTHON fallback is configured", async 
 		});
 
 		await waitForTerminalText(events, "__PYTHON_FALLBACK_OK__");
+
+		ws.send({
+			data: { chatId, data: "exit\r" },
+			event: "terminal_input",
+		});
+		await waitForCondition(
+			() =>
+				events.some(
+					(event) =>
+						event.event === "terminal_session_state"
+						&& event.data.status === "exited",
+				),
+			10_000,
+			"python fallback terminal exited state",
+		);
 	} finally {
 		if (originalPython3 === undefined) {
 			delete process.env.PYTHON3;
@@ -449,8 +538,9 @@ test("terminal websocket starts when only PYTHON fallback is configured", async 
 			process.env.PATH = originalPath;
 		}
 
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 		rmSync(shimRoot, { force: true, recursive: true });
 	}
@@ -463,6 +553,7 @@ test("terminal websocket starts when bundled bridge file is missing and extracte
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	renameSync(candidatePath, backupPath);
 	terminalSessionBridgeTestHarness.clearCachedBridgePath();
@@ -471,7 +562,7 @@ test("terminal websocket starts when bundled bridge file is missing and extracte
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal extracted bridge" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		ws = await createEdenWsClient(createEdenClient({ baseUrl }));
 		const events: TerminalServerEvent[] = [];
@@ -494,9 +585,25 @@ test("terminal websocket starts when bundled bridge file is missing and extracte
 		});
 
 		await waitForTerminalText(events, "__EMBEDDED_BRIDGE_OK__");
+
+		ws.send({
+			data: { chatId, data: "exit\r" },
+			event: "terminal_input",
+		});
+		await waitForCondition(
+			() =>
+				events.some(
+					(event) =>
+						event.event === "terminal_session_state"
+						&& event.data.status === "exited",
+				),
+			10_000,
+			"embedded bridge terminal exited state",
+		);
 	} finally {
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		terminalSessionBridgeTestHarness.clearCachedBridgePath();
 		rmSync(candidatePath, { force: true });
 		renameSync(backupPath, candidatePath);
@@ -509,12 +616,13 @@ test("terminal websocket rejects chats whose workspace path no longer exists", a
 	const { baseUrl, cleanup, client } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal missing workspace" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		rmSync(workspaceRoot, { force: true, recursive: true });
 
@@ -534,8 +642,9 @@ test("terminal websocket rejects chats whose workspace path no longer exists", a
 		);
 		expect(events.some((event) => event.event === "terminal_session_snapshot")).toBe(false);
 	} finally {
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
 }, 20_000);
@@ -545,12 +654,13 @@ test("terminal websocket discards persisted exited snapshots and starts a fresh 
 	const { baseUrl, cleanup, client, databasePath } = await createTestServer();
 
 	let ws: Awaited<ReturnType<typeof createEdenWsClient>> | undefined;
+	let chatId: string | undefined;
 
 	try {
 		const project = await client.v1.projects.post({ path: workspaceRoot });
 		const projectId = (project.data as { project: { id: string } }).project.id;
 		const chat = await client.v1.projects({ id: projectId }).chats.post({ title: "terminal stale snapshot" });
-		const chatId = (chat.data as { chat: { id: string } }).chat.id;
+		chatId = (chat.data as { chat: { id: string } }).chat.id;
 
 		const database = new Database(databasePath);
 		try {
@@ -599,9 +709,25 @@ test("terminal websocket discards persisted exited snapshots and starts a fresh 
 			10_000,
 			"fresh snapshot after persisted exited snapshot",
 		);
+
+		ws.send({
+			data: { chatId, data: "exit\r" },
+			event: "terminal_input",
+		});
+		await waitForCondition(
+			() =>
+				events.some(
+					(event) =>
+						event.event === "terminal_session_state"
+						&& event.data.status === "exited",
+				),
+			10_000,
+			"stale snapshot terminal exited state",
+		);
 	} finally {
-		ws?.close();
+		await closeTerminalSocket(ws);
 		await cleanup();
+		await sleep(250);
 		rmSync(workspaceRoot, { force: true, recursive: true });
 	}
 }, 20_000);
