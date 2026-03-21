@@ -432,7 +432,7 @@ export const ThreadTerminalPtyPanel = ({
 						autoCapitalize="off"
 						autoComplete="off"
 						autoCorrect="off"
-						className="absolute inset-0 z-10 h-full w-full resize-none border-0 bg-transparent text-transparent caret-transparent outline-none"
+						className="pointer-events-none absolute inset-0 z-10 h-full w-full resize-none border-0 bg-transparent text-transparent caret-transparent outline-none"
 						data-testid="thread-terminal-keyboard-input"
 						onChange={(event) => {
 							event.currentTarget.value = "";

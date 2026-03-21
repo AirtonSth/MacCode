@@ -30,6 +30,20 @@ def set_window_size(fd: int, rows: int, cols: int) -> None:
         pass
 
 
+def attach_controlling_terminal(slave_fd: int) -> None:
+    os.setsid()
+
+    try:
+        ioctl(slave_fd, termios.TIOCSCTTY, 0)
+    except OSError:
+        pass
+
+    try:
+        os.tcsetpgrp(slave_fd, os.getpgrp())
+    except OSError:
+        pass
+
+
 def resolve_signal(name: object) -> int:
     if not isinstance(name, str):
         return signal.SIGTERM
@@ -95,8 +109,8 @@ def main() -> int:
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
-        start_new_session=True,
         close_fds=True,
+        preexec_fn=lambda: attach_controlling_terminal(slave_fd),
     )
     child_pid = child.pid
     os.close(slave_fd)

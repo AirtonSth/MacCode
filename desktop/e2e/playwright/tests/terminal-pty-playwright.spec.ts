@@ -370,6 +370,12 @@ const sendTerminalCommand = async (page: import("@playwright/test").Page, comman
 	await input.press("Enter");
 };
 
+const interruptTerminalWithKeyboard = async (page: import("@playwright/test").Page) => {
+	const input = page.getByTestId("thread-terminal-keyboard-input");
+	await input.click();
+	await input.press("Control+C");
+};
+
 const normalizeTerminalText = (value: string) => value.replace(/\s+/gu, "");
 
 const readTerminalSurfaceText = async (page: import("@playwright/test").Page) =>
@@ -408,7 +414,7 @@ test.afterAll(async () => {
 	await stopBackend();
 });
 
-test("desktop terminal preserves cwd, streams output, survives interrupt and restores after reconnect", async ({ page }) => {
+test("desktop terminal preserves cwd, streams output, survives keyboard interrupt and restores after reconnect", async ({ page }) => {
 	if (!terminalState) {
 		throw new Error("desktop terminal state was not initialized");
 	}
@@ -427,7 +433,7 @@ test("desktop terminal preserves cwd, streams output, survives interrupt and res
 	await sendTerminalCommand(page, "while true; do printf 'RC_DESKTOP_TICK\\n'; sleep 1; done");
 	await expect.poll(async () => await readTerminalSurfaceText(page)).toContain("RC_DESKTOP_TICK");
 
-	await page.getByTestId("thread-terminal-interrupt").click();
+	await interruptTerminalWithKeyboard(page);
 	await sendTerminalCommand(page, "echo RC_DESKTOP_AFTER_INTERRUPT");
 	await expect.poll(async () => await readTerminalSurfaceText(page)).toContain("RC_DESKTOP_AFTER_INTERRUPT");
 
