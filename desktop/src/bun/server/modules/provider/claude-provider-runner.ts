@@ -1,6 +1,3 @@
-import path from "node:path";
-import { accessSync, constants, statSync } from "node:fs";
-
 import type { CodexProviderResult, CodexProviderRunOptions } from "../../types";
 import {
 	DEFAULT_CODEX_PERMISSION_MODE,
@@ -12,6 +9,7 @@ import type {
 	AssistantStreamItemType,
 } from "../../../../shared/assistant-stream-event";
 import type { CodexReasoningEffort } from "../../../../shared/codex-model-config";
+import { resolveCommand, resolveCommandInPath } from "../../platform/index";
 
 interface ClaudeJsonEvent {
 	event?: ClaudeStreamEventPayload;
@@ -103,67 +101,8 @@ type ClaudeCommandInputPath = string | undefined;
 
 const CLAUDE_COMMAND = "claude";
 
-const isNodeModulesBinDirectory = (directory: string): boolean => {
-	const normalized = directory.replace(/\\+/g, "/");
-
-	return normalized.endsWith("/node_modules/.bin");
-};
-
-const isExecutable = (candidate: string): boolean => {
-	try {
-		accessSync(candidate, constants.X_OK);
-		const stats = statSync(candidate);
-		return stats.isFile() || stats.isFIFO();
-	} catch {
-		return false;
-	}
-};
-
-const commandCandidates = (platform: string): string[] => {
-	if (platform !== "win32") {
-		return [CLAUDE_COMMAND];
-	}
-
-	return [`${CLAUDE_COMMAND}.exe`, `${CLAUDE_COMMAND}.cmd`, `${CLAUDE_COMMAND}.bat`, `${CLAUDE_COMMAND}.com`, CLAUDE_COMMAND];
-};
-
-export const resolveClaudeCommand = (
-	pathValue: ClaudeCommandInputPath = process.env.PATH,
-): string => {
-	const pathEntries = (pathValue ?? "")
-		.split(path.delimiter)
-		.map((entry) => entry.trim())
-		.filter(Boolean);
-
-	const tryResolveInDirectories = (directories: string[]): string | null => {
-		for (const directory of directories) {
-			for (const command of commandCandidates(process.platform)) {
-				const candidatePath = path.join(directory, command);
-
-				if (isExecutable(candidatePath)) {
-					return candidatePath;
-				}
-			}
-		}
-
-		return null;
-	};
-
-	const nonShadowedDirectories = pathEntries.filter((directory) => !isNodeModulesBinDirectory(directory));
-	const shadowedDirectories = pathEntries.filter((directory) => isNodeModulesBinDirectory(directory));
-
-	const preferred = tryResolveInDirectories(nonShadowedDirectories);
-	if (preferred) {
-		return preferred;
-	}
-
-	const fallback = tryResolveInDirectories(shadowedDirectories);
-	if (fallback) {
-		return fallback;
-	}
-
-	return CLAUDE_COMMAND;
-};
+export const resolveClaudeCommand = (pathValue: ClaudeCommandInputPath = process.env.PATH): string =>
+	pathValue === process.env.PATH ? resolveCommand(CLAUDE_COMMAND) : resolveCommandInPath(CLAUDE_COMMAND, pathValue);
 
 interface ClaudeSpawnedProcess {
 	exitCode: number | null;

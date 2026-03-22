@@ -17,5 +17,5 @@ export const killProcess: PlatformModule["killProcess"] = (subprocess: Subproces
 
 export const commandExtensions: PlatformModule["commandExtensions"] = () => current.commandExtensions();
 
-export { resolveCommandInPath } from "./command";
+export { collectResolvedPath, mergePathEntries, resolveCommand, resolveCommandInPath } from "./command";
 export type { KillIntent, PlatformModule, Subprocess } from "./types";

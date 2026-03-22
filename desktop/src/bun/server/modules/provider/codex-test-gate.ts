@@ -1,3 +1,5 @@
+import { resolveCommand } from "../../platform/index";
+
 export interface CodexAvailability {
 	available: boolean;
 	reason: string;
@@ -54,7 +56,8 @@ export const getCodexAvailability = (): CodexAvailability => {
 		return cachedAvailability;
 	}
 
-	const versionResult = runCommand(["codex", "--version"]);
+	const codexCommand = resolveCommand("codex");
+	const versionResult = runCommand([codexCommand, "--version"]);
 
 	if (versionResult.exitCode !== 0) {
 		cachedAvailability = {
@@ -65,7 +68,7 @@ export const getCodexAvailability = (): CodexAvailability => {
 		return cachedAvailability;
 	}
 
-	const loginResult = runCommand(["codex", "login", "status"]);
+	const loginResult = runCommand([codexCommand, "login", "status"]);
 	const loginOutput = `${loginResult.stdout}\n${loginResult.stderr}`.trim();
 
 	if (loginResult.exitCode !== 0 || !isLoggedIn(loginOutput)) {

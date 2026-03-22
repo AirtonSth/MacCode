@@ -3,7 +3,7 @@ import {
 	type CodexModelsCatalog,
 	parseCodexReasoningEffort,
 } from "../../../../shared/codex-model-config";
-import { killProcess, resolveCommandInPath } from "../../platform/index";
+import { killProcess, resolveCommand } from "../../platform/index";
 
 interface CodexAppServerResult {
 	exitCode: number | null;
@@ -217,7 +217,7 @@ const readStdoutUntilModelListResponse = async (
 };
 
 const defaultExecuteCodexAppServer: ExecuteCodexAppServer = async (timeoutMs: number) => {
-	const codexCommand = resolveCommandInPath("codex");
+	const codexCommand = resolveCommand("codex");
 	const subprocess = Bun.spawn({
 		cmd: [codexCommand, "app-server", "--listen", "stdio://"],
 		env: process.env,
