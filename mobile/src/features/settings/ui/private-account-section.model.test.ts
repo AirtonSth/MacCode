@@ -126,6 +126,29 @@ test("registerPrivateAccountWithTrial creates a mobile signup intent, purchases 
 					trialEndsAt: null,
 				},
 			}),
+			getSignupIntent: async () => ({
+				signupIntent: {
+					email: "new@example.com",
+					id: "signup_123",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "completed",
+					subscriptionStatus: "trialing",
+					target: "mobile",
+					trialEndsAt: "2026-04-01T00:00:00.000Z",
+				},
+			}),
+			login: async () => ({
+				accessToken: "register-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 7,
+					daysRemaining: 7,
+					email: "new@example.com",
+					id: "usr_new",
+					subscribed: true,
+				},
+			}),
 		}) as never,
 		clearPendingSignupIntentRecord: async () => undefined,
 		email: "new@example.com",
@@ -313,8 +336,30 @@ test("registerPrivateAccountWithTrial continues to the native purchase flow when
 				},
 			}),
 			getSignupIntent: async () => {
-				throw new Error("getSignupIntent should not be called");
+				return {
+					signupIntent: {
+						email: "plain@example.com",
+						id: "signup_plain",
+						platform: "ios",
+						returnUrl: "remotecode-mobile://auth/complete",
+						status: "completed",
+						subscriptionStatus: "trialing",
+						target: "mobile",
+						trialEndsAt: "2026-04-01T00:00:00.000Z",
+					},
+				};
 			},
+			login: async () => ({
+				accessToken: "register-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 7,
+					daysRemaining: 7,
+					email: "plain@example.com",
+					id: "usr_plain",
+					subscribed: true,
+				},
+			}),
 		}) as never,
 		clearPendingSignupIntentRecord: async () => undefined,
 		email: "plain@example.com",
@@ -363,11 +408,119 @@ test("registerPrivateAccountWithTrial continues to the native purchase flow when
 	expect(result.session.user.email).toBe("plain@example.com");
 });
 
+test("registerPrivateAccountWithTrial restores purchases and retries completion when activation lags after purchase", async () => {
+	const password = ["recover", "after", "purchase"].join("");
+	let activationPollCount = 0;
+	let restoreCount = 0;
+
+	const result = await registerPrivateAccountWithTrial({
+		baseUrl: "https://private.remotecode.io:8787",
+		activationPollIntervalMs: 0,
+		activationPostRestoreTimeoutMs: 0,
+		activationTimeoutMs: 0,
+		createClient: () => ({
+			completeSignupIntent: async () => {
+				throw new PrivateApiError(
+					409,
+					{ code: "signup_checkout_incomplete" },
+					"Complete the checkout to activate your account.",
+				);
+			},
+			createSignupIntent: async () => ({
+				signupIntent: {
+					email: "recover-after-purchase@example.com",
+					id: "signup_recover_after_purchase",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "pending_checkout",
+					subscriptionStatus: "inactive",
+					target: "mobile",
+					trialEndsAt: null,
+				},
+			}),
+			getSignupIntent: async () => {
+				activationPollCount += 1;
+				return {
+					signupIntent: {
+						email: "recover-after-purchase@example.com",
+						id: "signup_recover_after_purchase",
+						platform: "ios",
+						returnUrl: "remotecode-mobile://auth/complete",
+						status: activationPollCount >= 2 ? "completed" : "pending_checkout",
+						subscriptionStatus: activationPollCount >= 2 ? "trialing" : "inactive",
+						target: "mobile",
+						trialEndsAt: activationPollCount >= 2 ? "2026-04-01T00:00:00.000Z" : null,
+					},
+				};
+			},
+			login: async () => ({
+				accessToken: "register-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 7,
+					daysRemaining: 7,
+					email: "recover-after-purchase@example.com",
+					id: "usr_recover_after_purchase",
+					subscribed: true,
+				},
+			}),
+		}) as never,
+		clearPendingSignupIntentRecord: async () => undefined,
+		email: "recover-after-purchase@example.com",
+		platform: "ios",
+		password,
+		purchasesClient: {
+			ensureConfigured: async () => true,
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({
+				current: {
+					availablePackages: [],
+					identifier: "default",
+					monthly: {
+						identifier: "$rc_monthly",
+						packageType: "MONTHLY",
+						product: {
+							priceString: "$4.99",
+						},
+					},
+				},
+			}),
+			isPurchaseCancelled: () => false,
+			purchasePackage: async () => ({
+				customerInfo: {
+					entitlements: {
+						active: {
+							"PS Tech Pro": {},
+						},
+					},
+				},
+			}),
+			restorePurchases: async () => {
+				restoreCount += 1;
+				return {
+					entitlements: {
+						active: {
+							"PS Tech Pro": {},
+						},
+					},
+				};
+			},
+		},
+		readPendingSignupIntentRecord: async () => null,
+		savePendingSignupIntentRecord: async (record) => record,
+	});
+
+	expect(activationPollCount).toBe(2);
+	expect(restoreCount).toBe(1);
+	expect(result.session.user.email).toBe("recover-after-purchase@example.com");
+});
+
 test("registerPrivateAccountWithTrial resumes a pending signup intent from local storage when the backend rejects duplicate signup creation", async () => {
 	const password = ["recover", "secret", "123"].join("");
 	let lookedUpSignupIntentId = "";
 	let purchaseCount = 0;
 	let clearedPendingRecordCount = 0;
+	let signupIntentStatusLookupCount = 0;
 
 	const result = await registerPrivateAccountWithTrial({
 		baseUrl: "https://private.remotecode.io:8787",
@@ -418,19 +571,31 @@ test("registerPrivateAccountWithTrial resumes a pending signup intent from local
 			},
 			getSignupIntent: async (signupIntentId: string) => {
 				lookedUpSignupIntentId = signupIntentId;
+				signupIntentStatusLookupCount += 1;
 				return {
 					signupIntent: {
 						email: "recover@example.com",
 						id: "signup_cached",
 						platform: "ios",
 						returnUrl: "remotecode-mobile://auth/complete",
-						status: "pending_checkout",
-						subscriptionStatus: "inactive",
+						status: signupIntentStatusLookupCount >= 2 ? "completed" : "pending_checkout",
+						subscriptionStatus: signupIntentStatusLookupCount >= 2 ? "trialing" : "inactive",
 						target: "mobile",
-						trialEndsAt: null,
+						trialEndsAt: signupIntentStatusLookupCount >= 2 ? "2026-04-01T00:00:00.000Z" : null,
 					},
 				};
 			},
+			login: async () => ({
+				accessToken: "register-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 7,
+					daysRemaining: 7,
+					email: "recover@example.com",
+					id: "usr_recover",
+					subscribed: true,
+				},
+			}),
 		}) as never,
 		email: "recover@example.com",
 		platform: "ios",
@@ -481,6 +646,7 @@ test("registerPrivateAccountWithTrial resumes a pending signup intent from local
 
 	expect(lookedUpSignupIntentId).toBe("signup_cached");
 	expect(purchaseCount).toBe(1);
+	expect(signupIntentStatusLookupCount).toBe(2);
 	expect(clearedPendingRecordCount).toBe(1);
 	expect(result.session.user.email).toBe("recover@example.com");
 });
