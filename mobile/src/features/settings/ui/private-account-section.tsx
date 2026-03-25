@@ -34,7 +34,7 @@ import {
 	loginPrivateAccount,
 	persistSavedPrivateConnection,
 	refreshPrivateAccountSessionRecord,
-	registerPrivateAccount,
+	registerPrivateAccountWithTrial,
 	requestPrivatePasswordReset,
 	sortPrivateConnectors,
 	syncPrivateRevenueCatSubscriptionStatus,
@@ -303,25 +303,32 @@ export const PrivateAccountSection = ({
 			return;
 		}
 
-		setIsSubmittingAuth(true);
-		setErrorMessage(null);
-		setNoticeMessage(null);
-		try {
-			const session = authMode === "register"
-				? await registerPrivateAccount({
-					baseUrl: backendUrl,
-					email: trimmedEmail,
-					password: trimmedPassword,
-				})
-				: await loginPrivateAccount({
-					baseUrl: backendUrl,
-					email: trimmedEmail,
-					password: trimmedPassword,
-				});
-			const nextRecord = {
-				backendUrl,
-				session,
-			};
+			setIsSubmittingAuth(true);
+			setErrorMessage(null);
+			setNoticeMessage(null);
+			try {
+				const session = await (async () => {
+					if (authMode === "register") {
+						const registration = await registerPrivateAccountWithTrial({
+							baseUrl: backendUrl,
+							email: trimmedEmail,
+							password: trimmedPassword,
+							platform: mobilePlatform,
+							purchasesClient: revenueCatPurchasesClient,
+						});
+						return registration.session;
+					}
+
+					return await loginPrivateAccount({
+						baseUrl: backendUrl,
+						email: trimmedEmail,
+						password: trimmedPassword,
+					});
+				})();
+				const nextRecord = {
+					backendUrl,
+					session,
+				};
 			await setSessionRecord(nextRecord);
 			await loadConnectors(nextRecord);
 			setConfirmPassword("");
@@ -337,6 +344,7 @@ export const PrivateAccountSection = ({
 		confirmPassword,
 		email,
 		loadConnectors,
+		mobilePlatform,
 		password,
 		setSessionRecord,
 	]);
@@ -475,10 +483,10 @@ export const PrivateAccountSection = ({
 
 	const authenticateButtonLabel = useMemo(() => {
 		if (isSubmittingAuth) {
-			return authMode === "register" ? "Creating account..." : "Signing in...";
+			return authMode === "register" ? "Starting trial..." : "Signing in...";
 		}
 
-		return authMode === "register" ? "Create account" : "Log in";
+		return authMode === "register" ? "Start 7-day trial" : "Log in";
 	}, [authMode, isSubmittingAuth]);
 
 	const subscribeButtonLabel = useMemo(() => {
@@ -608,8 +616,8 @@ export const PrivateAccountSection = ({
 				<View>
 					<Text style={styles.sectionTitle}>Private Account</Text>
 					{sessionRecord ? null : (
-						<Text selectable style={styles.supportText}>
-							Sign in or create an account to sync desktop and mobile.
+					<Text selectable style={styles.supportText}>
+							Sign in or start your 7-day trial to sync desktop and mobile.
 						</Text>
 					)}
 				</View>
@@ -671,7 +679,7 @@ export const PrivateAccountSection = ({
 							]}
 							testID="private-account-mode-register"
 						>
-							<Text style={authMode === "register" ? styles.segmentedLabelActive : styles.segmentedLabel}>Create account</Text>
+							<Text style={authMode === "register" ? styles.segmentedLabelActive : styles.segmentedLabel}>Start trial</Text>
 						</Pressable>
 					</View>
 					<TextInput
@@ -716,6 +724,11 @@ export const PrivateAccountSection = ({
 							value={confirmPassword}
 						/>
 					) : null}
+					{authMode === "register" ? (
+						<Text style={styles.supportText}>
+							New accounts are created only after the in-app trial starts on this device.
+						</Text>
+					) : null}
 					<Pressable
 						disabled={
 							isSubmittingAuth
@@ -723,6 +736,7 @@ export const PrivateAccountSection = ({
 							|| email.trim().length === 0
 							|| password.trim().length === 0
 							|| (authMode === "register" && confirmPassword.trim().length === 0)
+							|| (authMode === "register" && !revenueCatReady)
 						}
 						onPress={() => {
 							void handleAuthenticate();
@@ -730,12 +744,17 @@ export const PrivateAccountSection = ({
 						style={({ pressed }) => [
 							styles.primaryButton,
 							pressed ? styles.primaryButtonPressed : null,
-							isSubmittingAuth ? styles.disabledButton : null,
+							isSubmittingAuth || (authMode === "register" && !revenueCatReady) ? styles.disabledButton : null,
 						]}
 						testID="private-account-authenticate"
 					>
 						<Text style={styles.primaryLabel}>{authenticateButtonLabel}</Text>
 					</Pressable>
+					{authMode === "register" && !revenueCatReady ? (
+						<Text style={styles.supportText}>
+							RevenueCat must be configured on this platform before a new account can start the in-app trial.
+						</Text>
+					) : null}
 					<View style={styles.inlineActions}>
 						<Pressable
 							disabled={isSendingPasswordReset || email.trim().length === 0}
@@ -769,7 +788,7 @@ export const PrivateAccountSection = ({
 							testID="private-account-switch-auth-mode"
 						>
 							<Text style={styles.secondaryLabel}>
-								{authMode === "login" ? "Create account" : "Use login"}
+								{authMode === "login" ? "Start trial" : "Use login"}
 							</Text>
 						</Pressable>
 					</View>

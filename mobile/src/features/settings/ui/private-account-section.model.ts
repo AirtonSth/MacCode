@@ -2,19 +2,92 @@ import {
 	createPrivateClient,
 	PrivateApiError,
 	type PrivateConnectorDto,
+	type PrivateSignupIntentDto,
 	type PrivateSessionDto,
 	type PrivateSubscriptionSnapshotDto,
 } from "@remotecode/contracts";
 
 import type { PersistedPrivateSessionRecord } from "../../../shared/api/private-session-store";
 import { ApiConfigStore } from "../../../shared/api/api-config-store";
-import { getNativeSubscriptionManagementUrl, type RevenueCatPlatform } from "../../../shared/billing/revenuecat.model";
+import {
+	getNativeSubscriptionManagementUrl,
+	selectRevenueCatPackage,
+	type RevenueCatCustomerInfoLike,
+	type RevenueCatPackageLike,
+	type RevenueCatPlatform,
+} from "../../../shared/billing/revenuecat.model";
+import type { RevenueCatPurchasesClient } from "../../../shared/billing/revenuecat";
+import {
+	PrivateSignupIntentStore,
+	type PersistedPrivateSignupIntentRecord,
+} from "../../../shared/api/private-signup-intent-store";
 
 const REMOTECODE_WEB_URL = "https://remotecode.io";
 const REMOTECODE_PRIVACY_POLICY_URL = `${REMOTECODE_WEB_URL}/privacy`;
 const REMOTECODE_TERMS_OF_USE_URL = `${REMOTECODE_WEB_URL}/terms`;
+const MOBILE_SIGNUP_RETURN_URL = "remotecode-mobile://auth/complete";
+const PRIVATE_TRIAL_OFFERINGS_TIMEOUT_MS = 15_000;
+const PRIVATE_TRIAL_PURCHASE_TIMEOUT_MS = 30_000;
+const PRIVATE_TRIAL_PURCHASE_TIMEOUT_MESSAGE =
+	"Timed out while starting the in-app trial. If you're testing on the iOS Simulator, run the app from Xcode with a StoreKit configuration file or test on a physical device.";
 
 const trimBaseUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
+const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+const isSignupCheckoutIncomplete = (error: unknown): boolean =>
+	error instanceof PrivateApiError
+	&& (
+		(isObject(error.payload) && error.payload.code === "signup_checkout_incomplete")
+		|| error.message.toLowerCase().includes("complete the checkout")
+	);
+const isPendingSignupIntentError = (error: unknown): boolean =>
+	error instanceof PrivateApiError
+	&& (
+		(isObject(error.payload) && typeof error.payload.code === "string" && error.payload.code.includes("pending"))
+		|| error.message.toLowerCase().includes("pending signup already exists")
+	);
+const extractSignupIntentId = (payload: unknown): string | null => {
+	if (!isObject(payload)) {
+		return null;
+	}
+
+	if (typeof payload.signupIntentId === "string" && payload.signupIntentId.trim().length > 0) {
+		return payload.signupIntentId.trim();
+	}
+
+	if (
+		isObject(payload.signupIntent)
+		&& typeof payload.signupIntent.id === "string"
+		&& payload.signupIntent.id.trim().length > 0
+	) {
+		return payload.signupIntent.id.trim();
+	}
+
+	return null;
+};
+const withTimeout = async <T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+	timeoutMessage: string,
+): Promise<T> => {
+	let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+	try {
+		return await Promise.race([
+			promise,
+			// eslint-disable-next-line promise/avoid-new -- Timeout needs a deferred rejection promise.
+			new Promise<T>((resolve, reject) => {
+				void resolve;
+				timeoutId = setTimeout(() => {
+					reject(new Error(timeoutMessage));
+				}, timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timeoutId) {
+			clearTimeout(timeoutId);
+		}
+	}
+};
 
 export const buildNativeManageSubscriptionUrl = (platform: RevenueCatPlatform): string =>
 	getNativeSubscriptionManagementUrl(platform);
@@ -86,6 +159,137 @@ export const registerPrivateAccount = async (input: {
 	});
 };
 
+export const registerPrivateAccountWithTrial = async (input: {
+	baseUrl: string;
+	clearPendingSignupIntentRecord?: () => Promise<void>;
+	createClient?: typeof createPrivateClient;
+	email: string;
+	offeringsTimeoutMs?: number;
+	password: string;
+	platform: RevenueCatPlatform;
+	purchaseTimeoutMs?: number;
+	purchasesClient: RevenueCatPurchasesClient;
+	readPendingSignupIntentRecord?: () => Promise<PersistedPrivateSignupIntentRecord | null>;
+	savePendingSignupIntentRecord?: (
+		record: PersistedPrivateSignupIntentRecord,
+	) => Promise<PersistedPrivateSignupIntentRecord>;
+}): Promise<{
+	customerInfo: RevenueCatCustomerInfoLike | null;
+	pkg: RevenueCatPackageLike | null;
+	session: PrivateSessionDto;
+	signupIntent: PrivateSignupIntentDto;
+}> => {
+	const client = (input.createClient ?? createPrivateClient)({
+		baseUrl: input.baseUrl,
+	});
+	const clearPendingSignupIntentRecord =
+		input.clearPendingSignupIntentRecord ?? (async () => {
+			await PrivateSignupIntentStore.clear();
+		});
+	const readPendingSignupIntentRecord =
+		input.readPendingSignupIntentRecord ?? (async () => {
+			return await PrivateSignupIntentStore.read();
+		});
+	const savePendingSignupIntentRecord =
+		input.savePendingSignupIntentRecord ?? (async (record) => {
+			return await PrivateSignupIntentStore.save(record);
+		});
+	const normalizedBackendUrl = trimBaseUrl(input.baseUrl);
+	const normalizedEmail = input.email.trim().toLowerCase();
+		const signupIntent = await (async () => {
+			try {
+				const createdSignupIntentResponse = await client.createSignupIntent({
+					email: input.email,
+					password: input.password,
+					platform: input.platform,
+					returnUrl: MOBILE_SIGNUP_RETURN_URL,
+					target: "mobile",
+				});
+				const createdSignupIntent = createdSignupIntentResponse.signupIntent;
+				await savePendingSignupIntentRecord({
+					backendUrl: normalizedBackendUrl,
+					email: normalizedEmail,
+					platform: input.platform,
+				signupIntentId: createdSignupIntent.id,
+			});
+			return createdSignupIntent;
+		} catch (error) {
+			if (!isPendingSignupIntentError(error)) {
+				throw error;
+			}
+
+			const payloadSignupIntentId = error instanceof PrivateApiError ? extractSignupIntentId(error.payload) : null;
+				if (payloadSignupIntentId) {
+					await savePendingSignupIntentRecord({
+						backendUrl: normalizedBackendUrl,
+						email: normalizedEmail,
+						platform: input.platform,
+						signupIntentId: payloadSignupIntentId,
+					});
+					const signupIntentResponse = await client.getSignupIntent(payloadSignupIntentId);
+					return signupIntentResponse.signupIntent;
+				}
+
+			const persistedRecord = await readPendingSignupIntentRecord();
+				if (
+					persistedRecord
+					&& persistedRecord.backendUrl === normalizedBackendUrl
+					&& persistedRecord.email === normalizedEmail
+					&& persistedRecord.platform === input.platform
+				) {
+					const signupIntentResponse = await client.getSignupIntent(persistedRecord.signupIntentId);
+					return signupIntentResponse.signupIntent;
+				}
+
+			throw error;
+		}
+	})();
+
+	try {
+		const completion = await client.completeSignupIntent(signupIntent.id);
+		await clearPendingSignupIntentRecord();
+		return {
+			customerInfo: null,
+			pkg: null,
+			session: completion.session,
+			signupIntent: completion.signupIntent,
+		};
+	} catch (error) {
+		if (!isSignupCheckoutIncomplete(error)) {
+			throw error;
+		}
+	}
+
+	const configured = await input.purchasesClient.ensureConfigured(signupIntent.id);
+	if (!configured) {
+		throw new Error("revenuecat_not_configured");
+	}
+
+	const offerings = await withTimeout(
+		input.purchasesClient.getOfferings(),
+		input.offeringsTimeoutMs ?? PRIVATE_TRIAL_OFFERINGS_TIMEOUT_MS,
+		"Timed out while loading the in-app trial options. Try again in a moment.",
+	);
+	const pkg = selectRevenueCatPackage(offerings);
+	if (!pkg) {
+		throw new Error("private_subscription_package_unavailable");
+	}
+
+	const { customerInfo } = await withTimeout(
+		input.purchasesClient.purchasePackage(pkg),
+		input.purchaseTimeoutMs ?? PRIVATE_TRIAL_PURCHASE_TIMEOUT_MS,
+		PRIVATE_TRIAL_PURCHASE_TIMEOUT_MESSAGE,
+	);
+	const completion = await client.completeSignupIntent(signupIntent.id);
+	await clearPendingSignupIntentRecord();
+	return {
+		customerInfo,
+		pkg,
+		session: completion.session,
+		signupIntent: completion.signupIntent,
+	};
+};
+
 export const requestPrivatePasswordReset = async (input: {
 	baseUrl: string;
 	createClient?: typeof createPrivateClient;
@@ -132,7 +336,8 @@ export const refreshPrivateAccountSessionRecord = async (input: {
 	});
 
 	try {
-		const response = await createBackendClient(sessionRecord.session.accessToken).me();
+		const backendClient = createBackendClient(sessionRecord.session.accessToken);
+		const response = await backendClient.me();
 		return {
 			backendUrl: sessionRecord.backendUrl,
 			session: {

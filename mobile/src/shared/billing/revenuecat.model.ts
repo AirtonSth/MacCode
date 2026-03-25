@@ -1,9 +1,9 @@
 export type RevenueCatPlatform = "android" | "ios";
 
 export const PRIVATE_SUBSCRIPTION_PRICE_USD = 4.99;
-export const REVENUECAT_ENTITLEMENT_ID = "private_connectors";
+export const REVENUECAT_ENTITLEMENT_ID = "PS Tech Pro";
 export const REVENUECAT_OFFERING_ID = "default";
-export const REVENUECAT_IOS_API_KEY = "appl_dummy_ios_public_sdk_key";
+export const REVENUECAT_IOS_API_KEY = "appl_owUFxEeSXgcMdDixNFddzGIiqaA";
 export const REVENUECAT_ANDROID_API_KEY = "goog_dummy_android_public_sdk_key";
 export const REVENUECAT_APPLE_MANAGE_SUBSCRIPTION_URL = "https://apps.apple.com/account/subscriptions";
 export const REVENUECAT_PLAY_MANAGE_SUBSCRIPTION_URL = "https://play.google.com/store/account/subscriptions";

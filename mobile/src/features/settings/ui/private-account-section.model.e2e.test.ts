@@ -8,7 +8,7 @@ import {
 	deletePrivateAccount,
 	loginPrivateAccount,
 	persistSavedPrivateConnection,
-	registerPrivateAccount,
+	registerPrivateAccountWithTrial,
 	requestPrivatePasswordReset,
 	syncPrivateRevenueCatSubscriptionStatus,
 } from "./private-account-section.model";
@@ -38,29 +38,90 @@ test("private account section flow logs in with valid credentials", async () => 
 	expect(session.accessToken).toBe("access-token");
 });
 
-test("private account section flow registers in-app without a browser redirect", async () => {
+test("private account section flow starts the in-app trial and completes the mobile signup intent without a browser redirect", async () => {
 	const password = ["super", "secret", "123"].join("");
-	const session = await registerPrivateAccount({
+	const {session} = await registerPrivateAccountWithTrial({
 		baseUrl: "https://private.remotecode.io:8787",
 		createClient: () => ({
-			register: async () => ({
-				accessToken: "register-token",
-				refreshToken: "refresh-token",
-				user: {
-					daysRemaing: 0,
-					daysRemaining: 0,
+			completeSignupIntent: async () => ({
+				redirectUrl: "remotecode-mobile://auth/complete?completionToken=test",
+				session: {
+					accessToken: "register-token",
+					refreshToken: "refresh-token",
+					user: {
+						daysRemaing: 7,
+						daysRemaining: 7,
+						email: "founder@remotecode.io",
+						id: "usr_2",
+						subscribed: true,
+					},
+				},
+				signupIntent: {
 					email: "founder@remotecode.io",
-					id: "usr_2",
-					subscribed: false,
+					id: "signup_456",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "completed",
+					subscriptionStatus: "trialing",
+					target: "mobile",
+					trialEndsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+				},
+			}),
+			createSignupIntent: async () => ({
+				signupIntent: {
+					email: "founder@remotecode.io",
+					id: "signup_456",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "pending_checkout",
+					subscriptionStatus: "inactive",
+					target: "mobile",
+					trialEndsAt: null,
 				},
 			}),
 		}) as never,
+		clearPendingSignupIntentRecord: async () => undefined,
 		email: "founder@remotecode.io",
+		platform: "ios",
 		password,
+		purchasesClient: {
+			ensureConfigured: async () => true,
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({
+				current: {
+					availablePackages: [],
+					identifier: "default",
+					monthly: {
+						identifier: "$rc_monthly",
+						packageType: "MONTHLY",
+						product: {
+							priceString: "$4.99",
+						},
+					},
+				},
+			}),
+			isPurchaseCancelled: () => false,
+			purchasePackage: async () => ({
+				customerInfo: {
+					entitlements: {
+						active: {
+							"PS Tech Pro": {},
+						},
+					},
+				},
+			}),
+			restorePurchases: async () => ({
+				entitlements: {
+					active: {},
+				},
+			}),
+		},
+		readPendingSignupIntentRecord: async () => null,
+		savePendingSignupIntentRecord: async (record) => record,
 	});
 
 	expect(session.user.email).toBe("founder@remotecode.io");
-	expect(session.user.subscribed).toBe(false);
+	expect(session.user.subscribed).toBe(true);
 });
 
 test("private account section persistence helper writes the claimed connector as a saved private connection", async () => {

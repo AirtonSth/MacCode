@@ -29,7 +29,7 @@ const createPurchasesClient = () => ({
 			customerInfo: {
 				entitlements: {
 					active: {
-						"private_connectors": {},
+						"PS Tech Pro": {},
 					},
 				},
 			},
@@ -37,7 +37,7 @@ const createPurchasesClient = () => ({
 	restorePurchases: async () => ({
 		entitlements: {
 			active: {
-				"private_connectors": {},
+				"PS Tech Pro": {},
 			},
 		},
 	}),

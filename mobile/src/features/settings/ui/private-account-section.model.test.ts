@@ -13,7 +13,7 @@ import {
 	loginPrivateAccount,
 	persistSavedPrivateConnection,
 	refreshPrivateAccountSessionRecord,
-	registerPrivateAccount,
+	registerPrivateAccountWithTrial,
 	requestPrivatePasswordReset,
 	sortPrivateConnectors,
 	syncPrivateRevenueCatSubscriptionStatus,
@@ -72,29 +72,489 @@ test("loginPrivateAccount delegates login to the shared contracts client", async
 	expect(session.accessToken).toBe("access-token");
 });
 
-test("registerPrivateAccount delegates registration to the shared contracts client", async () => {
+test("registerPrivateAccountWithTrial creates a mobile signup intent, purchases the package, and completes the account", async () => {
 	const password = ["super", "safe", "123"].join("");
-	const session = await registerPrivateAccount({
+	let configuredUserId = "";
+	let purchaseCount = 0;
+
+	const result = await registerPrivateAccountWithTrial({
 		baseUrl: "https://private.remotecode.io:8787",
 		createClient: () => ({
-			register: async () => ({
-				accessToken: "register-token",
-				refreshToken: "refresh-token",
-				user: {
-					daysRemaing: 0,
-					daysRemaining: 0,
+			completeSignupIntent: async () => {
+				if (purchaseCount === 0) {
+					throw new PrivateApiError(
+						409,
+						{ code: "signup_checkout_incomplete" },
+						"Complete the checkout to activate your account.",
+					);
+				}
+
+				return {
+					redirectUrl: "remotecode-mobile://auth/complete?completionToken=test",
+					session: {
+						accessToken: "register-token",
+						refreshToken: "refresh-token",
+						user: {
+							daysRemaing: 7,
+							daysRemaining: 7,
+							email: "new@example.com",
+							id: "usr_new",
+							subscribed: true,
+						},
+					},
+					signupIntent: {
+						email: "new@example.com",
+						id: "signup_123",
+						platform: "ios",
+						returnUrl: "remotecode-mobile://auth/complete",
+						status: "completed",
+						subscriptionStatus: "trialing",
+						target: "mobile",
+						trialEndsAt: "2026-04-01T00:00:00.000Z",
+					},
+				};
+			},
+			createSignupIntent: async () => ({
+				signupIntent: {
 					email: "new@example.com",
-					id: "usr_new",
-					subscribed: false,
+					id: "signup_123",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "pending_checkout",
+					subscriptionStatus: "inactive",
+					target: "mobile",
+					trialEndsAt: null,
 				},
 			}),
 		}) as never,
+		clearPendingSignupIntentRecord: async () => undefined,
 		email: "new@example.com",
+		platform: "ios",
 		password,
+		purchasesClient: {
+			ensureConfigured: async (userId) => {
+				configuredUserId = userId;
+				return true;
+			},
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({
+				current: {
+					availablePackages: [],
+					identifier: "default",
+					monthly: {
+						identifier: "$rc_monthly",
+						packageType: "MONTHLY",
+						product: {
+							priceString: "$4.99",
+						},
+					},
+				},
+			}),
+			isPurchaseCancelled: () => false,
+			purchasePackage: async (pkg) => {
+				purchaseCount += 1;
+				return {
+					customerInfo: {
+						entitlements: {
+							active: {
+								"PS Tech Pro": {
+									pkg,
+								},
+							},
+						},
+					},
+				};
+			},
+			restorePurchases: async () => ({
+				entitlements: {
+					active: {},
+				},
+			}),
+		},
+		readPendingSignupIntentRecord: async () => null,
+		savePendingSignupIntentRecord: async (record) => record,
 	});
 
-	expect(session.user.email).toBe("new@example.com");
-	expect(session.accessToken).toBe("register-token");
+	expect(configuredUserId).toBe("signup_123");
+	expect(purchaseCount).toBe(1);
+	expect(result.session.user.email).toBe("new@example.com");
+	expect(result.session.accessToken).toBe("register-token");
+	expect(result.pkg?.identifier).toBe("$rc_monthly");
+});
+
+test("registerPrivateAccountWithTrial resumes an existing mobile signup intent without repurchasing when the trial is already active", async () => {
+	const password = ["resume", "secret", "123"].join("");
+	let purchaseCount = 0;
+
+	const result = await registerPrivateAccountWithTrial({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			completeSignupIntent: async () => ({
+				redirectUrl: "remotecode-mobile://auth/complete?completionToken=test",
+				session: {
+					accessToken: "register-token",
+					refreshToken: "refresh-token",
+					user: {
+						daysRemaing: 7,
+						daysRemaining: 7,
+						email: "resume@example.com",
+						id: "usr_resume",
+						subscribed: true,
+					},
+				},
+				signupIntent: {
+					email: "resume@example.com",
+					id: "signup_resume",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "completed",
+					subscriptionStatus: "trialing",
+					target: "mobile",
+					trialEndsAt: "2026-04-01T00:00:00.000Z",
+				},
+			}),
+			createSignupIntent: async () => ({
+				signupIntent: {
+					email: "resume@example.com",
+					id: "signup_resume",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "billing_active",
+					subscriptionStatus: "trialing",
+					target: "mobile",
+					trialEndsAt: "2026-04-01T00:00:00.000Z",
+				},
+			}),
+		}) as never,
+		clearPendingSignupIntentRecord: async () => undefined,
+		email: "resume@example.com",
+		platform: "ios",
+		password,
+		purchasesClient: {
+			ensureConfigured: async () => true,
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({ current: null }),
+			isPurchaseCancelled: () => false,
+			purchasePackage: async () => {
+				purchaseCount += 1;
+				return {
+					customerInfo: {
+						entitlements: {
+							active: {},
+						},
+					},
+				};
+			},
+			restorePurchases: async () => ({
+				entitlements: {
+					active: {},
+				},
+			}),
+		},
+		readPendingSignupIntentRecord: async () => null,
+		savePendingSignupIntentRecord: async (record) => record,
+	});
+
+	expect(purchaseCount).toBe(0);
+	expect(result.session.user.email).toBe("resume@example.com");
+});
+
+test("registerPrivateAccountWithTrial continues to the native purchase flow when checkout incomplete is returned as a plain message", async () => {
+	const password = ["plain", "message", "123"].join("");
+	let purchaseCount = 0;
+
+	const result = await registerPrivateAccountWithTrial({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			completeSignupIntent: async () => {
+				if (purchaseCount === 0) {
+					throw new PrivateApiError(
+						409,
+						{ error: "Complete the checkout to activate your account." },
+						"Complete the checkout to activate your account.",
+					);
+				}
+
+				return {
+					redirectUrl: "remotecode-mobile://auth/complete?completionToken=test",
+					session: {
+						accessToken: "register-token",
+						refreshToken: "refresh-token",
+						user: {
+							daysRemaing: 7,
+							daysRemaining: 7,
+							email: "plain@example.com",
+							id: "usr_plain",
+							subscribed: true,
+						},
+					},
+					signupIntent: {
+						email: "plain@example.com",
+						id: "signup_plain",
+						platform: "ios",
+						returnUrl: "remotecode-mobile://auth/complete",
+						status: "completed",
+						subscriptionStatus: "trialing",
+						target: "mobile",
+						trialEndsAt: "2026-04-01T00:00:00.000Z",
+					},
+				};
+			},
+			createSignupIntent: async () => ({
+				signupIntent: {
+					email: "plain@example.com",
+					id: "signup_plain",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "pending_checkout",
+					subscriptionStatus: "inactive",
+					target: "mobile",
+					trialEndsAt: null,
+				},
+			}),
+			getSignupIntent: async () => {
+				throw new Error("getSignupIntent should not be called");
+			},
+		}) as never,
+		clearPendingSignupIntentRecord: async () => undefined,
+		email: "plain@example.com",
+		platform: "ios",
+		password,
+		purchasesClient: {
+			ensureConfigured: async () => true,
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({
+				current: {
+					availablePackages: [],
+					identifier: "default",
+					monthly: {
+						identifier: "$rc_monthly",
+						packageType: "MONTHLY",
+						product: {
+							priceString: "$4.99",
+						},
+					},
+				},
+			}),
+			isPurchaseCancelled: () => false,
+			purchasePackage: async () => {
+				purchaseCount += 1;
+				return {
+					customerInfo: {
+						entitlements: {
+							active: {
+								"PS Tech Pro": {},
+							},
+						},
+					},
+				};
+			},
+			restorePurchases: async () => ({
+				entitlements: {
+					active: {},
+				},
+			}),
+		},
+		readPendingSignupIntentRecord: async () => null,
+		savePendingSignupIntentRecord: async (record) => record,
+	});
+
+	expect(purchaseCount).toBe(1);
+	expect(result.session.user.email).toBe("plain@example.com");
+});
+
+test("registerPrivateAccountWithTrial resumes a pending signup intent from local storage when the backend rejects duplicate signup creation", async () => {
+	const password = ["recover", "secret", "123"].join("");
+	let lookedUpSignupIntentId = "";
+	let purchaseCount = 0;
+	let clearedPendingRecordCount = 0;
+
+	const result = await registerPrivateAccountWithTrial({
+		baseUrl: "https://private.remotecode.io:8787",
+		clearPendingSignupIntentRecord: async () => {
+			clearedPendingRecordCount += 1;
+		},
+		createClient: () => ({
+			completeSignupIntent: async () => {
+				if (purchaseCount === 0) {
+					throw new PrivateApiError(
+						409,
+						{ code: "signup_checkout_incomplete" },
+						"Complete the checkout to activate your account.",
+					);
+				}
+
+				return {
+					redirectUrl: "remotecode-mobile://auth/complete?completionToken=test",
+					session: {
+						accessToken: "register-token",
+						refreshToken: "refresh-token",
+						user: {
+							daysRemaing: 7,
+							daysRemaining: 7,
+							email: "recover@example.com",
+							id: "usr_recover",
+							subscribed: true,
+						},
+					},
+					signupIntent: {
+						email: "recover@example.com",
+						id: "signup_cached",
+						platform: "ios",
+						returnUrl: "remotecode-mobile://auth/complete",
+						status: "completed",
+						subscriptionStatus: "trialing",
+						target: "mobile",
+						trialEndsAt: "2026-04-01T00:00:00.000Z",
+					},
+				};
+			},
+			createSignupIntent: async () => {
+				throw new PrivateApiError(
+					409,
+					{ error: "A pending signup already exists for this email." },
+					"A pending signup already exists for this email.",
+				);
+			},
+			getSignupIntent: async (signupIntentId: string) => {
+				lookedUpSignupIntentId = signupIntentId;
+				return {
+					signupIntent: {
+						email: "recover@example.com",
+						id: "signup_cached",
+						platform: "ios",
+						returnUrl: "remotecode-mobile://auth/complete",
+						status: "pending_checkout",
+						subscriptionStatus: "inactive",
+						target: "mobile",
+						trialEndsAt: null,
+					},
+				};
+			},
+		}) as never,
+		email: "recover@example.com",
+		platform: "ios",
+		password,
+		purchasesClient: {
+			ensureConfigured: async () => true,
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({
+				current: {
+					availablePackages: [],
+					identifier: "default",
+					monthly: {
+						identifier: "$rc_monthly",
+						packageType: "MONTHLY",
+						product: {
+							priceString: "$4.99",
+						},
+					},
+				},
+			}),
+			isPurchaseCancelled: () => false,
+			purchasePackage: async () => {
+				purchaseCount += 1;
+				return {
+					customerInfo: {
+						entitlements: {
+							active: {
+								"PS Tech Pro": {},
+							},
+						},
+					},
+				};
+			},
+			restorePurchases: async () => ({
+				entitlements: {
+					active: {},
+				},
+			}),
+		},
+		readPendingSignupIntentRecord: async () => ({
+			backendUrl: "https://private.remotecode.io:8787",
+			email: "recover@example.com",
+			platform: "ios",
+			signupIntentId: "signup_cached",
+		}),
+		savePendingSignupIntentRecord: async (record) => record,
+	});
+
+	expect(lookedUpSignupIntentId).toBe("signup_cached");
+	expect(purchaseCount).toBe(1);
+	expect(clearedPendingRecordCount).toBe(1);
+	expect(result.session.user.email).toBe("recover@example.com");
+});
+
+test("registerPrivateAccountWithTrial surfaces a clear timeout error when the purchase never resolves", async () => {
+	const password = ["timeout", "secret", "123"].join("");
+
+	const timeoutErrorPromise = registerPrivateAccountWithTrial({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			completeSignupIntent: async () => {
+				throw new PrivateApiError(
+					409,
+					{ code: "signup_checkout_incomplete" },
+					"Complete the checkout to activate your account.",
+				);
+			},
+			createSignupIntent: async () => ({
+				signupIntent: {
+					email: "timeout@example.com",
+					id: "signup_timeout",
+					platform: "ios",
+					returnUrl: "remotecode-mobile://auth/complete",
+					status: "pending_checkout",
+					subscriptionStatus: "inactive",
+					target: "mobile",
+					trialEndsAt: null,
+				},
+			}),
+		}) as never,
+		clearPendingSignupIntentRecord: async () => undefined,
+		email: "timeout@example.com",
+		platform: "ios",
+		password,
+		purchaseTimeoutMs: 1,
+		purchasesClient: {
+			ensureConfigured: async () => true,
+			getManagementUrl: () => "https://apps.apple.com/account/subscriptions",
+			getOfferings: async () => ({
+				current: {
+					availablePackages: [],
+					identifier: "default",
+					monthly: {
+						identifier: "$rc_monthly",
+						packageType: "MONTHLY",
+						product: {
+							priceString: "$4.99",
+						},
+					},
+				},
+			}),
+			isPurchaseCancelled: () => false,
+				// eslint-disable-next-line promise/avoid-new -- This test needs a permanently pending purchase promise.
+				purchasePackage: async () => await new Promise<never>((resolve) => {
+					void resolve;
+				}),
+			restorePurchases: async () => ({
+				entitlements: {
+					active: {},
+				},
+			}),
+			},
+			readPendingSignupIntentRecord: async () => null,
+			savePendingSignupIntentRecord: async (record) => record,
+	});
+	try {
+		await timeoutErrorPromise;
+		throw new Error("Expected the registration flow to time out.");
+	} catch (error) {
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toBe(
+			"Timed out while starting the in-app trial. If you're testing on the iOS Simulator, run the app from Xcode with a StoreKit configuration file or test on a physical device.",
+		);
+	}
 });
 
 test("requestPrivatePasswordReset delegates the reset email request to the shared contracts client", async () => {

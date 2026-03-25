@@ -14,7 +14,7 @@ import {
 	selectRevenueCatPackage,
 } from "./revenuecat.model";
 
-test("getRevenueCatApiKey returns the iOS and Android placeholder keys", () => {
+test("getRevenueCatApiKey returns the configured iOS key and the Android placeholder key", () => {
 	expect(getRevenueCatApiKey("ios")).toBe(REVENUECAT_IOS_API_KEY);
 	expect(getRevenueCatApiKey("android")).toBe(REVENUECAT_ANDROID_API_KEY);
 });
@@ -24,8 +24,8 @@ test("isRevenueCatPlaceholderKey identifies dummy keys", () => {
 	expect(isRevenueCatPlaceholderKey("real_key_value")).toBe(false);
 });
 
-test("isRevenueCatConfigured is false while dummy keys are still in place", () => {
-	expect(isRevenueCatConfigured("ios")).toBe(false);
+test("isRevenueCatConfigured reflects which platforms have a real SDK key", () => {
+	expect(isRevenueCatConfigured("ios")).toBe(true);
 	expect(isRevenueCatConfigured("android")).toBe(false);
 });
 
@@ -79,7 +79,7 @@ test("hasActiveRevenueCatEntitlement checks the configured entitlement id", () =
 		hasActiveRevenueCatEntitlement({
 			entitlements: {
 				active: {
-					"private_connectors": {},
+					"PS Tech Pro": {},
 				},
 			},
 		}),
