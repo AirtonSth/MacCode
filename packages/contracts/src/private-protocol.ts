@@ -61,6 +61,22 @@ export interface PrivateMeResponseDto {
 	user: PrivateAuthUserDto;
 }
 
+export interface PrivateSubscriptionSnapshotDto {
+	daysRemaing: number;
+	daysRemaining: number;
+	email: string;
+	endsAt: string | null;
+	portalUrl: string | null;
+	renewsAt: string | null;
+	status: "inactive" | "trialing" | "active" | "past_due" | "canceled" | "expired";
+	subscribed: boolean;
+	trialEndsAt: string | null;
+}
+
+export interface PrivateRevenueCatSyncResponseDto {
+	subscription: PrivateSubscriptionSnapshotDto;
+}
+
 export interface PrivateLogoutRequestDto {
 	refreshToken: string;
 }

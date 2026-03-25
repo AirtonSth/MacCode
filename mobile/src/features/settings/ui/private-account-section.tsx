@@ -4,6 +4,7 @@ import {
 	type PrivateSessionDto,
 } from "@remotecode/contracts";
 import * as Linking from "expo-linking";
+import * as WebBrowser from "expo-web-browser";
 import { useGlobalSearchParams } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -17,21 +18,32 @@ import {
 } from "react-native";
 
 import { usePrivateSession } from "../../../shared/api/private-session-provider";
+import { revenueCatPurchasesClient } from "../../../shared/billing/revenuecat";
+import {
+	formatPrivateSubscriptionPriceLabel,
+	isRevenueCatConfigured,
+} from "../../../shared/billing/revenuecat.model";
 import { IosActionSheet } from "../../../shared/ui/ios-action-sheet";
 import {
+	buildNativeManageSubscriptionUrl,
 	buildPrivacyPolicyUrl,
-	buildPrivateForgotPasswordUrl,
-	buildPrivateManageSubscriptionUrl,
-	buildPrivateRegisterUrl,
 	buildTermsOfUseUrl,
 	deletePrivateAccount,
 	getPrivateSubscriptionSnapshot,
-	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
+	loginPrivateAccount,
 	persistSavedPrivateConnection,
 	refreshPrivateAccountSessionRecord,
+	registerPrivateAccount,
+	requestPrivatePasswordReset,
 	sortPrivateConnectors,
+	syncPrivateRevenueCatSubscriptionStatus,
 } from "./private-account-section.model";
+import {
+	didRevenueCatUnlockPrivateAccess,
+	purchasePrivateSubscription,
+	restorePrivateSubscriptionPurchases,
+} from "./private-subscription.model";
 
 const palette = {
 	accent: "#63C8FF",
@@ -44,6 +56,8 @@ const palette = {
 
 const DEFAULT_PRIVATE_BACKEND_URL = "https://private.remotecode.io:8787";
 
+type AuthMode = "login" | "register";
+
 const areConnectorsEqual = (
 	left: PrivateConnectorDto[],
 	right: PrivateConnectorDto[],
@@ -55,7 +69,7 @@ const areConnectorsEqual = (
 	return left.every((leftConnector, index) => {
 		const rightConnector = right[index];
 		return (
-			leftConnector.id === rightConnector.id
+			leftConnector.id === rightConnector?.id
 			&& leftConnector.name === rightConnector.name
 			&& leftConnector.hostname === rightConnector.hostname
 			&& leftConnector.status === rightConnector.status
@@ -92,38 +106,30 @@ export const PrivateAccountSection = ({
 		setSessionRecord,
 	} = usePrivateSession();
 	const backendUrl = sessionRecord?.backendUrl ?? DEFAULT_PRIVATE_BACKEND_URL;
+	const [authMode, setAuthMode] = useState<AuthMode>("login");
+	const [confirmPassword, setConfirmPassword] = useState("");
 	const [connectors, setConnectors] = useState<PrivateConnectorDto[]>([]);
 	const [email, setEmail] = useState("");
 	const [errorMessage, setErrorMessage] = useState<string | null>(null);
-	const [isAuthenticating, setIsAuthenticating] = useState(false);
+	const [noticeMessage, setNoticeMessage] = useState<string | null>(null);
 	const [isDeletingAccount, setIsDeletingAccount] = useState(false);
 	const [isDeleteConfirmVisible, setIsDeleteConfirmVisible] = useState(false);
-	const [isOptionsSheetVisible, setIsOptionsSheetVisible] = useState(false);
 	const [isLoadingConnectors, setIsLoadingConnectors] = useState(false);
+	const [isOptionsSheetVisible, setIsOptionsSheetVisible] = useState(false);
+	const [isPurchasingSubscription, setIsPurchasingSubscription] = useState(false);
+	const [isRestoringSubscription, setIsRestoringSubscription] = useState(false);
+	const [isSendingPasswordReset, setIsSendingPasswordReset] = useState(false);
+	const [isSubmittingAuth, setIsSubmittingAuth] = useState(false);
 	const [password, setPassword] = useState("");
 	const subscriptionSnapshot = useMemo(
 		() => getPrivateSubscriptionSnapshot(sessionRecord?.session),
 		[sessionRecord?.session],
 	);
 	const mobilePlatform = Platform.OS === "android" ? "android" : "ios";
-	const registerUrl = useMemo(
-		() => buildPrivateRegisterUrl({
-			backendUrl,
-			email,
-			platform: mobilePlatform,
-		}),
-		[backendUrl, email, mobilePlatform],
-	);
-	const forgotPasswordUrl = useMemo(
-		() => buildPrivateForgotPasswordUrl({
-			backendUrl,
-			email,
-		}),
-		[backendUrl, email],
-	);
+	const revenueCatReady = useMemo(() => isRevenueCatConfigured(mobilePlatform), [mobilePlatform]);
 	const manageSubscriptionUrl = useMemo(
-		() => buildPrivateManageSubscriptionUrl(),
-		[],
+		() => buildNativeManageSubscriptionUrl(mobilePlatform),
+		[mobilePlatform],
 	);
 	const privacyPolicyUrl = useMemo(() => buildPrivacyPolicyUrl(), []);
 	const termsOfUseUrl = useMemo(() => buildTermsOfUseUrl(), []);
@@ -147,6 +153,17 @@ export const PrivateAccountSection = ({
 		if (!record) {
 			setConnectorsIfUnchanged([]);
 			return [];
+		}
+
+		if (revenueCatReady) {
+			try {
+				await syncPrivateRevenueCatSubscriptionStatus({
+					backendUrl: record.backendUrl,
+					getAccessToken: () => record.session.accessToken,
+				});
+			} catch {
+				// Keep the last known subscription state if the RevenueCat sync fails.
+			}
 		}
 
 		const refreshedRecord = await refreshPrivateAccountSessionRecord({
@@ -201,11 +218,12 @@ export const PrivateAccountSection = ({
 			setIsLoadingConnectors(false);
 		}
 	}, [
-	clearSessionRecord,
-	refreshSession,
-	sessionRecord,
-	setSessionRecord,
-]);
+		clearSessionRecord,
+		refreshSession,
+		revenueCatReady,
+		sessionRecord,
+		setSessionRecord,
+	]);
 
 	const connectConnector = useCallback(async (
 		connector: Pick<PrivateConnectorDto, "id" | "name">,
@@ -229,14 +247,15 @@ export const PrivateAccountSection = ({
 		});
 		onPrivateConnectionSaved?.();
 		setErrorMessage(null);
+		setNoticeMessage(null);
 		onConnected();
 	}, [
-	activateConnector,
-	backendUrl,
-	onConnected,
-	onPrivateConnectionSaved,
-	sessionRecord?.backendUrl,
-]);
+		activateConnector,
+		backendUrl,
+		onConnected,
+		onPrivateConnectionSaved,
+		sessionRecord?.backendUrl,
+	]);
 
 	useEffect(() => {
 		void loadPrivateConnectorsSafely({
@@ -257,42 +276,97 @@ export const PrivateAccountSection = ({
 		onConnectorsLoaded?.(connectors);
 	}, [connectors, onConnectorsLoaded]);
 
-	const handleAuthenticate = useCallback(async () => {
-		setIsAuthenticating(true);
-		setErrorMessage(null);
-		try {
-			const session = await loginPrivateAccount({
-				baseUrl: backendUrl,
-				email,
-				password,
-			});
-			await setSessionRecord({
-				backendUrl,
-				session,
-			});
-			if (!session.user.subscribed) {
-				setConnectorsIfUnchanged([]);
-				return;
+	useEffect(() => {
+		if (!sessionRecord) {
+			return;
+		}
+
+		void (async () => {
+			try {
+				await revenueCatPurchasesClient.ensureConfigured(sessionRecord.session.user.id);
+			} catch {
+				// Avoid surfacing silent RevenueCat configuration failures on mount.
 			}
-			await loadConnectors({
+		})();
+	}, [sessionRecord]);
+
+	const handleAuthenticate = useCallback(async () => {
+		const trimmedEmail = email.trim();
+		const trimmedPassword = password.trim();
+		if (!trimmedEmail || !trimmedPassword) {
+			setErrorMessage("Email and password are required.");
+			return;
+		}
+
+		if (authMode === "register" && trimmedPassword !== confirmPassword.trim()) {
+			setErrorMessage("Passwords do not match.");
+			return;
+		}
+
+		setIsSubmittingAuth(true);
+		setErrorMessage(null);
+		setNoticeMessage(null);
+		try {
+			const session = authMode === "register"
+				? await registerPrivateAccount({
+					baseUrl: backendUrl,
+					email: trimmedEmail,
+					password: trimmedPassword,
+				})
+				: await loginPrivateAccount({
+					baseUrl: backendUrl,
+					email: trimmedEmail,
+					password: trimmedPassword,
+				});
+			const nextRecord = {
 				backendUrl,
 				session,
-			});
+			};
+			await setSessionRecord(nextRecord);
+			await loadConnectors(nextRecord);
+			setConfirmPassword("");
+			setPassword("");
 		} catch (error) {
 			setErrorMessage(error instanceof Error ? error.message : "Unable to authenticate private account.");
 		} finally {
-			setIsAuthenticating(false);
+			setIsSubmittingAuth(false);
 		}
 	}, [
-	backendUrl,
-	email,
-	loadConnectors,
-	password,
-	setSessionRecord,
-]);
+		authMode,
+		backendUrl,
+		confirmPassword,
+		email,
+		loadConnectors,
+		password,
+		setSessionRecord,
+	]);
+
+	const handleForgotPassword = useCallback(async () => {
+		const trimmedEmail = email.trim();
+		if (!trimmedEmail) {
+			setErrorMessage("Enter your account email first.");
+			return;
+		}
+
+		setIsSendingPasswordReset(true);
+		setErrorMessage(null);
+		setNoticeMessage(null);
+		try {
+			await requestPrivatePasswordReset({
+				baseUrl: backendUrl,
+				email: trimmedEmail,
+			});
+			setNoticeMessage(`Password reset instructions were sent to ${trimmedEmail}.`);
+		} catch (error) {
+			setErrorMessage(error instanceof Error ? error.message : "Unable to send a password reset email.");
+		} finally {
+			setIsSendingPasswordReset(false);
+		}
+	}, [backendUrl, email]);
 
 	const handleLogout = useCallback(async () => {
 		setErrorMessage(null);
+		setNoticeMessage(null);
 		try {
 			if (sessionRecord) {
 				const client = createPrivateClient({
@@ -318,6 +392,7 @@ export const PrivateAccountSection = ({
 
 		setIsDeletingAccount(true);
 		setErrorMessage(null);
+		setNoticeMessage(null);
 		try {
 			await deletePrivateAccount({
 				backendUrl: sessionRecord.backendUrl,
@@ -332,13 +407,98 @@ export const PrivateAccountSection = ({
 		}
 	}, [clearSessionRecord, sessionRecord]);
 
-	const authenticateButtonLabel = useMemo(() => {
-		if (isAuthenticating) {
-			return "Working...";
+	const handlePurchaseSubscription = useCallback(async () => {
+		if (!sessionRecord) {
+			return;
 		}
 
-		return "Log in";
-	}, [isAuthenticating]);
+		setIsPurchasingSubscription(true);
+		setErrorMessage(null);
+		setNoticeMessage(null);
+		try {
+			const result = await purchasePrivateSubscription({
+				backendUrl: sessionRecord.backendUrl,
+				getAccessToken: () => sessionRecord.session.accessToken,
+				purchasesClient: revenueCatPurchasesClient,
+				userId: sessionRecord.session.user.id,
+			});
+			await loadConnectors(sessionRecord);
+			if (!result.subscription.subscribed && !didRevenueCatUnlockPrivateAccess(result.customerInfo)) {
+				setNoticeMessage("Purchase completed. Tap Restore purchases if access is not active yet.");
+				return;
+			}
+
+			setNoticeMessage("Subscription activated on this device.");
+		} catch (error) {
+			if (revenueCatPurchasesClient.isPurchaseCancelled(error)) {
+				return;
+			}
+
+			setErrorMessage(error instanceof Error ? error.message : "Unable to start the subscription purchase.");
+		} finally {
+			setIsPurchasingSubscription(false);
+		}
+	}, [loadConnectors, sessionRecord]);
+
+	const handleRestorePurchases = useCallback(async () => {
+		if (!sessionRecord) {
+			return;
+		}
+
+		setIsRestoringSubscription(true);
+		setErrorMessage(null);
+		setNoticeMessage(null);
+		try {
+			const result = await restorePrivateSubscriptionPurchases({
+				backendUrl: sessionRecord.backendUrl,
+				getAccessToken: () => sessionRecord.session.accessToken,
+				purchasesClient: revenueCatPurchasesClient,
+				userId: sessionRecord.session.user.id,
+			});
+			await loadConnectors(sessionRecord);
+			if (!result.subscription.subscribed && !didRevenueCatUnlockPrivateAccess(result.customerInfo)) {
+				setNoticeMessage("No active App Store subscription was restored for this account.");
+				return;
+			}
+
+			setNoticeMessage("Purchases restored successfully.");
+		} catch (error) {
+			setErrorMessage(error instanceof Error ? error.message : "Unable to restore purchases.");
+		} finally {
+			setIsRestoringSubscription(false);
+		}
+	}, [loadConnectors, sessionRecord]);
+
+	const openInAppBrowser = useCallback(async (url: string) => {
+		await WebBrowser.openBrowserAsync(url);
+	}, []);
+
+	const authenticateButtonLabel = useMemo(() => {
+		if (isSubmittingAuth) {
+			return authMode === "register" ? "Creating account..." : "Signing in...";
+		}
+
+		return authMode === "register" ? "Create account" : "Log in";
+	}, [authMode, isSubmittingAuth]);
+
+	const subscribeButtonLabel = useMemo(() => {
+		if (isPurchasingSubscription) {
+			return "Starting purchase...";
+		}
+
+		return revenueCatReady
+			? `Subscribe for ${formatPrivateSubscriptionPriceLabel()}`
+			: "Finish RevenueCat setup";
+	}, [isPurchasingSubscription, revenueCatReady]);
+
+	const restoreButtonLabel = useMemo(() => {
+		if (isRestoringSubscription) {
+			return "Restoring...";
+		}
+
+		return "Restore purchases";
+	}, [isRestoringSubscription]);
+
 	const subscriptionState = (() => {
 		if (subscriptionSnapshot.isSubscribed && shouldShowConnectorList) {
 			return (
@@ -376,23 +536,65 @@ export const PrivateAccountSection = ({
 		if (!subscriptionSnapshot.isSubscribed) {
 			return (
 				<View style={styles.subscribeCard} testID="private-account-subscribe-cta">
-					<Text style={styles.subscribeEyebrow}>Subscription required</Text>
+					<Text style={styles.subscribeEyebrow}>In-app purchase required</Text>
 					<Text style={styles.subscribeTitle}>Unlock private connectors on mobile</Text>
+					<Text style={styles.subscribePrice}>{formatPrivateSubscriptionPriceLabel()}</Text>
 					<Text style={styles.supportText}>
-						Subscribe to keep private sync active on this device and connect private servers.
+						Buy the subscription in-app or restore an existing App Store purchase for this account.
 					</Text>
 					<Pressable
+						disabled={!sessionRecord || isPurchasingSubscription || isRestoringSubscription || !revenueCatReady}
 						onPress={() => {
-							void Linking.openURL(manageSubscriptionUrl);
+							void handlePurchaseSubscription();
 						}}
 						style={({ pressed }) => [
 							styles.primaryButton,
 							pressed ? styles.primaryButtonPressed : null,
+							!sessionRecord || isPurchasingSubscription || isRestoringSubscription || !revenueCatReady
+								? styles.disabledButton
+								: null,
 						]}
-						testID="private-account-subscribe-link"
+						testID="private-account-subscribe-button"
 					>
-						<Text style={styles.primaryLabel}>Manage subscription</Text>
+						<Text style={styles.primaryLabel}>{subscribeButtonLabel}</Text>
 					</Pressable>
+					<View style={styles.inlineActions}>
+						<Pressable
+							disabled={!sessionRecord || isPurchasingSubscription || isRestoringSubscription || !revenueCatReady}
+							onPress={() => {
+								void handleRestorePurchases();
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+								!sessionRecord || isPurchasingSubscription || isRestoringSubscription || !revenueCatReady
+									? styles.disabledButton
+									: null,
+							]}
+							testID="private-account-restore-purchases"
+						>
+							<Text style={styles.secondaryLabel}>{restoreButtonLabel}</Text>
+						</Pressable>
+						<Pressable
+							onPress={() => {
+								void Linking.openURL(manageSubscriptionUrl);
+							}}
+							style={({ pressed }) => [
+								styles.secondaryButton,
+								styles.inlineButton,
+								pressed ? styles.secondaryButtonPressed : null,
+							]}
+							testID="private-account-manage-subscription"
+						>
+							<Text style={styles.secondaryLabel}>Open subscriptions</Text>
+						</Pressable>
+					</View>
+					{!revenueCatReady ? (
+						<Text style={styles.supportText}>
+							RevenueCat is still using placeholder keys. Finish the setup and rebuild the app before testing purchases.
+						</Text>
+					) : null}
 				</View>
 			);
 		}
@@ -407,7 +609,7 @@ export const PrivateAccountSection = ({
 					<Text style={styles.sectionTitle}>Private Account</Text>
 					{sessionRecord ? null : (
 						<Text selectable style={styles.supportText}>
-							Sign in to sync desktop and mobile.
+							Sign in or create an account to sync desktop and mobile.
 						</Text>
 					)}
 				</View>
@@ -440,10 +642,46 @@ export const PrivateAccountSection = ({
 				</View>
 			) : (
 				<View style={styles.formBody}>
+					<View style={styles.segmentedControl}>
+						<Pressable
+							onPress={() => {
+								setAuthMode("login");
+								setErrorMessage(null);
+								setNoticeMessage(null);
+							}}
+							style={({ pressed }) => [
+								styles.segmentedButton,
+								authMode === "login" ? styles.segmentedButtonActive : null,
+								pressed ? styles.segmentedButtonPressed : null,
+							]}
+							testID="private-account-mode-login"
+						>
+							<Text style={authMode === "login" ? styles.segmentedLabelActive : styles.segmentedLabel}>Log in</Text>
+						</Pressable>
+						<Pressable
+							onPress={() => {
+								setAuthMode("register");
+								setErrorMessage(null);
+								setNoticeMessage(null);
+							}}
+							style={({ pressed }) => [
+								styles.segmentedButton,
+								authMode === "register" ? styles.segmentedButtonActive : null,
+								pressed ? styles.segmentedButtonPressed : null,
+							]}
+							testID="private-account-mode-register"
+						>
+							<Text style={authMode === "register" ? styles.segmentedLabelActive : styles.segmentedLabel}>Create account</Text>
+						</Pressable>
+					</View>
 					<TextInput
 						autoCapitalize="none"
 						keyboardType="email-address"
-						onChangeText={setEmail}
+						onChangeText={(value) => {
+							setEmail(value);
+							setErrorMessage(null);
+							setNoticeMessage(null);
+						}}
 						placeholder="dev@example.com"
 						placeholderTextColor={palette.muted}
 						style={styles.input}
@@ -451,7 +689,11 @@ export const PrivateAccountSection = ({
 						value={email}
 					/>
 					<TextInput
-						onChangeText={setPassword}
+						onChangeText={(value) => {
+							setPassword(value);
+							setErrorMessage(null);
+							setNoticeMessage(null);
+						}}
 						placeholder="Password"
 						placeholderTextColor={palette.muted}
 						secureTextEntry
@@ -459,15 +701,36 @@ export const PrivateAccountSection = ({
 						testID="private-account-password"
 						value={password}
 					/>
+					{authMode === "register" ? (
+						<TextInput
+							onChangeText={(value) => {
+								setConfirmPassword(value);
+								setErrorMessage(null);
+								setNoticeMessage(null);
+							}}
+							placeholder="Confirm password"
+							placeholderTextColor={palette.muted}
+							secureTextEntry
+							style={styles.input}
+							testID="private-account-password-confirm"
+							value={confirmPassword}
+						/>
+					) : null}
 					<Pressable
-						disabled={isAuthenticating || backendUrl.trim().length === 0 || email.trim().length === 0 || password.trim().length === 0}
+						disabled={
+							isSubmittingAuth
+							|| backendUrl.trim().length === 0
+							|| email.trim().length === 0
+							|| password.trim().length === 0
+							|| (authMode === "register" && confirmPassword.trim().length === 0)
+						}
 						onPress={() => {
 							void handleAuthenticate();
 						}}
 						style={({ pressed }) => [
 							styles.primaryButton,
 							pressed ? styles.primaryButtonPressed : null,
-							isAuthenticating ? styles.disabledButton : null,
+							isSubmittingAuth ? styles.disabledButton : null,
 						]}
 						testID="private-account-authenticate"
 					>
@@ -475,30 +738,39 @@ export const PrivateAccountSection = ({
 					</Pressable>
 					<View style={styles.inlineActions}>
 						<Pressable
+							disabled={isSendingPasswordReset || email.trim().length === 0}
 							onPress={() => {
-								void Linking.openURL(forgotPasswordUrl);
+								void handleForgotPassword();
 							}}
 							style={({ pressed }) => [
 								styles.secondaryButton,
 								styles.inlineButton,
 								pressed ? styles.secondaryButtonPressed : null,
+								isSendingPasswordReset || email.trim().length === 0 ? styles.disabledButton : null,
 							]}
 							testID="private-account-forgot-password"
 						>
-							<Text style={styles.secondaryLabel}>Forgot password</Text>
+							<Text style={styles.secondaryLabel}>
+								{isSendingPasswordReset ? "Sending..." : "Send reset link"}
+							</Text>
 						</Pressable>
 						<Pressable
 							onPress={() => {
-								void Linking.openURL(registerUrl);
+								setAuthMode(authMode === "login" ? "register" : "login");
+								setConfirmPassword("");
+								setErrorMessage(null);
+								setNoticeMessage(null);
 							}}
 							style={({ pressed }) => [
 								styles.secondaryButton,
 								styles.inlineButton,
 								pressed ? styles.secondaryButtonPressed : null,
 							]}
-							testID="private-account-register-browser"
+							testID="private-account-switch-auth-mode"
 						>
-							<Text style={styles.secondaryLabel}>Register in browser</Text>
+							<Text style={styles.secondaryLabel}>
+								{authMode === "login" ? "Create account" : "Use login"}
+							</Text>
 						</Pressable>
 					</View>
 				</View>
@@ -507,7 +779,7 @@ export const PrivateAccountSection = ({
 			<View style={styles.legalLinks}>
 				<Pressable
 					onPress={() => {
-						void Linking.openURL(privacyPolicyUrl);
+						void openInAppBrowser(privacyPolicyUrl);
 					}}
 					testID="private-account-privacy-policy"
 				>
@@ -516,7 +788,7 @@ export const PrivateAccountSection = ({
 				<Text style={styles.legalSeparator}>·</Text>
 				<Pressable
 					onPress={() => {
-						void Linking.openURL(termsOfUseUrl);
+						void openInAppBrowser(termsOfUseUrl);
 					}}
 					testID="private-account-terms-of-use"
 				>
@@ -524,6 +796,11 @@ export const PrivateAccountSection = ({
 				</Pressable>
 			</View>
 
+			{noticeMessage ? (
+				<View style={styles.noticeBox}>
+					<Text selectable style={styles.noticeText}>{noticeMessage}</Text>
+				</View>
+			) : null}
 			{errorMessage ? (
 				<View style={styles.statusBox}>
 					<Text selectable style={styles.statusText}>{errorMessage}</Text>
@@ -642,6 +919,18 @@ const styles = StyleSheet.create({
 		fontSize: 12,
 		textDecorationLine: "underline",
 	},
+	noticeBox: {
+		backgroundColor: "rgba(99,200,255,0.12)",
+		borderColor: "rgba(99,200,255,0.32)",
+		borderRadius: 12,
+		borderWidth: 1,
+		padding: 12,
+	},
+	noticeText: {
+		color: palette.text,
+		fontSize: 13,
+		lineHeight: 19,
+	},
 	optionsButton: {
 		alignItems: "center",
 		borderColor: palette.border,
@@ -721,6 +1010,39 @@ const styles = StyleSheet.create({
 		fontSize: 15,
 		fontWeight: "700",
 	},
+	segmentedButton: {
+		alignItems: "center",
+		borderRadius: 10,
+		flex: 1,
+		height: 34,
+		justifyContent: "center",
+	},
+	segmentedButtonActive: {
+		backgroundColor: palette.soft,
+		borderColor: palette.border,
+		borderWidth: 1,
+	},
+	segmentedButtonPressed: {
+		opacity: 0.85,
+	},
+	segmentedControl: {
+		backgroundColor: "rgba(255,255,255,0.03)",
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		flexDirection: "row",
+		padding: 4,
+	},
+	segmentedLabel: {
+		color: palette.muted,
+		fontSize: 13,
+		fontWeight: "600",
+	},
+	segmentedLabelActive: {
+		color: palette.text,
+		fontSize: 13,
+		fontWeight: "700",
+	},
 	statusBox: {
 		backgroundColor: "rgba(255,107,133,0.16)",
 		borderColor: "rgba(255,107,133,0.38)",
@@ -747,6 +1069,11 @@ const styles = StyleSheet.create({
 		fontWeight: "700",
 		letterSpacing: 0.8,
 		textTransform: "uppercase",
+	},
+	subscribePrice: {
+		color: palette.text,
+		fontSize: 22,
+		fontWeight: "700",
 	},
 	subscribeTitle: {
 		color: palette.text,

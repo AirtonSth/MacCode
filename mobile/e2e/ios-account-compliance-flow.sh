@@ -59,5 +59,23 @@ if exists "private-account-options"; then
 fi
 echo "PASS: Options button is hidden when not logged in."
 
+echo "Checking native account creation controls are visible..."
+if ! exists "private-account-mode-register"; then
+	echo "FAIL: In-app account creation toggle not found." >&2
+	exit 1
+fi
+if ! exists "private-account-switch-auth-mode"; then
+	echo "FAIL: In-app auth mode switch not found." >&2
+	exit 1
+fi
+echo "PASS: In-app account creation controls are visible."
+
+echo "Checking legacy browser registration CTA is gone..."
+if exists "private-account-register-browser"; then
+	echo "FAIL: Browser registration CTA is still visible." >&2
+	exit 1
+fi
+echo "PASS: Browser registration CTA is hidden."
+
 echo "Account compliance flow passed."
 ad close >/dev/null || true

@@ -4,18 +4,19 @@ import { expect, mock, test } from "bun:test";
 import { PrivateApiError } from "@remotecode/contracts";
 
 import {
+	buildNativeManageSubscriptionUrl,
 	buildPrivacyPolicyUrl,
-	buildPrivateForgotPasswordUrl,
-	buildPrivateManageSubscriptionUrl,
-	buildPrivateRegisterUrl,
 	buildTermsOfUseUrl,
 	deletePrivateAccount,
 	getPrivateSubscriptionSnapshot,
-	refreshPrivateAccountSessionRecord,
-	loginPrivateAccount,
 	loadPrivateConnectorsSafely,
+	loginPrivateAccount,
 	persistSavedPrivateConnection,
+	refreshPrivateAccountSessionRecord,
+	registerPrivateAccount,
+	requestPrivatePasswordReset,
 	sortPrivateConnectors,
+	syncPrivateRevenueCatSubscriptionStatus,
 } from "./private-account-section.model";
 
 test("sortPrivateConnectors prioritizes online connectors", () => {
@@ -71,6 +72,73 @@ test("loginPrivateAccount delegates login to the shared contracts client", async
 	expect(session.accessToken).toBe("access-token");
 });
 
+test("registerPrivateAccount delegates registration to the shared contracts client", async () => {
+	const password = ["super", "safe", "123"].join("");
+	const session = await registerPrivateAccount({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			register: async () => ({
+				accessToken: "register-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 0,
+					daysRemaining: 0,
+					email: "new@example.com",
+					id: "usr_new",
+					subscribed: false,
+				},
+			}),
+		}) as never,
+		email: "new@example.com",
+		password,
+	});
+
+	expect(session.user.email).toBe("new@example.com");
+	expect(session.accessToken).toBe("register-token");
+});
+
+test("requestPrivatePasswordReset delegates the reset email request to the shared contracts client", async () => {
+	let seenEmail = "";
+
+	await requestPrivatePasswordReset({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			requestPasswordReset: async (input: { email: string }) => {
+				seenEmail = input.email;
+				return { sent: true };
+			},
+		}) as never,
+		email: "reset@example.com",
+	});
+
+	expect(seenEmail).toBe("reset@example.com");
+});
+
+test("syncPrivateRevenueCatSubscriptionStatus returns the backend subscription snapshot", async () => {
+	const subscription = await syncPrivateRevenueCatSubscriptionStatus({
+		backendUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			syncRevenueCatSubscription: async () => ({
+				subscription: {
+					daysRemaing: 30,
+					daysRemaining: 30,
+					email: "dev@example.com",
+					endsAt: null,
+					portalUrl: "https://apps.apple.com/account/subscriptions",
+					renewsAt: null,
+					status: "active",
+					subscribed: true,
+					trialEndsAt: null,
+				},
+			}),
+		}) as never,
+		getAccessToken: () => "access-token",
+	});
+
+	expect(subscription.subscribed).toBe(true);
+	expect(subscription.portalUrl).toBe("https://apps.apple.com/account/subscriptions");
+});
+
 test("loadPrivateConnectorsSafely reports load failures instead of rejecting", async () => {
 	let seenMessage = "";
 
@@ -115,27 +183,16 @@ test("persistSavedPrivateConnection stores a reconnectable private saved connect
 	expect(persistedKind).toBe("private");
 });
 
-test("buildPrivateRegisterUrl sends mobile users to the browser registration flow", () => {
-	expect(buildPrivateRegisterUrl({
-		backendUrl: "https://private.remotecode.io:8787/",
-		email: "dev@example.com",
-		platform: "ios",
-	})).toBe(
-		"https://remotecode.io/register?backendUrl=https%3A%2F%2Fprivate.remotecode.io%3A8787&email=dev%40example.com&platform=ios&returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete&target=mobile",
-	);
+test("buildNativeManageSubscriptionUrl points iOS users to native subscription management", () => {
+	expect(buildNativeManageSubscriptionUrl("ios")).toBe("https://apps.apple.com/account/subscriptions");
 });
 
-test("buildPrivateForgotPasswordUrl preserves the backend and optional email", () => {
-	expect(buildPrivateForgotPasswordUrl({
-		backendUrl: "https://private.remotecode.io:8787/",
-		email: "dev@example.com",
-	})).toBe(
-		"https://remotecode.io/forgot-password?backendUrl=https%3A%2F%2Fprivate.remotecode.io%3A8787&email=dev%40example.com",
-	);
+test("buildPrivacyPolicyUrl returns the privacy policy page", () => {
+	expect(buildPrivacyPolicyUrl()).toBe("https://remotecode.io/privacy");
 });
 
-test("buildPrivateManageSubscriptionUrl points to the private web app", () => {
-	expect(buildPrivateManageSubscriptionUrl()).toBe("https://remotecode.io/app");
+test("buildTermsOfUseUrl returns the terms of use page", () => {
+	expect(buildTermsOfUseUrl()).toBe("https://remotecode.io/terms");
 });
 
 test("refreshPrivateAccountSessionRecord updates subscription state from private account /me response", async () => {
@@ -248,24 +305,17 @@ test("getPrivateSubscriptionSnapshot reads the subscription flags from the sessi
 	});
 });
 
-test("buildPrivacyPolicyUrl returns the privacy policy page", () => {
-	expect(buildPrivacyPolicyUrl()).toBe("https://remotecode.io/privacy");
-});
-
-test("buildTermsOfUseUrl returns the terms of use page", () => {
-	expect(buildTermsOfUseUrl()).toBe("https://remotecode.io/terms");
-});
-
 test("deletePrivateAccount delegates deletion to the shared contracts client", async () => {
-	// eslint-disable-next-line @typescript-eslint/no-empty-function
-	const deleteAccount = mock(async () => {});
+	let deleteCalled = false;
 	await deletePrivateAccount({
 		backendUrl: "https://private.remotecode.io:8787",
 		createClient: () => ({
-			deleteAccount,
+			deleteAccount: async () => {
+				deleteCalled = true;
+			},
 		}) as never,
 		getAccessToken: () => "access-token",
 	});
 
-	expect(deleteAccount).toHaveBeenCalledTimes(1);
+	expect(deleteCalled).toBe(true);
 });

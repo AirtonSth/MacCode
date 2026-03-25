@@ -1,48 +1,23 @@
-import { createPrivateClient, PrivateApiError ,type  PrivateConnectorDto,type  PrivateSessionDto } from "@remotecode/contracts";
-import type { PersistedPrivateSessionRecord } from "../../../shared/api/private-session-store";
+import {
+	createPrivateClient,
+	PrivateApiError,
+	type PrivateConnectorDto,
+	type PrivateSessionDto,
+	type PrivateSubscriptionSnapshotDto,
+} from "@remotecode/contracts";
 
+import type { PersistedPrivateSessionRecord } from "../../../shared/api/private-session-store";
 import { ApiConfigStore } from "../../../shared/api/api-config-store";
+import { getNativeSubscriptionManagementUrl, type RevenueCatPlatform } from "../../../shared/billing/revenuecat.model";
 
 const REMOTECODE_WEB_URL = "https://remotecode.io";
 const REMOTECODE_PRIVACY_POLICY_URL = `${REMOTECODE_WEB_URL}/privacy`;
 const REMOTECODE_TERMS_OF_USE_URL = `${REMOTECODE_WEB_URL}/terms`;
 
 const trimBaseUrl = (value: string): string => value.trim().replace(/\/+$/u, "");
-const buildRemoteCodeWebUrl = (path: string, params: Record<string, string>): string => {
-	const searchParams = new URLSearchParams();
-	for (const [key, value] of Object.entries(params)) {
-		searchParams.set(key, value);
-	}
 
-	return `${REMOTECODE_WEB_URL}${path}?${searchParams.toString()}`;
-};
-
-export const buildPrivateRegisterUrl = (input: {
-	backendUrl: string;
-	email?: string | null;
-	platform: "android" | "ios";
-}): string => {
-	return buildRemoteCodeWebUrl("/register", {
-		backendUrl: trimBaseUrl(input.backendUrl),
-		...(input.email?.trim() ? { email: input.email.trim() } : {}),
-		platform: input.platform,
-		returnUrl: "remotecode://auth/complete",
-		target: "mobile",
-	});
-};
-
-export const buildPrivateForgotPasswordUrl = (input: {
-	backendUrl: string;
-	email?: string | null;
-}): string => {
-	return buildRemoteCodeWebUrl("/forgot-password", {
-		backendUrl: trimBaseUrl(input.backendUrl),
-		...(input.email?.trim() ? { email: input.email.trim() } : {}),
-	});
-};
-
-export const buildPrivateManageSubscriptionUrl = (): string =>
-	`${REMOTECODE_WEB_URL}/app`;
+export const buildNativeManageSubscriptionUrl = (platform: RevenueCatPlatform): string =>
+	getNativeSubscriptionManagementUrl(platform);
 
 export const buildPrivacyPolicyUrl = (): string => REMOTECODE_PRIVACY_POLICY_URL;
 
@@ -60,7 +35,12 @@ export const deletePrivateAccount = async (input: {
 	await client.deleteAccount();
 };
 
-export const getPrivateSubscriptionSnapshot = (session: PrivateSessionDto | null | undefined) => ({
+export const getPrivateSubscriptionSnapshot = (
+	session: PrivateSessionDto | null | undefined,
+): {
+	daysRemaining: number;
+	isSubscribed: boolean;
+} => ({
 	daysRemaining: session?.user.daysRemaining ?? session?.user.daysRemaing ?? 0,
 	isSubscribed: Boolean(session?.user.subscribed),
 });
@@ -88,6 +68,50 @@ export const loginPrivateAccount = async (input: {
 		email: input.email,
 		password: input.password,
 	});
+};
+
+export const registerPrivateAccount = async (input: {
+	baseUrl: string;
+	createClient?: typeof createPrivateClient;
+	email: string;
+	password: string;
+}): Promise<PrivateSessionDto> => {
+	const client = (input.createClient ?? createPrivateClient)({
+		baseUrl: input.baseUrl,
+	});
+
+	return await client.register({
+		email: input.email,
+		password: input.password,
+	});
+};
+
+export const requestPrivatePasswordReset = async (input: {
+	baseUrl: string;
+	createClient?: typeof createPrivateClient;
+	email: string;
+}): Promise<void> => {
+	const client = (input.createClient ?? createPrivateClient)({
+		baseUrl: input.baseUrl,
+	});
+
+	await client.requestPasswordReset({
+		email: input.email,
+	});
+};
+
+export const syncPrivateRevenueCatSubscriptionStatus = async (input: {
+	backendUrl: string;
+	createClient?: typeof createPrivateClient;
+	getAccessToken: () => string;
+}): Promise<PrivateSubscriptionSnapshotDto> => {
+	const client = (input.createClient ?? createPrivateClient)({
+		baseUrl: input.backendUrl,
+		getAccessToken: input.getAccessToken,
+	});
+
+	const response = await client.syncRevenueCatSubscription();
+	return response.subscription;
 };
 
 type PrivateClientWithMeOnly = Pick<ReturnType<typeof createPrivateClient>, "me">;

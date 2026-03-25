@@ -2,23 +2,14 @@
 /* eslint-disable @typescript-eslint/parameter-properties */
 /* eslint-disable max-statements */
 /* eslint-disable @typescript-eslint/no-magic-numbers */
+import { createPrivateAuthMethods } from "./private-client-auth";
 import type {
 	PrivateAuthCompletionExchangeRequestDto,
 	PrivateBootstrapResponseDto,
 	PrivateBootstrapStatusDto,
 	PrivateConnectorsResponseDto,
-	PrivateForgotPasswordRequestDto,
-	PrivateForgotPasswordResponseDto,
-	PrivateLoginRequestDto,
-	PrivateLogoutRequestDto,
-	PrivateMeResponseDto,
 	PrivatePairingClaimRequestDto,
 	PrivatePairingClaimResponseDto,
-	PrivateRefreshRequestDto,
-	PrivateRegisterRequestDto,
-	PrivateResetPasswordRequestDto,
-	PrivateResetPasswordResponseDto,
-	PrivateResetPasswordValidateResponseDto,
 	PrivateSessionDto,
 	PrivateSignupIntentCheckoutResponseDto,
 	PrivateSignupIntentCompletionResponseDto,
@@ -229,71 +220,6 @@ export const createPrivateClient = (config: PrivateClientConfig) => {
 				path: "/v1/private/connectors",
 			}),
 
-		login: async (input: PrivateLoginRequestDto): Promise<PrivateSessionDto> =>
-			await request<PrivateSessionDto>({
-				authenticated: false,
-				body: input,
-				method: "POST",
-				path: "/v1/private/auth/login",
-			}),
-
-		logout: async (input: PrivateLogoutRequestDto): Promise<void> => {
-			await request<null>({
-				body: input,
-				method: "POST",
-				path: "/v1/private/auth/logout",
-			});
-		},
-
-		me: async (): Promise<PrivateMeResponseDto> =>
-			await request<PrivateMeResponseDto>({
-				method: "GET",
-				path: "/v1/private/me",
-			}),
-
-		refresh: async (input: PrivateRefreshRequestDto): Promise<PrivateSessionDto> =>
-			await request<PrivateSessionDto>({
-				authenticated: false,
-				body: input,
-				method: "POST",
-				path: "/v1/private/auth/refresh",
-			}),
-
-		register: async (input: PrivateRegisterRequestDto): Promise<PrivateSessionDto> =>
-			await request<PrivateSessionDto>({
-				authenticated: false,
-				body: input,
-				method: "POST",
-				path: "/v1/private/auth/register",
-			}),
-
-		requestPasswordReset: async (
-			input: PrivateForgotPasswordRequestDto,
-		): Promise<PrivateForgotPasswordResponseDto> =>
-			await request<PrivateForgotPasswordResponseDto>({
-				authenticated: false,
-				body: input,
-				method: "POST",
-				path: "/v1/private/auth/forgot-password",
-			}),
-
-		resetPassword: async (
-			input: PrivateResetPasswordRequestDto,
-		): Promise<PrivateResetPasswordResponseDto> =>
-			await request<PrivateResetPasswordResponseDto>({
-				authenticated: false,
-				body: input,
-				method: "POST",
-				path: "/v1/private/auth/reset-password",
-			}),
-
-		validatePasswordResetToken: async (
-			token: string,
-		): Promise<PrivateResetPasswordValidateResponseDto> =>
-			await request<PrivateResetPasswordValidateResponseDto>({
-				authenticated: false,
-				method: "GET",
-				path: `/v1/private/auth/reset-password/${encodeURIComponent(token)}/validate`,
-			}),
+		...createPrivateAuthMethods(request),
 	};
 };

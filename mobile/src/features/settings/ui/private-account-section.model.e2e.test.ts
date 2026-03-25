@@ -2,12 +2,15 @@
 import { expect, test } from "bun:test";
 
 import {
+	buildNativeManageSubscriptionUrl,
 	buildPrivacyPolicyUrl,
-	buildPrivateRegisterUrl,
 	buildTermsOfUseUrl,
 	deletePrivateAccount,
 	loginPrivateAccount,
 	persistSavedPrivateConnection,
+	registerPrivateAccount,
+	requestPrivatePasswordReset,
+	syncPrivateRevenueCatSubscriptionStatus,
 } from "./private-account-section.model";
 
 test("private account section flow logs in with valid credentials", async () => {
@@ -35,6 +38,31 @@ test("private account section flow logs in with valid credentials", async () => 
 	expect(session.accessToken).toBe("access-token");
 });
 
+test("private account section flow registers in-app without a browser redirect", async () => {
+	const password = ["super", "secret", "123"].join("");
+	const session = await registerPrivateAccount({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			register: async () => ({
+				accessToken: "register-token",
+				refreshToken: "refresh-token",
+				user: {
+					daysRemaing: 0,
+					daysRemaining: 0,
+					email: "founder@remotecode.io",
+					id: "usr_2",
+					subscribed: false,
+				},
+			}),
+		}) as never,
+		email: "founder@remotecode.io",
+		password,
+	});
+
+	expect(session.user.email).toBe("founder@remotecode.io");
+	expect(session.user.subscribed).toBe(false);
+});
+
 test("private account section persistence helper writes the claimed connector as a saved private connection", async () => {
 	let persistedConnectorId = "";
 
@@ -53,13 +81,46 @@ test("private account section persistence helper writes the claimed connector as
 	expect(persistedConnectorId).toBe("con_42");
 });
 
+test("private account section sends password reset requests in-app", async () => {
+	let requestedEmail = "";
 
-test("private account section builds the browser registration URL with a native return target", () => {
-	expect(buildPrivateRegisterUrl({
+	await requestPrivatePasswordReset({
+		baseUrl: "https://private.remotecode.io:8787",
+		createClient: () => ({
+			requestPasswordReset: async (input: { email: string }) => {
+				requestedEmail = input.email;
+				return { sent: true };
+			},
+		}) as never,
+		email: "reset@remotecode.io",
+	});
+
+	expect(requestedEmail).toBe("reset@remotecode.io");
+});
+
+test("private account section syncs RevenueCat subscription status through the backend", async () => {
+	const subscription = await syncPrivateRevenueCatSubscriptionStatus({
 		backendUrl: "https://private.remotecode.io:8787",
-		email: "founder@remotecode.io",
-		platform: "android",
-	})).toContain("returnUrl=remotecode%3A%2F%2Fauth%2Fcomplete");
+		createClient: () => ({
+			syncRevenueCatSubscription: async () => ({
+				subscription: {
+					daysRemaing: 7,
+					daysRemaining: 7,
+					email: "founder@remotecode.io",
+					endsAt: null,
+					portalUrl: "https://apps.apple.com/account/subscriptions",
+					renewsAt: null,
+					status: "trialing",
+					subscribed: true,
+					trialEndsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+				},
+			}),
+		}) as never,
+		getAccessToken: () => "access-token",
+	});
+
+	expect(subscription.subscribed).toBe(true);
+	expect(subscription.status).toBe("trialing");
 });
 
 test("privacy policy URL points to remotecode.io/privacy", () => {
@@ -68,6 +129,10 @@ test("privacy policy URL points to remotecode.io/privacy", () => {
 
 test("terms of use URL points to remotecode.io/terms", () => {
 	expect(buildTermsOfUseUrl()).toBe("https://remotecode.io/terms");
+});
+
+test("subscription management URL points to the native iOS subscriptions screen", () => {
+	expect(buildNativeManageSubscriptionUrl("ios")).toBe("https://apps.apple.com/account/subscriptions");
 });
 
 test("deletePrivateAccount calls the deleteAccount method on the private client", async () => {
