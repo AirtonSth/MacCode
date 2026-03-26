@@ -484,7 +484,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch.complication;
 				PRODUCT_NAME = RemoteCodeWatchComplication;
 				SDKROOT = watchos;
@@ -506,7 +506,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch.tests;
 				PRODUCT_NAME = RemoteCodeWatchLogicTests;
 				SDKROOT = macosx;
@@ -526,7 +526,7 @@
 					"@executable_path/../Frameworks",
 					"@loader_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch.tests;
 				PRODUCT_NAME = RemoteCodeWatchLogicTests;
 				SDKROOT = macosx;
@@ -547,7 +547,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch.complication;
 				PRODUCT_NAME = RemoteCodeWatchComplication;
 				SDKROOT = watchos;
@@ -567,7 +567,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_WKApplication = YES;
 				INFOPLIST_KEY_WKWatchOnly = YES;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch;
 				PRODUCT_NAME = RemoteCodeWatch;
 				SDKROOT = watchos;
@@ -587,7 +587,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_WKApplication = YES;
 				INFOPLIST_KEY_WKWatchOnly = YES;
-				MARKETING_VERSION = 1.0.3;
+				MARKETING_VERSION = 1.0.6;
 				PRODUCT_BUNDLE_IDENTIFIER = io.remotecode.watch;
 				PRODUCT_NAME = RemoteCodeWatch;
 				SDKROOT = watchos;

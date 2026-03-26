@@ -57,8 +57,8 @@ project.yml defines the test scheme as `RemoteCodeWatchLogic` but the generated 
 
 ### 10. Version mismatch with iOS app
 **File:** `project.yml:22-23`, `project.pbxproj:342,358`
-Watch app is at `MARKETING_VERSION = 1.0` / `CURRENT_PROJECT_VERSION = 1` while the iOS app is at version `1.0.3`. Apple requires paired Watch/iOS apps to have coordinated versioning for App Store submission.
-**Fix:** Sync version to `1.0.3` (or current iOS version) and keep them in lockstep.
+Watch app is at `MARKETING_VERSION = 1.0` / `CURRENT_PROJECT_VERSION = 1` while the iOS app is at version `1.0.6`. Apple requires paired Watch/iOS apps to have coordinated versioning for App Store submission.
+**Fix:** Sync version to `1.0.6` (or current iOS version) and keep them in lockstep.
 
 ---
 

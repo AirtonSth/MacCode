@@ -24,7 +24,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_WKApplication: YES
         INFOPLIST_KEY_WKWatchOnly: YES
-        MARKETING_VERSION: 1.0.3
+        MARKETING_VERSION: 1.0.6
         PRODUCT_BUNDLE_IDENTIFIER: io.remotecode.watch
         PRODUCT_NAME: RemoteCodeWatch
         SKIP_INSTALL: NO
@@ -43,7 +43,7 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSExtension_NSExtensionPointIdentifier: com.apple.widgetkit-extension
-        MARKETING_VERSION: 1.0.3
+        MARKETING_VERSION: 1.0.6
         PRODUCT_BUNDLE_IDENTIFIER: io.remotecode.watch.complication
         PRODUCT_NAME: RemoteCodeWatchComplication
         SKIP_INSTALL: YES
@@ -59,7 +59,7 @@ targets:
       base:
         CURRENT_PROJECT_VERSION: 1
         GENERATE_INFOPLIST_FILE: YES
-        MARKETING_VERSION: 1.0.3
+        MARKETING_VERSION: 1.0.6
         PRODUCT_BUNDLE_IDENTIFIER: io.remotecode.watch.tests
         PRODUCT_NAME: RemoteCodeWatchLogicTests
         SWIFT_VERSION: "5.10"
