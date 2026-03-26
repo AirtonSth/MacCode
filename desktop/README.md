@@ -26,6 +26,26 @@ This hello world app demonstrates:
    bun run build
    ```
 
+## Headless Backend Server
+
+To run only the desktop backend without Electrobun, Vite, or the desktop UI:
+
+```bash
+bun run start:server
+```
+
+To start the backend and also authenticate the private relay:
+
+```bash
+bun run start:server --login=dev@example.com --password=super-secret
+```
+
+Notes:
+- `--login` and `--password` are optional, but they must be provided together.
+- When credentials are provided, startup only succeeds after the private relay is connected and ready for web/private access.
+- If login fails or the relay never becomes ready, the process exits non-zero.
+- The command still respects the existing server environment variables such as `REMOTECODE_SERVER_HOST`, `REMOTECODE_SERVER_PORT`, `REMOTECODE_LOCAL_TOKEN`, `REMOTECODE_DB_PATH`, and `REMOTECODE_PRIVATE_BACKEND_URL`.
+
 ## Project Structure
 
 ```

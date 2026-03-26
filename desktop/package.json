@@ -4,6 +4,7 @@
   "description": "Electrobun app with React + Vite",
   "scripts": {
     "start": "vite build && electrobun dev",
+    "start:server": "bun run ./src/bun/server/scripts/start-server.ts",
     "build:vite": "vite build",
     "dev": "electrobun dev --watch",
     "start:hmr": "concurrently \"bun run hmr\" \"bun start\"",

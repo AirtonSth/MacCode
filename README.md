@@ -47,6 +47,26 @@ Everything syncs in real-time between your PC and phone, so you're free to move 
 4. Connect the mobile app to the desktop server (usually automatic via local network or login).
 5. Start coding remotely!
 
+### Headless Desktop Server
+
+If you want to run only the desktop backend on a headless machine, such as a VPS, use:
+
+```bash
+bun run start:server
+```
+
+Optional private login:
+
+```bash
+bun run start:server --login=dev@example.com --password=super-secret
+```
+
+Behavior:
+- Without credentials, the command starts only the local/LAN desktop server.
+- With `--login` and `--password`, the command also authenticates with the private backend and waits for the private relay to become ready for web access.
+- `--login` and `--password` must be provided together.
+- If private login or relay startup fails, the process exits with a non-zero status.
+
 ## Contributing
 
 We welcome contributions! Please read our [Contributing Guide](CONTRIBUTING.md) for details on how to get started.
