@@ -486,7 +486,7 @@ export const PrivateAccountSection = ({
 			return authMode === "register" ? "Starting trial..." : "Signing in...";
 		}
 
-		return authMode === "register" ? "Start 7-day trial" : "Log in";
+		return authMode === "register" ? "Start free trial" : "Log in";
 	}, [authMode, isSubmittingAuth]);
 
 	const subscribeButtonLabel = useMemo(() => {
@@ -544,11 +544,12 @@ export const PrivateAccountSection = ({
 		if (!subscriptionSnapshot.isSubscribed) {
 			return (
 				<View style={styles.subscribeCard} testID="private-account-subscribe-cta">
-					<Text style={styles.subscribeEyebrow}>In-app purchase required</Text>
-					<Text style={styles.subscribeTitle}>Unlock private connectors on mobile</Text>
+					<Text style={styles.subscribeEyebrow}>Subscription required</Text>
+					<Text style={styles.subscribeTitle}>RemoteCode Pro</Text>
 					<Text style={styles.subscribePrice}>{formatPrivateSubscriptionPriceLabel()}</Text>
 					<Text style={styles.supportText}>
-						Buy the subscription in-app or restore an existing App Store purchase for this account.
+						Monthly auto-renewable subscription. Connect to your desktop from anywhere
+						without VPN or network setup. Cancel anytime in Settings on your device.
 					</Text>
 					<Pressable
 						disabled={!sessionRecord || isPurchasingSubscription || isRestoringSubscription || !revenueCatReady}
@@ -617,7 +618,7 @@ export const PrivateAccountSection = ({
 					<Text style={styles.sectionTitle}>Private Account</Text>
 					{sessionRecord ? null : (
 					<Text selectable style={styles.supportText}>
-							Sign in or start your 7-day trial to sync desktop and mobile.
+							Access your desktop from anywhere without VPN or network setup.
 						</Text>
 					)}
 				</View>
@@ -679,7 +680,7 @@ export const PrivateAccountSection = ({
 							]}
 							testID="private-account-mode-register"
 						>
-							<Text style={authMode === "register" ? styles.segmentedLabelActive : styles.segmentedLabel}>Start trial</Text>
+							<Text style={authMode === "register" ? styles.segmentedLabelActive : styles.segmentedLabel}>Free trial</Text>
 						</Pressable>
 					</View>
 					<TextInput
@@ -725,9 +726,16 @@ export const PrivateAccountSection = ({
 						/>
 					) : null}
 					{authMode === "register" ? (
-						<Text style={styles.supportText}>
-							New accounts are created only after the in-app trial starts on this device.
-						</Text>
+						<View style={styles.trialDisclosure}>
+							<Text style={styles.trialDisclosurePrice}>
+								{formatPrivateSubscriptionPriceLabel()} after trial
+							</Text>
+							<Text style={styles.trialDisclosureTerms}>
+								Start with a 7-day free trial. After the trial ends, your subscription
+								automatically renews at {formatPrivateSubscriptionPriceLabel()} unless
+								cancelled. Cancel anytime in Settings on your device.
+							</Text>
+						</View>
 					) : null}
 					<Pressable
 						disabled={
@@ -788,7 +796,7 @@ export const PrivateAccountSection = ({
 							testID="private-account-switch-auth-mode"
 						>
 							<Text style={styles.secondaryLabel}>
-								{authMode === "login" ? "Start trial" : "Use login"}
+								{authMode === "login" ? "Free trial" : "Use login"}
 							</Text>
 						</Pressable>
 					</View>
@@ -1113,5 +1121,23 @@ const styles = StyleSheet.create({
 		color: palette.muted,
 		fontSize: 13,
 		lineHeight: 18,
+	},
+	trialDisclosure: {
+		backgroundColor: "rgba(255,255,255,0.04)",
+		borderColor: palette.border,
+		borderRadius: 12,
+		borderWidth: 1,
+		gap: 6,
+		padding: 12,
+	},
+	trialDisclosurePrice: {
+		color: palette.text,
+		fontSize: 17,
+		fontWeight: "700",
+	},
+	trialDisclosureTerms: {
+		color: palette.muted,
+		fontSize: 12,
+		lineHeight: 17,
 	},
 });
