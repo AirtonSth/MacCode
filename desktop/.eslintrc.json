@@ -37,7 +37,10 @@
     "react-perf/jsx-no-new-function-as-prop": "off",
     "react-perf/jsx-no-new-object-as-prop": "off",
     "import/no-unused-modules": "off",
-    "import/no-anonymous-default-export": "off"
+    "import/no-anonymous-default-export": "off",
+    "@shopify/prefer-class-properties": "off",
+    "etc/no-implicit-any-catch": "off",
+    "import/no-namespace": "off"
   },
   "overrides": [
     {

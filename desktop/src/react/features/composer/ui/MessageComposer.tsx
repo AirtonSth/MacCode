@@ -1,5 +1,5 @@
 import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
+import { m, useReducedMotion } from "framer-motion";
 import { ArrowUp, ChevronDown, Loader2, Plus, Square } from "lucide-react";
 import { Button } from "../../../components/ui/button";
 import { Textarea } from "../../../components/ui/textarea";
@@ -54,9 +54,40 @@ interface MessageComposerProps {
 	onPickContextPaths?: () => Promise<unknown> | unknown;
 	focusMode?: boolean;
 	focusRequestId?: number;
+	onSlashCommand?: (command: string, args: string) => boolean | Promise<boolean>;
+	onNavigateChat?: (direction: "prev" | "next") => void;
 }
 
-const MAX_MESSAGE_LENGTH = 4000;
+export type SlashCommandId =
+	| "clear"
+	| "model"
+	| "plan"
+	| "status"
+	| "fork";
+
+export const KNOWN_SLASH_COMMANDS: { id: SlashCommandId; hint: string }[] = [
+	{ id: "clear", hint: "Start a fresh chat in current project" },
+	{ id: "model", hint: "Open model picker (command palette)" },
+	{ id: "plan", hint: "Toggle plan permission mode" },
+	{ id: "status", hint: "Show status overview" },
+	{ id: "fork", hint: "Fork this chat into a new one" },
+];
+
+const SLASH_COMMAND_REGEX = /^\/([a-z][a-z0-9-]*)(?:\s+(.*))?$/s;
+
+const parseSlashCommand = (value: string): { command: string; args: string } | null => {
+	const trimmed = value.trim();
+	if (!trimmed.startsWith("/")) return null;
+	const match = SLASH_COMMAND_REGEX.exec(trimmed);
+	if (!match) return null;
+	const [, command, args] = match;
+	return { command: command.toLowerCase(), args: args?.trim() ?? "" };
+};
+
+const estimateTokenCount = (value: string): number => {
+	if (value.length === 0) return 0;
+	return Math.max(1, Math.ceil(value.length / 4));
+};
 
 export const MessageComposer = ({
 	disabled,
@@ -87,6 +118,8 @@ export const MessageComposer = ({
 	onPickContextPaths,
 	focusMode = false,
 	focusRequestId = 0,
+	onSlashCommand,
+	onNavigateChat,
 }: MessageComposerProps): JSX.Element => {
 	const [value, setValue] = useState("");
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -101,22 +134,17 @@ export const MessageComposer = ({
 	const isRunning = chatStatus === "running";
 	const isInputLocked = disabled || sending || isRunning;
 	const hasText = value.trim().length > 0;
-	const isOverLimit = value.length > MAX_MESSAGE_LENGTH;
-	const hasValidationError = !hasText || isOverLimit;
+	const hasValidationError = !hasText;
 
 	const validate = (): string | null => {
 		if (!hasText) {
 			return "Type a message before sending.";
 		}
 
-		if (isOverLimit) {
-			return `Message is too long. Max ${MAX_MESSAGE_LENGTH} characters.`;
-		}
-
 		return null;
 	};
 
-	const send = () => {
+	const send = async () => {
 		if (isInputLocked) {
 			return;
 		}
@@ -127,7 +155,20 @@ export const MessageComposer = ({
 			return;
 		}
 
-		onSend(value.trim());
+		const trimmed = value.trim();
+		const slash = parseSlashCommand(trimmed);
+		if (slash && onSlashCommand) {
+			const handled = await onSlashCommand(slash.command, slash.args);
+			if (handled) {
+				setValue("");
+				setValidationError(null);
+				return;
+			}
+			setValidationError(`Unknown command: /${slash.command}`);
+			return;
+		}
+
+		onSend(trimmed);
 		setValue("");
 		setValidationError(null);
 	};
@@ -240,7 +281,7 @@ export const MessageComposer = ({
 
 	const submit = (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
-		send();
+		void send();
 	};
 
 	const handleInputChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
@@ -302,22 +343,33 @@ export const MessageComposer = ({
 			return;
 		}
 
+		if ((event.key === "ArrowUp" || event.key === "ArrowDown") && onNavigateChat) {
+			if (!hasText) {
+				event.preventDefault();
+				onNavigateChat(event.key === "ArrowUp" ? "prev" : "next");
+				return;
+			}
+		}
+
 		if (event.key !== "Enter") {
 			return;
 		}
 
 		if (!event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
 			event.preventDefault();
-			send();
+			void send();
 		}
 	};
 
+	const tokenEstimate = estimateTokenCount(value);
 	const statusText =
 		isRunning
 			? (stopping ? "Stopping thread..." : "Assistant is running. Force stop to interrupt.")
 			: sending
 				? "Sending message..."
-				: validationError ?? (hasText ? `${value.length}/${MAX_MESSAGE_LENGTH}` : "Type a message to send.");
+				: validationError ?? (hasText
+					? `~${tokenEstimate} tok · ${value.length} chars`
+					: "Type a message to send. Try /clear, /model, /status…");
 	const modelSelectId = focusMode ? "model-focus" : "model";
 	const reasoningSelectId = focusMode ? "reasoning-focus" : "reasoning";
 
@@ -373,7 +425,6 @@ export const MessageComposer = ({
 							`min-h-[56px] max-h-[220px] select-text resize-none overflow-y-auto border-0 bg-transparent px-0 py-0 ${composerTextClass} placeholder:text-[#5f636c] focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:shadow-none disabled:cursor-not-allowed`,
 						)}
 						disabled={isInputLocked}
-						maxLength={MAX_MESSAGE_LENGTH}
 						onChange={handleInputChange}
 						onCompositionEnd={() => {
 							deadKeySequenceRef.current = false;
@@ -495,7 +546,7 @@ export const MessageComposer = ({
 							) : null}
 						</div>
 
-						<motion.div className="ml-1" whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
+						<m.div className="ml-1" whileTap={shouldReduceMotion ? undefined : { scale: 0.97 }}>
 							<Button
 								aria-label={buttonLabel}
 								className={cn(
@@ -512,7 +563,7 @@ export const MessageComposer = ({
 									? (stopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-3.5 w-3.5" />)
 									: (sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />)}
 							</Button>
-						</motion.div>
+						</m.div>
 					</div>
 				</div>
 

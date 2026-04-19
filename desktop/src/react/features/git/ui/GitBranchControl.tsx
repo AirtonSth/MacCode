@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, m } from "framer-motion";
 import { Check, ChevronDown, GitBranch, Loader2, Plus, Search } from "lucide-react";
 
 import type { GitBranchDTO } from "../../../shared/api/remotecode-http";
@@ -171,7 +171,7 @@ export const GitBranchControl = ({
 
 			<AnimatePresence>
 			{isOpen ? (
-				<motion.div
+				<m.div
 					key="git-branch-dropdown"
 					initial={{ opacity: 0, y: 4 }}
 					animate={{ opacity: 1, y: 0 }}
@@ -310,7 +310,7 @@ export const GitBranchControl = ({
 					</div>
 
 					{errorMessage ? <p className="px-1.5 pt-1.5 text-[11px] text-rose-300">{errorMessage}</p> : null}
-				</motion.div>
+				</m.div>
 			) : null}
 			</AnimatePresence>
 

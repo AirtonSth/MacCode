@@ -1,8 +1,11 @@
 import "@xterm/xterm/css/xterm.css";
 
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import React, { useEffect, useLayoutEffect, useRef } from "react";
 import type {
 	ClipboardEvent as ReactClipboardEvent,
 	KeyboardEvent as ReactKeyboardEvent,
@@ -23,7 +26,7 @@ interface ThreadTerminalPtyPanelProps {
 	state: ThreadTerminalPtyChatState;
 }
 
-const resizeDebounceMs = 120;
+const TERMINAL_SCROLLBACK = 10_000;
 
 type TerminalKeyEvent = {
 	altKey: boolean;
@@ -82,8 +85,9 @@ const translateKeyEventToTerminalData = (event: TerminalKeyEvent): string | null
 const readVisibleTerminalBuffer = (term: XTerm): string => {
 	const lines: string[] = [];
 	const buffer = term.buffer.active;
+	const startLine = Math.max(0, buffer.length - term.rows);
 
-	for (let lineIndex = 0; lineIndex < buffer.length; lineIndex += 1) {
+	for (let lineIndex = startLine; lineIndex < buffer.length; lineIndex += 1) {
 		const line = buffer.getLine(lineIndex);
 		if (!line) {
 			continue;
@@ -95,7 +99,22 @@ const readVisibleTerminalBuffer = (term: XTerm): string => {
 	return lines.join("\n").trim();
 };
 
-export const ThreadTerminalPtyPanel = ({
+const openExternalUrl = (url: string) => {
+	try {
+		const maybeElectrobun = (window as unknown as {
+			electrobun?: { openExternalUrl?: (url: string) => void };
+		}).electrobun;
+		if (maybeElectrobun?.openExternalUrl) {
+			maybeElectrobun.openExternalUrl(url);
+			return;
+		}
+	} catch {
+		// ignore — fall back to window.open
+	}
+	window.open(url, "_blank", "noopener,noreferrer");
+};
+
+const ThreadTerminalPtyPanelImpl = ({
 	chatId,
 	className,
 	onInput,
@@ -107,6 +126,7 @@ export const ThreadTerminalPtyPanel = ({
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const termRef = useRef<XTerm | null>(null);
 	const fitAddonRef = useRef<FitAddon | null>(null);
+	const searchAddonRef = useRef<SearchAddon | null>(null);
 	const keyboardInputRef = useRef<HTMLTextAreaElement | null>(null);
 	const inputHandlerRef = useRef(onInput);
 	const resizeHandlerRef = useRef(onResize);
@@ -114,8 +134,11 @@ export const ThreadTerminalPtyPanel = ({
 	const lastSessionIdRef = useRef<string | null>(null);
 	const lastOutputIdRef = useRef<string | null>(null);
 	const lastOutputDataRef = useRef("");
-	const resizeTimeoutRef = useRef<number | null>(null);
 	const keyboardCaptureEnabledRef = useRef(false);
+	const pendingWriteRef = useRef("");
+	const rafWriteHandleRef = useRef<number | null>(null);
+	const predictionQueueRef = useRef<string[]>([]);
+	const predictionTimeoutRef = useRef<number | null>(null);
 
 	const focusTerminal = () => {
 		keyboardInputRef.current?.focus({ preventScroll: true });
@@ -129,6 +152,81 @@ export const ThreadTerminalPtyPanel = ({
 		}
 
 		terminalSurface.setAttribute("data-terminal-buffer-text", readVisibleTerminalBuffer(term));
+	};
+
+	const flushPendingWrites = () => {
+		rafWriteHandleRef.current = null;
+		const term = termRef.current;
+		const pending = pendingWriteRef.current;
+		pendingWriteRef.current = "";
+		if (!term || pending.length === 0) {
+			return;
+		}
+		term.write(pending, () => {
+			syncVisibleBufferText();
+		});
+	};
+
+	const queueTerminalWrite = (chunk: string) => {
+		if (chunk.length === 0) {
+			return;
+		}
+		pendingWriteRef.current += chunk;
+		if (rafWriteHandleRef.current !== null) {
+			return;
+		}
+		if (typeof window === "undefined" || !window.requestAnimationFrame) {
+			flushPendingWrites();
+			return;
+		}
+		rafWriteHandleRef.current = window.requestAnimationFrame(flushPendingWrites);
+	};
+
+	const canPredictInput = (data: string): boolean => {
+		const term = termRef.current;
+		if (!term) return false;
+		if (term.buffer.active.type === "alternate") return false;
+		if (data.length !== 1) return false;
+		const code = data.charCodeAt(0);
+		return code >= 32 && code <= 126;
+	};
+
+	const clearPredictionTimeout = () => {
+		if (predictionTimeoutRef.current !== null) {
+			window.clearTimeout(predictionTimeoutRef.current);
+			predictionTimeoutRef.current = null;
+		}
+	};
+
+	const schedulePredictionTimeout = () => {
+		clearPredictionTimeout();
+		predictionTimeoutRef.current = window.setTimeout(() => {
+			predictionQueueRef.current.length = 0;
+			predictionTimeoutRef.current = null;
+		}, 1000);
+	};
+
+	const queuePredictedEcho = (data: string) => {
+		predictionQueueRef.current.push(data);
+		schedulePredictionTimeout();
+		queueTerminalWrite(data);
+	};
+
+	const writeBackendData = (chunk: string) => {
+		if (chunk.length === 0) return;
+		let remaining = chunk;
+		const queue = predictionQueueRef.current;
+		while (queue.length > 0 && remaining.startsWith(queue[0]!)) {
+			remaining = remaining.slice(queue[0]!.length);
+			queue.shift();
+		}
+		if (queue.length > 0 && remaining.length > 0) {
+			queue.length = 0;
+		}
+		if (queue.length === 0) {
+			clearPredictionTimeout();
+		}
+		queueTerminalWrite(remaining);
 	};
 
 	const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -177,21 +275,33 @@ export const ThreadTerminalPtyPanel = ({
 			allowProposedApi: true,
 			convertEol: false,
 			cursorBlink: true,
+			fastScrollSensitivity: 5,
 			fontFamily: "\"SF Mono\", ui-monospace, Menlo, monospace",
 			fontSize: 13,
+			lineHeight: 1.2,
+			macOptionIsMeta: true,
+			rightClickSelectsWord: true,
 			rows: state.rows,
 			screenReaderMode: true,
-			scrollback: 5_000,
+			scrollback: TERMINAL_SCROLLBACK,
+			smoothScrollDuration: 0,
 			theme: {
 				background: "#020617",
 				foreground: "#e2e8f0",
 			},
 		});
 		const fitAddon = new FitAddon();
+		const searchAddon = new SearchAddon();
+		const webLinksAddon = new WebLinksAddon((_event, uri) => openExternalUrl(uri));
 		term.loadAddon(fitAddon);
+		term.loadAddon(searchAddon);
+		term.loadAddon(webLinksAddon);
+		let webglAddon: WebglAddon | null = null;
 		let resizeObserver: ResizeObserver | null = null;
 		let disposable: { dispose: () => void } | null = null;
-		let resizeAnimationFrame: number | null = null;
+		let webglDisposable: { dispose: () => void } | null = null;
+		let resizeRafId: number | null = null;
+		let mountRaf: number | null = null;
 		let mounted = false;
 
 		const emitResize = () => {
@@ -209,7 +319,7 @@ export const ThreadTerminalPtyPanel = ({
 
 			const { height, width } = container.getBoundingClientRect();
 			if (width < 1 || height < 1) {
-				resizeAnimationFrame = window.requestAnimationFrame(mountTerminal);
+				mountRaf = window.requestAnimationFrame(mountTerminal);
 				return;
 			}
 
@@ -217,24 +327,41 @@ export const ThreadTerminalPtyPanel = ({
 			term.open(container);
 			termRef.current = term;
 			fitAddonRef.current = fitAddon;
+			searchAddonRef.current = searchAddon;
+
+			try {
+				webglAddon = new WebglAddon();
+				webglDisposable = webglAddon.onContextLoss(() => {
+					webglAddon?.dispose();
+					webglAddon = null;
+				});
+				term.loadAddon(webglAddon);
+			} catch {
+				webglAddon = null;
+				webglDisposable = null;
+			}
+
 			emitResize();
+			term.options.ignoreBracketedPasteMode = false;
 			syncVisibleBufferText();
 			focusTerminal();
 
 			resizeObserver = new ResizeObserver(() => {
-				if (resizeTimeoutRef.current !== null) {
-					window.clearTimeout(resizeTimeoutRef.current);
+				if (resizeRafId !== null) {
+					return;
 				}
-
-				resizeTimeoutRef.current = window.setTimeout(() => {
-					resizeTimeoutRef.current = null;
+				resizeRafId = window.requestAnimationFrame(() => {
+					resizeRafId = null;
 					emitResize();
-				}, resizeDebounceMs);
+				});
 			});
 			resizeObserver.observe(container);
 
 			disposable = term.onData((data) => {
 				inputHandlerRef.current(data);
+				if (canPredictInput(data)) {
+					queuePredictedEcho(data);
+				}
 			});
 		};
 
@@ -294,15 +421,23 @@ export const ThreadTerminalPtyPanel = ({
 		window.addEventListener("paste", handleWindowPaste, true);
 
 		return () => {
-			if (resizeAnimationFrame !== null) {
-				window.cancelAnimationFrame(resizeAnimationFrame);
+			if (mountRaf !== null) {
+				window.cancelAnimationFrame(mountRaf);
 			}
+			if (resizeRafId !== null) {
+				window.cancelAnimationFrame(resizeRafId);
+			}
+			if (rafWriteHandleRef.current !== null) {
+				window.cancelAnimationFrame(rafWriteHandleRef.current);
+				rafWriteHandleRef.current = null;
+			}
+			pendingWriteRef.current = "";
+			predictionQueueRef.current.length = 0;
+			clearPredictionTimeout();
 			resizeObserver?.disconnect();
 			disposable?.dispose();
-			if (resizeTimeoutRef.current !== null) {
-				window.clearTimeout(resizeTimeoutRef.current);
-				resizeTimeoutRef.current = null;
-			}
+			webglDisposable?.dispose();
+			webglAddon?.dispose();
 			window.removeEventListener("pointerdown", handleWindowPointerDown, true);
 			window.removeEventListener("keydown", handleWindowKeyDown, true);
 			window.removeEventListener("paste", handleWindowPaste, true);
@@ -310,6 +445,7 @@ export const ThreadTerminalPtyPanel = ({
 			term.dispose();
 			termRef.current = null;
 			fitAddonRef.current = null;
+			searchAddonRef.current = null;
 		};
 	}, [chatId]);
 
@@ -324,12 +460,17 @@ export const ThreadTerminalPtyPanel = ({
 			lastSnapshotRef.current = state.snapshot;
 			lastOutputIdRef.current = null;
 			lastOutputDataRef.current = "";
+			pendingWriteRef.current = "";
+			if (rafWriteHandleRef.current !== null) {
+				window.cancelAnimationFrame(rafWriteHandleRef.current);
+				rafWriteHandleRef.current = null;
+			}
+			predictionQueueRef.current.length = 0;
+			clearPredictionTimeout();
 			term.reset();
 			syncVisibleBufferText();
 			if (state.snapshot.length > 0) {
-				term.write(state.snapshot, () => {
-					syncVisibleBufferText();
-				});
+				queueTerminalWrite(state.snapshot);
 			}
 		}
 	}, [state.sessionId, state.snapshot]);
@@ -351,9 +492,7 @@ export const ThreadTerminalPtyPanel = ({
 			return;
 		}
 
-		term.write(outputDelta, () => {
-			syncVisibleBufferText();
-		});
+		writeBackendData(outputDelta);
 	}, [state.lastOutput]);
 
 	useEffect(() => {
@@ -463,3 +602,5 @@ export const ThreadTerminalPtyPanel = ({
 		</section>
 	);
 };
+
+export const ThreadTerminalPtyPanel = React.memo(ThreadTerminalPtyPanelImpl);

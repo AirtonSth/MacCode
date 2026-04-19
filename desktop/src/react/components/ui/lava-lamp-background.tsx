@@ -31,11 +31,32 @@ const activeBlobs: BlobConfig[] = [
 	{ id: 4, color: "hsl(290, 100%, 65%)", size: 45, x: 50, y: 45, duration: 6, delay: -1.5, blur: 32, opacity: 0.38, variant: 4 },
 ];
 
-function LavaLampBackgroundInner({ mode = "idle" }: { mode?: LavaLampMode }) {
+function LavaLampBackgroundInner({
+	mode = "idle",
+	paused = false,
+}: {
+	mode?: LavaLampMode;
+	paused?: boolean;
+}) {
 	const [isLowFPS, setIsLowFPS] = useState(false);
+	const [isVisible, setIsVisible] = useState(() =>
+		typeof document === "undefined" ? true : document.visibilityState === "visible",
+	);
 	const timerRef = useRef<number | null>(null);
 
 	useEffect(() => {
+		const handleVisibility = () => {
+			setIsVisible(document.visibilityState === "visible");
+		};
+		document.addEventListener("visibilitychange", handleVisibility);
+		return () => document.removeEventListener("visibilitychange", handleVisibility);
+	}, []);
+
+	const shouldAnimate = isVisible && !paused;
+
+	useEffect(() => {
+		if (!shouldAnimate) return;
+
 		let frameCount = 0;
 		let lastTime = performance.now();
 		let rafId: number;
@@ -62,7 +83,7 @@ function LavaLampBackgroundInner({ mode = "idle" }: { mode?: LavaLampMode }) {
 			if (timerRef.current) clearTimeout(timerRef.current);
 			cancelAnimationFrame(rafId);
 		};
-	}, []);
+	}, [shouldAnimate]);
 
 	const blobs = mode === "active" ? activeBlobs : idleBlobs;
 
@@ -71,6 +92,8 @@ function LavaLampBackgroundInner({ mode = "idle" }: { mode?: LavaLampMode }) {
 			className="lava-lamp-container"
 			data-low-fps={isLowFPS || undefined}
 			data-mode={mode}
+			data-paused={!shouldAnimate || undefined}
+			style={{ animationPlayState: shouldAnimate ? "running" : "paused" } as React.CSSProperties}
 			aria-hidden="true"
 		>
 			{blobs.map((blob) => (
@@ -86,6 +109,7 @@ function LavaLampBackgroundInner({ mode = "idle" }: { mode?: LavaLampMode }) {
 						"--blob-delay": `${blob.delay}s`,
 						"--blob-blur": `${blob.blur}px`,
 						"--blob-opacity": blob.opacity,
+						animationPlayState: shouldAnimate ? "running" : "paused",
 					} as React.CSSProperties}
 				/>
 			))}

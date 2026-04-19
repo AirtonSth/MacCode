@@ -6,9 +6,9 @@ import { describe, expect, it } from "bun:test";
 const gitBranchSource = readFileSync(resolve(__dirname, "GitBranchControl.tsx"), "utf-8");
 
 describe("[D-31] Git branch dropdown animation", () => {
-	it("imports AnimatePresence and motion from framer-motion", () => {
+	it("imports AnimatePresence and m (motion) from framer-motion", () => {
 		const framerImport = gitBranchSource.match(
-			/import\s*\{[^}]*AnimatePresence[^}]*motion[^}]*\}\s*from\s*["']framer-motion["']/,
+			/import\s*\{[^}]*AnimatePresence[^}]*\bm\b[^}]*\}\s*from\s*["']framer-motion["']/,
 		);
 		expect(framerImport).not.toBeNull();
 	});
@@ -19,7 +19,7 @@ describe("[D-31] Git branch dropdown animation", () => {
 	});
 
 	it("uses motion.div with key for the dropdown panel", () => {
-		const motionDivPattern = /<motion\.div[^>]*key="git-branch-dropdown"/s;
+		const motionDivPattern = /<m\.div[^>]*key="git-branch-dropdown"/s;
 		expect(gitBranchSource).toMatch(motionDivPattern);
 	});
 

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type CSSProperties, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, domMax, LazyMotion, m, useReducedMotion } from "framer-motion";
 import {
 	Folder,
 	FolderSearch,
@@ -53,6 +53,9 @@ import {
 import { useMessagesQuery } from "../features/workspace/model/use-messages-query";
 import { useAppUpdate } from "../features/app-update/model/useAppUpdate";
 import { UpdateBanner } from "../features/app-update/ui/UpdateBanner";
+import { CommandPalette, type CommandPaletteItem } from "../components/ui/command-palette";
+import { ConnectionStatusBanner } from "../components/ui/connection-status-banner";
+import { useGlobalKeybindings } from "./useGlobalKeybindings";
 import { cn } from "../lib/utils";
 import { showThreadCompletionDesktopNotification } from "./thread-completion-notification";
 import type { AssistantStreamEvent } from "../../shared/assistant-stream-event";
@@ -250,6 +253,7 @@ const toChatDtoFromThreadSummary = (
 	updatedAt: thread.updatedAt,
 });
 const SIDEBAR_MAX_VISIBLE_THREADS = 3;
+const SIDEBAR_THREAD_EXPANSION_STEP = 30;
 
 const getThreadStatusTooltip = (chat: Pick<ChatDTO, "hasUnreadFinished" | "isActive">): string | null => {
 	if (chat.isActive) {
@@ -516,7 +520,8 @@ const AppContent = (): JSX.Element => {
 		enabled: Boolean(selectedChatId),
 	});
 	const streamTurnQuery = useQuery<StreamTurnState | null>({
-		gcTime: Number.POSITIVE_INFINITY,
+		enabled: Boolean(selectedChatId),
+		gcTime: 10 * 60 * 1000,
 		initialData: null,
 		queryFn: async () => null,
 		queryKey: queryKeys.streamTurn(selectedChatId),
@@ -606,7 +611,7 @@ const AppContent = (): JSX.Element => {
 	);
 
 	const [isOpeningProject, setIsOpeningProject] = useState(false);
-	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, boolean>>({});
+	const [expandedProjectThreads, setExpandedProjectThreads] = useState<Record<string, number>>({});
 	const [projectThreadsOpen, setProjectThreadsOpen] = useState<Record<string, boolean>>({});
 	const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
 	const [visibleOpeningProjectId, setVisibleOpeningProjectId] = useState<string | null>(null);
@@ -623,6 +628,7 @@ const AppContent = (): JSX.Element => {
 		return parseSidebarWidth(window.localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
 	});
 	const [isSidebarVisible, setIsSidebarVisible] = useState<boolean>(true);
+	const [isPaletteOpen, setIsPaletteOpen] = useState(false);
 	const [isSidebarResizing, setIsSidebarResizing] = useState(false);
 	const [permissionMode, setPermissionMode] = useState<CodexPermissionMode>(() => {
 		if (typeof window === "undefined") {
@@ -1049,7 +1055,42 @@ const AppContent = (): JSX.Element => {
 	}, []);
 
 	const formatApiErrorMessage = useCallback((error: unknown, fallback: string) => {
-		return error instanceof Error ? error.message : fallback;
+		if (error instanceof RemoteCodeApiError) {
+			if (error.status === 401 || error.status === 403) {
+				return "Authentication required. Please sign in again.";
+			}
+			if (error.status === 404) {
+				return "The requested resource is no longer available.";
+			}
+			if (error.status === 429) {
+				return "You're being rate limited. Wait a moment and retry.";
+			}
+			if (error.status >= 500) {
+				return "The remote server hit an internal error. Try again shortly.";
+			}
+			return error.message || fallback;
+		}
+		if (error instanceof Error) {
+			const message = error.message ?? "";
+			const lower = message.toLowerCase();
+			if (lower.includes("command not found") || lower.includes("enoent") || lower.includes("codex: not found") || lower.includes("claude: not found")) {
+				return "Required CLI is not installed or not in PATH. Install codex or claude-code and restart the app.";
+			}
+			if (message.includes("ECONNREFUSED") || lower.includes("connection refused")) {
+				return "Can't reach the RemoteCode backend. Is the desktop agent running?";
+			}
+			if (message.includes("ENOTFOUND") || lower.includes("not found") && lower.includes("dns")) {
+				return "Network hostname lookup failed. Check your internet connection.";
+			}
+			if (message.includes("ETIMEDOUT") || lower.includes("timeout")) {
+				return "Request timed out. The backend might be overloaded — try again.";
+			}
+			if (lower.includes("failed to fetch") || lower.includes("networkerror")) {
+				return "Connection lost. Retry once the network is back.";
+			}
+			return message || fallback;
+		}
+		return fallback;
 	}, []);
 
 	useEffect(() => {
@@ -3154,10 +3195,13 @@ const AppContent = (): JSX.Element => {
 	);
 
 	const handleShowMoreThreads = useCallback((projectId: string) => {
-		setExpandedProjectThreads((current) => ({
-			...current,
-			[projectId]: true,
-		}));
+		setExpandedProjectThreads((current) => {
+			const currentCount = current[projectId] ?? SIDEBAR_MAX_VISIBLE_THREADS;
+			return {
+				...current,
+				[projectId]: currentCount + SIDEBAR_THREAD_EXPANSION_STEP,
+			};
+		});
 	}, []);
 
 	const handleToggleWorkspaceMenu = useCallback((projectId: string) => {
@@ -3266,9 +3310,187 @@ const AppContent = (): JSX.Element => {
 	const isTerminalActive = selectedThreadTerminal?.status === "running";
 	const sidebarToggleLabel = isSidebarVisible ? "Hide sidebar" : "Show sidebar";
 	const threadPanelBgClass = isThreadFocusMode ? "bg-[#13161b]" : "bg-slate-950/35";
+
+	useGlobalKeybindings({
+		onOpenPalette: () => setIsPaletteOpen((current) => !current),
+		onToggleSidebar: () => setIsSidebarVisible((current) => !current),
+		onOpenHistorySearch: () => setIsPaletteOpen(true),
+		onFocusComposer: () => setComposerFocusRequestId((current) => current + 1),
+		onStopStreaming: () => {
+			if (selectedChatSending && state.selectedChatId) {
+				void handleForceStop();
+			}
+		},
+		onNewChat: () => {
+			if (state.selectedProjectId) {
+				void handleCreateChatForProject(state.selectedProjectId);
+			}
+		},
+		onCycleProvider: () => {
+			if (isProviderSelectionLocked) return;
+			handleProviderChange(selectedProvider === "codex" ? "claude" : "codex");
+		},
+	});
+
+	const handleSlashCommand = useCallback(
+		async (command: string, _args: string): Promise<boolean> => {
+			switch (command) {
+				case "clear":
+				case "new": {
+					if (state.selectedProjectId) {
+						await handleCreateChatForProject(state.selectedProjectId);
+						return true;
+					}
+					return false;
+				}
+				case "model": {
+					setIsPaletteOpen(true);
+					return true;
+				}
+				case "plan": {
+					handlePermissionModeChange(permissionMode === "plan" ? "default" : "plan");
+					return true;
+				}
+				case "status": {
+					setIsPaletteOpen(true);
+					return true;
+				}
+				case "fork": {
+					if (state.selectedProjectId) {
+						await handleCreateChatForProject(state.selectedProjectId);
+						return true;
+					}
+					return false;
+				}
+				default:
+					return false;
+			}
+		},
+		[
+			handleCreateChatForProject,
+			handlePermissionModeChange,
+			permissionMode,
+			state.selectedProjectId,
+		],
+	);
+
+	const handleNavigateChat = useCallback(
+		(direction: "prev" | "next") => {
+			if (knownChats.length === 0) return;
+			const currentIndex = knownChats.findIndex((chat) => chat.id === state.selectedChatId);
+			if (currentIndex === -1) {
+				const target = direction === "prev" ? knownChats[knownChats.length - 1] : knownChats[0];
+				if (target) void handleSelectChat(target.id);
+				return;
+			}
+			const delta = direction === "prev" ? -1 : 1;
+			const nextIndex = (currentIndex + delta + knownChats.length) % knownChats.length;
+			const next = knownChats[nextIndex];
+			if (next) void handleSelectChat(next.id);
+		},
+		[handleSelectChat, knownChats, state.selectedChatId],
+	);
+
+	const paletteItems = useMemo<CommandPaletteItem[]>(() => {
+		const items: CommandPaletteItem[] = [];
+
+		if (state.selectedProjectId) {
+			items.push({
+				id: "new-chat",
+				group: "Actions",
+				label: "New chat",
+				hint: "Start a new conversation in current project",
+				shortcut: "⌘N",
+				onSelect: () => handleCreateChatForProject(state.selectedProjectId!),
+			});
+		}
+
+		items.push({
+			id: "toggle-sidebar",
+			group: "View",
+			label: sidebarToggleLabel,
+			shortcut: "⌘B",
+			onSelect: () => setIsSidebarVisible((current) => !current),
+		});
+
+		if (state.selectedChatId) {
+			items.push({
+				id: "toggle-terminal",
+				group: "View",
+				label: isTerminalOpen ? "Hide terminal" : "Show terminal",
+				onSelect: handleToggleTerminal,
+			});
+		}
+
+		if (selectedChatSending && state.selectedChatId) {
+			items.push({
+				id: "stop-stream",
+				group: "Actions",
+				label: "Stop response",
+				hint: "Cancel the streaming turn",
+				shortcut: "Esc",
+				onSelect: () => handleForceStop(),
+			});
+		}
+
+		items.push({
+			id: "switch-provider-codex",
+			group: "Provider",
+			label: "Use Codex",
+			disabled: selectedProvider === "codex" || isProviderSelectionLocked,
+			onSelect: () => handleProviderChange("codex"),
+		});
+		items.push({
+			id: "switch-provider-claude",
+			group: "Provider",
+			label: "Use Claude",
+			disabled: selectedProvider === "claude" || isProviderSelectionLocked,
+			onSelect: () => handleProviderChange("claude"),
+		});
+
+
+		items.push({
+			id: "check-updates",
+			group: "App",
+			label: "Check for updates",
+			onSelect: () => {
+				void appUpdate.check?.();
+			},
+		});
+
+		for (const chat of knownChats.slice(0, 12)) {
+			if (chat.id === state.selectedChatId) continue;
+			items.push({
+				id: `switch-chat-${chat.id}`,
+				group: "Recent chats",
+				label: chat.title || "Untitled chat",
+				keywords: [chat.id],
+				onSelect: () => handleSelectChat(chat.id),
+			});
+		}
+
+		return items;
+	}, [
+		appUpdate,
+		handleCreateChatForProject,
+		handleForceStop,
+		handleProviderChange,
+		handleSelectChat,
+		handleToggleTerminal,
+		isProviderSelectionLocked,
+		isTerminalOpen,
+		knownChats,
+		selectedChatSending,
+		selectedProvider,
+		sidebarToggleLabel,
+		state.selectedChatId,
+		state.selectedProjectId,
+	]);
+
 	return (
 				<TooltipProvider delayDuration={120}>
 			<div className="relative flex h-full w-full flex-col overflow-hidden">
+				<ConnectionStatusBanner state={state.connectionState} />
 				{appUpdate.hasUpdate && !appUpdate.dismissed ? (
 					<UpdateBanner
 						latestVersion={appUpdate.latestVersion}
@@ -3277,7 +3499,7 @@ const AppContent = (): JSX.Element => {
 					/>
 				) : null}
 				<div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_48%_84%,rgba(55,150,255,0.22),transparent_44%)]" />
-				<motion.div
+				<m.div
 						ref={layoutShellRef}
 						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
 						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
@@ -3308,11 +3530,14 @@ const AppContent = (): JSX.Element => {
 											boxShadow: "inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 18px 38px rgba(0, 0, 0, 0.35)",
 										}}
 									>
-									{!shouldReduceMotion && <LavaLampBackground mode={
-									Object.values(state.streamingActiveByChat).some(Boolean)
-									|| Object.values(state.sendingByChat).some(Boolean)
-										? "active" : "idle"
-								} />}
+									{!shouldReduceMotion && <LavaLampBackground
+										mode={
+											Object.values(state.streamingActiveByChat).some(Boolean)
+											|| Object.values(state.sendingByChat).some(Boolean)
+												? "active" : "idle"
+										}
+										paused={!isSidebarVisible}
+									/>}
 									<div className="relative z-[2] flex items-center justify-between px-1.5 pb-2 pt-1">
 										<h2 className="text-[19px] font-medium tracking-[-0.01em] text-slate-300/95">Threads</h2>
 										<div className="relative z-10 flex items-center gap-0.5">
@@ -3383,20 +3608,18 @@ const AppContent = (): JSX.Element => {
 													const isThreadListOpen = isSelectedProject
 														? projectThreadsOpen[project.id] !== false
 														: Boolean(projectThreadsOpen[project.id]);
-													const isThreadListExpanded = Boolean(expandedProjectThreads[project.id]);
+													const threadVisibleCount =
+														expandedProjectThreads[project.id] ?? SIDEBAR_MAX_VISIBLE_THREADS;
 													const projectChats = isSelectedProject
 														? state.chats
 														: (projectChatsCacheRef.current[project.id] ?? []);
 													const hasMoreThreads =
-														isThreadListOpen &&
-														projectChats.length > SIDEBAR_MAX_VISIBLE_THREADS &&
-														!isThreadListExpanded;
-													const visibleChats =
-														isThreadListOpen && isThreadListExpanded
-														? projectChats
+														isThreadListOpen && projectChats.length > threadVisibleCount;
+													const visibleChats = isThreadListOpen
+														? projectChats.slice(0, threadVisibleCount)
 														: projectChats.slice(0, SIDEBAR_MAX_VISIBLE_THREADS);
 													return (
-													<motion.section
+													<m.section
 														className="px-1 py-0.5 transition-colors duration-150"
 														key={project.id}
 														layout={!shouldReduceMotion}
@@ -3540,7 +3763,7 @@ const AppContent = (): JSX.Element => {
 														});
 
 														return (
-																					<motion.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
+																					<m.li key={chat.id} className="w-full" layout={!shouldReduceMotion}>
 																					<div
                                                                                         aria-label={`Open ${chat.title}`}
                                                                                         className={cn(
@@ -3615,7 +3838,7 @@ const AppContent = (): JSX.Element => {
                                                                                             </Tooltip>
                                                                                         </div>
                                                                                         </div>
-																				</motion.li>
+																				</m.li>
 																			);
 																		})}
 																			{hasMoreThreads ? (
@@ -3638,7 +3861,7 @@ const AppContent = (): JSX.Element => {
 																	)}
 																</ul>
 															) : null}
-														</motion.section>
+														</m.section>
 													);
 												})
 											)}
@@ -3920,6 +4143,8 @@ const AppContent = (): JSX.Element => {
 														onReasoningEffortChange={handleReasoningEffortChange}
 														onForceStop={handleForceStop}
 														onSend={handleSendMessage}
+														onSlashCommand={handleSlashCommand}
+														onNavigateChat={handleNavigateChat}
 														permissionMode={permissionMode}
 														providerLocked={isProviderSelectionLocked}
 														selectedModel={selectedModel}
@@ -3934,7 +4159,7 @@ const AppContent = (): JSX.Element => {
 
 											<AnimatePresence initial={false}>
 												{isTerminalOpen && state.selectedChatId && selectedThreadTerminal ? (
-													<motion.div
+													<m.div
 														animate={{ height: "auto" }}
 														className="shrink-0 overflow-hidden border-t border-white/10"
 														exit={{ height: 0 }}
@@ -3971,12 +4196,12 @@ const AppContent = (): JSX.Element => {
 																state={selectedThreadTerminal}
 															/>
 														</div>
-													</motion.div>
+													</m.div>
 												) : null}
 											</AnimatePresence>
 										</section>
 									) : (
-							<motion.div
+							<m.div
 								animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
 								className="grid flex-1 place-items-center px-6 py-12"
 								initial={shouldReduceMotion ? undefined : { opacity: 0, y: 10 }}
@@ -4001,11 +4226,16 @@ const AppContent = (): JSX.Element => {
 										{isOpeningProject ? "Opening workspace..." : "Open workspace"}
 									</Button>
 								</section>
-							</motion.div>
+							</m.div>
 						)}
 					</main>
-				</motion.div>
+				</m.div>
 			</div>
+			<CommandPalette
+				open={isPaletteOpen}
+				onOpenChange={setIsPaletteOpen}
+				items={paletteItems}
+			/>
 		</TooltipProvider>
 	);
 };
@@ -4014,9 +4244,11 @@ const App = (): JSX.Element => {
 	const [queryClient] = useState(createDesktopQueryClient);
 
 	return (
-		<QueryClientProvider client={queryClient}>
-			<AppContent />
-		</QueryClientProvider>
+		<LazyMotion features={domMax} strict>
+			<QueryClientProvider client={queryClient}>
+				<AppContent />
+			</QueryClientProvider>
+		</LazyMotion>
 	);
 };
 

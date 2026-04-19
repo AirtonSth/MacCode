@@ -1,4 +1,4 @@
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, m, useReducedMotion } from "framer-motion";
 import { AlertTriangle, Bot, Check, ChevronDown, Copy, Loader2, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
 import { ScrollArea } from "../../../components/ui/scroll-area";
@@ -61,18 +61,23 @@ const CopyButton = React.memo(({ text, className }: { text: string; className?: 
 	}, []);
 
 	return (
-		<button
-			aria-label={copied ? "Copied" : "Copy"}
-			className={cn(
-				"inline-flex items-center justify-center rounded-md p-1 text-slate-400 transition-all hover:bg-white/10 hover:text-slate-200",
-				copied && "text-emerald-400 hover:text-emerald-300",
-				className,
-			)}
-			onClick={handleCopy}
-			type="button"
-		>
-			{copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-		</button>
+		<>
+			<button
+				aria-label={copied ? "Copied" : "Copy"}
+				className={cn(
+					"inline-flex items-center justify-center rounded-md p-1 text-slate-400 transition-all hover:bg-white/10 hover:text-slate-200",
+					copied && "text-emerald-400 hover:text-emerald-300",
+					className,
+				)}
+				onClick={handleCopy}
+				type="button"
+			>
+				{copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+			</button>
+			<span aria-live="polite" aria-atomic="true" className="sr-only">
+				{copied ? "Copied to clipboard" : ""}
+			</span>
+		</>
 	);
 });
 CopyButton.displayName = "CopyButton";
@@ -175,7 +180,7 @@ const MessageBubble = React.memo(({ message, focusMode, shouldReduceMotion, disa
 	const markdownComponents = focusMode ? MARKDOWN_COMPONENTS_FOCUS : MARKDOWN_COMPONENTS_NORMAL;
 
 	return (
-		<motion.article
+		<m.article
 			className={cn(
 				"group/msg relative select-text break-words",
 				focusMode
@@ -212,7 +217,7 @@ const MessageBubble = React.memo(({ message, focusMode, shouldReduceMotion, disa
 				)}
 				text={message.content}
 			/>
-		</motion.article>
+		</m.article>
 	);
 });
 MessageBubble.displayName = "MessageBubble";
@@ -236,7 +241,7 @@ interface ConversationPanelProps {
 	focusMode?: boolean;
 }
 
-export const ConversationPanel = ({
+const ConversationPanelImpl = ({
 	chat,
 	hasOlderMessages,
 	isLatestDirty = false,
@@ -262,7 +267,7 @@ export const ConversationPanel = ({
 		}
 		const timer = setTimeout(() => {
 			setDebouncedIsWorking(true);
-		}, 150);
+		}, 50);
 		return () => clearTimeout(timer);
 	}, [isWorking]);
 
@@ -340,17 +345,17 @@ export const ConversationPanel = ({
 				transition: { duration: 0.2, ease: "easeOut" as const },
 			};
 	const scrollToBottom = useCallback(
-		(behavior: ScrollBehavior = "smooth") => {
+		(_behavior: ScrollBehavior = "auto") => {
 			const viewport = scrollViewportRef.current;
 			if (!viewport) {
 				return;
 			}
 			viewport.scrollTo({
 				top: viewport.scrollHeight,
-				behavior: shouldReduceMotion ? "auto" : behavior,
+				behavior: "auto",
 			});
 		},
-		[shouldReduceMotion],
+		[],
 	);
 	const updateIsAtBottom = useCallback(() => {
 		const viewport = scrollViewportRef.current;
@@ -635,7 +640,7 @@ export const ConversationPanel = ({
 									) : null}
 									<AnimatePresence>
 										{messageWindowMode === "older" && isLatestDirty ? (
-											<motion.span
+											<m.span
 												animate={{ opacity: 1 }}
 												className="text-[11px] uppercase tracking-[0.18em] text-amber-200/90"
 												data-testid="conversation-latest-dirty-indicator"
@@ -645,7 +650,7 @@ export const ConversationPanel = ({
 												transition={{ duration: 0.2 }}
 											>
 												Newer messages available
-											</motion.span>
+											</m.span>
 										) : null}
 									</AnimatePresence>
 								</div>
@@ -696,7 +701,7 @@ export const ConversationPanel = ({
 									) : null}
 
 									{streamingText && !hasStreamingTimeline ? (
-										<motion.article
+										<m.article
 											className={cn(
 												"select-text break-words",
 												focusMode
@@ -716,18 +721,18 @@ export const ConversationPanel = ({
 											>
 												<Sparkles className="h-3.5 w-3.5" />
 												{focusMode ? "Assistant is writing" : "assistant · streaming"}
-												<motion.span
+												<m.span
 													animate={shouldReduceMotion ? undefined : { opacity: [0.3, 1, 0.3] }}
 													className={cn("h-1.5 w-1.5 rounded-full", focusMode ? "bg-slate-300" : "bg-sky-100")}
 													transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY, repeatType: "mirror" }}
 												/>
 											</div>
 											<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>{streamingText}</p>
-										</motion.article>
+										</m.article>
 									) : null}
 
 									{debouncedIsWorking ? (
-										<motion.article
+										<m.article
 											{...bubbleMotion}
 											aria-label="working-indicator"
 											className={cn(
@@ -739,14 +744,14 @@ export const ConversationPanel = ({
 										>
 											<Loader2 className="h-4 w-4 animate-spin" />
 											<span>Working...</span>
-										</motion.article>
+										</m.article>
 									) : null}
 								</AnimatePresence>
 							</div>
 						</ScrollArea>
 						<AnimatePresence>
 							{!isAtBottom ? (
-								<motion.button
+								<m.button
 									animate={{ opacity: 1, scale: 1 }}
 									aria-label="Scroll to latest message"
 									className={cn(
@@ -770,7 +775,7 @@ export const ConversationPanel = ({
 									type="button"
 								>
 									<ChevronDown className="h-4 w-4" />
-								</motion.button>
+								</m.button>
 							) : null}
 						</AnimatePresence>
 					</>
@@ -779,3 +784,6 @@ export const ConversationPanel = ({
 		</section>
 	);
 };
+
+export const ConversationPanel = React.memo(ConversationPanelImpl);
+ConversationPanel.displayName = "ConversationPanel";

@@ -7,7 +7,7 @@ import { startMdnsBroadcast } from "./network/mdns";
 import { checkForUpdates } from "./updater/check-update";
 import { resolveShellPath } from "./server/platform/resolve-shell-path";
 
-const APP_VERSION = "0.0.1";
+const APP_VERSION = "1.0.7";
 
 let mainWindowRef: BrowserWindow | null = null;
 let privateAccountServiceRef:
@@ -299,7 +299,7 @@ serverLogger.info("desktop-bootstrap", "Shell PATH resolved", {
 
 const backendHandle = await createBackendServer({ port: serverConfig.port });
 privateAccountServiceRef = backendHandle.privateAccountService;
-await waitForBackendReady();
+const backendReadyPromise = waitForBackendReady();
 
 electrobunEvents?.on("open-url", async ({ url }: { url: string }) => {
 	await handleOpenUrl(url);
@@ -308,11 +308,16 @@ electrobunEvents?.on("open-url", async ({ url }: { url: string }) => {
 let stopMdns = () => {
 	// no-op
 };
-try {
-	const discoveryResponse = await fetch(`http://127.0.0.1:${serverConfig.port}/v1/discovery`, {
-		method: "GET",
-	});
-	if (discoveryResponse.ok) {
+
+const startMdnsAsync = async () => {
+	try {
+		await backendReadyPromise;
+		const discoveryResponse = await fetch(`http://127.0.0.1:${serverConfig.port}/v1/discovery`, {
+			method: "GET",
+		});
+		if (!discoveryResponse.ok) {
+			return;
+		}
 		const discoveryMetadata = (await discoveryResponse.json()) as DiscoveryMetadata;
 		logDiscoveryHints(discoveryMetadata.connectHints);
 		stopMdns = await startMdnsBroadcast({
@@ -321,11 +326,11 @@ try {
 			serverId: discoveryMetadata.serverId,
 			version: discoveryMetadata.version,
 		});
+	} catch {
+		serverLogger.warn("desktop-bootstrap", "mDNS discovery broadcast unavailable");
 	}
-} catch {
-	// mDNS remains optional; keep app startup resilient
-	serverLogger.warn("desktop-bootstrap", "mDNS discovery broadcast unavailable");
-}
+};
+void startMdnsAsync();
 
 process.on("exit", () => {
 	stopMdns();

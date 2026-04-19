@@ -143,14 +143,14 @@ describe("D-40: newer messages badge fade animation", () => {
 
 	test("badge uses motion.span for animation", () => {
 		const motionBadge = source.match(
-			/<motion\.span[\s\S]*?key="newer-messages-badge"/,
+			/<m\.span[\s\S]*?key="newer-messages-badge"/,
 		);
 		expect(motionBadge).not.toBeNull();
 	});
 
 	test("badge has exit opacity animation", () => {
 		const badgeBlock = source.match(
-			/<motion\.span[\s\S]*?newer-messages-badge[\s\S]*?\/>/s,
+			/<m\.span[\s\S]*?newer-messages-badge[\s\S]*?\/>/s,
 		);
 		expect(badgeBlock).not.toBeNull();
 		expect(badgeBlock![0]).toContain("exit={{ opacity: 0 }}");
@@ -158,7 +158,7 @@ describe("D-40: newer messages badge fade animation", () => {
 
 	test("badge has initial opacity of 0", () => {
 		const badgeBlock = source.match(
-			/<motion\.span[\s\S]*?newer-messages-badge[\s\S]*?\/>/s,
+			/<m\.span[\s\S]*?newer-messages-badge[\s\S]*?\/>/s,
 		);
 		expect(badgeBlock).not.toBeNull();
 		expect(badgeBlock![0]).toContain("initial={{ opacity: 0 }}");
@@ -182,14 +182,14 @@ describe("D-41: scroll-to-bottom button animation", () => {
 
 	test("button uses motion.button for animation", () => {
 		const motionButton = source.match(
-			/<motion\.button[\s\S]*?key="scroll-to-bottom-fab"/,
+			/<m\.button[\s\S]*?key="scroll-to-bottom-fab"/,
 		);
 		expect(motionButton).not.toBeNull();
 	});
 
 	test("button has scale and opacity in exit animation", () => {
 		const fabBlock = source.match(
-			/<motion\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/motion\.button>/s,
+			/<m\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/m\.button>/s,
 		);
 		expect(fabBlock).not.toBeNull();
 		expect(fabBlock![0]).toContain("exit={{ opacity: 0, scale: 0.8 }}");
@@ -197,7 +197,7 @@ describe("D-41: scroll-to-bottom button animation", () => {
 
 	test("button has scale and opacity in initial state", () => {
 		const fabBlock = source.match(
-			/<motion\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/motion\.button>/s,
+			/<m\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/m\.button>/s,
 		);
 		expect(fabBlock).not.toBeNull();
 		expect(fabBlock![0]).toContain("initial={{ opacity: 0, scale: 0.8 }}");
@@ -205,7 +205,7 @@ describe("D-41: scroll-to-bottom button animation", () => {
 
 	test("button animates to full opacity and scale", () => {
 		const fabBlock = source.match(
-			/<motion\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/motion\.button>/s,
+			/<m\.button[\s\S]*?scroll-to-bottom-fab[\s\S]*?<\/m\.button>/s,
 		);
 		expect(fabBlock).not.toBeNull();
 		expect(fabBlock![0]).toContain("animate={{ opacity: 1, scale: 1 }}");

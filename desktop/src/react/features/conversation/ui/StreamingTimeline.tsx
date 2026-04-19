@@ -1,4 +1,3 @@
-import { AnimatePresence, motion } from "framer-motion";
 import {
 	Bot,
 	ChevronDown,
@@ -8,7 +7,7 @@ import {
 	ListTodo,
 	Sparkles,
 } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -319,25 +318,25 @@ const StreamingTimelineRow = ({
 						</p>
 					) : null}
 
-					<AnimatePresence initial={false}>
-						{showExpandedDetails ? (
-							<motion.div
-								animate={shouldReduceMotion ? undefined : { opacity: 1, height: "auto" }}
-								exit={shouldReduceMotion ? undefined : { opacity: 0, height: 0 }}
-								initial={shouldReduceMotion ? undefined : { opacity: 0, height: 0 }}
-								style={DETAIL_EXPAND_WRAPPER_STYLE}
-								transition={DETAIL_EXPAND_TRANSITION}
+					<div
+						className={cn(
+							"grid transition-[grid-template-rows,opacity] duration-[250ms] ease-[cubic-bezier(0.4,0,0.2,1)] motion-reduce:transition-none",
+							showExpandedDetails
+								? "grid-rows-[1fr] opacity-100"
+								: "grid-rows-[0fr] opacity-0",
+						)}
+						style={DETAIL_EXPAND_WRAPPER_STYLE}
+					>
+						<div className="min-h-0 overflow-hidden">
+							<pre
+								className={cn(
+									"mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/80 p-2.5 text-[12px] leading-5 text-slate-100",
+								)}
 							>
-								<pre
-									className={cn(
-										"mt-2 overflow-x-auto rounded-xl border border-white/15 bg-slate-950/80 p-2.5 text-[12px] leading-5 text-slate-100",
-									)}
-								>
-									{detailText}
-								</pre>
-							</motion.div>
-						) : null}
-					</AnimatePresence>
+								{detailText}
+							</pre>
+						</div>
+					</div>
 				</div>
 				{canToggle ? (
 					<button
@@ -362,7 +361,7 @@ const StreamingTimelineRow = ({
 	);
 };
 
-export const StreamingTimeline = ({
+const StreamingTimelineImpl = ({
 	turn,
 	focusMode,
 	shouldReduceMotion,
@@ -379,7 +378,6 @@ export const StreamingTimeline = ({
 				.map((itemId) => turn.itemsById[itemId])
 				.filter((item): item is StreamItem => Boolean(item))
 				.filter((item) => {
-					// Hide completed reasoning items with no visible content — they appear as empty "Thinking..." placeholders.
 					if (
 						item.type === "reasoning" &&
 						item.state !== "running" &&
@@ -403,3 +401,6 @@ export const StreamingTimeline = ({
 		</div>
 	);
 };
+
+export const StreamingTimeline = React.memo(StreamingTimelineImpl);
+StreamingTimeline.displayName = "StreamingTimeline";

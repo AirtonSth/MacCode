@@ -24,7 +24,7 @@ describe("Terminal panel resize animation", () => {
 	});
 
 	it("uses motion.div with overflow hidden for the animation wrapper", () => {
-		const motionDivPattern = /<motion\.div[^>]*key="terminal-panel"[^>]*>/s;
+		const motionDivPattern = /<m\.div[^>]*key="terminal-panel"[^>]*>/s;
 		const match = appSource.match(motionDivPattern);
 		expect(match).not.toBeNull();
 
@@ -33,7 +33,7 @@ describe("Terminal panel resize animation", () => {
 	});
 
 	it("animates height from 0 to auto and back to 0 on exit", () => {
-		const motionDivPattern = /<motion\.div[^>]*key="terminal-panel"[^>]*>/s;
+		const motionDivPattern = /<m\.div[^>]*key="terminal-panel"[^>]*>/s;
 		const match = appSource.match(motionDivPattern);
 		expect(match).not.toBeNull();
 

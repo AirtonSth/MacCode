@@ -4,12 +4,13 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "bun:test";
 
 const cssSource = readFileSync(resolve(__dirname, "index.css"), "utf-8");
+const htmlSource = readFileSync(resolve(__dirname, "index.html"), "utf-8");
 
 describe("[D-13] Google Fonts display=swap and @font-face fallback", () => {
-	it("includes display=swap in the Google Fonts import URL", () => {
-		const importLine = cssSource.match(/@import\s+url\([^)]+\)/);
-		expect(importLine).not.toBeNull();
-		expect(importLine![0]).toContain("display=swap");
+	it("includes display=swap in the Google Fonts preload link URL (loaded via <link> in index.html)", () => {
+		const fontsLink = htmlSource.match(/href="https:\/\/fonts\.googleapis\.com\/css2[^"]+"/);
+		expect(fontsLink).not.toBeNull();
+		expect(fontsLink![0]).toContain("display=swap");
 	});
 
 	it("declares @font-face for Manrope with font-display: swap", () => {
