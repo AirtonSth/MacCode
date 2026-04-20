@@ -159,8 +159,8 @@ export class RelayConnectorClient {
 		let socket: SocketLike;
 		try {
 			socket = this.createSocket(relayUrl);
-		} catch {
-			this.reportRelayFailure("private_relay_connect_failed");
+		} catch (error) {
+			this.reportRelayFailure(this.describeError("private_relay_connect_failed", error));
 			this.setState("error");
 			return;
 		}
@@ -198,17 +198,20 @@ export class RelayConnectorClient {
 			this.setState(this.remoteClosedByUser ? "idle" : "disconnected");
 		});
 
-		socket.addEventListener("error", () => {
+		socket.addEventListener("error", (event) => {
 			if (!this.isCurrentRelayAttempt(socket, attemptId)) {
 				return;
 			}
 
-			this.reportRelayFailure("private_relay_socket_error");
-			this.setState("error");
+			const description = this.describeError("private_relay_socket_error", (event as { error?: unknown }).error);
+			this.reportRelayFailure(description);
+			// Stay in disconnected so upstream auto-reconnect kicks in immediately
+			// (the close event will follow but error is surfaced now).
+			this.setState("disconnected");
 			try {
 				socket.close(1011, "relay_error");
-			} catch {
-				// Best effort close to force a clean reconnect path.
+			} catch (closeError) {
+				this.reportRelayFailure(this.describeError("private_relay_socket_close_failed", closeError));
 			}
 		});
 	}
@@ -261,8 +264,8 @@ export class RelayConnectorClient {
 
 		try {
 			this.relaySocket.send(JSON.stringify(frame));
-		} catch {
-			this.reportRelayFailure("private_relay_socket_error");
+		} catch (error) {
+			this.reportRelayFailure(this.describeError("private_relay_socket_error", error));
 		}
 	}
 
@@ -372,8 +375,8 @@ export class RelayConnectorClient {
 			socket = this.createSocket(
 				`${toWsBaseUrl(this.localServerBaseUrl)}/v1/ws?token=${encodeURIComponent(this.localServerToken)}`,
 			);
-		} catch {
-			this.reportRelayFailure("private_local_app_unavailable");
+		} catch (error) {
+			this.reportRelayFailure(this.describeError("private_local_app_unavailable", error));
 			this.forwardToRelay({
 				clientConnectionId,
 				code: 1011,
@@ -392,8 +395,9 @@ export class RelayConnectorClient {
 
 		const pendingClose = this.pendingRemoteClosures.get(clientConnectionId);
 		if (pendingClose) {
+			// No close listener has been attached yet, so do not register a suppression
+			// (it would leak forever). Just close and drop the local socket entry.
 			this.pendingRemoteClosures.delete(clientConnectionId);
-			this.suppressedLocalCloseIds.add(clientConnectionId);
 			socket.close(pendingClose.code, pendingClose.reason);
 			this.localSockets.delete(clientConnectionId);
 			return;
@@ -476,6 +480,17 @@ export class RelayConnectorClient {
 
 	private reportRelayFailure(message: string): void {
 		this.onError?.(message);
+	}
+
+	private describeError(code: string, error: unknown): string {
+		if (error instanceof Error) {
+			const detail = error.stack?.split("\n")[0]?.trim() || error.message;
+			return detail ? `${code}: ${detail}` : code;
+		}
+		if (typeof error === "string" && error.length > 0) {
+			return `${code}: ${error}`;
+		}
+		return code;
 	}
 
 	private startConnectTimeout(attemptId: number): void {

@@ -12,9 +12,13 @@ export type ConnectionState = "idle" | "connecting" | "connected" | "reconnectin
 
 interface RealtimeOptions {
 	createSocket?: (url: string, options?: { headers?: Record<string, string> }) => WebSocket;
+	idleTimeoutMs?: number;
 	onConnectionStateChange?: (state: ConnectionState) => void;
 	onEvent: (event: ServerWsEvent) => void;
 	onReliableMessageError?: (input: { chatId: string; message: string; requestId: string }) => void;
+	reliableQueueLimit?: number;
+	reliableQueueTtlMs?: number;
+	stableConnectionMs?: number;
 	target: ActiveConnectionTarget;
 }
 
@@ -405,14 +409,18 @@ export const buildRealtimeWebSocketHeaders = (target: ActiveConnectionTarget): R
 
 export const createRealtimeClient = (options: RealtimeOptions) => {
 	const reconnectBaseDelay = 300;
-	const reconnectMaxDelay = 4_000;
-	const reliableQueueLimit = 100;
-	const reliableQueueTtlMs = 120_000;
+	const reconnectMaxDelay = 30_000;
+	const reliableQueueLimit = options.reliableQueueLimit ?? 100;
+	const reliableQueueTtlMs = options.reliableQueueTtlMs ?? 300_000;
+	const stableConnectionMs = options.stableConnectionMs ?? 5_000;
+	const idleTimeoutMs = options.idleTimeoutMs ?? 60_000;
 
 	let socket: WebSocket | null = null;
 	let reconnectAttempts = 0;
 	let stopped = false;
 	let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+	let stableConnectionTimer: ReturnType<typeof setTimeout> | null = null;
+	let idleTimer: ReturnType<typeof setTimeout> | null = null;
 	let isConnecting = false;
 	let reconnectScheduled = false;
 	let isConnected = false;
@@ -434,6 +442,42 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		clearTimeout(reconnectTimeout);
 		reconnectTimeout = null;
 		reconnectScheduled = false;
+	};
+
+	const clearStableConnectionTimer = () => {
+		if (!stableConnectionTimer) {
+			return;
+		}
+
+		clearTimeout(stableConnectionTimer);
+		stableConnectionTimer = null;
+	};
+
+	const clearIdleTimer = () => {
+		if (!idleTimer) {
+			return;
+		}
+
+		clearTimeout(idleTimer);
+		idleTimer = null;
+	};
+
+	const resetIdleTimer = () => {
+		clearIdleTimer();
+		if (stopped || idleTimeoutMs <= 0) {
+			return;
+		}
+		idleTimer = setTimeout(() => {
+			idleTimer = null;
+
+			// No server activity for idleTimeoutMs — the socket may be dead even
+			// though onclose hasn't fired. Force a reconnect cycle.
+			try {
+				socket?.close();
+			} catch {
+				// no-op
+			}
+		}, idleTimeoutMs);
 	};
 
 	const closeSocket = () => {
@@ -641,7 +685,11 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			return;
 		}
 
-		const delay = Math.min(reconnectBaseDelay * 2 ** reconnectAttempts, reconnectMaxDelay);
+		const exponential = Math.min(reconnectBaseDelay * 2 ** reconnectAttempts, reconnectMaxDelay);
+
+		// Equal jitter: random in [exponential/2, exponential] to prevent
+		// reconnect storms when many clients reconnect simultaneously.
+		const jitter = exponential / 2 + Math.random() * (exponential / 2);
 		reconnectAttempts += 1;
 		reconnectScheduled = true;
 		notifyState("reconnecting");
@@ -650,7 +698,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 			reconnectTimeout = null;
 			reconnectScheduled = false;
 			connect();
-		}, delay);
+		}, jitter);
 	};
 
 	const connect = () => {
@@ -677,9 +725,18 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		socket.onopen = () => {
 			isConnected = true;
 			socketErrored = false;
-			reconnectAttempts = 0;
 			isConnecting = false;
 			clearReconnectTimeout();
+
+			// Don't reset reconnect attempts immediately — only after the connection
+			// has stayed up long enough to be considered stable. Prevents fast-fail
+			// loops from busy-looping with no backoff.
+			clearStableConnectionTimer();
+			stableConnectionTimer = setTimeout(() => {
+				reconnectAttempts = 0;
+				stableConnectionTimer = null;
+			}, stableConnectionMs);
+			resetIdleTimer();
 			notifyState("connected");
 
 			const queuedJoinChatIds = getQueuedJoinChatIds();
@@ -727,6 +784,8 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		socket.onclose = () => {
 			isConnected = false;
 			isConnecting = false;
+			clearStableConnectionTimer();
+			clearIdleTimer();
 			resetUnackedReliableMessagesForRetry();
 
 			if (!stopped) {
@@ -748,6 +807,7 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		};
 
 		socket.onmessage = (message) => {
+			resetIdleTimer();
 			const payload = parseServerWsEvent(message.data);
 
 			if (!payload) {
@@ -771,6 +831,13 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		};
 	};
 
+	const BACKPRESSURE_THRESHOLD_BYTES = 1_048_576;
+
+	const isSocketBackpressured = (): boolean => {
+		const bufferedAmount = (socket as { bufferedAmount?: number } | null)?.bufferedAmount;
+		return typeof bufferedAmount === "number" && bufferedAmount > BACKPRESSURE_THRESHOLD_BYTES;
+	};
+
 	const send = (payload: ClientWsEvent) => {
 		if (stopped) {
 			return;
@@ -778,13 +845,13 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 
 		if (payload.event === "user_message") {
 			enqueueMessage(payload);
-			if (socket && socket.readyState === WebSocket.OPEN && !socketErrored) {
+			if (socket && socket.readyState === WebSocket.OPEN && !socketErrored && !isSocketBackpressured()) {
 				flushQueue();
 			}
 			return;
 		}
 
-		if (!socket || socket.readyState !== WebSocket.OPEN || socketErrored) {
+		if (!socket || socket.readyState !== WebSocket.OPEN || socketErrored || isSocketBackpressured()) {
 			enqueueMessage(payload);
 			return;
 		}
@@ -797,7 +864,14 @@ export const createRealtimeClient = (options: RealtimeOptions) => {
 		disconnect: () => {
 			stopped = true;
 			clearReconnectTimeout();
+			clearStableConnectionTimer();
+			clearIdleTimer();
 			closeSocket();
+			activeChats.clear();
+			activeTerminalChats.clear();
+			activeWorkspaceSubscription = null;
+			sendQueue.length = 0;
+			reconnectAttempts = 0;
 			notifyState("disconnected");
 		},
 		getIsConnected: () => isConnected && socket?.readyState === WebSocket.OPEN,
