@@ -674,11 +674,24 @@ export const RemoteCodeRealtime = {
 			options.onConnectionStateChange?.(state);
 		};
 
+		let openHandler: (() => void) | null = null;
+		let closeHandler: (() => void) | null = null;
+		let errorHandler: (() => void) | null = null;
+		let messageHandler: ((message: MessageEvent) => void) | null = null;
+
+		const detachSocketListeners = (ws: WebSocket) => {
+			if (openHandler) ws.removeEventListener("open", openHandler);
+			if (closeHandler) ws.removeEventListener("close", closeHandler);
+			if (errorHandler) ws.removeEventListener("error", errorHandler);
+			if (messageHandler) ws.removeEventListener("message", messageHandler);
+		};
+
 		const closeSocket = () => {
 			if (!socket) {
 				return;
 			}
 
+			detachSocketListeners(socket);
 			try {
 				socket.close();
 			} catch {
@@ -719,7 +732,7 @@ export const RemoteCodeRealtime = {
 
 			socket = new WebSocket(buildWsUrl(options.baseUrl, options.token));
 
-			socket.addEventListener("open", () => {
+			openHandler = () => {
 				isConnected = true;
 				reconnectAttempts = 0;
 				isConnecting = false;
@@ -744,9 +757,9 @@ export const RemoteCodeRealtime = {
 						event: "join_terminal_session",
 					}));
 				}
-			});
+			};
 
-			socket.addEventListener("close", () => {
+			closeHandler = () => {
 				isConnected = false;
 				isConnecting = false;
 
@@ -755,20 +768,25 @@ export const RemoteCodeRealtime = {
 				} else {
 					notifyState("disconnected");
 				}
-			});
+			};
 
-			socket.addEventListener("error", () => {
+			errorHandler = () => {
 				notifyState("reconnecting");
 				scheduleReconnect();
-			});
+			};
 
-			socket.addEventListener("message", (message) => {
+			messageHandler = (message: MessageEvent) => {
 				const payload = parseServerWsEvent(message.data);
 				if (!payload) {
 					return;
 				}
 				options.onEvent(payload);
-			});
+			};
+
+			socket.addEventListener("open", openHandler);
+			socket.addEventListener("close", closeHandler);
+			socket.addEventListener("error", errorHandler);
+			socket.addEventListener("message", messageHandler);
 		};
 
 		const send = (payload: ClientWsEvent) => {

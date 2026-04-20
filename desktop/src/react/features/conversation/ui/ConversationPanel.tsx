@@ -1,3 +1,4 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { AnimatePresence, m, useReducedMotion } from "framer-motion";
 import { AlertTriangle, Bot, Check, ChevronDown, Copy, Loader2, Sparkles, User2 } from "lucide-react";
 import { Badge } from "../../../components/ui/badge";
@@ -18,6 +19,9 @@ export const SCROLL_BOTTOM_THRESHOLD_PX = 80;
 
 /** Debounce delay (ms) before top-pagination fires (D-20). */
 export const TOP_PAGINATION_DEBOUNCE_MS = 300;
+
+/** Estimated height (px) per item for initial virtualizer layout. */
+const ESTIMATED_ITEM_HEIGHT = 120;
 
 const extractTextFromChildren = (children: React.ReactNode): string => {
 	if (typeof children === "string") return children;
@@ -241,6 +245,23 @@ interface ConversationPanelProps {
 	focusMode?: boolean;
 }
 
+type VirtualItem =
+	| { kind: "message"; message: MessageDTO }
+	| { kind: "turn"; turn: StreamTurnState }
+	| { kind: "live-turn"; turn: StreamTurnState }
+	| { kind: "streaming-text"; text: string }
+	| { kind: "working" };
+
+const getVirtualItemKey = (item: VirtualItem): string => {
+	switch (item.kind) {
+		case "message": return `msg-${item.message.id}`;
+		case "turn": return `turn-${item.turn.turnId}`;
+		case "live-turn": return `live-${item.turn.turnId}`;
+		case "streaming-text": return "streaming-text";
+		case "working": return "working";
+	}
+};
+
 const ConversationPanelImpl = ({
 	chat,
 	hasOlderMessages,
@@ -288,27 +309,29 @@ const ConversationPanelImpl = ({
 	const [showRunDetails, setShowRunDetails] = useState(true);
 	const shouldForceRunDetails = !hasMessages && !hasStreaming && hasHistoricalRunDetails;
 	const showHistoricalTurns = showRunDetails || shouldForceRunDetails;
-	const mergedItems = useMemo(() => {
-		type Item =
-			| { kind: "message"; message: MessageDTO; sortMs: number }
-			| { kind: "turn"; turn: StreamTurnState; sortMs: number };
-		const items: Item[] = messages.map((m) => ({
-			kind: "message" as const,
-			message: m,
+
+	// Build a flat virtual list: sorted messages+turns, then live items at the end.
+	const virtualItems = useMemo((): VirtualItem[] => {
+		type SortedItem = { sortMs: number; item: VirtualItem };
+		const sorted: SortedItem[] = messages.map((m) => ({
 			sortMs: new Date(m.createdAt).getTime(),
+			item: { kind: "message" as const, message: m },
 		}));
 		if (showHistoricalTurns) {
 			for (const t of historicalTurns) {
-				items.push({
-					kind: "turn" as const,
-					turn: t,
-					sortMs: t.startedAtMs,
-				});
+				sorted.push({ sortMs: t.startedAtMs, item: { kind: "turn" as const, turn: t } });
 			}
 		}
-		items.sort((a, b) => a.sortMs - b.sortMs);
-		return items;
-	}, [messages, historicalTurns, showHistoricalTurns]);
+		sorted.sort((a, b) => a.sortMs - b.sortMs);
+		const result: VirtualItem[] = sorted.map((s) => s.item);
+
+		if (liveTurn) result.push({ kind: "live-turn", turn: liveTurn });
+		if (streamingText && !hasStreamingTimeline) result.push({ kind: "streaming-text", text: streamingText });
+		if (debouncedIsWorking) result.push({ kind: "working" });
+
+		return result;
+	}, [messages, historicalTurns, showHistoricalTurns, liveTurn, streamingText, hasStreamingTimeline, debouncedIsWorking]);
+
 	const hasContent = hasMessages || hasStreaming || hasHistoricalRunDetails || isWorking;
 	const showLoadingSkeleton = loading && !hasContent;
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -336,6 +359,7 @@ const ConversationPanelImpl = ({
 			isChatSwitchRef.current = false;
 		}
 	});
+
 	const bubbleMotion = shouldReduceMotion || isChatSwitchRef.current
 		? {}
 		: {
@@ -344,26 +368,48 @@ const ConversationPanelImpl = ({
 				initial: { opacity: 0, y: 8 },
 				transition: { duration: 0.2, ease: "easeOut" as const },
 			};
+
+	// ─── Virtualizer ──────────────────────────────────────────────────────────
+	const virtualizer = useVirtualizer({
+		count: virtualItems.length,
+		getScrollElement: () => scrollViewportRef.current,
+		estimateSize: () => ESTIMATED_ITEM_HEIGHT,
+		overscan: 5,
+		measureElement:
+			typeof window !== "undefined"
+				? (element) => element?.getBoundingClientRect().height ?? ESTIMATED_ITEM_HEIGHT
+				: undefined,
+	});
+	// ─────────────────────────────────────────────────────────────────────────
+
 	const scrollToBottom = useCallback(
 		(_behavior: ScrollBehavior = "auto") => {
-			const viewport = scrollViewportRef.current;
-			if (!viewport) {
-				return;
+			const lastIndex = virtualItems.length - 1;
+			if (lastIndex >= 0) {
+				virtualizer.scrollToIndex(lastIndex, { align: "end" });
 			}
-			viewport.scrollTo({
-				top: viewport.scrollHeight,
-				behavior: "auto",
-			});
 		},
-		[],
+		[virtualizer, virtualItems.length],
 	);
 	const updateIsAtBottom = useCallback(() => {
 		const viewport = scrollViewportRef.current;
 		if (!viewport) {
 			return;
 		}
-		const distanceFromBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-		const atBottom = distanceFromBottom <= SCROLL_BOTTOM_THRESHOLD_PX;
+
+		// scrollHeight is unreliable when items still have estimated (not yet measured) sizes,
+		// so use virtualizer item positions to detect whether we're at the actual bottom.
+		const renderedItems = virtualizer.getVirtualItems();
+		const lastRenderedItem = renderedItems.length > 0 ? renderedItems[renderedItems.length - 1] : null;
+		let atBottom: boolean;
+		if (virtualItems.length === 0) {
+			atBottom = true;
+		} else if (lastRenderedItem && lastRenderedItem.index >= virtualItems.length - 1) {
+			const distanceFromBottom = lastRenderedItem.end - viewport.scrollTop - viewport.clientHeight;
+			atBottom = distanceFromBottom <= SCROLL_BOTTOM_THRESHOLD_PX;
+		} else {
+			atBottom = false;
+		}
 
 		// Detect user scrolling up during streaming (D-18).
 		const scrolledUp = viewport.scrollTop < lastScrollTopRef.current;
@@ -377,7 +423,7 @@ const ConversationPanelImpl = ({
 
 		isAtBottomRef.current = atBottom;
 		setIsAtBottom(atBottom);
-	}, []);
+	}, [virtualizer, virtualItems.length]);
 	const forceScrollToBottom = useCallback(() => {
 		if (hasActiveSelection()) {
 			return;
@@ -449,6 +495,7 @@ const ConversationPanelImpl = ({
 			void onLoadLatestMessages?.();
 		}
 	}, [hasOlderMessages, loading, messageWindowMode, onLoadLatestMessages, onLoadOlderMessages, updateIsAtBottom]);
+
 	useEffect(() => {
 		if (
 			previousMessageWindowModeRef.current === "older" &&
@@ -464,6 +511,7 @@ const ConversationPanelImpl = ({
 		setIsAtBottom(true);
 		isAtBottomRef.current = true;
 		userScrolledUpRef.current = false;
+		lastScrollTopRef.current = 0;
 		setShowRunDetails(false);
 		topPaginationTriggeredRef.current = false;
 		latestReloadTriggeredRef.current = false;
@@ -513,6 +561,85 @@ const ConversationPanelImpl = ({
 			forceScrollToBottom();
 		}
 	}, [forceScrollToBottom, hasContent, historicalTurns, isWorking, liveTurn, messageWindowMode, messages, streamingText, updateIsAtBottom]);
+
+	const renderVirtualItem = useCallback((item: VirtualItem) => {
+		switch (item.kind) {
+			case "message":
+				return (
+					<MessageBubble
+						message={item.message}
+						focusMode={focusMode}
+						shouldReduceMotion={shouldReduceMotion}
+						disableAnimation={isChatSwitchRef.current}
+					/>
+				);
+			case "turn":
+				return (
+					<StreamingTimeline
+						focusMode={focusMode}
+						onSetItemExpanded={onSetStreamItemExpanded}
+						onSetItemState={onSetStreamItemState}
+						shouldReduceMotion={shouldReduceMotion}
+						turn={item.turn}
+					/>
+				);
+			case "live-turn":
+				return (
+					<StreamingTimeline
+						focusMode={focusMode}
+						onSetItemExpanded={onSetStreamItemExpanded}
+						onSetItemState={onSetStreamItemState}
+						shouldReduceMotion={shouldReduceMotion}
+						turn={item.turn}
+					/>
+				);
+			case "streaming-text":
+				return (
+					<m.article
+						className={cn(
+							"select-text break-words",
+							focusMode
+								? "w-full py-4 text-[15px] leading-7 text-slate-100"
+								: "mr-auto max-w-[85ch] rounded-2xl border border-sky-200/20 bg-sky-500/10 px-4 py-3 text-sky-50 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
+						)}
+						{...bubbleMotion}
+					>
+						<div
+							className={cn(
+								"mb-2 flex items-center gap-2",
+								focusMode
+									? "text-xs tracking-[0.12em] text-slate-400"
+									: "text-[11px] uppercase tracking-[0.18em] text-sky-100/90",
+							)}
+						>
+							<Sparkles className="h-3.5 w-3.5" />
+							{focusMode ? "Assistant is writing" : "assistant · streaming"}
+							<m.span
+								animate={shouldReduceMotion ? undefined : { opacity: [0.3, 1, 0.3] }}
+								className={cn("h-1.5 w-1.5 rounded-full", focusMode ? "bg-slate-300" : "bg-sky-100")}
+								transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY, repeatType: "mirror" }}
+							/>
+						</div>
+						<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>{item.text}</p>
+					</m.article>
+				);
+			case "working":
+				return (
+					<m.article
+						{...bubbleMotion}
+						aria-label="working-indicator"
+						className={cn(
+							"mr-auto inline-flex items-center gap-2 rounded-xl border border-sky-300/25 bg-sky-400/10 px-3 py-2 text-sm text-sky-100",
+							focusMode ? "mt-2" : "",
+						)}
+						data-testid="conversation-working-indicator"
+					>
+						<Loader2 className="h-4 w-4 animate-spin" />
+						<span>Working...</span>
+					</m.article>
+				);
+		}
+	}, [focusMode, shouldReduceMotion, onSetStreamItemExpanded, onSetStreamItemState, bubbleMotion]);
 
 	return (
 		<section
@@ -661,92 +788,41 @@ const ConversationPanelImpl = ({
 								aria-live="polite"
 								className={cn(
 									"mx-auto w-full max-w-3xl",
-									focusMode ? "space-y-2 px-4 pb-8 pt-5 sm:px-6" : "space-y-3 px-5 pb-5 pt-4",
+									focusMode ? "px-4 pb-8 pt-5 sm:px-6" : "px-5 pb-5 pt-4",
 								)}
 							>
 								<span className="sr-only" data-testid="conversation-window-mode">
 									{messageWindowMode}
 								</span>
-								<AnimatePresence initial={false}>
-									{mergedItems.map((item) =>
-										item.kind === "message" ? (
-											<MessageBubble
-												key={item.message.id}
-												message={item.message}
-												focusMode={focusMode}
-												shouldReduceMotion={shouldReduceMotion}
-												disableAnimation={isChatSwitchRef.current}
-											/>
-										) : (
-											<StreamingTimeline
-												focusMode={focusMode}
-												key={`stream-turn-${item.turn.turnId}`}
-												onSetItemExpanded={onSetStreamItemExpanded}
-												onSetItemState={onSetStreamItemState}
-												shouldReduceMotion={shouldReduceMotion}
-												turn={item.turn}
-											/>
-										),
-									)}
-
-									{liveTurn ? (
-										<StreamingTimeline
-											focusMode={focusMode}
-											key={`stream-live-${liveTurn.turnId}`}
-											onSetItemExpanded={onSetStreamItemExpanded}
-											onSetItemState={onSetStreamItemState}
-											shouldReduceMotion={shouldReduceMotion}
-											turn={liveTurn}
-										/>
-									) : null}
-
-									{streamingText && !hasStreamingTimeline ? (
-										<m.article
-											className={cn(
-												"select-text break-words",
-												focusMode
-													? "w-full py-4 text-[15px] leading-7 text-slate-100"
-													: "mr-auto max-w-[85ch] rounded-2xl border border-sky-200/20 bg-sky-500/10 px-4 py-3 text-sky-50 shadow-[0_18px_40px_rgba(2,6,23,0.35)]",
-											)}
-											key="streaming"
-											{...bubbleMotion}
-										>
+								{/* Virtual scroll container — total height keeps scrollbar accurate */}
+								<div
+									style={{
+										height: `${virtualizer.getTotalSize()}px`,
+										position: "relative",
+									}}
+								>
+									{virtualizer.getVirtualItems().map((vItem) => {
+										const item = virtualItems[vItem.index];
+										if (!item) return null;
+										return (
 											<div
-												className={cn(
-													"mb-2 flex items-center gap-2",
-													focusMode
-														? "text-xs tracking-[0.12em] text-slate-400"
-														: "text-[11px] uppercase tracking-[0.18em] text-sky-100/90",
-												)}
+												key={getVirtualItemKey(item)}
+												data-index={vItem.index}
+												ref={virtualizer.measureElement}
+												style={{
+													position: "absolute",
+													top: 0,
+													left: 0,
+													width: "100%",
+													transform: `translateY(${vItem.start}px)`,
+													paddingBottom: focusMode ? "0.5rem" : "0.75rem",
+												}}
 											>
-												<Sparkles className="h-3.5 w-3.5" />
-												{focusMode ? "Assistant is writing" : "assistant · streaming"}
-												<m.span
-													animate={shouldReduceMotion ? undefined : { opacity: [0.3, 1, 0.3] }}
-													className={cn("h-1.5 w-1.5 rounded-full", focusMode ? "bg-slate-300" : "bg-sky-100")}
-													transition={{ duration: 1.2, repeat: Number.POSITIVE_INFINITY, repeatType: "mirror" }}
-												/>
+												{renderVirtualItem(item)}
 											</div>
-											<p className={cn("whitespace-pre-wrap", focusMode ? "" : "text-sm leading-6")}>{streamingText}</p>
-										</m.article>
-									) : null}
-
-									{debouncedIsWorking ? (
-										<m.article
-											{...bubbleMotion}
-											aria-label="working-indicator"
-											className={cn(
-												"mr-auto inline-flex items-center gap-2 rounded-xl border border-sky-300/25 bg-sky-400/10 px-3 py-2 text-sm text-sky-100",
-												focusMode ? "mt-2" : "",
-											)}
-											data-testid="conversation-working-indicator"
-											key="conversation-working-indicator"
-										>
-											<Loader2 className="h-4 w-4 animate-spin" />
-											<span>Working...</span>
-										</m.article>
-									) : null}
-								</AnimatePresence>
+										);
+									})}
+								</div>
 							</div>
 						</ScrollArea>
 						<AnimatePresence>

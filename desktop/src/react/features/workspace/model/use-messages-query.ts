@@ -24,6 +24,8 @@ export const useMessagesQuery = (
 
 	const query = useQuery<MessagePageDTO>({
 		enabled: Boolean(chatId) && enabled,
+		gcTime: 2 * 60 * 1000,
+		staleTime: 10 * 1000,
 		placeholderData: (previousPage) => {
 			if (!chatId) {
 				return createEmptyPage();

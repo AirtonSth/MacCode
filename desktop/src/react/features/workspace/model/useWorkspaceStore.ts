@@ -241,18 +241,31 @@ const ensureItemForTurn = (
 	return created;
 };
 
+const MAX_TURN_HISTORY = 20;
+
 const upsertTurnHistory = (
 	turns: StreamTurnState[] | undefined,
 	turn: StreamTurnState,
 ): StreamTurnState[] => {
 	const current = turns ?? [];
 	const index = current.findIndex((item) => item.turnId === turn.turnId);
+	let next: StreamTurnState[];
 	if (index < 0) {
-		return [...current, turn];
+		next = [...current, turn];
+	} else {
+		next = [...current];
+		next[index] = turn;
 	}
-
-	const next = [...current];
-	next[index] = turn;
+	// Keep only the most recent MAX_TURN_HISTORY turns; never evict a running turn.
+	if (next.length > MAX_TURN_HISTORY) {
+		const runningIndex = next.findIndex((t) => t.status === "running");
+		const trimmed = next.slice(-MAX_TURN_HISTORY);
+		// If the running turn was sliced off, put it back at the start.
+		if (runningIndex !== -1 && runningIndex < next.length - MAX_TURN_HISTORY) {
+			trimmed.unshift(next[runningIndex]!);
+		}
+		return trimmed;
+	}
 	return next;
 };
 
@@ -1200,18 +1213,20 @@ export const workspaceReducer = (state: WorkspaceState, action: WorkspaceAction)
 				connectionError: null,
 			};
 
-		case "ADD_ERROR":
+		case "ADD_ERROR": {
+			const nextErrors = [
+				...state.errors,
+				{
+					...action.payload,
+					id: formatErrorId(),
+					timestamp: new Date().toISOString(),
+				},
+			];
 			return {
 				...state,
-				errors: [
-					...state.errors,
-					{
-						...action.payload,
-						id: formatErrorId(),
-						timestamp: new Date().toISOString(),
-					},
-				],
+				errors: nextErrors.length > 100 ? nextErrors.slice(-100) : nextErrors,
 			};
+		}
 
 		case "REMOVE_ERROR":
 			return {

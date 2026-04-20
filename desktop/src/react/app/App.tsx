@@ -87,6 +87,8 @@ const createDesktopQueryClient = (): QueryClient => new QueryClient({
 		queries: {
 			refetchOnWindowFocus: false,
 			retry: 1,
+			gcTime: 5 * 60 * 1000,
+			staleTime: 30 * 1000,
 		},
 	},
 });
@@ -521,11 +523,11 @@ const AppContent = (): JSX.Element => {
 	});
 	const streamTurnQuery = useQuery<StreamTurnState | null>({
 		enabled: Boolean(selectedChatId),
-		gcTime: 10 * 60 * 1000,
+		gcTime: 5 * 60 * 1000,
 		initialData: null,
 		queryFn: async () => null,
 		queryKey: queryKeys.streamTurn(selectedChatId),
-		staleTime: Number.POSITIVE_INFINITY,
+		staleTime: 0,
 	});
 	const messageWindowMode = selectedChatId ? messageWindowModeByChat[selectedChatId] ?? "latest" : "latest";
 	const hasOlderMessages = messagesQuery.hasOlderMessages;
@@ -2518,14 +2520,19 @@ const AppContent = (): JSX.Element => {
 			}
 
 			const selectedChatHasNoMessages = messagesQuery.messages.length === 0;
+			const messagesStillLoading = messagesQuery.isPending || messagesQuery.fetchStatus === "fetching";
 			const needsReplacementChat =
 				Boolean(selectedChat) &&
 				selectedChatHasNoMessages &&
+				!messagesStillLoading &&
 				isPlaceholderThreadTitle(selectedChat?.title);
-			const needsFallbackChat = !needsReplacementChat && !selectedChat;
+			// Only create a fallback when there is truly no selected chat at all (no ID either).
+			// If selectedChatId is set but the chat hasn't loaded into state/cache yet, trust the ID.
+			const needsFallbackChat = !needsReplacementChat && !selectedChat && !state.selectedChatId;
+			const optimisticChatIdBase = selectedChat?.id ?? state.selectedChatId;
 			const tempChatId = needsFallbackChat
 				? `temp-chat-${Date.now()}`
-				: (selectedChat?.id ?? null);
+				: (optimisticChatIdBase ?? null);
 			const optimisticChatId = tempChatId ?? `temp-chat-${Date.now()}`;
 			const nextMessage: MessageDTO = {
 				chatId: optimisticChatId,
@@ -2561,6 +2568,7 @@ const AppContent = (): JSX.Element => {
 			const activeChatId =
 				replacementChat?.id ??
 				selectedChat?.id ??
+				state.selectedChatId ??
 				fallbackChat?.id ??
 				null;
 
@@ -2923,10 +2931,20 @@ const AppContent = (): JSX.Element => {
 	);
 
 	const handleSelectChat = useCallback(
-		async (chatId: string) => {
-			if (chatId === state.selectedChatId) {
+		async (chatId: string, chatProjectId?: string) => {
+			const targetProjectId = chatProjectId ?? state.selectedProjectId;
+
+			if (chatId === state.selectedChatId && targetProjectId === state.selectedProjectId) {
 				setComposerFocusRequestId((current) => current + 1);
 				return;
+			}
+
+			if (targetProjectId && targetProjectId !== state.selectedProjectId) {
+				dispatch({ payload: targetProjectId, type: "SET_SELECTED_PROJECT" });
+				selectedProjectIdRef.current = targetProjectId;
+				persistedSelectedChatIdRef.current = chatId;
+				setOpeningProjectId(targetProjectId);
+				setOpeningThreadId(null);
 			}
 
 			setOpeningThreadId(chatId);
@@ -2934,7 +2952,7 @@ const AppContent = (): JSX.Element => {
 			setComposerFocusRequestId((current) => current + 1);
 			selectedChatIdRef.current = chatId;
 			persistedSelectedChatIdRef.current = chatId;
-			await persistWorkspaceSelection(state.selectedProjectId, chatId);
+			await persistWorkspaceSelection(targetProjectId ?? state.selectedProjectId, chatId);
 		},
 		[dispatch, persistWorkspaceSelection, state.selectedChatId, state.selectedProjectId],
 	);
@@ -3384,13 +3402,13 @@ const AppContent = (): JSX.Element => {
 			const currentIndex = knownChats.findIndex((chat) => chat.id === state.selectedChatId);
 			if (currentIndex === -1) {
 				const target = direction === "prev" ? knownChats[knownChats.length - 1] : knownChats[0];
-				if (target) void handleSelectChat(target.id);
+				if (target) void handleSelectChat(target.id, target.projectId);
 				return;
 			}
 			const delta = direction === "prev" ? -1 : 1;
 			const nextIndex = (currentIndex + delta + knownChats.length) % knownChats.length;
 			const next = knownChats[nextIndex];
-			if (next) void handleSelectChat(next.id);
+			if (next) void handleSelectChat(next.id, next.projectId);
 		},
 		[handleSelectChat, knownChats, state.selectedChatId],
 	);
@@ -3469,7 +3487,7 @@ const AppContent = (): JSX.Element => {
 				group: "Recent chats",
 				label: chat.title || "Untitled chat",
 				keywords: [chat.id],
-				onSelect: () => handleSelectChat(chat.id),
+				onSelect: () => handleSelectChat(chat.id, chat.projectId),
 			});
 		}
 
@@ -3784,12 +3802,12 @@ const AppContent = (): JSX.Element => {
 																								: "text-slate-300 hover:bg-white/[0.03] hover:text-slate-100",
 																						)}
                                                                                             onClick={() => {
-                                                                                                 void handleSelectChat(chat.id);
+                                                                                                 void handleSelectChat(chat.id, chat.projectId);
                                                                                             }}
                                                                                             onKeyDown={(event) => {
                                                                                                  if (event.key === "Enter" || event.key === " ") {
                                                                                                       event.preventDefault();
-                                                                                                      void handleSelectChat(chat.id);
+                                                                                                      void handleSelectChat(chat.id, chat.projectId);
                                                                                                  }
                                                                                             }}
                                                                                             role="button"
@@ -3912,7 +3930,7 @@ const AppContent = (): JSX.Element => {
 														)}
 														key={chat.id}
 														onClick={() => {
-															void handleSelectChat(chat.id);
+															void handleSelectChat(chat.id, chat.projectId);
 															setIsActiveThreadsOpen(false);
 														}}
 														type="button"

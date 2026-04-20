@@ -355,7 +355,9 @@ export class WsController {
 
 		for (const [socket, subscription] of targets.entries()) {
 			if (!subscription.ready) {
-				subscription.pendingEvents.push(event);
+				if (subscription.pendingEvents.length < 500) {
+					subscription.pendingEvents.push(event);
+				}
 				continue;
 			}
 

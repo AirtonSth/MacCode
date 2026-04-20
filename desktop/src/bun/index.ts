@@ -1,4 +1,5 @@
 import Electrobun, { ApplicationMenu, BrowserWindow, BrowserView, Updater, Utils } from "electrobun/bun";
+import { mkdir } from "node:fs/promises";
 
 import { createBackendServer } from "./server/app";
 import { serverConfig } from "./server/config";
@@ -14,10 +15,37 @@ let privateAccountServiceRef:
 	| Awaited<ReturnType<typeof createBackendServer>>["privateAccountService"]
 	| null = null;
 const electrobunEvents = (Electrobun as unknown as {
-	events?: {
-		on: (event: string, handler: (payload: { url: string }) => void | Promise<void>) => void;
-	};
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	events?: { on: (event: string, handler: (payload: any) => void) => void };
 }).events;
+
+interface WindowBounds {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+}
+
+const WINDOW_BOUNDS_DIR = `${Utils.paths.home}/.config/remotecode`;
+const WINDOW_BOUNDS_FILE = `${WINDOW_BOUNDS_DIR}/window-bounds.json`;
+
+const loadWindowBounds = async (): Promise<WindowBounds | null> => {
+	try {
+		const text = await Bun.file(WINDOW_BOUNDS_FILE).text();
+		return JSON.parse(text) as WindowBounds;
+	} catch {
+		return null;
+	}
+};
+
+const saveWindowBounds = async (bounds: WindowBounds): Promise<void> => {
+	try {
+		await mkdir(WINDOW_BOUNDS_DIR, { recursive: true });
+		await Bun.write(WINDOW_BOUNDS_FILE, JSON.stringify(bounds));
+	} catch {
+		// ignore
+	}
+};
 
 const AUTH_COMPLETE_PATH = "/auth/complete";
 
@@ -339,11 +367,12 @@ process.on("exit", () => {
 installMacShortcutsMenu();
 
 const url = await getMainViewUrl();
+const savedBounds = await loadWindowBounds();
 
 const mainWindow = new BrowserWindow({
 	titleBarStyle: "default",
 	transparent: false,
-	frame: {
+	frame: savedBounds ?? {
 		height: 700,
 		width: 1200,
 		x: 200,
@@ -354,6 +383,30 @@ const mainWindow = new BrowserWindow({
 	rpc: appRPC,
 });
 mainWindowRef = mainWindow;
+
+let currentBounds: WindowBounds = savedBounds ?? { height: 700, width: 1200, x: 200, y: 200 };
+let saveBoundsTimer: ReturnType<typeof setTimeout> | null = null;
+
+const scheduleSave = (bounds: WindowBounds): void => {
+	if (saveBoundsTimer) clearTimeout(saveBoundsTimer);
+	saveBoundsTimer = setTimeout(() => void saveWindowBounds(bounds), 500);
+};
+
+const windowEventEmitter = electrobunEvents as unknown as {
+	on: (event: string, handler: (event: { data: { id: number; x: number; y: number; width?: number; height?: number } }) => void) => void;
+};
+
+windowEventEmitter.on("resize", (event) => {
+	if (event.data.id !== mainWindow.id) return;
+	currentBounds = { x: event.data.x, y: event.data.y, width: event.data.width!, height: event.data.height! };
+	scheduleSave(currentBounds);
+});
+
+windowEventEmitter.on("move", (event) => {
+	if (event.data.id !== mainWindow.id) return;
+	currentBounds = { ...currentBounds, x: event.data.x, y: event.data.y };
+	scheduleSave(currentBounds);
+});
 
 void mainWindow;
 serverLogger.success("desktop-bootstrap", "Electrobun app started", {

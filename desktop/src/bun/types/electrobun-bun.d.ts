@@ -24,6 +24,7 @@ declare module "electrobun/bun" {
 
 	export class BrowserWindow {
 		constructor(options?: BrowserWindowConfig);
+		id: number;
 		webview: WebView;
 		close(): void;
 		focus(): void;

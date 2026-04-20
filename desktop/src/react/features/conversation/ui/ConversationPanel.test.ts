@@ -259,8 +259,8 @@ describe("[D-63/D-64] resilient conversation hydration", () => {
 	});
 
 	test("merges messages and historical turns chronologically", () => {
-		expect(source).toContain("const mergedItems = useMemo(");
-		expect(source).toContain("items.sort((a, b) => a.sortMs - b.sortMs)");
-		expect(source).toContain("mergedItems.map(");
+		expect(source).toContain("const virtualItems = useMemo(");
+		expect(source).toContain("sorted.sort((a, b) => a.sortMs - b.sortMs)");
+		expect(source).toContain("virtualizer.getVirtualItems().map(");
 	});
 });
