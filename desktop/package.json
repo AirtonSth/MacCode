@@ -1,6 +1,6 @@
 {
   "name": "remotecode-electrobun",
-  "version": "1.0.7",
+  "version": "1.0.9",
   "description": "Electrobun app with React + Vite",
   "scripts": {
     "start": "vite build && electrobun dev",
