@@ -1877,6 +1877,10 @@ const AppContent = (): JSX.Element => {
 								[event.data.chatId]: "",
 							}));
 						}
+						dispatch({
+							payload: { chatId: event.data.chatId },
+							type: "CLEAR_STREAMING",
+						});
 						clearChatSending(event.data.chatId);
 						break;
 				case "chat_updated":
@@ -3503,12 +3507,7 @@ const AppContent = (): JSX.Element => {
 						ref={layoutShellRef}
 						style={{ "--desktop-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
 						animate={shouldReduceMotion ? undefined : { opacity: 1, y: 0 }}
-						className={cn(
-							"grid min-h-0 w-full flex-1 overflow-hidden rounded-b-[14px] border-x border-b border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl",
-							isSidebarVisible
-								? "grid-cols-[var(--desktop-sidebar-width)_8px_minmax(0,1fr)] max-[920px]:grid-cols-1 max-[920px]:grid-rows-[minmax(280px,42vh)_minmax(0,1fr)]"
-								: "grid-cols-[minmax(0,1fr)]",
-							)}
+						className="flex min-h-0 w-full flex-1 overflow-hidden rounded-b-[14px] border-x border-b border-white/5 bg-[#0d0f14]/88 backdrop-blur-xl max-[920px]:flex-col"
 							initial={shouldReduceMotion ? undefined : { opacity: 0.8, y: 4 }}
 							transition={{ duration: 0.1, ease: "easeOut" }}
 						>
@@ -3520,10 +3519,22 @@ const AppContent = (): JSX.Element => {
 							/>
 						) : null}
 
-									{isSidebarVisible ? (
-							<>
+						<AnimatePresence initial={false}>
+							{isSidebarVisible && (
+							<m.div
+								key="sidebar-panel"
+								animate={{ width: sidebarWidth }}
+								className="min-w-0 shrink-0 overflow-hidden max-[920px]:!w-full max-[920px]:h-[42vh] max-[920px]:min-h-[280px]"
+								exit={{ width: 0 }}
+								initial={{ width: 0 }}
+								transition={
+									shouldReduceMotion
+										? { duration: 0 }
+										: { duration: 0.3, ease: [0.4, 0, 0.2, 1] }
+								}
+							>
 									<aside
-										className="codex-sidebar relative z-10 flex min-h-0 flex-col overflow-hidden rounded-bl-2xl px-2 py-2 max-[920px]:rounded-none"
+										className="codex-sidebar relative z-10 flex h-full min-h-0 w-full flex-col overflow-hidden rounded-bl-2xl px-2 py-2 max-[920px]:rounded-none"
 										style={{
 											background: "linear-gradient(180deg, #131722 0%, #1a1b29 34%, #2a1a31 68%, #2b1d25 100%)",
 											borderRadius: "0 0 0 16px",
@@ -3916,28 +3927,30 @@ const AppContent = (): JSX.Element => {
 								) : null}
 								<PrivateAccountSidebarFooter openExternalUrl={handleOpenExternalUrl} />
 								</aside>
-
-								<button
-									aria-label="Resize sidebar"
-									className={cn(
-										"z-20 h-full cursor-ew-resize touch-none p-0 transition-colors duration-150 max-[920px]:hidden",
-										isSidebarResizing ? "bg-white/[0.08]" : "hover:bg-white/[0.04]",
-										sidebarResizeBound === "min" ? "bg-amber-300/10" : "",
-										sidebarResizeBound === "max" ? "bg-sky-300/10" : "",
-										threadPanelBgClass,
-									)}
-									onPointerCancel={stopSidebarResize}
-									onPointerDown={startSidebarResize}
-									onPointerMove={handleSidebarResizePointerMove}
-									onPointerUp={handleSidebarResizePointerUp}
-									type="button"
-								/>
-							</>
+							</m.div>
+							)}
+						</AnimatePresence>
+						{isSidebarVisible ? (
+							<button
+								aria-label="Resize sidebar"
+								className={cn(
+									"z-20 h-full cursor-ew-resize touch-none p-0 transition-colors duration-150 max-[920px]:hidden",
+									isSidebarResizing ? "bg-white/[0.08]" : "hover:bg-white/[0.04]",
+									sidebarResizeBound === "min" ? "bg-amber-300/10" : "",
+									sidebarResizeBound === "max" ? "bg-sky-300/10" : "",
+									threadPanelBgClass,
+								)}
+								onPointerCancel={stopSidebarResize}
+								onPointerDown={startSidebarResize}
+								onPointerMove={handleSidebarResizePointerMove}
+								onPointerUp={handleSidebarResizePointerUp}
+								type="button"
+							/>
 						) : null}
 
 									<main
 										className={cn(
-											"relative z-10 flex min-h-0 flex-col",
+											"relative z-10 flex min-h-0 min-w-0 flex-1 flex-col",
 											threadPanelBgClass,
 											isThreadFocusMode && isSidebarVisible ? "shadow-[-20px_0_38px_rgba(4,7,14,0.42)]" : "",
 										)}
