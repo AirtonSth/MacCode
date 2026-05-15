@@ -150,6 +150,11 @@ public final class AppCommandRouter: CommandRouting {
         windowController?.refreshFromState()
     }
 
+    public func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws {
+        try context?.apply(.setWorkspaceDescription(id, text))
+        windowController?.refreshFromState()
+    }
+
     public func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let desc = makeSurface(type: type, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")

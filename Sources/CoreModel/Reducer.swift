@@ -3,6 +3,7 @@ import Foundation
 public enum LayoutAction: Sendable {
     case createWorkspace(name: String, cwd: String, initial: SurfaceDescriptor?)
     case renameWorkspace(WorkspaceID, String)
+    case setWorkspaceDescription(WorkspaceID, String)
     case closeWorkspace(WorkspaceID)
     case selectWorkspace(WorkspaceID)
     case addSurface(WorkspaceID, paneID: PaneID?, descriptor: SurfaceDescriptor)
@@ -81,6 +82,13 @@ public struct LayoutReducer {
         case let .renameWorkspace(wid, newName):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
             ws.name = newName; ws.updatedAt = Date(); next.workspaces[wid] = ws
+            return next
+        case let .setWorkspaceDescription(wid, text):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            if text.isEmpty { ws.metadata.removeValue(forKey: "description") }
+            else { ws.metadata["description"] = text }
+            ws.updatedAt = Date()
+            next.workspaces[wid] = ws
             return next
         case .closeWorkspace(let wid):
             guard next.workspaces[wid] != nil else { throw LayoutError.workspaceNotFound }

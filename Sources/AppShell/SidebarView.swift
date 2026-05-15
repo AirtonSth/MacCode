@@ -12,7 +12,6 @@ public final class SidebarViewModel: ObservableObject {
 
     @Published public var workspaces: [Workspace] = []
     @Published public var selectedWorkspaceID: WorkspaceID?
-    @Published public var threadsByWorkspace: [WorkspaceID: [AgentThread]] = [:]
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -24,11 +23,6 @@ public final class SidebarViewModel: ObservableObject {
         guard let ctx = context else { return }
         workspaces = ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
-        var map: [WorkspaceID: [AgentThread]] = [:]
-        for ws in workspaces {
-            map[ws.id] = (try? ctx.threadRepo.list(workspaceId: ws.id)) ?? []
-        }
-        threadsByWorkspace = map
     }
 
     public func select(_ wid: WorkspaceID) {
@@ -40,6 +34,52 @@ public final class SidebarViewModel: ObservableObject {
         panel.canChooseFiles = false; panel.canChooseDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
             _ = try? router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+        }
+    }
+
+    // MARK: cmux-style workspace editing (AppKit prompts — reliable,
+    // no SwiftUI sheet plumbing).
+
+    private func prompt(title: String, message: String, initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.stringValue = initial
+        field.placeholderString = title
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn
+            ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+    }
+
+    public func renameWorkspace(_ ws: Workspace) {
+        guard let name = prompt(title: "Rename workspace",
+                                message: "New name for “\(ws.name)”.",
+                                initial: ws.name), !name.isEmpty else { return }
+        try? router?.renameWorkspace(ws.id, name)
+    }
+
+    public func editDescription(_ ws: Workspace) {
+        let current = ws.metadata["description"] ?? ""
+        guard let text = prompt(title: "Workspace description",
+                                message: "Optional note for “\(ws.name)”.",
+                                initial: current) else { return }
+        try? router?.setWorkspaceDescription(ws.id, text)
+    }
+
+    public func removeWorkspace(_ ws: Workspace) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove “\(ws.name)”?"
+        alert.informativeText = "This removes the workspace and its tabs from RemoteCode 2. Files on disk are not touched."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            try? router?.closeWorkspace(ws.id)
         }
     }
 }
@@ -68,55 +108,59 @@ public struct SidebarRootView: View {
                              subtitle: "Press ⌘N or the + button to open a folder as a workspace.")
             } else {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.xs) {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
                         ForEach(vm.workspaces, id: \.id) { ws in
-                            workspaceSection(ws)
+                            workspaceRow(ws)
                         }
                     }.padding(DS.Space.sm)
                 }
             }
         }
-        .background(DS.Palette.surface)
+        // Subtle liquid-glass: a near-transparent tint over the
+        // NSVisualEffectView the host sits in (see SidebarView).
+        .background(DS.Palette.surface.opacity(0.55))
     }
 
     @ViewBuilder
-    private func workspaceSection(_ ws: Workspace) -> some View {
+    private func workspaceRow(_ ws: Workspace) -> some View {
         let selected = vm.selectedWorkspaceID == ws.id
-        VStack(alignment: .leading, spacing: DS.Space.xxs) {
-            Button { vm.select(ws.id) } label: {
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "folder")
-                        .font(.system(size: 11)).foregroundColor(DS.Palette.textSecondary)
+        let desc = ws.metadata["description"]
+        Button { vm.select(ws.id) } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "folder")
+                    .font(.system(size: 11))
+                    .foregroundColor(selected ? DS.Palette.accent : DS.Palette.textSecondary)
+                VStack(alignment: .leading, spacing: 1) {
                     Text(ws.name).font(DS.Font.bodyStrong)
                         .foregroundColor(DS.Palette.text).lineLimit(1)
-                    Spacer(minLength: 0)
-                    if ws.notificationsUnread > 0 {
-                        DSPill("\(ws.notificationsUnread)", tone: .accent)
+                    if let d = desc, !d.isEmpty {
+                        Text(d).font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary).lineLimit(1)
                     }
                 }
-                .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
-                .background(selected ? DS.Palette.selection : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            ForEach(vm.threadsByWorkspace[ws.id] ?? [], id: \.id) { thread in
-                HStack(spacing: DS.Space.sm) {
-                    Circle()
-                        .fill(thread.status == .running ? DS.Palette.success : DS.Palette.textTertiary)
-                        .frame(width: 5, height: 5)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(thread.title).font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary).lineLimit(1)
-                        Text("\(thread.provider.rawValue) · \(thread.model)")
-                            .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
+                Spacer(minLength: 0)
+                if ws.notificationsUnread > 0 {
+                    DSPill("\(ws.notificationsUnread)", tone: .accent)
                 }
-                .padding(.leading, DS.Space.xxl).padding(.trailing, DS.Space.md)
-                .padding(.vertical, DS.Space.xs)
             }
+            .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .fill(selected ? DS.Palette.selection : Color.white.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .strokeBorder(selected ? DS.Palette.accent.opacity(0.35) : Color.white.opacity(0.05),
+                                  lineWidth: DS.Border.hairline)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("Rename…") { vm.renameWorkspace(ws) }
+            Button("Edit description…") { vm.editDescription(ws) }
+            Divider()
+            Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
         }
     }
 }
@@ -135,8 +179,17 @@ public final class SidebarView: NSObject {
         self.viewModel = SidebarViewModel(context: context, router: router)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
+        // NSHostingView is opaque by default; let the vibrancy show.
+        h.wantsLayer = true
+        h.layer?.backgroundColor = NSColor.clear.cgColor
         self.host = h
-        let container = NSView()
+        // Subtle Liquid Glass: an under-window vibrancy material behind
+        // the translucent SwiftUI sidebar. Chrome only — per design rules
+        // glass never goes on main content.
+        let container = NSVisualEffectView()
+        container.material = .underWindowBackground
+        container.blendingMode = .behindWindow
+        container.state = .active
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(h)
         NSLayoutConstraint.activate([
