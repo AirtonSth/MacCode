@@ -39,12 +39,41 @@
   <h2 style="border:0;padding:0;margin-top:0;">TL;DR</h2>
   <ul>
     <li><span class="badge ok">build</span> <code>swift build</code> succeeds on Swift 6.3 (compiler in language mode 5), arm64 macOS 26.</li>
-    <li><span class="badge ok">tests</span> 31 XCTest cases pass (<code>DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test</code>).</li>
-    <li><span class="badge ok">app</span> <code>swift run RemoteCode2</code> launches a native window with sidebar, panes, surface tabs, command palette, and unix-socket + HTTP automation.</li>
-    <li><span class="badge ok">cli</span> <code>swift run rc2 ping</code> talks to the running app over <code>/tmp/RemoteCode2Debug.sock</code>. <span class="muted">(The CLI binary was renamed from <code>remotecode2</code> to <code>rc2</code> because macOS APFS is case-insensitive — having both <code>RemoteCode2</code> and <code>remotecode2</code> made them resolve to the same file.)</span></li>
-    <li><span class="badge warn">decisions</span> Phase 0 cards (license, layout engine, terminal engine, mobile contract) are <strong>still open for human sign-off</strong>; the implementation took the conservative default for each (clean-room, custom split tree, pipe-backed shell, loopback-only HTTP). See "Decisions I took for you" below.</li>
+    <li><span class="badge ok">tests</span> 36 XCTest cases pass (<code>DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test</code>).</li>
+    <li><span class="badge ok">app</span> <code>swift run RemoteCode2</code> launches a native window with sidebar, panes, surface tabs, command palette, and unix-socket + HTTP automation. The terminal surface uses a <strong>real PTY</strong> (forkpty via the new <code>CSystem</code> C shim), so <code>vim</code>/<code>htop</code>/<code>git log</code> behave correctly.</li>
+    <li><span class="badge ok">cli</span> <code>swift run rc2 ping</code>, <code>rc2 new-workspace --cwd PATH --name N</code>, <code>rc2 workspaces</code> all return real data over <code>/tmp/RemoteCode2Debug.sock</code>. Workspace mutations publish <code>workspace.created</code> + <code>surface.created</code> events to the in-process bus, retrievable via the <code>events.recent</code> JSON-RPC method. <span class="muted">(The CLI was renamed from <code>remotecode2</code> to <code>rc2</code> because macOS APFS is case-insensitive — having both <code>RemoteCode2</code> and <code>remotecode2</code> made them resolve to the same file.)</span></li>
+    <li><span class="badge ok">git</span> Agent App shows a live branch/+/- toolbar and a "Changed files" card pulled from the workspace's git diff (via the new <code>GitDiff</code> helper).</li>
+    <li><span class="badge ok">references</span> Both <a href="https://github.com/manaflow-ai/cmux">cmux</a> and <a href="https://github.com/pingdotgg/t3code">T3 Code</a> were cloned into <code>.references/</code> (git-ignored) and distilled into <code>project/14-reference-repos-distillation.md</code>. RemoteCode 2 takes <em>structural inspiration</em>; no source is copied. <code>THIRD_PARTY_NOTICES.md</code> records the attribution stance.</li>
+    <li><span class="badge warn">decisions</span> Phase 0 cards (cmux license, layout engine, terminal engine, mobile contract) still need explicit owner sign-off. The implementation took the conservative default for each — see "Decisions I took for you" below.</li>
     <li><span class="badge warn">release</span> No app bundle, signing, notarization, updater or installer. The shipped binaries are SwiftPM executables. Release engineering (RC2-120 → RC2-124) was deliberately not started — those need certificates and an Apple Developer account.</li>
   </ul>
+</section>
+
+<section class="card">
+  <h3 style="margin-top:0;">Smoke transcript that proves it works</h3>
+<pre>$ swift build
+Build complete!
+
+$ swift test 2&gt;&amp;1 | tail -3
+Executed 36 tests, with 0 failures (0 unexpected) in 0.85s
+
+$ .build/debug/RemoteCode2 &amp;             # launches GUI
+$ .build/debug/rc2 ping
+ts: 1778810880.27
+pong: 1
+
+$ .build/debug/rc2 --json new-workspace --cwd /tmp --name smoke
+{ "result": { "name": "smoke", "cwd": "/tmp", "id": { "value": "515764B8-..." }, ... } }
+
+$ echo '{"jsonrpc":"2.0","id":2,"method":"events.recent","params":{}}' \
+    | nc -U /tmp/RemoteCode2Debug.sock
+{ "result": { "last_seq": 1,
+              "events": [ { "kind": "workspace.created", "seq": 1, "ts": 1778810880.28,
+                            "payload": { "name": "smoke", "cwd": "/tmp", ... } } ] } }
+
+$ curl -s http://127.0.0.1:18217/v1/capabilities
+{ "agent": { "providers": [ "codex", "claude" ] }, "browser_automation": { ... },
+  "surface_types": [ "terminal", "browser", "agentApp" ] }</pre>
 </section>
 
 <h2>What ships in this pass</h2>
@@ -57,7 +86,8 @@
   <tr><td>Surfaces</td><td><code>Sources/Surfaces</code></td><td>Surface protocol, TerminalSurface (pipe-backed), BrowserSurface (WKWebView with navigate/back/forward/reload/eval/screenshot), AgentAppSurface (SwiftUI chat with thread list, provider/model picker, streaming timeline, composer).</td></tr>
   <tr><td>AppShell</td><td><code>Sources/AppShell</code></td><td>NSApplication delegate, NSWindow shell, sidebar workspace list, split-tree pane view with tabs, command router, command palette (⌘⇧K), main menu.</td></tr>
   <tr><td>RC2CLI</td><td><code>Sources/RC2CLI</code></td><td>Thin Unix-socket client. Commands: ping, capabilities, workspaces, new-workspace, new-surface, new-split, focus, close, send-text, read-text, agent {open,thread list/create,send,stop,models}.</td></tr>
-  <tr><td>Tests</td><td><code>Tests/*</code></td><td>31 XCTest cases covering: layout reducer invariants, timeline reducer, Codex+Claude parsers, fake runner end-to-end, persistence bootstrap, schema migration idempotency, snapshot round-trip, run reconciliation, dispatcher, HTTP server smoke, fixture determinism, filesystem trace.</td></tr>
+  <tr><td>Tests</td><td><code>Tests/*</code></td><td>36 XCTest cases covering: layout reducer invariants, timeline reducer, Codex+Claude parsers, fake runner end-to-end, persistence bootstrap, schema migration idempotency, snapshot round-trip, run reconciliation, dispatcher, HTTP server smoke, fixture determinism, filesystem trace, event bus replay, git diff helpers.</td></tr>
+  <tr><td>CSystem</td><td><code>Sources/CSystem</code></td><td>One-file C target exposing <code>forkpty(3)</code> and <code>ioctl(TIOCSWINSZ)</code> so Swift can spawn the user's shell with a real controlling terminal.</td></tr>
 </table>
 
 <h3>Run it</h3>
@@ -90,9 +120,9 @@ swift run rc2 new-workspace --cwd /tmp --name demo
   </tr>
   <tr>
     <td>Terminal engine (RC2-003)</td>
-    <td><strong>Pipe-backed shell</strong> (Process + Pipe), <em>not</em> a real PTY. ANSI escapes are stripped for readability.</td>
-    <td>libghostty integration requires Zig toolchain + license decision. <code>forkpty</code> isn't exposed via Swift's Darwin module without a C shim. Pipe-backed shell builds and runs immediately.</td>
-    <td>You decide on a real terminal. Replace <code>Sources/Surfaces/TerminalSurface.swift</code> with a libghostty- or SwiftTerm-backed implementation. The Surface protocol won't need to change.</td>
+    <td><strong>Real PTY via <code>forkpty(3)</code></strong>. A small C shim (<code>Sources/CSystem</code>) exposes <code>forkpty</code> and <code>ioctl(TIOCSWINSZ)</code>; the terminal surface spawns the user's login shell as a child of the master fd. ANSI escapes are stripped on the way to NSTextView for readability — the raw bytes still flow back to the master.</td>
+    <td>libghostty/Ghostty integration requires the Zig toolchain plus a cmux license decision. Real PTY via the OS gets us interactive behavior today without either.</td>
+    <td>You want libghostty-quality rendering (true-color, glyph atlas, sixel, ligatures). Replace <code>TerminalSurface</code>'s NSTextView with a Ghostty-backed renderer. The Surface protocol stays as-is.</td>
   </tr>
   <tr>
     <td>Provider interface (RC2-004)</td>
@@ -128,7 +158,7 @@ swift run rc2 new-workspace --cwd /tmp --name demo
 
 <h2>Things you should know to use the result safely</h2>
 <ul>
-  <li>The pipe-backed terminal surface is fine for line-oriented work (<code>git status</code>, <code>ls</code>, the Codex/Claude CLIs running with <code>--json</code>/<code>--print</code>), but anything that requires a TTY (htop, vim, ncurses anything) will misbehave. Replace before relying on it.</li>
+  <li>The terminal surface now uses a real PTY (<code>forkpty</code>) so interactive programs work. The shim is in <code>Sources/CSystem</code>. ANSI rendering is still minimal (escapes stripped) — full ANSI support is the next step.</li>
   <li><code>swift run RemoteCode2</code> places state under <code>~/Library/Application Support/RemoteCode2Debug/</code>. Channels are isolated; the debug, canary and stable channels never share data. Override via <code>RC2_APP_SUPPORT</code>, <code>RC2_DB_PATH</code>, <code>RC2_CHANNEL</code>.</li>
   <li>The Unix socket lives at <code>/tmp/RemoteCode2{Debug,Canary}.sock</code> with mode 0600. Only your user can connect.</li>
   <li>DirectHTTPServer binds <code>127.0.0.1:18217</code> by default and refuses anything else until <code>settings.remote_access_enabled = "1"</code>. Even then, there is <strong>no auth yet</strong> — pairing/device trust (RC2-024) is unimplemented. Leave remote access off until that lands.</li>
@@ -142,7 +172,7 @@ swift run rc2 new-workspace --cwd /tmp --name demo
   <tr><th>Gate</th><th>Status</th><th>Command</th></tr>
   <tr><td>./scripts/bootstrap</td><td><span class="ok">passes</span></td><td><code>./scripts/bootstrap.sh</code></td></tr>
   <tr><td>./scripts/build-debug</td><td><span class="ok">passes</span></td><td><code>./scripts/build-debug.sh</code></td></tr>
-  <tr><td>./scripts/test-unit</td><td><span class="ok">31/31 pass</span></td><td><code>./scripts/test-unit.sh</code></td></tr>
+  <tr><td>./scripts/test-unit</td><td><span class="ok">36/36 pass</span></td><td><code>./scripts/test-unit.sh</code></td></tr>
   <tr><td>./scripts/test-integration</td><td><span class="warn">not provided</span></td><td>Covered indirectly by HTTP server + dispatcher tests; no end-to-end socket CLI integration script yet.</td></tr>
   <tr><td>./scripts/test-ui</td><td><span class="bad">missing</span></td><td>No XCUITest target; planned. UI today is exercised through the AgentAppViewModel unit tests + manual launch.</td></tr>
   <tr><td>./scripts/test-visual</td><td><span class="bad">missing</span></td><td>Visual parity to T3 Code is a separate effort.</td></tr>
@@ -188,13 +218,13 @@ notification.create, notification.list, notification.dismiss
 
 <h2>What I would do next if I had another night</h2>
 <ol>
-  <li><strong>Real PTY terminal.</strong> Add a small <code>CSystem</code> SwiftPM target that imports <code>&lt;util.h&gt;</code> so <code>forkpty</code> is callable; wire it into <code>TerminalSurface</code>, then resurrect copy/paste, resize, and selection. Track in RC2-030 + RC2-031.</li>
+  <li><strong>Full ANSI rendering in the terminal surface.</strong> Real PTY landed this pass; the renderer still strips escape sequences. Plug in a small ANSI parser or, with a license decision, the cmux Ghostty integration.</li>
   <li><strong>Pairing + device trust.</strong> Implement RC2-024: per-device tokens stored in Keychain, expiring pairing codes, rate-limited auth, audit log. Required before flipping <code>remote_access_enabled</code>.</li>
-  <li><strong>Command bus + event log (RC2-025).</strong> Today the dispatcher and AgentRunCoordinator emit no replayable events; the <code>events</code> table is empty. Add envelope writes + a WebSocket replay endpoint.</li>
-  <li><strong>T3 Code visual audit (RC2-006/094).</strong> When you have T3 Code source, port the design tokens, sidebar density, header layout, diff panel, terminal drawer. The structural slots in <code>AgentAppSurface</code> are ready for them.</li>
+  <li><strong>Persisted command/event log (RC2-025).</strong> In-process <code>EventBus</code> ships with backlog replay. The next step is writing each event into the <code>events</code> SQLite table and exposing a WebSocket <code>/v1/ws</code> endpoint that streams from <code>last_seq</code> on reconnect.</li>
+  <li><strong>T3 Code visual audit (RC2-006/094).</strong> Now that <code>.references/t3code/</code> is local, port the design tokens, sidebar density, header layout, diff panel, terminal drawer. The structural slots in <code>AgentAppSurface</code> are ready for them.</li>
   <li><strong>Browser P1 (click/fill/type/wait/snapshot).</strong> Add a <code>WKUserContentController</code>-based DOM serializer and stable element refs. The dispatcher already routes them; just unblock the handlers.</li>
   <li><strong>Xcode project + signing.</strong> Wrap the SwiftPM modules in an <code>.app</code> target, add Info.plist + entitlements + hardened runtime, set up Sparkle. Required for Phase 9.</li>
-  <li><strong>Conformance isolation cleanup.</strong> <code>AppCommandRouter</code> uses <code>@preconcurrency CommandRouting</code> to bridge the main actor across an actor-isolated protocol. The proper fix is to make <code>CommandRouting</code> itself @MainActor or async; revisit once strict concurrency is on.</li>
+  <li><strong>Markdown / file-preview surfaces (RC2 cmux parity).</strong> Models are already in the SurfaceType enum and dispatcher; UI implementations are stubs.</li>
 </ol>
 
 <h2>Files of interest</h2>
