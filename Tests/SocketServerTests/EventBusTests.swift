@@ -26,6 +26,7 @@ final class EventBusTests: XCTestCase {
         XCTAssertEqual(received.map(\.kind), ["c"])
     }
 
+    @MainActor
     func test_dispatcher_eventsRecent_returnsBus() async {
         // publish to shared bus then query
         EventBus.shared.publish(kind: "test.kind", payload: .string("hello"))

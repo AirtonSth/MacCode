@@ -4,6 +4,7 @@ import CoreModel
 import Persistence
 import AgentRuntime
 
+@MainActor
 final class FakeRouter: CommandRouting {
     var workspaces: [Workspace] = []
     var window = AppWindow()
@@ -50,6 +51,7 @@ final class FakeRouter: CommandRouting {
 }
 
 final class DispatcherTests: XCTestCase {
+    @MainActor
     func test_ping_returnsPong() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.ping", params: nil))
@@ -57,6 +59,7 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(o["pong"], .bool(true))
     }
 
+    @MainActor
     func test_capabilities_listsRemoteCode2() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil))
@@ -64,6 +67,7 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(o["app"], .string("remotecode2"))
     }
 
+    @MainActor
     func test_methodNotFound_returnsError() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "does.not.exist", params: nil))
@@ -71,12 +75,14 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(resp.error?.code, -32601)
     }
 
+    @MainActor
     func test_unsupportedDeferredMethod_returnsTypedError() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "browser.click", params: nil))
         XCTAssertEqual(resp.error?.code, -32004)
     }
 
+    @MainActor
     func test_createWorkspace_returnsWorkspace() async {
         let router = FakeRouter()
         let d = JSONRPCDispatcher(router: router)

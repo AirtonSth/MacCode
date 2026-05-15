@@ -2,6 +2,7 @@ import XCTest
 @testable import SocketServer
 
 final class HTTPServerTests: XCTestCase {
+    @MainActor
     func test_health_and_discovery_loopback() throws {
         let port = UInt16.random(in: 33000...44000)
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())

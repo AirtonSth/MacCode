@@ -3,6 +3,7 @@ import CoreModel
 import Persistence
 import AgentRuntime
 
+@MainActor
 public protocol CommandRouting: AnyObject {
     // window/workspace/pane/surface
     func listWorkspaces() throws -> [Workspace]
@@ -34,6 +35,7 @@ public protocol CommandRouting: AnyObject {
     func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String
 }
 
+@MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
     public init(router: CommandRouting) { self.router = router }

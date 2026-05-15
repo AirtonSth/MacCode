@@ -126,6 +126,7 @@ public final class SidebarView: NSObject, NSTableViewDataSource, NSTableViewDele
         let row = tableView.selectedRow
         guard let ctx = context, row >= 0, row < ctx.state.window.workspaces.count else { return }
         let wid = ctx.state.window.workspaces[row]
+        if ctx.state.window.selectedWorkspaceID == wid { return } // avoid re-entrant refresh cycle
         try? router?.selectWorkspace(wid)
     }
 }

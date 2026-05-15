@@ -3,7 +3,7 @@ import Darwin
 
 public final class UnixSocketServer: @unchecked Sendable {
     public let socketPath: String
-    private let dispatcher: JSONRPCDispatcher
+    nonisolated(unsafe) private let dispatcher: JSONRPCDispatcher
     private var listenFD: Int32 = -1
     private var acceptThread: Thread?
     private var running = false
@@ -105,14 +105,24 @@ public final class UnixSocketServer: @unchecked Sendable {
         do {
             let req = try decoder.decode(JSONRPCRequest.self, from: lineData)
             let semaphore = DispatchSemaphore(value: 0)
-            var captured: JSONRPCResponse?
-            Task {
-                let resp = await self.dispatcher.dispatch(req)
-                captured = resp
-                semaphore.signal()
+            final class Slot: @unchecked Sendable { var value: JSONRPCResponse? }
+            let slot = Slot()
+            // The CommandRouting conformance is @preconcurrency, so the
+            // compiler will not insert an actor hop when the dispatcher
+            // calls a main-actor method. We hop to the main thread
+            // ourselves before dispatching, and inherit that thread into
+            // the Task so any synchronous calls into AppKit/SwiftUI
+            // happen on the main thread.
+            DispatchQueue.main.async {
+                let task = Task { @MainActor in
+                    let resp = await self.dispatcher.dispatch(req)
+                    slot.value = resp
+                    semaphore.signal()
+                }
+                _ = task // silence unused warning
             }
             semaphore.wait()
-            if let resp = captured {
+            if let resp = slot.value {
                 write(fd: fd, response: resp)
             }
         } catch {

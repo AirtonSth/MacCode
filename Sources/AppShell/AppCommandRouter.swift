@@ -9,7 +9,7 @@ import Surfaces
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: @preconcurrency CommandRouting {
+public final class AppCommandRouter: CommandRouting {
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
 
