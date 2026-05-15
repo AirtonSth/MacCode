@@ -13,6 +13,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     private let backButton = NSButton()
     private let forwardButton = NSButton()
     private let reloadButton = NSButton()
+    private var googleLegacyLayoutReloads = Set<String>()
 
     public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
         self.descriptor = SurfaceDescriptor(
@@ -25,6 +26,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = WKWebsiteDataStore.default()
         let wv = WKWebView(frame: .zero, configuration: cfg)
+        wv.customUserAgent = Self.currentSafariUserAgent()
         self.webView = wv
 
         let tf = NSTextField()
@@ -114,6 +116,40 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     public func navigate(to url: URL) {
         addressBar.stringValue = url.absoluteString
         webView.load(URLRequest(url: url))
+        if Self.isGoogleHost(url.host) {
+            scheduleGoogleLegacyLayoutRefresh(for: url.absoluteString)
+        }
+    }
+
+    static func safariLikeUserAgent(safariVersion: String) -> String {
+        let osToken = "10_15_7"
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X \(osToken)) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(safariVersion) Safari/605.1.15"
+    }
+
+    static func isGoogleHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        return host == "google.com" || host.hasSuffix(".google.com")
+    }
+
+    private static func currentSafariUserAgent() -> String {
+        safariLikeUserAgent(
+            safariVersion: installedSafariVersion() ?? "17.0"
+        )
+    }
+
+    private static func installedSafariVersion() -> String? {
+        let paths = [
+            "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app",
+            "/Applications/Safari.app"
+        ]
+        for path in paths {
+            if let bundle = Bundle(path: path),
+               let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+               !version.isEmpty {
+                return version
+            }
+        }
+        return nil
     }
 
     public func navigate(string: String) -> Bool {
@@ -294,6 +330,37 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         if let url = webView.url { addressBar.stringValue = url.absoluteString }
         if let title = webView.title, !title.isEmpty {
             descriptor.title = title
+        }
+        reloadGoogleOnceAfterClearingLegacyLayoutCookie()
+    }
+
+    private func scheduleGoogleLegacyLayoutRefresh(for key: String) {
+        guard !googleLegacyLayoutReloads.contains(key) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self,
+                  self.webView.url?.absoluteString == key,
+                  !self.googleLegacyLayoutReloads.contains(key) else { return }
+            self.expireGoogleLegacyLayoutCookieAndReload(key: key)
+        }
+    }
+
+    private func reloadGoogleOnceAfterClearingLegacyLayoutCookie() {
+        guard let url = webView.url, Self.isGoogleHost(url.host) else { return }
+        let key = url.absoluteString
+        guard !googleLegacyLayoutReloads.contains(key) else { return }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.webView.url?.absoluteString == key else { return }
+            self.expireGoogleLegacyLayoutCookieAndReload(key: key)
+        }
+    }
+
+    private func expireGoogleLegacyLayoutCookieAndReload(key: String) {
+        let js = "document.cookie='__Secure-STRP=; Max-Age=0; path=/; domain=.google.com; Secure'"
+        evaluate(js) { [weak self] _, _ in
+            guard let self, self.webView.url?.absoluteString == key else { return }
+            self.googleLegacyLayoutReloads.insert(key)
+            self.webView.reload()
         }
     }
 
