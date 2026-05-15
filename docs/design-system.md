@@ -79,7 +79,7 @@ Within the SKILL 150–300ms window; ease-out for entrances.
 | Screen / surface | File | Treatment |
 |------------------|------|-----------|
 | Workspace sidebar | `AppShell/SidebarView.swift` | App-identity bar, workspace rows with folder glyph + unread pill, indented thread rows with status dot, empty state. |
-| Pane tab strip + toolbar | `AppShell/PaneTabsView.swift` | `surface` toolbar, flat token buttons, 1px divider, `bg` content, styled missing-surface placeholder. |
+| Pane tab strip + toolbar | `AppShell/PaneTabsView.swift` | `surface` toolbar with a single **+** pull-down (Terminal/Browser/Agent App/Diff/Markdown/File Preview) and a **Split** pull-down (Horizontal → / Vertical ↓ submenus, each offering every surface type), 1px divider, `bg` content, styled missing-surface placeholder. |
 | Agent App | `Surfaces/AgentAppSurface.swift` | Header bar (provider/model/mode pickers, drawer/plan toggles, status pill), branch toolbar, message cards (user vs AI accent), item rows with type pill, changed-files panel, plan sidebar, terminal drawer, composer with placeholder + ⌘↩ hint + primary Send. |
 | Diff panel | `Surfaces/DiffPanelSurface.swift` | File list with status glyphs + selection, toggle bar, tinted patch body (success/danger/accent/warning), empty states. |
 | Feed | `Surfaces/FeedSurface.swift` | Header + token filter field, kind-toned pills, bordered event rows, empty state. |

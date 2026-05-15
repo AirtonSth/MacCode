@@ -47,6 +47,35 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(updated.layout.paneIDs().count, 2)
     }
 
+    func test_splitHorizontal_and_splitVertical_orientations() throws {
+        let (ctx, router) = try makeContext()
+        // Horizontal split → side-by-side (orientation .horizontal)
+        let ws1 = try router.createWorkspace(name: "h", cwd: NSTemporaryDirectory())
+        guard case .pane(let p1) = ws1.layout else { return XCTFail() }
+        let v1 = PaneTabsView(pane: p1, router: router)
+        XCTAssertNotNil(v1.performAdd(.terminal, title: "t"))
+        XCTAssertNotNil(v1.performSplit(.right, type: .agentApp, title: "Agent App"))
+        guard case .split(let sH) = ctx.state.workspaces[ws1.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(sH.orientation, .horizontal)
+
+        // Vertical split → stacked (orientation .vertical)
+        let ws2 = try router.createWorkspace(name: "v", cwd: NSTemporaryDirectory())
+        guard case .pane(let p2) = ws2.layout else { return XCTFail() }
+        let v2 = PaneTabsView(pane: p2, router: router)
+        XCTAssertNotNil(v2.performAdd(.terminal, title: "t"))
+        XCTAssertNotNil(v2.performSplit(.down, type: .agentApp, title: "Agent App"))
+        guard case .split(let sV) = ctx.state.workspaces[ws2.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(sV.orientation, .vertical)
+    }
+
+    func test_surfaceChoices_haveSixDistinctTypes() {
+        let types = PaneTabsView.surfaceChoices.map { $0.1 }
+        XCTAssertEqual(Set(types).count, types.count)
+        XCTAssertTrue(types.contains(.terminal))
+        XCTAssertTrue(types.contains(.browser))
+        XCTAssertTrue(types.contains(.agentApp))
+    }
+
     func test_buttons_noop_without_workspace() throws {
         let (_, router) = try makeContext()
         // No workspace selected.

@@ -64,29 +64,33 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
             }
         }
 
-        // Toolbar for + surface buttons — token-styled flat buttons.
-        func mkButton(_ title: String, _ sel: Selector) -> NSButton {
-            let b = NSButton(title: title, target: self, action: sel)
-            b.isBordered = false
-            b.bezelStyle = .inline
-            b.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-            b.contentTintColor = DS.NS.textSecondary
-            b.wantsLayer = true
-            b.layer?.cornerRadius = DS.Radius.control
-            b.layer?.backgroundColor = DS.NS.surfaceRaised.cgColor
-            let attr = NSMutableAttributedString(string: title, attributes: [
-                .foregroundColor: DS.NS.textSecondary,
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium)
-            ])
-            b.attributedTitle = attr
-            return b
+        // Single "+" pull-down to add a surface to this pane, and a
+        // "Split" pull-down with Horizontal / Vertical submenus.
+        let addPopup = Self.makePullDown(title: "+")
+        addPopup.menu?.addItem(.separator())
+        for (label, type) in Self.surfaceChoices {
+            let it = NSMenuItem(title: label, action: #selector(addFromMenu(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = type.rawValue
+            addPopup.menu?.addItem(it)
         }
-        let addTerminal = mkButton("+ Term", #selector(addTerminal))
-        let addBrowser = mkButton("+ Browser", #selector(addBrowser))
-        let addAgent = mkButton("+ Agent", #selector(addAgent))
-        let splitRight = mkButton("⇥ Split", #selector(splitRight))
 
-        let toolbar = NSStackView(views: [addTerminal, addBrowser, addAgent, NSView(), splitRight])
+        let splitPopup = Self.makePullDown(title: "Split")
+        splitPopup.menu?.addItem(.separator())
+        for (dirLabel, dir) in [("Horizontal  →", "right"), ("Vertical  ↓", "down")] {
+            let parent = NSMenuItem(title: dirLabel, action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for (label, type) in Self.surfaceChoices {
+                let it = NSMenuItem(title: label, action: #selector(splitFromMenu(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = "\(dir)|\(type.rawValue)"
+                sub.addItem(it)
+            }
+            parent.submenu = sub
+            splitPopup.menu?.addItem(parent)
+        }
+
+        let toolbar = NSStackView(views: [addPopup, splitPopup, NSView()])
         toolbar.orientation = .horizontal
         toolbar.spacing = DS.Space.md
         toolbar.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
@@ -129,10 +133,47 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
         router?.context?.state.window.selectedWorkspaceID
     }
 
-    @objc private func addTerminal() { performAdd(.terminal, title: "terminal") }
-    @objc private func addBrowser() { performAdd(.browser, title: "browser") }
-    @objc private func addAgent() { performAdd(.agentApp, title: "Agent App") }
-    @objc private func splitRight() { performSplit(.right, type: .agentApp, title: "Agent App") }
+    /// Surfaces offered by the + and Split menus, in display order.
+    static let surfaceChoices: [(String, SurfaceType)] = [
+        ("Terminal", .terminal),
+        ("Browser", .browser),
+        ("Agent App", .agentApp),
+        ("Diff Panel", .rightSidebarTool),
+        ("Markdown", .markdown),
+        ("File Preview", .filePreview)
+    ]
+
+    private static func title(for type: SurfaceType) -> String {
+        surfaceChoices.first(where: { $0.1 == type })?.0 ?? type.rawValue
+    }
+
+    /// A token-styled pull-down NSPopUpButton whose first (index 0) item
+    /// is the always-visible label.
+    private static func makePullDown(title: String) -> NSPopUpButton {
+        let p = NSPopUpButton(frame: .zero, pullsDown: true)
+        p.translatesAutoresizingMaskIntoConstraints = false
+        p.bezelStyle = .texturedRounded
+        p.controlSize = .small
+        p.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let head = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        p.menu?.addItem(head)
+        return p
+    }
+
+    @objc private func addFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let type = SurfaceType(rawValue: raw) else { return }
+        performAdd(type, title: Self.title(for: type))
+    }
+
+    @objc private func splitFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        let parts = raw.split(separator: "|")
+        guard parts.count == 2,
+              let dir = SplitDirection(rawValue: String(parts[0])),
+              let type = SurfaceType(rawValue: String(parts[1])) else { return }
+        performSplit(dir, type: type, title: Self.title(for: type))
+    }
 
     /// Testable seam shared by the @objc button handlers.
     @discardableResult
