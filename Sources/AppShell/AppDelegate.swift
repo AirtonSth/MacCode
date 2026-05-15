@@ -37,6 +37,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         router = AppCommandRouter(context: context)
         context.router = router
+
+        // Wire EventBus to the persisted event log so events survive restart.
+        let log = context.eventLog
+        EventBus.shared.persister = { ev in
+            let payloadData = (try? JSONEncoder().encode(ev.payload)) ?? Data("null".utf8)
+            let json = String(data: payloadData, encoding: .utf8) ?? "null"
+            _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
+        }
+        if let rows = try? log.read(since: 0, limit: 256) {
+            let events = rows.compactMap { row -> EventBus.Event? in
+                guard let data = row.payloadJSON.data(using: .utf8),
+                      let val = try? JSONDecoder().decode(JSONValue.self, from: data)
+                else { return nil }
+                return EventBus.Event(seq: row.seq, kind: row.kind, payload: val, ts: Date().timeIntervalSince1970)
+            }
+            EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
+        }
         windowController = MainWindowController(context: context, router: router)
         router.windowController = windowController
 

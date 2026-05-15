@@ -83,7 +83,11 @@ public final class UnixSocketServer: @unchecked Sendable {
     }
 
     private func handleClient(fd: Int32) {
-        defer { close(fd) }
+        var streamSubID: UUID?
+        defer {
+            if let s = streamSubID { EventBus.shared.unsubscribe(s) }
+            close(fd)
+        }
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while running {
@@ -95,6 +99,30 @@ public final class UnixSocketServer: @unchecked Sendable {
                 let lineData = buffer.subdata(in: buffer.startIndex..<nlIdx)
                 buffer.removeSubrange(buffer.startIndex...nlIdx)
                 if lineData.isEmpty { continue }
+                // Special-case events.stream so this connection becomes a
+                // long-lived event feed instead of a single request/response.
+                if let req = try? JSONDecoder().decode(JSONRPCRequest.self, from: lineData),
+                   req.method == "events.stream" {
+                    let since: Int64 = req.params?["after_seq"]?.intValue.map(Int64.init) ?? 0
+                    let id = EventBus.shared.subscribe(since: since) { [weak self] ev in
+                        guard let self else { return }
+                        let payload: [String: JSONValue] = [
+                            "seq": .number(Double(ev.seq)),
+                            "kind": .string(ev.kind),
+                            "ts": .number(ev.ts),
+                            "payload": ev.payload
+                        ]
+                        let resp = JSONRPCResponse(id: req.id, result: .object(payload))
+                        self.write(fd: fd, response: resp)
+                    }
+                    streamSubID = id
+                    // ack
+                    let ack = JSONRPCResponse(id: req.id, result: .object([
+                        "subscribed": .bool(true)
+                    ]))
+                    write(fd: fd, response: ack)
+                    continue
+                }
                 respond(fd: fd, lineData: lineData)
             }
         }

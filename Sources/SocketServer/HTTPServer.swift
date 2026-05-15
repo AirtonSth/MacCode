@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 /// Minimal HTTP/1.1 + WebSocket-stub server used as the desktop-side
 /// foundation for a future direct-VPN/LAN mobile client. The intent is
@@ -75,14 +76,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func handle(fd: Int32) {
-        defer { close(fd) }
+        var subID: UUID?
+        defer {
+            if let s = subID { EventBus.shared.unsubscribe(s) }
+            close(fd)
+        }
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while running {
             let n = read(fd, &tmp, tmp.count)
             if n <= 0 { return }
             buffer.append(tmp, count: n)
-            // crude: wait for blank line
             if buffer.range(of: Data("\r\n\r\n".utf8)) != nil { break }
         }
         guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else { return }
@@ -94,6 +98,39 @@ public final class DirectHTTPServer: @unchecked Sendable {
         guard parts.count >= 2 else { return }
         let method = String(parts[0])
         let path = String(parts[1])
+
+        // Parse headers
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            if let r = line.range(of: ":") {
+                let k = String(line[..<r.lowerBound]).lowercased().trimmingCharacters(in: .whitespaces)
+                let v = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                headers[k] = v
+            }
+        }
+
+        // WebSocket upgrade
+        if method == "GET", path == "/v1/ws",
+           headers["upgrade"]?.lowercased() == "websocket",
+           let key = headers["sec-websocket-key"] {
+            performWSHandshake(fd: fd, key: key)
+            // bind subscription
+            let id = EventBus.shared.subscribe(since: 0) { [weak self] ev in
+                guard let self else { return }
+                let obj: [String: Any] = [
+                    "seq": ev.seq,
+                    "kind": ev.kind,
+                    "ts": ev.ts,
+                    "payload": Self.jsonValueToAny(ev.payload)
+                ]
+                guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+                self.sendWSText(fd: fd, data: data)
+            }
+            subID = id
+            // keep connection open; read incoming frames (ping/pong/close)
+            wsServeLoop(fd: fd)
+            return
+        }
 
         switch (method, path) {
         case ("GET", "/healthz"):
@@ -140,6 +177,127 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func reasonPhrase(_ s: Int) -> String {
-        switch s { case 200: return "OK"; case 404: return "Not Found"; default: return "OK" }
+        switch s { case 200: return "OK"; case 404: return "Not Found"; case 101: return "Switching Protocols"; default: return "OK" }
+    }
+
+    // MARK: WebSocket
+
+    private static let wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    private func performWSHandshake(fd: Int32, key: String) {
+        let toHash = key + Self.wsGUID
+        let digest = Insecure.SHA1.hash(data: Data(toHash.utf8))
+        let accept = Data(digest).base64EncodedString()
+        let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n"
+        let data = Data(head.utf8)
+        data.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, data.count) }
+    }
+
+    private func sendWSText(fd: Int32, data: Data) {
+        // server frames are unmasked
+        var frame = Data()
+        frame.append(0x81) // FIN + text
+        let len = data.count
+        if len <= 125 {
+            frame.append(UInt8(len))
+        } else if len <= 0xFFFF {
+            frame.append(126)
+            frame.append(UInt8(len >> 8)); frame.append(UInt8(len & 0xFF))
+        } else {
+            frame.append(127)
+            for shift in stride(from: 56, through: 0, by: -8) {
+                frame.append(UInt8((len >> shift) & 0xFF))
+            }
+        }
+        frame.append(data)
+        frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
+    }
+
+    private func wsServeLoop(fd: Int32) {
+        var buf = Data()
+        var tmp = [UInt8](repeating: 0, count: 4096)
+        while running {
+            let n = read(fd, &tmp, tmp.count)
+            if n <= 0 { return }
+            buf.append(tmp, count: n)
+            while let (frame, consumed) = parseClientFrame(buf) {
+                buf.removeFirst(consumed)
+                switch frame.opcode {
+                case 0x8: // close
+                    sendCloseFrame(fd: fd); return
+                case 0x9: // ping -> pong
+                    sendPongFrame(fd: fd, payload: frame.payload)
+                case 0xA: // pong
+                    continue
+                case 0x1, 0x2:
+                    continue // client text/binary -- ignore for now
+                default: continue
+                }
+            }
+        }
+    }
+
+    private struct WSFrame { let opcode: UInt8; let payload: Data }
+
+    private func parseClientFrame(_ buf: Data) -> (WSFrame, Int)? {
+        guard buf.count >= 2 else { return nil }
+        let b0 = buf[buf.startIndex]
+        let b1 = buf[buf.index(buf.startIndex, offsetBy: 1)]
+        let opcode = b0 & 0x0F
+        let masked = (b1 & 0x80) != 0
+        var len = Int(b1 & 0x7F)
+        var idx = 2
+        if len == 126 {
+            guard buf.count >= 4 else { return nil }
+            len = (Int(buf[buf.index(buf.startIndex, offsetBy: 2)]) << 8) | Int(buf[buf.index(buf.startIndex, offsetBy: 3)])
+            idx = 4
+        } else if len == 127 {
+            guard buf.count >= 10 else { return nil }
+            len = 0
+            for i in 0..<8 { len = (len << 8) | Int(buf[buf.index(buf.startIndex, offsetBy: 2 + i)]) }
+            idx = 10
+        }
+        var maskKey: [UInt8] = [0, 0, 0, 0]
+        if masked {
+            guard buf.count >= idx + 4 else { return nil }
+            for i in 0..<4 { maskKey[i] = buf[buf.index(buf.startIndex, offsetBy: idx + i)] }
+            idx += 4
+        }
+        guard buf.count >= idx + len else { return nil }
+        var payload = Data(count: len)
+        for i in 0..<len {
+            let b = buf[buf.index(buf.startIndex, offsetBy: idx + i)]
+            payload[i] = masked ? (b ^ maskKey[i % 4]) : b
+        }
+        return (WSFrame(opcode: opcode, payload: payload), idx + len)
+    }
+
+    private func sendPongFrame(fd: Int32, payload: Data) {
+        var frame = Data()
+        frame.append(0x8A) // FIN + pong
+        frame.append(UInt8(payload.count))
+        frame.append(payload)
+        frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
+    }
+
+    private func sendCloseFrame(fd: Int32) {
+        var frame = Data()
+        frame.append(0x88) // FIN + close
+        frame.append(0x00) // empty payload
+        frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
+    }
+
+    static func jsonValueToAny(_ v: JSONValue) -> Any {
+        switch v {
+        case .null: return NSNull()
+        case .bool(let b): return b
+        case .number(let n): return n
+        case .string(let s): return s
+        case .array(let a): return a.map(jsonValueToAny)
+        case .object(let o):
+            var out: [String: Any] = [:]
+            for (k, vv) in o { out[k] = jsonValueToAny(vv) }
+            return out
+        }
     }
 }

@@ -16,6 +16,7 @@ public final class AppContext {
     public let runRepo: AgentRunRepository
     public let snapshotRepo: SessionSnapshotRepository
     public let settingsRepo: SettingsRepository
+    public let eventLog: EventLogRepository
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()
@@ -36,6 +37,7 @@ public final class AppContext {
         self.runRepo = AgentRunRepository(db: db)
         self.snapshotRepo = SessionSnapshotRepository(db: db)
         self.settingsRepo = SettingsRepository(db: db)
+        self.eventLog = EventLogRepository(db: db)
         let codex = CodexRunner()
         let claude = ClaudeRunner()
         self.coordinator = AgentRunCoordinator(
