@@ -108,7 +108,8 @@ public struct SidebarRootView: View {
             if vm.workspaces.isEmpty {
                 DSEmptyState(icon: "folder.badge.plus",
                              title: "No workspaces",
-                             subtitle: "Press ⌘N or the + button to open a folder as a workspace.")
+                             subtitle: "Press ⌘N or the + button to open a folder as a workspace.",
+                             opaque: false)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
@@ -183,9 +184,11 @@ public final class SidebarView: NSObject {
         self.viewModel = SidebarViewModel(context: context, router: router)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
-        // NSHostingView is opaque by default; let the vibrancy show.
+        // NSHostingView is opaque by default; force it transparent so
+        // the behind-window vibrancy (and the blurred desktop) shows.
         h.wantsLayer = true
         h.layer?.backgroundColor = NSColor.clear.cgColor
+        h.layer?.isOpaque = false
         self.host = h
         // Subtle Liquid Glass: an under-window vibrancy material behind
         // the translucent SwiftUI sidebar. Chrome only — per design rules

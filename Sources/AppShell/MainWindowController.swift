@@ -12,7 +12,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private let sidebar: SidebarView
     private let workspaceContainer = NSView()
-    private let split = NSSplitView()
+    private let split = TransparentSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
     /// Retains the live pane controllers; their @objc button and tab
     /// targets die with them, so they must outlive a layout rebuild.
@@ -222,6 +222,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 /// [0.5, 0.5], so each new pane is exactly half the old pane's width
 /// (vertical divider) or height (horizontal divider). Ratios are kept
 /// on live resize too.
+/// NSSplitView paints an opaque background in dark Aqua, which would sit
+/// behind the sidebar's behind-window vibrancy and block the desktop
+/// blur. This subclass draws nothing and reports non-opaque so the
+/// sidebar's NSVisualEffectView can actually see the desktop.
+final class TransparentSplitView: NSSplitView {
+    override var isOpaque: Bool { false }
+    override func drawDivider(in rect: NSRect) {
+        DS.NS.line.withAlphaComponent(0.5).setFill()
+        rect.fill()
+    }
+    override func draw(_ dirtyRect: NSRect) { /* no background */ }
+}
+
 final class RatioSplitView: NSSplitView {
     var ratios: [CGFloat] = []
 

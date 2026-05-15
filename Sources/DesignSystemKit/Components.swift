@@ -159,8 +159,9 @@ public struct DSEmptyState: View {
     let icon: String
     let title: String
     let subtitle: String
-    public init(icon: String, title: String, subtitle: String) {
-        self.icon = icon; self.title = title; self.subtitle = subtitle
+    let opaque: Bool
+    public init(icon: String, title: String, subtitle: String, opaque: Bool = true) {
+        self.icon = icon; self.title = title; self.subtitle = subtitle; self.opaque = opaque
     }
     public var body: some View {
         VStack(spacing: DS.Space.lg) {
@@ -175,6 +176,6 @@ public struct DSEmptyState: View {
                 .frame(maxWidth: 360)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(DS.Palette.bg)
+        .background(opaque ? AnyView(DS.Palette.bg) : AnyView(Color.clear))
     }
 }
