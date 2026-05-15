@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CoreModel
 import Surfaces
+import AgentRuntime
 import DesignSystemKit
 
 public struct PaletteCommand {
@@ -117,6 +118,59 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             cmds.append(PaletteCommand(id: "surface.new.agent", title: "New Agent App Surface", subtitle: "In current workspace", keywords: ["agent", "codex", "claude", "chat"]) {
                 _ = try? router.createSurface(workspace: wid, type: .agentApp, paneID: nil, title: nil)
             })
+            cmds.append(PaletteCommand(id: "surface.new.git", title: "New Git / Diff Surface", subtitle: "In current workspace", keywords: ["git", "diff", "changes", "history"]) {
+                _ = try? router.createSurface(workspace: wid, type: .rightSidebarTool, paneID: nil, title: "Git")
+            })
+
+            // Project scripts + open-in-editor (RC2-069, t3code parity).
+            for s in (try? router.projectScripts(workspace: wid))?.prefix(12) ?? [] {
+                cmds.append(PaletteCommand(id: "project.run.\(s.name)", title: "Run: \(s.name)", subtitle: "\(s.command) · \(s.source)", keywords: ["run", "script", "task", s.name]) {
+                    _ = try? router.projectRunScript(workspace: wid, name: s.name)
+                })
+            }
+            cmds.append(PaletteCommand(id: "project.open_in_editor", title: "Open Workspace in Editor", subtitle: "Cursor / VS Code / Zed / Xcode", keywords: ["open", "editor", "code", "cursor", "zed"]) {
+                _ = try? router.projectOpenInEditor(workspace: wid)
+            })
+
+            // Agent App commands — reach the live VM of the agent surface
+            // in the selected workspace (t3code palette parity).
+            if let agent = SurfaceRegistry.shared.all()
+                .compactMap({ $0 as? AgentAppSurface })
+                .first(where: { $0.descriptor.metadata["workspace"] == wid.value.uuidString }) {
+                let vm = agent.viewModel
+                cmds.append(PaletteCommand(id: "agent.provider.codex", title: "Agent: Use Codex", subtitle: "Switch provider", keywords: ["provider", "codex"]) {
+                    vm.provider = .codex; Task { await vm.loadModels() }
+                })
+                cmds.append(PaletteCommand(id: "agent.provider.claude", title: "Agent: Use Claude", subtitle: "Switch provider", keywords: ["provider", "claude"]) {
+                    vm.provider = .claude; Task { await vm.loadModels() }
+                })
+                cmds.append(PaletteCommand(id: "agent.thread.new", title: "Agent: New Thread", subtitle: "Start a fresh thread", keywords: ["thread", "new", "chat"]) {
+                    vm.createThread(title: "New thread")
+                })
+                cmds.append(PaletteCommand(id: "agent.plan.toggle", title: "Agent: Toggle Plan Sidebar", keywords: ["plan", "notes", "sidebar"]) {
+                    vm.showPlanSidebar.toggle()
+                })
+                // E2: surface the provider's model catalog as quick-switches.
+                for m in vm.availableModels.prefix(12) {
+                    cmds.append(PaletteCommand(id: "agent.model.\(m.id)", title: "Agent: Model → \(m.label)", subtitle: m.provider.rawValue, keywords: ["model", "switch", m.id, m.label.lowercased()]) {
+                        vm.model = m.id
+                    })
+                }
+                for (i, t) in vm.threads.prefix(9).enumerated() {
+                    let n = i + 1
+                    cmds.append(PaletteCommand(id: "agent.thread.jump.\(n)", title: "Agent: Jump to \(t.title)", subtitle: "Thread \(n) · \(t.provider.rawValue)", keywords: ["thread", "jump", "\(n)"]) {
+                        vm.selectThread(t.id)
+                    })
+                }
+            }
+        }
+        // Jump to any workspace (sidebar navigation parity).
+        if let ctx = router.context {
+            for ws in ctx.state.window.workspaces.compactMap({ ctx.state.workspaces[$0] }) {
+                cmds.append(PaletteCommand(id: "workspace.jump.\(ws.id.value.uuidString)", title: "Switch to: \(ws.name)", subtitle: "Workspace · \(ws.cwd)", keywords: ["workspace", "switch", "jump", ws.name.lowercased()]) {
+                    try? router.selectWorkspace(ws.id)
+                })
+            }
         }
         cmds.append(PaletteCommand(id: "session.save", title: "Save Session Snapshot", keywords: ["snapshot", "session"]) { router.context?.saveSnapshot() })
         cmds.append(PaletteCommand(id: "app.quit", title: "Quit RemoteCode 2", keywords: ["exit", "quit"]) { NSApp.terminate(nil) })
@@ -138,15 +192,11 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     private func applyFilter(_ q: String) {
-        let lower = q.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = q.trimmingCharacters(in: .whitespacesAndNewlines)
         if lower.isEmpty {
             filtered = all
         } else {
-            filtered = all.filter { c in
-                if c.title.lowercased().contains(lower) { return true }
-                if c.subtitle.lowercased().contains(lower) { return true }
-                return c.keywords.contains { $0.contains(lower) }
-            }
+            filtered = CommandPaletteFilter.rank(all, query: lower) { ($0.title, $0.subtitle, $0.keywords) }
         }
         tableView.reloadData()
         if !filtered.isEmpty { tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
@@ -164,6 +214,32 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
 
     public func controlTextDidChange(_ obj: Notification) {
         applyFilter(searchField.stringValue)
+    }
+
+    /// Esc dismisses the palette (documented behaviour); ↑/↓ move the
+    /// selection; ↩ runs it. Without this Esc did nothing — the panel
+    /// could only be closed by re-toggling.
+    public func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        switch sel {
+        case #selector(NSResponder.cancelOperation(_:)):
+            window.orderOut(nil); return true
+        case #selector(NSResponder.insertNewline(_:)):
+            submit(); return true
+        case #selector(NSResponder.moveDown(_:)):
+            moveSelection(1); return true
+        case #selector(NSResponder.moveUp(_:)):
+            moveSelection(-1); return true
+        default:
+            return false
+        }
+    }
+
+    private func moveSelection(_ delta: Int) {
+        guard !filtered.isEmpty else { return }
+        let cur = tableView.selectedRow
+        let next = min(max(0, cur + delta), filtered.count - 1)
+        tableView.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+        tableView.scrollRowToVisible(next)
     }
 
     // MARK: NSTableViewDataSource

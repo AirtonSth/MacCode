@@ -203,4 +203,22 @@ final class DiffPanelViewModelTests: XCTestCase {
         vm.refresh()
         waitUntil("refresh reflects the new working-tree edit") { vm.summary.dirty }
     }
+
+    /// The "Ignore WS" toggle must actually re-query git with `-w`, not be
+    /// inert chrome: a whitespace-only edit shows a diff normally but
+    /// vanishes once whitespace is ignored.
+    func test_ignoreWhitespace_collapsesWhitespaceOnlyDiff() throws {
+        let dir = try mkTmpRepo()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try "alpha\nbeta\n".write(toFile: dir + "/w.txt", atomically: true, encoding: .utf8)
+        sh(["git", "-C", dir, "add", "w.txt"])
+        sh(["git", "-C", dir, "commit", "-q", "-m", "seed w"])
+        try "alpha    \nbeta\n".write(toFile: dir + "/w.txt", atomically: true, encoding: .utf8)
+        let vm = DiffPanelViewModel(cwd: dir)
+        vm.selectFile("w.txt")
+        waitUntil("whitespace change is visible by default") { vm.rawDiff.contains("+alpha") }
+        vm.ignoreWhitespace = true
+        vm.reloadDiff()
+        waitUntil("ignoring whitespace empties a whitespace-only diff") { vm.rawDiff.isEmpty }
+    }
 }

@@ -78,6 +78,9 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
+        // `codex exec` otherwise prints "Reading additional input from
+        // stdin..." and can block — the prompt is already an arg.
+        proc.standardInput = FileHandle.nullDevice
 
         let parser = CodexParser()
         let timeline = TimelineAggregator()

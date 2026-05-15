@@ -17,6 +17,26 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         ]
     }
 
+    /// Builds the `claude` CLI argv. Pure + static so the exact flag
+    /// combination is regression-tested without spawning a process.
+    /// `--print --output-format stream-json` MUST be accompanied by
+    /// `--verbose` or the CLI rejects the run.
+    public static func buildArgs(_ request: AgentRunRequest) -> [String] {
+        var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
+        args.append(contentsOf: ["--model", request.model])
+        if let ptid = request.providerThreadId {
+            args.append(contentsOf: ["--resume", ptid])
+        }
+        switch request.permissionMode {
+        case .supervised: args.append(contentsOf: ["--permission-mode", "default"])
+        case .autoAcceptEdits: args.append(contentsOf: ["--permission-mode", "acceptEdits"])
+        case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
+        }
+        args.append(contentsOf: request.extraArgs)
+        args.append(request.prompt)
+        return args
+    }
+
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
         let binary = binaryNameOverride ?? "claude"
         guard let path = ProcessLocator.resolve(binary) else {
@@ -25,19 +45,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             throw AgentRunError.missingBinary(binary)
         }
 
-        var args: [String] = ["--output-format", "stream-json", "--print"]
-        args.append(contentsOf: ["--model", request.model])
-        if let ptid = request.providerThreadId {
-            args.append(contentsOf: ["--resume", ptid])
-        }
-        // permission/sandbox mapping
-        switch request.permissionMode {
-        case .supervised: args.append(contentsOf: ["--permission-mode", "default"])
-        case .autoAcceptEdits: args.append(contentsOf: ["--permission-mode", "acceptEdits"])
-        case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
-        }
-        args.append(contentsOf: request.extraArgs)
-        args.append(request.prompt)
+        let args = Self.buildArgs(request)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -46,6 +54,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
+        // Never block waiting on stdin — the prompt is an arg. Without this
+        // a provider can sit "running" forever reading a TTY that isn't there.
+        proc.standardInput = FileHandle.nullDevice
 
         let parser = ClaudeParser()
         let timeline = TimelineAggregator()

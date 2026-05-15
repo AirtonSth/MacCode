@@ -32,7 +32,24 @@ public protocol CommandRouting: AnyObject {
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String) throws -> AgentThread
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?) async throws -> AgentRunID
     func stopAgentRun(thread: AgentThreadID) throws
+    func deleteAgentThread(thread: AgentThreadID) throws
+    func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread
+    func markAgentThreadRead(thread: AgentThreadID) throws
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor]
+    // git
+    func gitStatus(workspace: WorkspaceID) throws -> GitSummary
+    func gitBranches(workspace: WorkspaceID) throws -> GitBranches
+    func gitCheckout(workspace: WorkspaceID, branch: String) throws -> GitActionResult
+    func gitCreateBranch(workspace: WorkspaceID, name: String) throws -> GitActionResult
+    func gitCommit(workspace: WorkspaceID, message: String) throws -> GitActionResult
+    func gitLog(workspace: WorkspaceID, limit: Int) throws -> [GitCommit]
+    func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String
+    func gitPush(workspace: WorkspaceID) throws -> GitActionResult
+    func gitPullRequestURL(workspace: WorkspaceID) throws -> String?
+    // project scripts / open-in-editor (RC2-069)
+    func projectScripts(workspace: WorkspaceID) throws -> [ProjectScript]
+    func projectRunScript(workspace: WorkspaceID, name: String) throws -> SurfaceDescriptor
+    func projectOpenInEditor(workspace: WorkspaceID) throws -> String
     // browser P0
     func browserNavigate(surface: SurfaceID, url: String) throws
     func browserBack(surface: SurfaceID) throws
@@ -219,6 +236,7 @@ public final class JSONRPCDispatcher {
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
                 let model = params["model"]?.stringValue ?? "fake-model"
                 let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model)
+                EventBus.shared.publish(kind: "agent.thread.created", payload: .object(["thread_id": .string(t.id.value.uuidString), "title": .string(t.title)]))
                 return .init(id: id, result: encode(t))
             case "agent.message.send":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
@@ -231,6 +249,77 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 try router.stopAgentRun(thread: tid)
                 return .init(id: id, result: .bool(true))
+            case "agent.thread.delete":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                try router.deleteAgentThread(thread: tid)
+                EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object(["thread_id": .string(tid.value.uuidString)]))
+                return .init(id: id, result: .bool(true))
+            case "agent.thread.rename":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let title = params["title"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let t = try router.renameAgentThread(thread: tid, title: title)
+                EventBus.shared.publish(kind: "agent.thread.renamed", payload: .object(["thread_id": .string(tid.value.uuidString), "title": .string(title)]))
+                return .init(id: id, result: encode(t))
+            case "agent.thread.mark_read":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                try router.markAgentThreadRead(thread: tid)
+                EventBus.shared.publish(kind: "agent.thread.read", payload: .object(["thread_id": .string(tid.value.uuidString)]))
+                return .init(id: id, result: .bool(true))
+            case "git.status":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.gitStatus(workspace: wid)))
+            case "git.branches":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.gitBranches(workspace: wid)))
+            case "git.checkout":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let branch = params["branch"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let r = try router.gitCheckout(workspace: wid, branch: branch)
+                EventBus.shared.publish(kind: "git.checkout", payload: .object(["workspace_id": .string(wid.value.uuidString), "branch": .string(branch), "ok": .bool(r.ok)]))
+                return .init(id: id, result: encode(r))
+            case "git.create_branch":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let name = params["name"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let r = try router.gitCreateBranch(workspace: wid, name: name)
+                EventBus.shared.publish(kind: "git.branch_created", payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name), "ok": .bool(r.ok)]))
+                return .init(id: id, result: encode(r))
+            case "git.commit":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let message = params["message"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let r = try router.gitCommit(workspace: wid, message: message)
+                EventBus.shared.publish(kind: "git.commit", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                return .init(id: id, result: encode(r))
+            case "git.log":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let limit = params["limit"]?.intValue ?? 100
+                return .init(id: id, result: encode(try router.gitLog(workspace: wid, limit: limit)))
+            case "git.diff":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let path = params["path"]?.stringValue
+                let iw = params["ignore_whitespace"]?.boolValue ?? false
+                return .init(id: id, result: .string(try router.gitDiff(workspace: wid, path: path, ignoreWhitespace: iw)))
+            case "git.push":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let r = try router.gitPush(workspace: wid)
+                EventBus.shared.publish(kind: "git.push", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                return .init(id: id, result: encode(r))
+            case "git.pull_request_url":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let url = try router.gitPullRequestURL(workspace: wid)
+                return .init(id: id, result: .object(["url": url.map { .string($0) } ?? .null]))
+            case "project.scripts":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.projectScripts(workspace: wid)))
+            case "project.run_script":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let name = params["name"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let s = try router.projectRunScript(workspace: wid, name: name)
+                EventBus.shared.publish(kind: "project.script_started", payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name)]))
+                return .init(id: id, result: encode(s))
+            case "project.open_in_editor":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let app = try router.projectOpenInEditor(workspace: wid)
+                return .init(id: id, result: .object(["app": .string(app)]))
             case "agent.models.list":
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
                 let models = await router.listAgentModels(provider: provider)
@@ -385,9 +474,18 @@ public final class JSONRPCDispatcher {
         }
     }
 
+    /// Accept the lowercased/underscored tokens the CLI documents
+    /// (`rightsidebartool`, `filepreview`, …) and map them to the
+    /// `SurfaceType` raw values, which are camelCase. Without this the
+    /// documented `rc2 new-surface --type rightsidebartool` fails.
     private func normalizeSurfaceTypeString(_ s: String) -> String {
-        switch s {
-        case "agent", "agent_app", "agentapp", "agentApp": return "agentApp"
+        switch s.lowercased() {
+        case "agent", "agent_app", "agentapp": return "agentApp"
+        case "rightsidebartool", "right_sidebar_tool", "diff", "git": return "rightSidebarTool"
+        case "filepreview", "file_preview": return "filePreview"
+        case "markdown": return "markdown"
+        case "terminal": return "terminal"
+        case "browser": return "browser"
         default: return s
         }
     }

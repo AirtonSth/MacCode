@@ -100,12 +100,60 @@ public final class ClaudeParser {
             }
         case "message_delta", "message_stop":
             break
+        case "assistant", "user":
+            // `claude --print --output-format stream-json` emits whole
+            // messages, NOT Anthropic-API deltas: {type:"assistant",
+            // message:{content:[{type:"text",text:…}|{type:"tool_use",…}]}}.
+            ensureTurn(&out)
+            let msg = obj["message"] as? [String: Any] ?? [:]
+            let content = msg["content"] as? [[String: Any]] ?? []
+            for block in content {
+                let bt = (block["type"] as? String) ?? "text"
+                let itemId = (block["id"] as? String) ?? UUID().uuidString
+                let turnId = currentTurnId ?? ""
+                switch bt {
+                case "text":
+                    let text = block["text"] as? String ?? ""
+                    if text.isEmpty { break }
+                    assembledAssistantBody += (assembledAssistantBody.isEmpty ? "" : "\n") + text
+                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
+                    out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
+                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                case "thinking":
+                    let text = block["thinking"] as? String ?? ""
+                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .reasoning, state: .streaming, summary: nil, body: "", startedAtMs: now)))
+                    out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
+                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                case "tool_use":
+                    let name = block["name"] as? String
+                    let input = (try? JSONSerialization.data(withJSONObject: block["input"] ?? [:]))
+                        .flatMap { String(data: $0, encoding: .utf8) }
+                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .streaming, summary: name, body: input ?? "", startedAtMs: now)))
+                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                case "tool_result":
+                    let payload = block["content"]
+                    let s = (payload as? String) ?? ((try? JSONSerialization.data(withJSONObject: payload ?? [:])).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
+                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .completed, summary: "result", body: "", output: s, startedAtMs: now)))
+                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                default:
+                    break
+                }
+            }
         case "result":
-            if let err = obj["error"] as? [String: Any], let msg = err["message"] as? String {
+            // Authoritative final answer is the top-level `result` string.
+            let isError = (obj["is_error"] as? Bool) ?? ((obj["subtype"] as? String).map { $0 != "success" } ?? false)
+            let resultText = obj["result"] as? String
+            if isError {
+                let msg = resultText
+                    ?? (obj["error"] as? [String: Any])?["message"] as? String
+                    ?? "claude run failed"
                 out.append(.error(message: msg, recoverable: false))
             }
+            ensureTurn(&out)
+            let final = (resultText?.isEmpty == false ? resultText : nil)
+                ?? (assembledAssistantBody.isEmpty ? nil : assembledAssistantBody)
             if let tid = currentTurnId {
-                out.append(.turnCompleted(turnId: tid, finalMessage: assembledAssistantBody.isEmpty ? nil : assembledAssistantBody))
+                out.append(.turnCompleted(turnId: tid, finalMessage: final))
                 currentTurnId = nil
             }
         case "error":
@@ -115,6 +163,16 @@ public final class ClaudeParser {
             break
         }
         return out
+    }
+
+    /// The CLI never sends `message_start`, so synthesize a turn the
+    /// first time any assistant/result content appears.
+    private func ensureTurn(_ out: inout [AssistantEvent]) {
+        if currentTurnId == nil {
+            let tid = UUID().uuidString
+            currentTurnId = tid
+            out.append(.turnStarted(turnId: tid))
+        }
     }
 
     public func finalize() -> [AssistantEvent] {

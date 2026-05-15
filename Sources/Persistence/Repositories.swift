@@ -174,6 +174,33 @@ public final class AgentMessageRepository {
         }
         return out
     }
+
+    public func count(threadId: AgentThreadID) throws -> Int {
+        let st = try db.prepare("SELECT COUNT(*) FROM agent_messages WHERE thread_id = ?;")
+        try st.bind(1, threadId.value.uuidString)
+        return (try st.step()) ? Int(st.columnInt64(0)) : 0
+    }
+
+    /// The newest `limit` messages, returned oldest→newest for display.
+    /// Backs the bounded message window (B4 pagination).
+    public func listRecent(threadId: AgentThreadID, limit: Int) throws -> [AgentMessage] {
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?;")
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, max(0, limit))
+        var out: [AgentMessage] = []
+        while try st.step() {
+            let id = AgentMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
+            let tid = AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID())
+            out.append(AgentMessage(
+                id: id,
+                threadId: tid,
+                role: AgentMessageRole(rawValue: st.columnText(2) ?? "") ?? .user,
+                content: st.columnText(3) ?? "",
+                createdAt: parseDate(st.columnText(4))
+            ))
+        }
+        return out.reversed()
+    }
 }
 
 public final class AgentRunRepository {

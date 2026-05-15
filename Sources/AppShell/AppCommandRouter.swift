@@ -37,13 +37,19 @@ public final class AppCommandRouter: CommandRouting {
                     case .browser:
                         surface = BrowserSurface(workspaceID: wid, initialURL: nil, title: title)
                     case .agentApp:
-                        surface = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: title)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: title)
+                        let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
+                            guard ev.kind.hasPrefix("agent.thread.") else { return }
+                            DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
+                        }
+                        agent.subscriptionToken = AnyHashable(token)
+                        surface = agent
                     case .markdown:
                         surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
                     case .filePreview:
                         surface = FilePreviewSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
                     case .rightSidebarTool:
-                        surface = DiffPanelSurface(workspaceID: wid, cwd: cwd, title: title)
+                        surface = DiffPanelSurface(workspaceID: wid, cwd: cwd, title: title, settings: SettingsStore(db: ctx.db))
                     }
                     idMap[desc.id] = surface.descriptor.id
                     SurfaceRegistry.shared.register(surface)
@@ -250,9 +256,89 @@ public final class AppCommandRouter: CommandRouting {
         // Best effort: nothing here; the AgentAppViewModel keeps live runs.
     }
 
+    public func deleteAgentThread(thread: AgentThreadID) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.threadRepo.delete(id: thread)
+    }
+
+    public func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw JSONRPCError.invalidParams }
+        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        t.title = trimmed
+        t.updatedAt = Date()
+        try ctx.threadRepo.upsert(t)
+        return t
+    }
+
+    public func markAgentThreadRead(thread: AgentThreadID) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        if t.hasUnread { t.hasUnread = false; try ctx.threadRepo.upsert(t) }
+    }
+
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
         return await runner.listModels()
+    }
+
+    // MARK: git (socket/CLI parity — same engine the diff panel uses)
+
+    private func workspaceCwd(_ id: WorkspaceID) throws -> String {
+        guard let cwd = context?.state.workspaces[id]?.cwd else { throw LayoutError.workspaceNotFound }
+        return cwd
+    }
+
+    public func gitStatus(workspace: WorkspaceID) throws -> GitSummary {
+        GitDiff.summary(in: try workspaceCwd(workspace))
+    }
+    public func gitBranches(workspace: WorkspaceID) throws -> GitBranches {
+        GitDiff.branches(in: try workspaceCwd(workspace))
+    }
+    public func gitCheckout(workspace: WorkspaceID, branch: String) throws -> GitActionResult {
+        GitDiff.checkout(in: try workspaceCwd(workspace), branch: branch)
+    }
+    public func gitCreateBranch(workspace: WorkspaceID, name: String) throws -> GitActionResult {
+        GitDiff.createBranch(in: try workspaceCwd(workspace), name: name)
+    }
+    public func gitCommit(workspace: WorkspaceID, message: String) throws -> GitActionResult {
+        GitDiff.commit(in: try workspaceCwd(workspace), message: message)
+    }
+    public func gitLog(workspace: WorkspaceID, limit: Int) throws -> [GitCommit] {
+        GitDiff.log(in: try workspaceCwd(workspace), limit: limit)
+    }
+    public func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String {
+        GitDiff.diff(in: try workspaceCwd(workspace), path: path, ignoreWhitespace: ignoreWhitespace)
+    }
+    public func gitPush(workspace: WorkspaceID) throws -> GitActionResult {
+        GitDiff.push(in: try workspaceCwd(workspace))
+    }
+    public func gitPullRequestURL(workspace: WorkspaceID) throws -> String? {
+        GitDiff.pullRequestURL(in: try workspaceCwd(workspace))
+    }
+
+    // MARK: project scripts / open-in-editor (RC2-069)
+
+    public func projectScripts(workspace: WorkspaceID) throws -> [ProjectScript] {
+        ProjectScripts.discover(in: try workspaceCwd(workspace))
+    }
+
+    public func projectRunScript(workspace: WorkspaceID, name: String) throws -> SurfaceDescriptor {
+        let cwd = try workspaceCwd(workspace)
+        guard let script = ProjectScripts.discover(in: cwd).first(where: { $0.name == name }) else {
+            throw JSONRPCError(code: -32602, message: "no such script: \(name)")
+        }
+        // Run it in a fresh terminal surface (t3code ProjectScriptsControl).
+        let desc = try createSurface(workspace: workspace, type: .terminal, paneID: nil, title: "Run: \(name)")
+        if let term = SurfaceRegistry.shared.surface(desc.id) {
+            term.sendText(script.command + "\n")
+        }
+        return desc
+    }
+
+    public func projectOpenInEditor(workspace: WorkspaceID) throws -> String {
+        ProjectScripts.openInEditor(cwd: try workspaceCwd(workspace))
     }
 
     private func browserSurface(_ id: SurfaceID) throws -> BrowserSurface {
@@ -407,7 +493,15 @@ public final class AppCommandRouter: CommandRouting {
                 surface = BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle)
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                surface = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: baseTitle)
+                // Socket-driven thread mutations (create/rename/delete/read)
+                // refresh this already-open surface — fixes the stale-VM gap.
+                let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
+                    guard ev.kind.hasPrefix("agent.thread.") else { return }
+                    DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
+                }
+                agent.subscriptionToken = AnyHashable(token)
+                surface = agent
             case .markdown:
                 let path = title // optional: pass file path via title for now
                 surface = MarkdownSurface(workspaceID: workspace, filePath: path, title: baseTitle)
@@ -432,7 +526,7 @@ public final class AppCommandRouter: CommandRouting {
                     feed.subscriptionToken = AnyHashable(token)
                     surface = feed
                 } else {
-                    surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
+                    surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, settings: context.map { SettingsStore(db: $0.db) })
                 }
             }
             let finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)

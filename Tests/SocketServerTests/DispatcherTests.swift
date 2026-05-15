@@ -46,9 +46,37 @@ final class FakeRouter: CommandRouting {
     }
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?) async throws -> AgentRunID { AgentRunID() }
     func stopAgentRun(thread: AgentThreadID) throws {}
+    var threadStore: [AgentThread] = []
+    func deleteAgentThread(thread: AgentThreadID) throws { threadStore.removeAll { $0.id == thread } }
+    func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
+        guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        threadStore[idx].title = title
+        return threadStore[idx]
+    }
+    func markAgentThreadRead(thread: AgentThreadID) throws {
+        guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        threadStore[idx].hasUnread = false
+    }
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         [AgentModelDescriptor(id: "x", label: "X", provider: provider)]
     }
+    var gitCwd = "/tmp"
+    func gitStatus(workspace: WorkspaceID) throws -> GitSummary { GitDiff.summary(in: gitCwd) }
+    func gitBranches(workspace: WorkspaceID) throws -> GitBranches { GitDiff.branches(in: gitCwd) }
+    func gitCheckout(workspace: WorkspaceID, branch: String) throws -> GitActionResult { GitDiff.checkout(in: gitCwd, branch: branch) }
+    func gitCreateBranch(workspace: WorkspaceID, name: String) throws -> GitActionResult { GitDiff.createBranch(in: gitCwd, name: name) }
+    func gitCommit(workspace: WorkspaceID, message: String) throws -> GitActionResult { GitDiff.commit(in: gitCwd, message: message) }
+    func gitLog(workspace: WorkspaceID, limit: Int) throws -> [GitCommit] { GitDiff.log(in: gitCwd, limit: limit) }
+    func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String { GitDiff.diff(in: gitCwd, path: path, ignoreWhitespace: ignoreWhitespace) }
+    func gitPush(workspace: WorkspaceID) throws -> GitActionResult { GitDiff.push(in: gitCwd) }
+    func gitPullRequestURL(workspace: WorkspaceID) throws -> String? { GitDiff.pullRequestURL(in: gitCwd) }
+    var projectCwd = "/tmp"
+    func projectScripts(workspace: WorkspaceID) throws -> [ProjectScript] { ProjectScripts.discover(in: projectCwd) }
+    func projectRunScript(workspace: WorkspaceID, name: String) throws -> SurfaceDescriptor {
+        guard ProjectScripts.discover(in: projectCwd).contains(where: { $0.name == name }) else { throw JSONRPCError(code: -32602, message: "no such script") }
+        return SurfaceDescriptor(type: .terminal, title: "Run: \(name)")
+    }
+    func projectOpenInEditor(workspace: WorkspaceID) throws -> String { "Finder" }
     func browserNavigate(surface: SurfaceID, url: String) throws {}
     func browserBack(surface: SurfaceID) throws {}
     func browserForward(surface: SurfaceID) throws {}
@@ -114,5 +142,139 @@ final class DispatcherTests: XCTestCase {
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "workspace.create", params: params))
         XCTAssertNil(resp.error)
         XCTAssertEqual(router.workspaces.count, 1)
+    }
+
+    private func sh(_ a: [String]) {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/env"); p.arguments = a
+        let pi = Pipe(); p.standardOutput = pi; p.standardError = pi
+        try? p.run(); p.waitUntilExit()
+    }
+
+    @MainActor
+    func test_gitMethods_routeThroughDispatcher() async throws {
+        let dir = NSTemporaryDirectory() + "rc2-disp-git-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        sh(["git", "init", "-q", "-b", "main", dir])
+        sh(["git", "-C", dir, "config", "user.email", "t@t.t"])
+        sh(["git", "-C", dir, "config", "user.name", "t"])
+        try "hi\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+        sh(["git", "-C", dir, "add", "a.txt"])
+        sh(["git", "-C", dir, "commit", "-q", "-m", "init"])
+        let router = FakeRouter(); router.gitCwd = dir
+        let d = JSONRPCDispatcher(router: router)
+        let wid = JSONValue.string(UUID().uuidString)
+
+        let status = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "git.status", params: ["workspace_id": wid]))
+        guard case .object(let so)? = status.result else { return XCTFail("git.status must return an object") }
+        XCTAssertEqual(so["isGitRepo"], .bool(true), "git.status over the socket must report a real repo")
+
+        let log = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "git.log", params: ["workspace_id": wid]))
+        guard case .array(let la)? = log.result else { return XCTFail("git.log must return an array") }
+        XCTAssertEqual(la.count, 1, "the one seeded commit must round-trip through the socket")
+
+        let br = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "git.create_branch", params: ["workspace_id": wid, "name": .string("feat")]))
+        guard case .object(let bo)? = br.result else { return XCTFail("git.create_branch must return a result") }
+        XCTAssertEqual(bo["ok"], .bool(true), "create_branch must report success over the wire")
+        XCTAssertEqual(GitDiff.branches(in: dir).current, "feat", "the socket call must actually move HEAD")
+    }
+
+    @MainActor
+    func test_surfaceCreate_normalizesDocumentedTypeTokens() async throws {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        let wid = JSONValue.string(UUID().uuidString)
+        let cases: [(String, String)] = [
+            ("rightsidebartool", "rightSidebarTool"),
+            ("diff", "rightSidebarTool"),
+            ("agentapp", "agentApp"),
+            ("filepreview", "filePreview")
+        ]
+        for (token, expected) in cases {
+            let r = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.create", params: ["workspace_id": wid, "type": .string(token)]))
+            XCTAssertNil(r.error, "documented CLI token '\(token)' must be accepted by surface.create")
+            guard case .object(let o)? = r.result, case .string(let ty)? = o["type"] else {
+                return XCTFail("surface.create must return a typed descriptor for '\(token)'")
+            }
+            XCTAssertEqual(ty, expected, "'\(token)' must normalize to SurfaceType.\(expected)")
+        }
+    }
+
+    @MainActor
+    func test_gitStatus_countsEncodeAsNumbersNotBooleans() async throws {
+        let dir = NSTemporaryDirectory() + "rc2-disp-num-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        sh(["git", "init", "-q", "-b", "main", dir])
+        sh(["git", "-C", dir, "config", "user.email", "t@t.t"])
+        sh(["git", "-C", dir, "config", "user.name", "t"])
+        try "l1\n".write(toFile: dir + "/n.txt", atomically: true, encoding: .utf8)
+        sh(["git", "-C", dir, "add", "n.txt"])
+        sh(["git", "-C", dir, "commit", "-q", "-m", "seed"])
+        try "l1\nl2\n".write(toFile: dir + "/n.txt", atomically: true, encoding: .utf8) // +1 line
+        let router = FakeRouter(); router.gitCwd = dir
+        let d = JSONRPCDispatcher(router: router)
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "git.status", params: ["workspace_id": .string(UUID().uuidString)]))
+        guard case .object(let o)? = resp.result else { return XCTFail("git.status must return an object") }
+        // Regression: an integer count of 1 must stay a JSON number, never
+        // collapse to `true` (NSNumber/Bool bridging bug in JSONValue.from).
+        if case .bool = (o["totalAdditions"] ?? .null) {
+            XCTFail("totalAdditions encoded as a bool — integer collapsed via NSNumber bridging")
+        }
+        guard case .number(let n)? = o["totalAdditions"] else {
+            return XCTFail("totalAdditions must be a number, got \(String(describing: o["totalAdditions"]))")
+        }
+        XCTAssertEqual(n, 1, "one added line must serialize as the number 1 over the socket")
+    }
+
+    @MainActor
+    func test_agentThreadRenameAndDelete_overSocket() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "old", provider: .codex, model: "m")
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+        let tidParam = JSONValue.string(t.id.value.uuidString)
+
+        let r = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.rename", params: ["thread_id": tidParam, "title": .string("new name")]))
+        guard case .object(let o)? = r.result else { return XCTFail("rename must echo the thread") }
+        XCTAssertEqual(o["title"], .string("new name"), "rename must persist and echo the new title")
+
+        let del = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.thread.delete", params: ["thread_id": tidParam]))
+        XCTAssertEqual(del.result, .bool(true))
+        XCTAssertTrue(router.threadStore.isEmpty, "delete over the socket must remove the thread")
+
+        let missing = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.thread.rename", params: ["thread_id": tidParam, "title": .string("x")]))
+        XCTAssertNotNil(missing.error, "renaming a deleted thread must fail loudly, not silently succeed")
+    }
+
+    @MainActor
+    func test_projectScripts_overSocket() async throws {
+        let dir = NSTemporaryDirectory() + "rc2-disp-ps-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try #"{"scripts":{"lint":"eslint .","build":"tsc"}}"#
+            .write(toFile: dir + "/package.json", atomically: true, encoding: .utf8)
+        let router = FakeRouter(); router.projectCwd = dir
+        let d = JSONRPCDispatcher(router: router)
+        let wid = JSONValue.string(UUID().uuidString)
+        let r = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "project.scripts", params: ["workspace_id": wid]))
+        guard case .array(let arr)? = r.result else { return XCTFail("project.scripts must return an array") }
+        XCTAssertEqual(arr.count, 2, "both package.json scripts must round-trip the socket")
+        let ok = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "project.run_script", params: ["workspace_id": wid, "name": .string("build")]))
+        XCTAssertNil(ok.error, "running a known script must succeed")
+        let bad = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "project.run_script", params: ["workspace_id": wid, "name": .string("nope")]))
+        XCTAssertNotNil(bad.error, "running an unknown script must fail loudly")
+    }
+
+    @MainActor
+    func test_agentThreadMarkRead_overSocket() async throws {
+        let router = FakeRouter()
+        var t = AgentThread(workspaceId: nil, title: "unread", provider: .codex, model: "m")
+        t.hasUnread = true
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+        let r = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.mark_read", params: ["thread_id": .string(t.id.value.uuidString)]))
+        XCTAssertEqual(r.result, .bool(true))
+        XCTAssertEqual(router.threadStore.first?.hasUnread, false,
+                       "mark_read over the socket must clear the unread flag")
     }
 }

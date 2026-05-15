@@ -25,6 +25,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false
     @Published public var planNotes: String = ""
+    /// C1: git branch of the agent's working dir, for the context bar.
+    @Published public var gitBranch: String?
+    /// B3: file paths attached to the next message (composer chips).
+    @Published public var attachments: [String] = []
+    /// When the active run started — drives the "Working for Xs" line.
+    @Published public var runStartedAt: Date?
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -46,7 +52,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.messageRepo = messageRepo
         self.coordinator.observer = self
         reloadThreads()
+        loadGitBranch()
     }
+
+    public func loadGitBranch() {
+        let cwd = self.cwd
+        DispatchQueue.global().async { [weak self] in
+            let b = GitDiff.branches(in: cwd).current
+            DispatchQueue.main.async { self?.gitBranch = b }
+        }
+    }
+
+    /// Maps an in-flight run back to its thread so a completion can mark
+    /// the right thread unread even after the user navigated away (B6).
+    private var runThreads: [AgentRunID: AgentThreadID] = [:]
 
     public func reloadThreads() {
         threads = (try? threadRepo.list(workspaceId: workspaceID)) ?? []
@@ -61,14 +80,64 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             provider = t.provider
             model = t.model
         }
-        messages = (try? messageRepo.list(threadId: id)) ?? []
+        // B6: opening a thread marks it read (persist + reflect in the rail
+        // without re-querying, which would recurse through reloadThreads).
+        if var t = try? threadRepo.get(id: id), t.hasUnread {
+            t.hasUnread = false
+            try? threadRepo.upsert(t)
+        }
+        if let idx = threads.firstIndex(where: { $0.id == id }), threads[idx].hasUnread {
+            threads[idx].hasUnread = false
+        }
+        messageWindow = Self.baseMessageWindow
+        loadWindow(id)
         timeline = AssistantTimelineState()
+    }
+
+    // MARK: B4 — bounded message window
+
+    static let baseMessageWindow = 50
+    private var messageWindow = AgentAppViewModel.baseMessageWindow
+    @Published public var hasMoreOlder: Bool = false
+
+    private func loadWindow(_ id: AgentThreadID) {
+        let total = (try? messageRepo.count(threadId: id)) ?? 0
+        messages = (try? messageRepo.listRecent(threadId: id, limit: messageWindow)) ?? []
+        hasMoreOlder = total > messages.count
+    }
+
+    public func loadEarlierMessages() {
+        guard let id = selectedThreadId else { return }
+        messageWindow += Self.baseMessageWindow
+        loadWindow(id)
+    }
+
+    /// B7: count of threads with an in-flight run, for the rail header.
+    public var activeThreadCount: Int { threads.filter { $0.status == .running }.count }
+
+    /// C7: the most recent plan the agent proposed in this thread's
+    /// timeline (t3code PlanSidebar — proposed-plan tracking).
+    public var latestPlanText: String? {
+        for turn in timeline.turns.reversed() {
+            if let plan = turn.items.last(where: { $0.type == .plan }) {
+                let t = plan.body.isEmpty ? (plan.summary ?? "") : plan.body
+                return t.isEmpty ? nil : t
+            }
+        }
+        return nil
     }
 
     public func loadModels() async {
         let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
         let m = await runner.listModels()
-        await MainActor.run { self.availableModels = m }
+        await MainActor.run {
+            self.availableModels = m
+            // B8: a provider switch must leave a model valid for that
+            // provider — never a stale id from the other provider.
+            if !m.isEmpty, !m.contains(where: { $0.id == self.model }) {
+                self.model = m.first?.id ?? self.model
+            }
+        }
     }
 
     public func createThread(title: String) {
@@ -78,30 +147,156 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         selectThread(t.id)
     }
 
+    public func renameThread(_ id: AgentThreadID, to newTitle: String) {
+        let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, var t = try? threadRepo.get(id: id) else { return }
+        t.title = title
+        t.updatedAt = Date()
+        try? threadRepo.upsert(t)
+        reloadThreads()
+    }
+
+    public func deleteThread(_ id: AgentThreadID) {
+        try? threadRepo.delete(id: id)
+        if selectedThreadId == id {
+            selectedThreadId = nil
+            messages = []
+            timeline = AssistantTimelineState()
+        }
+        reloadThreads()
+    }
+
+    /// Derive a concise thread title from the first user message: first
+    /// non-empty line, trimmed, clipped, stripped of trailing punctuation.
+    public static func deriveTitle(from text: String) -> String {
+        let firstLine = text.split(separator: "\n").first.map(String.init) ?? text
+        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clipped = String(trimmed.prefix(48))
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \t.-:#*"))
+        return clipped.isEmpty ? "New thread" : clipped
+    }
+
+    public func statusSummary() -> String {
+        let t = threads.first(where: { $0.id == selectedThreadId })?.title ?? "—"
+        return "provider=\(provider.rawValue) model=\(model) permission=\(permissionMode.rawValue) reasoning=\(reasoningEffort.rawValue) status=\(status.rawValue) thread=\(t)"
+    }
+
+    private func systemNote(_ text: String) {
+        guard let tid = selectedThreadId else { return }
+        let m = AgentMessage(threadId: tid, role: .system, content: text)
+        messages.append(m)
+        try? messageRepo.append(m)
+    }
+
+    /// `/fork` — branch a new thread from the current one, copying its
+    /// message history, then select it (remotecode.io `/fork` parity).
+    public func forkCurrentThread() {
+        guard let tid = selectedThreadId,
+              let src = threads.first(where: { $0.id == tid }) else { return }
+        let copy = AgentThread(workspaceId: workspaceID, title: "\(src.title) (fork)",
+                               provider: src.provider, model: src.model)
+        try? threadRepo.upsert(copy)
+        for m in (try? messageRepo.list(threadId: tid)) ?? [] {
+            try? messageRepo.append(AgentMessage(threadId: copy.id, role: m.role, content: m.content))
+        }
+        reloadThreads()
+        selectThread(copy.id)
+    }
+
+    /// Intercept `/clear /fork /model /plan /status` before they reach the
+    /// provider. Returns true if the input was a (handled) command.
+    @discardableResult
+    public func handleSlashCommand(_ raw: String) -> Bool {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.hasPrefix("/") else { return false }
+        let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
+        let cmd = parts.first?.lowercased() ?? ""
+        let arg = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        switch cmd {
+        case "clear":
+            createThread(title: "New thread")
+        case "fork":
+            forkCurrentThread()
+        case "model":
+            if !arg.isEmpty, let m = availableModels.first(where: {
+                $0.id.localizedCaseInsensitiveContains(arg) || $0.label.localizedCaseInsensitiveContains(arg)
+            }) {
+                model = m.id
+                systemNote("Model → \(m.label)")
+            } else {
+                let names = availableModels.map { $0.label }.joined(separator: ", ")
+                systemNote(names.isEmpty ? "No models loaded yet." : "Models: \(names)")
+            }
+        case "plan":
+            showPlanSidebar.toggle()
+            permissionMode = .supervised
+            systemNote("Plan mode \(showPlanSidebar ? "on" : "off") · permission: supervised")
+        case "status":
+            systemNote(statusSummary())
+        default:
+            systemNote("Unknown command: /\(cmd)")
+        }
+        return true
+    }
+
+    public func addAttachments(_ paths: [String]) {
+        for p in paths where !attachments.contains(p) { attachments.append(p) }
+    }
+    public func removeAttachment(_ path: String) {
+        attachments.removeAll { $0 == path }
+    }
+
     public func send() async {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || !attachments.isEmpty else { return }
+        // Slash commands never reach the provider.
+        if text.hasPrefix("/") {
+            prompt = ""
+            _ = handleSlashCommand(text)
+            return
+        }
         if selectedThreadId == nil {
-            createThread(title: String(text.prefix(48)))
+            createThread(title: "New thread")
         }
         guard let tid = selectedThreadId else { return }
+        // B5: title a still-default thread from its first message.
+        if let t = threads.first(where: { $0.id == tid }),
+           (t.title == "New thread" || t.title.isEmpty),
+           ((try? messageRepo.list(threadId: tid))?.isEmpty ?? true) {
+            renameThread(tid, to: Self.deriveTitle(from: text))
+        }
         prompt = ""
         timeline = AssistantTimelineState()
-        let userMsg = AgentMessage(threadId: tid, role: .user, content: text)
-        messages.append(userMsg)
+        // B3: fold attachment paths into the prompt so the agent (which
+        // has fs access per permission mode) can read them; show a friendly
+        // chip summary in the transcript.
+        let attached = attachments
+        attachments = []
+        let composed = attached.isEmpty ? text
+            : text + "\n\n[Attached files]\n" + attached.map { "- \($0)" }.joined(separator: "\n")
+        let display = attached.isEmpty ? text
+            : text + "\n\n📎 " + attached.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+        // The coordinator is the single writer of run messages — mirror
+        // the user message in-memory only (no double-persist).
+        messages.append(AgentMessage(threadId: tid, role: .user, content: display))
         let req = AgentRunRequest(
             threadId: tid,
             provider: provider,
             model: model,
             cwd: cwd,
-            prompt: text,
+            prompt: composed,
             providerThreadId: threads.first(where: { $0.id == tid })?.providerThreadId,
             permissionMode: permissionMode,
             reasoningEffort: reasoningEffort
         )
         do {
             let runId = try await coordinator.startRun(req)
-            await MainActor.run { self.currentRunId = runId; self.status = .running }
+            await MainActor.run {
+                self.currentRunId = runId
+                self.runThreads[runId] = tid
+                self.status = .running
+                self.runStartedAt = Date()
+            }
         } catch {
             await MainActor.run { self.statusMessage = "Failed to start: \(error)"; self.status = .failed }
         }
@@ -122,21 +317,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         Task { @MainActor in
             self.status = status
-            if status == .completed, let msg = finalMessage, let tid = self.selectedThreadId {
-                self.messages.append(AgentMessage(threadId: tid, role: .assistant, content: msg))
+            let finishedTid = self.runThreads[runId] ?? self.selectedThreadId
+            self.runThreads[runId] = nil
+            if status == .completed, let _ = finalMessage, let tid = finishedTid,
+               tid != self.selectedThreadId, var t = try? self.threadRepo.get(id: tid) {
+                // B6: finished on a thread the user left → mark unread.
+                // The selected thread already shows the reply via the live
+                // turn items, so we do NOT mirror it into `messages`
+                // (that caused the answer to render two/three times).
+                t.hasUnread = true
+                try? self.threadRepo.upsert(t)
             }
             self.currentRunId = nil
+            self.runStartedAt = nil
             self.reloadThreads()
         }
     }
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID) {
-        Task { @MainActor in self.status = status }
+        Task { @MainActor in
+            self.status = status
+            if status == .running, self.runStartedAt == nil { self.runStartedAt = Date() }
+        }
     }
 }
 
 public struct AgentAppView: View {
     @ObservedObject var vm: AgentAppViewModel
+    @State private var renamingThreadId: AgentThreadID?
+    @State private var renameText: String = ""
+    @State private var expandedTools: Set<String> = []
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -158,7 +368,8 @@ public struct AgentAppView: View {
 
     private var threadRail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            DSSectionHeader("Threads", trailing: AnyView(
+            DSSectionHeader(vm.activeThreadCount > 0 ? "Threads · \(vm.activeThreadCount) active" : "Threads",
+                            trailing: AnyView(
                 DSIconButton("plus", help: "New thread") { vm.createThread(title: "New thread") }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -182,29 +393,70 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func threadRow(_ t: AgentThread) -> some View {
-        let selected = vm.selectedThreadId == t.id
-        Button { vm.selectThread(t.id) } label: {
-            HStack(spacing: DS.Space.md) {
-                Circle()
-                    .fill(t.status == .running ? DS.Palette.success
-                          : t.status == .failed ? DS.Palette.danger
-                          : DS.Palette.textTertiary)
-                    .frame(width: 6, height: 6)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(t.title).font(DS.Font.bodyDense)
-                        .foregroundColor(DS.Palette.text).lineLimit(1)
-                    Text("\(t.provider.rawValue) · \(t.model)")
-                        .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
+        if renamingThreadId == t.id {
+            renameRow(t)
+        } else {
+            let selected = vm.selectedThreadId == t.id
+            Button { vm.selectThread(t.id) } label: {
+                HStack(spacing: DS.Space.md) {
+                    Circle()
+                        .fill(t.status == .running ? DS.Palette.success
+                              : t.status == .failed ? DS.Palette.danger
+                              : DS.Palette.textTertiary)
+                        .frame(width: 6, height: 6)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(t.title).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
+                            .foregroundColor(DS.Palette.text).lineLimit(1)
+                        Text("\(t.provider.rawValue) · \(t.model)")
+                            .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    if t.hasUnread {
+                        Circle().fill(DS.Palette.accent).frame(width: 7, height: 7)
+                            .accessibilityLabel("Unread activity")
+                    }
                 }
-                Spacer(minLength: 0)
+                .padding(.horizontal, DS.Space.md)
+                .padding(.vertical, DS.Space.sm)
+                .background(selected ? DS.Palette.selection : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, DS.Space.md)
-            .padding(.vertical, DS.Space.sm)
-            .background(selected ? DS.Palette.selection : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button("Rename…") { renameText = t.title; renamingThreadId = t.id }
+                Button("Delete", role: .destructive) { vm.deleteThread(t.id) }
+            }
         }
-        .buttonStyle(.plain)
+    }
+
+    private func renameRow(_ t: AgentThread) -> some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "pencil")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(DS.Palette.accent)
+            TextField("Thread name", text: $renameText)
+                .textFieldStyle(.plain)
+                .font(DS.Font.bodyDense)
+                .onSubmit { commitRename(t) }
+            Button { renamingThreadId = nil } label: {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Cancel rename")
+        }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+            .strokeBorder(DS.Palette.accent.opacity(0.4), lineWidth: DS.Border.hairline))
+    }
+
+    private func commitRename(_ t: AgentThread) {
+        vm.renameThread(t.id, to: renameText)
+        renamingThreadId = nil
     }
 
     // MARK: Conversation column
@@ -214,8 +466,36 @@ public struct AgentAppView: View {
             header
             timeline
             composer
+            contextBar
         }
         .background(DS.Palette.bg)
+        // C6: Esc interrupts an in-flight run (remotecode.io parity).
+        .onExitCommand { if vm.status == .running { vm.stop() } }
+    }
+
+    // C1: the agent's operating context — git branch + project dir.
+    // (t3code BranchToolbar essence; C2's global header folded in here
+    // since our pane/tab chrome already owns app-level navigation.)
+    private var contextBar: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(DS.Palette.accent)
+            Text(vm.gitBranch ?? "no branch")
+                .font(DS.Font.caption2.monospaced())
+                .foregroundColor(DS.Palette.textSecondary)
+            Text("·").foregroundColor(DS.Palette.textTertiary)
+            Text(URL(fileURLWithPath: vm.cwd).lastPathComponent)
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 0)
+            DSPill(vm.permissionMode == .supervised ? "supervised"
+                   : vm.permissionMode == .autoAcceptEdits ? "auto-edit" : "full-access",
+                   tone: vm.permissionMode == .fullAccess ? .warning : .neutral)
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.xs)
+        .dsBar(edge: .top)
     }
 
     // Compact run-config header. Git/terminal intentionally absent —
@@ -229,11 +509,15 @@ public struct AgentAppView: View {
                 }
                 .labelsHidden()
                 .onChange(of: vm.provider) { _ in Task { await vm.loadModels() } }
+                // B8: provider is locked for the duration of a run.
+                .disabled(vm.status == .running)
             }
             runConfigChip(icon: "sparkle", value: modelLabel) {
                 Picker("", selection: $vm.model) {
                     ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
-                }.labelsHidden()
+                }
+                .labelsHidden()
+                .disabled(vm.status == .running)
             }
             runConfigChip(icon: "lock.shield", value: permissionLabel) {
                 Picker("", selection: $vm.permissionMode) {
@@ -300,25 +584,82 @@ public struct AgentAppView: View {
 
     // MARK: Timeline
 
+    // Flat, Codex-style transcript: a centered reading column, user
+    // messages as right-aligned bubbles, assistant output as full-width
+    // prose, tools as one dim line. No per-item cards.
     private var timeline: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
+                LazyVStack(alignment: .leading, spacing: DS.Space.huge) {
                     if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
-                        emptyConversation.padding(.top, DS.Space.huge)
+                        emptyConversation.padding(.top, 56)
                     }
                     ForEach(vm.messages, id: \.id) { msg in messageRow(msg) }
                     ForEach(vm.timeline.turns, id: \.turnId) { turn in turnView(turn) }
-                    if let err = vm.timeline.error { errorCard(err) }
+                    if vm.status == .running { workingStatus }
+                    if let err = vm.timeline.error { errorRow(err) }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
-                .padding(DS.Space.xl)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, DS.Space.xxl)
+                .padding(.vertical, DS.Space.xxxl)
+                .frame(maxWidth: 760, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
             .background(DS.Palette.bg)
             .onChange(of: vm.messages.count) { _ in withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM") } }
             .onChange(of: vm.timeline.turns.count) { _ in withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM") } }
+            .onChange(of: vm.status) { _ in withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM") } }
         }
+    }
+
+    // "Working for 2m 21s" + hairline, while a run is in flight.
+    private var workingStatus: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            TimelineView(.periodic(from: vm.runStartedAt ?? Date(), by: 1)) { _ in
+                HStack(spacing: DS.Space.sm) {
+                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                    Text("Working for \(elapsedString)")
+                        .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                }
+            }
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var elapsedString: String {
+        let s = max(0, Int(Date().timeIntervalSince(vm.runStartedAt ?? Date())))
+        return s < 60 ? "\(s)s" : "\(s / 60)m \(s % 60)s"
+    }
+
+    private func copyToPasteboard(_ s: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(s, forType: .string)
+    }
+
+    /// Markdown → AttributedString with Codex-style inline code chips.
+    private func styledMarkdown(_ text: String) -> AttributedString {
+        let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        guard var a = try? AttributedString(markdown: text, options: opts) else {
+            return AttributedString(text)
+        }
+        let codeRanges = a.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }.map(\.range)
+        for r in codeRanges {
+            a[r].font = DS.Font.monoSmall
+            a[r].backgroundColor = DS.Palette.surfaceOverlay
+            a[r].foregroundColor = DS.Palette.accent
+        }
+        return a
+    }
+
+    @ViewBuilder
+    private func assistantProse(_ text: String) -> some View {
+        Text(styledMarkdown(text))
+            .font(DS.Font.body)
+            .foregroundColor(DS.Palette.text)
+            .lineSpacing(5)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var emptyConversation: some View {
@@ -338,125 +679,144 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func errorCard(_ err: String) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.md) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(DS.Palette.danger).font(.system(size: 13))
+    private func errorRow(_ err: String) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.sm) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 11)).foregroundColor(DS.Palette.danger)
             Text(err)
-                .font(DS.Font.monoSmall)
-                .foregroundColor(DS.Palette.danger)
-                .textSelection(.enabled)
+                .font(DS.Font.monoSmall).foregroundColor(DS.Palette.danger)
+                .lineSpacing(3).textSelection(.enabled)
             Spacer(minLength: 0)
         }
-        .padding(DS.Space.lg)
-        .background(DS.Palette.danger.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-            .strokeBorder(DS.Palette.danger.opacity(0.35), lineWidth: DS.Border.hairline))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
     private func messageRow(_ msg: AgentMessage) -> some View {
-        let isUser = msg.role == .user
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: isUser ? "person.crop.circle" : "sparkle")
-                    .font(.system(size: 11))
-                    .foregroundColor(isUser ? DS.Palette.accent : DS.Palette.success)
-                Text(isUser ? "You" : "Assistant")
-                    .font(DS.Font.caption2.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
+        switch msg.role {
+        case .user:
+            VStack(alignment: .trailing, spacing: DS.Space.xs) {
+                Text(msg.content)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, DS.Space.xl)
+                    .padding(.vertical, DS.Space.lg)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+                    .frame(maxWidth: 560, alignment: .leading)
+                Button { copyToPasteboard(msg.content) } label: {
+                    Image(systemName: "doc.on.doc").font(.system(size: 11))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Copy message")
             }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        case .assistant:
+            assistantProse(msg.content)
+        case .system:
             Text(msg.content)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .italic()
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(DS.Space.lg)
-        .background(isUser ? DS.Palette.surface : DS.Palette.surfaceRaised)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-            .strokeBorder(isUser ? DS.Palette.line : DS.Palette.accent.opacity(0.22),
-                          lineWidth: DS.Border.hairline))
     }
 
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
+        VStack(alignment: .leading, spacing: DS.Space.xl) {
             ForEach(turn.items, id: \.id) { item in itemRow(item) }
-            if let final = turn.finalAssistantMessage, !final.isEmpty {
-                VStack(alignment: .leading, spacing: DS.Space.sm) {
-                    HStack(spacing: DS.Space.sm) {
-                        Image(systemName: "sparkle").font(.system(size: 11)).foregroundColor(DS.Palette.success)
-                        Text("Assistant").font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
-                    }
-                    Text(final)
-                        .font(DS.Font.body).foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .padding(DS.Space.lg)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                    .strokeBorder(DS.Palette.accent.opacity(0.3), lineWidth: DS.Border.hairline))
+            // Only show the turn's final text if no assistant-message item
+            // already rendered it (prevents the answer showing twice).
+            if let final = turn.finalAssistantMessage, !final.isEmpty,
+               !turn.items.contains(where: { $0.type == .assistantMessage }) {
+                assistantProse(final)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
     private func itemRow(_ item: AssistantItem) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            HStack(spacing: DS.Space.sm) {
-                DSPill(item.type.rawValue, tone: itemTone(item.type))
-                if let s = item.summary, !s.isEmpty {
-                    Text(s).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
-                }
-                Spacer()
-                if item.state == .streaming {
-                    ProgressView().controlSize(.small).scaleEffect(0.5)
-                } else {
-                    Text(item.state.rawValue).font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
-                }
-            }
-            if !item.body.isEmpty {
-                Text(item.body)
-                    .font(item.type == .tool ? DS.Font.monoSmall : DS.Font.bodyDense)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
-            }
-            if let o = item.output, !o.isEmpty {
-                Text(o)
-                    .font(DS.Font.monoSmall)
+        switch item.type {
+        case .assistantMessage:
+            if !item.body.isEmpty { assistantProse(item.body) }
+        case .reasoning:
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text(item.state == .streaming ? "Thinking…" : "Thought")
+                    .font(DS.Font.caption2.weight(.semibold))
                     .foregroundColor(DS.Palette.textTertiary)
+                if !item.body.isEmpty {
+                    Text(item.body)
+                        .font(DS.Font.bodyDense)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineSpacing(3)
+                        .textSelection(.enabled)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .plan:
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text("PLAN").font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
+                    .foregroundColor(DS.Palette.accent)
+                assistantProse(item.body)
+            }
+        case .tool:
+            toolRow(item)
+        }
+    }
+
+    @ViewBuilder
+    private func toolRow(_ item: AssistantItem) -> some View {
+        let label = ((item.summary?.isEmpty == false ? item.summary! : item.body))
+            .replacingOccurrences(of: "\n", with: " ")
+        let running = item.state == .streaming
+        let hasOutput = (item.output?.isEmpty == false)
+        let expanded = expandedTools.contains(item.id)
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Button {
+                guard hasOutput else { return }
+                if expanded { expandedTools.remove(item.id) } else { expandedTools.insert(item.id) }
+            } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: running ? "circle.dotted" : "terminal")
+                        .font(.system(size: 10)).foregroundColor(DS.Palette.textTertiary)
+                    (Text(running ? "Running " : "Ran ")
+                        .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                     + Text(label)
+                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary))
+                    .lineLimit(1).truncationMode(.tail)
+                    Spacer(minLength: 0)
+                    if hasOutput {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expanded, let o = item.output, !o.isEmpty {
+                Text(o)
+                    .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
                     .textSelection(.enabled)
-                    .padding(DS.Space.sm)
+                    .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(DS.Palette.bg)
+                    .background(DS.Palette.surface)
                     .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             }
         }
-        .padding(DS.Space.lg)
-        .background(DS.Palette.surface)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-    }
-
-    private func itemTone(_ t: AssistantItemType) -> DSPill.Tone {
-        switch t {
-        case .reasoning: return .neutral
-        case .plan: return .accent
-        case .tool: return .warning
-        case .assistantMessage: return .success
-        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: Composer
 
     private var composer: some View {
         VStack(spacing: DS.Space.sm) {
+            if !vm.attachments.isEmpty { attachmentChips }
             ZStack(alignment: .topLeading) {
                 if vm.prompt.isEmpty {
                     Text("Message \(vm.provider.rawValue.capitalized)…")
@@ -474,8 +834,17 @@ public struct AgentAppView: View {
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            HStack {
-                Text("⌘↩ to send").font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
+            HStack(spacing: DS.Space.md) {
+                Button(action: pickAttachments) {
+                    Image(systemName: "paperclip").font(.system(size: 12))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textSecondary)
+                .help("Attach files")
+                .accessibilityLabel("Attach files")
+                .disabled(vm.status == .running)
+                Text("⌘↩ send · /clear /fork /model /plan /status")
+                    .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
                 Spacer()
                 Button("Send") { Task { await vm.send() } }
                     .buttonStyle(DSPrimaryButtonStyle())
@@ -488,18 +857,75 @@ public struct AgentAppView: View {
         .dsBar(edge: .top)
     }
 
+    private var attachmentChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: DS.Space.sm) {
+                ForEach(vm.attachments, id: \.self) { path in
+                    HStack(spacing: DS.Space.xs) {
+                        Image(systemName: "doc").font(.system(size: 9))
+                        Text((path as NSString).lastPathComponent)
+                            .font(DS.Font.caption2).lineLimit(1)
+                        Button { vm.removeAttachment(path) } label: {
+                            Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove attachment")
+                    }
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 3)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(Capsule())
+                    .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                }
+            }
+        }
+    }
+
+    private func pickAttachments() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            vm.addAttachments(panel.urls.map { $0.path })
+        }
+    }
+
     private var sendDisabled: Bool {
-        vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.status == .running
+        (vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty)
+            || vm.status == .running
     }
 
     // MARK: Plan notes sidebar
 
     private var planSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            DSSectionHeader("Plan notes", trailing: AnyView(
-                DSIconButton("xmark", help: "Hide notes") { vm.showPlanSidebar = false }
+            DSSectionHeader("Plan", trailing: AnyView(
+                DSIconButton("xmark", help: "Hide plan") { vm.showPlanSidebar = false }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            if let plan = vm.latestPlanText {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text("PROPOSED BY AGENT")
+                        .font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
+                        .foregroundColor(DS.Palette.accent)
+                    ScrollView {
+                        Text(plan)
+                            .font(DS.Font.monoSmall)
+                            .foregroundColor(DS.Palette.text)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 220)
+                }
+                .padding(DS.Space.md)
+                .background(DS.Palette.bg)
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            }
+            Text("NOTES")
+                .font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
+                .foregroundColor(DS.Palette.textTertiary)
+                .padding(.horizontal, DS.Space.md).padding(.top, DS.Space.sm)
             TextEditor(text: $vm.planNotes)
                 .font(DS.Font.mono)
                 .scrollContentBackground(.hidden)
@@ -519,6 +945,9 @@ public final class AgentAppSurface: NSObject, Surface {
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     public let viewModel: AgentAppViewModel
+    /// EventBus subscription so socket-driven thread mutations refresh
+    /// this already-open surface (wired by AppCommandRouter, like Feed).
+    public var subscriptionToken: AnyHashable?
 
     public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])

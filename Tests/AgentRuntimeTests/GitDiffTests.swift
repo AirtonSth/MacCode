@@ -262,4 +262,59 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(GitDiff.commitDiff(in: dir, hash: "deadbeefdeadbeef"), "",
                        "an unknown revision must yield empty output, not stale/garbage text")
     }
+
+    // MARK: D4 — suggested commit message
+
+    func test_suggestCommitMessage_singleManyAndEmpty() {
+        let one = GitSummary(isGitRepo: true, branch: "m", dirty: true,
+            files: [GitFileEntry(path: "a.txt", oldPath: nil, status: .modified, additions: 2, deletions: 1, binary: false)],
+            totalAdditions: 2, totalDeletions: 1)
+        XCTAssertEqual(GitDiff.suggestCommitMessage(one), "Update a.txt (+2 −1)")
+        let many = GitSummary(isGitRepo: true, branch: "m", dirty: true,
+            files: (0..<3).map { GitFileEntry(path: "f\($0)", oldPath: nil, status: .modified, additions: 1, deletions: 0, binary: false) },
+            totalAdditions: 3, totalDeletions: 0)
+        XCTAssertEqual(GitDiff.suggestCommitMessage(many), "Update 3 files (+3 −0)")
+        let clean = GitSummary(isGitRepo: true, branch: nil, dirty: false, files: [], totalAdditions: 0, totalDeletions: 0)
+        XCTAssertEqual(GitDiff.suggestCommitMessage(clean), "", "a clean tree suggests no message")
+    }
+
+    // MARK: D2 — push / pull-request URL
+
+    func test_push_setsUpstreamThenPushesAgain() throws {
+        let remote = NSTemporaryDirectory() + "rc2-bare-" + UUID().uuidString
+        run(["git", "init", "-q", "--bare", remote])
+        let dir = try mkTmpRepo()
+        defer { try? FileManager.default.removeItem(atPath: dir); try? FileManager.default.removeItem(atPath: remote) }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "remote", "add", "origin", remote])
+        let first = GitDiff.push(in: dir)
+        XCTAssertTrue(first.ok, "first push must set upstream and succeed: \(first.message)")
+        try "more\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+        run(["git", "-C", dir, "commit", "-aqm", "second"])
+        XCTAssertTrue(GitDiff.push(in: dir).ok, "subsequent push (upstream set) must also succeed")
+    }
+
+    func test_push_notGitRepo_failsLoud() {
+        let dir = NSTemporaryDirectory() + UUID().uuidString
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let r = GitDiff.push(in: dir)
+        XCTAssertFalse(r.ok); XCTAssertFalse(r.message.isEmpty)
+    }
+
+    func test_pullRequestURL_githubSSH_gitlabHTTPS_andNoRemote() throws {
+        let dir = try mkTmpRepo()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "checkout", "-qb", "feature/x"])
+        XCTAssertNil(GitDiff.pullRequestURL(in: dir), "no origin → no PR URL")
+        run(["git", "-C", dir, "remote", "add", "origin", "git@github.com:acme/widget.git"])
+        XCTAssertEqual(GitDiff.pullRequestURL(in: dir),
+                       "https://github.com/acme/widget/compare/feature/x?expand=1",
+                       "git@github SSH remote must normalize to a GitHub compare URL")
+        run(["git", "-C", dir, "remote", "set-url", "origin", "https://gitlab.com/acme/widget.git"])
+        XCTAssertEqual(GitDiff.pullRequestURL(in: dir),
+                       "https://gitlab.com/acme/widget/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature/x",
+                       "GitLab remotes must use the MR-new URL shape")
+    }
 }

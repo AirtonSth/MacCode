@@ -104,8 +104,16 @@ public indirect enum JSONValue: Codable, Sendable, Equatable {
 public extension JSONValue {
     static func obj(_ pairs: [String: JSONValue]) -> JSONValue { .object(pairs) }
     static func from(_ any: Any?) -> JSONValue {
-        guard let any else { return .null }
+        guard let any, !(any is NSNull) else { return .null }
         if let s = any as? String { return .string(s) }
+        // JSONSerialization bridges both `true` and `1` to NSNumber, and
+        // `1 as? Bool` succeeds — so an integer count like `additions: 1`
+        // would wrongly encode as `true`. CFBoolean is the only reliable
+        // bool discriminator; everything else NSNumber is a real number.
+        if let n = any as? NSNumber {
+            if CFGetTypeID(n) == CFBooleanGetTypeID() { return .bool(n.boolValue) }
+            return .number(n.doubleValue)
+        }
         if let b = any as? Bool { return .bool(b) }
         if let i = any as? Int { return .number(Double(i)) }
         if let d = any as? Double { return .number(d) }

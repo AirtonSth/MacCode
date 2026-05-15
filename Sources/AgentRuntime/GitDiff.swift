@@ -54,7 +54,7 @@ public struct GitCommit: Codable, Sendable, Equatable {
     }
 }
 
-public struct GitActionResult: Sendable, Equatable {
+public struct GitActionResult: Codable, Sendable, Equatable {
     public let ok: Bool
     public let message: String
 
@@ -146,9 +146,10 @@ public enum GitDiff {
         )
     }
 
-    public static func diff(in cwd: String, path: String?) -> String {
+    public static func diff(in cwd: String, path: String?, ignoreWhitespace: Bool = false) -> String {
         guard isGit(cwd) else { return "" }
         var args = ["diff", "HEAD", "--no-color"]
+        if ignoreWhitespace { args.append("-w") }
         if let path { args.append("--"); args.append(path) }
         return run(args, cwd: cwd).stdout
     }
@@ -199,9 +200,63 @@ public enum GitDiff {
         return commits
     }
 
-    public static func commitDiff(in cwd: String, hash: String) -> String {
+    /// remotecode.io GitQuickControl parity — a sensible fallback commit
+    /// subject derived from the working-tree summary.
+    public static func suggestCommitMessage(_ s: GitSummary) -> String {
+        guard !s.files.isEmpty else { return "" }
+        let stat = "+\(s.totalAdditions) −\(s.totalDeletions)"
+        if s.files.count == 1 { return "Update \(s.files[0].path) (\(stat))" }
+        return "Update \(s.files.count) files (\(stat))"
+    }
+
+    /// `git push`; if there is no upstream, set one (`-u origin HEAD`).
+    public static func push(in cwd: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let r = run(["push"], cwd: cwd)
+        if r.exit == 0 { return GitActionResult(ok: true, message: actionMessage(r)) }
+        let combined = (r.stderr + r.stdout).lowercased()
+        if combined.contains("no upstream") || combined.contains("set-upstream") || combined.contains("has no upstream") {
+            let r2 = run(["push", "-u", "origin", "HEAD"], cwd: cwd)
+            return GitActionResult(ok: r2.exit == 0, message: actionMessage(r2))
+        }
+        return GitActionResult(ok: false, message: actionMessage(r))
+    }
+
+    /// A web URL to open a pull/merge request for the current branch,
+    /// derived from `origin`. nil if not a repo / no usable remote.
+    public static func pullRequestURL(in cwd: String) -> String? {
+        guard isGit(cwd) else { return nil }
+        let remote = run(["remote", "get-url", "origin"], cwd: cwd)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remote.isEmpty else { return nil }
+        let branch = run(["rev-parse", "--abbrev-ref", "HEAD"], cwd: cwd)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !branch.isEmpty, branch != "HEAD" else { return nil }
+        // Normalize git@host:owner/repo(.git) and https://host/owner/repo(.git)
+        var host = "", path = ""
+        if remote.hasPrefix("git@"), let colon = remote.firstIndex(of: ":") {
+            host = String(remote[remote.index(remote.startIndex, offsetBy: 4)..<colon])
+            path = String(remote[remote.index(after: colon)...])
+        } else if let r = URL(string: remote), let h = r.host {
+            host = h
+            path = String(r.path.drop(while: { $0 == "/" }))
+        } else {
+            return nil
+        }
+        if path.hasSuffix(".git") { path = String(path.dropLast(4)) }
+        guard !host.isEmpty, !path.isEmpty else { return nil }
+        if host.contains("gitlab") {
+            return "https://\(host)/\(path)/-/merge_requests/new?merge_request%5Bsource_branch%5D=\(branch)"
+        }
+        // GitHub (and GitHub-compatible) compare page.
+        return "https://\(host)/\(path)/compare/\(branch)?expand=1"
+    }
+
+    public static func commitDiff(in cwd: String, hash: String, ignoreWhitespace: Bool = false) -> String {
         guard isGit(cwd) else { return "" }
-        return run(["show", hash, "--no-color"], cwd: cwd).stdout
+        var args = ["show", hash, "--no-color"]
+        if ignoreWhitespace { args.append("-w") }
+        return run(args, cwd: cwd).stdout
     }
 
     // MARK: helpers

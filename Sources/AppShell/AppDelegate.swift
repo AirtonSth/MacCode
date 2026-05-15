@@ -147,8 +147,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(viewItem)
         let viewMenu = NSMenu(title: "View")
         let paletteItem = NSMenuItem(title: "Show Command Palette", action: #selector(togglePalette), keyEquivalent: "k")
-        paletteItem.keyEquivalentModifierMask = [.command, .shift]
+        paletteItem.keyEquivalentModifierMask = [.command]
         paletteItem.target = self
+        // C5: ~/.remotecode2/keybindings.json may rebind the palette.
+        applyKeybindingOverride(to: paletteItem, command: "commandPalette.toggle")
         viewMenu.addItem(paletteItem)
         viewItem.submenu = viewMenu
 
@@ -183,6 +185,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "RemoteCode 2"
         alert.informativeText = "Native Swift macOS rewrite. cmux-style panes + Agent App surface."
         alert.runModal()
+    }
+
+    private func applyKeybindingOverride(to item: NSMenuItem, command: String) {
+        let cfg = KeybindingConfig.loadDefaultPath()
+        guard let binding = cfg.bindings.last(where: { $0.command == command }) else { return }
+        var mask: NSEvent.ModifierFlags = []
+        var ch = ""
+        for t in binding.key.split(separator: "+").map(String.init) {
+            switch t {
+            case "mod": mask.insert(.command)
+            case "ctrl": mask.insert(.control)
+            case "alt", "opt": mask.insert(.option)
+            case "shift": mask.insert(.shift)
+            default: ch = t
+            }
+        }
+        if !ch.isEmpty { item.keyEquivalent = ch; item.keyEquivalentModifierMask = mask }
     }
 
     @objc private func togglePalette() {

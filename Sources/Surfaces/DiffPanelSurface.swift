@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import CoreModel
 import AgentRuntime
+import Persistence
 import DesignSystemKit
 
 public enum GitPanelMode: String, CaseIterable, Sendable {
@@ -15,8 +16,8 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var summary: GitSummary
     @Published public var selectedPath: String?
     @Published public var rawDiff: String = ""
-    @Published public var wordWrap: Bool = false
-    @Published public var ignoreWhitespace: Bool = false
+    @Published public var wordWrap: Bool = false { didSet { persistPrefs() } }
+    @Published public var ignoreWhitespace: Bool = false { didSet { persistPrefs() } }
 
     @Published public var branches: GitBranches
     @Published public var commits: [GitCommit] = []
@@ -25,11 +26,26 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var selectedCommit: String?
     @Published public var lastError: String?
     private var historyLoaded = false
+    private let settings: SettingsStore?
 
-    public init(cwd: String) {
+    /// C8: diff view prefs persist across launches via SettingsStore.
+    public init(cwd: String, settings: SettingsStore? = nil) {
         self.cwd = cwd
+        self.settings = settings
         self.summary = GitDiff.summary(in: cwd)
         self.branches = GitDiff.branches(in: cwd)
+        if let s = settings?.load() {
+            // Set within init → property observers don't fire (no echo write).
+            self.wordWrap = s.diffWordWrap
+            self.ignoreWhitespace = s.diffIgnoreWhitespace
+        }
+    }
+
+    private func persistPrefs() {
+        settings?.update {
+            $0.diffWordWrap = self.wordWrap
+            $0.diffIgnoreWhitespace = self.ignoreWhitespace
+        }
     }
 
     public func refresh() {
@@ -61,12 +77,8 @@ public final class DiffPanelViewModel: ObservableObject {
     public func selectFile(_ path: String?) {
         selectedPath = path
         selectedCommit = nil
-        if let p = path {
-            let cwd = self.cwd
-            DispatchQueue.global().async { [weak self] in
-                let d = GitDiff.diff(in: cwd, path: p)
-                DispatchQueue.main.async { self?.rawDiff = d }
-            }
+        if path != nil {
+            reloadDiff()
         } else {
             rawDiff = ""
         }
@@ -75,9 +87,27 @@ public final class DiffPanelViewModel: ObservableObject {
     public func selectCommit(_ hash: String) {
         selectedCommit = hash
         selectedPath = nil
+        reloadDiff()
+    }
+
+    /// Re-fetch the diff for whatever is currently selected. Called on
+    /// selection change and whenever the ignore-whitespace toggle flips,
+    /// so the toggle has a visible effect instead of being inert.
+    public func reloadDiff() {
         let cwd = self.cwd
+        let ws = self.ignoreWhitespace
+        let path = self.selectedPath
+        let commit = self.selectedCommit
+        guard path != nil || commit != nil else { rawDiff = ""; return }
         DispatchQueue.global().async { [weak self] in
-            let d = GitDiff.commitDiff(in: cwd, hash: hash)
+            let d: String
+            if let p = path {
+                d = GitDiff.diff(in: cwd, path: p, ignoreWhitespace: ws)
+            } else if let h = commit {
+                d = GitDiff.commitDiff(in: cwd, hash: h, ignoreWhitespace: ws)
+            } else {
+                d = ""
+            }
             DispatchQueue.main.async { self?.rawDiff = d }
         }
     }
@@ -96,6 +126,25 @@ public final class DiffPanelViewModel: ObservableObject {
         let msg = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !msg.isEmpty else { return }
         runAction(clearMessageOnOK: true) { GitDiff.commit(in: $0, message: msg) }
+    }
+
+    /// D4: fill the composer with a generated fallback subject.
+    public func suggestMessage() {
+        commitMessage = GitDiff.suggestCommitMessage(summary)
+    }
+
+    /// D2: push the current branch (sets upstream if needed).
+    public func push() {
+        runAction { GitDiff.push(in: $0) }
+    }
+
+    /// D2: open a PR/MR page for the current branch in the browser.
+    public func openPullRequest() {
+        guard let url = GitDiff.pullRequestURL(in: cwd), let u = URL(string: url) else {
+            lastError = "No remote 'origin' / branch to open a pull request for."
+            return
+        }
+        NSWorkspace.shared.open(u)
     }
 
     /// Runs a mutating git op off the main thread, then re-reads summary,
@@ -456,11 +505,24 @@ public struct DiffPanelView: View {
     private var commitBox: some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            Text("COMMIT")
-                .font(DS.Font.caption2.weight(.semibold))
-                .tracking(0.6)
-                .foregroundColor(DS.Palette.textTertiary)
-                .padding(.top, DS.Space.xs)
+            HStack {
+                Text("COMMIT")
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .tracking(0.6)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer()
+                Button(action: vm.suggestMessage) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "sparkles").font(.system(size: 9))
+                        Text("Suggest").font(DS.Font.caption2.weight(.medium))
+                    }
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.accent)
+                .disabled(vm.summary.files.isEmpty)
+                .help("Generate a fallback commit message")
+            }
+            .padding(.top, DS.Space.xs)
             TextField("Message (summarize the change)", text: $vm.commitMessage, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(DS.Font.monoSmall)
@@ -483,6 +545,24 @@ public struct DiffPanelView: View {
             .disabled(commitDisabled)
             .opacity(commitDisabled ? 0.45 : 1)
             .animation(DS.Motion.micro, value: commitDisabled)
+            HStack(spacing: DS.Space.sm) {
+                Button(action: vm.push) {
+                    HStack(spacing: DS.Space.xs) {
+                        Image(systemName: "arrow.up.circle").font(.system(size: 11))
+                        Text("Push")
+                    }.frame(maxWidth: .infinity)
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .help("git push (sets upstream if needed)")
+                Button(action: vm.openPullRequest) {
+                    HStack(spacing: DS.Space.xs) {
+                        Image(systemName: "arrow.triangle.pull").font(.system(size: 11))
+                        Text("Pull Request")
+                    }.frame(maxWidth: .infinity)
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .help("Open a PR/MR page for this branch")
+            }
             if commitDisabled {
                 Text(commitHint)
                     .font(DS.Font.caption2)
@@ -604,6 +684,7 @@ public struct DiffPanelView: View {
                 .background(DS.Palette.bg)
             }
         }
+        .onChange(of: vm.ignoreWhitespace) { _ in vm.reloadDiff() }
     }
 
     private var diffToolbar: some View {
@@ -716,10 +797,10 @@ public final class DiffPanelSurface: NSObject, Surface {
     public let view: NSView
     public let viewModel: DiffPanelViewModel
 
-    public init(workspaceID: WorkspaceID, cwd: String, title: String = "Diff") {
+    public init(workspaceID: WorkspaceID, cwd: String, title: String = "Diff", settings: SettingsStore? = nil) {
         self.descriptor = SurfaceDescriptor(type: .rightSidebarTool, title: title, iconName: "doc.text.magnifyingglass",
                                             metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd, "tool": "diff"])
-        self.viewModel = DiffPanelViewModel(cwd: cwd)
+        self.viewModel = DiffPanelViewModel(cwd: cwd, settings: settings)
         let host = NSHostingView(rootView: DiffPanelView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

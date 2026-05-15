@@ -10,7 +10,7 @@ RemoteCode 2's default shortcuts are inspired by T3 Code's defaults (`KEYBINDING
 | ⌘T             | New Terminal Surface   | In the active workspace. |
 | ⌘B             | New Browser Surface    | In the active workspace. |
 | ⌘G             | New Agent App Surface  | In the active workspace. |
-| ⌘⇧K            | Toggle Command Palette | Floating panel; ESC closes. |
+| ⌘K             | Toggle Command Palette | Floating panel; ESC closes. t3code/remotecode.io parity. |
 | ⌘W             | Close Window           | Saves session snapshot first. |
 | ⌘M             | Minimize Window        | Native AppKit. |
 | ⌘Q             | Quit                   | Saves session snapshot. |
