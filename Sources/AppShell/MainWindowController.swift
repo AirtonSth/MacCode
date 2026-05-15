@@ -321,21 +321,35 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-/// NSSplitView that lays out its panes by explicit ratios instead of
+/// Split view that lays out its panes by explicit ratios instead of
 /// AppKit's content-hugging heuristics. A fresh split has ratios
 /// [0.5, 0.5], so each new pane is exactly half the old pane's width
 /// (vertical divider) or height (horizontal divider). Ratios are kept
 /// on live resize too.
-final class RatioSplitView: NSSplitView {
+final class RatioSplitView: NSView {
     var ratios: [CGFloat] = []
+    var isVertical = true { didSet { needsLayout = true } }
+    var dividerStyle: NSSplitView.DividerStyle = .thin
+    var dividerThickness: CGFloat { 1 }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = DS.NS.bg.cgColor
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer?.backgroundColor = DS.NS.bg.cgColor
+        layer?.masksToBounds = true
+    }
 
     func relayoutNow() { layoutByRatios() }
+    func adjustSubviews() { layoutByRatios() }
 
-    // NSSplitView routes layout through these; force our proportional
-    // pass from every entry point so the split is always exactly
-    // ratio-based regardless of when AppKit decides to lay out.
     override func resizeSubviews(withOldSize oldSize: NSSize) { layoutByRatios() }
-    override func adjustSubviews() { layoutByRatios() }
     override func layout() {
         super.layout()
         layoutByRatios()
@@ -364,19 +378,29 @@ final class RatioSplitView: NSSplitView {
                 let w = (i == n - 1) ? max(0, bounds.width - x)
                                      : (avail * norm[i]).rounded()
                 sv.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
-                (sv as? RatioSplitView)?.layoutByRatios()
+                relayoutChild(sv)
                 x += w + dt
             }
         } else {
             let avail = max(0, bounds.height - dt * CGFloat(n - 1))
-            var y: CGFloat = 0
+            var y: CGFloat = bounds.height
             for (i, sv) in subviews.enumerated() {
-                let h = (i == n - 1) ? max(0, bounds.height - y)
+                let h = (i == n - 1) ? max(0, y)
                                      : (avail * norm[i]).rounded()
+                y -= h
                 sv.frame = NSRect(x: 0, y: y, width: bounds.width, height: h)
-                (sv as? RatioSplitView)?.layoutByRatios()
-                y += h + dt
+                relayoutChild(sv)
+                y -= dt
             }
+        }
+    }
+
+    private func relayoutChild(_ child: NSView) {
+        child.needsLayout = true
+        if let split = child as? RatioSplitView {
+            split.layoutByRatios()
+        } else {
+            child.layoutSubtreeIfNeeded()
         }
     }
 }

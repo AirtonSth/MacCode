@@ -25,8 +25,8 @@ final class RatioSplitTests: XCTestCase {
         sv.isVertical = true
         sv.ratios = [0.5, 0.5]
         let l = NSView(); let r = NSView()
-        sv.addArrangedSubview(l)
-        sv.addArrangedSubview(r)
+        sv.addSubview(l)
+        sv.addSubview(r)
         sv.adjustSubviews()
         let lw = sv.subviews[0].frame.width
         let rw = sv.subviews[1].frame.width
@@ -40,14 +40,16 @@ final class RatioSplitTests: XCTestCase {
         sv.isVertical = false
         sv.ratios = [0.5, 0.5]
         let top = NSView(); let bottom = NSView()
-        sv.addArrangedSubview(top)
-        sv.addArrangedSubview(bottom)
+        sv.addSubview(top)
+        sv.addSubview(bottom)
         sv.adjustSubviews()
         let h0 = sv.subviews[0].frame.height
         let h1 = sv.subviews[1].frame.height
         XCTAssertEqual(h0, h1, accuracy: 1.0)
         XCTAssertEqual(h0 + h1 + sv.dividerThickness, 500, accuracy: 1.0)
         XCTAssertEqual(sv.subviews[0].frame.width, 300, accuracy: 0.5)
+        XCTAssertGreaterThan(sv.subviews[0].frame.minY, sv.subviews[1].frame.minY,
+                             "stacked splits must keep the first child visually above the second child")
     }
 
     func test_ratioSplitView_nestedHorizontalSplitRelayoutsChildren() {
@@ -72,5 +74,30 @@ final class RatioSplitTests: XCTestCase {
         XCTAssertEqual(bottom.frame.width, rightNested.bounds.width, accuracy: 0.5)
         XCTAssertEqual(top.frame.height, bottom.frame.height, accuracy: 1.0,
                        "a vertical/down split inside another split must stack panes, not leave stale side-by-side frames")
+    }
+
+    func test_ratioSplitView_relayoutsPaneSubviewConstraintsAfterFrameChange() {
+        let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 300, height: 200))
+        sv.isVertical = true
+        sv.ratios = [0.5, 0.5]
+
+        let pane = NSView()
+        pane.translatesAutoresizingMaskIntoConstraints = true
+        let surface = NSView()
+        surface.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(surface)
+        NSLayoutConstraint.activate([
+            surface.topAnchor.constraint(equalTo: pane.topAnchor),
+            surface.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+            surface.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            surface.trailingAnchor.constraint(equalTo: pane.trailingAnchor)
+        ])
+
+        sv.addSubview(pane)
+        sv.addSubview(NSView())
+        sv.adjustSubviews()
+
+        XCTAssertEqual(surface.frame.width, pane.bounds.width, accuracy: 0.5,
+                       "pane content must relayout immediately after a split changes pane width, or terminal text can bleed into neighboring panes")
     }
 }

@@ -72,4 +72,15 @@ final class ANSIRendererTests: XCTestCase {
         XCTAssertEqual(r.grid[0][0].ch, "b")
         XCTAssertEqual(r.grid[1][0].ch, "c")
     }
+
+    func test_cursorOffset_usesCursorRowNotTrailingBlankRows() {
+        let r = ANSIRenderer(rows: 5, cols: 20)
+        r.feed("prompt".data(using: .utf8)!)
+
+        let snap = r.snapshot()
+        let cursorOffset = r.cursorOffset(in: snap.string)
+
+        XCTAssertLessThan(cursorOffset, (snap.string as NSString).length - 3,
+                          "terminal panes must scroll the cursor into view, not scroll to trailing blank rows")
+    }
 }

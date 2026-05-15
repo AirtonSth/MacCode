@@ -119,6 +119,10 @@ public final class TerminalSurface: NSObject, Surface {
         scroll.borderType = .noBorder
         scroll.drawsBackground = true
         scroll.backgroundColor = DS.NS.terminalBG
+        scroll.wantsLayer = true
+        scroll.layer?.masksToBounds = true
+        scroll.contentView.wantsLayer = true
+        scroll.contentView.layer?.masksToBounds = true
 
         let tv = TerminalTextView()
         tv.isEditable = false
@@ -145,6 +149,7 @@ public final class TerminalSurface: NSObject, Surface {
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.terminalBG.cgColor
+        container.layer?.masksToBounds = true
         scroll.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(scroll)
         NSLayoutConstraint.activate([
@@ -219,8 +224,13 @@ public final class TerminalSurface: NSObject, Surface {
             if sel.location + sel.length <= (self.textView.string as NSString).length {
                 self.textView.setSelectedRange(sel)
             }
-            self.textView.scrollToEndOfDocument(nil)
+            self.scrollCursorToVisible(in: snap)
         }
+    }
+
+    private func scrollCursorToVisible(in snap: NSAttributedString) {
+        let location = renderer.cursorOffset(in: snap.string)
+        textView.scrollRangeToVisible(NSRange(location: location, length: 0))
     }
 
     private func appendString(_ raw: String) {

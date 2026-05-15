@@ -387,6 +387,18 @@ public final class ANSIRenderer {
         return out
     }
 
+    public func cursorOffset(in rendered: String) -> Int {
+        let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard !lines.isEmpty else { return 0 }
+        let row = min(cursorRow, lines.count - 1)
+        var offset = 0
+        for i in 0..<row {
+            offset += (lines[i] as NSString).length + 1
+        }
+        offset += min(cursorCol, (lines[row] as NSString).length)
+        return min(offset, (rendered as NSString).length)
+    }
+
     public func resize(rows newRows: Int, cols newCols: Int) {
         guard newRows > 0, newCols > 0 else { return }
         var newGrid = Array(repeating: Array(repeating: Cell.empty, count: newCols), count: newRows)

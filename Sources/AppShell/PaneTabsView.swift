@@ -24,10 +24,11 @@ public final class PaneTabsView: NSObject {
         self.pane = pane
         self.router = router
         self.showsWorkspaceControls = showsWorkspaceControls
-        let v = NSView()
+        let v = PaneRootView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
         v.layer?.backgroundColor = DS.NS.bg.cgColor
+        v.layer?.masksToBounds = true
         self.view = v
 
         super.init()
@@ -53,6 +54,7 @@ public final class PaneTabsView: NSObject {
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         contentArea.wantsLayer = true
         contentArea.layer?.backgroundColor = DS.NS.bg.cgColor
+        contentArea.layer?.masksToBounds = true
         if let selID = selectedID, let surface = SurfaceRegistry.shared.surface(selID) {
             let sv = surface.view
             sv.translatesAutoresizingMaskIntoConstraints = false
@@ -504,8 +506,18 @@ final class PaneTabButton: NSView {
 // of window dragging. (headerBG stays a plain NSView so its empty area
 // can still drag the window.)
 
-final class NoDragView: NSView {
+class NoDragView: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
+}
+
+final class PaneRootView: NoDragView {
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsUpdateConstraints = true
+        needsLayout = true
+        updateConstraintsForSubtreeIfNeeded()
+        layoutSubtreeIfNeeded()
+    }
 }
 
 final class NoDragStack: NSStackView {
