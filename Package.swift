@@ -18,6 +18,11 @@ let package = Package(
     dependencies: [],
     targets: [
         .target(
+            name: "CSystem",
+            path: "Sources/CSystem",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "CoreModel",
             path: "Sources/CoreModel"
         ),
@@ -41,7 +46,7 @@ let package = Package(
         ),
         .target(
             name: "Surfaces",
-            dependencies: ["CoreModel", "AgentRuntime", "Persistence"],
+            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "CSystem"],
             path: "Sources/Surfaces"
         ),
         .executableTarget(

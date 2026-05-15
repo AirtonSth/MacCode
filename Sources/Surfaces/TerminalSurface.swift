@@ -1,12 +1,13 @@
 import Foundation
 import AppKit
+import Darwin
 import CoreModel
+import CSystem
 
-/// Pipe-backed shell surface. This is a deliberate V1 simplification: it
-/// runs the user's shell with stdin/stdout/stderr connected to pipes
-/// (not a real PTY), so interactive programs that probe isatty() will
-/// behave differently than in a normal terminal. Use the agent's
-/// Codex/Claude CLI in --json/--print modes, which do not require a TTY.
+/// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)` so
+/// the child sees a real controlling terminal and `isatty()` returns true.
+/// ANSI escapes are stripped on the way to NSTextView for readability;
+/// raw bytes are still sent to the master fd via `sendText`.
 @MainActor
 public final class TerminalSurface: NSObject, Surface {
     public private(set) var descriptor: SurfaceDescriptor
@@ -14,10 +15,9 @@ public final class TerminalSurface: NSObject, Surface {
     private let textView: NSTextView
     private let scroll: NSScrollView
     private let inputField: NSTextField
-    private let process = Process()
-    private let stdinPipe = Pipe()
-    private let stdoutPipe = Pipe()
-    private let stderrPipe = Pipe()
+    private var masterFD: Int32 = -1
+    private var childPID: pid_t = -1
+    private var readSource: DispatchSourceRead?
 
     public init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         self.descriptor = SurfaceDescriptor(
@@ -76,36 +76,50 @@ public final class TerminalSurface: NSObject, Surface {
         input.action = #selector(submit)
 
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        process.executableURL = URL(fileURLWithPath: shell)
-        // -i interactive without rc: we want command-line oriented behavior; use -s -i
-        process.arguments = ["-i", "-l"]
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        var env = ProcessInfo.processInfo.environment
-        env["RC2_WORKSPACE_ID"] = workspaceID.value.uuidString
-        env["RC2_SURFACE_ID"] = descriptor.id.value.uuidString
-        env["TERM"] = "dumb"
-        process.environment = env
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+        var amaster: Int32 = -1
+        let pid = rc2_forkpty(&amaster)
+        if pid < 0 {
+            appendString("[forkpty failed: \(String(cString: strerror(errno)))]\n")
+            return
+        }
+        if pid == 0 {
+            // Child: change to cwd, set env, exec the user's shell.
+            _ = chdir(cwd)
+            setenv("TERM", "xterm-256color", 1)
+            setenv("RC2_WORKSPACE_ID", workspaceID.value.uuidString, 1)
+            setenv("RC2_SURFACE_ID", descriptor.id.value.uuidString, 1)
+            let shellName = (shell as NSString).lastPathComponent
+            shell.withCString { sPath in
+                ("-" + shellName).withCString { argv0 in
+                    // Login shell: argv[0] is "-zsh" or similar.
+                    let argv: [UnsafeMutablePointer<CChar>?] = [
+                        strdup(argv0),
+                        nil
+                    ]
+                    _ = execv(sPath, argv)
+                }
+            }
+            _exit(127)
+        }
+        self.masterFD = amaster
+        self.childPID = pid
+        _ = rc2_set_winsize(masterFD, 40, 120)
+        startReader()
+        appendString("[shell started: \(shell) cwd=\(cwd) pid=\(pid)]\n")
+    }
 
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let data = h.availableData
-            guard !data.isEmpty else { return }
-            DispatchQueue.main.async { self?.appendDataAsync(data) }
+    private func startReader() {
+        let src = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: .global())
+        readSource = src
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            let n = read(self.masterFD, &buf, buf.count)
+            if n <= 0 { return }
+            let data = Data(buf[0..<Int(n)])
+            DispatchQueue.main.async { self.appendDataAsync(data) }
         }
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let data = h.availableData
-            guard !data.isEmpty else { return }
-            DispatchQueue.main.async { self?.appendDataAsync(data) }
-        }
-
-        do {
-            try process.run()
-            appendString("[shell started: \(shell) cwd=\(cwd)]\n")
-        } catch {
-            appendString("[failed to start shell: \(error.localizedDescription)]\n")
-        }
+        src.resume()
     }
 
     private func appendDataAsync(_ data: Data) {
@@ -158,8 +172,10 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func sendText(_ text: String) {
-        guard let data = text.data(using: .utf8) else { return }
-        try? stdinPipe.fileHandleForWriting.write(contentsOf: data)
+        guard masterFD >= 0, let data = text.data(using: .utf8) else { return }
+        data.withUnsafeBytes { ptr in
+            _ = Darwin.write(masterFD, ptr.baseAddress, data.count)
+        }
     }
 
     public func readText() -> String {
@@ -174,10 +190,13 @@ public final class TerminalSurface: NSObject, Surface {
     public func unfocus() {}
 
     public func close() {
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        if process.isRunning { process.terminate() }
-        try? stdinPipe.fileHandleForWriting.close()
+        readSource?.cancel()
+        readSource = nil
+        if childPID > 0 { kill(childPID, SIGHUP) }
+        if masterFD >= 0 {
+            Darwin.close(masterFD)
+            masterFD = -1
+        }
     }
 
     public func snapshot() -> [String: String] {

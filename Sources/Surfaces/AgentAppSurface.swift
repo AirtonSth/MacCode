@@ -22,6 +22,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var statusMessage: String = ""
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
+    @Published public var gitSummary: GitSummary = GitSummary(isGitRepo: false, branch: nil, dirty: false, files: [], totalAdditions: 0, totalDeletions: 0)
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -43,6 +44,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.messageRepo = messageRepo
         self.coordinator.observer = self
         reloadThreads()
+        refreshGitSummary()
+    }
+
+    public func refreshGitSummary() {
+        let cwd = self.cwd
+        DispatchQueue.global().async {
+            let s = GitDiff.summary(in: cwd)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.applyGitSummary(s)
+            }
+        }
+    }
+
+    private func applyGitSummary(_ s: GitSummary) {
+        self.gitSummary = s
     }
 
     public func reloadThreads() {
@@ -124,6 +141,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             self.currentRunId = nil
             self.reloadThreads()
+            self.refreshGitSummary()
         }
     }
 
@@ -176,10 +194,38 @@ public struct AgentAppView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            branchToolbar
+            Divider()
             timelineView
             Divider()
             composer
         }
+    }
+
+    private var branchToolbar: some View {
+        HStack(spacing: 8) {
+            if vm.gitSummary.isGitRepo {
+                Label(vm.gitSummary.branch ?? "(detached)", systemImage: "arrow.triangle.branch")
+                    .font(.caption).foregroundColor(.secondary)
+                if vm.gitSummary.dirty {
+                    Text("dirty").font(.caption2).foregroundColor(.orange)
+                }
+                Text("+\(vm.gitSummary.totalAdditions)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.green)
+                Text("-\(vm.gitSummary.totalDeletions)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.red)
+            } else {
+                Label("No Git", systemImage: "questionmark.circle")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            Text(vm.cwd).font(.caption2).foregroundColor(.secondary).lineLimit(1).truncationMode(.middle)
+            Button(action: { vm.refreshGitSummary() }) {
+                Image(systemName: "arrow.clockwise").font(.caption2)
+            }.buttonStyle(.borderless)
+        }.padding(.horizontal, 8).padding(.vertical, 4)
     }
 
     private var header: some View {
@@ -222,6 +268,7 @@ public struct AgentAppView: View {
                     if let err = vm.timeline.error {
                         Text(err).foregroundColor(.red)
                     }
+                    changedFilesCard
                 }.padding(10)
             }
         }
@@ -249,6 +296,58 @@ public struct AgentAppView: View {
                 Text(final).font(.body).textSelection(.enabled).padding(6).background(Color.blue.opacity(0.08)).cornerRadius(6)
             }
         }.padding(4)
+    }
+
+    @ViewBuilder
+    private var changedFilesCard: some View {
+        if vm.gitSummary.isGitRepo && !vm.gitSummary.files.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Image(systemName: "doc.on.doc")
+                    Text("Changed files (\(vm.gitSummary.files.count))").font(.caption.bold())
+                    Spacer()
+                    Text("+\(vm.gitSummary.totalAdditions)  -\(vm.gitSummary.totalDeletions)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                ForEach(vm.gitSummary.files, id: \.path) { f in
+                    HStack {
+                        Text(statusGlyph(f.status)).frame(width: 18).foregroundColor(statusColor(f.status))
+                        Text(f.path).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        if !f.binary {
+                            Text("+\(f.additions)").font(.caption2.monospacedDigit()).foregroundColor(.green)
+                            Text("-\(f.deletions)").font(.caption2.monospacedDigit()).foregroundColor(.red)
+                        } else {
+                            Text("bin").font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            .padding(8)
+            .background(Color.gray.opacity(0.06))
+            .cornerRadius(6)
+        }
+    }
+
+    private func statusGlyph(_ s: GitFileStatus) -> String {
+        switch s {
+        case .added: return "A"
+        case .modified: return "M"
+        case .deleted: return "D"
+        case .renamed: return "R"
+        case .copied: return "C"
+        case .untracked: return "?"
+        case .unknown: return "•"
+        }
+    }
+    private func statusColor(_ s: GitFileStatus) -> Color {
+        switch s {
+        case .added, .untracked: return .green
+        case .deleted: return .red
+        case .renamed, .copied: return .yellow
+        default: return .secondary
+        }
     }
 
     @ViewBuilder
