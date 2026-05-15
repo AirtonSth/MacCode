@@ -13,6 +13,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public var socketServer: UnixSocketServer?
     public var httpServer: DirectHTTPServer?
     public var palette: CommandPalette?
+    public var settings: SettingsWindowController?
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
@@ -85,6 +86,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         palette = CommandPalette(router: router)
+        settings = SettingsWindowController(context: context)
         SystemNotifier.shared.bootstrap()
 
         installMainMenu()
@@ -107,6 +109,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenu.addItem(NSMenuItem(title: "About RemoteCode 2", action: #selector(showAbout), keyEquivalent: ""))
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "Hide RemoteCode 2", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         appMenu.addItem(NSMenuItem(title: "Quit RemoteCode 2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -179,6 +184,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePalette() {
         palette?.toggle()
+    }
+
+    @objc private func showSettings() {
+        settings?.show()
     }
 
     @objc private func newWorkspace() {
