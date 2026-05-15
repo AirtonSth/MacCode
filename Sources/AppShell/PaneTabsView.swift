@@ -90,21 +90,22 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
         router?.context?.state.window.selectedWorkspaceID
     }
 
-    @objc private func addTerminal() {
-        guard let wid = currentWorkspaceID() else { return }
-        _ = try? router?.createSurface(workspace: wid, type: .terminal, paneID: pane.id, title: "terminal")
+    @objc private func addTerminal() { performAdd(.terminal, title: "terminal") }
+    @objc private func addBrowser() { performAdd(.browser, title: "browser") }
+    @objc private func addAgent() { performAdd(.agentApp, title: "Agent App") }
+    @objc private func splitRight() { performSplit(.right, type: .agentApp, title: "Agent App") }
+
+    /// Testable seam shared by the @objc button handlers.
+    @discardableResult
+    public func performAdd(_ type: SurfaceType, title: String) -> SurfaceDescriptor? {
+        guard let wid = currentWorkspaceID() else { return nil }
+        return try? router?.createSurface(workspace: wid, type: type, paneID: pane.id, title: title)
     }
-    @objc private func addBrowser() {
-        guard let wid = currentWorkspaceID() else { return }
-        _ = try? router?.createSurface(workspace: wid, type: .browser, paneID: pane.id, title: "browser")
-    }
-    @objc private func addAgent() {
-        guard let wid = currentWorkspaceID() else { return }
-        _ = try? router?.createSurface(workspace: wid, type: .agentApp, paneID: pane.id, title: "Agent App")
-    }
-    @objc private func splitRight() {
-        guard let wid = currentWorkspaceID() else { return }
-        _ = try? router?.splitPane(workspace: wid, paneID: pane.id, direction: .right, surfaceType: .agentApp, title: "Agent App")
+
+    @discardableResult
+    public func performSplit(_ direction: SplitDirection, type: SurfaceType, title: String) -> SurfaceDescriptor? {
+        guard let wid = currentWorkspaceID() else { return nil }
+        return try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
     }
 
     public func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {

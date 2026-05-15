@@ -13,6 +13,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private let workspaceContainer = NSView()
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
+    /// Retains the live pane controllers; their @objc button and tab
+    /// targets die with them, so they must outlive a layout rebuild.
+    private var paneControllers: [PaneTabsView] = []
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -111,6 +114,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private func rebuildWorkspaceContainer() {
         for sub in workspaceContainer.subviews { sub.removeFromSuperview() }
+        // Drop references to the previous pane controllers; new ones are
+        // created below. Without retaining them their @objc button/tab
+        // targets are deallocated and clicks silently no-op.
+        paneControllers.removeAll()
         guard let ctx = context,
               let wid = ctx.state.window.selectedWorkspaceID,
               let ws = ctx.state.workspaces[wid] else {
@@ -142,7 +149,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private func buildLayoutView(node: LayoutNode) -> NSView {
         switch node {
         case .pane(let p):
-            return PaneTabsView(pane: p, router: router).view
+            let ptv = PaneTabsView(pane: p, router: router)
+            paneControllers.append(ptv)
+            return ptv.view
         case .split(let s):
             let split = NSSplitView()
             split.isVertical = (s.orientation == .horizontal)

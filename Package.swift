@@ -83,6 +83,11 @@ let package = Package(
             name: "SurfacesTests",
             dependencies: ["Surfaces", "CoreModel"],
             path: "Tests/SurfacesTests"
+        ),
+        .testTarget(
+            name: "AppShellTests",
+            dependencies: ["AppShell", "CoreModel", "Persistence", "Surfaces"],
+            path: "Tests/AppShellTests"
         )
     ],
     swiftLanguageVersions: [.v5]
