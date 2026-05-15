@@ -43,10 +43,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func setupLayout() {
-        window.backgroundColor = DS.NS.bg
+        // Window is non-opaque so the sidebar's behind-window vibrancy
+        // can blur the desktop. Content areas paint their own solid
+        // backgrounds, so only the sidebar region is translucent.
+        window.isOpaque = false
+        window.backgroundColor = .clear
         let content = NSView()
         content.wantsLayer = true
-        content.layer?.backgroundColor = DS.NS.bg.cgColor
+        content.layer?.backgroundColor = NSColor.clear.cgColor
         content.translatesAutoresizingMaskIntoConstraints = false
         split.isVertical = true
         split.dividerStyle = .thin

@@ -100,7 +100,10 @@ public struct SidebarRootView: View {
                 DSIconButton("plus", help: "New workspace") { vm.newWorkspace() }
             }
             .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
-            .dsBar(edge: .bottom)
+            .background(DS.Palette.surface.opacity(0.28))
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(DS.Palette.line.opacity(0.6)).frame(height: DS.Border.hairline)
+            }
 
             if vm.workspaces.isEmpty {
                 DSEmptyState(icon: "folder.badge.plus",
@@ -116,9 +119,10 @@ public struct SidebarRootView: View {
                 }
             }
         }
-        // Subtle liquid-glass: a near-transparent tint over the
-        // NSVisualEffectView the host sits in (see SidebarView).
-        .background(DS.Palette.surface.opacity(0.55))
+        // Subtle liquid-glass: a faint tint over the NSVisualEffectView
+        // the host sits in (see SidebarView). Low opacity so the blurred
+        // desktop behind the window reads through, gently.
+        .background(DS.Palette.surface.opacity(0.28))
     }
 
     @ViewBuilder
@@ -187,9 +191,10 @@ public final class SidebarView: NSObject {
         // the translucent SwiftUI sidebar. Chrome only — per design rules
         // glass never goes on main content.
         let container = NSVisualEffectView()
-        container.material = .underWindowBackground
+        container.material = .sidebar
         container.blendingMode = .behindWindow
         container.state = .active
+        container.isEmphasized = false
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(h)
         NSLayoutConstraint.activate([
