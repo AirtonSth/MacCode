@@ -261,11 +261,11 @@ public final class PaneTabsView: NSObject {
     }
 
     @objc private func splitHorizontal() {
-        performSplit(.right, type: .agentApp, title: Self.title(for: .agentApp))
+        performSplit(.right, type: .terminal, title: Self.title(for: .terminal))
     }
 
     @objc private func splitVertical() {
-        performSplit(.down, type: .agentApp, title: Self.title(for: .agentApp))
+        performSplit(.down, type: .terminal, title: Self.title(for: .terminal))
     }
 
     /// Testable seam shared by the @objc button handlers.

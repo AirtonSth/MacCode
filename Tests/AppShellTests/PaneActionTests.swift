@@ -14,24 +14,24 @@ final class PaneActionTests: XCTestCase {
         return (ctx, router)
     }
 
-    func test_addTerminal_button_addsSurface_toEmptyPane() throws {
+    func test_newWorkspace_opensTerminalByDefault_andAddCreatesAnother() throws {
         let (ctx, router) = try makeContext()
-        // create a workspace (empty pane)
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
-        guard case .pane(let pane) = ws.layout else { return XCTFail("expected single empty pane") }
-        XCTAssertEqual(pane.surfaces.count, 0)
+        // A new workspace opens with a terminal by default.
+        guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
+        XCTAssertEqual(pane.surfaces.count, 1)
+        XCTAssertEqual(pane.surfaces.first?.type, .terminal)
 
         let ptv = PaneTabsView(pane: pane, router: router)
         let desc = ptv.performAdd(.terminal, title: "terminal")
         XCTAssertNotNil(desc, "performAdd should return a descriptor")
 
-        // state must now contain the surface in that pane
         let updated = ctx.state.workspaces[ws.id]!
         guard case .pane(let p2) = updated.layout else { return XCTFail() }
-        XCTAssertEqual(p2.surfaces.count, 1)
-        XCTAssertEqual(p2.surfaces.first?.type, .terminal)
-        // and it must be registered so the tab can render it
+        XCTAssertEqual(p2.surfaces.count, 2)
+        XCTAssertTrue(p2.surfaces.allSatisfy { $0.type == .terminal })
         XCTAssertNotNil(SurfaceRegistry.shared.surface(p2.surfaces[0].id))
+        XCTAssertNotNil(SurfaceRegistry.shared.surface(p2.surfaces[1].id))
     }
 
     func test_addAgent_then_splitRight_buildsSplitTree() throws {
@@ -80,14 +80,15 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "c", cwd: NSTemporaryDirectory())
         guard case .pane(let pane) = ws.layout else { return XCTFail() }
+        // Workspace already has a default terminal (1); add two more (3).
         let v = PaneTabsView(pane: pane, router: router)
         let a = v.performAdd(.terminal, title: "t")
         _ = v.performAdd(.browser, title: "b")
         guard case .pane(let p1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
-        XCTAssertEqual(p1.surfaces.count, 2)
+        XCTAssertEqual(p1.surfaces.count, 3)
         try router.closeSurface(workspace: ws.id, surface: a!.id)
         guard case .pane(let p2) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
-        XCTAssertEqual(p2.surfaces.count, 1)
+        XCTAssertEqual(p2.surfaces.count, 2)
         XCTAssertFalse(p2.surfaces.contains { $0.id == a!.id })
     }
 

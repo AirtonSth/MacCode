@@ -33,7 +33,8 @@ final class PersistenceRestoreTests: XCTestCase {
         guard case .pane(let pane) = restoredWS.layout else {
             return XCTFail("expected the restored workspace to keep its pane")
         }
-        XCTAssertEqual(pane.surfaces.count, 2, "both tabs must persist")
+        // Default terminal (1) + the two added tabs (terminal, browser) = 3.
+        XCTAssertEqual(pane.surfaces.count, 3, "all tabs must persist")
         XCTAssertEqual(Set(pane.surfaces.map(\.type)), [.terminal, .browser])
         // And the window selection points at the restored workspace.
         XCTAssertEqual(ctx2.state.window.selectedWorkspaceID, restoredWS.id)

@@ -86,7 +86,7 @@ Within the SKILL 150–300ms window; ease-out for entrances.
 | Settings | `AppShell/SettingsWindow.swift` | Sectioned tabs, setting rows, CLI availability pills, pairing code, paired-device panels. |
 | Command palette | `AppShell/CommandPalette.swift` | `surface` panel, raised search field, divider, token row text colors. |
 | Browser chrome | `Surfaces/BrowserSurface.swift` | `surface` toolbar, SF Symbol nav buttons, mono address field, divider, dark blank page. |
-| Terminal | `Surfaces/TerminalSurface.swift` + `ANSIRenderer.swift` | Directly interactive (cmux model): `TerminalTextView` is first responder, every keystroke is encoded to VT100/xterm bytes and written to the pty — no bottom input field. Selection + ⌘C copy, ⌘V paste-to-pty. `terminalBG/FG`; ANSI default bg clear so the viewport color shows through. |
+| Terminal | `Surfaces/TerminalSurface.swift` + `ANSIRenderer.swift` | Directly interactive (cmux model): `TerminalTextView` is first responder, every keystroke is encoded to VT100/xterm bytes and written to the pty — no bottom input field. Solid inverse block caret at the cursor cell (always visible, survives end-of-line). Selection + ⌘C copy, ⌘V paste-to-pty. `terminalBG/FG`; ANSI default bg clear so the viewport color shows through. New workspaces and both split directions open a terminal by default. |
 | Window shell / empty state | `AppShell/MainWindowController.swift` | `bg` window + container, icon+title+subtitle empty state. |
 
 ## Accessibility notes

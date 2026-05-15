@@ -344,20 +344,38 @@ public final class ANSIRenderer {
         return NSColor(srgbRed: g, green: g, blue: g, alpha: 1)
     }
 
+    /// When true, the cell at (cursorRow, cursorCol) is drawn as a solid
+    /// inverse block so the caret is always visible (cmux/terminal style).
+    public var showCursor = true
+
     public func snapshot() -> NSAttributedString {
         let out = NSMutableAttributedString()
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let curRow = cursorRow
+        let curCol = min(cursorCol, cols - 1)
         for (i, row) in grid.enumerated() {
             // Trim trailing empties to keep lines tidy.
             var endCol = row.count - 1
             while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.clear { endCol -= 1 }
+            // Always render up to (and including) the cursor on its row
+            // so a caret at end-of-line / on a blank line still shows.
+            if showCursor, i == curRow { endCol = max(endCol, curCol) }
             if endCol < 0 {
                 if i < grid.count - 1 { out.append(NSAttributedString(string: "\n")) }
                 continue
             }
             for c in 0...endCol {
                 let cell = row[c]
-                var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: cell.fg, .backgroundColor: cell.bg]
+                let isCursor = showCursor && i == curRow && c == curCol
+                var fg = cell.fg
+                var bg = cell.bg
+                if isCursor {
+                    // Solid block: invert — fill with foreground color,
+                    // glyph (if any) painted in the background color.
+                    bg = ANSIRenderer.Cell.defaultFG
+                    fg = ANSIRenderer.Cell.defaultBG == NSColor.clear ? DS.NS.terminalBG : ANSIRenderer.Cell.defaultBG
+                }
+                var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: fg, .backgroundColor: bg]
                 if cell.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
                 if cell.bold {
                     attrs[.font] = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)

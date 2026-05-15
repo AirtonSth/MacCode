@@ -12,6 +12,29 @@ final class ANSIRendererTests: XCTestCase {
         XCTAssertEqual(r.cursorCol, 0)
     }
 
+    func test_cursorBlock_isRenderedInverse() {
+        let r = ANSIRenderer(rows: 2, cols: 10)
+        r.feed("ab".data(using: .utf8)!)   // cursor now at row 0, col 2
+        let snap = r.snapshot()
+        // Row keeps a 3rd cell (the caret) even though it is blank.
+        let firstLine = snap.string.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        XCTAssertTrue(firstLine.hasPrefix("ab"))
+        XCTAssertGreaterThanOrEqual(firstLine.count, 3)
+        // The caret cell uses an inverse (filled) background.
+        let attrs = snap.attributes(at: 2, effectiveRange: nil)
+        let bg = attrs[.backgroundColor] as? NSColor
+        XCTAssertEqual(bg, ANSIRenderer.Cell.defaultFG)
+    }
+
+    func test_cursorHidden_whenShowCursorFalse() {
+        let r = ANSIRenderer(rows: 2, cols: 10)
+        r.showCursor = false
+        r.feed("ab".data(using: .utf8)!)
+        let snap = r.snapshot()
+        let firstLine = snap.string.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        XCTAssertEqual(firstLine, "ab")  // trailing caret cell trimmed
+    }
+
     func test_sgrColors_applied() {
         let r = ANSIRenderer(rows: 1, cols: 10)
         r.feed("\u{1B}[31mR\u{1B}[0mX".data(using: .utf8)!)
