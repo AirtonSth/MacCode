@@ -13,7 +13,8 @@ let package = Package(
         .library(name: "Persistence", targets: ["Persistence"]),
         .library(name: "AgentRuntime", targets: ["AgentRuntime"]),
         .library(name: "SocketServer", targets: ["SocketServer"]),
-        .library(name: "Surfaces", targets: ["Surfaces"])
+        .library(name: "Surfaces", targets: ["Surfaces"]),
+        .library(name: "DesignSystemKit", targets: ["DesignSystemKit"])
     ],
     dependencies: [],
     targets: [
@@ -45,13 +46,17 @@ let package = Package(
             path: "Sources/SocketServer"
         ),
         .target(
+            name: "DesignSystemKit",
+            path: "Sources/DesignSystemKit"
+        ),
+        .target(
             name: "Surfaces",
-            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "CSystem"],
+            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "CSystem", "DesignSystemKit"],
             path: "Sources/Surfaces"
         ),
         .executableTarget(
             name: "AppShell",
-            dependencies: ["CoreModel", "Persistence", "AgentRuntime", "SocketServer", "Surfaces"],
+            dependencies: ["CoreModel", "Persistence", "AgentRuntime", "SocketServer", "Surfaces", "DesignSystemKit"],
             path: "Sources/AppShell"
         ),
         .executableTarget(

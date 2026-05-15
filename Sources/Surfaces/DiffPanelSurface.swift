@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import CoreModel
 import AgentRuntime
+import DesignSystemKit
 
 @MainActor
 public final class DiffPanelViewModel: ObservableObject {
@@ -46,67 +47,92 @@ public struct DiffPanelView: View {
 
     public var body: some View {
         HSplitView {
-            fileList.frame(minWidth: 220, idealWidth: 260)
-            diffBody.frame(minWidth: 400)
+            fileList.frame(minWidth: 240, idealWidth: 280)
+            diffBody.frame(minWidth: 420)
         }
+        .background(DS.Palette.bg)
     }
 
     private var fileList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Changes").font(.headline)
-                Spacer()
-                Button(action: vm.refresh) { Image(systemName: "arrow.clockwise") }.buttonStyle(.borderless)
-            }.padding(8)
-            Divider()
+            DSSectionHeader("Changes", trailing: AnyView(
+                DSIconButton("arrow.clockwise", help: "Refresh", action: vm.refresh)
+            ))
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             if !vm.summary.isGitRepo {
-                Spacer()
-                Text("Not a git repo").foregroundColor(.secondary).padding()
-                Spacer()
+                DSEmptyState(icon: "questionmark.folder", title: "Not a git repo",
+                             subtitle: "Open a workspace backed by git to inspect changes.")
             } else if vm.summary.files.isEmpty {
-                Spacer()
-                Text("No changes").foregroundColor(.secondary).padding()
-                Spacer()
+                DSEmptyState(icon: "checkmark.seal", title: "No changes",
+                             subtitle: "The working tree is clean.")
             } else {
-                List(selection: Binding(
-                    get: { vm.selectedPath },
-                    set: { vm.selectFile($0) }
-                )) {
-                    ForEach(vm.summary.files, id: \.path) { f in
-                        HStack {
-                            Text(statusGlyph(f.status))
-                                .font(.caption.monospaced())
-                                .foregroundColor(statusColor(f.status))
-                                .frame(width: 16)
-                            Text(f.path).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
-                            Spacer()
-                            if !f.binary {
-                                Text("+\(f.additions)").font(.caption2.monospacedDigit()).foregroundColor(.green)
-                                Text("-\(f.deletions)").font(.caption2.monospacedDigit()).foregroundColor(.red)
-                            }
-                        }.tag(f.path as String?)
-                    }
-                }.listStyle(.sidebar)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        ForEach(vm.summary.files, id: \.path) { f in
+                            fileRow(f)
+                        }
+                    }.padding(DS.Space.sm)
+                }
             }
         }
+        .background(DS.Palette.surface)
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+        }
+    }
+
+    @ViewBuilder
+    private func fileRow(_ f: GitFileEntry) -> some View {
+        let selected = vm.selectedPath == f.path
+        Button { vm.selectFile(f.path) } label: {
+            HStack(spacing: DS.Space.md) {
+                Text(statusGlyph(f.status))
+                    .font(DS.Font.monoSmall.weight(.bold))
+                    .foregroundColor(statusColor(f.status)).frame(width: 14)
+                Text(f.path).font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                if !f.binary {
+                    Text("+\(f.additions)").font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.success)
+                    Text("−\(f.deletions)").font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.danger)
+                }
+            }
+            .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+            .background(selected ? DS.Palette.selection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var diffBody: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Toggle("wrap", isOn: $vm.wordWrap).controlSize(.small)
-                Toggle("ignore-ws", isOn: $vm.ignoreWhitespace).controlSize(.small)
+            HStack(spacing: DS.Space.lg) {
+                Toggle("Wrap", isOn: $vm.wordWrap).controlSize(.small).font(DS.Font.caption)
+                Toggle("Ignore WS", isOn: $vm.ignoreWhitespace).controlSize(.small).font(DS.Font.caption)
                 Spacer()
-                if let p = vm.selectedPath { Text(p).font(.caption.monospaced()).foregroundColor(.secondary) }
-            }.padding(6)
-            Divider()
-            ScrollView([.vertical, vm.wordWrap ? .init() : .horizontal]) {
-                Text(vm.rawDiff.isEmpty ? "Select a file." : displayDiff)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let p = vm.selectedPath {
+                    Text(p).font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1).truncationMode(.middle)
+                }
             }
+            .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+            .dsBar(edge: .bottom)
+            ScrollView([.vertical, vm.wordWrap ? .init() : .horizontal]) {
+                if vm.rawDiff.isEmpty {
+                    Text("Select a file to view its diff.")
+                        .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textTertiary)
+                        .padding(DS.Space.xl)
+                } else {
+                    Text(displayDiff)
+                        .font(DS.Font.mono)
+                        .textSelection(.enabled)
+                        .padding(DS.Space.lg)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .background(DS.Palette.bg)
         }
     }
 
@@ -115,13 +141,15 @@ public struct DiffPanelView: View {
         for line in vm.rawDiff.split(separator: "\n", omittingEmptySubsequences: false) {
             var seg = AttributedString(String(line) + "\n")
             if line.hasPrefix("+") && !line.hasPrefix("+++") {
-                seg.foregroundColor = .green
+                seg.foregroundColor = DS.Palette.success
             } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-                seg.foregroundColor = .red
+                seg.foregroundColor = DS.Palette.danger
             } else if line.hasPrefix("@@") {
-                seg.foregroundColor = .cyan
+                seg.foregroundColor = DS.Palette.accent
             } else if line.hasPrefix("diff --git") || line.hasPrefix("+++") || line.hasPrefix("---") {
-                seg.foregroundColor = .yellow
+                seg.foregroundColor = DS.Palette.warning
+            } else {
+                seg.foregroundColor = DS.Palette.textSecondary
             }
             out.append(seg)
         }
@@ -137,10 +165,10 @@ public struct DiffPanelView: View {
     }
     private func statusColor(_ s: GitFileStatus) -> Color {
         switch s {
-        case .added, .untracked: return .green
-        case .deleted: return .red
-        case .renamed, .copied: return .yellow
-        default: return .secondary
+        case .added, .untracked: return DS.Palette.success
+        case .deleted: return DS.Palette.danger
+        case .renamed, .copied: return DS.Palette.warning
+        default: return DS.Palette.textSecondary
         }
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import WebKit
 import CoreModel
+import DesignSystemKit
 
 @MainActor
 public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
@@ -28,17 +29,24 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
 
         let tf = NSTextField()
         tf.placeholderString = "Enter URL and press Return"
-        tf.font = .systemFont(ofSize: 12)
+        tf.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tf.drawsBackground = true
+        tf.backgroundColor = DS.NS.surfaceRaised
+        tf.textColor = DS.NS.text
+        tf.bezelStyle = .roundedBezel
+        tf.focusRingType = .none
         self.addressBar = tf
 
         let toolbar = NSView()
-        for b in [backButton, forwardButton, reloadButton] {
-            b.bezelStyle = .recessed
-            b.controlSize = .small
+        toolbar.wantsLayer = true
+        toolbar.layer?.backgroundColor = DS.NS.surface.cgColor
+        for (b, glyph) in [(backButton, "chevron.backward"), (forwardButton, "chevron.forward"), (reloadButton, "arrow.clockwise")] {
+            b.isBordered = false
+            b.bezelStyle = .inline
+            b.image = NSImage(systemSymbolName: glyph, accessibilityDescription: glyph)
+            b.contentTintColor = DS.NS.textSecondary
+            b.imageScaling = .scaleProportionallyDown
         }
-        backButton.title = "◀"
-        forwardButton.title = "▶"
-        reloadButton.title = "↻"
 
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
@@ -66,6 +74,20 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             wv.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
 
+        let toolbarDivider = NSView()
+        toolbarDivider.wantsLayer = true
+        toolbarDivider.layer?.backgroundColor = DS.NS.line.cgColor
+        toolbarDivider.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(toolbarDivider)
+        NSLayoutConstraint.activate([
+            toolbarDivider.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            toolbarDivider.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            toolbarDivider.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+            toolbarDivider.heightAnchor.constraint(equalToConstant: 1)
+        ])
+
+        container.wantsLayer = true
+        container.layer?.backgroundColor = DS.NS.bg.cgColor
         self.view = container
         super.init()
         wv.navigationDelegate = self
@@ -78,10 +100,12 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             navigate(to: url)
         } else {
             let blank = """
-            <html><body style="background:#0a0e13;color:#cfd9e4;font:14px -apple-system">
-            <h2>RemoteCode 2 Browser Surface</h2>
+            <html><body style="background:#0F1419;color:#9DA9B5;font:14px/1.6 -apple-system;display:flex;align-items:center;justify-content:center;height:90vh;margin:0">
+            <div style="text-align:center;max-width:420px">
+            <div style="font-size:34px;margin-bottom:12px">🌐</div>
+            <h2 style="color:#E7EDF3;font-weight:600;font-size:18px">Browser surface</h2>
             <p>Enter a URL above. Local dev URLs (localhost) and file:// URLs are allowed.</p>
-            </body></html>
+            </div></body></html>
             """
             webView.loadHTMLString(blank, baseURL: nil)
         }

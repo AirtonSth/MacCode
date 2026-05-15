@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import CoreModel
 import Persistence
+import DesignSystemKit
 
 @MainActor
 public final class SettingsViewModel: ObservableObject {
@@ -64,68 +65,116 @@ public struct SettingsView: View {
             general.tabItem { Label("General", systemImage: "gearshape") }
             providers.tabItem { Label("Providers", systemImage: "sparkle") }
             remote.tabItem { Label("Remote Access", systemImage: "network") }
-        }.padding(16).frame(width: 540, height: 380)
+        }
+        .padding(DS.Space.xl)
+        .frame(width: 560, height: 400)
+        .background(DS.Palette.bg)
+    }
+
+    private func settingRow<Content: View>(_ label: String, @ViewBuilder _ control: () -> Content) -> some View {
+        HStack {
+            Text(label).font(DS.Font.body).foregroundColor(DS.Palette.text)
+            Spacer()
+            control()
+        }
+        .padding(.vertical, DS.Space.sm)
     }
 
     private var general: some View {
-        Form {
-            Picker("Theme", selection: $vm.theme) {
-                Text("Dark").tag("dark")
-                Text("Light").tag("light")
-            }.disabled(true) // V1 ships dark only
-            Toggle("First-run completed", isOn: $vm.firstRunCompleted).disabled(true)
-            Text("State directory: \(vm.context.bootstrapReport.path)")
-                .font(.caption.monospaced()).foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Appearance")
+            settingRow("Theme") {
+                Picker("", selection: $vm.theme) {
+                    Text("Dark").tag("dark"); Text("Light").tag("light")
+                }.labelsHidden().frame(width: 140).disabled(true)
+            }
+            settingRow("First-run completed") {
+                Image(systemName: vm.firstRunCompleted ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(vm.firstRunCompleted ? DS.Palette.success : DS.Palette.textTertiary)
+            }
+            Divider().overlay(DS.Palette.line)
+            Text("State directory")
+                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
+            Text(vm.context.bootstrapReport.path)
+                .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
+                .textSelection(.enabled)
+            Spacer()
         }
     }
 
     private var providers: some View {
-        Form {
-            Picker("Default provider", selection: $vm.defaultProvider) {
-                Text("Codex").tag(AgentProvider.codex)
-                Text("Claude").tag(AgentProvider.claude)
-            }.onChange(of: vm.defaultProvider) { v in vm.setDefaultProvider(v) }
-            Text("Codex CLI: \( codexInstalled ? "found" : "not in PATH" )")
-                .foregroundColor(codexInstalled ? .green : .red).font(.caption)
-            Text("Claude CLI: \( claudeInstalled ? "found" : "not in PATH" )")
-                .foregroundColor(claudeInstalled ? .green : .red).font(.caption)
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Default Provider")
+            settingRow("Provider") {
+                Picker("", selection: $vm.defaultProvider) {
+                    Text("Codex").tag(AgentProvider.codex)
+                    Text("Claude").tag(AgentProvider.claude)
+                }.labelsHidden().frame(width: 140)
+                .onChange(of: vm.defaultProvider) { v in vm.setDefaultProvider(v) }
+            }
+            Divider().overlay(DS.Palette.line)
+            DSSectionHeader("CLI Availability")
+            HStack(spacing: DS.Space.md) {
+                DSPill("codex", tone: codexInstalled ? .success : .danger)
+                Text(codexInstalled ? "Found in PATH" : "Not in PATH")
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+            }
+            HStack(spacing: DS.Space.md) {
+                DSPill("claude", tone: claudeInstalled ? .success : .danger)
+                Text(claudeInstalled ? "Found in PATH" : "Not in PATH")
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+            }
+            Spacer()
         }
     }
 
     private var remote: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle("Enable remote access (binds 0.0.0.0:18217)", isOn: $vm.remoteAccessEnabled)
-                .onChange(of: vm.remoteAccessEnabled) { v in vm.setRemoteAccess(v) }
-            Text("Pairing required when remote access is on. Tokens authorize every non-loopback /v1/* request.")
-                .font(.caption).foregroundColor(.secondary)
-            HStack {
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            DSSectionHeader("Direct Access")
+            settingRow("Enable remote access (0.0.0.0:18217)") {
+                Toggle("", isOn: $vm.remoteAccessEnabled)
+                    .labelsHidden()
+                    .onChange(of: vm.remoteAccessEnabled) { v in vm.setRemoteAccess(v) }
+            }
+            Text("Pairing required when remote access is on. Every non-loopback /v1/* request must carry a paired device token.")
+                .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+            HStack(spacing: DS.Space.lg) {
                 Button("Generate pairing code") { vm.createPairingCode() }
+                    .buttonStyle(DSSecondaryButtonStyle())
                 if let c = vm.newPairingCode {
-                    Text(c).font(.title.monospaced()).foregroundColor(.green).textSelection(.enabled)
+                    Text(c).font(DS.Font.title2.monospaced())
+                        .foregroundColor(DS.Palette.success).textSelection(.enabled)
                 }
             }
-            Divider()
-            Text("Paired devices:").font(.headline)
+            Divider().overlay(DS.Palette.line)
+            DSSectionHeader("Paired Devices")
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
+                LazyVStack(alignment: .leading, spacing: DS.Space.sm) {
+                    if vm.devices.isEmpty {
+                        Text("No paired devices.")
+                            .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                            .padding(DS.Space.md)
+                    }
                     ForEach(vm.devices, id: \.id) { d in
                         HStack {
-                            VStack(alignment: .leading) {
-                                Text(d.displayName).bold()
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(d.displayName).font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
                                 Text(d.id.prefix(8) + " · " + ISO8601DateFormatter().string(from: d.createdAt))
-                                    .font(.caption.monospaced()).foregroundColor(.secondary)
+                                    .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
                             }
                             Spacer()
                             if d.revokedAt != nil {
-                                Text("revoked").foregroundColor(.red).font(.caption)
+                                DSPill("revoked", tone: .danger)
                             } else {
-                                Button("Revoke") { vm.revoke(d.id) }.controlSize(.small)
+                                Button("Revoke") { vm.revoke(d.id) }
+                                    .buttonStyle(DSSecondaryButtonStyle())
                             }
                         }
+                        .dsPanel(padding: DS.Space.md)
                     }
                 }
-            }.frame(maxHeight: 140)
-        }.padding(.top, 4)
+            }.frame(maxHeight: 150)
+        }
     }
 
     private var codexInstalled: Bool {

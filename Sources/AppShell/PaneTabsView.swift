@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CoreModel
 import Surfaces
+import DesignSystemKit
 
 @MainActor
 public final class PaneTabsView: NSObject, NSTabViewDelegate {
@@ -16,6 +17,8 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
         self.router = router
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
+        v.wantsLayer = true
+        v.layer?.backgroundColor = DS.NS.bg.cgColor
         self.view = v
 
         super.init()
@@ -40,10 +43,13 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
                 ])
                 item.view = host
             } else {
-                let placeholder = NSTextField(labelWithString: "(missing surface \(desc.type.rawValue))")
-                placeholder.textColor = .secondaryLabelColor
+                let placeholder = NSTextField(labelWithString: "missing surface · \(desc.type.rawValue)")
+                placeholder.textColor = DS.NS.textTertiary
+                placeholder.font = NSFont.systemFont(ofSize: 12)
                 placeholder.translatesAutoresizingMaskIntoConstraints = false
                 let host = NSView()
+                host.wantsLayer = true
+                host.layer?.backgroundColor = DS.NS.bg.cgColor
                 host.translatesAutoresizingMaskIntoConstraints = false
                 host.addSubview(placeholder)
                 NSLayoutConstraint.activate([
@@ -58,28 +64,61 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
             }
         }
 
-        // Toolbar for + surface buttons
-        let addTerminal = NSButton(title: "+ Term", target: self, action: #selector(addTerminal))
-        let addBrowser = NSButton(title: "+ Browser", target: self, action: #selector(addBrowser))
-        let addAgent = NSButton(title: "+ Agent", target: self, action: #selector(addAgent))
-        let splitRight = NSButton(title: "↦ Split", target: self, action: #selector(splitRight))
-        for b in [addTerminal, addBrowser, addAgent, splitRight] {
-            b.bezelStyle = .recessed
-            b.controlSize = .small
+        // Toolbar for + surface buttons — token-styled flat buttons.
+        func mkButton(_ title: String, _ sel: Selector) -> NSButton {
+            let b = NSButton(title: title, target: self, action: sel)
+            b.isBordered = false
+            b.bezelStyle = .inline
+            b.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+            b.contentTintColor = DS.NS.textSecondary
+            b.wantsLayer = true
+            b.layer?.cornerRadius = DS.Radius.control
+            b.layer?.backgroundColor = DS.NS.surfaceRaised.cgColor
+            let attr = NSMutableAttributedString(string: title, attributes: [
+                .foregroundColor: DS.NS.textSecondary,
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium)
+            ])
+            b.attributedTitle = attr
+            return b
         }
+        let addTerminal = mkButton("+ Term", #selector(addTerminal))
+        let addBrowser = mkButton("+ Browser", #selector(addBrowser))
+        let addAgent = mkButton("+ Agent", #selector(addAgent))
+        let splitRight = mkButton("⇥ Split", #selector(splitRight))
+
         let toolbar = NSStackView(views: [addTerminal, addBrowser, addAgent, NSView(), splitRight])
         toolbar.orientation = .horizontal
-        toolbar.spacing = 6
+        toolbar.spacing = DS.Space.md
+        toolbar.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
-        v.addSubview(toolbar)
+        let toolbarBG = NSView()
+        toolbarBG.wantsLayer = true
+        toolbarBG.layer?.backgroundColor = DS.NS.surface.cgColor
+        toolbarBG.translatesAutoresizingMaskIntoConstraints = false
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = DS.NS.line.cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        v.addSubview(toolbarBG)
+        toolbarBG.addSubview(toolbar)
+        v.addSubview(divider)
         v.addSubview(tabView)
         NSLayoutConstraint.activate([
-            toolbar.topAnchor.constraint(equalTo: v.topAnchor, constant: 4),
-            toolbar.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 6),
-            toolbar.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -6),
-            toolbar.heightAnchor.constraint(equalToConstant: 22),
-            tabView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 4),
+            toolbarBG.topAnchor.constraint(equalTo: v.topAnchor),
+            toolbarBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            toolbarBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            toolbarBG.heightAnchor.constraint(equalToConstant: 32),
+            toolbar.leadingAnchor.constraint(equalTo: toolbarBG.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: toolbarBG.trailingAnchor),
+            toolbar.centerYAnchor.constraint(equalTo: toolbarBG.centerYAnchor),
+            divider.topAnchor.constraint(equalTo: toolbarBG.bottomAnchor),
+            divider.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            divider.heightAnchor.constraint(equalToConstant: 1),
+            tabView.topAnchor.constraint(equalTo: divider.bottomAnchor),
             tabView.bottomAnchor.constraint(equalTo: v.bottomAnchor),
             tabView.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             tabView.trailingAnchor.constraint(equalTo: v.trailingAnchor)

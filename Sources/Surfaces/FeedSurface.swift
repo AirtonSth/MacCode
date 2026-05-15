@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import Combine
 import CoreModel
+import DesignSystemKit
 
 /// Lightweight "feed" panel inspired by cmux's Feed (`docs/feed.md`).
 /// Subscribes to the in-process event bus exposed through a callback
@@ -40,41 +41,65 @@ public struct FeedPanelView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Feed").font(.headline)
+            HStack(spacing: DS.Space.md) {
+                Text("FEED").font(DS.Font.caption2.weight(.semibold))
+                    .tracking(0.6).foregroundColor(DS.Palette.textTertiary)
                 Spacer()
-                TextField("filter", text: $vm.filter).frame(maxWidth: 140)
-            }.padding(8)
-            Divider()
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(vm.filtered) { item in
-                        VStack(alignment: .leading, spacing: 1) {
-                            HStack {
-                                Text("#\(item.id)").font(.caption2.monospacedDigit()).foregroundColor(.secondary)
-                                Text(item.kind).font(.caption.bold()).foregroundColor(kindColor(item.kind))
-                                Spacer()
-                                Text(item.ts, style: .time).font(.caption2).foregroundColor(.secondary)
+                TextField("filter", text: $vm.filter)
+                    .textFieldStyle(.plain)
+                    .font(DS.Font.caption)
+                    .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.xs)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    .frame(maxWidth: 150)
+            }
+            .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+            .dsBar(edge: .bottom)
+            if vm.filtered.isEmpty {
+                DSEmptyState(icon: "dot.radiowaves.left.and.right",
+                             title: "No activity",
+                             subtitle: "Domain events (workspace, surface, notification, window) stream here as they happen.")
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xs) {
+                        ForEach(vm.filtered) { item in
+                            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                                HStack(spacing: DS.Space.sm) {
+                                    Text("#\(item.id)")
+                                        .font(DS.Font.caption2.monospacedDigit())
+                                        .foregroundColor(DS.Palette.textTertiary)
+                                    DSPill(item.kind, tone: kindTone(item.kind))
+                                    Spacer()
+                                    Text(item.ts, style: .time)
+                                        .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
+                                }
+                                if !item.title.isEmpty {
+                                    Text(item.title).font(DS.Font.caption)
+                                        .foregroundColor(DS.Palette.textSecondary).lineLimit(2)
+                                }
                             }
-                            if !item.title.isEmpty {
-                                Text(item.title).font(.caption).lineLimit(2)
-                            }
+                            .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+                            .background(DS.Palette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
                         }
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(Color.gray.opacity(0.05))
-                        .cornerRadius(4)
-                    }
-                }.padding(8)
+                    }.padding(DS.Space.md)
+                }
+                .background(DS.Palette.bg)
             }
         }
+        .background(DS.Palette.surface)
     }
 
-    private func kindColor(_ k: String) -> Color {
-        if k.hasPrefix("notification") { return .orange }
-        if k.hasPrefix("workspace") { return .blue }
-        if k.hasPrefix("surface") { return .green }
-        if k.hasPrefix("window") { return .purple }
-        return .primary
+    private func kindTone(_ k: String) -> DSPill.Tone {
+        if k.hasPrefix("notification") { return .warning }
+        if k.hasPrefix("workspace") { return .accent }
+        if k.hasPrefix("surface") { return .success }
+        if k.hasPrefix("window") { return .accent }
+        return .neutral
     }
 }
 

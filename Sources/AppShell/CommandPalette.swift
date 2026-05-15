@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CoreModel
 import Surfaces
+import DesignSystemKit
 
 public struct PaletteCommand {
     public let id: String
@@ -41,14 +42,21 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         panel.delegate = self
 
         searchField.placeholderString = "Type a command…"
-        searchField.font = .systemFont(ofSize: 14)
+        searchField.font = .systemFont(ofSize: 15)
         searchField.delegate = self
         searchField.target = self
         searchField.action = #selector(submit)
+        searchField.drawsBackground = true
+        searchField.backgroundColor = DS.NS.surfaceRaised
+        searchField.textColor = DS.NS.text
+        searchField.bezelStyle = .roundedBezel
+        searchField.focusRingType = .none
 
         tableView.headerView = nil
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.allowsMultipleSelection = false
+        tableView.backgroundColor = .clear
+        tableView.selectionHighlightStyle = .regular
         tableView.delegate = self
         tableView.dataSource = self
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("cmd"))
@@ -56,23 +64,38 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         tableView.addTableColumn(col)
         scroll.documentView = tableView
         scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
 
         let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = DS.NS.surface.cgColor
         container.translatesAutoresizingMaskIntoConstraints = false
         searchField.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = DS.NS.line.cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(searchField)
+        container.addSubview(divider)
         container.addSubview(scroll)
         NSLayoutConstraint.activate([
-            searchField.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
-            searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
-            searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
-            scroll.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
+            searchField.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
+            searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            divider.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 10),
+            divider.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            divider.heightAnchor.constraint(equalToConstant: 1),
+            scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
             scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
-            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8)
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6)
         ])
         panel.contentView = container
+        panel.isOpaque = false
+        panel.backgroundColor = DS.NS.surface
     }
 
     public func rebuildCommands() {
@@ -152,9 +175,10 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         cell.translatesAutoresizingMaskIntoConstraints = false
         let title = NSTextField(labelWithString: filtered[row].title)
         title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.textColor = DS.NS.text
         let subtitle = NSTextField(labelWithString: filtered[row].subtitle)
         subtitle.font = .systemFont(ofSize: 11)
-        subtitle.textColor = .secondaryLabelColor
+        subtitle.textColor = DS.NS.textTertiary
         let stack = NSStackView(views: [title, subtitle])
         stack.orientation = .vertical
         stack.alignment = .leading

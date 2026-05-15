@@ -3,6 +3,7 @@ import AppKit
 import Darwin
 import CoreModel
 import CSystem
+import DesignSystemKit
 
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)` so
 /// the child sees a real controlling terminal and `isatty()` returns true.
@@ -37,8 +38,8 @@ public final class TerminalSurface: NSObject, Surface {
         tv.isEditable = false
         tv.isSelectable = true
         tv.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        tv.backgroundColor = NSColor.black
-        tv.textColor = NSColor.white
+        tv.backgroundColor = DS.NS.terminalBG
+        tv.textColor = DS.NS.terminalFG
         tv.drawsBackground = true
         tv.minSize = NSSize(width: 0, height: 0)
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -50,9 +51,13 @@ public final class TerminalSurface: NSObject, Surface {
         self.scroll = scroll
 
         let input = NSTextField()
-        input.placeholderString = "Type command and press Return (pipe-backed shell)"
+        input.placeholderString = "Type a command and press Return"
         input.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         input.bezelStyle = .squareBezel
+        input.drawsBackground = true
+        input.backgroundColor = DS.NS.surface
+        input.textColor = DS.NS.text
+        input.focusRingType = .none
         self.inputField = input
 
         let container = NSView()

@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CoreModel
 import Surfaces
+import DesignSystemKit
 
 @MainActor
 public final class MainWindowController: NSObject, NSWindowDelegate {
@@ -42,7 +43,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func setupLayout() {
+        window.backgroundColor = DS.NS.bg
         let content = NSView()
+        content.wantsLayer = true
+        content.layer?.backgroundColor = DS.NS.bg.cgColor
         content.translatesAutoresizingMaskIntoConstraints = false
         split.isVertical = true
         split.dividerStyle = .thin
@@ -50,6 +54,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         sidebar.view.translatesAutoresizingMaskIntoConstraints = false
         workspaceContainer.translatesAutoresizingMaskIntoConstraints = false
 
+        workspaceContainer.wantsLayer = true
+        workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
         split.addArrangedSubview(sidebar.view)
         split.addArrangedSubview(workspaceContainer)
         split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
@@ -134,14 +140,36 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private func makeEmptyState() -> NSView {
         let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = DS.NS.bg.cgColor
         v.translatesAutoresizingMaskIntoConstraints = false
-        let label = NSTextField(labelWithString: "No workspace selected. Use ⌘N or the sidebar + button.")
-        label.textColor = .secondaryLabelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(label)
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "square.split.2x2", accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 30, weight: .light)
+        icon.contentTintColor = DS.NS.textTertiary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "No workspace selected")
+        title.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        title.textColor = DS.NS.textSecondary
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let sub = NSTextField(labelWithString: "Press ⌘N or the sidebar + button to open a folder as a workspace.")
+        sub.font = NSFont.systemFont(ofSize: 12)
+        sub.textColor = DS.NS.textTertiary
+        sub.alignment = .center
+        sub.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [icon, title, sub])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(stack)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: v.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: v.centerYAnchor)
+            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: v.centerYAnchor)
         ])
         return v
     }

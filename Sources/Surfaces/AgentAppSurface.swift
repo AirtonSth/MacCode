@@ -5,6 +5,7 @@ import Combine
 import CoreModel
 import Persistence
 import AgentRuntime
+import DesignSystemKit
 
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
@@ -161,220 +162,288 @@ public struct AgentAppView: View {
     public var body: some View {
         HSplitView {
             threadListPane
-                .frame(minWidth: 200, idealWidth: 230)
+                .frame(minWidth: 210, idealWidth: 240)
             mainPane
-                .frame(minWidth: 400)
+                .frame(minWidth: 420)
             if vm.showPlanSidebar {
-                planSidebar.frame(minWidth: 220, idealWidth: 260)
+                planSidebar.frame(minWidth: 230, idealWidth: 280)
             }
         }
+        .background(DS.Palette.bg)
         .task { await vm.loadModels() }
     }
 
+    // MARK: Plan sidebar
+
     private var planSidebar: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Plan").font(.headline)
-                Spacer()
-                Button(action: { vm.showPlanSidebar = false }) { Image(systemName: "xmark") }.buttonStyle(.borderless)
-            }
+        VStack(alignment: .leading, spacing: 0) {
+            DSSectionHeader("Plan", trailing: AnyView(
+                DSIconButton("xmark", help: "Hide plan") { vm.showPlanSidebar = false }
+            ))
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             TextEditor(text: $vm.planNotes)
-                .font(.body)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
-        }.padding(8)
+                .font(DS.Font.mono)
+                .scrollContentBackground(.hidden)
+                .padding(DS.Space.md)
+                .background(DS.Palette.surface)
+        }
+        .background(DS.Palette.surface)
+        .overlay(alignment: .leading) {
+            Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+        }
     }
+
+    // MARK: Thread list
 
     private var threadListPane: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Threads").font(.headline)
-                Spacer()
-                Button(action: { vm.createThread(title: "New thread") }) {
-                    Image(systemName: "plus")
-                }.buttonStyle(.borderless)
-            }.padding(8)
-            Divider()
-            List(selection: Binding(
-                get: { vm.selectedThreadId },
-                set: { if let t = $0 { vm.selectThread(t) } }
-            )) {
-                ForEach(vm.threads, id: \.id) { t in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(t.title).font(.body)
-                        Text("\(t.provider.rawValue) • \(t.model)")
-                            .font(.caption).foregroundColor(.secondary)
-                    }.tag(t.id)
+            DSSectionHeader("Threads", trailing: AnyView(
+                DSIconButton("plus", help: "New thread") { vm.createThread(title: "New thread") }
+            ))
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            if vm.threads.isEmpty {
+                DSEmptyState(icon: "bubble.left.and.bubble.right",
+                             title: "No threads",
+                             subtitle: "Send a prompt below to start a Codex or Claude thread in this workspace.")
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        ForEach(vm.threads, id: \.id) { t in
+                            threadRow(t)
+                        }
+                    }.padding(DS.Space.sm)
                 }
-            }.listStyle(.sidebar)
+            }
+        }
+        .background(DS.Palette.surface)
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
         }
     }
+
+    @ViewBuilder
+    private func threadRow(_ t: AgentThread) -> some View {
+        let selected = vm.selectedThreadId == t.id
+        Button { vm.selectThread(t.id) } label: {
+            HStack(spacing: DS.Space.md) {
+                Circle()
+                    .fill(t.status == .running ? DS.Palette.success : DS.Palette.textTertiary)
+                    .frame(width: 6, height: 6)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(t.title).font(DS.Font.bodyDense)
+                        .foregroundColor(DS.Palette.text).lineLimit(1)
+                    Text("\(t.provider.rawValue) · \(t.model)")
+                        .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.md)
+            .padding(.vertical, DS.Space.sm)
+            .background(selected ? DS.Palette.selection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: Main column
 
     private var mainPane: some View {
         VStack(spacing: 0) {
             header
-            Divider()
             branchToolbar
-            Divider()
             timelineView
             if vm.showTerminalDrawer {
-                Divider()
-                terminalDrawer.frame(minHeight: 140, idealHeight: 180, maxHeight: 280)
+                terminalDrawer.frame(minHeight: 150, idealHeight: 190, maxHeight: 300)
             }
-            Divider()
             composer
         }
+        .background(DS.Palette.bg)
     }
 
     private var terminalDrawer: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Terminal").font(.caption.bold())
+                Text("TERMINAL").font(DS.Font.caption2.weight(.semibold))
+                    .tracking(0.6).foregroundColor(DS.Palette.textTertiary)
                 Spacer()
-                Button(action: { vm.showTerminalDrawer = false }) {
-                    Image(systemName: "xmark.circle").font(.caption)
-                }.buttonStyle(.borderless)
-            }.padding(.horizontal, 8).padding(.vertical, 4)
+                DSIconButton("xmark", help: "Hide drawer") { vm.showTerminalDrawer = false }
+            }
+            .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             ScrollView {
-                Text("(open a Terminal surface beside this Agent App for a full shell.)\nUse ⌘T to create one.")
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .padding(8)
+                Text("Open a dedicated Terminal surface beside this Agent App for a full shell. Press ⌘T or use “+ Term” in the pane toolbar.")
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .padding(DS.Space.lg)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-        }.background(Color.black.opacity(0.6))
+        }
+        .background(DS.Palette.surface)
+        .overlay(alignment: .top) { Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline) }
     }
 
     private var branchToolbar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: DS.Space.md) {
             if vm.gitSummary.isGitRepo {
-                Label(vm.gitSummary.branch ?? "(detached)", systemImage: "arrow.triangle.branch")
-                    .font(.caption).foregroundColor(.secondary)
-                if vm.gitSummary.dirty {
-                    Text("dirty").font(.caption2).foregroundColor(.orange)
+                Label(vm.gitSummary.branch ?? "detached", systemImage: "arrow.triangle.branch")
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                if vm.gitSummary.dirty { DSPill("dirty", tone: .warning) }
+                HStack(spacing: DS.Space.xs) {
+                    Text("+\(vm.gitSummary.totalAdditions)")
+                        .font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.success)
+                    Text("−\(vm.gitSummary.totalDeletions)")
+                        .font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.danger)
                 }
-                Text("+\(vm.gitSummary.totalAdditions)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundColor(.green)
-                Text("-\(vm.gitSummary.totalDeletions)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundColor(.red)
             } else {
                 Label("No Git", systemImage: "questionmark.circle")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
             }
             Spacer()
-            Text(vm.cwd).font(.caption2).foregroundColor(.secondary).lineLimit(1).truncationMode(.middle)
-            Button(action: { vm.refreshGitSummary() }) {
-                Image(systemName: "arrow.clockwise").font(.caption2)
-            }.buttonStyle(.borderless)
-        }.padding(.horizontal, 8).padding(.vertical, 4)
+            Text(vm.cwd).font(DS.Font.monoSmall)
+                .foregroundColor(DS.Palette.textTertiary).lineLimit(1).truncationMode(.middle)
+            DSIconButton("arrow.clockwise", help: "Refresh git status") { vm.refreshGitSummary() }
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .dsBar(edge: .bottom)
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            Picker("Provider", selection: $vm.provider) {
+        HStack(spacing: DS.Space.md) {
+            Picker("", selection: $vm.provider) {
                 Text("Codex").tag(AgentProvider.codex)
                 Text("Claude").tag(AgentProvider.claude)
             }
+            .labelsHidden()
             .onChange(of: vm.provider) { _ in Task { await vm.loadModels() } }
-            .frame(width: 130)
-            Picker("Model", selection: $vm.model) {
-                ForEach(vm.availableModels, id: \.id) { m in
-                    Text(m.label).tag(m.id)
-                }
-            }.frame(width: 220)
-            Picker("Mode", selection: $vm.permissionMode) {
+            .frame(width: 120)
+            Picker("", selection: $vm.model) {
+                ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
+            }.labelsHidden().frame(width: 200)
+            Picker("", selection: $vm.permissionMode) {
                 Text("Supervised").tag(AgentPermissionMode.supervised)
                 Text("Auto-edit").tag(AgentPermissionMode.autoAcceptEdits)
-                Text("Full").tag(AgentPermissionMode.fullAccess)
-            }.frame(width: 160)
+                Text("Full access").tag(AgentPermissionMode.fullAccess)
+            }.labelsHidden().frame(width: 150)
             Spacer()
-            Button(action: { vm.showTerminalDrawer.toggle() }) {
-                Image(systemName: "terminal")
-            }.help("Toggle terminal drawer").buttonStyle(.borderless)
-            Button(action: { vm.showPlanSidebar.toggle() }) {
-                Image(systemName: "list.bullet.rectangle")
-            }.help("Toggle plan sidebar").buttonStyle(.borderless)
+            DSIconButton("terminal", help: "Toggle terminal drawer") { vm.showTerminalDrawer.toggle() }
+            DSIconButton("list.bullet.rectangle", help: "Toggle plan sidebar") { vm.showPlanSidebar.toggle() }
             if vm.status == .running {
-                ProgressView().controlSize(.small)
-                Button("Stop") { vm.stop() }
+                ProgressView().controlSize(.small).scaleEffect(0.7)
+                Button("Stop") { vm.stop() }.buttonStyle(DSSecondaryButtonStyle())
             }
-            Text(vm.status.rawValue).font(.caption).foregroundColor(.secondary)
-        }.padding(8)
+            DSPill(vm.status.rawValue, tone: statusTone(vm.status))
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+        .dsBar(edge: .bottom)
+    }
+
+    private func statusTone(_ s: AgentRunStatus) -> DSPill.Tone {
+        switch s {
+        case .running: return .accent
+        case .completed: return .success
+        case .failed: return .danger
+        case .cancelled, .interrupted: return .warning
+        default: return .neutral
+        }
     }
 
     private var timelineView: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach(vm.messages, id: \.id) { msg in
-                        messageRow(msg)
-                    }
-                    ForEach(vm.timeline.turns, id: \.turnId) { turn in
-                        turnView(turn)
-                    }
-                    if let err = vm.timeline.error {
-                        Text(err).foregroundColor(.red)
-                    }
-                    changedFilesCard
-                }.padding(10)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: DS.Space.md) {
+                ForEach(vm.messages, id: \.id) { msg in messageRow(msg) }
+                ForEach(vm.timeline.turns, id: \.turnId) { turn in turnView(turn) }
+                if let err = vm.timeline.error {
+                    HStack(spacing: DS.Space.sm) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(DS.Palette.danger)
+                        Text(err).font(DS.Font.bodyDense).foregroundColor(DS.Palette.danger)
+                    }.dsPanel()
+                }
+                changedFilesCard
+            }
+            .padding(DS.Space.xl)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(DS.Palette.bg)
+    }
+
+    @ViewBuilder
+    private func messageRow(_ msg: AgentMessage) -> some View {
+        let isUser = msg.role == .user
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            Text(isUser ? "YOU" : "AI")
+                .font(DS.Font.caption2.weight(.semibold))
+                .foregroundColor(isUser ? DS.Palette.accent : DS.Palette.success)
+                .frame(width: 28, alignment: .leading)
+                .padding(.top, 2)
+            Text(msg.content)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+        .padding(DS.Space.lg)
+        .background(isUser ? DS.Palette.surface : DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+    }
+
+    @ViewBuilder
+    private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            ForEach(turn.items, id: \.id) { item in itemRow(item) }
+            if let final = turn.finalAssistantMessage, !final.isEmpty {
+                Text(final)
+                    .font(DS.Font.body).foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                    .padding(DS.Space.lg)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                            .strokeBorder(DS.Palette.accent.opacity(0.3), lineWidth: DS.Border.hairline)
+                    )
             }
         }
     }
 
     @ViewBuilder
-    private func messageRow(_ msg: AgentMessage) -> some View {
-        HStack(alignment: .top) {
-            Text(msg.role == .user ? "You" : "Assistant")
-                .font(.caption).foregroundColor(.secondary).frame(width: 70, alignment: .leading)
-            Text(msg.content).textSelection(.enabled)
-            Spacer()
-        }.padding(8)
-            .background(msg.role == .user ? Color.gray.opacity(0.05) : Color.blue.opacity(0.05))
-            .cornerRadius(6)
-    }
-
-    @ViewBuilder
-    private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(turn.items, id: \.id) { item in
-                itemRow(item)
-            }
-            if let final = turn.finalAssistantMessage, !final.isEmpty {
-                Text(final).font(.body).textSelection(.enabled).padding(6).background(Color.blue.opacity(0.08)).cornerRadius(6)
-            }
-        }.padding(4)
-    }
-
-    @ViewBuilder
     private var changedFilesCard: some View {
         if vm.gitSummary.isGitRepo && !vm.gitSummary.files.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Image(systemName: "doc.on.doc")
-                    Text("Changed files (\(vm.gitSummary.files.count))").font(.caption.bold())
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "doc.on.doc").font(.system(size: 11)).foregroundColor(DS.Palette.textSecondary)
+                    Text("Changed files (\(vm.gitSummary.files.count))")
+                        .font(DS.Font.captionStrong).foregroundColor(DS.Palette.text)
                     Spacer()
-                    Text("+\(vm.gitSummary.totalAdditions)  -\(vm.gitSummary.totalDeletions)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(.secondary)
+                    Text("+\(vm.gitSummary.totalAdditions)")
+                        .font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.success)
+                    Text("−\(vm.gitSummary.totalDeletions)")
+                        .font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.danger)
                 }
                 ForEach(vm.gitSummary.files, id: \.path) { f in
-                    HStack {
-                        Text(statusGlyph(f.status)).frame(width: 18).foregroundColor(statusColor(f.status))
-                        Text(f.path).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
+                    HStack(spacing: DS.Space.md) {
+                        Text(statusGlyph(f.status))
+                            .font(DS.Font.monoSmall.weight(.bold))
+                            .frame(width: 14).foregroundColor(statusColor(f.status))
+                        Text(f.path).font(DS.Font.monoSmall)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .lineLimit(1).truncationMode(.middle)
                         Spacer()
                         if !f.binary {
-                            Text("+\(f.additions)").font(.caption2.monospacedDigit()).foregroundColor(.green)
-                            Text("-\(f.deletions)").font(.caption2.monospacedDigit()).foregroundColor(.red)
+                            Text("+\(f.additions)").font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.success)
+                            Text("−\(f.deletions)").font(DS.Font.caption2.monospacedDigit()).foregroundColor(DS.Palette.danger)
                         } else {
-                            Text("bin").font(.caption2).foregroundColor(.secondary)
+                            DSPill("bin")
                         }
                     }
                 }
             }
-            .padding(8)
-            .background(Color.gray.opacity(0.06))
-            .cornerRadius(6)
+            .dsPanel()
         }
     }
 
@@ -391,44 +460,92 @@ public struct AgentAppView: View {
     }
     private func statusColor(_ s: GitFileStatus) -> Color {
         switch s {
-        case .added, .untracked: return .green
-        case .deleted: return .red
-        case .renamed, .copied: return .yellow
-        default: return .secondary
+        case .added, .untracked: return DS.Palette.success
+        case .deleted: return DS.Palette.danger
+        case .renamed, .copied: return DS.Palette.warning
+        default: return DS.Palette.textSecondary
         }
     }
 
     @ViewBuilder
     private func itemRow(_ item: AssistantItem) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                Text(item.type.rawValue).font(.caption2.bold()).foregroundColor(.secondary)
-                if let s = item.summary { Text(s).font(.caption2).foregroundColor(.secondary) }
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.sm) {
+                DSPill(item.type.rawValue, tone: itemTone(item.type))
+                if let s = item.summary, !s.isEmpty {
+                    Text(s).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                }
                 Spacer()
-                Text(item.state.rawValue).font(.caption2).foregroundColor(.secondary)
+                Text(item.state.rawValue).font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
             }
             if !item.body.isEmpty {
-                Text(item.body).font(.system(.body, design: item.type == .tool ? .monospaced : .default)).textSelection(.enabled)
+                Text(item.body)
+                    .font(item.type == .tool ? DS.Font.monoSmall : DS.Font.bodyDense)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .textSelection(.enabled)
             }
             if let o = item.output, !o.isEmpty {
-                Text(o).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                Text(o)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .textSelection(.enabled)
+                    .padding(DS.Space.sm)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DS.Palette.bg)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             }
-        }.padding(6).background(Color.gray.opacity(0.04)).cornerRadius(4)
+        }
+        .padding(DS.Space.lg)
+        .background(DS.Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+    }
+
+    private func itemTone(_ t: AssistantItemType) -> DSPill.Tone {
+        switch t {
+        case .reasoning: return .neutral
+        case .plan: return .accent
+        case .tool: return .warning
+        case .assistantMessage: return .success
+        }
     }
 
     private var composer: some View {
-        VStack(spacing: 4) {
-            TextEditor(text: $vm.prompt)
-                .font(.body)
-                .frame(minHeight: 60, maxHeight: 140)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
+        VStack(spacing: DS.Space.sm) {
+            ZStack(alignment: .topLeading) {
+                if vm.prompt.isEmpty {
+                    Text("Message \(vm.provider.rawValue.capitalized)…")
+                        .font(DS.Font.body).foregroundColor(DS.Palette.textTertiary)
+                        .padding(.horizontal, DS.Space.md + 2).padding(.vertical, DS.Space.md)
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $vm.prompt)
+                    .font(DS.Font.body)
+                    .scrollContentBackground(.hidden)
+                    .padding(DS.Space.sm)
+                    .frame(minHeight: 64, maxHeight: 150)
+            }
+            .background(DS.Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+            )
             HStack {
+                Text("⌘↩ to send").font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
                 Spacer()
                 Button("Send") { Task { await vm.send() } }
+                    .buttonStyle(DSPrimaryButtonStyle())
                     .disabled(vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.status == .running)
+                    .opacity((vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.status == .running) ? 0.45 : 1)
                     .keyboardShortcut(.return, modifiers: [.command])
             }
-        }.padding(8)
+        }
+        .padding(DS.Space.lg)
+        .dsBar(edge: .top)
     }
 }
 

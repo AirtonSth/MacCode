@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import DesignSystemKit
 
 /// Minimal ANSI / VT100 emulator that converts a stream of bytes into an
 /// NSAttributedString. Handles a useful subset: SGR (colors, bold,
@@ -19,7 +20,9 @@ public final class ANSIRenderer {
         public var underline: Bool
         public var inverse: Bool
 
-        public static let empty = Cell(ch: " ", fg: .white, bg: .black,
+        public static let defaultFG = DS.NS.terminalFG
+        public static let defaultBG = NSColor.clear
+        public static let empty = Cell(ch: " ", fg: DS.NS.terminalFG, bg: NSColor.clear,
                                        bold: false, italic: false, underline: false, inverse: false)
     }
 
@@ -29,8 +32,8 @@ public final class ANSIRenderer {
     public private(set) var cursorRow = 0
     public private(set) var cursorCol = 0
 
-    private var fg: NSColor = .white
-    private var bg: NSColor = .black
+    private var fg: NSColor = ANSIRenderer.Cell.defaultFG
+    private var bg: NSColor = ANSIRenderer.Cell.defaultBG
     private var bold = false
     private var italic = false
     private var underline = false
@@ -274,9 +277,9 @@ public final class ANSIRenderer {
             case 24: underline = false
             case 27: inverse = false
             case 30...37: fg = ANSIRenderer.basicColors[p - 30]
-            case 39: fg = .white
+            case 39: fg = ANSIRenderer.Cell.defaultFG
             case 40...47: bg = ANSIRenderer.basicColors[p - 40]
-            case 49: bg = .black
+            case 49: bg = ANSIRenderer.Cell.defaultBG
             case 90...97: fg = ANSIRenderer.brightColors[p - 90]
             case 100...107: bg = ANSIRenderer.brightColors[p - 100]
             case 38, 48:
@@ -304,7 +307,7 @@ public final class ANSIRenderer {
     }
 
     private func reset() {
-        fg = .white; bg = .black
+        fg = ANSIRenderer.Cell.defaultFG; bg = ANSIRenderer.Cell.defaultBG
         bold = false; italic = false; underline = false; inverse = false
     }
 
@@ -347,7 +350,7 @@ public final class ANSIRenderer {
         for (i, row) in grid.enumerated() {
             // Trim trailing empties to keep lines tidy.
             var endCol = row.count - 1
-            while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.black { endCol -= 1 }
+            while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.clear { endCol -= 1 }
             if endCol < 0 {
                 if i < grid.count - 1 { out.append(NSAttributedString(string: "\n")) }
                 continue

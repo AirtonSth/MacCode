@@ -16,9 +16,9 @@ final class ANSIRendererTests: XCTestCase {
         let r = ANSIRenderer(rows: 1, cols: 10)
         r.feed("\u{1B}[31mR\u{1B}[0mX".data(using: .utf8)!)
         XCTAssertEqual(r.grid[0][0].ch, "R")
-        XCTAssertNotEqual(r.grid[0][0].fg, NSColor.white)
+        XCTAssertNotEqual(r.grid[0][0].fg, ANSIRenderer.Cell.defaultFG)
         XCTAssertEqual(r.grid[0][1].ch, "X")
-        XCTAssertEqual(r.grid[0][1].fg, NSColor.white)
+        XCTAssertEqual(r.grid[0][1].fg, ANSIRenderer.Cell.defaultFG)
     }
 
     func test_carriageReturn_overwrites() {
