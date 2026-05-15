@@ -48,6 +48,9 @@ final class FakeRouter: CommandRouting {
     func browserURL(surface: SurfaceID) throws -> String { "about:blank" }
     func browserEval(surface: SurfaceID, script: String) async throws -> String { "null" }
     func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String { savePath ?? "/tmp/x.png" }
+    func browserSnapshot(surface: SurfaceID) async throws -> String { "{\"elements\":[]}" }
+    func browserAction(surface: SurfaceID, kind: String, ref: String, value: String?) async throws -> String { "{\"ok\":true}" }
+    func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String { "{\"ok\":true}" }
 }
 
 final class DispatcherTests: XCTestCase {
@@ -78,7 +81,8 @@ final class DispatcherTests: XCTestCase {
     @MainActor
     func test_unsupportedDeferredMethod_returnsTypedError() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
-        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "browser.click", params: nil))
+        // pane.list still deferred in V1
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "pane.list", params: nil))
         XCTAssertEqual(resp.error?.code, -32004)
     }
 

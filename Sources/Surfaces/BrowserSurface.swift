@@ -111,6 +111,141 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         webView.evaluateJavaScript(js, completionHandler: completion)
     }
 
+    /// Returns an array of {ref, tag, text, role, attrs} for all visible
+    /// elements that look interactable. ref is a stable per-snapshot id
+    /// the browser stores on a WeakMap so subsequent click/fill calls can
+    /// resolve to the same node even if the DOM is reshuffled.
+    public func snapshot(completion: @escaping (String) -> Void) {
+        let js = #"""
+        (function(){
+          window.__rc2 = window.__rc2 || { refs: new Map(), counter: 0 };
+          const out = [];
+          const isVisible = (el) => {
+            if (!el) return false;
+            const s = getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          };
+          const interactable = (el) => {
+            const t = el.tagName;
+            if (['A','BUTTON','INPUT','TEXTAREA','SELECT','LABEL','SUMMARY'].includes(t)) return true;
+            if (el.getAttribute('role')) return true;
+            if (el.onclick) return true;
+            if (el.getAttribute('contenteditable') === 'true') return true;
+            return false;
+          };
+          document.querySelectorAll('*').forEach(el => {
+            if (!isVisible(el) || !interactable(el)) return;
+            const ref = 'rc2-' + (++window.__rc2.counter);
+            window.__rc2.refs.set(ref, el);
+            out.push({
+              ref,
+              tag: el.tagName,
+              text: (el.innerText || '').slice(0, 200),
+              role: el.getAttribute('role') || null,
+              name: el.getAttribute('name') || null,
+              type: el.getAttribute('type') || null,
+              placeholder: el.getAttribute('placeholder') || null,
+              href: el.tagName === 'A' ? el.getAttribute('href') : null,
+              value: ('value' in el) ? el.value : null,
+              bounding: (() => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })()
+            });
+          });
+          return JSON.stringify({ url: location.href, title: document.title, elements: out });
+        })()
+        """#
+        evaluate(js) { value, _ in
+            if let s = value as? String { completion(s) }
+            else { completion("{\"error\":\"snapshot failed\"}") }
+        }
+    }
+
+    public func performAction(_ kind: String, ref: String, value: String?, completion: @escaping (String) -> Void) {
+        let val = (value ?? "").replacingOccurrences(of: "`", with: "\\`")
+        let js = """
+        (function(){
+          const ref = "\(ref)";
+          if (!window.__rc2 || !window.__rc2.refs.has(ref)) {
+            return JSON.stringify({ ok: false, error: 'ref not found; call snapshot first' });
+          }
+          const el = window.__rc2.refs.get(ref);
+          try {
+            switch ("\(kind)") {
+              case 'click':
+                el.click();
+                break;
+              case 'focus':
+                el.focus();
+                break;
+              case 'fill':
+                el.focus();
+                if ('value' in el) {
+                  el.value = `\(val)`;
+                  el.dispatchEvent(new Event('input', { bubbles: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                } else if (el.isContentEditable) {
+                  el.textContent = `\(val)`;
+                }
+                break;
+              case 'type':
+                el.focus();
+                const txt = `\(val)`;
+                for (const ch of txt) {
+                  el.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true }));
+                  if ('value' in el) el.value += ch;
+                  el.dispatchEvent(new InputEvent('input', { data: ch, bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true }));
+                }
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                break;
+              case 'check':
+                el.checked = true;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                break;
+              case 'uncheck':
+                el.checked = false;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                break;
+              case 'select':
+                if (el.tagName === 'SELECT') {
+                  el.value = `\(val)`;
+                  el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                break;
+              case 'hover':
+                el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                break;
+            }
+            return JSON.stringify({ ok: true });
+          } catch (e) {
+            return JSON.stringify({ ok: false, error: String(e) });
+          }
+        })()
+        """
+        evaluate(js) { value, _ in
+            if let s = value as? String { completion(s) } else { completion("{\"ok\":false}") }
+        }
+    }
+
+    public func waitFor(_ selector: String, timeoutMs: Int, completion: @escaping (String) -> Void) {
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutMs) / 1000.0)
+        let escaped = selector.replacingOccurrences(of: "`", with: "\\`")
+        func poll() {
+            let probe = "(function(){ return document.querySelector(`\(escaped)`) ? true : false; })()"
+            self.evaluate(probe) { value, _ in
+                if (value as? Bool) == true {
+                    completion("{\"ok\":true}")
+                } else if Date() > deadline {
+                    completion("{\"ok\":false,\"error\":\"timeout\"}")
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll() }
+                }
+            }
+        }
+        poll()
+    }
+
     public func screenshotPNG() -> Data? {
         let bounds = webView.bounds
         guard bounds.width > 0, bounds.height > 0 else { return nil }

@@ -33,6 +33,9 @@ public protocol CommandRouting: AnyObject {
     func browserURL(surface: SurfaceID) throws -> String
     func browserEval(surface: SurfaceID, script: String) async throws -> String
     func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String
+    func browserSnapshot(surface: SurfaceID) async throws -> String
+    func browserAction(surface: SurfaceID, kind: String, ref: String, value: String?) async throws -> String
+    func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String
 }
 
 @MainActor
@@ -209,8 +212,23 @@ public final class JSONRPCDispatcher {
                 let path = params["path"]?.stringValue
                 let resolved = try router.browserScreenshot(surface: sid, savePath: path)
                 return .init(id: id, result: .object(["path": .string(resolved)]))
-            case "browser.click", "browser.fill", "browser.type", "browser.wait", "browser.snapshot":
-                throw JSONRPCError.notSupported(req.method)
+            case "browser.snapshot":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                let json = try await router.browserSnapshot(surface: sid)
+                return .init(id: id, result: .string(json))
+            case "browser.click", "browser.fill", "browser.type", "browser.focus", "browser.hover", "browser.check", "browser.uncheck", "browser.select":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let ref = params["ref"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let kind = String(req.method.dropFirst("browser.".count))
+                let value = params["value"]?.stringValue
+                let json = try await router.browserAction(surface: sid, kind: kind, ref: ref, value: value)
+                return .init(id: id, result: .string(json))
+            case "browser.wait":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let sel = params["selector"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let timeout = params["timeout_ms"]?.intValue ?? 5000
+                let json = try await router.browserWait(surface: sid, selector: sel, timeoutMs: timeout)
+                return .init(id: id, result: .string(json))
             // V1 deferred families return a typed unsupported error.
             case "window.list", "window.create", "window.focus", "window.close",
                  "pane.list", "pane.resize", "pane.swap", "pane.break", "pane.join",

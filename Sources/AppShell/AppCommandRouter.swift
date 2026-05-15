@@ -175,6 +175,27 @@ public final class AppCommandRouter: CommandRouting {
         return path
     }
 
+    public func browserSnapshot(surface: SurfaceID) async throws -> String {
+        let s = try browserSurface(surface)
+        return await withCheckedContinuation { cont in
+            s.snapshot { json in cont.resume(returning: json) }
+        }
+    }
+
+    public func browserAction(surface: SurfaceID, kind: String, ref: String, value: String?) async throws -> String {
+        let s = try browserSurface(surface)
+        return await withCheckedContinuation { cont in
+            s.performAction(kind, ref: ref, value: value) { json in cont.resume(returning: json) }
+        }
+    }
+
+    public func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String {
+        let s = try browserSurface(surface)
+        return await withCheckedContinuation { cont in
+            s.waitFor(selector, timeoutMs: timeoutMs) { json in cont.resume(returning: json) }
+        }
+    }
+
     private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String) -> SurfaceDescriptor {
         let baseTitle = title ?? defaultTitle(for: type)
         let descriptor = SurfaceDescriptor(type: type, title: baseTitle, iconName: type.rawValue, metadata: ["workspace": workspace.value.uuidString, "cwd": cwd])
