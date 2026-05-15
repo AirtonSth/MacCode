@@ -297,6 +297,8 @@ public final class AppCommandRouter: CommandRouting {
             ctx.state.workspaces[wid] = ws
             windowController?.refreshFromState()
         }
+        // Mirror into macOS notification center.
+        SystemNotifier.shared.post(title: title, body: body, category: category)
         return n.id
     }
 

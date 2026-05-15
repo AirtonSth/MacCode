@@ -116,7 +116,10 @@ public final class SidebarView: NSObject, NSTableViewDataSource, NSTableViewDele
         if let ctx = context, row < ctx.state.window.workspaces.count {
             let wid = ctx.state.window.workspaces[row]
             if let ws = ctx.state.workspaces[wid] {
-                cell.textField?.stringValue = ws.name
+                let unread = ws.notificationsUnread
+                let suffix = unread > 0 ? "  •\(unread)" : ""
+                cell.textField?.stringValue = ws.name + suffix
+                cell.textField?.textColor = unread > 0 ? NSColor.systemBlue : NSColor.labelColor
             }
         }
         return cell

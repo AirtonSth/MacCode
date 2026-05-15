@@ -85,6 +85,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         palette = CommandPalette(router: router)
+        SystemNotifier.shared.bootstrap()
 
         installMainMenu()
         windowController.show()
