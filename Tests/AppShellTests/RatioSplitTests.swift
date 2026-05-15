@@ -49,4 +49,28 @@ final class RatioSplitTests: XCTestCase {
         XCTAssertEqual(h0 + h1 + sv.dividerThickness, 500, accuracy: 1.0)
         XCTAssertEqual(sv.subviews[0].frame.width, 300, accuracy: 0.5)
     }
+
+    func test_ratioSplitView_nestedHorizontalSplitRelayoutsChildren() {
+        let outer = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        outer.isVertical = true
+        outer.ratios = [0.5, 0.5]
+
+        let left = NSView()
+        let rightNested = RatioSplitView()
+        rightNested.isVertical = false
+        rightNested.ratios = [0.5, 0.5]
+        let top = NSView()
+        let bottom = NSView()
+        rightNested.addSubview(top)
+        rightNested.addSubview(bottom)
+
+        outer.addSubview(left)
+        outer.addSubview(rightNested)
+        outer.adjustSubviews()
+
+        XCTAssertEqual(top.frame.width, rightNested.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(bottom.frame.width, rightNested.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(top.frame.height, bottom.frame.height, accuracy: 1.0,
+                       "a vertical/down split inside another split must stack panes, not leave stale side-by-side frames")
+    }
 }

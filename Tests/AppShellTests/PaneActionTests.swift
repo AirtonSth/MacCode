@@ -123,4 +123,36 @@ final class PaneActionTests: XCTestCase {
         XCTAssertNil(ptv.performAdd(.terminal, title: "terminal"),
                      "with no selected workspace performAdd must return nil, not crash")
     }
+
+    func test_tabHeaderControls_doNotBecomeWindowDragTargets() throws {
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "controls", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
+        let ptv = PaneTabsView(pane: pane, router: router)
+
+        let buttons = allSubviews(of: ptv.view).compactMap { $0 as? NSButton }
+        XCTAssertGreaterThanOrEqual(buttons.count, 4, "pane header should expose add/split/close controls")
+        XCTAssertTrue(buttons.allSatisfy { !$0.mouseDownCanMoveWindow },
+                      "tab add and close buttons live in the titlebar band, so they must receive clicks instead of starting a window drag")
+    }
+
+    func test_secondaryPaneHeader_onlyShowsPaneLocalControls() throws {
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "secondary", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
+        let ptv = PaneTabsView(pane: pane, router: router, showsWorkspaceControls: false)
+
+        let tooltips = allSubviews(of: ptv.view)
+            .compactMap { ($0 as? NSButton)?.toolTip }
+        XCTAssertFalse(tooltips.contains("Toggle sidebar"),
+                       "only the first pane should own workspace-level sidebar controls")
+        XCTAssertFalse(tooltips.contains("Open Git (changed files & diff)"),
+                       "only the first pane should own the workspace-level Git tab")
+        XCTAssertTrue(tooltips.contains("Split right (side by side)"))
+        XCTAssertTrue(tooltips.contains("Split down (stacked)"))
+    }
+
+    private func allSubviews(of view: NSView) -> [NSView] {
+        view.subviews + view.subviews.flatMap { allSubviews(of: $0) }
+    }
 }

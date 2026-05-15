@@ -9,18 +9,21 @@ public final class PaneTabsView: NSObject {
     public let view: NSView
     public let pane: PaneNode
     public weak var router: AppCommandRouter?
-    private let tabStrip = NSStackView()
+    private let tabStrip = NoDragStack()
     private let contentArea = NSView()
     // Leading edge of the header: an always-visible sidebar toggle, plus
     // an accent workspace pill (folder icon + name) shown only while the
     // sidebar is collapsed, so the active workspace stays obvious.
-    private let leadingBox = NSStackView()
-    private let wsPill = NSStackView()
+    private let leadingBox = NoDragStack()
+    private let wsPill = NoDragStack()
     private let wsLabel = NSTextField(labelWithString: "")
+    private let addMenu = NSMenu()
+    private let showsWorkspaceControls: Bool
 
-    public init(pane: PaneNode, router: AppCommandRouter?) {
+    public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true) {
         self.pane = pane
         self.router = router
+        self.showsWorkspaceControls = showsWorkspaceControls
         let v = NSView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
@@ -46,25 +49,6 @@ public final class PaneTabsView: NSObject {
             )
             tabStrip.addArrangedSubview(tab)
         }
-        let stripScroll = NSScrollView()
-        stripScroll.drawsBackground = false
-        stripScroll.borderType = .noBorder
-        stripScroll.hasHorizontalScroller = false
-        stripScroll.hasVerticalScroller = false
-        stripScroll.horizontalScrollElasticity = .allowed
-        stripScroll.translatesAutoresizingMaskIntoConstraints = false
-        let stripDoc = NSView()
-        stripDoc.translatesAutoresizingMaskIntoConstraints = false
-        stripDoc.addSubview(tabStrip)
-        stripScroll.documentView = stripDoc
-        NSLayoutConstraint.activate([
-            tabStrip.leadingAnchor.constraint(equalTo: stripDoc.leadingAnchor),
-            tabStrip.trailingAnchor.constraint(equalTo: stripDoc.trailingAnchor),
-            tabStrip.topAnchor.constraint(equalTo: stripDoc.topAnchor),
-            tabStrip.bottomAnchor.constraint(equalTo: stripDoc.bottomAnchor),
-            stripDoc.heightAnchor.constraint(equalTo: stripScroll.heightAnchor)
-        ])
-
         // Content area: the selected surface (or a styled placeholder).
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         contentArea.wantsLayer = true
@@ -99,7 +83,6 @@ public final class PaneTabsView: NSObject {
             symbol: "plus",
             help: "New surface",
             target: self, action: #selector(showAddMenu(_:)))
-        let addMenu = NSMenu()
         let addChoices: [(String, SurfaceType)] = [
             ("Terminal", .terminal),
             ("Browser", .browser),
@@ -114,7 +97,6 @@ public final class PaneTabsView: NSObject {
             it.image = img?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
             addMenu.addItem(it)
         }
-        addButton.menu = addMenu
         tabStrip.addArrangedSubview(addButton)
 
         // Split controls live on the RIGHT of the toolbar as two icon
@@ -131,7 +113,7 @@ public final class PaneTabsView: NSObject {
         // Git lives at the workspace level: this button opens a Git tab
         // (changed files + diff) in the current pane.
         let gitButton = Self.makeIconButton(
-            symbol: "arrow.triangle.branch",
+            symbol: "arrow.branch",
             help: "Open Git (changed files & diff)",
             target: self, action: #selector(openGit))
 
@@ -149,7 +131,9 @@ public final class PaneTabsView: NSObject {
 
         // Single unified header row: tabs scroll on the left, the action
         // cluster (+ · git · split) stays pinned on the right.
-        let rightCluster = NSStackView(views: [zoneSep, gitButton, sep, splitColumns, splitRows])
+        let rightCluster = NoDragStack(views: showsWorkspaceControls
+            ? [zoneSep, gitButton, sep, splitColumns, splitRows]
+            : [splitColumns, splitRows])
         rightCluster.orientation = .horizontal
         rightCluster.spacing = DS.Space.sm
         rightCluster.translatesAutoresizingMaskIntoConstraints = false
@@ -192,13 +176,16 @@ public final class PaneTabsView: NSObject {
         leadingBox.orientation = .horizontal
         leadingBox.spacing = DS.Space.sm
         leadingBox.alignment = .centerY
-        // Default (sidebar visible): small inset, pane sits right of the
-        // sidebar. When collapsed the inset grows to clear the traffic
-        // lights (this header then sits at the window's left edge).
-        leadingBox.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.sm, bottom: 0, right: DS.Space.sm)
+        // Only the first pane owns workspace-level controls. Split panes
+        // stay independent and expose only pane-local split actions.
+        leadingBox.edgeInsets = showsWorkspaceControls
+            ? NSEdgeInsets(top: 0, left: DS.Space.sm, bottom: 0, right: DS.Space.sm)
+            : NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         leadingBox.translatesAutoresizingMaskIntoConstraints = false
-        leadingBox.addArrangedSubview(sidebarToggle)
-        leadingBox.addArrangedSubview(wsPill)
+        if showsWorkspaceControls {
+            leadingBox.addArrangedSubview(sidebarToggle)
+            leadingBox.addArrangedSubview(wsPill)
+        }
 
         let headerBG = NSView()
         headerBG.wantsLayer = true
@@ -212,7 +199,7 @@ public final class PaneTabsView: NSObject {
 
         v.addSubview(headerBG)
         headerBG.addSubview(leadingBox)
-        headerBG.addSubview(stripScroll)
+        headerBG.addSubview(tabStrip)
         headerBG.addSubview(rightCluster)
         v.addSubview(divider)
         v.addSubview(contentArea)
@@ -228,10 +215,10 @@ public final class PaneTabsView: NSObject {
             wsLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 200),
             wsPill.heightAnchor.constraint(equalToConstant: 22),
 
-            stripScroll.leadingAnchor.constraint(equalTo: leadingBox.trailingAnchor),
-            stripScroll.topAnchor.constraint(equalTo: headerBG.topAnchor),
-            stripScroll.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
-            stripScroll.trailingAnchor.constraint(equalTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
+            tabStrip.leadingAnchor.constraint(equalTo: leadingBox.trailingAnchor),
+            tabStrip.topAnchor.constraint(equalTo: headerBG.topAnchor),
+            tabStrip.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
+            tabStrip.trailingAnchor.constraint(lessThanOrEqualTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
 
             rightCluster.trailingAnchor.constraint(equalTo: headerBG.trailingAnchor, constant: -DS.Space.md),
             rightCluster.centerYAnchor.constraint(equalTo: headerBG.centerYAnchor),
@@ -247,9 +234,11 @@ public final class PaneTabsView: NSObject {
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
 
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(sidebarVisibilityChanged(_:)),
-            name: .rc2SidebarVisibility, object: nil)
+        if showsWorkspaceControls {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(sidebarVisibilityChanged(_:)),
+                name: .rc2SidebarVisibility, object: nil)
+        }
     }
 
     private func selectSurface(_ id: SurfaceID) {
@@ -294,7 +283,7 @@ public final class PaneTabsView: NSObject {
     /// A token-styled square icon button used for the split controls.
     private static func makeIconButton(symbol: String, help: String,
                                        target: AnyObject, action: Selector) -> NSButton {
-        let b = NSButton(frame: .zero)
+        let b = NoDragButton(frame: .zero)
         b.translatesAutoresizingMaskIntoConstraints = false
         b.isBordered = false
         b.bezelStyle = .inline
@@ -317,10 +306,12 @@ public final class PaneTabsView: NSObject {
     deinit { NotificationCenter.default.removeObserver(self) }
 
     @objc private func toggleSidebar() {
+        guard showsWorkspaceControls else { return }
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
     }
 
     @objc private func sidebarVisibilityChanged(_ note: Notification) {
+        guard showsWorkspaceControls else { return }
         let collapsed = (note.userInfo?["collapsed"] as? Bool) ?? false
         wsPill.isHidden = !collapsed
         if collapsed { wsLabel.stringValue = currentWorkspaceName() }
@@ -339,9 +330,13 @@ public final class PaneTabsView: NSObject {
     }
 
     @objc private func showAddMenu(_ sender: NSButton) {
-        guard let menu = sender.menu else { return }
-        let origin = NSPoint(x: 0, y: sender.bounds.height + 4)
-        menu.popUp(positioning: nil, at: origin, in: sender)
+        // Defer: popping the menu inside the mouse-up that triggered the
+        // action makes the same event dismiss it immediately.
+        DispatchQueue.main.async { [weak self, weak sender] in
+            guard let self, let sender else { return }
+            let origin = NSPoint(x: 0, y: sender.bounds.maxY + 4)
+            self.addMenu.popUp(positioning: nil, at: origin, in: sender)
+        }
     }
 
     @objc private func addFromMenu(_ sender: NSMenuItem) {
@@ -412,7 +407,7 @@ final class PaneTabButton: NSView {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let close = NSButton(frame: .zero)
+        let close = NoDragButton(frame: .zero)
         close.isBordered = false
         close.bezelStyle = .inline
         close.imagePosition = .imageOnly
@@ -479,10 +474,16 @@ final class PaneTabButton: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    // In the full-size-content titlebar band, AppKit would otherwise
+    // treat clicks here as a window drag and the tab/close never fire.
+    override var mouseDownCanMoveWindow: Bool { false }
+
     override func mouseDown(with event: NSEvent) {
         // Selection only fires if the close button didn't consume the click.
         onSelect()
     }
+
+    func performSelectFromTitlebarClick() { onSelect() }
 
     @objc private func closeClicked() { onClose() }
 
@@ -494,3 +495,27 @@ final class PaneTabButton: NSView {
     }
 }
 
+// MARK: - Non-draggable header containers
+//
+// With `.fullSizeContentView` the tab bar lives inside the titlebar
+// band. Container views default `mouseDownCanMoveWindow` to true, so
+// AppKit starts a window drag on mouse-down and the buttons/tabs never
+// receive the click. These subclasses opt the interactive subtree out
+// of window dragging. (headerBG stays a plain NSView so its empty area
+// can still drag the window.)
+
+final class NoDragView: NSView {
+    override var mouseDownCanMoveWindow: Bool { false }
+}
+
+final class NoDragStack: NSStackView {
+    override var mouseDownCanMoveWindow: Bool { false }
+}
+
+final class NoDragScroll: NSScrollView {
+    override var mouseDownCanMoveWindow: Bool { false }
+}
+
+final class NoDragButton: NSButton {
+    override var mouseDownCanMoveWindow: Bool { false }
+}

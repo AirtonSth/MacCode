@@ -4,6 +4,45 @@ import CoreModel
 import Surfaces
 import DesignSystemKit
 
+final class InteractiveTitlebarWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, dispatchInteractiveTitlebarClick(event) {
+            return
+        }
+        super.sendEvent(event)
+    }
+
+    private func dispatchInteractiveTitlebarClick(_ event: NSEvent) -> Bool {
+        guard styleMask.contains(.fullSizeContentView),
+              let contentView else { return false }
+
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard point.y >= contentView.bounds.height - 44,
+              let hit = contentView.hitTest(point) else { return false }
+
+        if let button = enclosingView(from: hit, as: NoDragButton.self) {
+            button.performClick(nil)
+            return true
+        }
+
+        if let tab = enclosingView(from: hit, as: PaneTabButton.self) {
+            tab.performSelectFromTitlebarClick()
+            return true
+        }
+
+        return false
+    }
+
+    private func enclosingView<T: NSView>(from view: NSView, as type: T.Type) -> T? {
+        var current: NSView? = view
+        while let candidate = current {
+            if let typed = candidate as? T { return typed }
+            current = candidate.superview
+        }
+        return nil
+    }
+}
+
 public extension Notification.Name {
     /// Posted by any sidebar-toggle button (sidebar header or pane header).
     static let rc2ToggleSidebar = Notification.Name("rc2.toggleSidebar")
@@ -34,7 +73,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         self.sidebar = SidebarView(context: context, router: router)
 
         let style: NSWindow.StyleMask = [.titled, .resizable, .closable, .miniaturizable]
-        let win = NSWindow(
+        let win = InteractiveTitlebarWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
             styleMask: style,
             backing: .buffered,
@@ -47,6 +86,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         win.styleMask.insert(.fullSizeContentView)
         win.titlebarAppearsTransparent = true
         win.titleVisibility = .hidden
+        win.isMovableByWindowBackground = false
         win.minSize = NSSize(width: 900, height: 600)
         self.window = win
 
@@ -60,7 +100,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             name: .rc2ToggleSidebar, object: nil)
     }
 
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     @objc private func handleToggleSidebar() {
         sidebarCollapsed.toggle()
@@ -155,6 +197,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     private func rebuildWorkspaceContainer() {
+        window.disableScreenUpdatesUntilFlush()
         for sub in workspaceContainer.subviews { sub.removeFromSuperview() }
         // Drop references to the previous pane controllers; new ones are
         // created below. Without retaining them their @objc button/tab
@@ -168,16 +211,32 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             pin(empty, to: workspaceContainer)
             return
         }
-        let layoutView = buildLayoutView(node: ws.layout)
-        layoutView.translatesAutoresizingMaskIntoConstraints = false
-        workspaceContainer.addSubview(layoutView)
-        pin(layoutView, to: workspaceContainer)
+        var primaryControlsAvailable = true
+        let layoutView = buildLayoutView(node: ws.layout, primaryControlsAvailable: &primaryControlsAvailable)
+        attachRootLayoutView(layoutView)
         // Freshly built pane headers default to "sidebar visible"; if it
         // is actually collapsed, re-sync them so the workspace name shows.
         if sidebarCollapsed {
             NotificationCenter.default.post(
                 name: .rc2SidebarVisibility, object: nil,
                 userInfo: ["collapsed": true])
+        }
+    }
+
+    private func attachRootLayoutView(_ layoutView: NSView) {
+        layoutView.translatesAutoresizingMaskIntoConstraints = true
+        layoutView.frame = workspaceContainer.bounds
+        layoutView.autoresizingMask = [.width, .height]
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            ctx.allowsImplicitAnimation = false
+            workspaceContainer.addSubview(layoutView)
+            layoutView.needsLayout = true
+            layoutView.layoutSubtreeIfNeeded()
+            if let split = layoutView as? RatioSplitView {
+                split.relayoutNow()
+            }
         }
     }
 
@@ -217,10 +276,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         return v
     }
 
-    private func buildLayoutView(node: LayoutNode) -> NSView {
+    private func buildLayoutView(node: LayoutNode, primaryControlsAvailable: inout Bool) -> NSView {
         switch node {
         case .pane(let p):
-            let ptv = PaneTabsView(pane: p, router: router)
+            let showsWorkspaceControls = primaryControlsAvailable
+            primaryControlsAvailable = false
+            let ptv = PaneTabsView(
+                pane: p,
+                router: router,
+                showsWorkspaceControls: showsWorkspaceControls
+            )
             paneControllers.append(ptv)
             return ptv.view
         case .split(let s):
@@ -229,7 +294,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             split.dividerStyle = .thin
             split.ratios = s.ratios.map { CGFloat($0) }
             for child in s.children {
-                let cv = buildLayoutView(node: child)
+                let cv = buildLayoutView(node: child, primaryControlsAvailable: &primaryControlsAvailable)
                 // Frame-managed (NOT arranged / NOT autolayout): the
                 // RatioSplitView owns every subview frame so the split
                 // is exactly proportional.
@@ -264,6 +329,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 final class RatioSplitView: NSSplitView {
     var ratios: [CGFloat] = []
 
+    func relayoutNow() { layoutByRatios() }
+
     // NSSplitView routes layout through these; force our proportional
     // pass from every entry point so the split is always exactly
     // ratio-based regardless of when AppKit decides to lay out.
@@ -297,6 +364,7 @@ final class RatioSplitView: NSSplitView {
                 let w = (i == n - 1) ? max(0, bounds.width - x)
                                      : (avail * norm[i]).rounded()
                 sv.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
+                (sv as? RatioSplitView)?.layoutByRatios()
                 x += w + dt
             }
         } else {
@@ -306,6 +374,7 @@ final class RatioSplitView: NSSplitView {
                 let h = (i == n - 1) ? max(0, bounds.height - y)
                                      : (avail * norm[i]).rounded()
                 sv.frame = NSRect(x: 0, y: y, width: bounds.width, height: h)
+                (sv as? RatioSplitView)?.layoutByRatios()
                 y += h + dt
             }
         }
