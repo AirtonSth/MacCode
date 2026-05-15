@@ -187,8 +187,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             split.ratios = s.ratios.map { CGFloat($0) }
             for child in s.children {
                 let cv = buildLayoutView(node: child)
-                cv.translatesAutoresizingMaskIntoConstraints = false
-                split.addArrangedSubview(cv)
+                // Frame-managed (NOT arranged / NOT autolayout): the
+                // RatioSplitView owns every subview frame so the split
+                // is exactly proportional.
+                cv.translatesAutoresizingMaskIntoConstraints = true
+                cv.autoresizingMask = []
+                split.addSubview(cv)
             }
             return split
         }
@@ -217,39 +221,48 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 final class RatioSplitView: NSSplitView {
     var ratios: [CGFloat] = []
 
-    override func adjustSubviews() {
-        guard subviews.count >= 2,
-              subviews.count == ratios.count,
-              bounds.width > 0, bounds.height > 0 else {
-            super.adjustSubviews()
-            return
-        }
+    // NSSplitView routes layout through these; force our proportional
+    // pass from every entry point so the split is always exactly
+    // ratio-based regardless of when AppKit decides to lay out.
+    override func resizeSubviews(withOldSize oldSize: NSSize) { layoutByRatios() }
+    override func adjustSubviews() { layoutByRatios() }
+    override func layout() {
+        super.layout()
+        layoutByRatios()
+    }
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        layoutByRatios()
+    }
+
+    private func layoutByRatios() {
         let n = subviews.count
+        guard n >= 1, bounds.width > 0, bounds.height > 0 else { return }
         let dt = dividerThickness
         let norm: [CGFloat] = {
-            let total = ratios.reduce(0, +)
-            return total > 0 ? ratios.map { $0 / total }
-                             : Array(repeating: 1.0 / CGFloat(n), count: n)
+            if ratios.count == n {
+                let total = ratios.reduce(0, +)
+                if total > 0 { return ratios.map { $0 / total } }
+            }
+            return Array(repeating: 1.0 / CGFloat(n), count: n)
         }()
 
         if isVertical {
-            // Side-by-side; divide width.
-            let avail = bounds.width - dt * CGFloat(n - 1)
+            let avail = max(0, bounds.width - dt * CGFloat(n - 1))
             var x: CGFloat = 0
             for (i, sv) in subviews.enumerated() {
-                let w = (i == n - 1) ? (bounds.width - x)
+                let w = (i == n - 1) ? max(0, bounds.width - x)
                                      : (avail * norm[i]).rounded()
-                sv.frame = NSRect(x: x, y: 0, width: max(0, w), height: bounds.height)
+                sv.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
                 x += w + dt
             }
         } else {
-            // Stacked; divide height.
-            let avail = bounds.height - dt * CGFloat(n - 1)
+            let avail = max(0, bounds.height - dt * CGFloat(n - 1))
             var y: CGFloat = 0
             for (i, sv) in subviews.enumerated() {
-                let h = (i == n - 1) ? (bounds.height - y)
+                let h = (i == n - 1) ? max(0, bounds.height - y)
                                      : (avail * norm[i]).rounded()
-                sv.frame = NSRect(x: 0, y: y, width: bounds.width, height: max(0, h))
+                sv.frame = NSRect(x: 0, y: y, width: bounds.width, height: h)
                 y += h + dt
             }
         }
