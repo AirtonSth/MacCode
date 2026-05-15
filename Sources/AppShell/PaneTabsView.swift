@@ -75,24 +75,23 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
             addPopup.menu?.addItem(it)
         }
 
-        let splitPopup = Self.makePullDown(title: "Split")
-        splitPopup.menu?.addItem(.separator())
-        for (dirLabel, dir) in [("Horizontal  →", "right"), ("Vertical  ↓", "down")] {
-            let parent = NSMenuItem(title: dirLabel, action: nil, keyEquivalent: "")
-            let sub = NSMenu()
-            for (label, type) in Self.surfaceChoices {
-                let it = NSMenuItem(title: label, action: #selector(splitFromMenu(_:)), keyEquivalent: "")
-                it.target = self
-                it.representedObject = "\(dir)|\(type.rawValue)"
-                sub.addItem(it)
-            }
-            parent.submenu = sub
-            splitPopup.menu?.addItem(parent)
-        }
+        // Split controls live on the RIGHT of the toolbar as two icon
+        // buttons: columns (side-by-side, .right) and rows (stacked, .down).
+        let splitColumns = Self.makeIconButton(
+            symbol: "rectangle.split.2x1",
+            help: "Split right (side by side)",
+            target: self, action: #selector(splitHorizontal))
+        let splitRows = Self.makeIconButton(
+            symbol: "rectangle.split.1x2",
+            help: "Split down (stacked)",
+            target: self, action: #selector(splitVertical))
 
-        let toolbar = NSStackView(views: [addPopup, splitPopup, NSView()])
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let toolbar = NSStackView(views: [addPopup, spacer, splitColumns, splitRows])
         toolbar.orientation = .horizontal
-        toolbar.spacing = DS.Space.md
+        toolbar.spacing = DS.Space.sm
         toolbar.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
@@ -160,19 +159,41 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
         return p
     }
 
+    /// A token-styled square icon button used for the split controls.
+    private static func makeIconButton(symbol: String, help: String,
+                                       target: AnyObject, action: Selector) -> NSButton {
+        let b = NSButton(frame: .zero)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.isBordered = false
+        b.bezelStyle = .inline
+        b.imagePosition = .imageOnly
+        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: help)
+        b.symbolConfiguration = .init(pointSize: 13, weight: .regular)
+        b.contentTintColor = DS.NS.textSecondary
+        b.toolTip = help
+        b.target = target
+        b.action = action
+        b.wantsLayer = true
+        b.layer?.cornerRadius = DS.Radius.control
+        NSLayoutConstraint.activate([
+            b.widthAnchor.constraint(equalToConstant: 26),
+            b.heightAnchor.constraint(equalToConstant: 22)
+        ])
+        return b
+    }
+
     @objc private func addFromMenu(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let type = SurfaceType(rawValue: raw) else { return }
         performAdd(type, title: Self.title(for: type))
     }
 
-    @objc private func splitFromMenu(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String else { return }
-        let parts = raw.split(separator: "|")
-        guard parts.count == 2,
-              let dir = SplitDirection(rawValue: String(parts[0])),
-              let type = SurfaceType(rawValue: String(parts[1])) else { return }
-        performSplit(dir, type: type, title: Self.title(for: type))
+    @objc private func splitHorizontal() {
+        performSplit(.right, type: .agentApp, title: Self.title(for: .agentApp))
+    }
+
+    @objc private func splitVertical() {
+        performSplit(.down, type: .agentApp, title: Self.title(for: .agentApp))
     }
 
     /// Testable seam shared by the @objc button handlers.
