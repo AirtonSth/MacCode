@@ -100,16 +100,12 @@ public struct SidebarRootView: View {
                 DSIconButton("plus", help: "New workspace") { vm.newWorkspace() }
             }
             .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
-            .background(DS.Palette.surface.opacity(0.28))
-            .overlay(alignment: .bottom) {
-                Rectangle().fill(DS.Palette.line.opacity(0.6)).frame(height: DS.Border.hairline)
-            }
+            .dsBar(edge: .bottom)
 
             if vm.workspaces.isEmpty {
                 DSEmptyState(icon: "folder.badge.plus",
                              title: "No workspaces",
-                             subtitle: "Press ⌘N or the + button to open a folder as a workspace.",
-                             opaque: false)
+                             subtitle: "Press ⌘N or the + button to open a folder as a workspace.")
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
@@ -120,10 +116,9 @@ public struct SidebarRootView: View {
                 }
             }
         }
-        // Subtle liquid-glass: a faint tint over the NSVisualEffectView
-        // the host sits in (see SidebarView). Low opacity so the blurred
-        // desktop behind the window reads through, gently.
-        .background(DS.Palette.surface.opacity(0.28))
+        // Subtle liquid-glass: a near-transparent tint over the
+        // NSVisualEffectView the host sits in (see SidebarView).
+        .background(DS.Palette.surface.opacity(0.55))
     }
 
     @ViewBuilder
@@ -184,20 +179,17 @@ public final class SidebarView: NSObject {
         self.viewModel = SidebarViewModel(context: context, router: router)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
-        // NSHostingView is opaque by default; force it transparent so
-        // the behind-window vibrancy (and the blurred desktop) shows.
+        // NSHostingView is opaque by default; let the vibrancy show.
         h.wantsLayer = true
         h.layer?.backgroundColor = NSColor.clear.cgColor
-        h.layer?.isOpaque = false
         self.host = h
         // Subtle Liquid Glass: an under-window vibrancy material behind
         // the translucent SwiftUI sidebar. Chrome only — per design rules
         // glass never goes on main content.
         let container = NSVisualEffectView()
-        container.material = .sidebar
+        container.material = .underWindowBackground
         container.blendingMode = .behindWindow
         container.state = .active
-        container.isEmphasized = false
         container.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(h)
         NSLayoutConstraint.activate([
