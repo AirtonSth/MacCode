@@ -225,6 +225,18 @@ case "send-text":
     let (flags, _) = parseFlags(restArgs)
     guard let sid = flags["id"], let text = flags["text"] else { usage(2) }
     emit(rpc.call("surface.send_text", params: ["id": sid, "text": text]))
+case "send-key":
+    let (flags, _) = parseFlags(restArgs)
+    guard let sid = flags["id"], let key = flags["key"] else { usage(2) }
+    emit(rpc.call("surface.send_key", params: ["id": sid, "key": key]))
+case "clear-history":
+    let (flags, _) = parseFlags(restArgs)
+    guard let sid = flags["id"] else { usage(2) }
+    emit(rpc.call("surface.clear_history", params: ["id": sid]))
+case "health":
+    let (flags, _) = parseFlags(restArgs)
+    guard let sid = flags["id"] else { usage(2) }
+    emit(rpc.call("surface.health", params: ["id": sid]))
 case "read-text":
     let (flags, _) = parseFlags(restArgs)
     guard let sid = flags["id"] else { usage(2) }
