@@ -17,6 +17,72 @@ public final class AppCommandRouter: CommandRouting {
         self.context = context
     }
 
+    /// Walk the restored layout state and instantiate fresh Surface
+    /// views for every descriptor. Surfaces are rebuilt with new IDs
+    /// (their old IDs were owned by surfaces that no longer exist), so
+    /// we rewrite the layout state to refer to the new IDs and update
+    /// selectedSurfaceID per pane.
+    public func reinstantiateRestoredSurfaces() {
+        guard let ctx = context else { return }
+        var idMap: [SurfaceID: SurfaceID] = [:]
+        for (wid, ws) in ctx.state.workspaces {
+            forEachSurface(in: ws.layout) { desc in
+                let cwd = ws.cwd
+                let title = desc.title
+                do {
+                    let surface: Surface
+                    switch desc.type {
+                    case .terminal:
+                        surface = try TerminalSurface(workspaceID: wid, cwd: cwd, title: title)
+                    case .browser:
+                        surface = BrowserSurface(workspaceID: wid, initialURL: nil, title: title)
+                    case .agentApp:
+                        surface = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: title)
+                    case .markdown:
+                        surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
+                    case .filePreview:
+                        surface = FilePreviewSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
+                    case .rightSidebarTool:
+                        surface = DiffPanelSurface(workspaceID: wid, cwd: cwd, title: title)
+                    }
+                    idMap[desc.id] = surface.descriptor.id
+                    SurfaceRegistry.shared.register(surface)
+                } catch {
+                    // skip
+                }
+            }
+        }
+        guard !idMap.isEmpty else { return }
+        for (wid, ws) in ctx.state.workspaces {
+            var copy = ws
+            copy.layout = remapIDs(in: copy.layout, idMap: idMap)
+            ctx.state.workspaces[wid] = copy
+        }
+    }
+
+    private func forEachSurface(in node: LayoutNode, _ visit: (SurfaceDescriptor) -> Void) {
+        switch node {
+        case .pane(let p): for s in p.surfaces { visit(s) }
+        case .split(let s): for c in s.children { forEachSurface(in: c, visit) }
+        }
+    }
+
+    private func remapIDs(in node: LayoutNode, idMap: [SurfaceID: SurfaceID]) -> LayoutNode {
+        switch node {
+        case .pane(var p):
+            p.surfaces = p.surfaces.map { d in
+                let new = idMap[d.id] ?? d.id
+                return SurfaceDescriptor(id: new, type: d.type, title: d.title, iconName: d.iconName,
+                                          isDirty: d.isDirty, hasUnreadActivity: d.hasUnreadActivity, metadata: d.metadata)
+            }
+            if let sel = p.selectedSurfaceID { p.selectedSurfaceID = idMap[sel] ?? sel }
+            return .pane(p)
+        case .split(var s):
+            s.children = s.children.map { remapIDs(in: $0, idMap: idMap) }
+            return .split(s)
+        }
+    }
+
     public func listWorkspaces() throws -> [Workspace] {
         guard let ctx = context else { return [] }
         return ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }

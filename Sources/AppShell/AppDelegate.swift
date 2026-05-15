@@ -56,6 +56,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowController = MainWindowController(context: context, router: router)
         router.windowController = windowController
+        // Rebuild Surface objects from restored layout descriptors.
+        router.reinstantiateRestoredSurfaces()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)
