@@ -127,7 +127,8 @@ final class PaneActionTests: XCTestCase {
     }
 
     func test_tabHeaderControls_doNotBecomeWindowDragTargets() throws {
-        let (_, router) = try makeContext()
+        let (ctx, router) = try makeContext()
+        _ = ctx
         let ws = try router.createWorkspace(name: "controls", cwd: NSTemporaryDirectory())
         guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
         let ptv = PaneTabsView(pane: pane, router: router)
@@ -139,7 +140,8 @@ final class PaneActionTests: XCTestCase {
     }
 
     func test_secondaryPaneHeader_onlyShowsPaneLocalControls() throws {
-        let (_, router) = try makeContext()
+        let (ctx, router) = try makeContext()
+        _ = ctx
         let ws = try router.createWorkspace(name: "secondary", cwd: NSTemporaryDirectory())
         guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
         let ptv = PaneTabsView(pane: pane, router: router, showsWorkspaceControls: false)
@@ -154,7 +156,129 @@ final class PaneActionTests: XCTestCase {
         XCTAssertTrue(tooltips.contains("Split down (stacked)"))
     }
 
+    func test_visibleSidebarHeader_hasOnlyToggleBecauseWorkspaceCreationLivesInSidebarList() throws {
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "visible", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        let visibleButtons = visibleSubviews(of: controller.window.contentView!)
+            .compactMap { $0 as? NSButton }
+        let visibleTooltips = visibleButtons.compactMap(\.toolTip)
+
+        XCTAssertEqual(visibleTooltips.filter { $0 == "Toggle sidebar" }.count, 1,
+                       "the visible sidebar must keep one collapse affordance")
+        XCTAssertFalse(visibleTooltips.contains("New workspace"),
+                       "workspace creation moved into the sidebar body as New Workspace; the top + must stay removed")
+    }
+
+    func test_sidebarViewModel_listsWindowWorkspacesAndSelectedWorkspaceForSidebarBody() throws {
+        let (ctx, router) = try makeContext()
+        let first = try router.createWorkspace(name: "alpha", cwd: NSTemporaryDirectory())
+        let second = try router.createWorkspace(name: "beta", cwd: NSTemporaryDirectory())
+
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.reload()
+
+        XCTAssertEqual(vm.workspaces.map(\.name), ["alpha", "beta"],
+                       "the visible sidebar Workspaces section must render the current window workspaces in order")
+        XCTAssertEqual(vm.selectedWorkspaceID, second.id,
+                       "the workspace row highlight must follow the router's selected workspace")
+
+        try router.selectWorkspace(first.id)
+        vm.reload()
+        XCTAssertEqual(vm.selectedWorkspaceID, first.id,
+                       "selecting a workspace must update the model that drives the sidebar row selection")
+    }
+
+    func test_collapsedSidebar_usesFullWidthHeaderWithToggleLeftPlusRightAndTabsBelow() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "collapsed", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
+        let extra = PaneTabsView(pane: pane, router: router)
+        XCTAssertNotNil(extra.performAdd(.terminal, title: "Terminal"))
+
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        let content = try XCTUnwrap(controller.window.contentView)
+        let buttons = visibleSubviews(of: content).compactMap { $0 as? NSButton }
+        let toggle = try XCTUnwrap(buttons.first { $0.toolTip == "Toggle sidebar" },
+                                   "collapsed header must expose a left-side sidebar toggle")
+        let plus = try XCTUnwrap(buttons.first { $0.toolTip == "New workspace" },
+                                 "collapsed header must keep the workspace + on the right")
+        let toggleFrame = toggle.convert(toggle.bounds, to: content)
+        let plusFrame = plus.convert(plus.bounds, to: content)
+
+        XCTAssertLessThan(toggleFrame.minX, 130,
+                          "the collapsed-header toggle should sit near the left edge, not drift toward the center")
+        XCTAssertGreaterThan(plusFrame.minX, content.bounds.width - 60,
+                             "the collapsed-header + should remain on the right edge")
+        XCTAssertLessThan(toggleFrame.maxX, plusFrame.minX,
+                          "toggle and + must stay on opposite sides of the hidden-sidebar header")
+
+        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
+        let splitTop = try XCTUnwrap(content.constraints.first {
+            ($0.firstItem as? NSSplitView) === split && $0.firstAttribute == .top && $0.secondAttribute == .top
+        })
+        XCTAssertEqual(splitTop.constant, 34, accuracy: 0.1,
+                       "when the sidebar is hidden, tabs must move below the full-width workspace header")
+    }
+
+    func test_ratioSplit_laysOutSideBySideWithoutFreeSpace() {
+        let split = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 901, height: 300))
+        split.isVertical = true
+        split.ratios = [0.5, 0.5]
+        let left = NSView()
+        let right = NSView()
+        split.addSubview(left)
+        split.addSubview(right)
+
+        split.relayoutNow()
+
+        XCTAssertEqual(left.frame.minX, 0)
+        XCTAssertEqual(left.frame.height, split.bounds.height)
+        XCTAssertEqual(right.frame.maxX, split.bounds.width)
+        XCTAssertEqual(right.frame.minX, left.frame.maxX + split.dividerThickness,
+                       "side-by-side splits must allocate every pixel except the single divider")
+    }
+
+    func test_ratioSplit_laysOutStackedTopToBottomWithoutFreeSpace() {
+        let split = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 500, height: 601))
+        split.isVertical = false
+        split.ratios = [0.5, 0.5]
+        let top = NSView()
+        let bottom = NSView()
+        split.addSubview(top)
+        split.addSubview(bottom)
+
+        split.relayoutNow()
+
+        XCTAssertEqual(top.frame.maxY, split.bounds.height)
+        XCTAssertEqual(top.frame.width, split.bounds.width)
+        XCTAssertEqual(bottom.frame.minY, 0)
+        XCTAssertEqual(top.frame.minY, bottom.frame.maxY + split.dividerThickness,
+                       "stacked splits must allocate every pixel except the single divider, with the original pane on top")
+    }
+
     private func allSubviews(of view: NSView) -> [NSView] {
         view.subviews + view.subviews.flatMap { allSubviews(of: $0) }
+    }
+
+    private func visibleSubviews(of view: NSView) -> [NSView] {
+        allSubviews(of: view).filter { isVisibleInTree($0) }
+    }
+
+    private func isVisibleInTree(_ view: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate.isHidden { return false }
+            current = candidate.superview
+        }
+        return true
     }
 }
