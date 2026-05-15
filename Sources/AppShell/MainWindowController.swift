@@ -63,7 +63,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private let collapsedWorkspaceLabel = NSTextField(labelWithString: "")
     private let collapsedPlusButton = NoDragButton(frame: .zero)
     private let collapsedSidebarButton = NoDragButton(frame: .zero)
-    private let visiblePlusButton = NoDragButton(frame: .zero)
     private let visibleSidebarButton = NoDragButton(frame: .zero)
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
@@ -120,7 +119,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             sidebar.view.isHidden = sidebarCollapsed
             splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
             collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
-            visiblePlusButton.isHidden = sidebarCollapsed
             visibleSidebarButton.isHidden = sidebarCollapsed
             updateCollapsedWorkspaceHeader()
             if !sidebarCollapsed {
@@ -155,7 +153,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
         content.addSubview(split)
         content.addSubview(collapsedWorkspaceHeader)
-        content.addSubview(visiblePlusButton)
         content.addSubview(visibleSidebarButton)
         let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor)
         splitTopConstraint = splitTop
@@ -170,9 +167,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             collapsedWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight),
             visibleSidebarButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
-            visibleSidebarButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: sidebarWidth - 34),
-            visiblePlusButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
-            visiblePlusButton.trailingAnchor.constraint(equalTo: visibleSidebarButton.leadingAnchor, constant: -DS.Space.xs)
+            visibleSidebarButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: sidebarWidth - 34)
         ])
         collapsedWorkspaceHeader.isHidden = true
         window.contentView = content
@@ -217,12 +212,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	        NSLayoutConstraint.activate([
 	            collapsedWorkspaceLabel.centerXAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerXAnchor),
 	            collapsedWorkspaceLabel.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
-	            collapsedWorkspaceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: collapsedWorkspaceHeader.leadingAnchor, constant: 84),
-	            collapsedWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: collapsedPlusButton.leadingAnchor, constant: -DS.Space.sm),
-	            collapsedPlusButton.trailingAnchor.constraint(equalTo: collapsedSidebarButton.leadingAnchor, constant: -DS.Space.xs),
-	            collapsedPlusButton.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
-	            collapsedSidebarButton.trailingAnchor.constraint(equalTo: collapsedWorkspaceHeader.trailingAnchor, constant: -DS.Space.sm),
-	            collapsedSidebarButton.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
+		            collapsedWorkspaceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: collapsedSidebarButton.trailingAnchor, constant: DS.Space.sm),
+		            collapsedWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: collapsedPlusButton.leadingAnchor, constant: -DS.Space.sm),
+		            collapsedPlusButton.trailingAnchor.constraint(equalTo: collapsedWorkspaceHeader.trailingAnchor, constant: -DS.Space.sm),
+		            collapsedPlusButton.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
+		            collapsedSidebarButton.leadingAnchor.constraint(equalTo: collapsedWorkspaceHeader.leadingAnchor, constant: 92),
+		            collapsedSidebarButton.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
 	            divider.leadingAnchor.constraint(equalTo: collapsedWorkspaceHeader.leadingAnchor),
 	            divider.trailingAnchor.constraint(equalTo: collapsedWorkspaceHeader.trailingAnchor),
 	            divider.bottomAnchor.constraint(equalTo: collapsedWorkspaceHeader.bottomAnchor),
@@ -231,13 +226,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	        updateCollapsedWorkspaceHeader()
 	    }
 
-	    private func configureVisibleSidebarHeaderButtons() {
-	        configureHeaderButton(visiblePlusButton, symbol: "plus",
-	                              help: "New workspace",
-	                              action: #selector(newWorkspace))
-	        configureHeaderButton(visibleSidebarButton, symbol: "sidebar.left",
-	                              help: "Toggle sidebar",
-	                              action: #selector(handleToggleSidebar))
+    private func configureVisibleSidebarHeaderButtons() {
+        configureHeaderButton(visibleSidebarButton, symbol: "sidebar.left",
+                              help: "Toggle sidebar",
+                              action: #selector(handleToggleSidebar))
 	    }
 
 	    private func configureHeaderButton(_ button: NSButton, symbol: String, help: String, action: Selector) {

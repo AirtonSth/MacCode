@@ -90,35 +90,37 @@ public struct SidebarRootView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-	            HStack(spacing: DS.Space.xs) {
-		                Text("RemoteCode 2")
-		                    .font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
-		                    .lineLimit(1).truncationMode(.tail)
-		                    .layoutPriority(1)
-		                Spacer(minLength: DS.Space.xs)
-		            }
-		            // Left inset clears the macOS traffic-light buttons; the row
-		            // is fixed at titlebar height so the text sits level with
-		            // them (the sidebar ignores the top safe area, below).
-		            .padding(.leading, 84).padding(.trailing, 100)
-	            .frame(height: 34)
-	            .overlay(alignment: .bottom) {
-	                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-	            }
+            Color.clear.frame(height: 44)
 
-            if vm.workspaces.isEmpty {
-                DSEmptyState(icon: "folder.badge.plus",
-                             title: "No workspaces",
-                             subtitle: "Press ⌘N or the + button to open a folder as a workspace.")
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+            Button { vm.newWorkspace() } label: {
+                sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, DS.Space.md)
+            .padding(.bottom, DS.Space.lg)
+
+            Text("Workspaces")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.bottom, DS.Space.sm)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    if vm.workspaces.isEmpty {
+                        Text("No workspaces")
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, DS.Space.md)
+                            .padding(.vertical, DS.Space.sm)
+                    } else {
                         ForEach(vm.workspaces, id: \.id) { ws in
                             workspaceRow(ws)
                         }
-                    }.padding(DS.Space.sm)
+                    }
                 }
-            }
+                .padding(.horizontal, DS.Space.sm)
+            }.padding(.bottom, DS.Space.md)
         }
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
@@ -129,6 +131,27 @@ public struct SidebarRootView: View {
         .ignoresSafeArea(.container, edges: .top)
     }
 
+    private func sidebarActionRow(symbol: String, title: String) -> some View {
+        HStack(spacing: DS.Space.md) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .regular))
+                .frame(width: 20, height: 20)
+                .foregroundColor(DS.Palette.text)
+            Text(title)
+                .font(DS.Font.bodyStrong)
+                .foregroundColor(DS.Palette.text)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .frame(height: 42)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(Color.white.opacity(0.001))
+        )
+    }
+
     @ViewBuilder
     private func workspaceRow(_ ws: Workspace) -> some View {
         let selected = vm.selectedWorkspaceID == ws.id
@@ -136,10 +159,11 @@ public struct SidebarRootView: View {
         Button { vm.select(ws.id) } label: {
             HStack(spacing: DS.Space.sm) {
                 Image(systemName: "folder")
-                    .font(.system(size: 11))
-                    .foregroundColor(selected ? DS.Palette.accent : DS.Palette.textSecondary)
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(DS.Palette.textSecondary)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(ws.name).font(DS.Font.bodyStrong)
+                    Text(ws.name).font(selected ? DS.Font.bodyStrong : DS.Font.body)
                         .foregroundColor(DS.Palette.text).lineLimit(1)
                     if let d = desc, !d.isEmpty {
                         Text(d).font(DS.Font.caption2)
@@ -151,15 +175,11 @@ public struct SidebarRootView: View {
                     DSPill("\(ws.notificationsUnread)", tone: .accent)
                 }
             }
-            .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 38)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(selected ? DS.Palette.selection : Color.white.opacity(0.04))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .strokeBorder(selected ? DS.Palette.accent.opacity(0.35) : Color.white.opacity(0.05),
-                                  lineWidth: DS.Border.hairline)
+                    .fill(selected ? DS.Palette.selection.opacity(0.75) : Color.white.opacity(0.001))
             )
             .contentShape(Rectangle())
         }
