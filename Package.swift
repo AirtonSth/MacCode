@@ -86,7 +86,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SurfacesTests",
-            dependencies: ["Surfaces", "CoreModel"],
+            dependencies: ["Surfaces", "CoreModel", "AgentRuntime"],
             path: "Tests/SurfacesTests"
         ),
         .testTarget(

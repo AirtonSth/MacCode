@@ -1,6 +1,11 @@
 import XCTest
 @testable import Surfaces
 
+// BrowserSurface is @MainActor; its static helpers inherit that isolation.
+// Under the Swift 6 compiler these calls must come from a MainActor context,
+// so the test case itself is MainActor-isolated. (Pre-existing build blocker
+// for the whole SwiftPM test bundle — unrelated to git-tab work.)
+@MainActor
 final class BrowserSurfaceTests: XCTestCase {
     func test_safariUserAgent_identifiesEmbeddedBrowserAsDesktopSafari() {
         let ua = BrowserSurface.safariLikeUserAgent(

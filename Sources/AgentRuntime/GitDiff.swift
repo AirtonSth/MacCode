@@ -32,6 +32,37 @@ public struct GitSummary: Codable, Sendable, Equatable {
     }
 }
 
+public struct GitBranches: Codable, Sendable, Equatable {
+    public let current: String?
+    public let locals: [String]
+
+    public init(current: String?, locals: [String]) {
+        self.current = current; self.locals = locals
+    }
+}
+
+public struct GitCommit: Codable, Sendable, Equatable {
+    public let hash: String
+    public let shortHash: String
+    public let author: String
+    public let date: String
+    public let subject: String
+
+    public init(hash: String, shortHash: String, author: String, date: String, subject: String) {
+        self.hash = hash; self.shortHash = shortHash; self.author = author
+        self.date = date; self.subject = subject
+    }
+}
+
+public struct GitActionResult: Sendable, Equatable {
+    public let ok: Bool
+    public let message: String
+
+    public init(ok: Bool, message: String) {
+        self.ok = ok; self.message = message
+    }
+}
+
 /// Lightweight git-diff helpers. Spawns `git` directly so we never link
 /// libgit. Used by the changed-files summary and the diff panel surface.
 public enum GitDiff {
@@ -122,7 +153,66 @@ public enum GitDiff {
         return run(args, cwd: cwd).stdout
     }
 
+    // MARK: branch / commit / history
+
+    public static func branches(in cwd: String) -> GitBranches {
+        guard isGit(cwd) else { return GitBranches(current: nil, locals: []) }
+        let head = run(["rev-parse", "--abbrev-ref", "HEAD"], cwd: cwd)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let current = (head.isEmpty || head == "HEAD") ? nil : head
+        let listed = run(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd: cwd).stdout
+        let locals = listed.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return GitBranches(current: current, locals: locals)
+    }
+
+    public static func checkout(in cwd: String, branch: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let r = run(["checkout", branch], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
+    public static func createBranch(in cwd: String, name: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let r = run(["checkout", "-b", name], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
+    /// Stages every change (`git add -A`) then commits with `message`.
+    public static func commit(in cwd: String, message: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let add = run(["add", "-A"], cwd: cwd)
+        guard add.exit == 0 else { return GitActionResult(ok: false, message: actionMessage(add)) }
+        let r = run(["commit", "-m", message], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
+    public static func log(in cwd: String, limit: Int = 100) -> [GitCommit] {
+        guard isGit(cwd) else { return [] }
+        let fmt = "%H%x1f%h%x1f%an%x1f%ad%x1f%s"
+        let out = run(["log", "-n", String(limit), "--date=short", "--pretty=format:\(fmt)"], cwd: cwd).stdout
+        var commits: [GitCommit] = []
+        for line in out.split(separator: "\n", omittingEmptySubsequences: true) {
+            let f = line.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
+            guard f.count >= 5 else { continue }
+            commits.append(GitCommit(hash: f[0], shortHash: f[1], author: f[2], date: f[3], subject: f[4]))
+        }
+        return commits
+    }
+
+    public static func commitDiff(in cwd: String, hash: String) -> String {
+        guard isGit(cwd) else { return "" }
+        return run(["show", hash, "--no-color"], cwd: cwd).stdout
+    }
+
     // MARK: helpers
+
+    /// Prefer stderr (where git writes failures); fall back to stdout
+    /// (e.g. "nothing to commit") so errors are never surfaced empty.
+    private static func actionMessage(_ r: ProcessResult) -> String {
+        let e = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !e.isEmpty { return e }
+        return r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     public static func isGit(_ cwd: String) -> Bool {
         let r = run(["rev-parse", "--is-inside-work-tree"], cwd: cwd)
