@@ -29,10 +29,6 @@ public final class SidebarViewModel: ObservableObject {
         try? router?.selectWorkspace(wid)
     }
 
-    public func toggleSidebar() {
-        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
-    }
-
     public func newWorkspace() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false; panel.canChooseDirectories = true
@@ -100,7 +96,6 @@ public struct SidebarRootView: View {
                     .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: DS.Space.sm)
                 DSIconButton("plus", help: "New workspace") { vm.newWorkspace() }
-                DSIconButton("sidebar.left", help: "Hide sidebar") { vm.toggleSidebar() }
             }
             // Left inset clears the macOS traffic-light buttons; the row
             // is fixed at titlebar height so the text sits level with

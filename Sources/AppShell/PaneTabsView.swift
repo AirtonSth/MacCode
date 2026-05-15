@@ -11,11 +11,10 @@ public final class PaneTabsView: NSObject {
     public weak var router: AppCommandRouter?
     private let tabStrip = NSStackView()
     private let contentArea = NSView()
-    // Shown only when the sidebar is collapsed: a sidebar-restore button
-    // plus the current workspace name, at the header's leading edge.
+    // Leading edge of the header: an always-visible sidebar toggle, plus
+    // the active workspace name shown only while the sidebar is collapsed.
     private let leadingBox = NSStackView()
     private let wsLabel = NSTextField(labelWithString: "")
-    private var leadingZeroWidth: NSLayoutConstraint?
 
     public init(pane: PaneNode, router: AppCommandRouter?) {
         self.pane = pane
@@ -157,23 +156,24 @@ public final class PaneTabsView: NSObject {
         // Leading block (collapsed-sidebar only): restore button + the
         // active workspace name, so the user still knows where they are.
         let sidebarToggle = Self.makeIconButton(
-            symbol: "sidebar.left", help: "Show sidebar",
+            symbol: "sidebar.left", help: "Toggle sidebar",
             target: self, action: #selector(toggleSidebar))
         wsLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         wsLabel.textColor = DS.NS.text
         wsLabel.lineBreakMode = .byTruncatingTail
         wsLabel.translatesAutoresizingMaskIntoConstraints = false
         wsLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        wsLabel.isHidden = true
         leadingBox.orientation = .horizontal
         leadingBox.spacing = DS.Space.sm
         leadingBox.alignment = .centerY
-        // Left inset clears the traffic lights: with the sidebar gone,
-        // this pane header sits at the window's left edge.
-        leadingBox.edgeInsets = NSEdgeInsets(top: 0, left: 84, bottom: 0, right: DS.Space.sm)
+        // Default (sidebar visible): small inset, pane sits right of the
+        // sidebar. When collapsed the inset grows to clear the traffic
+        // lights (this header then sits at the window's left edge).
+        leadingBox.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.sm, bottom: 0, right: DS.Space.sm)
         leadingBox.translatesAutoresizingMaskIntoConstraints = false
         leadingBox.addArrangedSubview(sidebarToggle)
         leadingBox.addArrangedSubview(wsLabel)
-        leadingBox.isHidden = true
 
         let headerBG = NSView()
         headerBG.wantsLayer = true
@@ -191,9 +191,6 @@ public final class PaneTabsView: NSObject {
         headerBG.addSubview(rightCluster)
         v.addSubview(divider)
         v.addSubview(contentArea)
-        let zeroWidth = leadingBox.widthAnchor.constraint(equalToConstant: 0)
-        zeroWidth.isActive = true
-        self.leadingZeroWidth = zeroWidth
         NSLayoutConstraint.activate([
             headerBG.topAnchor.constraint(equalTo: v.topAnchor),
             headerBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
@@ -299,9 +296,13 @@ public final class PaneTabsView: NSObject {
 
     @objc private func sidebarVisibilityChanged(_ note: Notification) {
         let collapsed = (note.userInfo?["collapsed"] as? Bool) ?? false
-        leadingBox.isHidden = !collapsed
-        leadingZeroWidth?.isActive = !collapsed
+        wsLabel.isHidden = !collapsed
         if collapsed { wsLabel.stringValue = currentWorkspaceName() }
+        // Clear the traffic lights only when this header is at the
+        // window's left edge (sidebar gone).
+        leadingBox.edgeInsets = NSEdgeInsets(
+            top: 0, left: collapsed ? 84 : DS.Space.sm,
+            bottom: 0, right: DS.Space.sm)
     }
 
     private func currentWorkspaceName() -> String {
