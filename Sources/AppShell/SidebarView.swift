@@ -1,135 +1,123 @@
 import Foundation
 import AppKit
+import SwiftUI
 import CoreModel
+import Persistence
 
 @MainActor
-public final class SidebarView: NSObject, NSTableViewDataSource, NSTableViewDelegate {
-    public let view: NSView
+public final class SidebarViewModel: ObservableObject {
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
-    private let tableView = NSTableView()
-    private let scroll = NSScrollView()
-    private let addButton = NSButton()
-    private let titleLabel = NSTextField(labelWithString: "Workspaces")
+    @Published public var workspaces: [Workspace] = []
+    @Published public var selectedWorkspaceID: WorkspaceID?
+    @Published public var threadsByWorkspace: [WorkspaceID: [AgentThread]] = [:]
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
         self.router = router
+        reload()
+    }
+
+    public func reload() {
+        guard let ctx = context else { return }
+        workspaces = ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
+        selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
+        var map: [WorkspaceID: [AgentThread]] = [:]
+        for ws in workspaces {
+            map[ws.id] = (try? ctx.threadRepo.list(workspaceId: ws.id)) ?? []
+        }
+        threadsByWorkspace = map
+    }
+
+    public func select(_ wid: WorkspaceID) {
+        try? router?.selectWorkspace(wid)
+    }
+
+    public func newWorkspace() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true
+        if panel.runModal() == .OK, let url = panel.url {
+            _ = try? router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+        }
+    }
+}
+
+public struct SidebarRootView: View {
+    @ObservedObject var vm: SidebarViewModel
+    public init(vm: SidebarViewModel) { self.vm = vm }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Workspaces").font(.headline)
+                Spacer()
+                Button(action: { vm.newWorkspace() }) { Image(systemName: "plus") }
+                    .buttonStyle(.borderless)
+            }.padding(8)
+            Divider()
+            List(selection: Binding(
+                get: { vm.selectedWorkspaceID },
+                set: { if let id = $0 { vm.select(id) } }
+            )) {
+                ForEach(vm.workspaces, id: \.id) { ws in
+                    Section(header: HStack {
+                        Text(ws.name).font(.body).bold()
+                        Spacer()
+                        if ws.notificationsUnread > 0 {
+                            Text("•\(ws.notificationsUnread)").font(.caption.bold()).foregroundColor(.accentColor)
+                        }
+                    }) {
+                        ForEach(vm.threadsByWorkspace[ws.id] ?? [], id: \.id) { thread in
+                            HStack(spacing: 6) {
+                                Image(systemName: thread.status == .running ? "circle.fill" : "circle")
+                                    .font(.caption2)
+                                    .foregroundColor(thread.status == .running ? .green : .secondary)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(thread.title).font(.caption).lineLimit(1)
+                                    Text("\(thread.provider.rawValue) · \(thread.model)")
+                                        .font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                                }
+                                Spacer()
+                            }
+                        }
+                    }.tag(ws.id)
+                }
+            }
+            .listStyle(.sidebar)
+        }
+    }
+}
+
+@MainActor
+public final class SidebarView: NSObject {
+    public let view: NSView
+    public weak var context: AppContext?
+    public weak var router: AppCommandRouter?
+    private let viewModel: SidebarViewModel
+    private let host: NSHostingView<SidebarRootView>
+
+    public init(context: AppContext, router: AppCommandRouter) {
+        self.context = context
+        self.router = router
+        self.viewModel = SidebarViewModel(context: context, router: router)
+        let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
+        h.translatesAutoresizingMaskIntoConstraints = false
+        self.host = h
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
-        self.view = container
-
-        super.init()
-
-        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        addButton.title = "+"
-        addButton.bezelStyle = .recessed
-        addButton.controlSize = .small
-        addButton.target = self
-        addButton.action = #selector(createWorkspaceClicked)
-        addButton.translatesAutoresizingMaskIntoConstraints = false
-
-        let header = NSStackView(views: [titleLabel, NSView(), addButton])
-        header.orientation = .horizontal
-        header.spacing = 8
-        header.translatesAutoresizingMaskIntoConstraints = false
-
-        tableView.headerView = nil
-        tableView.usesAlternatingRowBackgroundColors = false
-        tableView.style = .sourceList
-        tableView.allowsMultipleSelection = false
-        tableView.delegate = self
-        tableView.dataSource = self
-        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
-        col.title = "Name"
-        col.width = 200
-        tableView.addTableColumn(col)
-        scroll.documentView = tableView
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-
-        container.addSubview(header)
-        container.addSubview(scroll)
+        container.addSubview(h)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
-            header.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
-            header.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
-            scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+            h.topAnchor.constraint(equalTo: container.topAnchor),
+            h.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            h.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            h.trailingAnchor.constraint(equalTo: container.trailingAnchor)
         ])
+        self.view = container
+        super.init()
     }
 
     public func refresh() {
-        tableView.reloadData()
-        guard let ctx = context else { return }
-        if let sel = ctx.state.window.selectedWorkspaceID,
-           let idx = ctx.state.window.workspaces.firstIndex(of: sel) {
-            tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
-        }
-    }
-
-    @objc private func createWorkspaceClicked() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "Choose a folder to use as the workspace cwd"
-        if panel.runModal() == .OK, let url = panel.url {
-            do {
-                _ = try router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
-            } catch {
-                NSSound.beep()
-            }
-        }
-    }
-
-    // MARK: NSTableViewDataSource
-
-    public func numberOfRows(in tableView: NSTableView) -> Int {
-        context?.state.window.workspaces.count ?? 0
-    }
-
-    public func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let identifier = NSUserInterfaceItemIdentifier("cell")
-        let cell: NSTableCellView
-        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
-            cell = reused
-        } else {
-            cell = NSTableCellView()
-            cell.identifier = identifier
-            let tf = NSTextField(labelWithString: "")
-            tf.translatesAutoresizingMaskIntoConstraints = false
-            tf.lineBreakMode = .byTruncatingTail
-            cell.addSubview(tf)
-            cell.textField = tf
-            NSLayoutConstraint.activate([
-                tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-                tf.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-                tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
-            ])
-        }
-        if let ctx = context, row < ctx.state.window.workspaces.count {
-            let wid = ctx.state.window.workspaces[row]
-            if let ws = ctx.state.workspaces[wid] {
-                let unread = ws.notificationsUnread
-                let suffix = unread > 0 ? "  •\(unread)" : ""
-                cell.textField?.stringValue = ws.name + suffix
-                cell.textField?.textColor = unread > 0 ? NSColor.systemBlue : NSColor.labelColor
-            }
-        }
-        return cell
-    }
-
-    public func tableViewSelectionDidChange(_ notification: Notification) {
-        let row = tableView.selectedRow
-        guard let ctx = context, row >= 0, row < ctx.state.window.workspaces.count else { return }
-        let wid = ctx.state.window.workspaces[row]
-        if ctx.state.window.selectedWorkspaceID == wid { return } // avoid re-entrant refresh cycle
-        try? router?.selectWorkspace(wid)
+        viewModel.reload()
     }
 }
