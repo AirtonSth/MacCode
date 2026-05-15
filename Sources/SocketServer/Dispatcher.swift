@@ -36,6 +36,11 @@ public protocol CommandRouting: AnyObject {
     func browserSnapshot(surface: SurfaceID) async throws -> String
     func browserAction(surface: SurfaceID, kind: String, ref: String, value: String?) async throws -> String
     func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String
+    // notifications
+    func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String
+    func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]]
+    func notificationMarkRead(id: String) throws
+    func notificationDismiss(id: String) throws
 }
 
 @MainActor
@@ -229,10 +234,32 @@ public final class JSONRPCDispatcher {
                 let timeout = params["timeout_ms"]?.intValue ?? 5000
                 let json = try await router.browserWait(surface: sid, selector: sel, timeoutMs: timeout)
                 return .init(id: id, result: .string(json))
+            case "notification.create":
+                let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
+                let title = params["title"]?.stringValue ?? "Notification"
+                let body = params["body"]?.stringValue
+                let category = params["category"]?.stringValue
+                let nid = try router.notificationCreate(workspaceId: wid, title: title, body: body, category: category)
+                EventBus.shared.publish(kind: "notification.created", payload: .object(["id": .string(nid), "title": .string(title)]))
+                return .init(id: id, result: .object(["id": .string(nid)]))
+            case "notification.list":
+                let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
+                let unread = params["unread_only"]?.boolValue ?? false
+                let list = try router.notificationList(workspaceId: wid, unreadOnly: unread)
+                return .init(id: id, result: .array(list.map { .object($0) }))
+            case "notification.mark_read":
+                guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                try router.notificationMarkRead(id: nid)
+                EventBus.shared.publish(kind: "notification.read", payload: .object(["id": .string(nid)]))
+                return .init(id: id, result: .bool(true))
+            case "notification.dismiss":
+                guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                try router.notificationDismiss(id: nid)
+                EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(nid)]))
+                return .init(id: id, result: .bool(true))
             // V1 deferred families return a typed unsupported error.
             case "window.list", "window.create", "window.focus", "window.close",
-                 "pane.list", "pane.resize", "pane.swap", "pane.break", "pane.join",
-                 "notification.create", "notification.list", "notification.dismiss":
+                 "pane.list", "pane.resize", "pane.swap", "pane.break", "pane.join":
                 throw JSONRPCError.notSupported(req.method)
             default:
                 throw JSONRPCError.methodNotFound

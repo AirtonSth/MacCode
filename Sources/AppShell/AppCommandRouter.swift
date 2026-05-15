@@ -189,6 +189,49 @@ public final class AppCommandRouter: CommandRouting {
         }
     }
 
+    public func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let repo = NotificationRepository(db: ctx.db)
+        let n = AppNotification(workspaceId: workspaceId, title: title, body: body, category: category)
+        try repo.insert(n)
+        // bump workspace unread + flash
+        if let wid = workspaceId, var ws = ctx.state.workspaces[wid] {
+            ws.notificationsUnread += 1
+            ctx.state.workspaces[wid] = ws
+            windowController?.refreshFromState()
+        }
+        return n.id
+    }
+
+    public func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] {
+        guard let ctx = context else { return [] }
+        let repo = NotificationRepository(db: ctx.db)
+        let list = try repo.list(workspaceId: workspaceId, unreadOnly: unreadOnly)
+        return list.map { n in
+            var d: [String: JSONValue] = [
+                "id": .string(n.id),
+                "title": .string(n.title),
+                "created_at": .string(ISO8601DateFormatter().string(from: n.createdAt))
+            ]
+            if let b = n.body { d["body"] = .string(b) }
+            if let c = n.category { d["category"] = .string(c) }
+            if let w = n.workspaceId { d["workspace_id"] = .string(w.value.uuidString) }
+            if let s = n.surfaceId { d["surface_id"] = .string(s.value.uuidString) }
+            if let r = n.readAt { d["read_at"] = .string(ISO8601DateFormatter().string(from: r)) }
+            return d
+        }
+    }
+
+    public func notificationMarkRead(id: String) throws {
+        guard let ctx = context else { return }
+        try NotificationRepository(db: ctx.db).markRead(id: id)
+    }
+
+    public func notificationDismiss(id: String) throws {
+        guard let ctx = context else { return }
+        try NotificationRepository(db: ctx.db).dismiss(id: id)
+    }
+
     public func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String {
         let s = try browserSurface(surface)
         return await withCheckedContinuation { cont in
