@@ -40,6 +40,13 @@ final class FakeRouter: CommandRouting {
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         [AgentModelDescriptor(id: "x", label: "X", provider: provider)]
     }
+    func browserNavigate(surface: SurfaceID, url: String) throws {}
+    func browserBack(surface: SurfaceID) throws {}
+    func browserForward(surface: SurfaceID) throws {}
+    func browserReload(surface: SurfaceID) throws {}
+    func browserURL(surface: SurfaceID) throws -> String { "about:blank" }
+    func browserEval(surface: SurfaceID, script: String) async throws -> String { "null" }
+    func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String { savePath ?? "/tmp/x.png" }
 }
 
 final class DispatcherTests: XCTestCase {
@@ -66,7 +73,7 @@ final class DispatcherTests: XCTestCase {
 
     func test_unsupportedDeferredMethod_returnsTypedError() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
-        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "browser.screenshot", params: nil))
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "browser.click", params: nil))
         XCTAssertEqual(resp.error?.code, -32004)
     }
 

@@ -24,6 +24,14 @@ public protocol CommandRouting: AnyObject {
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?) async throws -> AgentRunID
     func stopAgentRun(thread: AgentThreadID) throws
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor]
+    // browser P0
+    func browserNavigate(surface: SurfaceID, url: String) throws
+    func browserBack(surface: SurfaceID) throws
+    func browserForward(surface: SurfaceID) throws
+    func browserReload(surface: SurfaceID) throws
+    func browserURL(surface: SurfaceID) throws -> String
+    func browserEval(surface: SurfaceID, script: String) async throws -> String
+    func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String
 }
 
 public final class JSONRPCDispatcher {
@@ -149,11 +157,42 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .object([
                     "selected_workspace_id": w.selectedWorkspaceID.map { .string($0.value.uuidString) } ?? .null
                 ]))
+            case "browser.navigate":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let url = params["url"]?.stringValue else { throw JSONRPCError.invalidParams }
+                try router.browserNavigate(surface: sid, url: url)
+                return .init(id: id, result: .bool(true))
+            case "browser.back":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                try router.browserBack(surface: sid)
+                return .init(id: id, result: .bool(true))
+            case "browser.forward":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                try router.browserForward(surface: sid)
+                return .init(id: id, result: .bool(true))
+            case "browser.reload":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                try router.browserReload(surface: sid)
+                return .init(id: id, result: .bool(true))
+            case "browser.url.get":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                let url = try router.browserURL(surface: sid)
+                return .init(id: id, result: .string(url))
+            case "browser.eval":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let script = params["script"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let s = try await router.browserEval(surface: sid, script: script)
+                return .init(id: id, result: .string(s))
+            case "browser.screenshot":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                let path = params["path"]?.stringValue
+                let resolved = try router.browserScreenshot(surface: sid, savePath: path)
+                return .init(id: id, result: .object(["path": .string(resolved)]))
+            case "browser.click", "browser.fill", "browser.type", "browser.wait", "browser.snapshot":
+                throw JSONRPCError.notSupported(req.method)
             // V1 deferred families return a typed unsupported error.
             case "window.list", "window.create", "window.focus", "window.close",
                  "pane.list", "pane.resize", "pane.swap", "pane.break", "pane.join",
-                 "browser.eval", "browser.snapshot", "browser.click", "browser.fill", "browser.type",
-                 "browser.screenshot", "browser.navigate", "browser.back", "browser.forward", "browser.reload", "browser.wait",
                  "notification.create", "notification.list", "notification.dismiss":
                 throw JSONRPCError.notSupported(req.method)
             default:

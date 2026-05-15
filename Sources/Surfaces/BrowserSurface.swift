@@ -92,6 +92,33 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         webView.load(URLRequest(url: url))
     }
 
+    public func navigate(string: String) -> Bool {
+        var s = string.trimmingCharacters(in: .whitespaces)
+        if s.isEmpty { return false }
+        if !s.contains("://") { s = "https://" + s }
+        guard let u = URL(string: s) else { return false }
+        navigate(to: u)
+        return true
+    }
+
+    public func currentURL() -> String { webView.url?.absoluteString ?? "" }
+    public func currentTitle() -> String { webView.title ?? "" }
+    public func goBackAction() { webView.goBack() }
+    public func goForwardAction() { webView.goForward() }
+    public func reloadAction() { webView.reload() }
+
+    public func evaluate(_ js: String, completion: @escaping (Any?, Error?) -> Void) {
+        webView.evaluateJavaScript(js, completionHandler: completion)
+    }
+
+    public func screenshotPNG() -> Data? {
+        let bounds = webView.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        guard let rep = webView.bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        webView.cacheDisplay(in: bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
+    }
+
     @objc private func goBack() { webView.goBack() }
     @objc private func goForward() { webView.goForward() }
     @objc private func reload() { webView.reload() }

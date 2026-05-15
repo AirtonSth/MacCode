@@ -133,6 +133,48 @@ public final class AppCommandRouter: @preconcurrency CommandRouting {
         return await runner.listModels()
     }
 
+    private func browserSurface(_ id: SurfaceID) throws -> BrowserSurface {
+        guard let s = SurfaceRegistry.shared.surface(id) as? BrowserSurface else { throw LayoutError.surfaceNotFound }
+        return s
+    }
+
+    public func browserNavigate(surface: SurfaceID, url: String) throws {
+        let b = try browserSurface(surface)
+        if !b.navigate(string: url) { throw LayoutError.invalidLayout }
+    }
+    public func browserBack(surface: SurfaceID) throws { try browserSurface(surface).goBackAction() }
+    public func browserForward(surface: SurfaceID) throws { try browserSurface(surface).goForwardAction() }
+    public func browserReload(surface: SurfaceID) throws { try browserSurface(surface).reloadAction() }
+    public func browserURL(surface: SurfaceID) throws -> String { try browserSurface(surface).currentURL() }
+
+    public func browserEval(surface: SurfaceID, script: String) async throws -> String {
+        let s = try browserSurface(surface)
+        return await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            s.evaluate(script) { result, error in
+                if let error = error {
+                    cont.resume(returning: "error: \(error.localizedDescription)")
+                } else if let result = result {
+                    if let data = try? JSONSerialization.data(withJSONObject: result, options: [.fragmentsAllowed]),
+                       let s = String(data: data, encoding: .utf8) {
+                        cont.resume(returning: s)
+                    } else {
+                        cont.resume(returning: String(describing: result))
+                    }
+                } else {
+                    cont.resume(returning: "")
+                }
+            }
+        }
+    }
+
+    public func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String {
+        let s = try browserSurface(surface)
+        guard let png = s.screenshotPNG() else { throw LayoutError.invalidLayout }
+        let path = savePath ?? (NSTemporaryDirectory() + "rc2-screenshot-\(UUID().uuidString).png")
+        try png.write(to: URL(fileURLWithPath: path))
+        return path
+    }
+
     private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String) -> SurfaceDescriptor {
         let baseTitle = title ?? defaultTitle(for: type)
         let descriptor = SurfaceDescriptor(type: type, title: baseTitle, iconName: type.rawValue, metadata: ["workspace": workspace.value.uuidString, "cwd": cwd])

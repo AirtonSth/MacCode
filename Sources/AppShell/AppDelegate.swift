@@ -11,6 +11,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public var router: AppCommandRouter!
     public var windowController: MainWindowController!
     public var socketServer: UnixSocketServer?
+    public var httpServer: DirectHTTPServer?
+    public var palette: CommandPalette?
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
@@ -49,6 +51,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("Failed to start socket server: \(error)")
         }
 
+        // Start direct HTTP server bound to loopback by default.
+        let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
+        let loopbackOnly = remoteEnabled != "1"
+        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly, dispatcher: dispatcher)
+        do {
+            try http.start()
+            httpServer = http
+            NSLog("Direct HTTP server listening on 127.0.0.1:18217 (loopback=\(loopbackOnly))")
+        } catch {
+            NSLog("Failed to start HTTP server: \(error)")
+        }
+
+        palette = CommandPalette(router: router)
+
         installMainMenu()
         windowController.show()
     }
@@ -56,6 +72,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public func applicationWillTerminate(_ notification: Notification) {
         context?.saveSnapshot()
         socketServer?.stop()
+        httpServer?.stop()
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -95,7 +112,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
         editMenuItem.submenu = editMenu
 
-        // View / Surface
+        // View
+        let viewItem = NSMenuItem()
+        mainMenu.addItem(viewItem)
+        let viewMenu = NSMenu(title: "View")
+        let paletteItem = NSMenuItem(title: "Show Command Palette", action: #selector(togglePalette), keyEquivalent: "k")
+        paletteItem.keyEquivalentModifierMask = [.command, .shift]
+        paletteItem.target = self
+        viewMenu.addItem(paletteItem)
+        viewItem.submenu = viewMenu
+
+        // Surface
         let surfaceItem = NSMenuItem()
         mainMenu.addItem(surfaceItem)
         let surfaceMenu = NSMenu(title: "Surface")
@@ -126,6 +153,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "RemoteCode 2"
         alert.informativeText = "Native Swift macOS rewrite. cmux-style panes + Agent App surface."
         alert.runModal()
+    }
+
+    @objc private func togglePalette() {
+        palette?.toggle()
     }
 
     @objc private func newWorkspace() {
