@@ -109,10 +109,22 @@ public final class PaneTabsView: NSObject {
             help: "Split down (stacked)",
             target: self, action: #selector(splitVertical))
 
+        // Git lives at the workspace level: this button opens a Git tab
+        // (changed files + diff) in the current pane.
+        let gitButton = Self.makeIconButton(
+            symbol: "arrow.triangle.branch",
+            help: "Open Git (changed files & diff)",
+            target: self, action: #selector(openGit))
+
+        let sep = NSBox()
+        sep.boxType = .separator
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.heightAnchor.constraint(equalToConstant: 16).isActive = true
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let toolbar = NSStackView(views: [addPopup, spacer, splitColumns, splitRows])
+        let toolbar = NSStackView(views: [addPopup, spacer, gitButton, sep, splitColumns, splitRows])
         toolbar.orientation = .horizontal
         toolbar.spacing = DS.Space.sm
         toolbar.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
@@ -266,6 +278,11 @@ public final class PaneTabsView: NSObject {
 
     @objc private func splitVertical() {
         performSplit(.down, type: .terminal, title: Self.title(for: .terminal))
+    }
+
+    @objc private func openGit() {
+        // The Git surface is the workspace changed-files + diff view.
+        performAdd(.rightSidebarTool, title: "Git")
     }
 
     /// Testable seam shared by the @objc button handlers.

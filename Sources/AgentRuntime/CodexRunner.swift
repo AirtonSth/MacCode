@@ -51,18 +51,22 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             throw AgentRunError.missingBinary(binary)
         }
 
-        var args: [String] = ["exec", "--json"]
+        // `codex exec` flag surface (current CLI): --model, --json,
+        // --sandbox <mode>, and config overrides via `-c key=value`.
+        // `--reasoning` / `--permission` are NOT valid flags (they made
+        // every run fail with "unexpected argument").
+        var args: [String] = ["exec", "--json", "--skip-git-repo-check"]
         args.append(contentsOf: ["--model", request.model])
         if let r = request.reasoningEffort?.rawValue {
-            args.append(contentsOf: ["--reasoning", r])
+            args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(r)\""])
         }
         switch request.permissionMode {
-        case .supervised: args.append(contentsOf: ["--permission", "supervised"])
-        case .autoAcceptEdits: args.append(contentsOf: ["--permission", "auto-edit"])
-        case .fullAccess: args.append(contentsOf: ["--permission", "full-access"])
-        }
-        if let ptid = request.providerThreadId {
-            args.append(contentsOf: ["--resume", ptid])
+        case .supervised:
+            args.append(contentsOf: ["--sandbox", "read-only"])
+        case .autoAcceptEdits:
+            args.append(contentsOf: ["--sandbox", "workspace-write"])
+        case .fullAccess:
+            args.append(contentsOf: ["--sandbox", "danger-full-access"])
         }
         args.append(contentsOf: request.extraArgs)
         args.append(request.prompt)
