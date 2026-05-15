@@ -1,0 +1,1731 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 AI Agent Trello Board</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1419;
+      --panel: #171d24;
+      --panel-2: #111820;
+      --card: #202833;
+      --text: #e7edf3;
+      --muted: #9da9b5;
+      --line: #2a3440;
+      --accent: #7cc7ff;
+      --build: #7cc7ff;
+      --review: #ffd37a;
+      --test: #8ee6a8;
+      --risk: #ff9b9b;
+      --ops: #c9a7ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    header { position: sticky; top: 0; z-index: 5; background: rgba(15, 20, 25, 0.96); border-bottom: 1px solid var(--line); backdrop-filter: blur(12px); }
+    .topbar { max-width: 1600px; margin: 0 auto; padding: 18px 24px; display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; }
+    h1 { margin: 0 0 6px; font-size: 28px; line-height: 1.15; }
+    h2 { margin: 0 0 12px; font-size: 17px; }
+    h3 { margin: 0 0 8px; font-size: 15px; }
+    p { margin: 0 0 10px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: #0a0e13; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+    main { max-width: 1600px; margin: 0 auto; padding: 22px 24px 72px; }
+    .muted { color: var(--muted); }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--text); background: var(--panel-2); white-space: nowrap; }
+    .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--accent); }
+    .board { display: grid; grid-template-columns: repeat(5, minmax(310px, 1fr)); gap: 14px; align-items: start; overflow-x: auto; padding-bottom: 20px; }
+    .column { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-height: 400px; }
+    .column-header { position: sticky; top: 86px; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); border-radius: 8px 8px 0 0; padding: 13px 14px; }
+    .column-header .count { color: var(--muted); font-size: 12px; }
+    .cards { display: grid; gap: 10px; padding: 12px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; box-shadow: 0 14px 28px rgba(0,0,0,.16); }
+    .card-title { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; margin-bottom: 8px; }
+    .card-id { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .labels { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+    .label { border-radius: 5px; padding: 2px 6px; color: #071018; font-weight: 650; font-size: 11px; }
+    .build { background: var(--build); }
+    .review { background: var(--review); }
+    .test { background: var(--test); }
+    .risk { background: var(--risk); }
+    .ops { background: var(--ops); }
+    details { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
+    summary { cursor: pointer; color: var(--accent); font-weight: 650; }
+    ul, ol { padding-left: 19px; margin: 7px 0 10px; }
+    li { margin: 4px 0; }
+    .meta { display: grid; grid-template-columns: 90px 1fr; gap: 4px 8px; color: var(--muted); font-size: 12px; }
+    .section { margin-top: 10px; }
+    .section strong { color: var(--text); }
+    .swimlane { margin: 24px 0 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+    th, td { border: 1px solid var(--line); padding: 8px 9px; text-align: left; vertical-align: top; }
+    th { background: var(--panel-2); }
+    @media (max-width: 900px) {
+      .topbar { display: block; }
+      .board { grid-template-columns: 1fr; overflow: visible; }
+      .column-header { position: static; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <div>
+      <p><a href="index.html">Back to index</a></p>
+      <h1>RemoteCode 2 AI Agent Trello Board</h1>
+      <p class="muted">English Scrum board for LLM agents to build the Swift cmux-like RemoteCode 2 app from zero. Agent App and general interface tasks are now based on T3 Code. Each card is written as an executable task with context, steps, deliverables, tests, review checks, and acceptance criteria.</p>
+      <div class="legend">
+        <span class="pill"><span class="dot" style="background:var(--build)"></span>Build</span>
+        <span class="pill"><span class="dot" style="background:var(--review)"></span>Review</span>
+        <span class="pill"><span class="dot" style="background:var(--test)"></span>Test</span>
+        <span class="pill"><span class="dot" style="background:var(--risk)"></span>Risk</span>
+        <span class="pill"><span class="dot" style="background:var(--ops)"></span>Ops</span>
+      </div>
+    </div>
+    <div class="muted">
+      <strong>Board rule:</strong> every card must have explicit acceptance criteria, automated tests, E2E/proof gates, and fail signals before an agent can mark it done.
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="swimlane">
+    <h2>Global Definition Of Ready</h2>
+    <ul>
+      <li>The agent must read <code>01-product-requirements.html</code>, <code>03-target-architecture.html</code>, and the card details before editing.</li>
+      <li>The agent must state assumptions and blockers before coding when the card depends on licensing, external tools, signing credentials, or provider behavior.</li>
+      <li>The agent must keep diffs surgical and use Swift-native implementations unless the card explicitly allows a temporary stub.</li>
+      <li>The agent must not copy cmux source unless the license decision card is completed with explicit approval.</li>
+      <li>The agent must use T3 Code as the Agent App and general UI reference: dense developer-tool layout, project/thread sidebar, chat timeline, bottom composer, top action toolbar, diff panel, terminal drawer, command palette, and provider/runtime controls.</li>
+      <li>The agent must not blindly paste TypeScript/React source into Swift. Direct T3 Code source reuse is allowed only when the implementation preserves MIT attribution and the card explicitly asks for source translation; otherwise copy behavior, structure, and UX patterns.</li>
+      <li>The ideal UI stack is fixed unless a later architecture review changes it: SwiftUI for sidebar, chat, composer, lists, settings, and command palette; AppKit for window ownership, responder chain, menus, focus, terminal host, and complex split panes; Liquid Glass only for controls and bars, never the main content canvas.</li>
+      <li>The desktop core must be designed for the future mobile mirror from day zero. The mobile app is not in current build scope, but every command, event, identity, and state boundary must be ready for a future direct app-to-computer client.</li>
+      <li>Remote access architecture is direct only: future mobile connects to the desktop over VPN or trusted local network using desktop-hosted HTTP/WebSocket APIs. No relay, no private backend, no cloud broker, and no server-side repository mirroring.</li>
+    </ul>
+  </section>
+
+  <section class="swimlane" id="cold-agent-execution-packet">
+    <h2>Cold Agent Execution Packet</h2>
+    <p class="muted">This block is the mandatory context for any AI agent that starts with no thread history. If this block and the assigned card disagree, this block wins unless a senior reviewer updates it in the same change.</p>
+    <table>
+      <tr><th>Topic</th><th>Non-negotiable instruction</th></tr>
+      <tr><td>Product in one sentence</td><td>Build RemoteCode 2: a native Swift macOS developer tool like cmux, with terminal and browser surfaces plus a T3 Code/Codex App-style Agent App surface that can run Codex or Claude.</td></tr>
+      <tr><td>User mental model</td><td>The user opens a project, creates workspaces, splits panes, opens surface tabs, chats with coding agents, inspects changed files/diffs, runs terminals, and uses browser automation without leaving the app.</td></tr>
+      <tr><td>Target UI</td><td>Dark, dense, developer-tool UI. Copy T3 Code structure: searchable project/thread sidebar, compact action header, chat timeline, bottom composer, changed-files proof card, diff panel, terminal drawer, command palette, and provider/runtime controls.</td></tr>
+      <tr><td>Swift boundary</td><td>Use SwiftUI for sidebar, chat, composer, lists, settings, command palette, controls, and data-driven content. Use AppKit for window ownership, responder chain, menus, focus, terminal host, complex split panes, panels, and fragile desktop mechanics.</td></tr>
+      <tr><td>Liquid Glass boundary</td><td>Allowed only on controls and bars. Forbidden on main content, chat body, sidebar rows, terminal, browser, diff content, repeated lists, and dense data surfaces.</td></tr>
+      <tr><td>Previous-app boundary</td><td>Start from zero. Do not read, scan, transform, transfer, or depend on any previous RemoteCode app data, schema, source architecture, or runtime. The current local app may be studied only to understand product intent and direct-control behavior.</td></tr>
+      <tr><td>Mobile boundary</td><td>Do not build the mobile app now. Build the desktop core so a future mobile app can directly connect to the desktop over VPN/LAN and mirror/control the same state through versioned HTTP/WebSocket contracts.</td></tr>
+      <tr><td>Network boundary</td><td>No relay, no private backend, no cloud broker, no connector id, no hosted repository mirror, no cloud command queue. The desktop is the source of truth and the only machine touching repositories and provider CLIs.</td></tr>
+      <tr><td>V1 success</td><td>A signed macOS app can open a clean first workspace, split terminal/browser/Agent App surfaces, run fake and real provider smoke flows where credentials exist, show changed-file evidence, restore session state, pass tests, and prove direct-VPN API readiness with a fake client.</td></tr>
+      <tr><td>Agent rule</td><td>No card can be marked done with prose alone. It needs changed artifacts, automated tests, E2E/proof evidence, and explicit pass/fail status tied to the assigned card and this board.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane" id="execution-sequence-stage-gates">
+    <h2>Execution Sequence And Stage Gates</h2>
+    <p class="muted">Agents must execute cards in dependency order. A later phase cannot start until the previous phase gate passes or a senior reviewer writes an explicit exception.</p>
+    <table>
+      <tr><th>Phase</th><th>Cards</th><th>Exit gate</th><th>Required proof</th></tr>
+      <tr><td>0. Decisions</td><td>RC2-001 through RC2-008</td><td>All ADRs/specs exist and remove ambiguity for implementation agents.</td><td>Review report links to each decision, forbidden actions, and exact downstream card impacts.</td></tr>
+      <tr><td>1. Native shell</td><td>RC2-010, RC2-011, RC2-020</td><td>Clean clone builds and launches native macOS window with design tokens and no fake chrome.</td><td>Build log, launch screenshot, unit smoke, fake-chrome scan, UI ownership check.</td></tr>
+      <tr><td>2. Domain and persistence</td><td>RC2-012, RC2-016, RC2-017, RC2-080, RC2-081</td><td>Workspace state, database, snapshots, clean first-run, and fixtures are deterministic.</td><td>Reducer tests, DB tests, restore E2E, first-run filesystem trace, fixture determinism report.</td></tr>
+      <tr><td>3. Layout and navigation</td><td>RC2-013 through RC2-015, RC2-021, RC2-022</td><td>Sidebar, split panes, tabs, command palette, header, and context toolbar work with placeholders.</td><td>UI automation recording, keyboard navigation proof, T3 parity screenshot, no-overlap check.</td></tr>
+      <tr><td>4. Automation core</td><td>RC2-018, RC2-019, RC2-023 through RC2-026</td><td>Local CLI/socket and direct-VPN-ready HTTP/WebSocket contracts drive the same command bus.</td><td>Socket integration test, CLI E2E, fake mobile direct API E2E, replay/idempotency report, no-relay static scan.</td></tr>
+      <tr><td>5. Surfaces</td><td>RC2-030 through RC2-042</td><td>Terminal and browser are production-usable and automation-safe.</td><td>Terminal E2E, browser E2E, process cleanup proof, browser screenshot, target-isolation tests.</td></tr>
+      <tr><td>6. Agent App runtime</td><td>RC2-050 through RC2-065</td><td>Codex and Claude run through one normalized Agent App model and can be driven by UI/CLI/API.</td><td>Provider fixture tests, fake provider E2E, real provider smoke when auth exists, cancellation/crash proof.</td></tr>
+      <tr><td>7. Work evidence and project actions</td><td>RC2-066 through RC2-069</td><td>Agent work produces changed-file proof, diff inspection, terminal context, and safe project actions.</td><td>Git fixture E2E, diff screenshot, terminal drawer E2E, script-run E2E, log redaction proof.</td></tr>
+      <tr><td>8. Quality gates</td><td>RC2-090 through RC2-104</td><td>Unit, integration, UI, performance, visual, security, accessibility, T3, and mobile-readiness gates pass.</td><td>CI/test reports, screenshots, recordings, review reports, unresolved P0/P1 count equals zero.</td></tr>
+      <tr><td>9. Release</td><td>RC2-120 through RC2-124</td><td>Signed/notarized release candidate installs cleanly, updates safely, and docs match actual behavior.</td><td>DMG proof, clean-machine E2E, canary update E2E, docs dry run, final go/no-go report.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane" id="universal-card-done-contract">
+    <h2>Universal Card Done Contract</h2>
+    <p class="muted">Every card must produce this evidence. If a card cannot produce one item, the agent must mark the card blocked with the exact reason and the smallest follow-up needed.</p>
+    <table>
+      <tr><th>Required item</th><th>Exact expectation</th></tr>
+      <tr><td>Context proof</td><td>Name the files/specs read, the relevant prior cards, and the assumptions used. Do not rely on hidden thread history.</td></tr>
+      <tr><td>Changed artifacts</td><td>List every created/modified file or document. For decision cards, list ADR/spec outputs. For build cards, list code/tests/docs. For review cards, list reports and linked evidence.</td></tr>
+      <tr><td>Acceptance criteria</td><td>Restate the card-specific acceptance criteria and mark each item <code>PASS</code>, <code>FAIL</code>, or <code>BLOCKED</code>.</td></tr>
+      <tr><td>Automated tests</td><td>Run the smallest reliable automated test layer plus any card-required tests. Include exact command, result, and failing test names if any.</td></tr>
+      <tr><td>E2E/proof gate</td><td>Run the card's E2E/proof gate. For UI work, include screenshot or recording. For API work, include request/response or fake-client transcript. For review/spec work, include dry-run proof that another agent can follow it.</td></tr>
+      <tr><td>Regression guard</td><td>State which future regression the new tests catch. If no automated regression guard is possible, explain why and add a manual release gate.</td></tr>
+      <tr><td>Security/privacy check</td><td>Confirm no secrets, tokens, prompts, terminal input, browser cookies, or repository content are logged or exposed beyond the card's intended local/direct path.</td></tr>
+      <tr><td>Fresh-start check</td><td>Confirm no old RemoteCode data, schema, transfer path, user home probe, or compatibility bridge was added.</td></tr>
+      <tr><td>Mobile-readiness check</td><td>For shared state/network/command/surface work, confirm the command bus and event envelopes remain future-mobile-ready and direct-VPN-only.</td></tr>
+      <tr><td>Exit status</td><td>The final card report must end with exactly one status: <code>DONE</code>, <code>BLOCKED</code>, or <code>NEEDS REVIEW</code>. <code>DONE</code> requires all acceptance and proof gates to pass.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane" id="required-command-gates">
+    <h2>Required Command Gates</h2>
+    <p class="muted">Before the real repository exists, these are command names and evidence contracts. When the Swift project is scaffolded, RC2-010 must create concrete scripts with these names or update this board in the same change.</p>
+    <table>
+      <tr><th>Gate</th><th>Command contract</th><th>Pass condition</th></tr>
+      <tr><td>Bootstrap</td><td><code>./scripts/bootstrap</code></td><td>Installs/validates dependencies without touching user app data.</td></tr>
+      <tr><td>Build</td><td><code>./scripts/build-debug</code></td><td>Builds debug app and CLI helper from clean checkout.</td></tr>
+      <tr><td>Unit</td><td><code>./scripts/test-unit</code></td><td>Runs deterministic unit tests for reducers, persistence, providers, command bus, and parsers.</td></tr>
+      <tr><td>Integration</td><td><code>./scripts/test-integration</code></td><td>Runs socket, CLI, API, DB, terminal, browser, and fake-provider integration tests.</td></tr>
+      <tr><td>UI E2E</td><td><code>./scripts/test-ui</code></td><td>Runs XCTest UI flows and writes screenshots/recordings for core workflows.</td></tr>
+      <tr><td>Visual parity</td><td><code>./scripts/test-visual</code></td><td>Captures T3 parity screenshots and fails on blank screens, overlap, missing controls, or contrast failures.</td></tr>
+      <tr><td>Direct-VPN contract</td><td><code>./scripts/test-direct-vpn-contract</code></td><td>Runs fake-client HTTP/WebSocket pairing, command, replay, revocation, and no-relay negative tests.</td></tr>
+      <tr><td>Security</td><td><code>./scripts/test-security</code></td><td>Runs secret scan, auth negative tests, log redaction tests, and old-data path probes.</td></tr>
+      <tr><td>Performance</td><td><code>./scripts/test-performance</code></td><td>Runs budgeted launch, memory, timeline, diff, terminal, browser, and event-burst benchmarks.</td></tr>
+      <tr><td>Release candidate</td><td><code>./scripts/release-candidate-check</code></td><td>Builds signed candidate where credentials exist, validates docs, package shape, clean install smoke, and known-risk report.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane" id="agent-self-check-before-work">
+    <h2>Agent Self-Check Before Work</h2>
+    <p class="muted">Every implementation, review, or test agent must answer these checks in its card report before writing code or marking completion. Any <code>NO</code> answer blocks the card.</p>
+    <table>
+      <tr><th>Check</th><th>Required answer</th></tr>
+      <tr><td>Can I state the product target in one sentence?</td><td>YES: native Swift cmux-like app with terminal, browser, and T3/Codex-style Agent App for Codex/Claude.</td></tr>
+      <tr><td>Can I state what is forbidden?</td><td>YES: no previous-app data path, no fake desktop chrome, no web runtime for the app shell, no relay/private backend/cloud broker, no mobile app build in this phase.</td></tr>
+      <tr><td>Do I know the exact card scope?</td><td>YES: card id, dependencies, outputs, acceptance criteria, automated tests, E2E/proof gate, and fail signal are all named.</td></tr>
+      <tr><td>Do I know which files/modules I own?</td><td>YES: the report names intended files/modules. If unknown, inspect architecture docs first and stop before editing.</td></tr>
+      <tr><td>Do I know the verification command or proof artifact?</td><td>YES: exact script/test/proof path is named. If scripts do not exist yet, the card must create or update them under RC2-010's command contract.</td></tr>
+      <tr><td>Can I prove the user-facing behavior?</td><td>YES: UI/API/CLI/E2E evidence is planned before implementation starts, not after.</td></tr>
+      <tr><td>Can I explain what failure looks like?</td><td>YES: the card fail signal is restated and mapped to a test, screenshot, contract check, or review gate.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane" id="failure-escalation-rules">
+    <h2>Failure Escalation Rules</h2>
+    <table>
+      <tr><th>Failure type</th><th>Agent action</th><th>Card status</th></tr>
+      <tr><td>Missing dependency card</td><td>Stop, name the missing dependency, and do not implement around it.</td><td>BLOCKED</td></tr>
+      <tr><td>Ambiguous product behavior</td><td>Search this board and project docs. If still ambiguous, write the smallest question or ADR update needed.</td><td>BLOCKED</td></tr>
+      <tr><td>Test cannot be automated yet</td><td>Add the smallest fixture/harness needed. If impossible in current phase, add manual proof with a future automation card.</td><td>NEEDS REVIEW</td></tr>
+      <tr><td>E2E/proof gate fails</td><td>Fix implementation or update task scope only through a reviewer-approved card change.</td><td>FAIL</td></tr>
+      <tr><td>Security/privacy uncertainty</td><td>Stop before release-impacting behavior, add evidence request, and route to RC2-101.</td><td>BLOCKED</td></tr>
+      <tr><td>Direct-VPN or mobile-readiness uncertainty</td><td>Stop and route to RC2-008, RC2-023, RC2-025, RC2-026, or RC2-104.</td><td>BLOCKED</td></tr>
+      <tr><td>T3/UI parity uncertainty</td><td>Capture screenshot, compare to T3 spec, and route to RC2-006, RC2-094, or RC2-103.</td><td>NEEDS REVIEW</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane" id="one-hundred-percent-readiness-checklist">
+    <h2>100% Readiness Checklist</h2>
+    <p class="muted">This board is considered cold-agent ready only when every check below is true. If any check becomes false during implementation, update the board before continuing.</p>
+    <table>
+      <tr><th>Check</th><th>Pass condition</th></tr>
+      <tr><td>Product target</td><td>A cold agent can identify the app as a native Swift cmux-like macOS app with terminal, browser, and T3/Codex-style Agent App for Codex/Claude.</td></tr>
+      <tr><td>Forbidden scope</td><td>A cold agent can list the hard no-go rules: no previous-app data path, no fake chrome, no shell web runtime, no relay/private backend/cloud broker, no mobile app build now.</td></tr>
+      <tr><td>Architecture path</td><td>The board defines SwiftUI/AppKit/Liquid Glass ownership, command bus, persistence, surfaces, provider runtime, direct-VPN API, and release gates.</td></tr>
+      <tr><td>Execution order</td><td>The board defines phase order and blocks later work until the prior phase exit gate has proof.</td></tr>
+      <tr><td>Card scope</td><td>Every card has id, owner, dependencies, output, steps, acceptance intent, and a matching verification-matrix row.</td></tr>
+      <tr><td>Automated tests</td><td>Every card has a required automated test layer or a reviewer-approved proof rule when code does not exist yet.</td></tr>
+      <tr><td>E2E proof</td><td>Every card has an explicit <code>E2E:</code> proof gate, including decision/review/docs cards.</td></tr>
+      <tr><td>Fail signal</td><td>Every card defines what failure looks like so an agent cannot mark uncertain work as done.</td></tr>
+      <tr><td>Command gates</td><td>The future repository command names and pass conditions are fixed before implementation starts.</td></tr>
+      <tr><td>Completion report</td><td>The Universal Card Done Contract forces context proof, artifact list, test evidence, E2E evidence, security check, fresh-start check, mobile-readiness check, and final status.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane">
+    <h2>T3 Code UX And Swift UI Contract</h2>
+    <p class="muted">These constraints apply to every Agent App and general interface card. Source reference: <a href="https://github.com/pingdotgg/t3code">pingdotgg/t3code</a>, <a href="https://github.com/pingdotgg/t3code/blob/main/README.md">README</a>, <a href="https://github.com/pingdotgg/t3code/blob/main/KEYBINDINGS.md">KEYBINDINGS</a>, and <a href="https://github.com/pingdotgg/t3code/blob/main/LICENSE">MIT license</a>.</p>
+    <table>
+      <tr><th>Area</th><th>RemoteCode 2 requirement</th></tr>
+      <tr><td>Product model</td><td>Use T3 Code's mental model: a minimal GUI for coding agents, provider-agnostic across Codex and Claude, with project-scoped threads, provider/model/runtime controls, and real changed-file evidence.</td></tr>
+      <tr><td>Visual structure</td><td>Copy the T3 Code screen grammar: dark dense developer surface, left searchable project/thread sidebar, main chat timeline, compact top action bar, bottom composer, right/inline diff surface, and Agent App terminal drawer. Keep native macOS window chrome, not simulated chrome.</td></tr>
+      <tr><td>SwiftUI ownership</td><td>Use SwiftUI for the sidebar, project/thread lists, chat timeline, composer, settings, command palette, popovers, empty states, banners, model/provider controls, and other data-driven app surfaces.</td></tr>
+      <tr><td>AppKit ownership</td><td>Use AppKit where SwiftUI is still weak or too indirect: NSWindow lifecycle, responder chain, native menus, first-responder/focus routing, terminal host integration, complex split panes, drag/drop/focus edge cases, and native file/open panels.</td></tr>
+      <tr><td>Liquid Glass limit</td><td>Use Liquid Glass only on controls and bars where it improves native macOS feel: toolbars, segmented controls, command palette shell, compact buttons, and modal/action surfaces. Do not apply glass to the main content canvas, timeline body, diff content, terminal content, browser content, or dense list rows.</td></tr>
+      <tr><td>Visual rule</td><td>The product must look like a dark, dense developer tool similar to T3 Code/Codex App. It must not look like a marketing website, consumer dashboard, decorative glass demo, or "beautiful app" with oversized type and ornamental spacing.</td></tr>
+      <tr><td>Interaction model</td><td>Keyboard-first command palette, contextual shortcuts, visible focus, disabled states, hover tooltips for icon buttons, compact responsive controls, and clear empty/loading/error states.</td></tr>
+      <tr><td>Agent workflow</td><td>Composer supports provider/model picker, reasoning/trait controls, runtime permission mode, plan/build mode, image/context attachment affordances, pending approval/user-input panels, interrupt/send actions, and context window meter where available.</td></tr>
+      <tr><td>Work evidence</td><td>Timeline must show user messages, assistant messages, work log/tool calls, proposed plans, working timer, changed-files summary with additions/deletions, collapse/expand controls, and open diff actions.</td></tr>
+      <tr><td>Terminal integration</td><td>Terminal drawer must support open/toggle, split, new, close, focus-aware shortcuts, xterm-like interaction, link opening, selected terminal text added to chat context, and height persistence.</td></tr>
+      <tr><td>License</td><td>T3 Code is MIT. If any source is translated or reused, preserve the license notice in a third-party notices file and document the reused files. cmux remains governed by RC2-001.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane">
+    <h2>Future Mobile Direct-VPN Contract</h2>
+    <p class="muted">The mobile app is deferred. The desktop core is not deferred: it must be built so a future mobile client can mirror and control the same state without rewriting the foundation.</p>
+    <table>
+      <tr><th>Area</th><th>RemoteCode 2 requirement</th></tr>
+      <tr><td>Product promise</td><td>RemoteCode means the user can later do from mobile what they can do on desktop. Mobile actions must execute on the computer, against the same workspaces, panes, Agent App threads, terminals, browser surfaces, git state, and settings allowed by policy.</td></tr>
+      <tr><td>Transport</td><td>Expose a desktop-owned direct HTTP plus WebSocket API intended for VPN or trusted local network access. Do not design any relay/private-backend/cloud-broker path. The desktop is the source of truth and the only machine that touches repositories and provider CLIs.</td></tr>
+      <tr><td>Discovery</td><td>Design discovery metadata for server id, app version, capabilities version, auth mode, visible host/port, VPN/LAN connect hints, and health. mDNS, QR pairing, and manual host entry may be supported, but they must resolve to direct desktop addresses only.</td></tr>
+      <tr><td>Pairing and trust</td><td>Use explicit pairing, per-device identity, revocable tokens, secure storage, token rotation, and visible device management. Never ship a production default token. Desktop user must opt in before listening beyond loopback.</td></tr>
+      <tr><td>State mirror</td><td>Every mutating action must flow through a versioned command bus and emit ordered events with sequence, timestamp, request id, origin client id, actor, target ids, and replay rules. UI, CLI, tests, and future mobile must use the same domain actions.</td></tr>
+      <tr><td>Realtime behavior</td><td>WebSocket clients need join/leave semantics, last-sequence replay, ack/idempotency, backpressure handling, reconnect jitter, stale-host recovery, and origin filtering so a mobile-originated command does not duplicate in the desktop UI.</td></tr>
+      <tr><td>Security</td><td>Remote control is high risk. Bind to loopback by default, require explicit enablement for VPN/LAN, audit sensitive commands, redact secrets, rate-limit auth failures, and make file/terminal/provider access policy-driven.</td></tr>
+      <tr><td>Scope boundary</td><td>Do not build the mobile app in this project phase. Build desktop APIs, contracts, fixtures, and tests that prove the future mobile client can be added without replacing the desktop core.</td></tr>
+    </table>
+  </section>
+
+  <section class="board" aria-label="Trello-style board">
+    <section class="column">
+      <div class="column-header">
+        <h2>Backlog / Decisions</h2>
+        <div class="count">Strategic cards that unblock implementation.</div>
+      </div>
+      <div class="cards">
+        <article class="card" id="RC2-001">
+          <div class="card-title"><h3>Resolve cmux Licensing Strategy</h3><span class="card-id">RC2-001</span></div>
+          <div class="labels"><span class="label risk">Risk</span><span class="label review">Review</span></div>
+          <p>Make the legal/source-reuse decision before any implementation agent uses cmux source code.</p>
+          <div class="meta"><span>Owner</span><span>Senior analyst + project owner</span><span>Depends</span><span>None</span><span>Output</span><span>License decision record</span></div>
+          <details open>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> cmux is GPL-3.0-or-later or commercial. RemoteCode 2 can either become GPL-compatible, use a commercial license, or clean-room implement behavior without source copy.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Document whether RemoteCode 2 will copy cmux code, depend on cmux packages, or only use behavioral reference.</li>
+                <li>List affected components: Bonsplit/layout, Ghostty integration, browser automation, socket/CLI API, session restore.</li>
+                <li>Write allowed and forbidden actions for implementation agents.</li>
+                <li>Update the board with the chosen constraint.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> A human-readable decision exists and every later card can tell whether source reuse is allowed.</div>
+            <div class="section"><strong>Review checklist:</strong> No cmux source is copied before this card is complete; the decision names license obligations and distribution impact.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-002">
+          <div class="card-title"><h3>Choose Layout Engine Strategy</h3><span class="card-id">RC2-002</span></div>
+          <div class="labels"><span class="label risk">Risk</span><span class="label build">Build</span></div>
+          <p>Decide how RemoteCode 2 will implement workspaces, panes, splits, and surface tabs.</p>
+          <div class="meta"><span>Owner</span><span>Architecture agent</span><span>Depends</span><span>RC2-001</span><span>Output</span><span>Layout ADR + prototype criteria</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> The app must behave like cmux: vertical workspaces, split panes, and horizontal surface tabs. Do not assume Bonsplit by default; choose between Bonsplit, licensed cmux layout code, and custom split-tree only after the license/package review is written.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Evaluate Bonsplit, licensed cmux layout code, and a custom split-tree implementation.</li>
+                <li>Define core model types: Window, Workspace, Pane, Surface, SplitNode, PaneNode.</li>
+                <li>Specify drag/drop, keyboard focus, tab reorder, close behavior, and session snapshot needs.</li>
+                <li>Write a decision with implementation cost and risks.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> A chosen layout strategy can support terminal, browser, and Agent App surfaces without per-surface special cases.</div>
+            <div class="section"><strong>Tests:</strong> Prototype test plan covers create split, close split, move surface, restore layout, and focus direction.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-003">
+          <div class="card-title"><h3>Choose Terminal Engine Strategy</h3><span class="card-id">RC2-003</span></div>
+          <div class="labels"><span class="label risk">Risk</span><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Prove the terminal technology before building the rest of the shell around it.</p>
+          <div class="meta"><span>Owner</span><span>Terminal architecture agent</span><span>Depends</span><span>RC2-001</span><span>Output</span><span>Terminal ADR + proof checklist</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> cmux quality depends on a real terminal. Current RemoteCode used xterm through Electrobun; RemoteCode 2 should be native.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Evaluate libghostty integration, SwiftTerm, and minimal PTY+view alternatives.</li>
+                <li>Confirm build requirements for arm64 and x86_64 if universal release is required.</li>
+                <li>Define PTY lifecycle, shell selection, env injection, scrollback, copy/paste, and resize behavior.</li>
+                <li>Produce a spike app or test harness showing prompt, input, resize, close, and cleanup.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> The chosen terminal can run a shell in workspace cwd and survive split/tab focus changes.</div>
+            <div class="section"><strong>Tests:</strong> PTY launch, command output, resize, SIGINT, close, and no orphan child process.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-004">
+          <div class="card-title"><h3>Define Provider Runtime Contract</h3><span class="card-id">RC2-004</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label review">Review</span></div>
+          <p>Specify how Codex and Claude runners behave before implementing either provider.</p>
+          <div class="meta"><span>Owner</span><span>Agent runtime architect</span><span>Depends</span><span>Source inventory</span><span>Output</span><span>Provider protocol spec</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> Current RemoteCode has separate Codex and Claude parsers that emit one assistant event model. Swift must preserve that separation.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Define <code>AgentProviderRunner</code>, <code>AgentRunRequest</code>, <code>AgentRunHandle</code>, and <code>AgentProviderEvent</code>.</li>
+                <li>Define supported provider options: model, reasoning effort, permission mode, cwd, prompt, provider thread ID.</li>
+                <li>Define cancellation semantics and process cleanup.</li>
+                <li>Define missing CLI and auth error mapping.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Codex and Claude can be implemented behind the same protocol without UI branching beyond provider-specific settings.</div>
+            <div class="section"><strong>Review checklist:</strong> No UI model depends on raw Codex or Claude JSON.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-005">
+          <div class="card-title"><h3>Define V1 Scope And Deferred cmux Features</h3><span class="card-id">RC2-005</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label ops">Ops</span></div>
+          <p>Protect the project from scope creep while preserving a complete V1.</p>
+          <div class="meta"><span>Owner</span><span>Scrum master</span><span>Depends</span><span>Product requirements</span><span>Output</span><span>V1 scope contract</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Classify all cmux families as V1 required, V1 partial, or post-V1.</li>
+                <li>Confirm terminal, browser P0, Agent App, CLI/socket, persistence, clean first-run bootstrap, QA, signing are V1 required.</li>
+                <li>Mark SSH/cloud VM, markdown/file preview, and advanced browser P2 as post-V1 unless owner changes priority.</li>
+                <li>Add unsupported-method response rules for deferred APIs.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Every missing cmux feature has an explicit status and no agent has to infer scope.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-006">
+          <div class="card-title"><h3>Create T3 Code UX Reference Spec</h3><span class="card-id">RC2-006</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label build">Build</span><span class="label risk">Risk</span></div>
+          <p>Turn the T3 Code research into a precise Swift UI implementation contract before UI agents start building.</p>
+          <div class="meta"><span>Owner</span><span>Senior product analyst + Scrum master</span><span>Depends</span><span>T3 Code source review</span><span>Output</span><span>T3 UX parity spec + attribution decision</span></div>
+          <details open>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> RemoteCode 2 must be a Swift-native app, but the Agent App and general interface should copy T3 Code's product behavior and visual structure. T3 Code is MIT; source translation requires attribution. This card prevents vague "inspired by" work.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Read T3 Code README, KEYBINDINGS, LICENSE, <code>apps/web/src/components/Sidebar.tsx</code>, <code>AppSidebarLayout.tsx</code>, <code>ChatView.tsx</code>, <code>chat/ChatHeader.tsx</code>, <code>chat/ChatComposer.tsx</code>, <code>chat/MessagesTimeline.tsx</code>, <code>DiffPanel.tsx</code>, <code>ThreadTerminalDrawer.tsx</code>, <code>CommandPaletteResults.tsx</code>, and <code>BranchToolbar.tsx</code>.</li>
+                <li>Write a Swift-facing UX spec mapping each T3 Code surface to RemoteCode 2 components: sidebar, header toolbar, branch/workspace toolbar, timeline, composer, diff panel, terminal drawer, command palette, settings.</li>
+                <li>Define exact visual tokens to reproduce: dense dark surface, 1px borders, subtle muted text, compact icon buttons, small rounded controls, project/thread rows, status pills, diff additions/deletions, and bottom composer proportions.</li>
+                <li>Define what must not be copied: Electron runtime, React state architecture, fake web chrome, web-only CSS implementation details, or provider support beyond Codex and Claude for V1.</li>
+                <li>Create an attribution rule: if code or substantial UI text is translated from T3 Code, add a third-party notice and list files used.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> UI agents can implement T3 Code parity from the spec without opening the T3 Code repo again, and reviewers can check every major T3 Code pattern against a written requirement.</div>
+            <div class="section"><strong>Review checklist:</strong> Spec separates UX copying from source copying, includes license obligations, and preserves RemoteCode 2 native Swift/macOS constraints.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-007">
+          <div class="card-title"><h3>Define SwiftUI, AppKit, And Liquid Glass UI Ownership</h3><span class="card-id">RC2-007</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label build">Build</span><span class="label risk">Risk</span></div>
+          <p>Lock the UI implementation boundary before any visual or shell code is built.</p>
+          <div class="meta"><span>Owner</span><span>Senior macOS UI architect</span><span>Depends</span><span>RC2-006</span><span>Output</span><span>UI ownership ADR</span></div>
+          <details open>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> RemoteCode 2 must feel like T3 Code/Codex App, but it must be a native Swift macOS app. The right architecture is not "all SwiftUI" and not "all AppKit". The boundary must be explicit so agents do not create fragile wrappers or decorative UI.</div>
+            <div class="section"><strong>Required decision:</strong>
+              <ol>
+                <li>Use SwiftUI for sidebar, chat timeline, composer, data lists, settings, command palette, banners, empty states, model/provider controls, and dense state-driven content.</li>
+                <li>Use AppKit for NSWindow lifecycle, responder chain, native menus, focus ownership, terminal host view/controller, complex split panes, drag/drop edge cases, file/open/save panels, and any surface that needs precise first-responder behavior.</li>
+                <li>Use Liquid Glass only for controls and bars: toolbars, compact segmented controls, icon buttons, command palette shell, modal/action surfaces, and native chrome-adjacent controls.</li>
+                <li>Do not use Liquid Glass for main content: chat transcript, timeline body, sidebar rows, diff body, terminal viewport, browser viewport, file trees, or dense repeated list cells.</li>
+                <li>Set the visual baseline as dark, dense, developer-tool, T3 Code/Codex App-like. Reject marketing-page spacing, oversized hero typography, decorative gradients, glass cards, and ornamental backgrounds.</li>
+                <li>Define the interop boundary: SwiftUI views receive state/actions; AppKit coordinators own imperative focus/window/terminal/split behavior; shared state lives outside both UI frameworks.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> ADR includes a component-by-component table naming SwiftUI, AppKit, or mixed ownership, plus a "forbidden UI patterns" list that implementation agents must follow.</div>
+            <div class="section"><strong>Tests:</strong> Add architecture tests or lint-style checks for no fake window chrome, no Liquid Glass on main content containers, no terminal hosted purely inside unstable SwiftUI wrappers, and no command palette implemented outside the shared command model. If a rule cannot be enforced statically, add a UI/E2E assertion or review checklist item that names the exact file/component.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-008">
+          <div class="card-title"><h3>Define Future Mobile Direct-VPN Mirror Contract</h3><span class="card-id">RC2-008</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label risk">Risk</span><span class="label build">Build</span></div>
+          <p>Lock the architecture that lets a future mobile app mirror and control the desktop without a relay.</p>
+          <div class="meta"><span>Owner</span><span>Senior platform architect + Scrum master</span><span>Depends</span><span>Current RemoteCode local/mobile study</span><span>Output</span><span>Mobile-ready desktop contract ADR</span></div>
+          <details open>
+            <summary>Card details</summary>
+            <div class="section"><strong>Context:</strong> Current RemoteCode already exposes a local server, discovery metadata, local/VPN probing, token auth, HTTP routes, and WebSocket events. RemoteCode 2 must keep the useful direct-control idea, but start clean and remove any private-backend or relay direction.</div>
+            <div class="section"><strong>Required decision:</strong>
+              <ol>
+                <li>Define the future mobile promise precisely: mobile mirrors the desktop and sends commands that execute on the computer.</li>
+                <li>Declare mobile implementation out of scope for this phase, while making desktop contracts in scope.</li>
+                <li>Define direct-only networking: desktop-hosted HTTP/WebSocket over VPN or trusted LAN, no relay, no private backend, no cloud command queue, no hosted repository sync.</li>
+                <li>Define mobile-ready primitives: server identity, capabilities version, command envelope, event envelope, request id, origin client id, sequence, replay, ack, idempotency, and device trust.</li>
+                <li>List every desktop surface that must eventually be controllable: Agent App, terminal, browser, workspace/pane tabs, git actions, file context, settings subset, and command palette actions.</li>
+                <li>Write explicit non-goals: no mobile UI, no push notification feature, no APNS work, no private account system, no remote execution outside the user's computer.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Architecture agents can build desktop core and APIs without guessing how future mobile will connect, authenticate, replay state, or route commands.</div>
+            <div class="section"><strong>Review checklist:</strong> ADR forbids relay/private backend design, keeps repositories and provider CLIs on the desktop, and maps mobile readiness to concrete desktop tasks and tests.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <section class="column">
+      <div class="column-header">
+        <h2>Foundation Build</h2>
+        <div class="count">App skeleton, persistence, layout, CLI, and domain core.</div>
+      </div>
+      <div class="cards">
+        <article class="card" id="RC2-010">
+          <div class="card-title"><h3>Create Swift macOS Project Skeleton</h3><span class="card-id">RC2-010</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Initialize the native app and test structure from zero.</p>
+          <div class="meta"><span>Owner</span><span>Foundation agent</span><span>Depends</span><span>RC2-001</span><span>Output</span><span>Xcode project + Swift packages</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create <code>RemoteCode2.xcodeproj</code> or SwiftPM-driven Xcode project with macOS app target.</li>
+                <li>Add modules/folders: App, Windowing, Workspace, Surfaces, AgentRuntime, Persistence, SocketAutomation, CLI, Tests, UITests.</li>
+                <li>Configure app bundle IDs for debug, canary, stable.</li>
+                <li>Add scripts: bootstrap, build-debug, test-unit, test-integration, test-ui.</li>
+                <li>Commit a minimal app that opens a native NSWindow with placeholder content.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Clean clone builds and runs the debug app; unit test target executes one smoke test.</div>
+            <div class="section"><strong>Tests:</strong> Build test, launch smoke test, app bundle ID test.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-011">
+          <div class="card-title"><h3>Implement App Lifecycle, Menus, And Native Window Shell</h3><span class="card-id">RC2-011</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label review">Review</span></div>
+          <p>Build the macOS shell without fake in-app window chrome.</p>
+          <div class="meta"><span>Owner</span><span>AppKit shell agent</span><span>Depends</span><span>RC2-010</span><span>Output</span><span>Native window shell</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create AppDelegate or SwiftUI App lifecycle with explicit NSWindow management.</li>
+                <li>Add native menus for app, file, edit, view, workspace, surface, window, help.</li>
+                <li>Add settings window stub and about/version metadata.</li>
+                <li>Persist and restore window bounds per release channel.</li>
+                <li>Use AppKit as the owner for NSWindow, responder chain, menu validation, first responder, focus handoff, and native window commands.</li>
+                <li>Embed SwiftUI content inside the AppKit-owned shell; do not let SwiftUI accidentally own desktop-level focus or menu behavior.</li>
+                <li>Ensure there are no fake close/minimize/maximize controls or fake title bars.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> App opens one native window, uses native menu commands, and restores bounds after restart.</div>
+            <div class="section"><strong>Review checklist:</strong> Desktop chrome constraint is respected; no web runtime dependency exists; AppKit owns the macOS shell behaviors that SwiftUI cannot model reliably.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-012">
+          <div class="card-title"><h3>Implement Workspace Domain Model</h3><span class="card-id">RC2-012</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Create the model and reducer/store for windows, workspaces, panes, and surfaces.</p>
+          <div class="meta"><span>Owner</span><span>Domain model agent</span><span>Depends</span><span>RC2-002, RC2-010</span><span>Output</span><span>WorkspaceCore module</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Define stable IDs for window, workspace, pane, split, and surface.</li>
+                <li>Define immutable actions for create, select, rename, close, split, move, reorder, focus.</li>
+                <li>Attach command metadata needed by local UI, CLI, tests, and future mobile: request id, origin client id, actor kind, issuedAt, target ids, idempotency key, and audit category.</li>
+                <li>Define surface type enum: terminal, browser, agentApp.</li>
+                <li>Encode invariants: every workspace has a valid split tree; every pane has at least one selected surface unless being removed.</li>
+                <li>Keep domain logic UI-independent.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Unit tests prove split/surface operations preserve invariants.</div>
+            <div class="section"><strong>Tests:</strong> Create workspace, close last surface, move surface between panes, focus fallback, reorder surfaces.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-013">
+          <div class="card-title"><h3>Implement T3 Code-Style Workspace Sidebar UI</h3><span class="card-id">RC2-013</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label review">Review</span></div>
+          <p>Build vertical workspace/project/thread navigation using T3 Code's dense sidebar as the reference.</p>
+          <div class="meta"><span>Owner</span><span>UI agent</span><span>Depends</span><span>RC2-006, RC2-011, RC2-012</span><span>Output</span><span>Sidebar view</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Render a T3 Code-like left rail with app identity, search row, project section header, project rows, nested thread rows, relative timestamps, status pills, and settings footer.</li>
+                <li>For each project row show icon/fallback, name, expanded state, active run indicator, latest thread preview, and git/branch metadata for git projects; show a clear "No Git" state for non-git projects.</li>
+                <li>For each thread row show title or generated summary, provider/status indicator, elapsed/relative time, completion/working state, and selected hover/focus styling.</li>
+                <li>Add search across projects and threads with keyboard navigation and command-key shortcut hint.</li>
+                <li>Add create, select, rename, archive/close, show-more, and context menu actions. Render reorder/group as disabled V1-deferred commands with a typed unsupported reason until RC2-005 explicitly promotes them.</li>
+                <li>Support T3 Code-style compact density, muted secondary text, subtle 1px dividers, visible focus state, and responsive collapse behavior.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> User can create/select/rename/archive workspaces and threads from UI and keyboard; visual structure matches T3 Code sidebar conventions while remaining native Swift/macOS.</div>
+            <div class="section"><strong>Tests:</strong> UI tests for search, project expand/collapse, thread selection, show-more behavior, relative timestamp updates, and keyboard focus restoration.</div>
+            <div class="section"><strong>Review checklist:</strong> Text fits, no marketing/hero UI, no decorative cards inside cards, no fake macOS window controls, and T3 Code parity notes are linked in the PR/MR.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-014">
+          <div class="card-title"><h3>Implement Pane Split And Surface Tab UI</h3><span class="card-id">RC2-014</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Expose the cmux-like work area where all surface types live.</p>
+          <div class="meta"><span>Owner</span><span>Layout UI agent</span><span>Depends</span><span>RC2-002, RC2-012</span><span>Output</span><span>PaneLayout UI</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Render split tree with resizable dividers.</li>
+                <li>Render horizontal surface tabs per pane with icon, title, dirty/unread state, close button, and selected state.</li>
+                <li>Add commands for split right/down, focus directionally, close surface, close pane, equalize splits.</li>
+                <li>Route selected surface to SurfaceRenderer by type.</li>
+                <li>Use AppKit for complex split-pane mechanics when SwiftUI cannot provide stable drag, focus, sizing, and first-responder behavior.</li>
+                <li>Use SwiftUI for pane tab labels, surface metadata, and declarative state display inside the AppKit-owned split structure.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Placeholder terminal/browser/agent surfaces can be created, switched, split, and closed.</div>
+            <div class="section"><strong>Tests:</strong> UI test for 3-surface split layout and focus direction.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-015">
+          <div class="card-title"><h3>Implement T3 Code-Style Command Palette And Keybindings</h3><span class="card-id">RC2-015</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Add T3 Code-like keyboard-first access to commands, projects, threads, terminal actions, and scripts.</p>
+          <div class="meta"><span>Owner</span><span>Command palette agent</span><span>Depends</span><span>RC2-006, RC2-013, RC2-014</span><span>Output</span><span>Command palette + keybinding resolver</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Define command contribution model with id, title, subtitle/description, icon, keywords, shortcut command, timestamp/trailing metadata, availability predicate, and action.</li>
+                <li>Register commands for search/open project, search/open thread, new chat/thread, new local/worktree thread, split terminal, new terminal, close terminal, toggle terminal, toggle diff, open editor, run project script, workspace/surface actions, browser actions, and Agent App actions.</li>
+                <li>Implement T3 Code-compatible keybinding concepts: shortcut string, command id, nullable boolean <code>when</code> expression, contexts for terminal focus/open state, invalid-rule warnings, and last matching rule wins.</li>
+                <li>Use T3 Code default shortcuts as the reference: terminal toggle, terminal split/new/close, command palette toggle, new chat, new local chat, open favorite editor, and script run commands.</li>
+                <li>Add fuzzy search, grouped results, disabled rows, keyboard highlight, enter to run, escape to close, submenu affordance, and shortcut labels.</li>
+                <li>Ensure palette focus does not leak keystrokes to terminal, browser, or composer surfaces.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Command palette can create/open a T3 Code-style Agent App thread, split/toggle terminal, open project/editor, and show grouped results with shortcuts.</div>
+            <div class="section"><strong>Tests:</strong> Unit tests for keybinding parsing, <code>when</code> evaluation, last-rule precedence, command filtering, disabled items, and focus isolation; UI tests for keyboard navigation and execution.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-016">
+          <div class="card-title"><h3>Implement SQLite Persistence Foundation</h3><span class="card-id">RC2-016</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Create the database layer, schema versioning, and repositories used by all later features.</p>
+          <div class="meta"><span>Owner</span><span>Persistence agent</span><span>Depends</span><span>RC2-010, RC2-012</span><span>Output</span><span>Persistence module</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Choose and configure GRDB or direct SQLite based on the architecture decision.</li>
+                <li>Create versioned schema steps for projects, agent threads, messages, runs, events, snapshots, settings, and session snapshots.</li>
+                <li>Implement repository protocols and concrete SQLite repositories.</li>
+                <li>Add in-memory/test database setup.</li>
+                <li>Ensure app data directories differ for debug, canary, and stable.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Tests create the latest schema from scratch and verify schema steps against empty RemoteCode 2 databases only.</div>
+            <div class="section"><strong>Tests:</strong> Schema step order, repository CRUD, transaction rollback, schema version checks.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-017">
+          <div class="card-title"><h3>Implement Session Snapshot Foundation</h3><span class="card-id">RC2-017</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Persist and restore window/workspace/pane/surface layout independent of surface implementation details.</p>
+          <div class="meta"><span>Owner</span><span>Session restore agent</span><span>Depends</span><span>RC2-012, RC2-016</span><span>Output</span><span>Snapshot model + store</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Define Codable snapshot schema with version, createdAt, windows, workspaces, layout tree, and surface snapshots.</li>
+                <li>Implement save debounce/autosave and explicit save on app quit.</li>
+                <li>Implement restore policy that skips automated tests unless enabled.</li>
+                <li>Add unknown surface type handling that does not crash restore.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Placeholder layout restores exactly after app restart.</div>
+            <div class="section"><strong>Tests:</strong> Snapshot encode/decode, invalid snapshot rejection, restore selected surface, unknown type fallback.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-018">
+          <div class="card-title"><h3>Implement JSON-RPC Socket Server</h3><span class="card-id">RC2-018</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Add external automation API compatible with cmux concepts.</p>
+          <div class="meta"><span>Owner</span><span>Socket automation agent</span><span>Depends</span><span>RC2-012, RC2-014</span><span>Output</span><span>Socket server</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create local Unix socket server with JSON-RPC request/response envelope.</li>
+                <li>Implement <code>system.ping</code>, <code>system.capabilities</code>, and <code>system.identify</code>.</li>
+                <li>Implement workspace, pane, and surface list/create/focus/close methods for placeholder surfaces.</li>
+                <li>Keep this socket local-only for CLI and tests; future mobile uses the direct-VPN HTTP/WebSocket API, not this Unix socket.</li>
+                <li>Publish domain events for successful commands.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Tests can drive app state through socket without using UI.</div>
+            <div class="section"><strong>Tests:</strong> Method not found, invalid params, successful workspace create, surface create, identify focused surface.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-019">
+          <div class="card-title"><h3>Implement CLI Client</h3><span class="card-id">RC2-019</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Create the <code>remotecode2</code> CLI as a thin socket client.</p>
+          <div class="meta"><span>Owner</span><span>CLI agent</span><span>Depends</span><span>RC2-018</span><span>Output</span><span>CLI binary</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Implement global flags: socket path, json output, id format, window/workspace/surface target.</li>
+                <li>Implement commands: ping, capabilities, identify, list-workspaces, new-workspace, new-surface, new-split, focus, close.</li>
+                <li>Implement stable JSON output for scripts and concise text output for humans.</li>
+                <li>Handle app-not-running and stale socket errors clearly.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> CLI can create an Agent App placeholder surface in a target workspace.</div>
+            <div class="section"><strong>Tests:</strong> CLI parser tests, socket integration tests, JSON output snapshot tests.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-020">
+          <div class="card-title"><h3>Create T3 Code-Inspired Swift Design System</h3><span class="card-id">RC2-020</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label review">Review</span><span class="label test">Test</span></div>
+          <p>Define reusable SwiftUI/AppKit tokens and controls that make the whole app feel like T3 Code without using a web runtime.</p>
+          <div class="meta"><span>Owner</span><span>Design system agent</span><span>Depends</span><span>RC2-006, RC2-007, RC2-011</span><span>Output</span><span>DesignSystem module</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create color tokens for dark default plus an explicit theme decision for light/auto: either implement light/auto tokens fully or document them as disabled with tests asserting dark default only.</li>
+                <li>Create typography tokens using system UI and SF Mono equivalents; use compact developer-tool sizes, not marketing scale.</li>
+                <li>Create SwiftUI reusable controls: icon button, split button, segmented toggle, pill/status label, sidebar row, command row, toolbar button, diff stat label, popover/menu shell, tooltip, empty state, loading state, and error banner.</li>
+                <li>Create AppKit bridge components only where needed: focus bridge, menu command bridge, terminal host wrapper, split-pane host, file/open panel bridge, and first-responder coordinator.</li>
+                <li>Match T3 Code density: 1px borders, small radii, compact spacing, low-contrast dividers, hover/selected states, and no decorative gradient/orb backgrounds.</li>
+                <li>Apply Liquid Glass only to controls and bars where useful: toolbar clusters, compact command palette chrome, segmented controls, and modal/action surfaces.</li>
+                <li>Do not apply Liquid Glass to the main content canvas, chat body, sidebar rows, terminal viewport, browser viewport, diff body, or repeated dense list cells.</li>
+                <li>Document how to use controls in Agent App, sidebar, command palette, terminal drawer, diff panel, settings, and native menus.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> All shared UI controls render in a small preview/test app and visually align with the dark dense T3 Code/Codex App reference, not a marketing-style app.</div>
+            <div class="section"><strong>Tests:</strong> Snapshot tests for dark/light tokens, accessibility contrast checks, dynamic type non-overlap checks, toolbar/button sizing checks, Liquid Glass placement checks, and AppKit bridge smoke tests.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-021">
+          <div class="card-title"><h3>Implement T3 Code-Style Top Action Header</h3><span class="card-id">RC2-021</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Create the compact top bar used across workspaces and Agent App threads.</p>
+          <div class="meta"><span>Owner</span><span>Header UI agent</span><span>Depends</span><span>RC2-006, RC2-020</span><span>Output</span><span>ActionHeader component</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Render current thread/workspace title, project badge, and exactly one git status badge: branch/dirty state for git projects or "No Git" for non-git projects.</li>
+                <li>Add T3 Code-style actions: Add action, Open with dropdown, Commit &amp; push with dropdown, terminal toggle, diff toggle, new/split surface actions, and overflow menu.</li>
+                <li>Use icon-first controls with tooltips, disabled states, and keyboard shortcuts where available.</li>
+                <li>Keep the header compact and responsive; collapse text labels into icons/menus at narrow widths without clipping.</li>
+                <li>Route actions through command model so toolbar and command palette execute the same code paths.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Header matches T3 Code's action density and can drive open editor, commit placeholder, diff toggle, terminal toggle, and new surface actions.</div>
+            <div class="section"><strong>Tests:</strong> Unit tests for action availability, UI tests for responsive collapse, tooltip labels, disabled states, and command routing.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-022">
+          <div class="card-title"><h3>Implement Branch, Workspace, And Environment Toolbar</h3><span class="card-id">RC2-022</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Copy T3 Code's lower context toolbar pattern for branch, local/worktree mode, and environment selection.</p>
+          <div class="meta"><span>Owner</span><span>Git/workspace UI agent</span><span>Depends</span><span>RC2-006, RC2-012, RC2-020</span><span>Output</span><span>BranchWorkspaceToolbar</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Detect git repository, active branch, dirty state, and worktree path for the selected project/workspace.</li>
+                <li>Render compact controls for environment, local vs worktree mode, current workspace path, current branch, checkout pull request placeholder, and focus composer action.</li>
+                <li>Support locked states when a thread is already bound to a worktree or provider session.</li>
+                <li>Use responsive mobile/narrow-window behavior inspired by T3 Code's combined run-context selector.</li>
+                <li>Fail loudly for non-git projects and show clear "No Git" state without breaking Agent App usage.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Agent App surfaces show branch/workspace context equivalent to T3 Code, including locked and non-git states.</div>
+            <div class="section"><strong>Tests:</strong> Git repo fixture, non-git fixture, dirty fixture, worktree fixture, locked-thread behavior, and responsive collapse tests.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-023">
+          <div class="card-title"><h3>Implement Direct-VPN Desktop API Foundation</h3><span class="card-id">RC2-023</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span><span class="label risk">Risk</span></div>
+          <p>Create the desktop-hosted HTTP/WebSocket foundation that a future mobile app will use over VPN.</p>
+          <div class="meta"><span>Owner</span><span>Networking foundation agent</span><span>Depends</span><span>RC2-008, RC2-012, RC2-016</span><span>Output</span><span>DirectDesktopAPI module</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Hard rule:</strong> This API is direct desktop access only. Do not add hosted relay, private backend forwarding, connector ids, cloud command queues, or repository mirroring.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create a desktop HTTP server owned by the macOS app, disabled for non-loopback access until the user explicitly enables VPN/LAN access.</li>
+                <li>Add <code>/v1/discovery</code> with server id, app version, capabilities version, auth mode, enabled transports, host/port, VPN/LAN connect hints, and health status.</li>
+                <li>Add <code>/v1/capabilities</code> covering available surfaces, command versions, provider availability, terminal/browser support, git support, and feature flags.</li>
+                <li>Add direct WebSocket endpoint <code>/v1/ws</code> with authenticated join/leave, ping/pong, and protocol-version negotiation.</li>
+                <li>Add mDNS or QR/manual-connect metadata only when it points to direct desktop addresses.</li>
+                <li>Keep API handlers thin: they validate auth and protocol, then call the shared command bus used by desktop UI and CLI.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> A test client on the same machine can discover capabilities, open a WebSocket, and receive workspace events without any hosted service.</div>
+            <div class="section"><strong>Tests:</strong> Loopback default, explicit VPN/LAN enablement, discovery shape, capability version mismatch, WebSocket auth failure, WebSocket join success, no private backend configuration path.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-024">
+          <div class="card-title"><h3>Implement Pairing, Device Trust, And Remote Access Settings</h3><span class="card-id">RC2-024</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span><span class="label risk">Risk</span></div>
+          <p>Add the desktop-side security model needed before any future mobile client can control the computer.</p>
+          <div class="meta"><span>Owner</span><span>Security/platform agent</span><span>Depends</span><span>RC2-008, RC2-023</span><span>Output</span><span>Device trust store + settings UI</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create device trust model: device id, display name, public key or token hash, createdAt, lastSeenAt, revokedAt, capabilities granted, and audit metadata.</li>
+                <li>Create pairing flow contract for future mobile: desktop generates short-lived pairing material, future client redeems it directly over VPN/LAN, desktop stores only revocable trust material.</li>
+                <li>Add remote access settings: disabled by default, loopback-only default, explicit VPN/LAN enablement, visible host/port, rotate credentials, revoke device, and audit log viewer.</li>
+                <li>Store secrets in Keychain or equivalent secure storage; never store production tokens in plain SQLite.</li>
+                <li>Rate-limit auth failures and log denied attempts without leaking tokens or prompts.</li>
+                <li>Document that the mobile app is not built yet; settings exist to validate and operate the desktop contract safely.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Direct remote access cannot be enabled accidentally, every trusted device can be revoked, and no production default token exists.</div>
+            <div class="section"><strong>Tests:</strong> Disabled default, enable/disable, pairing expiry, token rotation, revoke device, denied auth logging, Keychain storage, audit redaction, and LAN listener blocked until enabled.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-025">
+          <div class="card-title"><h3>Implement Mobile-Ready Command Bus And Event Replay</h3><span class="card-id">RC2-025</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Make all UI, CLI, and future mobile commands use the same ordered domain/event model.</p>
+          <div class="meta"><span>Owner</span><span>Command/event platform agent</span><span>Depends</span><span>RC2-012, RC2-016, RC2-023</span><span>Output</span><span>Command bus + event log</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create command envelope with command id, schema version, request id, origin client id, actor kind, target ids, payload, idempotency key, and issuedAt.</li>
+                <li>Create event envelope with monotonic sequence, timestamp, event type, target ids, payload, origin client id, request id, and redaction class.</li>
+                <li>Persist enough event history to replay workspace and active-thread state for reconnecting future mobile clients.</li>
+                <li>Implement WebSocket subscription by scope: app, workspace, Agent App thread, terminal session, browser surface, and git status.</li>
+                <li>Implement last-sequence replay, ack, duplicate request suppression, backpressure limits, and deterministic error events.</li>
+                <li>Route desktop UI actions through this bus instead of private view-only callbacks so mobile parity is architectural, not bolted on later.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> A fake remote client can reconnect with last sequence and receive exactly the missed events, while duplicate commands do not execute twice.</div>
+            <div class="section"><strong>Tests:</strong> Sequence ordering, replay after disconnect, duplicate request id, duplicate idempotency key, origin filtering, scoped subscriptions, redaction, event pruning, and command failure events.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-026">
+          <div class="card-title"><h3>Define Remote Mirror Coverage For Every Desktop Surface</h3><span class="card-id">RC2-026</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Ensure terminal, browser, Agent App, git, and workspace features expose future mobile-safe contracts.</p>
+          <div class="meta"><span>Owner</span><span>Surface contract agent</span><span>Depends</span><span>RC2-008, RC2-025</span><span>Output</span><span>Remote mirror capability matrix</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required matrix:</strong>
+              <ul>
+                <li>Workspace/panes: list, create, focus, split, close, reorder, restore, selected surface.</li>
+                <li>Agent App: list projects/threads, load visible thread context, send message, stop run, stream timeline, expose changed files, open diff, provider/model/runtime state.</li>
+                <li>Terminal: list sessions, create, resize, input, signal, restart, read bounded scrollback, stream output metadata, redact sensitive input.</li>
+                <li>Browser: create/open, navigate, reload, go back/forward, title/url state, screenshot/metadata if allowed, automation-safe errors.</li>
+                <li>Git/files: branch/status/diff actions, open project metadata, bounded file listing, lazy secondary-panel loading, no unnecessary bulk data fetch.</li>
+                <li>Settings: remote access enablement, trusted devices, provider availability, UI preferences safe to mirror.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Every V1 desktop feature has a yes/deferred/forbidden remote mirror status with command/event names and minimum payload fields.</div>
+            <div class="section"><strong>Review checklist:</strong> Matrix forbids broad filesystem dumps, preserves screen-level lazy loading, and maps each future mobile action to the same command bus as desktop UI.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <section class="column">
+      <div class="column-header">
+        <h2>Surfaces Build</h2>
+        <div class="count">Terminal, browser, Agent App, and provider runtime cards.</div>
+      </div>
+      <div class="cards">
+        <article class="card" id="RC2-030">
+          <div class="card-title"><h3>Implement Terminal Surface Host</h3><span class="card-id">RC2-030</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Replace placeholder terminal surfaces with a real terminal surface.</p>
+          <div class="meta"><span>Owner</span><span>Terminal agent</span><span>Depends</span><span>RC2-003, RC2-014</span><span>Output</span><span>TerminalSurface</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create <code>TerminalSurface</code> conforming to common Surface protocol.</li>
+                <li>Launch shell in workspace cwd with env variables for window, workspace, pane, and surface IDs.</li>
+                <li>Render terminal view and route keyboard/mouse input only when focused.</li>
+                <li>Implement close lifecycle and process group cleanup.</li>
+                <li>Report title, cwd, dirty/confirm-close state if supported by terminal engine.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> User can open terminal, run <code>pwd</code>, split away, return, and keep shell alive.</div>
+            <div class="section"><strong>Tests:</strong> Launch cwd, input/output, focus routing, close cleanup, no orphan process.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-031">
+          <div class="card-title"><h3>Implement Terminal Copy, Paste, Resize, And Scrollback</h3><span class="card-id">RC2-031</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Make terminal surfaces production-usable.</p>
+          <div class="meta"><span>Owner</span><span>Terminal UX agent</span><span>Depends</span><span>RC2-030</span><span>Output</span><span>Terminal UX features</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Implement copy with selection, paste, select all when the chosen terminal engine exposes selection ranges; if it does not, create a typed unsupported state and E2E proof that the control is hidden or disabled. Implement clear scrollback and font size controls either way.</li>
+                <li>Resize PTY when pane size changes.</li>
+                <li>Keep terminal input disabled when another surface or command palette owns focus.</li>
+                <li>Capture scrollback snapshot for session restore using safe truncation.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Terminal behaves like a normal macOS terminal in split and tab layouts.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-032">
+          <div class="card-title"><h3>Implement Terminal Socket Commands</h3><span class="card-id">RC2-032</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Expose terminal automation through the surface API.</p>
+          <div class="meta"><span>Owner</span><span>Terminal automation agent</span><span>Depends</span><span>RC2-030, RC2-018</span><span>Output</span><span>Terminal command handlers</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Implement <code>surface.send_text</code>, <code>surface.send_key</code>, <code>surface.read_text</code>, and <code>surface.clear_history</code> for terminal surfaces.</li>
+                <li>Reject terminal input commands against browser/agent surfaces with clear typed errors.</li>
+                <li>Redact input content in event logs while preserving length and target metadata.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> CLI can send commands to one specific terminal surface without affecting others.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-040">
+          <div class="card-title"><h3>Implement WKWebView Browser Surface</h3><span class="card-id">RC2-040</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Replace placeholder browser surfaces with a real in-app browser.</p>
+          <div class="meta"><span>Owner</span><span>Browser agent</span><span>Depends</span><span>RC2-014</span><span>Output</span><span>BrowserSurface</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create <code>BrowserSurface</code> with WKWebView, address bar, back, forward, reload, stop/loading state.</li>
+                <li>Support local dev URLs, localhost, file URLs when allowed, and external navigation policy.</li>
+                <li>Persist title, URL, loading state, and selected profile ID in surface snapshot.</li>
+                <li>Ensure browser focus does not leak to terminal or Agent App.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> User can split browser beside Agent App and navigate a local dev server.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-041">
+          <div class="card-title"><h3>Implement Browser Profiles And Cookie Storage</h3><span class="card-id">RC2-041</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Support persistent browser sessions without mixing all users into one opaque store.</p>
+          <div class="meta"><span>Owner</span><span>Browser persistence agent</span><span>Depends</span><span>RC2-040, RC2-016</span><span>Output</span><span>Browser profile store</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Define browser profile model: id, display name, createdAt, default flag.</li>
+                <li>Create WKWebsiteDataStore per profile when the chosen WKWebView API supports it. If full cookie isolation is not available, block release until the limitation is documented, the maximum available isolation is implemented, and the E2E profile-isolation test records the exact remaining shared state.</li>
+                <li>Add profile list/create/rename/clear/delete commands.</li>
+                <li>Prevent deleting active default profile.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Browser profile survives app restart and can be cleared through UI or CLI.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-042">
+          <div class="card-title"><h3>Implement Browser P0 Automation</h3><span class="card-id">RC2-042</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Give agents an automation surface similar to cmux's agent-browser port.</p>
+          <div class="meta"><span>Owner</span><span>Browser automation agent</span><span>Depends</span><span>RC2-040, RC2-018</span><span>Output</span><span>Browser automation handlers</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Implement <code>browser.open_split</code>, navigate, back, forward, reload, URL get, title get.</li>
+                <li>Implement DOM snapshot with stable element refs.</li>
+                <li>Implement eval, wait, click, double click, hover, focus, fill, type, press, select, check/uncheck.</li>
+                <li>Implement screenshot to file and return path/metadata.</li>
+                <li>Return explicit unsupported errors for P1/P2 commands not implemented yet.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> CLI can operate a local test page in a specific browser surface end to end.</div>
+            <div class="section"><strong>Tests:</strong> Local HTML fixture for snapshot, click, fill, wait, screenshot, two-browser target isolation.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-050">
+          <div class="card-title"><h3>Implement Normalized Assistant Event Model</h3><span class="card-id">RC2-050</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Create provider-independent events for the Agent App timeline.</p>
+          <div class="meta"><span>Owner</span><span>Agent runtime agent</span><span>Depends</span><span>RC2-004, RC2-016</span><span>Output</span><span>AssistantEvent model</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Define event types: threadStarted, turnStarted, itemStarted, itemDelta, itemState, itemCompleted, turnCompleted, error.</li>
+                <li>Define item types: reasoning, plan, tool, assistantMessage.</li>
+                <li>Define item fields: id, turnId, state, summary, body, output, startedAtMs, finishedAtMs, expanded state.</li>
+                <li>Implement reducer that turns event stream into turn snapshots.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Fixture events build stable timeline snapshots independent of provider.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-051">
+          <div class="card-title"><h3>Implement Codex Runner And Parser</h3><span class="card-id">RC2-051</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Run Codex CLI and convert its JSON events into normalized assistant events.</p>
+          <div class="meta"><span>Owner</span><span>Codex provider agent</span><span>Depends</span><span>RC2-004, RC2-050</span><span>Output</span><span>CodexProviderRunner</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Resolve <code>codex</code> executable from PATH and surface missing binary errors.</li>
+                <li>Spawn Codex with cwd, prompt, model, reasoning effort, permission mode, and provider thread ID when resuming an existing Codex thread; omit provider thread ID only for a new thread.</li>
+                <li>Parse line-delimited JSON for thread, turn, item, delta, completed, failed, and error events.</li>
+                <li>Capture assistant final text, provider thread ID, diff counts if available, exit status, and cancellation.</li>
+                <li>Ensure unknown event types are ignored with debug logging, not fatal unless required fields are missing.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Codex fixture streams produce the same timeline shape as current RemoteCode intent.</div>
+            <div class="section"><strong>Tests:</strong> Parser fixtures for reasoning, plan, tool output, assistant text, failure, malformed JSON, cancellation.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-052">
+          <div class="card-title"><h3>Implement Claude Runner And Parser</h3><span class="card-id">RC2-052</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Run Claude CLI and normalize stream events into the same timeline model.</p>
+          <div class="meta"><span>Owner</span><span>Claude provider agent</span><span>Depends</span><span>RC2-004, RC2-050</span><span>Output</span><span>ClaudeProviderRunner</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Resolve <code>claude</code> executable from PATH and surface missing binary errors.</li>
+                <li>Spawn Claude with cwd, prompt, every supported model/runtime option from the provider contract, and session resume ID when resuming an existing Claude session; omit session resume ID only for a new session.</li>
+                <li>Parse system init session ID, stream content blocks, thinking deltas, text deltas, tool uses, tool results, result events, and errors.</li>
+                <li>Map Claude blocks to normalized reasoning/tool/assistant items.</li>
+                <li>Handle process exit and cancellation deterministically.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Claude fixture streams render in the same Agent App timeline component as Codex.</div>
+            <div class="section"><strong>Tests:</strong> Parser fixtures for thinking, text, tool use, tool result, result cost/duration metadata, failure.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-053">
+          <div class="card-title"><h3>Implement Agent Run Supervisor</h3><span class="card-id">RC2-053</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Own active run lifecycle so app restarts and cancellations never leave stale state.</p>
+          <div class="meta"><span>Owner</span><span>Agent runtime agent</span><span>Depends</span><span>RC2-051, RC2-052, RC2-016</span><span>Output</span><span>AgentRunCoordinator</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Implement start run, stop run, mark completed, mark failed, mark cancelled, and crash recovery.</li>
+                <li>Persist user message before provider process starts.</li>
+                <li>Persist stream events and snapshots during run.</li>
+                <li>Persist final assistant message only after successful run completion.</li>
+                <li>On app launch, reconcile rows that were running during previous crash and mark them failed or interrupted.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Killing the app during an active fake provider run does not resume it silently as running.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-060">
+          <div class="card-title"><h3>Implement T3 Code-Style Agent App Surface Shell</h3><span class="card-id">RC2-060</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label review">Review</span></div>
+          <p>Create the native Agent App surface using T3 Code's ChatView structure as the product reference.</p>
+          <div class="meta"><span>Owner</span><span>Agent App UI agent</span><span>Depends</span><span>RC2-006, RC2-014, RC2-020, RC2-050</span><span>Output</span><span>AgentAppSurface</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create <code>AgentAppSurface</code> conforming to Surface protocol.</li>
+                <li>Assemble T3 Code-like layout: left sidebar already available, compact top action header, branch/workspace toolbar, central messages timeline, bottom composer, right/inline diff panel, and terminal drawer.</li>
+                <li>Add provider/model controls, runtime permission controls, plan/build mode control, run state, stop/interruption action, missing provider status banner, and thread error banner.</li>
+                <li>Add commands: add action, open editor, commit/push placeholder, open terminal split/drawer, open browser split, reveal project in Finder, toggle diff, toggle plan sidebar, and new Agent App thread.</li>
+                <li>Respect surface lifecycle: create, split, focus, rename, close, restore, and snapshot selected project/thread/provider/model.</li>
+                <li>Make empty state useful: no selected thread, no project, missing CLI, disconnected environment, and first-run prompt states.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Agent App surface can be created, split, focused, renamed, closed, restored, and visually reads as a native Swift version of T3 Code's chat workspace.</div>
+            <div class="section"><strong>Tests:</strong> UI tests for surface lifecycle, header actions, empty states, provider status banner, terminal/diff toggles, and snapshot restore.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-061">
+          <div class="card-title"><h3>Implement T3 Code-Style Agent Thread List And Selection</h3><span class="card-id">RC2-061</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Show project-scoped Codex/Claude threads using T3 Code's project/thread sidebar patterns.</p>
+          <div class="meta"><span>Owner</span><span>Agent App data UI agent</span><span>Depends</span><span>RC2-006, RC2-013, RC2-016, RC2-060</span><span>Output</span><span>Thread list UI</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Load only thread fields required for visible list: id, title, updatedAt, status, provider, project id/name, branch/worktree label, unread state, active run state, and latest preview.</li>
+                <li>Render thread rows under projects with T3 Code-like active selection, muted previews, relative timestamps, working/completed status, and show-more controls.</li>
+                <li>Add create thread, create local/worktree thread, select thread, rename thread, archive/delete if in V1 scope, and preserve active thread's branch/worktree state when requested.</li>
+                <li>Sort by active/updatedAt while keeping search results predictable.</li>
+                <li>Keep selection persisted per workspace and surface snapshot, including selected provider/model where appropriate.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Thread selection changes timeline without loading all message bodies until thread is opened; list behavior matches T3 Code's project/thread navigation expectations.</div>
+            <div class="section"><strong>Tests:</strong> Lazy loading, active run ordering, search, show-more, rename/archive, branch/worktree preservation, and restore selected thread after app restart.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-062">
+          <div class="card-title"><h3>Implement T3 Code-Style Agent Timeline Rendering</h3><span class="card-id">RC2-062</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Render messages and structured streaming turns using T3 Code's MessagesTimeline as the UX model.</p>
+          <div class="meta"><span>Owner</span><span>Timeline UI agent</span><span>Depends</span><span>RC2-006, RC2-050, RC2-061</span><span>Output</span><span>Timeline view</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Render user message bubbles aligned right with attachments, terminal context chips, copy action, revert-to-message action when checkpoint exists, timestamp, and long-message collapse/expand.</li>
+                <li>Render assistant messages as markdown with streaming state, copy action on hover, timestamp plus elapsed duration, completion divider, and empty-response fallback.</li>
+                <li>Render work log/tool calls as compact grouped rows with icon/tone, collapsed overflow, show-more/show-less, normalized tool labels, and stable row identity.</li>
+                <li>Render proposed plan cards, working row with live timer, pending approval/user-input rows when applicable, and terminal context inline chips.</li>
+                <li>Use virtualization or bounded rendering for long histories and preserve scroll-at-end behavior while streaming.</li>
+                <li>Support image previews, markdown file path links, code copy, text selection, load older messages, and latest dirty state.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Timeline handles long tool output without freezing, preserves visible state during active stream, and shows changed-file evidence after agent turns like T3 Code.</div>
+            <div class="section"><strong>Tests:</strong> Fixture tests for every row type, streaming updates, long work log collapse, image preview, terminal context chips, revert disabled states, scroll behavior, and accessibility labels.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-063">
+          <div class="card-title"><h3>Implement T3 Code-Style Agent Composer</h3><span class="card-id">RC2-063</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Create the native prompt composer using T3 Code's ChatComposer as the reference.</p>
+          <div class="meta"><span>Owner</span><span>Composer UI agent</span><span>Depends</span><span>RC2-006, RC2-060, RC2-053</span><span>Output</span><span>Message composer</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Add rounded bottom composer with multiline prompt editor, send shortcut, accessible submit/stop button, collapsed/narrow-width mode, and disabled environment states.</li>
+                <li>Add provider/model picker, provider trait/reasoning controls, plan/build mode toggle, runtime permission mode selector with Supervised, Auto-accept edits, and Full access options.</li>
+                <li>Add context path mention support, file/folder tagging, terminal context chips, image attachments with preview/remove/warning state, and native file dialogs. Skill/command menu is V1-deferred unless RC2-005 explicitly promotes it; if deferred, expose a typed unsupported command and no visible broken control.</li>
+                <li>Add pending approval panel, pending user-input panel, plan follow-up banner, "implement plan in new thread" action, and context window meter where provider metadata supports it.</li>
+                <li>Disable submit when no workspace path, no provider, missing CLI/auth, unsupported model, empty prompt, environment disconnected, or active run for selected thread.</li>
+                <li>Support stop/interrupt action during active run, preserve drafts per thread, and clear composer only after prompt is accepted.</li>
+                <li>Normalize dead keys, paste, drag-over attachment, command menu highlight, and focus behavior on macOS.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Sending a prompt creates a user message, starts fake/real run, clears composer only after accepted, and the footer controls visually and behaviorally match T3 Code's composer pattern.</div>
+            <div class="section"><strong>Tests:</strong> Send-state unit tests, image attachment limits, pending approval/input flows, provider picker, runtime mode selector, plan/build toggle, stop action, disabled states, draft persistence, and keyboard focus tests.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-064">
+          <div class="card-title"><h3>Integrate T3 Code-Like Agent App With Codex And Claude</h3><span class="card-id">RC2-064</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Wire real provider runners into the Agent App surface while keeping the T3 Code provider-agnostic UI model.</p>
+          <div class="meta"><span>Owner</span><span>Agent integration agent</span><span>Depends</span><span>RC2-051, RC2-052, RC2-062, RC2-063</span><span>Output</span><span>Real agent runs</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Add provider selector and provider-specific model loading while preserving a shared model picker UI shape.</li>
+                <li>Lock provider selection for threads with existing provider thread IDs.</li>
+                <li>Start Codex and Claude runs from composer.</li>
+                <li>Stream normalized events into timeline and persist final messages.</li>
+                <li>Show missing CLI/auth/model errors in T3 Code-style banners and disabled composer states.</li>
+                <li>Persist provider session/thread IDs, model selection, runtime mode, effort/traits, and branch/worktree context.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Codex and Claude can each run in the same Agent App UI without raw-provider UI branches, and each run produces timeline, work log, and changed-file evidence.</div>
+            <div class="section"><strong>Tests:</strong> Fake provider integration plus real CLI smoke tests when local auth exists; missing binary/auth tests; provider lock tests; cancellation and persistence tests.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-065">
+          <div class="card-title"><h3>Implement Agent Socket And CLI Commands</h3><span class="card-id">RC2-065</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Allow external agents/scripts to create and drive Agent App surfaces.</p>
+          <div class="meta"><span>Owner</span><span>Agent automation agent</span><span>Depends</span><span>RC2-018, RC2-019, RC2-064</span><span>Output</span><span><code>agent.*</code> API</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Implement socket methods: <code>agent.open</code>, <code>agent.thread.create</code>, <code>agent.thread.list</code>, <code>agent.message.send</code>, <code>agent.run.stop</code>, <code>agent.state.current</code>, <code>agent.models.list</code>.</li>
+                <li>Add CLI wrappers under <code>remotecode2 agent</code>.</li>
+                <li>Return window/workspace/pane/surface/thread/run IDs in responses.</li>
+                <li>Ensure command can target a specific workspace or surface.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> CLI can open Agent App surface and send prompt to selected provider.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-066">
+          <div class="card-title"><h3>Implement T3 Code-Style Changed Files Summary</h3><span class="card-id">RC2-066</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Add the changed-files card shown after agent turns, matching T3 Code's proof-of-work pattern.</p>
+          <div class="meta"><span>Owner</span><span>Diff evidence UI agent</span><span>Depends</span><span>RC2-022, RC2-062</span><span>Output</span><span>ChangedFilesSummary component</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>After each completed provider turn, compute git diff summary for the relevant checkpoint, branch, or working tree range.</li>
+                <li>Render a compact card titled "Changed files (N)" with additions/deletions totals, collapse all/expand all, view diff, and a nested file tree.</li>
+                <li>Show file icons/fallbacks, directory nesting, per-file additions/deletions, created/deleted/modified/renamed states, and selected hover/focus styling.</li>
+                <li>Open the diff panel to selected turn/file when a file or "View diff" is clicked.</li>
+                <li>Handle non-git projects, no changes, deleted files, binary files, large diffs, and git command failures with clear states.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Every completed agent turn with file changes shows a T3 Code-style changed-files proof card and opens the correct diff.</div>
+            <div class="section"><strong>Tests:</strong> Git fixture tests for additions/deletions/renames/binary/no-git/no-change; UI tests for collapse, expand, and open diff.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-067">
+          <div class="card-title"><h3>Implement T3 Code-Style Diff Panel</h3><span class="card-id">RC2-067</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Build the dedicated diff inspection surface inspired by T3 Code's DiffPanel.</p>
+          <div class="meta"><span>Owner</span><span>Diff panel agent</span><span>Depends</span><span>RC2-066</span><span>Output</span><span>DiffPanel surface/pane</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Render turn selector chips including all turns and individual turns with timestamp/checkpoint labels.</li>
+                <li>Render stacked and split diff modes, word-wrap toggle, ignore-whitespace toggle, file collapse/expand controls, and open-file-in-editor action.</li>
+                <li>Support raw patch fallback when parser cannot render a diff, with a clear reason.</li>
+                <li>Virtualize or chunk large diffs so the UI remains responsive.</li>
+                <li>Persist selected diff turn/file and restore when reopening the surface.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> User can inspect all changes or one turn's changes, switch stacked/split mode, toggle whitespace/wrap, and open a file in the preferred editor.</div>
+            <div class="section"><strong>Tests:</strong> Diff parser fixture tests, large-diff performance test, no-git/no-completed-turn/no-net-change states, selected-file scroll test, and accessibility labels for toggles.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-068">
+          <div class="card-title"><h3>Implement T3 Code-Style Terminal Drawer And Chat Context Bridge</h3><span class="card-id">RC2-068</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Add the T3 Code terminal drawer behavior on top of RemoteCode 2 terminal surfaces.</p>
+          <div class="meta"><span>Owner</span><span>Terminal drawer agent</span><span>Depends</span><span>RC2-030, RC2-031, RC2-063</span><span>Output</span><span>ThreadTerminalDrawer</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Add a resizable bottom terminal drawer attached to the active Agent App thread with persisted height and visible/hidden state.</li>
+                <li>Support terminal toggle, split, new, close, active terminal selection, group sidebar when multiple terminals exist, and max split limit.</li>
+                <li>Route terminal shortcuts only when terminal focus/open context matches the keybinding resolver.</li>
+                <li>Open file paths and URLs from terminal output using preferred editor/external browser rules.</li>
+                <li>Allow selecting terminal text and adding it to the composer as a terminal context chip with label, line range, and body text.</li>
+                <li>Preserve terminal snapshot/history across drawer remounts and close terminal sessions cleanly.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> User can open the drawer, run commands, split terminals, add selected terminal output to chat context, and return focus to composer reliably.</div>
+            <div class="section"><strong>Tests:</strong> Drawer resize persistence, shortcut context tests, selection-to-chat context, split/new/close lifecycle, link opening, snapshot restore, and no orphan process checks.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-069">
+          <div class="card-title"><h3>Implement T3 Code-Style Project Scripts And Open-In Controls</h3><span class="card-id">RC2-069</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Add header actions that let users run project scripts and open the project like T3 Code.</p>
+          <div class="meta"><span>Owner</span><span>Project actions agent</span><span>Depends</span><span>RC2-015, RC2-021, RC2-030</span><span>Output</span><span>Project actions controls</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Discover project scripts from package metadata, Makefile, or configured scripts file without executing untrusted commands automatically.</li>
+                <li>Render an "Add action" or scripts control in the top header with script name, command preview, and run-in-terminal behavior.</li>
+                <li>Render an "Open" control for preferred editor, Finder, Terminal, and external browser where applicable.</li>
+                <li>Register all actions in the command palette and expose shortcuts where configured.</li>
+                <li>Log script start/finish metadata without logging secrets from command output.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> User can run a project test/build script into a terminal drawer or surface and open the current project in the preferred editor from header or palette.</div>
+            <div class="section"><strong>Tests:</strong> Script discovery fixtures, disabled unsafe script cases, run-in-terminal integration, open editor/finder actions, and command palette registration.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <section class="column">
+      <div class="column-header">
+        <h2>Review / Test / Fresh Start</h2>
+        <div class="count">Clean first-run bootstrap, Scrum review, and verification cards.</div>
+      </div>
+      <div class="cards">
+        <article class="card" id="RC2-080">
+          <div class="card-title"><h3>Implement Clean First-Run Data Bootstrap</h3><span class="card-id">RC2-080</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Start RemoteCode 2 from a clean database with no previous-app data path.</p>
+          <div class="meta"><span>Owner</span><span>Persistence bootstrap agent</span><span>Depends</span><span>RC2-016</span><span>Output</span><span>Fresh data bootstrap</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Hard rule:</strong> Do not read, scan, convert, or accept data from any previous RemoteCode app. RemoteCode 2 starts from zero.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create the app support directory for debug, canary, and stable channels when absent.</li>
+                <li>Create the latest schema from scratch without probing external database locations.</li>
+                <li>Initialize required settings with explicit defaults: theme, command shortcuts, provider defaults, first-run completed flag, and direct-VPN mobile-readiness flags.</li>
+                <li>Seed no projects, no threads, no messages, no provider sessions, and no terminal history unless an automated test fixture explicitly requests test-only data.</li>
+                <li>Expose a diagnostic report that says "fresh start" and lists created directories/schema version without mentioning old data.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> First launch creates only RemoteCode 2-owned files and never asks for, searches for, or loads data from another RemoteCode app.</div>
+            <div class="section"><strong>Tests:</strong> Fresh install, empty app support directory, corrupted new DB recovery, debug/canary/stable isolation, and explicit assertion that no previous-app paths are touched.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-081">
+          <div class="card-title"><h3>Create Test-Only Data Fixture Factory</h3><span class="card-id">RC2-081</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
+          <p>Provide deterministic seed data for tests without using any previous RemoteCode data.</p>
+          <div class="meta"><span>Owner</span><span>Test infrastructure agent</span><span>Depends</span><span>RC2-080</span><span>Output</span><span>Fixture factory</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Hard rule:</strong> Fixtures must be generated from code and static test assets only. They must not load other app databases, exports, user home folders, or external product data sources.</div>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Create fixture builders for projects, workspaces, panes, surfaces, agent threads, messages, provider events, terminal sessions, browser snapshots, and mobile connection targets.</li>
+                <li>Make fixtures deterministic with stable IDs and explicit timestamps.</li>
+                <li>Allow tests to request minimal fixtures by scenario instead of booting with sample user data.</li>
+                <li>Keep fixture data visibly fake and safe for screenshots.</li>
+                <li>Document that production builds never seed sample projects or threads.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Test suites can create realistic app states from fixtures, while production first-run remains empty and clean.</div>
+            <div class="section"><strong>Tests:</strong> Fixture determinism, channel isolation, no production seeding, no filesystem reads outside fixture directory, and no previous-product data source references.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-090">
+          <div class="card-title"><h3>Create Unit Test Suite</h3><span class="card-id">RC2-090</span></div>
+          <div class="labels"><span class="label test">Test</span></div>
+          <p>Build low-level tests that verify business intent and invariants.</p>
+          <div class="meta"><span>Owner</span><span>Test agent</span><span>Depends</span><span>Foundation modules</span><span>Output</span><span>Unit tests</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required coverage:</strong>
+              <ul>
+                <li>Workspace/pane/surface reducer invariants.</li>
+                <li>Session snapshot encode/decode and invalid snapshot handling.</li>
+                <li>SQLite repository operations and schema versioning.</li>
+                <li>Codex and Claude parser fixtures.</li>
+                <li>Assistant event reducer and turn snapshot builder.</li>
+                <li>CLI parser and command validation.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Tests fail when provider switch corrupts thread history, stale runs remain active, or layout loses selected surface.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-091">
+          <div class="card-title"><h3>Create Integration Test Suite</h3><span class="card-id">RC2-091</span></div>
+          <div class="labels"><span class="label test">Test</span></div>
+          <p>Verify subsystems working together without relying on manual UI.</p>
+          <div class="meta"><span>Owner</span><span>Integration test agent</span><span>Depends</span><span>RC2-018, RC2-030, RC2-040, RC2-053</span><span>Output</span><span>Integration tests</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required scenarios:</strong>
+              <ul>
+                <li>Socket server creates workspace, pane, terminal/browser/agent surfaces.</li>
+                <li>CLI drives socket server and receives stable JSON.</li>
+                <li>Terminal launches shell in workspace cwd and cleans up process.</li>
+                <li>Browser P0 automation operates a local fixture page.</li>
+                <li>Fake provider run streams normalized events into DB.</li>
+                <li>Fresh-start fixture factory creates deterministic app state for tests.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Integration suite can run headless or with minimal app host in CI.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-092">
+          <div class="card-title"><h3>Create UI Automation Suite With T3 Code Parity Flows</h3><span class="card-id">RC2-092</span></div>
+          <div class="labels"><span class="label test">Test</span><span class="label review">Review</span></div>
+          <p>Validate the full app like a user would use it, including T3 Code-inspired Agent App workflows.</p>
+          <div class="meta"><span>Owner</span><span>UI test agent</span><span>Depends</span><span>Core UI complete, RC2-006</span><span>Output</span><span>XCTest UI suite</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required scenarios:</strong>
+              <ul>
+                <li>Fresh launch has native window and no fake chrome controls.</li>
+                <li>Create workspace from folder path.</li>
+                <li>Create terminal left, Agent App top-right, browser bottom-right.</li>
+                <li>Use command palette to split and switch surfaces.</li>
+                <li>Run fake provider from Agent App and inspect streaming timeline.</li>
+                <li>Use provider/model picker, runtime mode selector, plan/build toggle, changed-files card, diff panel, and terminal drawer.</li>
+                <li>Select terminal text and add it to composer context.</li>
+                <li>Quit/reopen restores layout and selected Agent App thread.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Suite produces screenshots or recordings for major flows and includes a visual parity checkpoint against the T3 Code reference layout.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-093">
+          <div class="card-title"><h3>Create Performance Test Suite</h3><span class="card-id">RC2-093</span></div>
+          <div class="labels"><span class="label test">Test</span><span class="label ops">Ops</span></div>
+          <p>Keep native rewrite fast and prevent regressions.</p>
+          <div class="meta"><span>Owner</span><span>Performance agent</span><span>Depends</span><span>Core vertical slice</span><span>Output</span><span>Perf reports</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Metrics:</strong>
+              <ul>
+                <li>Cold launch to interactive window.</li>
+                <li>Idle memory with one workspace and no browser.</li>
+                <li>Create terminal surface to prompt visible.</li>
+                <li>Create browser surface to address ready.</li>
+                <li>Agent timeline rendering under long tool output.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Reports compare current run to budget and flag regression above threshold.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-094">
+          <div class="card-title"><h3>Create T3 Code UI Parity Screenshot Suite</h3><span class="card-id">RC2-094</span></div>
+          <div class="labels"><span class="label test">Test</span><span class="label review">Review</span></div>
+          <p>Create screenshot and semantic checks that prevent the Swift UI from drifting away from the T3 Code reference.</p>
+          <div class="meta"><span>Owner</span><span>Visual QA agent</span><span>Depends</span><span>RC2-020 through RC2-069</span><span>Output</span><span>Visual parity test suite</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required scenarios:</strong>
+              <ul>
+                <li>Desktop width: sidebar with multiple projects/threads, selected thread, header actions, changed-files card, composer, and branch/workspace toolbar.</li>
+                <li>Narrow width: compact header, compact composer footer, sidebar behavior, and no text overlap.</li>
+                <li>Active run: working timer, disabled controls, stop button, provider status banner, and streaming message.</li>
+                <li>Diff panel open: turn chips, stacked/split toggle, wrap/whitespace toggles, file diff collapsed/expanded states.</li>
+                <li>Terminal drawer open: resizable drawer, split terminals, terminal action buttons, selected text context action.</li>
+                <li>Light/auto theme only if RC2-020 implements it completely; otherwise assert dark default only and fail any visible half-implemented theme switch.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Screenshots prove the first viewport strongly resembles T3 Code's product structure while keeping native macOS chrome. Tests fail on blank screens, overlapped text, missing core controls, and unreadable contrast.</div>
+            <div class="section"><strong>Review checklist:</strong> Reviewer compares screenshots against T3 Code reference and confirms differences are intentional Swift/native adaptations, not omissions.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-095">
+          <div class="card-title"><h3>Create Future Mobile Direct-VPN Contract Test Suite</h3><span class="card-id">RC2-095</span></div>
+          <div class="labels"><span class="label test">Test</span><span class="label risk">Risk</span></div>
+          <p>Prove the desktop core can support a future mobile mirror without building the mobile app.</p>
+          <div class="meta"><span>Owner</span><span>Contract test agent</span><span>Depends</span><span>RC2-023, RC2-024, RC2-025, RC2-026</span><span>Output</span><span>Direct-VPN API contract tests</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required scenarios:</strong>
+              <ul>
+                <li>Direct discovery returns only desktop-owned address/capability metadata and no hosted relay/private-backend fields.</li>
+                <li>Remote access is disabled by default and cannot bind to VPN/LAN until explicitly enabled.</li>
+                <li>Paired fake device can authenticate, subscribe to workspace events, send one workspace command, and receive the resulting event.</li>
+                <li>Fake mobile client reconnects with last sequence and receives missed Agent App timeline events exactly once.</li>
+                <li>Terminal input, terminal resize, browser navigate, Agent App send message, stop run, git status, and workspace focus commands all route through the shared command bus.</li>
+                <li>Revoked device loses HTTP and WebSocket access immediately.</li>
+                <li>Large event burst applies backpressure and does not freeze desktop UI state.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Contract tests pass with a fake client and fail if a developer adds a relay/private-backend dependency, bypasses the command bus, removes replay metadata, or ships a default production token.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-100">
+          <div class="card-title"><h3>Run Architecture Review</h3><span class="card-id">RC2-100</span></div>
+          <div class="labels"><span class="label review">Review</span></div>
+          <p>Review module boundaries and lifecycle before feature work hardens.</p>
+          <div class="meta"><span>Owner</span><span>Senior reviewer agent</span><span>Depends</span><span>RC2-010 through RC2-019</span><span>Output</span><span>Review report</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Review focus:</strong>
+              <ul>
+                <li>Surface protocol does not leak concrete terminal/browser/agent details.</li>
+                <li>Socket API uses public terminology and stable IDs.</li>
+                <li>Persistence layer is testable and schema steps are deterministic.</li>
+                <li>No source license violation risk was introduced.</li>
+                <li>No fake desktop chrome or web runtime dependency exists.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Findings are prioritized by severity and implementation resumes only after P0/P1 issues are resolved.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-101">
+          <div class="card-title"><h3>Run Security And Privacy Review</h3><span class="card-id">RC2-101</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label risk">Risk</span></div>
+          <p>Check secrets, provider process handling, browser data, socket access, and first-run local data handling.</p>
+          <div class="meta"><span>Owner</span><span>Security reviewer agent</span><span>Depends</span><span>Provider, browser, socket, fresh-start bootstrap complete</span><span>Output</span><span>Security review report</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Review focus:</strong>
+              <ul>
+                <li>Prompts and terminal input are redacted in logs/events where needed.</li>
+                <li>Provider thread IDs and tokens are not printed unnecessarily.</li>
+                <li>Local automation socket remains local-only; direct-VPN HTTP/WebSocket access requires explicit enablement, pairing, revocable device trust, and strong auth.</li>
+                <li>No relay, private backend, connector id, cloud command queue, or hosted repository mirror exists in the remote-control path.</li>
+                <li>Browser profiles/cookies are stored and cleared intentionally.</li>
+                <li>First-run bootstrap never scans other app data, home-folder previous-product paths, or external databases.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> No high-severity privacy or local privilege issue remains open for release.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-102">
+          <div class="card-title"><h3>Run Accessibility And Keyboard Review</h3><span class="card-id">RC2-102</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label test">Test</span></div>
+          <p>Ensure the developer UI is keyboard-first and accessible enough for daily use.</p>
+          <div class="meta"><span>Owner</span><span>Accessibility reviewer agent</span><span>Depends</span><span>Core UI complete</span><span>Output</span><span>A11y review</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Review focus:</strong>
+              <ul>
+                <li>Workspace/sidebar/surface tabs have accessible names and focus states.</li>
+                <li>Command palette is fully keyboard usable.</li>
+                <li>Agent composer, stop button, provider selectors, and copy buttons are accessible.</li>
+                <li>Terminal/browser focus handoff is predictable.</li>
+                <li>Text does not overlap or truncate critical controls at supported window sizes.</li>
+              </ul>
+            </div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-103">
+          <div class="card-title"><h3>Run T3 Code UX Parity Review</h3><span class="card-id">RC2-103</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label risk">Risk</span></div>
+          <p>Senior design/product review proving RemoteCode 2 copied the right T3 Code behaviors without violating SwiftUI/AppKit/native constraints.</p>
+          <div class="meta"><span>Owner</span><span>Senior UX reviewer + Scrum master</span><span>Depends</span><span>RC2-060 through RC2-069, RC2-094</span><span>Output</span><span>T3 parity review report</span></div>
+          <details open>
+            <summary>Card details</summary>
+            <div class="section"><strong>Review focus:</strong>
+              <ul>
+                <li>Sidebar: search, project/thread grouping, selected state, status pills, timestamps, and settings footer match T3 Code intent.</li>
+                <li>Header: action density, Add action, Open, Commit &amp; push deferred command, terminal toggle, diff toggle, and overflow controls are present with either working behavior or typed unsupported state from RC2-005.</li>
+                <li>Agent App: timeline rows, work log, changed-files card, diff panel, composer footer, provider/model/runtime controls, and pending approvals match T3 Code intent.</li>
+                <li>Terminal drawer: split/new/close, selection-to-chat, focus/keybinding behavior, and height persistence match T3 Code intent.</li>
+                <li>SwiftUI usage: sidebar, chat, composer, lists, settings, command palette, controls, and data-driven content are SwiftUI unless a documented AppKit need exists.</li>
+                <li>AppKit usage: window, responder chain, menus, focus, terminal host, complex split panes, and native panels are AppKit-owned where SwiftUI is weak.</li>
+                <li>Liquid Glass usage: present only in controls and bars; absent from main content, chat body, sidebar rows, terminal, browser, and diff content.</li>
+                <li>Swift/native adaptation: no Electron/React runtime, no fake window chrome, no CSS-only assumptions, no marketing-style UI, and all direct T3 Code source reuse has MIT attribution.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Report lists pass/fail for each T3 Code pattern and every failing P0/P1 item becomes a new task before release readiness.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-104">
+          <div class="card-title"><h3>Run Future Mobile Readiness Review</h3><span class="card-id">RC2-104</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label risk">Risk</span><span class="label test">Test</span></div>
+          <p>Senior review gate proving RemoteCode 2 was built from zero with the future mobile mirror in mind.</p>
+          <div class="meta"><span>Owner</span><span>Senior platform reviewer + Scrum master</span><span>Depends</span><span>RC2-008, RC2-023 through RC2-026, RC2-095</span><span>Output</span><span>Mobile readiness review report</span></div>
+          <details open>
+            <summary>Card details</summary>
+            <div class="section"><strong>Review focus:</strong>
+              <ul>
+                <li>Architecture keeps the desktop as source of truth and stores repositories/provider credentials only on the user's computer.</li>
+                <li>Networking is direct VPN/LAN only, disabled by default beyond loopback, and contains no relay/private-backend/cloud-broker path.</li>
+                <li>Every desktop action that future mobile needs is routed through the shared command bus and emits replayable events.</li>
+                <li>Event envelopes include sequence, request id, origin client id, actor, target ids, replay semantics, and redaction class.</li>
+                <li>Device trust is explicit, revocable, auditable, and does not rely on production default credentials.</li>
+                <li>Surface contracts cover Agent App, terminal, browser, git/files, workspace/panes, and remote-access settings.</li>
+                <li>Mobile itself was not implemented in this phase; only desktop readiness contracts, APIs, fixtures, and tests were built.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Report names pass/fail for each mobile-readiness invariant and every P0/P1 failure becomes a blocking card before release readiness.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+
+    <section class="column">
+      <div class="column-header">
+        <h2>Release / Done</h2>
+        <div class="count">Packaging, release readiness, and final acceptance cards.</div>
+      </div>
+      <div class="cards">
+        <article class="card" id="RC2-120">
+          <div class="card-title"><h3>Implement Signing, Notarization, And DMG Packaging</h3><span class="card-id">RC2-120</span></div>
+          <div class="labels"><span class="label ops">Ops</span><span class="label test">Test</span></div>
+          <p>Produce a macOS artifact that can launch on a clean machine.</p>
+          <div class="meta"><span>Owner</span><span>Release engineering agent</span><span>Depends</span><span>Feature-complete app</span><span>Output</span><span>Signed DMG</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Configure signing identities, entitlements, hardened runtime, and app sandbox status if used.</li>
+                <li>Sign app bundle and CLI helper.</li>
+                <li>Create DMG with Applications drag target.</li>
+                <li>Submit for notarization and staple ticket.</li>
+                <li>Validate with <code>spctl</code> and launch on a clean macOS user account.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Clean macOS user can install and launch without Gatekeeper warnings beyond normal first-open flow.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-121">
+          <div class="card-title"><h3>Implement Update Channel Strategy</h3><span class="card-id">RC2-121</span></div>
+          <div class="labels"><span class="label ops">Ops</span><span class="label build">Build</span></div>
+          <p>Prepare debug/canary/stable channel separation and updater behavior.</p>
+          <div class="meta"><span>Owner</span><span>Release engineering agent</span><span>Depends</span><span>RC2-120</span><span>Output</span><span>Updater config</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Set separate bundle IDs and app support directories for debug, canary, stable.</li>
+                <li>Integrate Sparkle or approved updater.</li>
+                <li>Define update feed signing and release metadata workflow.</li>
+                <li>Test update from canary N to canary N+1.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Canary app updates without touching stable app data.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-122">
+          <div class="card-title"><h3>Create Clean First-Run UX</h3><span class="card-id">RC2-122</span></div>
+          <div class="labels"><span class="label build">Build</span><span class="label review">Review</span></div>
+          <p>Guide users through dependency checks and first workspace creation from zero.</p>
+          <div class="meta"><span>Owner</span><span>Onboarding agent</span><span>Depends</span><span>RC2-080, provider checks</span><span>Output</span><span>First-run flow</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Steps:</strong>
+              <ol>
+                <li>Detect Codex and Claude CLI availability.</li>
+                <li>State clearly that RemoteCode 2 starts clean and does not connect to another RemoteCode app's data.</li>
+                <li>Allow opening a folder and choosing initial surface: Agent App, terminal, browser.</li>
+                <li>Offer CLI symlink install/update only with explicit user approval.</li>
+                <li>Show remote access disabled by default, with direct-VPN readiness settings clearly separated from first workspace setup and unreachable unless the user explicitly opens remote access settings.</li>
+              </ol>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> New user can reach first Agent App prompt without reading docs.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-123">
+          <div class="card-title"><h3>Create User And Developer Documentation</h3><span class="card-id">RC2-123</span></div>
+          <div class="labels"><span class="label ops">Ops</span><span class="label review">Review</span></div>
+          <p>Document installation, first-run setup, CLI, T3 Code-inspired Agent App, direct-VPN desktop API, browser automation, and troubleshooting.</p>
+          <div class="meta"><span>Owner</span><span>Docs agent</span><span>Depends</span><span>Feature behavior stable</span><span>Output</span><span>Docs</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Required docs:</strong>
+              <ul>
+                <li>Getting started and first workspace.</li>
+                <li>Clean-start behavior and the rule that other RemoteCode app data is not read or reused.</li>
+                <li>Agent App with Codex and Claude.</li>
+                <li>T3 Code-inspired UI model: sidebar, timeline, composer, diff panel, terminal drawer, keybindings, and where RemoteCode 2 intentionally differs.</li>
+                <li>Terminal/browser/split workflows.</li>
+                <li>CLI and socket API reference.</li>
+                <li>Future mobile readiness: direct VPN/LAN only, no relay/private backend, pairing/device trust, event replay, command bus, and why the mobile app is deferred.</li>
+                <li>Third-party notices for T3 Code if any source or substantial translated code was reused.</li>
+                <li>Known limitations and deferred cmux parity.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Docs describe actual behavior, not planned behavior, and include release version.</div>
+          </details>
+        </article>
+
+        <article class="card" id="RC2-124">
+          <div class="card-title"><h3>Run Final Release Readiness Review</h3><span class="card-id">RC2-124</span></div>
+          <div class="labels"><span class="label review">Review</span><span class="label ops">Ops</span><span class="label test">Test</span></div>
+          <p>Scrum master gate before stable release.</p>
+          <div class="meta"><span>Owner</span><span>Scrum master + senior reviewer</span><span>Depends</span><span>All V1 cards</span><span>Output</span><span>Go/no-go report</span></div>
+          <details>
+            <summary>Card details</summary>
+            <div class="section"><strong>Checklist:</strong>
+              <ul>
+                <li>All required build cards done.</li>
+                <li>All review P0/P1 findings resolved.</li>
+                <li>Unit, integration, UI, fresh-start, performance suites pass.</li>
+                <li>Signed/notarized app launches on clean macOS user.</li>
+                <li>Fresh-start bootstrap and channel isolation have been tested.</li>
+                <li>Direct-VPN mobile-readiness contract tests and review have passed, with the mobile app explicitly deferred.</li>
+                <li>Deferred scope is documented and unsupported APIs fail loudly.</li>
+              </ul>
+            </div>
+            <div class="section"><strong>Acceptance:</strong> Go/no-go report names release version, commit, artifacts, known risks, and recovery path.</div>
+          </details>
+        </article>
+      </div>
+    </section>
+  </section>
+
+  <section class="swimlane" id="per-card-verification-matrix">
+    <h2>Per-Card Verification Matrix</h2>
+    <p class="muted">This matrix is part of every card. Agents must satisfy the card details and the matching row below. A card fails if any listed acceptance, automated test, E2E/proof gate, or fail signal is unresolved.</p>
+    <table>
+      <tr><th>Card</th><th>Acceptance criteria</th><th>Automated tests</th><th>E2E / proof gate</th><th>Fail signal</th></tr>
+      <tr><td><a href="#RC2-001">RC2-001</a></td><td>License decision names allowed source use, dependency use, notices, and distribution impact.</td><td>Script checks source-use inventory and required third-party notice placeholders.</td><td>E2E: proof gate - a dry-run implementation agent can classify cmux allowed/forbidden actions without asking.</td><td>Any cmux code copy starts before approval, or obligations remain ambiguous.</td></tr>
+      <tr><td><a href="#RC2-002">RC2-002</a></td><td>Chosen layout model supports workspaces, split panes, tabs, focus, restore, and all surface types.</td><td>Prototype reducer tests for split, close, move, focus, restore, and invalid layout rejection.</td><td>E2E: prototype app creates terminal, browser, and Agent App placeholders in a 3-pane layout and restores after relaunch.</td><td>Any surface needs special layout handling or focus is lost after split/restore.</td></tr>
+      <tr><td><a href="#RC2-003">RC2-003</a></td><td>Terminal engine can launch shell, render prompt, route input, resize, signal, and clean up.</td><td>PTY lifecycle tests for cwd, output, resize, SIGINT, close, and orphan detection.</td><td>E2E: spike app opens terminal, runs <code>pwd</code>, resizes pane, sends interrupt, closes, and proves no child remains.</td><td>Terminal view blanks, input leaks, resize breaks prompt, or process survives close.</td></tr>
+      <tr><td><a href="#RC2-004">RC2-004</a></td><td>Provider contract covers Codex and Claude request fields, stream events, errors, cancellation, and missing auth.</td><td>Contract fixture tests assert both providers map into the same normalized event schema.</td><td>E2E: proof gate - fake provider run renders in Agent App timeline without provider-specific UI branches.</td><td>UI depends on raw Codex/Claude JSON or cancellation semantics differ silently.</td></tr>
+      <tr><td><a href="#RC2-005">RC2-005</a></td><td>V1 scope lists required, partial, and deferred cmux features with unsupported-method rules.</td><td>Scope lint verifies every feature family has status and every deferred API has an error rule.</td><td>E2E: proof gate - unsupported API smoke call returns typed not-supported error with docs link.</td><td>Agent must infer scope or missing feature appears as silent no-op.</td></tr>
+      <tr><td><a href="#RC2-006">RC2-006</a></td><td>T3 Code UX spec maps sidebar, header, timeline, composer, diff, terminal drawer, command palette, settings, and attribution.</td><td>Spec lint checks required T3 sections, file references, license decision, and forbidden copy list.</td><td>E2E: proof gate - visual checklist can evaluate a full Agent App screenshot against T3 Code structure.</td><td>Implementation agent still needs to reopen T3 Code to know core UI behavior.</td></tr>
+      <tr><td><a href="#RC2-007">RC2-007</a></td><td>ADR assigns SwiftUI/AppKit/Liquid Glass ownership per component and forbids marketing UI patterns.</td><td>Static checks for fake chrome, Liquid Glass on main content, and terminal hosted only in SwiftUI.</td><td>E2E: screenshot proves dense dark developer UI with native chrome and no decorative glass content.</td><td>Window/focus/split ownership is unclear or main content uses decorative glass.</td></tr>
+      <tr><td><a href="#RC2-008">RC2-008</a></td><td>Future mobile contract defines direct VPN/LAN transport, identity, command/event envelopes, replay, and non-goals.</td><td>ADR lint verifies no relay/private-backend path and all required protocol fields are named.</td><td>E2E: proof gate - fake future-mobile sequence diagram can execute discovery, pair, command, event replay on paper.</td><td>Any mobile path assumes a hosted relay or desktop-only private action path.</td></tr>
+      <tr><td><a href="#RC2-010">RC2-010</a></td><td>Clean clone builds, launches debug app, and includes app/test targets and scripts.</td><td>Build smoke, unit smoke, bundle id checks, script existence checks.</td><td>E2E: launch app from built artifact and assert native window appears with placeholder content.</td><td>Build requires manual local state or app opens no window.</td></tr>
+      <tr><td><a href="#RC2-011">RC2-011</a></td><td>Native NSWindow, menus, responder chain, settings stub, bounds restore, and no fake chrome.</td><td>Menu command tests, window restore tests, focus bridge tests, fake-chrome DOM/view scan.</td><td>E2E: open app, use menu command, focus content, resize/relaunch, verify bounds and native chrome.</td><td>Menu command misses target, focus leaks, or fake close/minimize/maximize controls appear.</td></tr>
+      <tr><td><a href="#RC2-012">RC2-012</a></td><td>Workspace reducer preserves IDs, split invariants, selected surface, command metadata, and UI independence.</td><td>Reducer property tests and invariant tests for create/select/close/split/move/reorder/focus.</td><td>E2E: command bus drives workspace changes and UI reflects exact selected surface after reload.</td><td>Invalid split tree persists or action lacks request/origin metadata.</td></tr>
+      <tr><td><a href="#RC2-013">RC2-013</a></td><td>Sidebar supports project/thread hierarchy, search, timestamps, statuses, keyboard navigation, and settings footer.</td><td>View model tests for filtering, sorting, expand/collapse, rename/archive, timestamp updates.</td><td>E2E: create projects/threads, search/select/show-more, navigate by keyboard, compare screenshot to T3 sidebar.</td><td>Search loses selection, text overlaps, or status/timestamp data is missing.</td></tr>
+      <tr><td><a href="#RC2-014">RC2-014</a></td><td>Pane/tab UI can create, switch, split, close, move, and focus all placeholder surfaces.</td><td>Layout reducer tests, split geometry tests, tab lifecycle tests, focus direction tests.</td><td>E2E: build terminal left, Agent App top-right, browser bottom-right; switch tabs and close panes safely.</td><td>Closing last surface crashes or focus goes to wrong pane.</td></tr>
+      <tr><td><a href="#RC2-015">RC2-015</a></td><td>Command palette registers commands, shortcuts, when-rules, grouping, disabled states, and focus isolation.</td><td>Parser, precedence, availability, fuzzy-search, disabled-row, and focus-isolation tests.</td><td>E2E: open palette, create Agent App thread, split terminal, toggle diff, and verify no keystrokes leak.</td><td>Shortcut triggers in wrong context or disabled command runs.</td></tr>
+      <tr><td><a href="#RC2-016">RC2-016</a></td><td>SQLite schema creates from zero, repositories work, transactions rollback, channels isolate data.</td><td>Schema version, CRUD, rollback, in-memory DB, channel path, and corruption recovery tests.</td><td>E2E: first launch creates empty RemoteCode 2 database, creates workspace/thread, relaunches with data intact.</td><td>Schema reads outside owned directory or transaction leaves partial rows.</td></tr>
+      <tr><td><a href="#RC2-017">RC2-017</a></td><td>Session snapshots save/restore windows, layouts, selected surfaces, and unknown types safely.</td><td>Encode/decode, invalid snapshot, unknown surface, debounce, and restore-policy tests.</td><td>E2E: create multi-pane layout, quit, reopen, verify exact selection and surface order.</td><td>Layout changes after relaunch or invalid snapshot crashes app.</td></tr>
+      <tr><td><a href="#RC2-018">RC2-018</a></td><td>Local JSON-RPC socket supports ping, capabilities, identify, workspace/pane/surface methods, and events.</td><td>Protocol tests for invalid JSON, method missing, invalid params, auth/local-only guard, event emission.</td><td>E2E: CLI/test client creates workspace and Agent App placeholder through socket without UI.</td><td>Socket binds non-local unexpectedly or response schema is unstable.</td></tr>
+      <tr><td><a href="#RC2-019">RC2-019</a></td><td>CLI wraps socket with stable JSON, clear text output, targeting flags, and stale-app errors.</td><td>Parser tests, JSON snapshots, socket integration tests, app-not-running tests.</td><td>E2E: run CLI to create and focus an Agent App surface in the running app.</td><td>CLI output cannot be scripted or stale socket error is unclear.</td></tr>
+      <tr><td><a href="#RC2-020">RC2-020</a></td><td>Design system exposes T3-like tokens, controls, AppKit bridges, accessibility, and Liquid Glass limits.</td><td>Snapshot, contrast, sizing, no-overlap, Liquid Glass placement, and bridge smoke tests.</td><td>E2E: preview app renders all controls in dark mode and screenshot passes visual density checklist.</td><td>Control text clips, color contrast fails, or main content receives glass styling.</td></tr>
+      <tr><td><a href="#RC2-021">RC2-021</a></td><td>Top header shows thread/project context, core actions, responsive collapse, tooltips, and command routing.</td><td>Action availability, responsive layout, tooltip, disabled-state, and command routing tests.</td><td>E2E: use header to open editor placeholder, toggle diff, toggle terminal, create surface, and inspect screenshot.</td><td>Header action bypasses command model or clips at narrow width.</td></tr>
+      <tr><td><a href="#RC2-022">RC2-022</a></td><td>Toolbar shows git/workspace/environment context, locked state, non-git state, and responsive collapse.</td><td>Git/non-git/dirty/worktree/locked fixtures and collapse tests.</td><td>E2E: open git and non-git projects; verify branch/no-git/locked states and no clipped controls.</td><td>Non-git project breaks Agent App or worktree lock can be changed incorrectly.</td></tr>
+      <tr><td><a href="#RC2-023">RC2-023</a></td><td>Desktop API exposes direct discovery, capabilities, WebSocket, protocol negotiation, and loopback default.</td><td>Discovery schema, capability mismatch, auth failure, WebSocket join, explicit enablement, no relay config tests.</td><td>E2E: fake client connects over loopback/VPN-enabled path, reads capabilities, joins WebSocket, receives event.</td><td>API contains relay/private-backend fields or listens beyond loopback without opt-in.</td></tr>
+      <tr><td><a href="#RC2-024">RC2-024</a></td><td>Remote access has explicit enablement, pairing, revocation, rotation, device audit, and secure storage.</td><td>Pairing expiry, revoke, rotate, Keychain, rate limit, audit redaction, denied auth tests.</td><td>E2E: pair fake device, run one command, revoke device, prove HTTP/WS access stops immediately.</td><td>Default production token exists or revoked device remains connected.</td></tr>
+      <tr><td><a href="#RC2-025">RC2-025</a></td><td>Command bus and event log support envelopes, sequence, replay, ack, idempotency, scopes, and redaction.</td><td>Ordering, replay, duplicate request, duplicate idempotency key, origin filter, pruning, and failure-event tests.</td><td>E2E: fake mobile disconnects, desktop changes state, reconnects with last sequence, receives missed events once.</td><td>Command executes twice or reconnect misses/duplicates events.</td></tr>
+      <tr><td><a href="#RC2-026">RC2-026</a></td><td>Capability matrix names remote status, commands, events, payload fields, and deferred/forbidden items per surface.</td><td>Matrix lint checks all V1 surfaces and commands have status, payload, and test owner.</td><td>E2E: proof gate - fake client script can plan one remote flow per surface from the matrix alone.</td><td>Any surface has unknown mobile-readiness status or requires bulk data fetch.</td></tr>
+      <tr><td><a href="#RC2-030">RC2-030</a></td><td>Terminal surface launches shell in cwd, routes focus, reports metadata, and cleans process groups.</td><td>PTY cwd, input/output, focus, close cleanup, metadata, and orphan-process tests.</td><td>E2E: open terminal, run <code>pwd</code>, split away, return, close, and verify no child remains.</td><td>Input reaches unfocused terminal or process survives close.</td></tr>
+      <tr><td><a href="#RC2-031">RC2-031</a></td><td>Terminal copy/paste/select all/clear/font/resize/scrollback behave like normal macOS terminal use.</td><td>Selection, paste, resize, font, clear history, scrollback truncation, and focus guard tests.</td><td>E2E: select/copy output, paste command, resize pane, change font, relaunch with bounded scrollback.</td><td>Paste goes to wrong surface or scrollback grows unbounded.</td></tr>
+      <tr><td><a href="#RC2-032">RC2-032</a></td><td>Terminal automation commands target one terminal and reject wrong surface types with typed errors.</td><td>Command handler tests for send text/key/read/clear, wrong target, redaction, and target isolation.</td><td>E2E: socket/CLI sends command to terminal A while terminal B remains unchanged.</td><td>Terminal command affects wrong surface or logs raw sensitive input.</td></tr>
+      <tr><td><a href="#RC2-040">RC2-040</a></td><td>WKWebView browser supports navigation, state persistence, profiles, local URLs, and focus isolation.</td><td>Navigation policy, state snapshot, focus guard, URL/title persistence, and profile hook tests.</td><td>E2E: open local dev page, navigate back/forward/reload, split with Agent App, relaunch with URL restored.</td><td>Browser focus leaks to terminal or forbidden URL opens silently.</td></tr>
+      <tr><td><a href="#RC2-041">RC2-041</a></td><td>Browser profiles persist, isolate available data, can be renamed/cleared/deleted, and protect default profile.</td><td>Profile CRUD, active default guard, clear data, persistence, and isolation-limit tests.</td><td>E2E: create two profiles, set cookie in one, verify other profile does not share it where WKWebView permits.</td><td>Deleting active default succeeds or profile state mixes unexpectedly without documented limitation.</td></tr>
+      <tr><td><a href="#RC2-042">RC2-042</a></td><td>Browser P0 automation supports navigate, snapshot, element actions, eval, wait, screenshot, and unsupported errors.</td><td>Local HTML fixture tests for snapshot, click, fill, wait, screenshot, target isolation, unsupported methods.</td><td>E2E: CLI drives a browser surface through form fill, click, wait, screenshot, and verifies expected DOM.</td><td>Element refs are unstable or action hits wrong browser surface.</td></tr>
+      <tr><td><a href="#RC2-050">RC2-050</a></td><td>Normalized event model builds provider-independent thread/turn/item snapshots.</td><td>Reducer fixture tests for all event/item types, malformed events, ordering, and unknown event handling.</td><td>E2E: proof gate - fake provider stream renders a full timeline without provider-specific conditionals.</td><td>Timeline needs raw provider fields or malformed event crashes reducer.</td></tr>
+      <tr><td><a href="#RC2-051">RC2-051</a></td><td>Codex runner resolves CLI, spawns with correct options, parses JSON events, captures status, and cancels.</td><td>Parser fixtures for reasoning, tools, assistant text, failure, malformed JSON, cancellation, missing binary.</td><td>E2E: fake Codex fixture and real Codex smoke when authenticated produce identical normalized timeline shape.</td><td>Unknown event kills run or missing CLI error is not actionable.</td></tr>
+      <tr><td><a href="#RC2-052">RC2-052</a></td><td>Claude runner resolves CLI, spawns with supported options, parses stream blocks, maps events, and cancels.</td><td>Parser fixtures for thinking, text, tool use/result, cost metadata, failure, missing binary, cancellation.</td><td>E2E: fake Claude fixture and real Claude smoke when authenticated render in the same Agent App timeline.</td><td>Claude UI branch diverges from shared event model.</td></tr>
+      <tr><td><a href="#RC2-053">RC2-053</a></td><td>Run supervisor persists lifecycle, handles stop/fail/complete/cancel, and reconciles crashes.</td><td>Lifecycle state-machine, DB persistence, cancellation, crash recovery, and final-message tests.</td><td>E2E: kill app during fake run, relaunch, verify run is marked interrupted and no process remains.</td><td>Stale run remains active after crash or final assistant message persists before success.</td></tr>
+      <tr><td><a href="#RC2-060">RC2-060</a></td><td>Agent App surface supports lifecycle, T3-like shell, provider controls, errors, commands, restore, and snapshots.</td><td>Surface lifecycle, header actions, empty states, provider status, diff/terminal toggles, snapshot tests.</td><td>E2E: create/split/focus/rename/close/restore Agent App surface and compare first viewport to T3 Code.</td><td>Surface cannot restore selected thread/provider or visual structure misses core T3 regions.</td></tr>
+      <tr><td><a href="#RC2-061">RC2-061</a></td><td>Thread list lazy-loads visible fields, supports project grouping, search, selection, rename/archive, ordering, restore.</td><td>Lazy loading, active ordering, search, rename/archive, branch/worktree preservation, restore tests.</td><td>E2E: create projects/threads, search, show more, select thread, relaunch, verify same active thread.</td><td>Opening list loads full message bodies or loses branch/worktree context.</td></tr>
+      <tr><td><a href="#RC2-062">RC2-062</a></td><td>Timeline renders all row types, streaming, long output collapse, markdown, images, scrolling, and accessibility.</td><td>Fixture rendering, virtualization, stream update, long output, image preview, copy/link, a11y label tests.</td><td>E2E: run fake provider with long tool output and image; verify smooth scroll, collapse, and final evidence rows.</td><td>Streaming freezes UI or long output expands unbounded by default.</td></tr>
+      <tr><td><a href="#RC2-063">RC2-063</a></td><td>Composer handles prompt, attachments, provider/model/runtime controls, pending panels, disabled states, drafts, stop.</td><td>Send-state, attachment limit, pending approval/input, provider picker, mode selector, stop, draft, focus tests.</td><td>E2E: send prompt, attach image/path, stop active run, restore draft, verify composer clears only after accept.</td><td>Submit is enabled in invalid state or prompt is lost on failed send.</td></tr>
+      <tr><td><a href="#RC2-064">RC2-064</a></td><td>Codex and Claude run in one Agent App UI, stream normalized events, persist state, lock provider when needed.</td><td>Fake provider integration, missing auth/binary, provider lock, cancellation, persistence tests.</td><td>E2E: run fake Codex then fake Claude in separate threads and verify identical timeline/work evidence behavior.</td><td>Provider switch corrupts thread history or UI forks into raw-provider screens.</td></tr>
+      <tr><td><a href="#RC2-065">RC2-065</a></td><td>Agent socket/CLI commands can open Agent App, create/list threads, send message, stop run, and list models.</td><td>API handler, CLI wrapper, target resolution, response schema, error handling, and provider state tests.</td><td>E2E: CLI opens Agent App, sends prompt to fake provider, waits for completion, stops another active run.</td><td>Command cannot target a specific workspace/surface or returns unstable IDs.</td></tr>
+      <tr><td><a href="#RC2-066">RC2-066</a></td><td>Changed-files summary shows totals, tree, per-file state, empty/no-git errors, collapse, and diff opening.</td><td>Git fixtures for add/delete/rename/binary/no-git/no-change and UI state tests.</td><td>E2E: fake agent changes files; timeline shows changed-files card; clicking file opens correct diff.</td><td>Completed file-changing run lacks proof card or wrong file opens.</td></tr>
+      <tr><td><a href="#RC2-067">RC2-067</a></td><td>Diff panel supports turns, files, stacked/split mode, wrap/whitespace, large diffs, fallback, restore.</td><td>Diff parser fixtures, large-diff performance, no-git/no-change, selected-file scroll, accessibility tests.</td><td>E2E: open diff from changed-files card, toggle modes/options, reopen, verify selected file persists.</td><td>Large diff freezes UI or fallback hides parser failure reason.</td></tr>
+      <tr><td><a href="#RC2-068">RC2-068</a></td><td>Terminal drawer supports toggle, split/new/close, resize persistence, shortcuts, link open, selection-to-context.</td><td>Drawer state, resize, shortcuts, selection context, link open, lifecycle, restore, orphan-process tests.</td><td>E2E: open drawer, split terminals, select output into composer context, hide/show, verify focus returns.</td><td>Drawer steals composer focus or terminal process leaks on close.</td></tr>
+      <tr><td><a href="#RC2-069">RC2-069</a></td><td>Project actions discover scripts safely, render Add action/Open controls, run in terminal, and log safely.</td><td>Script discovery fixtures, unsafe disabled cases, open actions, command registration, log redaction tests.</td><td>E2E: run project test script from header into terminal drawer and open project in preferred editor placeholder.</td><td>Untrusted script executes automatically or secrets appear in logs.</td></tr>
+      <tr><td><a href="#RC2-080">RC2-080</a></td><td>First run creates only RemoteCode 2-owned files, clean schema, explicit defaults, and empty production data.</td><td>Fresh install, empty support directory, corrupt new DB recovery, channel isolation, no previous-path touch tests.</td><td>E2E: launch as clean user, verify empty workspace state and filesystem trace touches only RemoteCode 2 paths.</td><td>App reads or probes another product data path.</td></tr>
+      <tr><td><a href="#RC2-081">RC2-081</a></td><td>Test fixtures create deterministic fake projects, surfaces, threads, events, terminal/browser state, and connection targets.</td><td>Determinism, no production seeding, channel isolation, fixture directory guard, fake-data visibility tests.</td><td>E2E: proof gate - UI suite boots from fixture scenario and production first run remains empty.</td><td>Fixture reads user home data or appears in production build.</td></tr>
+      <tr><td><a href="#RC2-090">RC2-090</a></td><td>Unit suite covers reducers, snapshots, DB, providers, event model, CLI, and command validation intent.</td><td>CI unit command fails on missing required test family or shallow no-intent tests.</td><td>E2E: proof gate - mutation-style spot checks prove tests fail when key invariants are broken.</td><td>Suite passes while stale run, bad layout, or provider-history corruption is injected.</td></tr>
+      <tr><td><a href="#RC2-091">RC2-091</a></td><td>Integration suite proves socket, CLI, terminal, browser, fake provider, and fixture factory work together.</td><td>Headless/minimal-host integration tests for each required scenario with deterministic fixtures.</td><td>E2E: CI launches minimal app host and drives full socket-to-UI-state workflow.</td><td>Subsystem tests pass individually but integrated workflow cannot run.</td></tr>
+      <tr><td><a href="#RC2-092">RC2-092</a></td><td>UI automation covers fresh launch, workspace, surfaces, command palette, fake provider, diff, drawer, restore.</td><td>XCTest UI suite with fixture setup, screenshots, recordings, and deterministic selectors.</td><td>E2E: full happy path creates terminal/Agent App/browser layout, runs fake provider, inspects diff, relaunches.</td><td>Any core daily workflow lacks UI automation or produces blank/overlapped screenshots.</td></tr>
+      <tr><td><a href="#RC2-093">RC2-093</a></td><td>Performance suite measures launch, idle memory, terminal/browser creation, timeline, diff, and large events against budgets.</td><td>Automated perf benchmarks with baseline comparison and regression thresholds.</td><td>E2E: scripted heavy workspace run records timings and screenshots, then flags regression above threshold.</td><td>Perf data is manual-only or regressions do not fail CI/review gate.</td></tr>
+      <tr><td><a href="#RC2-094">RC2-094</a></td><td>Visual suite proves T3-like desktop/narrow/active/diff/drawer views with contrast and no overlap.</td><td>Screenshot comparison, semantic control checks, blank-screen detection, contrast, and layout bounds tests.</td><td>E2E: capture canonical screenshots for each major viewport and compare to approved T3 parity references.</td><td>Missing core control, unreadable contrast, blank area, or overlapped text passes unnoticed.</td></tr>
+      <tr><td><a href="#RC2-095">RC2-095</a></td><td>Direct-VPN contract suite proves discovery, auth, pairing, WS replay, command bus routing, revocation, and backpressure.</td><td>Fake-client HTTP/WS contract tests plus negative tests for relay/private-backend fields.</td><td>E2E: paired fake mobile drives workspace, Agent App, terminal, browser, git/status flows over direct API.</td><td>Relay dependency appears, default token ships, replay metadata missing, or command bypasses bus.</td></tr>
+      <tr><td><a href="#RC2-100">RC2-100</a></td><td>Architecture review lists P0/P1/P2 findings for module boundaries, source use, persistence, socket, and native constraints.</td><td>Review checklist lint verifies all required focus areas are answered with evidence links.</td><td>E2E: proof gate - reviewer runs one vertical slice smoke before approving architecture readiness.</td><td>P0/P1 issue remains open or review lacks file/test evidence.</td></tr>
+      <tr><td><a href="#RC2-101">RC2-101</a></td><td>Security review clears secrets, auth, remote access, browser data, logging, first-run paths, and provider handling.</td><td>Secret scan, auth negative tests, log redaction tests, denied remote access tests, path touch audit.</td><td>E2E: attempted unauthorized HTTP/WS/CLI access fails; authorized paired device audit trail is visible.</td><td>High severity issue open, token logged, or remote control works without explicit trust.</td></tr>
+      <tr><td><a href="#RC2-102">RC2-102</a></td><td>Keyboard and accessibility review confirms names, focus, command palette, composer, terminal/browser handoff, and no truncation.</td><td>Accessibility tree checks, focus-order tests, keyboard-only navigation tests, text bounds checks.</td><td>E2E: keyboard-only user completes create workspace, run fake provider, inspect diff, operate terminal drawer.</td><td>Mouse-only required path or inaccessible critical control remains.</td></tr>
+      <tr><td><a href="#RC2-103">RC2-103</a></td><td>T3 parity review passes sidebar, header, Agent App, drawer, SwiftUI/AppKit, Liquid Glass, and native adaptation checks.</td><td>Parity checklist lint ties every required T3 pattern to screenshots/tests or explicit deferral.</td><td>E2E: reviewer compares canonical app recording against T3 Code reference flow and marks each pattern pass/fail.</td><td>Major T3 behavior missing without deferral or UI drifts into marketing style.</td></tr>
+      <tr><td><a href="#RC2-104">RC2-104</a></td><td>Mobile readiness review proves direct-only networking, command bus, replay, device trust, surface coverage, and deferred mobile scope.</td><td>Review checklist plus contract test report from RC2-095 and static scan for forbidden network paths.</td><td>E2E: fake mobile readiness run pairs, reconnects, replays missed events, revokes access, and records evidence.</td><td>Any mobile-critical invariant fails or mobile app work is accidentally added to scope.</td></tr>
+      <tr><td><a href="#RC2-120">RC2-120</a></td><td>Signed/notarized DMG installs and launches cleanly with correct entitlements and CLI helper signing.</td><td>Codesign, notarization, staple, entitlement, Gatekeeper, bundle structure, and CLI helper checks.</td><td>E2E: install DMG on clean macOS account, launch app, run smoke flow, and verify Gatekeeper acceptance.</td><td>Unsigned helper, unstapled ticket, or clean machine launch fails.</td></tr>
+      <tr><td><a href="#RC2-121">RC2-121</a></td><td>Update channels isolate bundle ids/data and canary updates from N to N+1 safely.</td><td>Bundle id, app support path, update feed signing, canary update, stable isolation tests.</td><td>E2E: install canary N, create data, update to N+1, verify data persists and stable remains untouched.</td><td>Canary touches stable data or update requires manual repair.</td></tr>
+      <tr><td><a href="#RC2-122">RC2-122</a></td><td>First-run UX reaches first Agent App prompt from zero and keeps remote-access settings disabled and separate from onboarding.</td><td>Dependency detection, provider missing states, folder chooser, initial surface, remote disabled default tests.</td><td>E2E: clean user completes onboarding, opens folder, creates Agent App, sends fake prompt, sees response.</td><td>User cannot reach first prompt without docs or remote access is enabled by default.</td></tr>
+      <tr><td><a href="#RC2-123">RC2-123</a></td><td>Docs match actual behavior for install, first run, CLI/socket, Agent App, direct VPN, tests, limits, and notices.</td><td>Docs lint for required sections, broken links, stale planned wording, command snippets, notice references.</td><td>E2E: proof gate - new-agent dry run follows docs to complete first workspace and one direct-API fake-client check.</td><td>Docs describe planned behavior as shipped or omit critical direct-VPN/no-relay constraints.</td></tr>
+      <tr><td><a href="#RC2-124">RC2-124</a></td><td>Final go/no-go report names version, commit, artifacts, tests, reviews, risks, and recovery path.</td><td>Release checklist validates all blocking cards, test reports, notarization, screenshots, and review signoffs exist.</td><td>E2E: final release candidate runs clean install, first prompt, terminal/browser/diff/drawer, direct-VPN fake-client, update smoke.</td><td>Any P0/P1 open, missing artifact, missing evidence, or unsupported API fails silently.</td></tr>
+    </table>
+  </section>
+
+  <section class="swimlane">
+    <h2>Cross-Card LLM Execution Rules</h2>
+    <table>
+      <tr><th>Rule</th><th>Expected agent behavior</th></tr>
+      <tr><td>Evidence first</td><td>Before changing code, inspect the relevant planning file and existing implementation. Do not infer architecture from memory.</td></tr>
+      <tr><td>Verification matrix</td><td>Before marking any card done, satisfy its row in the Per-Card Verification Matrix. Missing E2E/proof evidence is a fail, not a follow-up.</td></tr>
+      <tr><td>T3 Code parity</td><td>For Agent App and general UI work, inspect the T3 UX reference spec and preserve the sidebar, header, timeline, composer, diff, terminal drawer, and keybinding patterns unless the card explicitly says to diverge.</td></tr>
+      <tr><td>UI ownership</td><td>For UI work, default to SwiftUI for state-driven content and AppKit for shell/focus/terminal/split-pane mechanics. Liquid Glass is allowed only on controls and bars, not the main content.</td></tr>
+      <tr><td>Future mobile readiness</td><td>Any shared command, event, networking, auth, surface, or settings card must preserve the future direct-VPN mobile mirror contract. Do not add relay/private-backend assumptions or desktop-only private action paths.</td></tr>
+      <tr><td>Small diffs</td><td>Implement only the card scope. Do not refactor adjacent modules unless required by the card.</td></tr>
+      <tr><td>Tests verify intent</td><td>Write tests that fail when the product invariant breaks, not tests that only assert literal current output.</td></tr>
+      <tr><td>Fail loud</td><td>If licensing, T3 Code attribution, signing, provider CLI, or terminal dependency cannot be verified, stop and report the blocker.</td></tr>
+      <tr><td>Fresh start</td><td>No card may support data reads, reuse, or transfer from any previous RemoteCode app. RemoteCode 2 starts from zero.</td></tr>
+      <tr><td>Review loop</td><td>Any shared model, persistence, socket, provider, terminal, browser, or first-run data change requires a review card before release.</td></tr>
+    </table>
+  </section>
+</main>
+</body>
+</html>

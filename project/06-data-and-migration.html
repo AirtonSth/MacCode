@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Data and Migration Plan</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --warn:#ffd37a; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    a { color:var(--accent); text-decoration:none; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+    pre { background:#0a0e13; border:1px solid var(--line); border-radius:8px; padding:14px; overflow:auto; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>Data and Migration Plan</h1>
+  <p class="muted">Plan to move from current RemoteCode SQLite/Bun persistence to native Swift SQLite persistence.</p>
+
+  <h2>Storage Decision</h2>
+  <table>
+    <tr><th>Choice</th><th>Decision</th><th>Reason</th></tr>
+    <tr><td>Primary database</td><td>SQLite</td><td>Both current RemoteCode and cmux session state are local-first. SQLite is enough and migration-friendly.</td></tr>
+    <tr><td>Swift library</td><td>GRDB preferred</td><td>Good migrations, Codable support, query safety, and testability. Direct SQLite is acceptable for low-level session snapshot code.</td></tr>
+    <tr><td>Schema changes</td><td>Versioned SQL migrations</td><td>Need deterministic upgrades and downgrade-safe backups.</td></tr>
+    <tr><td>Session snapshots</td><td>SQLite plus JSON snapshot blobs</td><td>Structured tables for domain data, JSON snapshot for window/pane/surface layout.</td></tr>
+  </table>
+
+  <h2>Target Tables</h2>
+  <table>
+    <tr><th>Table</th><th>Purpose</th><th>Source mapping</th></tr>
+    <tr><td><code>projects</code></td><td>Workspace/project list: id, name, path, favorite, timestamps.</td><td>Current <code>projects</code>.</td></tr>
+    <tr><td><code>agent_threads</code></td><td>Codex/Claude thread metadata.</td><td>Current <code>chats</code>. Rename to agent-specific domain.</td></tr>
+    <tr><td><code>agent_messages</code></td><td>User and assistant messages.</td><td>Current <code>messages</code>.</td></tr>
+    <tr><td><code>agent_runs</code></td><td>One row per provider run, active/cancelled/failed/completed state.</td><td>New table. Replaces overloading <code>chats.isActive</code>.</td></tr>
+    <tr><td><code>agent_stream_events</code></td><td>Normalized assistant event log while run is active or retained for replay.</td><td>Current <code>chat_stream_events</code>.</td></tr>
+    <tr><td><code>agent_turn_snapshots</code></td><td>Structured turn snapshot anchored to assistant/user message.</td><td>Current <code>chat_turn_snapshots</code>.</td></tr>
+    <tr><td><code>workspace_selection</code></td><td>Selected workspace, surface, thread, provider/model settings.</td><td>Current <code>workspace_selection</code>, extended with surface IDs.</td></tr>
+    <tr><td><code>terminal_sessions</code></td><td>Terminal surface state and scrollback metadata.</td><td>Current terminal session table plus cmux-style session snapshot.</td></tr>
+    <tr><td><code>browser_profiles</code></td><td>Browser profile definitions and last used profile.</td><td>New, based on cmux browser profile concept.</td></tr>
+    <tr><td><code>session_snapshots</code></td><td>Window/workspace/pane/surface restore payloads.</td><td>cmux <code>SessionPersistence</code> concept.</td></tr>
+    <tr><td><code>events</code></td><td>Reconnectable automation/domain event stream.</td><td>Current <code>workspace_events</code> plus cmux event stream behavior.</td></tr>
+    <tr><td><code>settings</code></td><td>Key-value app settings.</td><td>Current <code>server_metadata</code> and local storage equivalents.</td></tr>
+  </table>
+
+  <h2>Migration Mapping</h2>
+  <table>
+    <tr><th>Current RemoteCode</th><th>RemoteCode 2</th><th>Rule</th></tr>
+    <tr><td><code>projects.id</code></td><td><code>projects.id</code></td><td>Preserve IDs.</td></tr>
+    <tr><td><code>projects.path</code></td><td><code>projects.path</code></td><td>Preserve exact path. Validate availability lazily, not during migration.</td></tr>
+    <tr><td><code>chats.id</code></td><td><code>agent_threads.id</code></td><td>Preserve IDs for message references and old links.</td></tr>
+    <tr><td><code>chats.provider</code></td><td><code>agent_threads.provider</code></td><td>Map <code>codex</code> and <code>claude</code>. Mark <code>fake</code> threads read-only or archive.</td></tr>
+    <tr><td><code>chats.providerThreadId</code></td><td><code>agent_threads.provider_thread_id</code></td><td>Preserve for resume.</td></tr>
+    <tr><td><code>messages</code></td><td><code>agent_messages</code></td><td>Preserve roles/content/timestamps.</td></tr>
+    <tr><td><code>chat_turn_snapshots.payloadJson</code></td><td><code>agent_turn_snapshots.payload_json</code></td><td>Copy if schema-compatible; otherwise convert with a migration decoder.</td></tr>
+    <tr><td><code>workspace_selection</code></td><td><code>workspace_selection</code></td><td>Preserve selected project/thread/provider/model. Surface selection is initialized to a new Agent App surface.</td></tr>
+    <tr><td><code>terminal_sessions</code></td><td><code>terminal_sessions</code></td><td>Best-effort import only if target terminal implementation can replay snapshots safely.</td></tr>
+  </table>
+
+  <h2>Migration Tool</h2>
+  <pre><code>remotecode2 migrate import-remotecode1 \
+  --source-db /path/to/remotecode.sqlite \
+  --target-db ~/Library/Application Support/RemoteCode2/remotecode2.sqlite \
+  --backup-dir ~/Library/Application Support/RemoteCode2/backups
+</code></pre>
+  <table>
+    <tr><th>Step</th><th>Action</th><th>Pass criteria</th></tr>
+    <tr><td>1</td><td>Locate current RemoteCode DB or ask user to choose it.</td><td>Source path is explicit in migration report.</td></tr>
+    <tr><td>2</td><td>Copy source DB to backup directory before reading.</td><td>Backup file exists and checksum is recorded.</td></tr>
+    <tr><td>3</td><td>Run read-only schema introspection.</td><td>Report source schema version or detected table set.</td></tr>
+    <tr><td>4</td><td>Create target DB with latest migrations.</td><td>Target schema version equals app schema version.</td></tr>
+    <tr><td>5</td><td>Import projects, threads, messages, snapshots, selection.</td><td>Counts match, skipped rows are listed with reasons.</td></tr>
+    <tr><td>6</td><td>Open app into imported selected project and Agent App surface.</td><td>Imported thread renders without network or provider calls.</td></tr>
+  </table>
+
+  <h2>Failure Rules</h2>
+  <ul>
+    <li>Never mutate the source RemoteCode database.</li>
+    <li>Never silently drop rows. Every skipped row must be counted and explained.</li>
+    <li>Provider thread IDs are sensitive enough to preserve exactly, but they are not logged in plain migration summaries unless necessary.</li>
+    <li>Migration can complete with warnings for missing paths, fake-provider chats, unsupported terminal snapshots, or malformed stream events.</li>
+    <li>Migration must be re-runnable. Existing target rows with the same source IDs update deterministically.</li>
+  </ul>
+</main>
+</body>
+</html>

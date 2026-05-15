@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Build and Release Plan</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --ok:#8ee6a8; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); }
+    a { color:var(--accent); text-decoration:none; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>Build, Release, and Operations Plan</h1>
+  <p class="muted">Operational plan for turning the Swift rewrite into a distributable app.</p>
+
+  <h2>Repository Layout</h2>
+  <table>
+    <tr><th>Path</th><th>Purpose</th></tr>
+    <tr><td><code>RemoteCode2.xcodeproj</code></td><td>Main macOS app project.</td></tr>
+    <tr><td><code>Sources/App</code></td><td>App lifecycle, windows, menu, settings.</td></tr>
+    <tr><td><code>Sources/Workspace</code></td><td>Workspace/sidebar/domain state.</td></tr>
+    <tr><td><code>Sources/Surfaces</code></td><td>Surface protocol and terminal/browser/agent implementations.</td></tr>
+    <tr><td><code>Sources/AgentRuntime</code></td><td>Codex/Claude runners, parser, normalized events.</td></tr>
+    <tr><td><code>Sources/Persistence</code></td><td>SQLite, migrations, repositories, session snapshots.</td></tr>
+    <tr><td><code>Sources/SocketAutomation</code></td><td>JSON-RPC socket server and command handlers.</td></tr>
+    <tr><td><code>CLI/remotecode2.swift</code></td><td>Thin CLI client.</td></tr>
+    <tr><td><code>Tests</code></td><td>Unit and integration tests.</td></tr>
+    <tr><td><code>UITests</code></td><td>App automation tests.</td></tr>
+    <tr><td><code>scripts</code></td><td>Build, package, notarize, release helper scripts.</td></tr>
+  </table>
+
+  <h2>Developer Commands</h2>
+  <table>
+    <tr><th>Command</th><th>Purpose</th></tr>
+    <tr><td><code>./scripts/bootstrap.sh</code></td><td>Install dependencies, validate Xcode, prepare local config.</td></tr>
+    <tr><td><code>./scripts/build-debug.sh</code></td><td>Build debug app and CLI.</td></tr>
+    <tr><td><code>./scripts/test-unit.sh</code></td><td>Run unit tests.</td></tr>
+    <tr><td><code>./scripts/test-integration.sh</code></td><td>Run SQLite, provider fixture, socket, and browser automation tests.</td></tr>
+    <tr><td><code>./scripts/test-ui.sh</code></td><td>Run XCTest UI suite against app.</td></tr>
+    <tr><td><code>./scripts/package-dmg.sh</code></td><td>Create distributable DMG.</td></tr>
+    <tr><td><code>./scripts/notarize.sh</code></td><td>Sign and notarize release artifact.</td></tr>
+  </table>
+
+  <h2>Release Channels</h2>
+  <table>
+    <tr><th>Channel</th><th>Bundle ID</th><th>Purpose</th></tr>
+    <tr><td>Debug</td><td><code>io.remotecode.RemoteCode2.debug</code></td><td>Local dev builds. Separate app data directory.</td></tr>
+    <tr><td>Canary</td><td><code>io.remotecode.RemoteCode2.canary</code></td><td>Early testing with migration preview and extra logging.</td></tr>
+    <tr><td>Stable</td><td><code>io.remotecode.RemoteCode2</code></td><td>Signed user release.</td></tr>
+  </table>
+
+  <h2>Packaging Requirements</h2>
+  <ul>
+    <li>Universal macOS app if feasible: arm64 first, x86_64 if dependencies support it.</li>
+    <li>Signed app and signed CLI helper.</li>
+    <li>Notarized DMG with app drag target.</li>
+    <li>Updater configured before stable release. Sparkle is the default candidate.</li>
+    <li>App data directories separated by release channel to protect stable data during canary testing.</li>
+  </ul>
+
+  <h2>First-Run Experience</h2>
+  <table>
+    <tr><th>Step</th><th>Behavior</th></tr>
+    <tr><td>Dependency check</td><td>Detect Codex CLI, Claude CLI, shell, terminal backend, browser profile permissions.</td></tr>
+    <tr><td>Migration prompt</td><td>Offer current RemoteCode import preview. Default is non-destructive backup first.</td></tr>
+    <tr><td>Workspace creation</td><td>Allow opening a folder and choosing initial surface: Agent App, terminal, or browser.</td></tr>
+    <tr><td>CLI install</td><td>Offer to install/update <code>remotecode2</code> CLI symlink in a user-approved location.</td></tr>
+  </table>
+
+  <h2>Rollback Plan</h2>
+  <table>
+    <tr><th>Failure</th><th>Rollback</th></tr>
+    <tr><td>Migration bug</td><td>Use backup copy of source RemoteCode DB. Target DB can be deleted without touching source DB.</td></tr>
+    <tr><td>Bad app release</td><td>Updater rollback to previous stable. Canary and stable data remain separated.</td></tr>
+    <tr><td>Provider parser regression</td><td>Disable affected provider through feature flag and keep local thread data intact.</td></tr>
+    <tr><td>Browser automation regression</td><td>Ship patch release with unsupported command guard instead of broken behavior.</td></tr>
+  </table>
+
+  <h2>Release Checklist</h2>
+  <ul>
+    <li><span class="ok">Pass</span> all unit/integration/UI/performance gates.</li>
+    <li><span class="ok">Pass</span> migration dry run and real import on fixture copy.</li>
+    <li><span class="ok">Pass</span> clean macOS user install, launch, and first workspace flow.</li>
+    <li><span class="ok">Pass</span> signed CLI socket commands against release app.</li>
+    <li><span class="ok">Pass</span> updater install from previous canary build.</li>
+    <li><span class="ok">Pass</span> notarization validation with <code>spctl</code> and Gatekeeper.</li>
+  </ul>
+</main>
+</body>
+</html>

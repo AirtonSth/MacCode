@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Implementation Roadmap</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --ok:#8ee6a8; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); }
+    a { color:var(--accent); text-decoration:none; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>Implementation Roadmap</h1>
+  <p class="muted">Phased plan from empty repo to signed release. Each phase has explicit pass criteria.</p>
+
+  <h2>Phase 0: Legal And Technical Baseline</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>Decide cmux license path: GPL-compatible derivative, commercial license, or clean-room behavior clone.</td><td>Written decision exists before copying any cmux source.</td></tr>
+    <tr><td>Choose layout dependency: Bonsplit reuse, licensed cmux code, or independent split/tab implementation.</td><td>Prototype renders split tree with surface tabs.</td></tr>
+    <tr><td>Choose terminal dependency: libghostty integration or alternative.</td><td>Terminal proof can run shell, resize, copy/paste, and close cleanly.</td></tr>
+    <tr><td>Create Swift package/Xcode project skeleton.</td><td>CI builds app and test target.</td></tr>
+  </table>
+
+  <h2>Phase 1: Native Shell</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>AppKit app lifecycle, menu, settings stub, window controller.</td><td>App opens a native window with no fake chrome.</td></tr>
+    <tr><td>Workspace sidebar with create/select/rename/close.</td><td>Workspaces persist across restart.</td></tr>
+    <tr><td>Pane split tree and surface tab strip.</td><td>Can create two panes and switch multiple surfaces inside a pane.</td></tr>
+    <tr><td>Command palette basics.</td><td>Can run workspace/surface commands by keyboard.</td></tr>
+  </table>
+
+  <h2>Phase 2: Terminal Surface</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>Terminal surface host view and shell process.</td><td>Shell opens in workspace cwd and accepts input.</td></tr>
+    <tr><td>Focus routing, copy/paste, resize, scrollback.</td><td>Terminal remains usable after split, tab switch, and window focus changes.</td></tr>
+    <tr><td>Terminal session snapshot.</td><td>Quit/reopen restores terminal surface and scrollback best effort.</td></tr>
+    <tr><td>Terminal socket commands.</td><td><code>surface.send_text</code>, <code>surface.send_key</code>, <code>surface.read_text</code> work.</td></tr>
+  </table>
+
+  <h2>Phase 3: Browser Surface</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>WKWebView browser surface with address bar.</td><td>Can open URL, back/forward/reload, split beside terminal.</td></tr>
+    <tr><td>Browser profile and cookie storage.</td><td>Profile survives restart and can be cleared.</td></tr>
+    <tr><td>P0 automation commands.</td><td>Snapshot, eval, wait, click, fill, type, press, screenshot pass integration tests.</td></tr>
+    <tr><td>Browser session snapshot.</td><td>URL and basic history restore.</td></tr>
+  </table>
+
+  <h2>Phase 4: Persistence And Socket Core</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>SQLite migrations and repositories.</td><td>All domain stores covered by unit tests and migration tests.</td></tr>
+    <tr><td>JSON-RPC socket server and CLI.</td><td>CLI can drive windows, workspaces, panes, surfaces, notifications, and browser P0.</td></tr>
+    <tr><td>Event stream.</td><td>CLI can reconnect and continue after last seen event sequence.</td></tr>
+    <tr><td>Session snapshot writer/loader.</td><td>Window/workspace/pane/surface state restores deterministically.</td></tr>
+  </table>
+
+  <h2>Phase 5: Agent Runtime</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>Codex Process runner and event parser in Swift.</td><td>Parser tests cover thread, turn, reasoning, plan, tool, assistant, failure, and cancellation.</td></tr>
+    <tr><td>Claude Process runner and event parser in Swift.</td><td>Parser tests cover streaming content blocks, tool use/results, assistant text, result, and errors.</td></tr>
+    <tr><td>Common normalized event model.</td><td>Same Agent App timeline renders fixture streams from both providers.</td></tr>
+    <tr><td>Run supervisor.</td><td>Stop/restart/app quit never leaves stale running rows.</td></tr>
+  </table>
+
+  <h2>Phase 6: Agent App Surface</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>Native thread list, timeline, composer, provider/model controls.</td><td>Can create thread and send prompt to fake provider.</td></tr>
+    <tr><td>Codex integration.</td><td>Real Codex run streams and persists final message.</td></tr>
+    <tr><td>Claude integration.</td><td>Real Claude run streams and persists final message.</td></tr>
+    <tr><td>Agent socket/CLI commands.</td><td><code>agent.open</code>, <code>agent.message.send</code>, <code>agent.run.stop</code>, <code>agent.state.current</code> pass.</td></tr>
+    <tr><td>Agent session restore.</td><td>Reopen restores selected thread without duplicating active run.</td></tr>
+  </table>
+
+  <h2>Phase 7: Migration</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>Import current RemoteCode DB with backup.</td><td>Projects, chats, messages, provider thread IDs, selection, and turn snapshots import with count report.</td></tr>
+    <tr><td>Read-only preview mode.</td><td>User can see what would import before writing target DB.</td></tr>
+    <tr><td>Regression fixture from current schema.</td><td>Migration test covers real-like current schema and malformed rows.</td></tr>
+  </table>
+
+  <h2>Phase 8: Polish, QA, Release</h2>
+  <table>
+    <tr><th>Work</th><th>Pass criteria</th></tr>
+    <tr><td>Keyboard shortcuts and command palette parity.</td><td>Core cmux shortcuts work or are documented as changed.</td></tr>
+    <tr><td>Performance tuning.</td><td>Meets cold start, memory, scrolling, and streaming budgets.</td></tr>
+    <tr><td>Signing, notarization, updater, installer.</td><td>Fresh install and update path pass on clean macOS test user.</td></tr>
+    <tr><td>Release docs and rollback.</td><td>Migration backup/restore and known limitations documented.</td></tr>
+  </table>
+</main>
+</body>
+</html>

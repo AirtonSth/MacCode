@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Quality Gates</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --bad:#ff8f8f; --ok:#8ee6a8; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); }
+    .bad { color:var(--bad); }
+    a { color:var(--accent); text-decoration:none; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>Quality Gates</h1>
+  <p class="muted">Tests must verify intent, not just behavior. Gates are written as product invariants.</p>
+
+  <h2>Test Layers</h2>
+  <table>
+    <tr><th>Layer</th><th>Scope</th><th>Required examples</th></tr>
+    <tr><td>Unit</td><td>Pure Swift domain logic.</td><td>Provider parsers, event normalization, migration mapping, snapshot encode/decode, command parameter validation.</td></tr>
+    <tr><td>Integration</td><td>SQLite, process runners, socket server, browser automation.</td><td>Codex/Claude fixture streams, SQLite migrations, JSON-RPC commands, WKWebView eval/screenshot.</td></tr>
+    <tr><td>UI</td><td>SwiftUI/AppKit behavior.</td><td>Workspace selection, split creation, surface switching, Agent App send/stop, timeline virtualization, keyboard focus.</td></tr>
+    <tr><td>End-to-end</td><td>Real app launched as signed/dev build.</td><td>Create workspace, split terminal/browser/agent, run fake provider, session restore, CLI automation.</td></tr>
+    <tr><td>Performance</td><td>Measured budgets.</td><td>Cold launch, memory, terminal scrollback, browser creation, Agent App streaming under long output.</td></tr>
+  </table>
+
+  <h2>Intent-Focused Tests</h2>
+  <table>
+    <tr><th>Risk</th><th>Intent test</th></tr>
+    <tr><td>Provider switch corrupts thread history</td><td>A thread with existing provider thread ID locks provider selection because provider-native resume IDs are not interchangeable.</td></tr>
+    <tr><td>Cancelled run looks active after restart</td><td>Stopping a run records cancellation and app restart does not resume it as running.</td></tr>
+    <tr><td>Agent App is not a real surface</td><td>CLI can move/split/focus/close Agent App exactly like terminal and browser.</td></tr>
+    <tr><td>Migration drops data silently</td><td>Fixture with bad rows imports valid rows and reports every skipped row with reason.</td></tr>
+    <tr><td>Browser automation targets wrong surface</td><td>Two browser surfaces exist; command with surface ID affects only the target.</td></tr>
+    <tr><td>Terminal focus steals Agent App input</td><td>Switching from terminal to Agent App routes text input to composer, not shell.</td></tr>
+  </table>
+
+  <h2>Acceptance Test Scenarios</h2>
+  <table>
+    <tr><th>ID</th><th>Scenario</th><th>Pass criteria</th></tr>
+    <tr><td>A1</td><td>Fresh launch</td><td>App opens native window, no fake chrome, sidebar visible, command palette works.</td></tr>
+    <tr><td>A2</td><td>Workspace create</td><td>Workspace uses selected folder path, persists after restart, and displays cwd.</td></tr>
+    <tr><td>A3</td><td>Three surface split</td><td>One workspace can contain terminal left, Agent App top-right, browser bottom-right.</td></tr>
+    <tr><td>A4</td><td>Fake provider run</td><td>Agent App streams deterministic fixture events and persists messages.</td></tr>
+    <tr><td>A5</td><td>Codex real run</td><td>Codex CLI run streams normalized events and writes final assistant message.</td></tr>
+    <tr><td>A6</td><td>Claude real run</td><td>Claude CLI run streams normalized events and writes final assistant message.</td></tr>
+    <tr><td>A7</td><td>Browser automation</td><td>CLI opens browser surface, navigates local server, snapshots, clicks, fills, screenshots.</td></tr>
+    <tr><td>A8</td><td>Session restore</td><td>After app restart, layout and selected Agent App thread restore without starting a new run.</td></tr>
+    <tr><td>A9</td><td>Migration</td><td>Current RemoteCode fixture imports with exact counts and backup report.</td></tr>
+    <tr><td>A10</td><td>Release build</td><td>Signed/notarized app launches on clean user and migration preview works.</td></tr>
+  </table>
+
+  <h2>Performance Budgets</h2>
+  <table>
+    <tr><th>Metric</th><th>Target</th><th>Gate</th></tr>
+    <tr><td>Cold launch to interactive window</td><td>Under 1.5 seconds on target Mac dev machine</td><td>Fail release if over 2.5 seconds without written exception.</td></tr>
+    <tr><td>Idle memory with one workspace and no browser</td><td>Under 180 MB</td><td>Track trend in CI/manual perf report.</td></tr>
+    <tr><td>Create terminal surface</td><td>Under 400 ms to prompt visible</td><td>Measured by UI harness.</td></tr>
+    <tr><td>Create browser surface</td><td>Under 900 ms to blank page/address ready</td><td>Measured by UI harness.</td></tr>
+    <tr><td>Agent stream rendering</td><td>No dropped UI frames during 10k line tool output fixture</td><td>Timeline remains responsive and memory bounded.</td></tr>
+  </table>
+
+  <h2>Release Blockers</h2>
+  <ul>
+    <li><span class="bad">Block</span> if cmux license path is unresolved and cmux source was copied.</li>
+    <li><span class="bad">Block</span> if migration can lose messages or provider thread IDs silently.</li>
+    <li><span class="bad">Block</span> if Agent App cannot be created as a normal surface through CLI/socket.</li>
+    <li><span class="bad">Block</span> if app restart can duplicate provider runs.</li>
+    <li><span class="bad">Block</span> if signed app cannot launch on a clean macOS account.</li>
+  </ul>
+</main>
+</body>
+</html>

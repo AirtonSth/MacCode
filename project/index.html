@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Swift Rewrite Plan</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --ok:#8ee6a8; --warn:#ffd37a; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1120px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:34px; }
+    h2 { margin-top:34px; font-size:23px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    p,li { color:var(--text); }
+    .muted { color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    a { color:var(--accent); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+    .ok { color:var(--ok); }
+    .warn { color:var(--warn); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>RemoteCode 2 Swift Rewrite Plan</h1>
+  <p class="muted">Planning package for <code>/Users/samuelfajreldines/dev/remotecode2/project</code>. Last updated 2026-05-14. Planning only: no product implementation is included.</p>
+
+  <section class="card">
+    <h2>Target</h2>
+    <p>Build a native Swift macOS app that behaves like cmux and adds one first-class surface type: <strong>Agent App</strong>. The app keeps cmux primitives: windows, vertical workspaces, panes, split layout, surface tabs, terminal surfaces, browser surfaces, notifications, socket/CLI automation, and session restore. RemoteCode adds an Agent App surface that provides the current RemoteCode graphical Codex/Claude experience inside the same split/tab model.</p>
+  </section>
+
+  <h2>Planning Files</h2>
+  <div class="grid">
+    <div class="card"><h3>1. Requirements</h3><p>Product scope, hard constraints, non-goals, and acceptance rules.</p><a href="01-product-requirements.html">Open requirements</a></div>
+    <div class="card"><h3>2. Source Inventory</h3><p>Evidence from current RemoteCode and cmux inspected source.</p><a href="02-source-inventory.html">Open inventory</a></div>
+    <div class="card"><h3>3. Architecture</h3><p>Native Swift architecture, module boundaries, and process model.</p><a href="03-target-architecture.html">Open architecture</a></div>
+    <div class="card"><h3>4. Agent App</h3><p>Agent App surface behavior, provider abstraction, and UX contract.</p><a href="04-agent-app-spec.html">Open Agent App spec</a></div>
+    <div class="card"><h3>5. cmux Parity</h3><p>Surface/pane/workspace API parity plus RemoteCode extensions.</p><a href="05-cmux-parity-and-api.html">Open parity spec</a></div>
+    <div class="card"><h3>6. Data and Migration</h3><p>SQLite model, migration path from current RemoteCode, and state restore.</p><a href="06-data-and-migration.html">Open data plan</a></div>
+    <div class="card"><h3>7. Roadmap</h3><p>End-to-end phased implementation plan with pass criteria.</p><a href="07-implementation-roadmap.html">Open roadmap</a></div>
+    <div class="card"><h3>8. Quality Gates</h3><p>Unit, integration, UI, automation, performance, and release checks.</p><a href="08-quality-gates.html">Open QA gates</a></div>
+    <div class="card"><h3>9. Risks</h3><p>Decisions, blockers, licensing, and technical risks to close before build.</p><a href="09-risks-decisions.html">Open risks</a></div>
+    <div class="card"><h3>10. Build and Release</h3><p>Developer workflow, signing, updates, distribution, and support plan.</p><a href="10-build-release-ops.html">Open release plan</a></div>
+    <div class="card"><h3>11. AI Agent Trello Board</h3><p>Scrum-ready build, review, and test cards, now updated with T3 Code-based Agent App and general UI tasks.</p><a href="11-ai-agent-trello-board.html">Open Trello board</a></div>
+  </div>
+
+  <h2>Definitions</h2>
+  <table>
+    <tr><th>Term</th><th>Meaning in RemoteCode 2</th></tr>
+    <tr><td>Window</td><td>A native macOS NSWindow containing one workspace stack.</td></tr>
+    <tr><td>Workspace</td><td>Vertical sidebar entry, equivalent to cmux workspace/tab. Owns cwd, metadata, panes, surfaces, and notifications.</td></tr>
+    <tr><td>Pane</td><td>A split region inside a workspace.</td></tr>
+    <tr><td>Surface</td><td>A tab inside a pane. Surface types are <code>terminal</code>, <code>browser</code>, and <code>agentApp</code> for V1.</td></tr>
+    <tr><td>Agent App</td><td>Native Swift graphical chat/thread/workspace UI for running Codex or Claude in a project. It replaces the current Electrobun/React RemoteCode desktop app.</td></tr>
+  </table>
+
+  <h2>Primary Decisions</h2>
+  <table>
+    <tr><th>Decision</th><th>Result</th></tr>
+    <tr><td>Runtime</td><td>Native Swift/AppKit/SwiftUI app. No Electrobun, Electron, or Tauri in the final product.</td></tr>
+    <tr><td>Layout model</td><td>Adopt cmux workspace/pane/surface model. Add <code>agentApp</code> as a new surface type.</td></tr>
+    <tr><td>Terminal</td><td>Use cmux-style libghostty integration if licensing permits. Fallback is a Swift terminal component only if libghostty cannot be used.</td></tr>
+    <tr><td>Browser</td><td>Use WKWebView plus cmux-like browser automation API.</td></tr>
+    <tr><td>Agent runtime</td><td>Native Swift process runners for <code>codex</code> and <code>claude</code>, parsing their streaming JSON/event output into a common event model.</td></tr>
+    <tr><td>Persistence</td><td>SQLite-backed state with Swift migrations. Preserve current RemoteCode projects, chats, messages, provider threads, streaming turns, terminal snapshots, and selection where possible.</td></tr>
+  </table>
+
+  <h2>Pass Criteria</h2>
+  <ul>
+    <li>User can open a workspace and create terminal, browser, and Agent App surfaces in the same pane/split system.</li>
+    <li>Agent App can start and resume Codex and Claude threads from a selected workspace path.</li>
+    <li>cmux keyboard, socket, CLI, notification, and session restore primitives have planned parity or an explicit V1 deferral.</li>
+    <li>Current RemoteCode data model has a documented migration path.</li>
+    <li>Release plan covers build, signing, update, tests, and rollback.</li>
+  </ul>
+</main>
+</body>
+</html>
