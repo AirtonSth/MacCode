@@ -401,8 +401,26 @@ public final class AppCommandRouter: CommandRouting {
             case .filePreview:
                 surface = FilePreviewSurface(workspaceID: workspace, filePath: title, title: baseTitle)
             case .rightSidebarTool:
-                // V1 right-sidebar tool: diff panel.
-                surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
+                // Tool selection is encoded in the title for V1 — keeps
+                // the JSON-RPC payload simple. Default is the diff panel.
+                let tool = baseTitle.lowercased()
+                if tool.contains("feed") {
+                    let feed = FeedPanelSurface(workspaceID: workspace, title: baseTitle)
+                    // Wire the in-process EventBus to the feed VM so any
+                    // dispatcher mutation lights up the panel in real time.
+                    let token = EventBus.shared.subscribe(since: 0) { ev in
+                        let kind = ev.kind
+                        let payload = JSONValue.object(ev.payload.objectValue ?? [:])
+                        let summary = Self.summary(of: payload)
+                        DispatchQueue.main.async {
+                            feed.viewModel.receive(seq: ev.seq, kind: kind, title: summary, ts: ev.ts)
+                        }
+                    }
+                    feed.subscriptionToken = AnyHashable(token)
+                    surface = feed
+                } else {
+                    surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
+                }
             }
             let finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
             SurfaceRegistry.shared.register(surface)
@@ -414,5 +432,14 @@ public final class AppCommandRouter: CommandRouting {
 
     private func defaultTitle(for type: SurfaceType) -> String {
         type.displayLabel.lowercased() == "agent app" ? "Agent App" : type.displayLabel.lowercased()
+    }
+
+    static func summary(of payload: JSONValue) -> String {
+        if case .object(let o) = payload {
+            if let s = o["title"]?.stringValue { return s }
+            if let s = o["name"]?.stringValue { return s }
+            if let s = o["id"]?.stringValue { return s }
+        }
+        return ""
     }
 }
