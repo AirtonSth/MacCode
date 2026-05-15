@@ -14,12 +14,30 @@ func usage(_ exit: Int32 = 0) -> Never {
       capabilities
       workspaces             list workspaces
       new-workspace --cwd PATH --name NAME
-      new-surface --workspace WID --type terminal|browser|agent [--title T]
+      new-surface --workspace WID --type terminal|browser|agent|markdown|filepreview|rightsidebartool [--title T]
       new-split  --workspace WID --pane PID --direction right|down|left|up --type ...
       focus --workspace WID --id SID
       close --workspace WID --id SID
       send-text --id SID --text "..."
       read-text --id SID
+      surface move --workspace WID --id SID --target-pane PID
+      surface reorder --workspace WID --id SID --target-pane PID [--position N]
+      pane list --workspace WID
+      pane swap --workspace WID --a PID --b PID
+      pane resize --workspace WID --split SPLIT_ID --ratios "0.3,0.7"
+      window list / window current / window create [--title T] / window focus --id WID / window close --id WID
+      workspace move-to-window --workspace WID --window WIDX
+      events recent / events stream
+      notification create [--workspace WID] --title T [--body B] [--category C]
+      notification list [--workspace WID] [--unread]
+      notification mark-read --id N / notification dismiss --id N
+      browser navigate --id SID --url URL / browser back/forward/reload --id SID
+      browser snapshot --id SID
+      browser click --id SID --ref REF
+      browser fill --id SID --ref REF --value V
+      browser type --id SID --ref REF --value V
+      browser wait --id SID --selector CSS [--timeout MS]
+      browser screenshot --id SID [--path PATH]
       agent open --workspace WID
       agent thread list [--workspace WID]
       agent thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]
@@ -211,6 +229,129 @@ case "read-text":
     let (flags, _) = parseFlags(restArgs)
     guard let sid = flags["id"] else { usage(2) }
     emit(rpc.call("surface.read_text", params: ["id": sid]))
+case "surface":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+    switch sub {
+    case "move":
+        guard let w = flags["workspace"], let id = flags["id"], let target = flags["target-pane"] else { usage(2) }
+        emit(rpc.call("surface.move", params: ["workspace_id": w, "id": id, "target_pane_id": target]))
+    case "reorder":
+        guard let w = flags["workspace"], let id = flags["id"], let target = flags["target-pane"] else { usage(2) }
+        let pos = Int(flags["position"] ?? "0") ?? 0
+        emit(rpc.call("surface.reorder", params: ["workspace_id": w, "id": id, "target_pane_id": target, "position": pos]))
+    default: usage(2)
+    }
+case "pane":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+    switch sub {
+    case "list":
+        guard let w = flags["workspace"] else { usage(2) }
+        emit(rpc.call("pane.list", params: ["workspace_id": w]))
+    case "swap":
+        guard let w = flags["workspace"], let a = flags["a"], let b = flags["b"] else { usage(2) }
+        emit(rpc.call("pane.swap", params: ["workspace_id": w, "a": a, "b": b]))
+    case "resize":
+        guard let w = flags["workspace"], let s = flags["split"], let r = flags["ratios"] else { usage(2) }
+        let ratios = r.split(separator: ",").compactMap { Double($0) }
+        emit(rpc.call("pane.resize", params: ["workspace_id": w, "split_id": s, "ratios": ratios]))
+    default: usage(2)
+    }
+case "window":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+    switch sub {
+    case "list":    emit(rpc.call("window.list", params: [:]))
+    case "current": emit(rpc.call("window.current", params: [:]))
+    case "create":
+        var p: [String: Any] = [:]; if let t = flags["title"] { p["title"] = t }
+        emit(rpc.call("window.create", params: p))
+    case "focus":
+        guard let id = flags["id"] else { usage(2) }
+        emit(rpc.call("window.focus", params: ["id": id]))
+    case "close":
+        guard let id = flags["id"] else { usage(2) }
+        emit(rpc.call("window.close", params: ["id": id]))
+    default: usage(2)
+    }
+case "events":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    switch sub {
+    case "recent": emit(rpc.call("events.recent", params: [:]))
+    default: usage(2)
+    }
+case "notification":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+    switch sub {
+    case "create":
+        var p: [String: Any] = ["title": flags["title"] ?? "Notification"]
+        if let w = flags["workspace"] { p["workspace_id"] = w }
+        if let b = flags["body"] { p["body"] = b }
+        if let c = flags["category"] { p["category"] = c }
+        emit(rpc.call("notification.create", params: p))
+    case "list":
+        var p: [String: Any] = [:]; if let w = flags["workspace"] { p["workspace_id"] = w }
+        if flags["unread"] != nil { p["unread_only"] = true }
+        emit(rpc.call("notification.list", params: p))
+    case "mark-read":
+        guard let id = flags["id"] else { usage(2) }
+        emit(rpc.call("notification.mark_read", params: ["id": id]))
+    case "dismiss":
+        guard let id = flags["id"] else { usage(2) }
+        emit(rpc.call("notification.dismiss", params: ["id": id]))
+    default: usage(2)
+    }
+case "browser":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+    switch sub {
+    case "navigate":
+        guard let id = flags["id"], let url = flags["url"] else { usage(2) }
+        emit(rpc.call("browser.navigate", params: ["id": id, "url": url]))
+    case "back", "forward", "reload", "url":
+        guard let id = flags["id"] else { usage(2) }
+        emit(rpc.call("browser." + (sub == "url" ? "url.get" : sub), params: ["id": id]))
+    case "snapshot":
+        guard let id = flags["id"] else { usage(2) }
+        emit(rpc.call("browser.snapshot", params: ["id": id]))
+    case "click", "focus", "hover", "check", "uncheck":
+        guard let id = flags["id"], let ref = flags["ref"] else { usage(2) }
+        emit(rpc.call("browser." + sub, params: ["id": id, "ref": ref]))
+    case "fill", "type", "select":
+        guard let id = flags["id"], let ref = flags["ref"], let val = flags["value"] else { usage(2) }
+        emit(rpc.call("browser." + sub, params: ["id": id, "ref": ref, "value": val]))
+    case "wait":
+        guard let id = flags["id"], let sel = flags["selector"] else { usage(2) }
+        let t = Int(flags["timeout"] ?? "5000") ?? 5000
+        emit(rpc.call("browser.wait", params: ["id": id, "selector": sel, "timeout_ms": t]))
+    case "screenshot":
+        guard let id = flags["id"] else { usage(2) }
+        var p: [String: Any] = ["id": id]
+        if let path = flags["path"] { p["path"] = path }
+        emit(rpc.call("browser.screenshot", params: p))
+    case "eval":
+        guard let id = flags["id"], let script = flags["script"] else { usage(2) }
+        emit(rpc.call("browser.eval", params: ["id": id, "script": script]))
+    default: usage(2)
+    }
+case "workspace":
+    if restArgs.isEmpty { usage(2) }
+    let sub = restArgs[0]
+    let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+    switch sub {
+    case "move-to-window":
+        guard let w = flags["workspace"], let win = flags["window"] else { usage(2) }
+        emit(rpc.call("workspace.move_to_window", params: ["workspace_id": w, "window_id": win]))
+    default: usage(2)
+    }
 case "agent":
     if restArgs.isEmpty { usage(2) }
     let sub = restArgs[0]
