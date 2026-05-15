@@ -58,6 +58,11 @@ final class FakeRouter: CommandRouting {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] { [] }
     func notificationMarkRead(id: String) throws {}
     func notificationDismiss(id: String) throws {}
+    func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]] { [] }
+    func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor] { [] }
+    func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {}
+    func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws {}
+    func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws {}
 }
 
 final class DispatcherTests: XCTestCase {
@@ -88,8 +93,8 @@ final class DispatcherTests: XCTestCase {
     @MainActor
     func test_unsupportedDeferredMethod_returnsTypedError() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
-        // pane.list still deferred in V1
-        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "pane.list", params: nil))
+        // pane.swap remains V1-deferred
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "pane.swap", params: nil))
         XCTAssertEqual(resp.error?.code, -32004)
     }
 

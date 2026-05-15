@@ -36,6 +36,12 @@ public protocol CommandRouting: AnyObject {
     func browserSnapshot(surface: SurfaceID) async throws -> String
     func browserAction(surface: SurfaceID, kind: String, ref: String, value: String?) async throws -> String
     func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String
+    // pane / window
+    func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]]
+    func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor]
+    func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws
+    func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws
+    func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws
     // notifications
     func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]]
@@ -257,9 +263,46 @@ public final class JSONRPCDispatcher {
                 try router.notificationDismiss(id: nid)
                 EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(nid)]))
                 return .init(id: id, result: .bool(true))
+            case "pane.list":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let panes = try router.paneList(workspace: wid)
+                return .init(id: id, result: .array(panes.map { .object($0) }))
+            case "pane.surfaces":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let pid = params["id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
+                let surfaces = try router.paneSurfaces(pane: pid, workspace: wid)
+                return .init(id: id, result: encode(surfaces))
+            case "pane.resize":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let split = params["split_id"]?.stringValue.flatMap(UUID.init) else { throw JSONRPCError.invalidParams }
+                var ratios: [Double] = []
+                if case .array(let arr) = params["ratios"] ?? .null {
+                    for v in arr { if case .number(let n) = v { ratios.append(n) } }
+                }
+                try router.paneResize(workspace: wid, splitID: split, ratios: ratios)
+                return .init(id: id, result: .bool(true))
+            case "surface.move":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let pid = params["target_pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
+                try router.surfaceMove(workspace: wid, surface: sid, targetPane: pid)
+                return .init(id: id, result: .bool(true))
+            case "surface.reorder":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let pid = params["target_pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
+                let pos = params["position"]?.intValue ?? 0
+                try router.surfaceReorder(workspace: wid, surface: sid, toPane: pid, position: pos)
+                return .init(id: id, result: .bool(true))
+            case "window.list":
+                let w = try router.currentWindow()
+                return .init(id: id, result: .array([encode(w)]))
+            case "window.current":
+                let w = try router.currentWindow()
+                return .init(id: id, result: encode(w))
             // V1 deferred families return a typed unsupported error.
-            case "window.list", "window.create", "window.focus", "window.close",
-                 "pane.list", "pane.resize", "pane.swap", "pane.break", "pane.join":
+            case "window.create", "window.focus", "window.close",
+                 "pane.swap", "pane.break", "pane.join":
                 throw JSONRPCError.notSupported(req.method)
             default:
                 throw JSONRPCError.methodNotFound

@@ -12,6 +12,9 @@ public enum LayoutAction: Sendable {
     case focusPane(WorkspaceID, PaneID)
     case renameSurface(WorkspaceID, SurfaceID, String)
     case markUnread(WorkspaceID, SurfaceID, Bool)
+    case reorderSurface(WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int)
+    case moveSurfaceToPane(WorkspaceID, surface: SurfaceID, targetPane: PaneID)
+    case resizeSplit(WorkspaceID, splitID: UUID, ratios: [Double])
 }
 
 public enum LayoutError: Error, Equatable {
@@ -109,6 +112,63 @@ public struct LayoutReducer {
             ws.layout = try mutateSurface(in: ws.layout, surfaceID: sid) { $0.hasUnreadActivity = unread }
             next.workspaces[wid] = ws
             return next
+        case .reorderSurface(let wid, let sid, let toPane, let position):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            guard let desc = findSurface(in: ws.layout, id: sid) else { throw LayoutError.surfaceNotFound }
+            ws.layout = try removeSurface(in: ws.layout, surfaceID: sid)
+            ws.layout = try insertSurface(in: ws.layout, paneID: toPane, descriptor: desc, position: position)
+            next.workspaces[wid] = ws
+            return next
+        case .moveSurfaceToPane(let wid, let sid, let target):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            guard let desc = findSurface(in: ws.layout, id: sid) else { throw LayoutError.surfaceNotFound }
+            ws.layout = try removeSurface(in: ws.layout, surfaceID: sid)
+            ws.layout = try addSurface(in: ws.layout, paneID: target, descriptor: desc)
+            next.workspaces[wid] = ws
+            return next
+        case .resizeSplit(let wid, let splitID, let ratios):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            ws.layout = updateSplitRatios(node: ws.layout, splitID: splitID, ratios: ratios)
+            next.workspaces[wid] = ws
+            return next
+        }
+    }
+
+    private func findSurface(in node: LayoutNode, id: SurfaceID) -> SurfaceDescriptor? {
+        switch node {
+        case .pane(let p): return p.surfaces.first { $0.id == id }
+        case .split(let s):
+            for c in s.children { if let r = findSurface(in: c, id: id) { return r } }
+            return nil
+        }
+    }
+
+    private func insertSurface(in node: LayoutNode, paneID: PaneID, descriptor: SurfaceDescriptor, position: Int) throws -> LayoutNode {
+        switch node {
+        case .pane(var p):
+            if p.id == paneID {
+                let idx = max(0, min(position, p.surfaces.count))
+                p.surfaces.insert(descriptor, at: idx)
+                p.selectedSurfaceID = descriptor.id
+                return .pane(p)
+            }
+            return .pane(p)
+        case .split(var s):
+            s.children = try s.children.map { try insertSurface(in: $0, paneID: paneID, descriptor: descriptor, position: position) }
+            return .split(s)
+        }
+    }
+
+    private func updateSplitRatios(node: LayoutNode, splitID: UUID, ratios: [Double]) -> LayoutNode {
+        switch node {
+        case .pane: return node
+        case .split(var s):
+            if s.id == splitID, ratios.count == s.children.count {
+                s.ratios = SplitNode.normalize(ratios)
+            } else {
+                s.children = s.children.map { updateSplitRatios(node: $0, splitID: splitID, ratios: ratios) }
+            }
+            return .split(s)
         }
     }
 

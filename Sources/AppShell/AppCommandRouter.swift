@@ -189,6 +189,37 @@ public final class AppCommandRouter: CommandRouting {
         }
     }
 
+    public func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]] {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return [] }
+        return ws.layout.paneIDs().map { pid in
+            let count = (ws.layout.find(paneID: pid)?.surfaces.count) ?? 0
+            return [
+                "id": .string(pid.value.uuidString),
+                "surface_count": .number(Double(count))
+            ]
+        }
+    }
+
+    public func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor] {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return [] }
+        return ws.layout.find(paneID: pane)?.surfaces ?? []
+    }
+
+    public func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {
+        try context?.apply(.resizeSplit(workspace, splitID: splitID, ratios: ratios))
+        windowController?.refreshFromState()
+    }
+
+    public func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws {
+        try context?.apply(.moveSurfaceToPane(workspace, surface: surface, targetPane: targetPane))
+        windowController?.refreshFromState()
+    }
+
+    public func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws {
+        try context?.apply(.reorderSurface(workspace, surface: surface, toPane: toPane, position: position))
+        windowController?.refreshFromState()
+    }
+
     public func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let repo = NotificationRepository(db: ctx.db)
