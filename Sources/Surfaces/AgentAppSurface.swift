@@ -25,8 +25,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false
     @Published public var planNotes: String = ""
-    /// C1: git branch of the agent's working dir, for the context bar.
+    /// C1: git branch + working-tree summary of the agent's dir, for the
+    /// composer context strip ("N files changed +A −B").
     @Published public var gitBranch: String?
+    @Published public var gitSummary: GitSummary?
+    /// Wired by AppCommandRouter — "Review here" opens a Git/Diff surface.
+    public var onReviewRequested: (() -> Void)?
     /// B3: file paths attached to the next message (composer chips).
     @Published public var attachments: [String] = []
     /// When the active run started — drives the "Working for Xs" line.
@@ -59,7 +63,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let cwd = self.cwd
         DispatchQueue.global().async { [weak self] in
             let b = GitDiff.branches(in: cwd).current
-            DispatchQueue.main.async { self?.gitBranch = b }
+            let s = GitDiff.summary(in: cwd)
+            DispatchQueue.main.async {
+                self?.gitBranch = b
+                self?.gitSummary = s.isGitRepo ? s : nil
+            }
         }
     }
 
@@ -331,6 +339,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.currentRunId = nil
             self.runStartedAt = nil
             self.reloadThreads()
+            self.loadGitBranch()   // the run may have changed the tree
         }
     }
 
@@ -466,21 +475,19 @@ public struct AgentAppView: View {
             header
             timeline
             composer
-            contextBar
         }
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
         .onExitCommand { if vm.status == .running { vm.stop() } }
     }
 
-    // C1: the agent's operating context — git branch + project dir.
-    // (t3code BranchToolbar essence; C2's global header folded in here
-    // since our pane/tab chrome already owns app-level navigation.)
-    private var contextBar: some View {
+    // Thin context header. Run-config (provider/model/permission) lives in
+    // the composer footer now, Codex-style.
+    private var header: some View {
         HStack(spacing: DS.Space.sm) {
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 9, weight: .semibold))
-                .foregroundColor(DS.Palette.accent)
+                .foregroundColor(DS.Palette.textTertiary)
             Text(vm.gitBranch ?? "no branch")
                 .font(DS.Font.caption2.monospaced())
                 .foregroundColor(DS.Palette.textSecondary)
@@ -490,55 +497,12 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
-            DSPill(vm.permissionMode == .supervised ? "supervised"
-                   : vm.permissionMode == .autoAcceptEdits ? "auto-edit" : "full-access",
-                   tone: vm.permissionMode == .fullAccess ? .warning : .neutral)
-        }
-        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.xs)
-        .dsBar(edge: .top)
-    }
-
-    // Compact run-config header. Git/terminal intentionally absent —
-    // those live in the workspace (Git tab + Terminal surface).
-    private var header: some View {
-        HStack(spacing: DS.Space.md) {
-            runConfigChip(icon: "cpu", value: vm.provider.rawValue.capitalized) {
-                Picker("", selection: $vm.provider) {
-                    Text("Codex").tag(AgentProvider.codex)
-                    Text("Claude").tag(AgentProvider.claude)
-                }
-                .labelsHidden()
-                .onChange(of: vm.provider) { _ in Task { await vm.loadModels() } }
-                // B8: provider is locked for the duration of a run.
-                .disabled(vm.status == .running)
-            }
-            runConfigChip(icon: "sparkle", value: modelLabel) {
-                Picker("", selection: $vm.model) {
-                    ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
-                }
-                .labelsHidden()
-                .disabled(vm.status == .running)
-            }
-            runConfigChip(icon: "lock.shield", value: permissionLabel) {
-                Picker("", selection: $vm.permissionMode) {
-                    Text("Supervised").tag(AgentPermissionMode.supervised)
-                    Text("Auto-edit").tag(AgentPermissionMode.autoAcceptEdits)
-                    Text("Full access").tag(AgentPermissionMode.fullAccess)
-                }.labelsHidden()
-            }
-            Spacer()
-            if vm.status == .running {
-                HStack(spacing: DS.Space.sm) {
-                    ProgressView().controlSize(.small).scaleEffect(0.65)
-                    Button("Stop") { vm.stop() }.buttonStyle(DSSecondaryButtonStyle())
-                }
-            }
             DSPill(vm.status.rawValue, tone: statusTone(vm.status))
-            DSIconButton("list.bullet.rectangle", help: "Toggle plan notes") {
+            DSIconButton("list.bullet.rectangle", help: "Toggle plan") {
                 vm.showPlanSidebar.toggle()
             }
         }
-        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
         .dsBar(edge: .bottom)
     }
 
@@ -552,25 +516,14 @@ public struct AgentAppView: View {
         case .fullAccess: return "Full access"
         }
     }
-
-    // A pill-shaped control wrapping a borderless Picker so the pickers
-    // read as one cohesive run-config strip instead of three raw combos.
-    @ViewBuilder
-    private func runConfigChip<P: View>(icon: String, value: String, @ViewBuilder _ picker: () -> P) -> some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: icon).font(.system(size: 10)).foregroundColor(DS.Palette.textTertiary)
-            picker()
-                .font(DS.Font.caption)
-                .frame(minWidth: 70)
-                .fixedSize()
+    private var permissionTone: Color {
+        switch vm.permissionMode {
+        case .supervised: return DS.Palette.textSecondary
+        case .autoAcceptEdits: return DS.Palette.warning
+        case .fullAccess: return DS.Palette.danger
         }
-        .padding(.horizontal, DS.Space.md)
-        .padding(.vertical, DS.Space.xs)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
     }
+    private var effortLabel: String { vm.reasoningEffort.rawValue.capitalized }
 
     private func statusTone(_ s: AgentRunStatus) -> DSPill.Tone {
         switch s {
@@ -600,9 +553,9 @@ public struct AgentAppView: View {
                     if let err = vm.timeline.error { errorRow(err) }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
-                .padding(.horizontal, DS.Space.xxl)
-                .padding(.vertical, DS.Space.xxxl)
-                .frame(maxWidth: 760, alignment: .leading)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.vertical, DS.Space.xl)
+                .frame(maxWidth: 920, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
             .background(DS.Palette.bg)
@@ -695,25 +648,27 @@ public struct AgentAppView: View {
     private func messageRow(_ msg: AgentMessage) -> some View {
         switch msg.role {
         case .user:
-            VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                Text(msg.content)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                    .textSelection(.enabled)
-                    .multilineTextAlignment(.leading)
-                    .padding(.horizontal, DS.Space.xl)
-                    .padding(.vertical, DS.Space.lg)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-                    .frame(maxWidth: 560, alignment: .leading)
-                Button { copyToPasteboard(msg.content) } label: {
-                    Image(systemName: "doc.on.doc").font(.system(size: 11))
+            HStack(spacing: 0) {
+                Spacer(minLength: DS.Space.huge)
+                VStack(alignment: .trailing, spacing: DS.Space.xs) {
+                    Text(msg.content)
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.text)
+                        .textSelection(.enabled)
+                        .multilineTextAlignment(.leading)
+                        .padding(.horizontal, DS.Space.lg)
+                        .padding(.vertical, DS.Space.md)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+                        .frame(maxWidth: 600, alignment: .leading)
+                    Button { copyToPasteboard(msg.content) } label: {
+                        Image(systemName: "doc.on.doc").font(.system(size: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Copy message")
                 }
-                .buttonStyle(.plain)
-                .foregroundColor(DS.Palette.textTertiary)
-                .accessibilityLabel("Copy message")
             }
-            .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
             assistantProse(msg.content)
         case .system:
@@ -814,47 +769,165 @@ public struct AgentAppView: View {
 
     // MARK: Composer
 
+    // Unified Codex-style composer card: changed-files strip → editor →
+    // toolbar (attach · permission · model·effort · send/stop).
     private var composer: some View {
-        VStack(spacing: DS.Space.sm) {
-            if !vm.attachments.isEmpty { attachmentChips }
+        VStack(spacing: 0) {
+            if let s = vm.gitSummary, !s.files.isEmpty { changedFilesStrip(s) }
+            if !vm.attachments.isEmpty {
+                attachmentChips
+                    .padding(.horizontal, DS.Space.lg)
+                    .padding(.top, DS.Space.md)
+            }
             ZStack(alignment: .topLeading) {
                 if vm.prompt.isEmpty {
-                    Text("Message \(vm.provider.rawValue.capitalized)…")
+                    Text("Ask \(vm.provider.rawValue.capitalized) for changes…")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textTertiary)
-                        .padding(.horizontal, DS.Space.md + 2).padding(.vertical, DS.Space.md)
+                        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
                         .allowsHitTesting(false)
                 }
                 TextEditor(text: $vm.prompt)
                     .font(DS.Font.body)
                     .scrollContentBackground(.hidden)
-                    .padding(DS.Space.sm)
-                    .frame(minHeight: 64, maxHeight: 160)
+                    .padding(.horizontal, DS.Space.md)
+                    .padding(.vertical, DS.Space.sm)
+                    .frame(minHeight: 50, maxHeight: 150)
             }
-            .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            HStack(spacing: DS.Space.md) {
-                Button(action: pickAttachments) {
-                    Image(systemName: "paperclip").font(.system(size: 12))
+            composerToolbar
+        }
+        .background(DS.Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        .padding(DS.Space.lg)
+        .background(DS.Palette.bg)
+    }
+
+    private func changedFilesStrip(_ s: GitSummary) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: DS.Space.sm) {
+                Text("\(s.files.count) file\(s.files.count == 1 ? "" : "s") changed")
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                Text("+\(s.totalAdditions)")
+                    .font(DS.Font.caption.monospacedDigit()).foregroundColor(DS.Palette.success)
+                Text("−\(s.totalDeletions)")
+                    .font(DS.Font.caption.monospacedDigit()).foregroundColor(DS.Palette.danger)
+                Spacer(minLength: 0)
+                Button { vm.onReviewRequested?() } label: {
+                    Text("Review here")
+                        .font(DS.Font.caption.weight(.medium))
+                        .foregroundColor(DS.Palette.accent)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(DS.Palette.textSecondary)
-                .help("Attach files")
-                .accessibilityLabel("Attach files")
-                .disabled(vm.status == .running)
-                Text("⌘↩ send · /clear /fork /model /plan /status")
-                    .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
-                Spacer()
-                Button("Send") { Task { await vm.send() } }
-                    .buttonStyle(DSPrimaryButtonStyle())
-                    .disabled(sendDisabled)
-                    .opacity(sendDisabled ? 0.45 : 1)
-                    .keyboardShortcut(.return, modifiers: [.command])
+                .accessibilityLabel("Review changes in the Git panel")
+            }
+            .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+        }
+    }
+
+    private var composerToolbar: some View {
+        HStack(spacing: DS.Space.md) {
+            Button(action: pickAttachments) {
+                Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textSecondary)
+            .help("Attach files").accessibilityLabel("Attach files")
+            .disabled(vm.status == .running)
+            permissionMenu
+            Spacer(minLength: DS.Space.sm)
+            if vm.status == .running {
+                ProgressView().controlSize(.small).scaleEffect(0.55)
+            }
+            modelMenu
+            sendStopButton
+        }
+        .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+    }
+
+    private var permissionMenu: some View {
+        Menu {
+            Button("Supervised") { vm.permissionMode = .supervised }
+            Button("Auto-edit") { vm.permissionMode = .autoAcceptEdits }
+            Button("Full access") { vm.permissionMode = .fullAccess }
+        } label: {
+            HStack(spacing: DS.Space.xs) {
+                Image(systemName: vm.permissionMode == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield")
+                    .font(.system(size: 10))
+                Text(permissionLabel).font(DS.Font.caption.weight(.medium)).lineLimit(1)
+                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+            }
+            .fixedSize()
+            .foregroundColor(permissionTone)
+            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+            .background(permissionTone.opacity(0.13))
+            .clipShape(Capsule())
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .help("Permission mode")
+    }
+
+    private var modelMenu: some View {
+        Menu {
+            Picker("Provider", selection: $vm.provider) {
+                Text("Codex").tag(AgentProvider.codex)
+                Text("Claude").tag(AgentProvider.claude)
+            }
+            .onChange(of: vm.provider) { _ in Task { await vm.loadModels() } }
+            if !vm.availableModels.isEmpty {
+                Picker("Model", selection: $vm.model) {
+                    ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
+                }
+            }
+            Divider()
+            Picker("Reasoning", selection: $vm.reasoningEffort) {
+                ForEach(AgentReasoningEffort.allCases, id: \.self) { e in
+                    Text(e.rawValue.capitalized).tag(e)
+                }
+            }
+        } label: {
+            HStack(spacing: DS.Space.xs) {
+                Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            .fixedSize()
+            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(Capsule())
+            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .disabled(vm.status == .running)
+        .help("Provider · model · reasoning effort")
+    }
+
+    private var sendStopButton: some View {
+        Button {
+            if vm.status == .running { vm.stop() } else { Task { await vm.send() } }
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(vm.status == .running ? DS.Palette.text
+                          : (sendIdleDisabled ? DS.Palette.surfaceRaised : DS.Palette.accent))
+                    .frame(width: 28, height: 28)
+                Image(systemName: vm.status == .running ? "stop.fill" : "arrow.up")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(vm.status == .running ? DS.Palette.bg
+                                     : (sendIdleDisabled ? DS.Palette.textTertiary : DS.Palette.onAccent))
             }
         }
-        .padding(DS.Space.lg)
-        .dsBar(edge: .top)
+        .buttonStyle(.plain)
+        .disabled(vm.status != .running && sendIdleDisabled)
+        .keyboardShortcut(.return, modifiers: [.command])
+        .accessibilityLabel(vm.status == .running ? "Stop" : "Send")
     }
 
     private var attachmentChips: some View {
@@ -891,9 +964,8 @@ public struct AgentAppView: View {
         }
     }
 
-    private var sendDisabled: Bool {
-        (vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty)
-            || vm.status == .running
+    private var sendIdleDisabled: Bool {
+        vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
     }
 
     // MARK: Plan notes sidebar

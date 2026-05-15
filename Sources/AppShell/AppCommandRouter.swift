@@ -43,6 +43,9 @@ public final class AppCommandRouter: CommandRouting {
                             DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
                         }
                         agent.subscriptionToken = AnyHashable(token)
+                        agent.viewModel.onReviewRequested = { [weak self] in
+                            _ = try? self?.createSurface(workspace: wid, type: .rightSidebarTool, paneID: nil, title: "Git")
+                        }
                         surface = agent
                     case .markdown:
                         surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
@@ -501,6 +504,9 @@ public final class AppCommandRouter: CommandRouting {
                     DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
                 }
                 agent.subscriptionToken = AnyHashable(token)
+                agent.viewModel.onReviewRequested = { [weak self] in
+                    _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
+                }
                 surface = agent
             case .markdown:
                 let path = title // optional: pass file path via title for now
