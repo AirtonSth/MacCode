@@ -5,12 +5,12 @@ import Surfaces
 import DesignSystemKit
 
 @MainActor
-public final class PaneTabsView: NSObject, NSTabViewDelegate {
+public final class PaneTabsView: NSObject {
     public let view: NSView
     public let pane: PaneNode
     public weak var router: AppCommandRouter?
-    private let tabView = NSTabView()
-    private let tabBar = NSView()
+    private let tabStrip = NSStackView()
+    private let contentArea = NSView()
 
     public init(pane: PaneNode, router: AppCommandRouter?) {
         self.pane = pane
@@ -23,45 +23,68 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
 
         super.init()
 
-        tabView.tabViewType = .topTabsBezelBorder
-        tabView.translatesAutoresizingMaskIntoConstraints = false
-        tabView.delegate = self
+        // Custom tab strip: icon + truncating title + close button.
+        let selectedID = pane.selectedSurfaceID ?? pane.surfaces.first?.id
+        tabStrip.orientation = .horizontal
+        tabStrip.spacing = 0
+        tabStrip.alignment = .centerY
+        tabStrip.translatesAutoresizingMaskIntoConstraints = false
         for desc in pane.surfaces {
-            let item = NSTabViewItem(identifier: desc.id.value.uuidString)
-            item.label = desc.title
-            if let surface = SurfaceRegistry.shared.surface(desc.id) {
-                let host = NSView()
-                host.translatesAutoresizingMaskIntoConstraints = false
-                let sv = surface.view
-                sv.translatesAutoresizingMaskIntoConstraints = false
-                host.addSubview(sv)
-                NSLayoutConstraint.activate([
-                    sv.topAnchor.constraint(equalTo: host.topAnchor),
-                    sv.bottomAnchor.constraint(equalTo: host.bottomAnchor),
-                    sv.leadingAnchor.constraint(equalTo: host.leadingAnchor),
-                    sv.trailingAnchor.constraint(equalTo: host.trailingAnchor)
-                ])
-                item.view = host
-            } else {
-                let placeholder = NSTextField(labelWithString: "missing surface · \(desc.type.rawValue)")
-                placeholder.textColor = DS.NS.textTertiary
-                placeholder.font = NSFont.systemFont(ofSize: 12)
-                placeholder.translatesAutoresizingMaskIntoConstraints = false
-                let host = NSView()
-                host.wantsLayer = true
-                host.layer?.backgroundColor = DS.NS.bg.cgColor
-                host.translatesAutoresizingMaskIntoConstraints = false
-                host.addSubview(placeholder)
-                NSLayoutConstraint.activate([
-                    placeholder.centerXAnchor.constraint(equalTo: host.centerXAnchor),
-                    placeholder.centerYAnchor.constraint(equalTo: host.centerYAnchor)
-                ])
-                item.view = host
-            }
-            tabView.addTabViewItem(item)
-            if pane.selectedSurfaceID == desc.id {
-                tabView.selectTabViewItem(item)
-            }
+            let isSel = desc.id == selectedID
+            let tab = PaneTabButton(
+                title: desc.title,
+                symbol: Self.symbol(for: desc.type),
+                selected: isSel,
+                onSelect: { [weak self] in self?.selectSurface(desc.id) },
+                onClose: { [weak self] in self?.closeSurface(desc.id) }
+            )
+            tabStrip.addArrangedSubview(tab)
+        }
+        let stripScroll = NSScrollView()
+        stripScroll.drawsBackground = false
+        stripScroll.borderType = .noBorder
+        stripScroll.hasHorizontalScroller = false
+        stripScroll.hasVerticalScroller = false
+        stripScroll.horizontalScrollElasticity = .allowed
+        stripScroll.translatesAutoresizingMaskIntoConstraints = false
+        let stripDoc = NSView()
+        stripDoc.translatesAutoresizingMaskIntoConstraints = false
+        stripDoc.addSubview(tabStrip)
+        stripScroll.documentView = stripDoc
+        NSLayoutConstraint.activate([
+            tabStrip.leadingAnchor.constraint(equalTo: stripDoc.leadingAnchor),
+            tabStrip.trailingAnchor.constraint(equalTo: stripDoc.trailingAnchor),
+            tabStrip.topAnchor.constraint(equalTo: stripDoc.topAnchor),
+            tabStrip.bottomAnchor.constraint(equalTo: stripDoc.bottomAnchor),
+            stripDoc.heightAnchor.constraint(equalTo: stripScroll.heightAnchor)
+        ])
+
+        // Content area: the selected surface (or a styled placeholder).
+        contentArea.translatesAutoresizingMaskIntoConstraints = false
+        contentArea.wantsLayer = true
+        contentArea.layer?.backgroundColor = DS.NS.bg.cgColor
+        if let selID = selectedID, let surface = SurfaceRegistry.shared.surface(selID) {
+            let sv = surface.view
+            sv.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(sv)
+            NSLayoutConstraint.activate([
+                sv.topAnchor.constraint(equalTo: contentArea.topAnchor),
+                sv.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+                sv.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+                sv.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
+            ])
+        } else {
+            let label = NSTextField(labelWithString: pane.surfaces.isEmpty
+                ? "Empty pane — use + to add a surface"
+                : "missing surface")
+            label.textColor = DS.NS.textTertiary
+            label.font = NSFont.systemFont(ofSize: 12)
+            label.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+                label.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
+            ])
         }
 
         // Single "+" pull-down to add a surface to this pane, and a
@@ -105,10 +128,22 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
         divider.layer?.backgroundColor = DS.NS.line.cgColor
         divider.translatesAutoresizingMaskIntoConstraints = false
 
+        let tabStripBG = NSView()
+        tabStripBG.wantsLayer = true
+        tabStripBG.layer?.backgroundColor = DS.NS.surface.cgColor
+        tabStripBG.translatesAutoresizingMaskIntoConstraints = false
+        let divider2 = NSView()
+        divider2.wantsLayer = true
+        divider2.layer?.backgroundColor = DS.NS.line.cgColor
+        divider2.translatesAutoresizingMaskIntoConstraints = false
+
         v.addSubview(toolbarBG)
         toolbarBG.addSubview(toolbar)
         v.addSubview(divider)
-        v.addSubview(tabView)
+        v.addSubview(tabStripBG)
+        tabStripBG.addSubview(stripScroll)
+        v.addSubview(divider2)
+        v.addSubview(contentArea)
         NSLayoutConstraint.activate([
             toolbarBG.topAnchor.constraint(equalTo: v.topAnchor),
             toolbarBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
@@ -117,15 +152,52 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
             toolbar.leadingAnchor.constraint(equalTo: toolbarBG.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: toolbarBG.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: toolbarBG.centerYAnchor),
+
             divider.topAnchor.constraint(equalTo: toolbarBG.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             divider.heightAnchor.constraint(equalToConstant: 1),
-            tabView.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            tabView.bottomAnchor.constraint(equalTo: v.bottomAnchor),
-            tabView.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            tabView.trailingAnchor.constraint(equalTo: v.trailingAnchor)
+
+            tabStripBG.topAnchor.constraint(equalTo: divider.bottomAnchor),
+            tabStripBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            tabStripBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            tabStripBG.heightAnchor.constraint(equalToConstant: 34),
+            stripScroll.topAnchor.constraint(equalTo: tabStripBG.topAnchor),
+            stripScroll.bottomAnchor.constraint(equalTo: tabStripBG.bottomAnchor),
+            stripScroll.leadingAnchor.constraint(equalTo: tabStripBG.leadingAnchor),
+            stripScroll.trailingAnchor.constraint(equalTo: tabStripBG.trailingAnchor),
+
+            divider2.topAnchor.constraint(equalTo: tabStripBG.bottomAnchor),
+            divider2.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            divider2.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            divider2.heightAnchor.constraint(equalToConstant: 1),
+
+            contentArea.topAnchor.constraint(equalTo: divider2.bottomAnchor),
+            contentArea.bottomAnchor.constraint(equalTo: v.bottomAnchor),
+            contentArea.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
+    }
+
+    private func selectSurface(_ id: SurfaceID) {
+        guard let wid = currentWorkspaceID() else { return }
+        try? router?.focusSurface(workspace: wid, surface: id)
+    }
+
+    private func closeSurface(_ id: SurfaceID) {
+        guard let wid = currentWorkspaceID() else { return }
+        try? router?.closeSurface(workspace: wid, surface: id)
+    }
+
+    static func symbol(for type: SurfaceType) -> String {
+        switch type {
+        case .terminal: return "terminal"
+        case .browser: return "globe"
+        case .agentApp: return "sparkles"
+        case .markdown: return "doc.richtext"
+        case .filePreview: return "doc"
+        case .rightSidebarTool: return "sidebar.right"
+        }
     }
 
     private func currentWorkspaceID() -> WorkspaceID? {
@@ -209,13 +281,121 @@ public final class PaneTabsView: NSObject, NSTabViewDelegate {
         return try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
     }
 
-    public func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
-        guard let item = tabViewItem,
-              let idStr = item.identifier as? String,
-              let uuid = UUID(uuidString: idStr) else { return }
-        let sid = SurfaceID(uuid)
-        guard let wid = currentWorkspaceID() else { return }
-        try? router?.focusSurface(workspace: wid, surface: sid)
+}
+
+// MARK: - Custom tab button (icon · truncating title · close ×)
+
+@MainActor
+final class PaneTabButton: NSView {
+    private let onSelect: () -> Void
+    private let onClose: () -> Void
+    private var hovering = false
+    private let selected: Bool
+
+    init(title: String, symbol: String, selected: Bool,
+         onSelect: @escaping () -> Void, onClose: @escaping () -> Void) {
+        self.onSelect = onSelect
+        self.onClose = onClose
+        self.selected = selected
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.backgroundColor = (selected ? DS.NS.bg : DS.NS.surface).cgColor
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+        icon.contentTintColor = selected ? DS.NS.text : DS.NS.textTertiary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 12, weight: selected ? .medium : .regular)
+        label.textColor = selected ? DS.NS.text : DS.NS.textSecondary
+        label.lineBreakMode = .byTruncatingTail
+        label.cell?.truncatesLastVisibleLine = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let close = NSButton(frame: .zero)
+        close.isBordered = false
+        close.bezelStyle = .inline
+        close.imagePosition = .imageOnly
+        close.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close tab")
+        close.symbolConfiguration = .init(pointSize: 9, weight: .semibold)
+        close.contentTintColor = DS.NS.textTertiary
+        close.translatesAutoresizingMaskIntoConstraints = false
+        close.target = self
+        close.action = #selector(closeClicked)
+        close.toolTip = "Close tab"
+
+        addSubview(icon); addSubview(label); addSubview(close)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 34),
+            widthAnchor.constraint(greaterThanOrEqualToConstant: 130),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 240),
+
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            close.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+            close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            close.centerYAnchor.constraint(equalTo: centerYAnchor),
+            close.widthAnchor.constraint(equalToConstant: 16),
+            close.heightAnchor.constraint(equalToConstant: 16)
+        ])
+
+        // Right-edge separator between tabs.
+        let sep = NSView()
+        sep.wantsLayer = true
+        sep.layer?.backgroundColor = DS.NS.line.cgColor
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(sep)
+        NSLayoutConstraint.activate([
+            sep.trailingAnchor.constraint(equalTo: trailingAnchor),
+            sep.topAnchor.constraint(equalTo: topAnchor),
+            sep.bottomAnchor.constraint(equalTo: bottomAnchor),
+            sep.widthAnchor.constraint(equalToConstant: 1)
+        ])
+
+        if selected {
+            let underline = NSView()
+            underline.wantsLayer = true
+            underline.layer?.backgroundColor = DS.NS.accent.cgColor
+            underline.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(underline)
+            NSLayoutConstraint.activate([
+                underline.leadingAnchor.constraint(equalTo: leadingAnchor),
+                underline.trailingAnchor.constraint(equalTo: trailingAnchor),
+                underline.bottomAnchor.constraint(equalTo: bottomAnchor),
+                underline.heightAnchor.constraint(equalToConstant: 2)
+            ])
+        }
+
+        let tracking = NSTrackingArea(rect: .zero,
+                                      options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                      owner: self, userInfo: nil)
+        addTrackingArea(tracking)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {
+        // Selection only fires if the close button didn't consume the click.
+        onSelect()
+    }
+
+    @objc private func closeClicked() { onClose() }
+
+    override func mouseEntered(with event: NSEvent) {
+        if !selected { layer?.backgroundColor = DS.NS.surfaceRaised.cgColor }
+    }
+    override func mouseExited(with event: NSEvent) {
+        if !selected { layer?.backgroundColor = DS.NS.surface.cgColor }
     }
 }
 

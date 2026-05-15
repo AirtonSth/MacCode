@@ -76,6 +76,27 @@ final class PaneActionTests: XCTestCase {
         XCTAssertTrue(types.contains(.agentApp))
     }
 
+    func test_closeSurface_removesTabFromPane() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "c", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail() }
+        let v = PaneTabsView(pane: pane, router: router)
+        let a = v.performAdd(.terminal, title: "t")
+        _ = v.performAdd(.browser, title: "b")
+        guard case .pane(let p1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(p1.surfaces.count, 2)
+        try router.closeSurface(workspace: ws.id, surface: a!.id)
+        guard case .pane(let p2) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(p2.surfaces.count, 1)
+        XCTAssertFalse(p2.surfaces.contains { $0.id == a!.id })
+    }
+
+    func test_symbolForType_isDistinctNonEmpty() {
+        let syms = SurfaceType.allCases.map { PaneTabsView.symbol(for: $0) }
+        XCTAssertTrue(syms.allSatisfy { !$0.isEmpty })
+        XCTAssertEqual(Set(syms).count, syms.count)
+    }
+
     func test_buttons_noop_without_workspace() throws {
         let (_, router) = try makeContext()
         // No workspace selected.
