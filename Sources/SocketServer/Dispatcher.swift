@@ -61,6 +61,20 @@ public final class JSONRPCDispatcher {
                     "app": .string("remotecode2"),
                     "pid": .number(Double(ProcessInfo.processInfo.processIdentifier))
                 ]))
+            case "events.recent":
+                let snap = EventBus.shared.snapshot()
+                let arr: [JSONValue] = snap.recent.map { ev in
+                    .object([
+                        "seq": .number(Double(ev.seq)),
+                        "kind": .string(ev.kind),
+                        "payload": ev.payload,
+                        "ts": .number(ev.ts)
+                    ])
+                }
+                return .init(id: id, result: .object([
+                    "last_seq": .number(Double(snap.lastSeq)),
+                    "events": .array(arr)
+                ]))
             case "workspace.list":
                 let ws = try router.listWorkspaces()
                 return .init(id: id, result: encode(ws))
@@ -71,6 +85,7 @@ public final class JSONRPCDispatcher {
                 let name = params["name"]?.stringValue ?? "workspace"
                 let cwd = params["cwd"]?.stringValue ?? FileManager.default.currentDirectoryPath
                 let ws = try router.createWorkspace(name: name, cwd: cwd)
+                EventBus.shared.publish(kind: "workspace.created", payload: encode(ws))
                 return .init(id: id, result: encode(ws))
             case "workspace.select":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
@@ -92,6 +107,10 @@ public final class JSONRPCDispatcher {
                 let pid: PaneID? = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
                 let title = params["title"]?.stringValue
                 let s = try router.createSurface(workspace: wid, type: type, paneID: pid, title: title)
+                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface": encode(s)
+                ]))
                 return .init(id: id, result: encode(s))
             case "surface.split":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),

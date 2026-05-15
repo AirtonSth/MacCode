@@ -189,6 +189,11 @@ public final class AppCommandRouter: @preconcurrency CommandRouting {
             case .agentApp:
                 guard let ctx = context else { return descriptor }
                 surface = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: baseTitle)
+            case .markdown, .filePreview, .rightSidebarTool:
+                // V1-deferred surface types; we still return the descriptor
+                // so callers receive a typed unsupported state instead of a
+                // crash. See project/14-reference-repos-distillation.md.
+                return descriptor
             }
             let finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
             SurfaceRegistry.shared.register(surface)
@@ -199,10 +204,6 @@ public final class AppCommandRouter: @preconcurrency CommandRouting {
     }
 
     private func defaultTitle(for type: SurfaceType) -> String {
-        switch type {
-        case .terminal: return "terminal"
-        case .browser: return "browser"
-        case .agentApp: return "Agent App"
-        }
+        type.displayLabel.lowercased() == "agent app" ? "Agent App" : type.displayLabel.lowercased()
     }
 }

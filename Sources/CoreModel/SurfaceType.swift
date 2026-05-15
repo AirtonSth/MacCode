@@ -4,6 +4,24 @@ public enum SurfaceType: String, Codable, Sendable, CaseIterable {
     case terminal
     case browser
     case agentApp
+    /// Deferred for V1; modelled here so the surface tree stays open to
+    /// cmux parity (see project/14-reference-repos-distillation.md).
+    case markdown
+    case filePreview
+    case rightSidebarTool
+}
+
+/// Mirrors cmux's `PanelFocusIntent`. Surfaces opt in to interpreting
+/// this; unsupported intents collapse to plain focus.
+public enum SurfaceFocusIntent: Sendable, Equatable {
+    case `default`
+    case terminalSurface
+    case terminalFindField
+    case browserWebView
+    case browserAddressBar
+    case browserFindField
+    case agentComposer
+    case agentTimeline
 }
 
 public enum AgentProvider: String, Codable, Sendable, CaseIterable {

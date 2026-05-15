@@ -41,7 +41,7 @@
     <li><span class="badge ok">build</span> <code>swift build</code> succeeds on Swift 6.3 (compiler in language mode 5), arm64 macOS 26.</li>
     <li><span class="badge ok">tests</span> 31 XCTest cases pass (<code>DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test</code>).</li>
     <li><span class="badge ok">app</span> <code>swift run RemoteCode2</code> launches a native window with sidebar, panes, surface tabs, command palette, and unix-socket + HTTP automation.</li>
-    <li><span class="badge ok">cli</span> <code>swift run remotecode2 ping</code> talks to the running app over <code>/tmp/RemoteCode2Debug.sock</code>.</li>
+    <li><span class="badge ok">cli</span> <code>swift run rc2 ping</code> talks to the running app over <code>/tmp/RemoteCode2Debug.sock</code>. <span class="muted">(The CLI binary was renamed from <code>remotecode2</code> to <code>rc2</code> because macOS APFS is case-insensitive — having both <code>RemoteCode2</code> and <code>remotecode2</code> made them resolve to the same file.)</span></li>
     <li><span class="badge warn">decisions</span> Phase 0 cards (license, layout engine, terminal engine, mobile contract) are <strong>still open for human sign-off</strong>; the implementation took the conservative default for each (clean-room, custom split tree, pipe-backed shell, loopback-only HTTP). See "Decisions I took for you" below.</li>
     <li><span class="badge warn">release</span> No app bundle, signing, notarization, updater or installer. The shipped binaries are SwiftPM executables. Release engineering (RC2-120 → RC2-124) was deliberately not started — those need certificates and an Apple Developer account.</li>
   </ul>
@@ -67,9 +67,9 @@
 ./scripts/build-debug.sh
 ./scripts/run-app.sh          # launches the app
 # In another terminal:
-swift run remotecode2 ping
-swift run remotecode2 capabilities
-swift run remotecode2 new-workspace --cwd /tmp --name demo
+swift run rc2 ping
+swift run rc2 capabilities
+swift run rc2 new-workspace --cwd /tmp --name demo
 </pre>
 
 <h2>Decisions I took for you</h2>

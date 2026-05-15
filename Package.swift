@@ -8,7 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "RemoteCode2", targets: ["AppShell"]),
-        .executable(name: "remotecode2", targets: ["RC2CLI"]),
+        .executable(name: "rc2", targets: ["RC2CLI"]),
         .library(name: "CoreModel", targets: ["CoreModel"]),
         .library(name: "Persistence", targets: ["Persistence"]),
         .library(name: "AgentRuntime", targets: ["AgentRuntime"]),

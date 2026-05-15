@@ -177,3 +177,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = try? router.createSurface(workspace: wid, type: type, paneID: nil, title: nil)
     }
 }
+
+extension SurfaceType {
+    /// Human-facing label, mirrors cmux terminology.
+    public var displayLabel: String {
+        switch self {
+        case .terminal: return "Terminal"
+        case .browser: return "Browser"
+        case .agentApp: return "Agent App"
+        case .markdown: return "Markdown"
+        case .filePreview: return "File Preview"
+        case .rightSidebarTool: return "Right Sidebar Tool"
+        }
+    }
+}
