@@ -10,6 +10,10 @@ public final class SystemNotifier {
     private var authorized = false
 
     public func bootstrap() {
+        // UNUserNotificationCenter requires the process to be a real
+        // bundled .app. Running from `swift run` produces a binary
+        // without a bundle identifier and would crash on .current().
+        guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             self.authorized = granted
@@ -17,7 +21,7 @@ public final class SystemNotifier {
     }
 
     public func post(title: String, body: String?, category: String?) {
-        guard authorized else { return }
+        guard authorized, Bundle.main.bundleIdentifier != nil else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         if let b = body { content.body = b }
