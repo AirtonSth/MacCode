@@ -87,16 +87,29 @@ public final class PaneTabsView: NSObject {
             ])
         }
 
-        // Single "+" pull-down to add a surface to this pane, and a
-        // "Split" pull-down with Horizontal / Vertical submenus.
-        let addPopup = Self.makePullDown(title: "+")
-        addPopup.menu?.addItem(.separator())
-        for (label, type) in Self.surfaceChoices {
+        // Chrome-style flat "+" that sits right after the last tab.
+        // Clicking it pops the surface-type menu under the button.
+        let addButton = Self.makeIconButton(
+            symbol: "plus",
+            help: "New surface",
+            target: self, action: #selector(showAddMenu(_:)))
+        let addMenu = NSMenu()
+        let addChoices: [(String, SurfaceType)] = [
+            ("Terminal", .terminal),
+            ("Browser", .browser),
+            ("Agent App", .agentApp)
+        ]
+        for (label, type) in addChoices {
             let it = NSMenuItem(title: label, action: #selector(addFromMenu(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = type.rawValue
-            addPopup.menu?.addItem(it)
+            let img = NSImage(systemSymbolName: Self.symbol(for: type), accessibilityDescription: label)
+            img?.isTemplate = true
+            it.image = img?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            addMenu.addItem(it)
         }
+        addButton.menu = addMenu
+        tabStrip.addArrangedSubview(addButton)
 
         // Split controls live on the RIGHT of the toolbar as two icon
         // buttons: columns (side-by-side, .right) and rows (stacked, .down).
@@ -121,70 +134,56 @@ public final class PaneTabsView: NSObject {
         sep.translatesAutoresizingMaskIntoConstraints = false
         sep.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        // Subtle separator splitting the unified header into two zones:
+        // the scrollable tab strip (left) and the action cluster (right).
+        let zoneSep = NSBox()
+        zoneSep.boxType = .separator
+        zoneSep.translatesAutoresizingMaskIntoConstraints = false
+        zoneSep.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
-        let toolbar = NSStackView(views: [addPopup, spacer, gitButton, sep, splitColumns, splitRows])
-        toolbar.orientation = .horizontal
-        toolbar.spacing = DS.Space.sm
-        toolbar.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
-        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        // Single unified header row: tabs scroll on the left, the action
+        // cluster (+ · git · split) stays pinned on the right.
+        let rightCluster = NSStackView(views: [zoneSep, gitButton, sep, splitColumns, splitRows])
+        rightCluster.orientation = .horizontal
+        rightCluster.spacing = DS.Space.sm
+        rightCluster.translatesAutoresizingMaskIntoConstraints = false
+        rightCluster.setContentHuggingPriority(.required, for: .horizontal)
 
-        let toolbarBG = NSView()
-        toolbarBG.wantsLayer = true
-        toolbarBG.layer?.backgroundColor = DS.NS.surface.cgColor
-        toolbarBG.translatesAutoresizingMaskIntoConstraints = false
+        let headerBG = NSView()
+        headerBG.wantsLayer = true
+        headerBG.layer?.backgroundColor = DS.NS.surface.cgColor
+        headerBG.translatesAutoresizingMaskIntoConstraints = false
 
         let divider = NSView()
         divider.wantsLayer = true
         divider.layer?.backgroundColor = DS.NS.line.cgColor
         divider.translatesAutoresizingMaskIntoConstraints = false
 
-        let tabStripBG = NSView()
-        tabStripBG.wantsLayer = true
-        tabStripBG.layer?.backgroundColor = DS.NS.surface.cgColor
-        tabStripBG.translatesAutoresizingMaskIntoConstraints = false
-        let divider2 = NSView()
-        divider2.wantsLayer = true
-        divider2.layer?.backgroundColor = DS.NS.line.cgColor
-        divider2.translatesAutoresizingMaskIntoConstraints = false
-
-        v.addSubview(toolbarBG)
-        toolbarBG.addSubview(toolbar)
+        v.addSubview(headerBG)
+        headerBG.addSubview(stripScroll)
+        headerBG.addSubview(rightCluster)
         v.addSubview(divider)
-        v.addSubview(tabStripBG)
-        tabStripBG.addSubview(stripScroll)
-        v.addSubview(divider2)
         v.addSubview(contentArea)
         NSLayoutConstraint.activate([
-            toolbarBG.topAnchor.constraint(equalTo: v.topAnchor),
-            toolbarBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            toolbarBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            toolbarBG.heightAnchor.constraint(equalToConstant: 32),
-            toolbar.leadingAnchor.constraint(equalTo: toolbarBG.leadingAnchor),
-            toolbar.trailingAnchor.constraint(equalTo: toolbarBG.trailingAnchor),
-            toolbar.centerYAnchor.constraint(equalTo: toolbarBG.centerYAnchor),
+            headerBG.topAnchor.constraint(equalTo: v.topAnchor),
+            headerBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
+            headerBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
+            headerBG.heightAnchor.constraint(equalToConstant: 34),
 
-            divider.topAnchor.constraint(equalTo: toolbarBG.bottomAnchor),
+            stripScroll.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
+            stripScroll.topAnchor.constraint(equalTo: headerBG.topAnchor),
+            stripScroll.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
+            stripScroll.trailingAnchor.constraint(equalTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
+
+            rightCluster.trailingAnchor.constraint(equalTo: headerBG.trailingAnchor, constant: -DS.Space.md),
+            rightCluster.centerYAnchor.constraint(equalTo: headerBG.centerYAnchor),
+
+            divider.topAnchor.constraint(equalTo: headerBG.bottomAnchor),
             divider.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             divider.heightAnchor.constraint(equalToConstant: 1),
 
-            tabStripBG.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            tabStripBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            tabStripBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            tabStripBG.heightAnchor.constraint(equalToConstant: 34),
-            stripScroll.topAnchor.constraint(equalTo: tabStripBG.topAnchor),
-            stripScroll.bottomAnchor.constraint(equalTo: tabStripBG.bottomAnchor),
-            stripScroll.leadingAnchor.constraint(equalTo: tabStripBG.leadingAnchor),
-            stripScroll.trailingAnchor.constraint(equalTo: tabStripBG.trailingAnchor),
-
-            divider2.topAnchor.constraint(equalTo: tabStripBG.bottomAnchor),
-            divider2.leadingAnchor.constraint(equalTo: v.leadingAnchor),
-            divider2.trailingAnchor.constraint(equalTo: v.trailingAnchor),
-            divider2.heightAnchor.constraint(equalToConstant: 1),
-
-            contentArea.topAnchor.constraint(equalTo: divider2.bottomAnchor),
+            contentArea.topAnchor.constraint(equalTo: divider.bottomAnchor),
             contentArea.bottomAnchor.constraint(equalTo: v.bottomAnchor),
             contentArea.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
@@ -230,19 +229,6 @@ public final class PaneTabsView: NSObject {
         surfaceChoices.first(where: { $0.1 == type })?.0 ?? type.rawValue
     }
 
-    /// A token-styled pull-down NSPopUpButton whose first (index 0) item
-    /// is the always-visible label.
-    private static func makePullDown(title: String) -> NSPopUpButton {
-        let p = NSPopUpButton(frame: .zero, pullsDown: true)
-        p.translatesAutoresizingMaskIntoConstraints = false
-        p.bezelStyle = .texturedRounded
-        p.controlSize = .small
-        p.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        let head = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        p.menu?.addItem(head)
-        return p
-    }
-
     /// A token-styled square icon button used for the split controls.
     private static func makeIconButton(symbol: String, help: String,
                                        target: AnyObject, action: Selector) -> NSButton {
@@ -264,6 +250,12 @@ public final class PaneTabsView: NSObject {
             b.heightAnchor.constraint(equalToConstant: 22)
         ])
         return b
+    }
+
+    @objc private func showAddMenu(_ sender: NSButton) {
+        guard let menu = sender.menu else { return }
+        let origin = NSPoint(x: 0, y: sender.bounds.height + 4)
+        menu.popUp(positioning: nil, at: origin, in: sender)
     }
 
     @objc private func addFromMenu(_ sender: NSMenuItem) {
