@@ -8,6 +8,12 @@ public protocol CommandRouting: AnyObject {
     // window/workspace/pane/surface
     func listWorkspaces() throws -> [Workspace]
     func currentWindow() throws -> AppWindow
+    func listWindows() throws -> [AppWindow]
+    func createWindow(title: String?) throws -> AppWindow
+    func focusWindow(_ id: WindowID) throws
+    func closeWindow(_ id: WindowID) throws
+    func moveWorkspaceToWindow(workspace: WorkspaceID, target: WindowID) throws
+    func paneSwap(workspace: WorkspaceID, a: PaneID, b: PaneID) throws
     func createWorkspace(name: String, cwd: String) throws -> Workspace
     func selectWorkspace(_ id: WorkspaceID) throws
     func closeWorkspace(_ id: WorkspaceID) throws
@@ -295,14 +301,37 @@ public final class JSONRPCDispatcher {
                 try router.surfaceReorder(workspace: wid, surface: sid, toPane: pid, position: pos)
                 return .init(id: id, result: .bool(true))
             case "window.list":
-                let w = try router.currentWindow()
-                return .init(id: id, result: .array([encode(w)]))
+                let ws = try router.listWindows()
+                return .init(id: id, result: encode(ws))
             case "window.current":
                 let w = try router.currentWindow()
                 return .init(id: id, result: encode(w))
+            case "window.create":
+                let title = params["title"]?.stringValue
+                let w = try router.createWindow(title: title)
+                EventBus.shared.publish(kind: "window.created", payload: encode(w))
+                return .init(id: id, result: encode(w))
+            case "window.focus":
+                guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
+                try router.focusWindow(wid)
+                return .init(id: id, result: .bool(true))
+            case "window.close":
+                guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
+                try router.closeWindow(wid)
+                return .init(id: id, result: .bool(true))
+            case "workspace.move_to_window":
+                guard let workspaceId = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let target = params["window_id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
+                try router.moveWorkspaceToWindow(workspace: workspaceId, target: target)
+                return .init(id: id, result: .bool(true))
+            case "pane.swap":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let a = params["a"]?.stringValue.flatMap(UUID.init).map(PaneID.init),
+                      let b = params["b"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
+                try router.paneSwap(workspace: wid, a: a, b: b)
+                return .init(id: id, result: .bool(true))
             // V1 deferred families return a typed unsupported error.
-            case "window.create", "window.focus", "window.close",
-                 "pane.swap", "pane.break", "pane.join":
+            case "pane.break", "pane.join":
                 throw JSONRPCError.notSupported(req.method)
             default:
                 throw JSONRPCError.methodNotFound

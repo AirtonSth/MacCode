@@ -92,6 +92,37 @@ public final class AppCommandRouter: CommandRouting {
         context?.state.window ?? AppWindow()
     }
 
+    public func listWindows() throws -> [AppWindow] {
+        context?.state.windows ?? []
+    }
+
+    public func createWindow(title: String?) throws -> AppWindow {
+        try context?.apply(.createWindow(title: title))
+        let w = try currentWindow()
+        windowController?.openAdditionalWindow(for: w)
+        return w
+    }
+
+    public func focusWindow(_ id: WindowID) throws {
+        try context?.apply(.focusWindow(id))
+        windowController?.refreshFromState()
+    }
+
+    public func closeWindow(_ id: WindowID) throws {
+        try context?.apply(.closeWindow(id))
+        windowController?.refreshFromState()
+    }
+
+    public func moveWorkspaceToWindow(workspace: WorkspaceID, target: WindowID) throws {
+        try context?.apply(.moveWorkspaceToWindow(workspace, target))
+        windowController?.refreshFromState()
+    }
+
+    public func paneSwap(workspace: WorkspaceID, a: PaneID, b: PaneID) throws {
+        try context?.apply(.swapPanes(workspace, a, b))
+        windowController?.refreshFromState()
+    }
+
     public func createWorkspace(name: String, cwd: String) throws -> Workspace {
         guard let ctx = context else { throw NSError(domain: "rc2", code: 0) }
         try ctx.apply(.createWorkspace(name: name, cwd: cwd, initial: nil))

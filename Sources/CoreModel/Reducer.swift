@@ -15,6 +15,11 @@ public enum LayoutAction: Sendable {
     case reorderSurface(WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int)
     case moveSurfaceToPane(WorkspaceID, surface: SurfaceID, targetPane: PaneID)
     case resizeSplit(WorkspaceID, splitID: UUID, ratios: [Double])
+    case createWindow(title: String?)
+    case focusWindow(WindowID)
+    case closeWindow(WindowID)
+    case moveWorkspaceToWindow(WorkspaceID, WindowID)
+    case swapPanes(WorkspaceID, PaneID, PaneID)
 }
 
 public enum LayoutError: Error, Equatable {
@@ -25,13 +30,38 @@ public enum LayoutError: Error, Equatable {
 }
 
 public struct LayoutState: Codable, Sendable, Equatable {
-    public var window: AppWindow
+    public var windows: [AppWindow]
+    public var focusedWindowID: WindowID
     public var workspaces: [WorkspaceID: Workspace]
 
+    /// Legacy single-window accessor: returns the focused window or the
+    /// first window. Setting it replaces the focused window.
+    public var window: AppWindow {
+        get { windows.first(where: { $0.id == focusedWindowID }) ?? windows[0] }
+        set {
+            if let idx = windows.firstIndex(where: { $0.id == newValue.id }) {
+                windows[idx] = newValue
+            } else {
+                windows.append(newValue)
+            }
+            focusedWindowID = newValue.id
+        }
+    }
+
     public init(window: AppWindow = AppWindow(), workspaces: [WorkspaceID: Workspace] = [:]) {
-        self.window = window
+        self.windows = [window]
+        self.focusedWindowID = window.id
         self.workspaces = workspaces
     }
+
+    public init(windows: [AppWindow], focusedWindowID: WindowID, workspaces: [WorkspaceID: Workspace] = [:]) {
+        precondition(!windows.isEmpty)
+        self.windows = windows
+        self.focusedWindowID = focusedWindowID
+        self.workspaces = workspaces
+    }
+
+    public func findWindow(_ id: WindowID) -> AppWindow? { windows.first(where: { $0.id == id }) }
 }
 
 public struct LayoutReducer {
@@ -131,6 +161,64 @@ public struct LayoutReducer {
             ws.layout = updateSplitRatios(node: ws.layout, splitID: splitID, ratios: ratios)
             next.workspaces[wid] = ws
             return next
+        case .createWindow(let title):
+            let w = AppWindow(title: title ?? "RemoteCode 2")
+            next.windows.append(w)
+            next.focusedWindowID = w.id
+            return next
+        case .focusWindow(let wid):
+            guard next.windows.contains(where: { $0.id == wid }) else { throw LayoutError.workspaceNotFound }
+            next.focusedWindowID = wid
+            return next
+        case .closeWindow(let wid):
+            guard next.windows.contains(where: { $0.id == wid }) else { throw LayoutError.workspaceNotFound }
+            // Move workspaces back to first remaining window; never strand them.
+            if let idx = next.windows.firstIndex(where: { $0.id == wid }) {
+                let removed = next.windows.remove(at: idx)
+                if next.windows.isEmpty {
+                    next.windows = [AppWindow()]
+                }
+                next.windows[0].workspaces.append(contentsOf: removed.workspaces)
+                if next.focusedWindowID == wid { next.focusedWindowID = next.windows[0].id }
+            }
+            return next
+        case .moveWorkspaceToWindow(let workspaceId, let targetWindowID):
+            guard next.windows.contains(where: { $0.id == targetWindowID }) else { throw LayoutError.workspaceNotFound }
+            for i in next.windows.indices {
+                next.windows[i].workspaces.removeAll { $0 == workspaceId }
+                if next.windows[i].selectedWorkspaceID == workspaceId {
+                    next.windows[i].selectedWorkspaceID = next.windows[i].workspaces.first
+                }
+            }
+            if let idx = next.windows.firstIndex(where: { $0.id == targetWindowID }) {
+                next.windows[idx].workspaces.append(workspaceId)
+                next.windows[idx].selectedWorkspaceID = workspaceId
+            }
+            return next
+        case .swapPanes(let wid, let a, let b):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            guard let nodeA = ws.layout.find(paneID: a), let nodeB = ws.layout.find(paneID: b) else { throw LayoutError.paneNotFound }
+            // Swap surface contents between the two panes.
+            ws.layout = swap(in: ws.layout, paneIDA: a, paneIDB: b, paneA: nodeA, paneB: nodeB)
+            next.workspaces[wid] = ws
+            return next
+        }
+    }
+
+    private func swap(in node: LayoutNode, paneIDA: PaneID, paneIDB: PaneID, paneA: PaneNode, paneB: PaneNode) -> LayoutNode {
+        switch node {
+        case .pane(var p):
+            if p.id == paneIDA {
+                p.surfaces = paneB.surfaces
+                p.selectedSurfaceID = paneB.selectedSurfaceID
+            } else if p.id == paneIDB {
+                p.surfaces = paneA.surfaces
+                p.selectedSurfaceID = paneA.selectedSurfaceID
+            }
+            return .pane(p)
+        case .split(var s):
+            s.children = s.children.map { swap(in: $0, paneIDA: paneIDA, paneIDB: paneIDB, paneA: paneA, paneB: paneB) }
+            return .split(s)
         }
     }
 

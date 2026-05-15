@@ -39,14 +39,16 @@ public struct Workspace: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
-public struct AppWindow: Codable, Sendable, Equatable {
+public struct AppWindow: Codable, Sendable, Equatable, Identifiable {
     public let id: WindowID
     public var workspaces: [WorkspaceID]
     public var selectedWorkspaceID: WorkspaceID?
+    public var title: String
 
-    public init(id: WindowID = WindowID(), workspaces: [WorkspaceID] = [], selectedWorkspaceID: WorkspaceID? = nil) {
+    public init(id: WindowID = WindowID(), workspaces: [WorkspaceID] = [], selectedWorkspaceID: WorkspaceID? = nil, title: String = "RemoteCode 2") {
         self.id = id
         self.workspaces = workspaces
         self.selectedWorkspaceID = selectedWorkspaceID
+        self.title = title
     }
 }

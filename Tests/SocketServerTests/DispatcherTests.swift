@@ -11,6 +11,12 @@ final class FakeRouter: CommandRouting {
 
     func listWorkspaces() throws -> [Workspace] { workspaces }
     func currentWindow() throws -> AppWindow { window }
+    func listWindows() throws -> [AppWindow] { [window] }
+    func createWindow(title: String?) throws -> AppWindow { AppWindow(title: title ?? "w") }
+    func focusWindow(_ id: WindowID) throws {}
+    func closeWindow(_ id: WindowID) throws {}
+    func moveWorkspaceToWindow(workspace: WorkspaceID, target: WindowID) throws {}
+    func paneSwap(workspace: WorkspaceID, a: PaneID, b: PaneID) throws {}
     func createWorkspace(name: String, cwd: String) throws -> Workspace {
         let ws = Workspace.empty(name: name, cwd: cwd)
         workspaces.append(ws); window.workspaces.append(ws.id); window.selectedWorkspaceID = ws.id
@@ -93,8 +99,8 @@ final class DispatcherTests: XCTestCase {
     @MainActor
     func test_unsupportedDeferredMethod_returnsTypedError() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
-        // pane.swap remains V1-deferred
-        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "pane.swap", params: nil))
+        // pane.break is still V1-deferred
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "pane.break", params: nil))
         XCTAssertEqual(resp.error?.code, -32004)
     }
 

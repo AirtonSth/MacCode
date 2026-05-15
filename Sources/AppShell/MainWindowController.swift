@@ -81,6 +81,34 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    private var extraWindows: [WindowID: NSWindow] = [:]
+
+    public func openAdditionalWindow(for w: AppWindow) {
+        if let existing = extraWindows[w.id] { existing.makeKeyAndOrderFront(nil); return }
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .resizable, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = w.title
+        let v = NSView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: "Window \(w.id.value.uuidString.prefix(8))\nuse the sidebar / CLI (rc2 workspace.move_to_window) to attach workspaces.")
+        label.alignment = .center
+        label.maximumNumberOfLines = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: v.centerYAnchor)
+        ])
+        win.contentView = v
+        win.center()
+        win.makeKeyAndOrderFront(nil)
+        extraWindows[w.id] = win
+    }
+
     private func rebuildWorkspaceContainer() {
         for sub in workspaceContainer.subviews { sub.removeFromSuperview() }
         guard let ctx = context,
