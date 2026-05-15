@@ -24,6 +24,8 @@ public protocol CommandRouting: AnyObject {
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws
     func sendText(surface: SurfaceID, text: String) throws
     func readText(surface: SurfaceID) throws -> String
+    func surfaceHealth(surface: SurfaceID) -> Bool
+    func surfaceClearHistory(surface: SurfaceID)
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
@@ -59,6 +61,32 @@ public protocol CommandRouting: AnyObject {
 public final class JSONRPCDispatcher {
     let router: CommandRouting
     public init(router: CommandRouting) { self.router = router }
+
+    /// Translate symbolic key names (cmux v2 contract) into raw bytes
+    /// the PTY-backed terminal understands. Anything we don't recognize
+    /// passes through verbatim.
+    private func encodeKey(_ key: String) -> String {
+        switch key {
+        case "enter", "return", "Enter", "Return": return "\r"
+        case "tab", "Tab": return "\t"
+        case "escape", "Escape", "esc", "Esc": return "\u{1B}"
+        case "backspace", "Backspace": return "\u{7F}"
+        case "space", "Space": return " "
+        case "ctrl-c", "C-c": return "\u{03}"
+        case "ctrl-d", "C-d": return "\u{04}"
+        case "ctrl-z", "C-z": return "\u{1A}"
+        case "ctrl-l", "C-l": return "\u{0C}"
+        case "up", "Up", "ArrowUp": return "\u{1B}[A"
+        case "down", "Down", "ArrowDown": return "\u{1B}[B"
+        case "right", "Right", "ArrowRight": return "\u{1B}[C"
+        case "left", "Left", "ArrowLeft": return "\u{1B}[D"
+        case "home", "Home": return "\u{1B}[H"
+        case "end", "End": return "\u{1B}[F"
+        case "page-up", "PageUp": return "\u{1B}[5~"
+        case "page-down", "PageDown": return "\u{1B}[6~"
+        default: return key
+        }
+    }
 
     public func dispatch(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         let id = req.id
@@ -158,6 +186,20 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let text = params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.sendText(surface: sid, text: text)
+                return .init(id: id, result: .bool(true))
+            case "surface.send_key":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let key = params["key"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let sequence = encodeKey(key)
+                try router.sendText(surface: sid, text: sequence)
+                return .init(id: id, result: .bool(true))
+            case "surface.health":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                let alive = router.surfaceHealth(surface: sid)
+                return .init(id: id, result: .object(["alive": .bool(alive)]))
+            case "surface.clear_history":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                router.surfaceClearHistory(surface: sid)
                 return .init(id: id, result: .bool(true))
             case "surface.read_text":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }

@@ -186,6 +186,18 @@ public final class AppCommandRouter: CommandRouting {
         return s.readText()
     }
 
+    public func surfaceHealth(surface: SurfaceID) -> Bool {
+        SurfaceRegistry.shared.surface(surface) != nil
+    }
+
+    public func surfaceClearHistory(surface: SurfaceID) {
+        // Terminal-specific: replace scrollback by sending the clear
+        // shortcut. Browser/agent surfaces ignore.
+        if let s = SurfaceRegistry.shared.surface(surface), s.descriptor.type == .terminal {
+            s.sendText("\u{0C}") // ctrl-L
+        }
+    }
+
     public func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
         try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
     }

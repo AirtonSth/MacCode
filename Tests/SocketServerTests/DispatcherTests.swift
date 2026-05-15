@@ -35,6 +35,8 @@ final class FakeRouter: CommandRouting {
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {}
     func sendText(surface: SurfaceID, text: String) throws {}
     func readText(surface: SurfaceID) throws -> String { "" }
+    func surfaceHealth(surface: SurfaceID) -> Bool { true }
+    func surfaceClearHistory(surface: SurfaceID) {}
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: .agentApp, title: "Agent App")
     }
