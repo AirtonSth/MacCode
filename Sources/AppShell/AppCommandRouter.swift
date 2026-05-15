@@ -290,7 +290,8 @@ public final class AppCommandRouter: CommandRouting {
             case .filePreview:
                 surface = FilePreviewSurface(workspaceID: workspace, filePath: title, title: baseTitle)
             case .rightSidebarTool:
-                return descriptor
+                // V1 right-sidebar tool: diff panel.
+                surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
             }
             let finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
             SurfaceRegistry.shared.register(surface)

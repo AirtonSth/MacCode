@@ -23,6 +23,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
     @Published public var gitSummary: GitSummary = GitSummary(isGitRepo: false, branch: nil, dirty: false, files: [], totalAdditions: 0, totalDeletions: 0)
+    @Published public var showPlanSidebar: Bool = false
+    @Published public var showTerminalDrawer: Bool = false
+    @Published public var planNotes: String = ""
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -161,8 +164,24 @@ public struct AgentAppView: View {
                 .frame(minWidth: 200, idealWidth: 230)
             mainPane
                 .frame(minWidth: 400)
+            if vm.showPlanSidebar {
+                planSidebar.frame(minWidth: 220, idealWidth: 260)
+            }
         }
         .task { await vm.loadModels() }
+    }
+
+    private var planSidebar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Plan").font(.headline)
+                Spacer()
+                Button(action: { vm.showPlanSidebar = false }) { Image(systemName: "xmark") }.buttonStyle(.borderless)
+            }
+            TextEditor(text: $vm.planNotes)
+                .font(.body)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
+        }.padding(8)
     }
 
     private var threadListPane: some View {
@@ -197,9 +216,32 @@ public struct AgentAppView: View {
             branchToolbar
             Divider()
             timelineView
+            if vm.showTerminalDrawer {
+                Divider()
+                terminalDrawer.frame(minHeight: 140, idealHeight: 180, maxHeight: 280)
+            }
             Divider()
             composer
         }
+    }
+
+    private var terminalDrawer: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Terminal").font(.caption.bold())
+                Spacer()
+                Button(action: { vm.showTerminalDrawer = false }) {
+                    Image(systemName: "xmark.circle").font(.caption)
+                }.buttonStyle(.borderless)
+            }.padding(.horizontal, 8).padding(.vertical, 4)
+            ScrollView {
+                Text("(open a Terminal surface beside this Agent App for a full shell.)\nUse ⌘T to create one.")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }.background(Color.black.opacity(0.6))
     }
 
     private var branchToolbar: some View {
@@ -247,6 +289,12 @@ public struct AgentAppView: View {
                 Text("Full").tag(AgentPermissionMode.fullAccess)
             }.frame(width: 160)
             Spacer()
+            Button(action: { vm.showTerminalDrawer.toggle() }) {
+                Image(systemName: "terminal")
+            }.help("Toggle terminal drawer").buttonStyle(.borderless)
+            Button(action: { vm.showPlanSidebar.toggle() }) {
+                Image(systemName: "list.bullet.rectangle")
+            }.help("Toggle plan sidebar").buttonStyle(.borderless)
             if vm.status == .running {
                 ProgressView().controlSize(.small)
                 Button("Stop") { vm.stop() }
