@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+Package.resolved
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+.DS_Store
+*.dmg
+.idea/
+.vscode/
+fixtures.sqlite*
+*.log
