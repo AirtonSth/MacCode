@@ -12,8 +12,10 @@ public final class PaneTabsView: NSObject {
     private let tabStrip = NSStackView()
     private let contentArea = NSView()
     // Leading edge of the header: an always-visible sidebar toggle, plus
-    // the active workspace name shown only while the sidebar is collapsed.
+    // an accent workspace pill (folder icon + name) shown only while the
+    // sidebar is collapsed, so the active workspace stays obvious.
     private let leadingBox = NSStackView()
+    private let wsPill = NSStackView()
     private let wsLabel = NSTextField(labelWithString: "")
 
     public init(pane: PaneNode, router: AppCommandRouter?) {
@@ -158,12 +160,35 @@ public final class PaneTabsView: NSObject {
         let sidebarToggle = Self.makeIconButton(
             symbol: "sidebar.left", help: "Toggle sidebar",
             target: self, action: #selector(toggleSidebar))
-        wsLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let folderIcon = NSImageView()
+        folderIcon.image = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)
+        folderIcon.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        folderIcon.contentTintColor = DS.NS.accent
+        folderIcon.translatesAutoresizingMaskIntoConstraints = false
+        folderIcon.setContentHuggingPriority(.required, for: .horizontal)
+
+        wsLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         wsLabel.textColor = DS.NS.text
         wsLabel.lineBreakMode = .byTruncatingTail
         wsLabel.translatesAutoresizingMaskIntoConstraints = false
         wsLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        wsLabel.isHidden = true
+
+        // Accent capsule = "you are in this workspace". Mirrors the
+        // folder rows in the sidebar so the link is obvious.
+        wsPill.orientation = .horizontal
+        wsPill.spacing = DS.Space.xs
+        wsPill.alignment = .centerY
+        wsPill.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
+        wsPill.translatesAutoresizingMaskIntoConstraints = false
+        wsPill.wantsLayer = true
+        wsPill.layer?.cornerRadius = 11
+        wsPill.layer?.borderWidth = 1
+        wsPill.layer?.backgroundColor = DS.NS.accent.withAlphaComponent(0.18).cgColor
+        wsPill.layer?.borderColor = DS.NS.accent.withAlphaComponent(0.55).cgColor
+        wsPill.addArrangedSubview(folderIcon)
+        wsPill.addArrangedSubview(wsLabel)
+        wsPill.isHidden = true
+
         leadingBox.orientation = .horizontal
         leadingBox.spacing = DS.Space.sm
         leadingBox.alignment = .centerY
@@ -173,7 +198,7 @@ public final class PaneTabsView: NSObject {
         leadingBox.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.sm, bottom: 0, right: DS.Space.sm)
         leadingBox.translatesAutoresizingMaskIntoConstraints = false
         leadingBox.addArrangedSubview(sidebarToggle)
-        leadingBox.addArrangedSubview(wsLabel)
+        leadingBox.addArrangedSubview(wsPill)
 
         let headerBG = NSView()
         headerBG.wantsLayer = true
@@ -201,6 +226,7 @@ public final class PaneTabsView: NSObject {
             leadingBox.topAnchor.constraint(equalTo: headerBG.topAnchor),
             leadingBox.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
             wsLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 200),
+            wsPill.heightAnchor.constraint(equalToConstant: 22),
 
             stripScroll.leadingAnchor.constraint(equalTo: leadingBox.trailingAnchor),
             stripScroll.topAnchor.constraint(equalTo: headerBG.topAnchor),
@@ -296,7 +322,7 @@ public final class PaneTabsView: NSObject {
 
     @objc private func sidebarVisibilityChanged(_ note: Notification) {
         let collapsed = (note.userInfo?["collapsed"] as? Bool) ?? false
-        wsLabel.isHidden = !collapsed
+        wsPill.isHidden = !collapsed
         if collapsed { wsLabel.stringValue = currentWorkspaceName() }
         // Clear the traffic lights only when this header is at the
         // window's left edge (sidebar gone).
