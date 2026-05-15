@@ -90,19 +90,21 @@ public struct SidebarRootView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: DS.Space.sm) {
-                Text("RemoteCode 2")
-                    .font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
-                    .lineLimit(1).truncationMode(.tail)
-                Spacer(minLength: DS.Space.sm)
-                DSIconButton("plus", help: "New workspace") { vm.newWorkspace() }
-            }
-            // Left inset clears the macOS traffic-light buttons; the row
-            // is fixed at titlebar height so the text sits level with
-            // them (the sidebar ignores the top safe area, below).
-            .padding(.leading, 84).padding(.trailing, DS.Space.lg)
-            .frame(height: 38)
-            .dsBar(edge: .bottom)
+	            HStack(spacing: DS.Space.xs) {
+		                Text("RemoteCode 2")
+		                    .font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
+		                    .lineLimit(1).truncationMode(.tail)
+		                    .layoutPriority(1)
+		                Spacer(minLength: DS.Space.xs)
+		            }
+		            // Left inset clears the macOS traffic-light buttons; the row
+		            // is fixed at titlebar height so the text sits level with
+		            // them (the sidebar ignores the top safe area, below).
+		            .padding(.leading, 84).padding(.trailing, 100)
+	            .frame(height: 34)
+	            .overlay(alignment: .bottom) {
+	                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+	            }
 
             if vm.workspaces.isEmpty {
                 DSEmptyState(icon: "folder.badge.plus",

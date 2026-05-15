@@ -59,6 +59,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private let sidebar: SidebarView
     private let workspaceContainer = NSView()
+    private let collapsedWorkspaceHeader = NoDragView()
+    private let collapsedWorkspaceLabel = NSTextField(labelWithString: "")
+    private let collapsedPlusButton = NoDragButton(frame: .zero)
+    private let collapsedSidebarButton = NoDragButton(frame: .zero)
+    private let visiblePlusButton = NoDragButton(frame: .zero)
+    private let visibleSidebarButton = NoDragButton(frame: .zero)
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
     /// Retains the live pane controllers; their @objc button and tab
@@ -106,13 +112,17 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     @objc private func handleToggleSidebar() {
         sidebarCollapsed.toggle()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            ctx.allowsImplicitAnimation = true
-            sidebar.view.isHidden = sidebarCollapsed
-            if !sidebarCollapsed {
-                split.setPosition(sidebarWidth, ofDividerAt: 0)
-            }
+	        NSAnimationContext.runAnimationGroup { ctx in
+	            ctx.duration = 0.18
+	            ctx.allowsImplicitAnimation = true
+	            sidebar.view.isHidden = sidebarCollapsed
+	            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
+	            visiblePlusButton.isHidden = sidebarCollapsed
+	            visibleSidebarButton.isHidden = sidebarCollapsed
+	            updateCollapsedWorkspaceHeader()
+	            if !sidebarCollapsed {
+	                split.setPosition(sidebarWidth, ofDividerAt: 0)
+	            }
             split.layoutSubtreeIfNeeded()
         }
         NotificationCenter.default.post(
@@ -132,21 +142,35 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         sidebar.view.translatesAutoresizingMaskIntoConstraints = false
         workspaceContainer.translatesAutoresizingMaskIntoConstraints = false
 
-        workspaceContainer.wantsLayer = true
-        workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
-        split.addArrangedSubview(sidebar.view)
-        split.addArrangedSubview(workspaceContainer)
-        split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+	        workspaceContainer.wantsLayer = true
+	        workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
+	        configureCollapsedWorkspaceHeader()
+	        configureVisibleSidebarHeaderButtons()
+	        split.addArrangedSubview(sidebar.view)
+	        split.addArrangedSubview(workspaceContainer)
+	        split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
 
-        content.addSubview(split)
-        NSLayoutConstraint.activate([
-            split.topAnchor.constraint(equalTo: content.topAnchor),
-            split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            sidebar.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 220)
-        ])
-        window.contentView = content
+	        content.addSubview(split)
+	        content.addSubview(collapsedWorkspaceHeader)
+	        content.addSubview(visiblePlusButton)
+	        content.addSubview(visibleSidebarButton)
+	        NSLayoutConstraint.activate([
+	            split.topAnchor.constraint(equalTo: content.topAnchor),
+	            split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+	            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+	            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+	            sidebar.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+	            collapsedWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
+	            collapsedWorkspaceHeader.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+	            collapsedWorkspaceHeader.widthAnchor.constraint(equalToConstant: sidebarWidth),
+	            collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: 34),
+	            visibleSidebarButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
+	            visibleSidebarButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: sidebarWidth - 34),
+	            visiblePlusButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
+	            visiblePlusButton.trailingAnchor.constraint(equalTo: visibleSidebarButton.leadingAnchor, constant: -DS.Space.xs)
+	        ])
+	        collapsedWorkspaceHeader.isHidden = true
+	        window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {
             self.split.setPosition(self.sidebarWidth, ofDividerAt: 0)
@@ -157,10 +181,103 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
     }
 
-    public func refreshFromState() {
-        sidebar.refresh()
-        rebuildWorkspaceContainer()
-    }
+	    private func configureCollapsedWorkspaceHeader() {
+	        collapsedWorkspaceHeader.translatesAutoresizingMaskIntoConstraints = false
+	        collapsedWorkspaceHeader.wantsLayer = true
+	        collapsedWorkspaceHeader.layer?.backgroundColor = DS.NS.surface.cgColor
+	        collapsedWorkspaceHeader.layer?.masksToBounds = true
+
+	        collapsedWorkspaceLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+	        collapsedWorkspaceLabel.textColor = DS.NS.text
+	        collapsedWorkspaceLabel.alignment = .center
+	        collapsedWorkspaceLabel.lineBreakMode = .byTruncatingTail
+	        collapsedWorkspaceLabel.translatesAutoresizingMaskIntoConstraints = false
+
+	        configureHeaderButton(collapsedPlusButton, symbol: "plus",
+	                              help: "New workspace",
+	                              action: #selector(newWorkspace))
+	        configureHeaderButton(collapsedSidebarButton, symbol: "sidebar.left",
+	                              help: "Toggle sidebar",
+	                              action: #selector(handleToggleSidebar))
+
+	        let divider = NSView()
+	        divider.wantsLayer = true
+	        divider.layer?.backgroundColor = DS.NS.line.cgColor
+	        divider.translatesAutoresizingMaskIntoConstraints = false
+
+	        collapsedWorkspaceHeader.addSubview(collapsedWorkspaceLabel)
+	        collapsedWorkspaceHeader.addSubview(collapsedPlusButton)
+	        collapsedWorkspaceHeader.addSubview(collapsedSidebarButton)
+	        collapsedWorkspaceHeader.addSubview(divider)
+	        NSLayoutConstraint.activate([
+	            collapsedWorkspaceLabel.centerXAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerXAnchor),
+	            collapsedWorkspaceLabel.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
+	            collapsedWorkspaceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: collapsedWorkspaceHeader.leadingAnchor, constant: 84),
+	            collapsedWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: collapsedPlusButton.leadingAnchor, constant: -DS.Space.sm),
+	            collapsedPlusButton.trailingAnchor.constraint(equalTo: collapsedSidebarButton.leadingAnchor, constant: -DS.Space.xs),
+	            collapsedPlusButton.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
+	            collapsedSidebarButton.trailingAnchor.constraint(equalTo: collapsedWorkspaceHeader.trailingAnchor, constant: -DS.Space.sm),
+	            collapsedSidebarButton.centerYAnchor.constraint(equalTo: collapsedWorkspaceHeader.centerYAnchor),
+	            divider.leadingAnchor.constraint(equalTo: collapsedWorkspaceHeader.leadingAnchor),
+	            divider.trailingAnchor.constraint(equalTo: collapsedWorkspaceHeader.trailingAnchor),
+	            divider.bottomAnchor.constraint(equalTo: collapsedWorkspaceHeader.bottomAnchor),
+	            divider.heightAnchor.constraint(equalToConstant: 1)
+	        ])
+	        updateCollapsedWorkspaceHeader()
+	    }
+
+	    private func configureVisibleSidebarHeaderButtons() {
+	        configureHeaderButton(visiblePlusButton, symbol: "plus",
+	                              help: "New workspace",
+	                              action: #selector(newWorkspace))
+	        configureHeaderButton(visibleSidebarButton, symbol: "sidebar.left",
+	                              help: "Toggle sidebar",
+	                              action: #selector(handleToggleSidebar))
+	    }
+
+	    private func configureHeaderButton(_ button: NSButton, symbol: String, help: String, action: Selector) {
+	        button.translatesAutoresizingMaskIntoConstraints = false
+	        button.isBordered = false
+	        button.bezelStyle = .inline
+	        button.imagePosition = .imageOnly
+	        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: help)
+	        button.symbolConfiguration = .init(pointSize: 13, weight: .regular)
+	        button.contentTintColor = DS.NS.textSecondary
+	        button.toolTip = help
+	        button.target = self
+	        button.action = action
+	        button.wantsLayer = true
+	        button.layer?.cornerRadius = DS.Radius.control
+	        NSLayoutConstraint.activate([
+	            button.widthAnchor.constraint(equalToConstant: 26),
+	            button.heightAnchor.constraint(equalToConstant: 22)
+	        ])
+	    }
+
+	    private func updateCollapsedWorkspaceHeader() {
+	        guard let ctx = context,
+	              let wid = ctx.state.window.selectedWorkspaceID,
+	              let ws = ctx.state.workspaces[wid] else {
+	            collapsedWorkspaceLabel.stringValue = "RemoteCode 2"
+	            return
+	        }
+	        collapsedWorkspaceLabel.stringValue = ws.name
+	    }
+
+	    @objc private func newWorkspace() {
+	        let panel = NSOpenPanel()
+	        panel.canChooseFiles = false
+	        panel.canChooseDirectories = true
+	        if panel.runModal() == .OK, let url = panel.url {
+	            _ = try? router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+	        }
+	    }
+
+	    public func refreshFromState() {
+	        sidebar.refresh()
+	        updateCollapsedWorkspaceHeader()
+	        rebuildWorkspaceContainer()
+	    }
 
     public func focusSurface(_ id: SurfaceID) {
         if let s = SurfaceRegistry.shared.surface(id) {

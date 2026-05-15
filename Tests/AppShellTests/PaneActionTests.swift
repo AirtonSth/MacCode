@@ -74,6 +74,8 @@ final class PaneActionTests: XCTestCase {
         XCTAssertTrue(types.contains(.terminal))
         XCTAssertTrue(types.contains(.browser))
         XCTAssertTrue(types.contains(.agentApp))
+        XCTAssertTrue(types.contains(.rightSidebarTool),
+                      "Git must be available as a normal tab surface option")
     }
 
     func test_focusSurface_switchesSelectedTab() throws {
@@ -145,9 +147,9 @@ final class PaneActionTests: XCTestCase {
         let tooltips = allSubviews(of: ptv.view)
             .compactMap { ($0 as? NSButton)?.toolTip }
         XCTAssertFalse(tooltips.contains("Toggle sidebar"),
-                       "only the first pane should own workspace-level sidebar controls")
+                       "sidebar toggling belongs in the sidebar header, not pane tabs")
         XCTAssertFalse(tooltips.contains("Open Git (changed files & diff)"),
-                       "only the first pane should own the workspace-level Git tab")
+                       "Git is created from the + menu as a tab, not from a persistent pane header button")
         XCTAssertTrue(tooltips.contains("Split right (side by side)"))
         XCTAssertTrue(tooltips.contains("Split down (stacked)"))
     }

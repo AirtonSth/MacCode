@@ -11,19 +11,11 @@ public final class PaneTabsView: NSObject {
     public weak var router: AppCommandRouter?
     private let tabStrip = NoDragStack()
     private let contentArea = NSView()
-    // Leading edge of the header: an always-visible sidebar toggle, plus
-    // an accent workspace pill (folder icon + name) shown only while the
-    // sidebar is collapsed, so the active workspace stays obvious.
-    private let leadingBox = NoDragStack()
-    private let wsPill = NoDragStack()
-    private let wsLabel = NSTextField(labelWithString: "")
     private let addMenu = NSMenu()
-    private let showsWorkspaceControls: Bool
 
     public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true) {
         self.pane = pane
         self.router = router
-        self.showsWorkspaceControls = showsWorkspaceControls
         let v = PaneRootView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
@@ -88,7 +80,8 @@ public final class PaneTabsView: NSObject {
         let addChoices: [(String, SurfaceType)] = [
             ("Terminal", .terminal),
             ("Browser", .browser),
-            ("Agent App", .agentApp)
+            ("Agent App", .agentApp),
+            ("Git", .rightSidebarTool)
         ]
         for (label, type) in addChoices {
             let it = NSMenuItem(title: label, action: #selector(addFromMenu(_:)), keyEquivalent: "")
@@ -112,82 +105,11 @@ public final class PaneTabsView: NSObject {
             help: "Split down (stacked)",
             target: self, action: #selector(splitVertical))
 
-        // Git lives at the workspace level: this button opens a Git tab
-        // (changed files + diff) in the current pane.
-        let gitButton = Self.makeIconButton(
-            symbol: "arrow.branch",
-            help: "Open Git (changed files & diff)",
-            target: self, action: #selector(openGit))
-
-        let sep = NSBox()
-        sep.boxType = .separator
-        sep.translatesAutoresizingMaskIntoConstraints = false
-        sep.heightAnchor.constraint(equalToConstant: 16).isActive = true
-
-        // Subtle separator splitting the unified header into two zones:
-        // the scrollable tab strip (left) and the action cluster (right).
-        let zoneSep = NSBox()
-        zoneSep.boxType = .separator
-        zoneSep.translatesAutoresizingMaskIntoConstraints = false
-        zoneSep.heightAnchor.constraint(equalToConstant: 16).isActive = true
-
-        // Single unified header row: tabs scroll on the left, the action
-        // cluster (+ · git · split) stays pinned on the right.
-        let rightCluster = NoDragStack(views: showsWorkspaceControls
-            ? [zoneSep, gitButton, sep, splitColumns, splitRows]
-            : [splitColumns, splitRows])
+        let rightCluster = NoDragStack(views: [splitColumns, splitRows])
         rightCluster.orientation = .horizontal
         rightCluster.spacing = DS.Space.sm
         rightCluster.translatesAutoresizingMaskIntoConstraints = false
         rightCluster.setContentHuggingPriority(.required, for: .horizontal)
-
-        // Leading block (collapsed-sidebar only): restore button + the
-        // active workspace name, so the user still knows where they are.
-        let sidebarToggle = Self.makeIconButton(
-            symbol: "sidebar.left", help: "Toggle sidebar",
-            target: self, action: #selector(toggleSidebar))
-        let folderIcon = NSImageView()
-        folderIcon.image = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)
-        folderIcon.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
-        folderIcon.contentTintColor = DS.NS.accent
-        folderIcon.translatesAutoresizingMaskIntoConstraints = false
-        folderIcon.setContentHuggingPriority(.required, for: .horizontal)
-
-        wsLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        wsLabel.textColor = DS.NS.text
-        wsLabel.lineBreakMode = .byTruncatingTail
-        wsLabel.translatesAutoresizingMaskIntoConstraints = false
-        wsLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        // Accent capsule = "you are in this workspace". Mirrors the
-        // folder rows in the sidebar so the link is obvious.
-        wsPill.orientation = .horizontal
-        wsPill.spacing = DS.Space.xs
-        wsPill.alignment = .centerY
-        wsPill.edgeInsets = NSEdgeInsets(top: 0, left: DS.Space.md, bottom: 0, right: DS.Space.md)
-        wsPill.translatesAutoresizingMaskIntoConstraints = false
-        wsPill.wantsLayer = true
-        wsPill.layer?.cornerRadius = 11
-        wsPill.layer?.borderWidth = 1
-        wsPill.layer?.backgroundColor = DS.NS.accent.withAlphaComponent(0.18).cgColor
-        wsPill.layer?.borderColor = DS.NS.accent.withAlphaComponent(0.55).cgColor
-        wsPill.addArrangedSubview(folderIcon)
-        wsPill.addArrangedSubview(wsLabel)
-        wsPill.isHidden = true
-
-        leadingBox.orientation = .horizontal
-        leadingBox.spacing = DS.Space.sm
-        leadingBox.alignment = .centerY
-        // Only the first pane owns workspace-level controls. Split panes
-        // stay independent and expose only pane-local split actions.
-        leadingBox.edgeInsets = showsWorkspaceControls
-            ? NSEdgeInsets(top: 0, left: DS.Space.sm, bottom: 0, right: DS.Space.sm)
-            : NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-        leadingBox.translatesAutoresizingMaskIntoConstraints = false
-        if showsWorkspaceControls {
-            leadingBox.addArrangedSubview(sidebarToggle)
-            leadingBox.addArrangedSubview(wsPill)
-        }
 
         let headerBG = NSView()
         headerBG.wantsLayer = true
@@ -200,7 +122,6 @@ public final class PaneTabsView: NSObject {
         divider.translatesAutoresizingMaskIntoConstraints = false
 
         v.addSubview(headerBG)
-        headerBG.addSubview(leadingBox)
         headerBG.addSubview(tabStrip)
         headerBG.addSubview(rightCluster)
         v.addSubview(divider)
@@ -211,13 +132,7 @@ public final class PaneTabsView: NSObject {
             headerBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             headerBG.heightAnchor.constraint(equalToConstant: 34),
 
-            leadingBox.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
-            leadingBox.topAnchor.constraint(equalTo: headerBG.topAnchor),
-            leadingBox.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
-            wsLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 200),
-            wsPill.heightAnchor.constraint(equalToConstant: 22),
-
-            tabStrip.leadingAnchor.constraint(equalTo: leadingBox.trailingAnchor),
+            tabStrip.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
             tabStrip.topAnchor.constraint(equalTo: headerBG.topAnchor),
             tabStrip.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
             tabStrip.trailingAnchor.constraint(lessThanOrEqualTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
@@ -235,12 +150,6 @@ public final class PaneTabsView: NSObject {
             contentArea.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
-
-        if showsWorkspaceControls {
-            NotificationCenter.default.addObserver(
-                self, selector: #selector(sidebarVisibilityChanged(_:)),
-                name: .rc2SidebarVisibility, object: nil)
-        }
     }
 
     private func selectSurface(_ id: SurfaceID) {
@@ -273,7 +182,7 @@ public final class PaneTabsView: NSObject {
         ("Terminal", .terminal),
         ("Browser", .browser),
         ("Agent App", .agentApp),
-        ("Diff Panel", .rightSidebarTool),
+        ("Git", .rightSidebarTool),
         ("Markdown", .markdown),
         ("File Preview", .filePreview)
     ]
@@ -307,30 +216,6 @@ public final class PaneTabsView: NSObject {
 
     deinit { NotificationCenter.default.removeObserver(self) }
 
-    @objc private func toggleSidebar() {
-        guard showsWorkspaceControls else { return }
-        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
-    }
-
-    @objc private func sidebarVisibilityChanged(_ note: Notification) {
-        guard showsWorkspaceControls else { return }
-        let collapsed = (note.userInfo?["collapsed"] as? Bool) ?? false
-        wsPill.isHidden = !collapsed
-        if collapsed { wsLabel.stringValue = currentWorkspaceName() }
-        // Clear the traffic lights only when this header is at the
-        // window's left edge (sidebar gone).
-        leadingBox.edgeInsets = NSEdgeInsets(
-            top: 0, left: collapsed ? 84 : DS.Space.sm,
-            bottom: 0, right: DS.Space.sm)
-    }
-
-    private func currentWorkspaceName() -> String {
-        guard let ctx = router?.context,
-              let wid = ctx.state.window.selectedWorkspaceID,
-              let ws = ctx.state.workspaces[wid] else { return "" }
-        return ws.name
-    }
-
     @objc private func showAddMenu(_ sender: NSButton) {
         // Defer: popping the menu inside the mouse-up that triggered the
         // action makes the same event dismiss it immediately.
@@ -353,11 +238,6 @@ public final class PaneTabsView: NSObject {
 
     @objc private func splitVertical() {
         performSplit(.down, type: .terminal, title: Self.title(for: .terminal))
-    }
-
-    @objc private func openGit() {
-        // The Git surface is the workspace changed-files + diff view.
-        performAdd(.rightSidebarTool, title: "Git")
     }
 
     /// Testable seam shared by the @objc button handlers.
