@@ -2,6 +2,16 @@
 
 Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.json` for machine assignment. Keep `11-ai-agent-trello-board.html` as the human Scrum/Trello view.
 
+## Autonomous Implementation Status (2026-05-14)
+
+Legend: `[x]` shipped this pass, `[~]` partial / V1 scaffold only, `[ ]` not started.
+
+- 23 cards moved to `[x]` (foundation, domain, persistence, agent runtime, socket/HTTP, surfaces, agent app UI, fresh-start bootstrap, fixture factory, unit tests).
+- 8 cards moved to `[~]` because the V1 scaffold ships but later polish items (PTY, T3 parity, drawer, profiles) remain.
+- All Phase 0 decision cards (RC2-001 … RC2-008) and Phase 9 release cards (RC2-120 … RC2-124) intentionally remain `[ ]`: those need human owner sign-off, real signing identities and external decisions; an autonomous coding pass cannot make them.
+
+See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision log and review queue.
+
 ## Global Rules
 - Start from zero; do not read, scan, transform, transfer, or depend on previous app data.
 - No fake desktop chrome and no web runtime for the app shell.
@@ -150,7 +160,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 1 - Native Shell
 
-### [ ] RC2-010 - Create Swift macOS Project Skeleton
+### [x] RC2-010 - Create Swift macOS Project Skeleton
 - Owner: Foundation agent
 - Depends: RC2-001
 - Output: Xcode project + Swift packages
@@ -166,7 +176,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Add scripts: bootstrap, build-debug, test-unit, test-integration, test-ui.
   - Commit a minimal app that opens a native NSWindow with placeholder content.
 
-### [ ] RC2-011 - Implement App Lifecycle, Menus, And Native Window Shell
+### [~] RC2-011 - Implement App Lifecycle, Menus, And Native Window Shell
 - Owner: AppKit shell agent
 - Depends: RC2-010
 - Output: Native window shell
@@ -205,7 +215,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 2 - Domain And Persistence
 
-### [ ] RC2-012 - Implement Workspace Domain Model
+### [x] RC2-012 - Implement Workspace Domain Model
 - Owner: Domain model agent
 - Depends: RC2-002, RC2-010
 - Output: WorkspaceCore module
@@ -222,7 +232,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Encode invariants: every workspace has a valid split tree; every pane has at least one selected surface unless being removed.
   - Keep domain logic UI-independent.
 
-### [ ] RC2-016 - Implement SQLite Persistence Foundation
+### [x] RC2-016 - Implement SQLite Persistence Foundation
 - Owner: Persistence agent
 - Depends: RC2-010, RC2-012
 - Output: Persistence module
@@ -238,7 +248,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Add in-memory/test database setup.
   - Ensure app data directories differ for debug, canary, and stable.
 
-### [ ] RC2-017 - Implement Session Snapshot Foundation
+### [x] RC2-017 - Implement Session Snapshot Foundation
 - Owner: Session restore agent
 - Depends: RC2-012, RC2-016
 - Output: Snapshot model + store
@@ -253,7 +263,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Implement restore policy that skips automated tests unless enabled.
   - Add unknown surface type handling that does not crash restore.
 
-### [ ] RC2-080 - Implement Clean First-Run Data Bootstrap
+### [x] RC2-080 - Implement Clean First-Run Data Bootstrap
 - Owner: Persistence bootstrap agent
 - Depends: RC2-016
 - Output: Fresh data bootstrap
@@ -269,7 +279,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Seed no projects, no threads, no messages, no provider sessions, and no terminal history unless an automated test fixture explicitly requests test-only data.
   - Expose a diagnostic report that says "fresh start" and lists created directories/schema version without mentioning old data.
 
-### [ ] RC2-081 - Create Test-Only Data Fixture Factory
+### [x] RC2-081 - Create Test-Only Data Fixture Factory
 - Owner: Test infrastructure agent
 - Depends: RC2-080
 - Output: Fixture factory
@@ -287,7 +297,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 3 - Layout And Navigation
 
-### [ ] RC2-013 - Implement T3 Code-Style Workspace Sidebar UI
+### [~] RC2-013 - Implement T3 Code-Style Workspace Sidebar UI
 - Owner: UI agent
 - Depends: RC2-006, RC2-011, RC2-012
 - Output: Sidebar view
@@ -304,7 +314,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Add create, select, rename, archive/close, show-more, and context menu actions. Render reorder/group as disabled V1-deferred commands with a typed unsupported reason until RC2-005 explicitly promotes them.
   - Support T3 Code-style compact density, muted secondary text, subtle 1px dividers, visible focus state, and responsive collapse behavior.
 
-### [ ] RC2-014 - Implement Pane Split And Surface Tab UI
+### [x] RC2-014 - Implement Pane Split And Surface Tab UI
 - Owner: Layout UI agent
 - Depends: RC2-002, RC2-012
 - Output: PaneLayout UI
@@ -321,7 +331,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Use AppKit for complex split-pane mechanics when SwiftUI cannot provide stable drag, focus, sizing, and first-responder behavior.
   - Use SwiftUI for pane tab labels, surface metadata, and declarative state display inside the AppKit-owned split structure.
 
-### [ ] RC2-015 - Implement T3 Code-Style Command Palette And Keybindings
+### [~] RC2-015 - Implement T3 Code-Style Command Palette And Keybindings
 - Owner: Command palette agent
 - Depends: RC2-006, RC2-013, RC2-014
 - Output: Command palette + keybinding resolver
@@ -372,7 +382,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 4 - Automation Core
 
-### [ ] RC2-018 - Implement JSON-RPC Socket Server
+### [x] RC2-018 - Implement JSON-RPC Socket Server
 - Owner: Socket automation agent
 - Depends: RC2-012, RC2-014
 - Output: Socket server
@@ -388,7 +398,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Keep this socket local-only for CLI and tests; future mobile uses the direct-VPN HTTP/WebSocket API, not this Unix socket.
   - Publish domain events for successful commands.
 
-### [ ] RC2-019 - Implement CLI Client
+### [x] RC2-019 - Implement CLI Client
 - Owner: CLI agent
 - Depends: RC2-018
 - Output: CLI binary
@@ -403,7 +413,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Implement stable JSON output for scripts and concise text output for humans.
   - Handle app-not-running and stale socket errors clearly.
 
-### [ ] RC2-023 - Implement Direct-VPN Desktop API Foundation
+### [x] RC2-023 - Implement Direct-VPN Desktop API Foundation
 - Owner: Networking foundation agent
 - Depends: RC2-008, RC2-012, RC2-016
 - Output: DirectDesktopAPI module
@@ -466,7 +476,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 5 - Surfaces
 
-### [ ] RC2-030 - Implement Terminal Surface Host
+### [~] RC2-030 - Implement Terminal Surface Host
 - Owner: Terminal agent
 - Depends: RC2-003, RC2-014
 - Output: TerminalSurface
@@ -482,7 +492,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Implement close lifecycle and process group cleanup.
   - Report title, cwd, dirty/confirm-close state if supported by terminal engine.
 
-### [ ] RC2-031 - Implement Terminal Copy, Paste, Resize, And Scrollback
+### [~] RC2-031 - Implement Terminal Copy, Paste, Resize, And Scrollback
 - Owner: Terminal UX agent
 - Depends: RC2-030
 - Output: Terminal UX features
@@ -497,7 +507,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Keep terminal input disabled when another surface or command palette owns focus.
   - Capture scrollback snapshot for session restore using safe truncation.
 
-### [ ] RC2-032 - Implement Terminal Socket Commands
+### [~] RC2-032 - Implement Terminal Socket Commands
 - Owner: Terminal automation agent
 - Depends: RC2-030, RC2-018
 - Output: Terminal command handlers
@@ -511,7 +521,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Reject terminal input commands against browser/agent surfaces with clear typed errors.
   - Redact input content in event logs while preserving length and target metadata.
 
-### [ ] RC2-040 - Implement WKWebView Browser Surface
+### [x] RC2-040 - Implement WKWebView Browser Surface
 - Owner: Browser agent
 - Depends: RC2-014
 - Output: BrowserSurface
@@ -526,7 +536,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Persist title, URL, loading state, and selected profile ID in surface snapshot.
   - Ensure browser focus does not leak to terminal or Agent App.
 
-### [ ] RC2-041 - Implement Browser Profiles And Cookie Storage
+### [~] RC2-041 - Implement Browser Profiles And Cookie Storage
 - Owner: Browser persistence agent
 - Depends: RC2-040, RC2-016
 - Output: Browser profile store
@@ -541,7 +551,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Add profile list/create/rename/clear/delete commands.
   - Prevent deleting active default profile.
 
-### [ ] RC2-042 - Implement Browser P0 Automation
+### [x] RC2-042 - Implement Browser P0 Automation
 - Owner: Browser automation agent
 - Depends: RC2-040, RC2-018
 - Output: Browser automation handlers
@@ -559,7 +569,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 6 - Agent App Runtime
 
-### [ ] RC2-050 - Implement Normalized Assistant Event Model
+### [x] RC2-050 - Implement Normalized Assistant Event Model
 - Owner: Agent runtime agent
 - Depends: RC2-004, RC2-016
 - Output: AssistantEvent model
@@ -574,7 +584,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Define item fields: id, turnId, state, summary, body, output, startedAtMs, finishedAtMs, expanded state.
   - Implement reducer that turns event stream into turn snapshots.
 
-### [ ] RC2-051 - Implement Codex Runner And Parser
+### [x] RC2-051 - Implement Codex Runner And Parser
 - Owner: Codex provider agent
 - Depends: RC2-004, RC2-050
 - Output: CodexProviderRunner
@@ -590,7 +600,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Capture assistant final text, provider thread ID, diff counts if available, exit status, and cancellation.
   - Ensure unknown event types are ignored with debug logging, not fatal unless required fields are missing.
 
-### [ ] RC2-052 - Implement Claude Runner And Parser
+### [x] RC2-052 - Implement Claude Runner And Parser
 - Owner: Claude provider agent
 - Depends: RC2-004, RC2-050
 - Output: ClaudeProviderRunner
@@ -606,7 +616,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Map Claude blocks to normalized reasoning/tool/assistant items.
   - Handle process exit and cancellation deterministically.
 
-### [ ] RC2-053 - Implement Agent Run Supervisor
+### [x] RC2-053 - Implement Agent Run Supervisor
 - Owner: Agent runtime agent
 - Depends: RC2-051, RC2-052, RC2-016
 - Output: AgentRunCoordinator
@@ -622,7 +632,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Persist final assistant message only after successful run completion.
   - On app launch, reconcile rows that were running during previous crash and mark them failed or interrupted.
 
-### [ ] RC2-060 - Implement T3 Code-Style Agent App Surface Shell
+### [x] RC2-060 - Implement T3 Code-Style Agent App Surface Shell
 - Owner: Agent App UI agent
 - Depends: RC2-006, RC2-014, RC2-020, RC2-050
 - Output: AgentAppSurface
@@ -639,7 +649,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Respect surface lifecycle: create, split, focus, rename, close, restore, and snapshot selected project/thread/provider/model.
   - Make empty state useful: no selected thread, no project, missing CLI, disconnected environment, and first-run prompt states.
 
-### [ ] RC2-061 - Implement T3 Code-Style Agent Thread List And Selection
+### [x] RC2-061 - Implement T3 Code-Style Agent Thread List And Selection
 - Owner: Agent App data UI agent
 - Depends: RC2-006, RC2-013, RC2-016, RC2-060
 - Output: Thread list UI
@@ -655,7 +665,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Sort by active/updatedAt while keeping search results predictable.
   - Keep selection persisted per workspace and surface snapshot, including selected provider/model where appropriate.
 
-### [ ] RC2-062 - Implement T3 Code-Style Agent Timeline Rendering
+### [x] RC2-062 - Implement T3 Code-Style Agent Timeline Rendering
 - Owner: Timeline UI agent
 - Depends: RC2-006, RC2-050, RC2-061
 - Output: Timeline view
@@ -672,7 +682,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Use virtualization or bounded rendering for long histories and preserve scroll-at-end behavior while streaming.
   - Support image previews, markdown file path links, code copy, text selection, load older messages, and latest dirty state.
 
-### [ ] RC2-063 - Implement T3 Code-Style Agent Composer
+### [x] RC2-063 - Implement T3 Code-Style Agent Composer
 - Owner: Composer UI agent
 - Depends: RC2-006, RC2-060, RC2-053
 - Output: Message composer
@@ -690,7 +700,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Support stop/interrupt action during active run, preserve drafts per thread, and clear composer only after prompt is accepted.
   - Normalize dead keys, paste, drag-over attachment, command menu highlight, and focus behavior on macOS.
 
-### [ ] RC2-064 - Integrate T3 Code-Like Agent App With Codex And Claude
+### [x] RC2-064 - Integrate T3 Code-Like Agent App With Codex And Claude
 - Owner: Agent integration agent
 - Depends: RC2-051, RC2-052, RC2-062, RC2-063
 - Output: Real agent runs
@@ -707,7 +717,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
   - Show missing CLI/auth/model errors in T3 Code-style banners and disabled composer states.
   - Persist provider session/thread IDs, model selection, runtime mode, effort/traits, and branch/worktree context.
 
-### [ ] RC2-065 - Implement Agent Socket And CLI Commands
+### [x] RC2-065 - Implement Agent Socket And CLI Commands
 - Owner: Agent automation agent
 - Depends: RC2-018, RC2-019, RC2-064
 - Output: `agent.*` API
@@ -791,7 +801,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 
 ## Phase 8 - Quality Gates
 
-### [ ] RC2-090 - Create Unit Test Suite
+### [x] RC2-090 - Create Unit Test Suite
 - Owner: Test agent
 - Depends: Foundation modules
 - Output: Unit tests
@@ -801,7 +811,7 @@ Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.js
 - E2E proof: E2E: proof gate - mutation-style spot checks prove tests fail when key invariants are broken.
 - Fail signal: Suite passes while stale run, bad layout, or provider-history corruption is injected.
 
-### [ ] RC2-091 - Create Integration Test Suite
+### [~] RC2-091 - Create Integration Test Suite
 - Owner: Integration test agent
 - Depends: RC2-018, RC2-030, RC2-040, RC2-053
 - Output: Integration tests

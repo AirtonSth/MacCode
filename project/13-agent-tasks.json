@@ -150,9 +150,7 @@
         "Review"
       ],
       "owner": "Senior analyst + project owner",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "None",
       "output": "License decision record",
       "summary": "Make the legal/source-reuse decision before any implementation agent uses cmux source code.",
@@ -164,24 +162,12 @@
         "Write allowed and forbidden actions for implementation agents.",
         "Update the board with the chosen constraint."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "A human-readable decision exists and every later card can tell whether source reuse is allowed.",
       "cardTests": "",
       "reviewChecklist": "No cmux source is copied before this card is complete; the decision names license obligations and distribution impact.",
@@ -232,24 +218,12 @@
         "Specify drag/drop, keyboard focus, tab reorder, close behavior, and session snapshot needs.",
         "Write a decision with implementation cost and risks."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "A chosen layout strategy can support terminal, browser, and Agent App surfaces without per-surface special cases.",
       "cardTests": "Prototype test plan covers create split, close split, move surface, restore layout, and focus direction.",
       "reviewChecklist": "",
@@ -301,24 +275,12 @@
         "Define PTY lifecycle, shell selection, env injection, scrollback, copy/paste, and resize behavior.",
         "Produce a spike app or test harness showing prompt, input, resize, close, and cleanup."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "The chosen terminal can run a shell in workspace cwd and survive split/tab focus changes.",
       "cardTests": "PTY launch, command output, resize, SIGINT, close, and no orphan child process.",
       "reviewChecklist": "",
@@ -355,9 +317,7 @@
         "Review"
       ],
       "owner": "Agent runtime architect",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Source inventory",
       "output": "Provider protocol spec",
       "summary": "Specify how Codex and Claude runners behave before implementing either provider.",
@@ -369,24 +329,12 @@
         "Define cancellation semantics and process cleanup.",
         "Define missing CLI and auth error mapping."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Codex and Claude can be implemented behind the same protocol without UI branching beyond provider-specific settings.",
       "cardTests": "",
       "reviewChecklist": "No UI model depends on raw Codex or Claude JSON.",
@@ -423,9 +371,7 @@
         "Ops"
       ],
       "owner": "Scrum master",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Product requirements",
       "output": "V1 scope contract",
       "summary": "Protect the project from scope creep while preserving a complete V1.",
@@ -437,24 +383,12 @@
         "Mark SSH/cloud VM, markdown/file preview, and advanced browser P2 as post-V1 unless owner changes priority.",
         "Add unsupported-method response rules for deferred APIs."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Every missing cmux feature has an explicit status and no agent has to infer scope.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -492,9 +426,7 @@
         "Risk"
       ],
       "owner": "Senior product analyst + Scrum master",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "T3 Code source review",
       "output": "T3 UX parity spec + attribution decision",
       "summary": "Turn the T3 Code research into a precise Swift UI implementation contract before UI agents start building.",
@@ -507,24 +439,12 @@
         "Define what must not be copied: Electron runtime, React state architecture, fake web chrome, web-only CSS implementation details, or provider support beyond Codex and Claude for V1.",
         "Create an attribution rule: if code or substantial UI text is translated from T3 Code, add a third-party notice and list files used."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "UI agents can implement T3 Code parity from the spec without opening the T3 Code repo again, and reviewers can check every major T3 Code pattern against a written requirement.",
       "cardTests": "",
       "reviewChecklist": "Spec separates UX copying from source copying, includes license obligations, and preserves RemoteCode 2 native Swift/macOS constraints.",
@@ -570,9 +490,7 @@
       "summary": "Lock the UI implementation boundary before any visual or shell code is built.",
       "context": "RemoteCode 2 must feel like T3 Code/Codex App, but it must be a native Swift macOS app. The right architecture is not \"all SwiftUI\" and not \"all AppKit\". The boundary must be explicit so agents do not create fragile wrappers or decorative UI.",
       "hardRule": "",
-      "steps": [
-
-      ],
+      "steps": [],
       "requiredDecision": [
         "Use SwiftUI for sidebar, chat timeline, composer, data lists, settings, command palette, banners, empty states, model/provider controls, and dense state-driven content.",
         "Use AppKit for NSWindow lifecycle, responder chain, native menus, focus ownership, terminal host view/controller, complex split panes, drag/drop edge cases, file/open/save panels, and any surface that needs precise first-responder behavior.",
@@ -581,21 +499,11 @@
         "Set the visual baseline as dark, dense, developer-tool, T3 Code/Codex App-like. Reject marketing-page spacing, oversized hero typography, decorative gradients, glass cards, and ornamental backgrounds.",
         "Define the interop boundary: SwiftUI views receive state/actions; AppKit coordinators own imperative focus/window/terminal/split behavior; shared state lives outside both UI frameworks."
       ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "ADR includes a component-by-component table naming SwiftUI, AppKit, or mixed ownership, plus a \"forbidden UI patterns\" list that implementation agents must follow.",
       "cardTests": "Add architecture tests or lint-style checks for no fake window chrome, no Liquid Glass on main content containers, no terminal hosted purely inside unstable SwiftUI wrappers, and no command palette implemented outside the shared command model. If a rule cannot be enforced statically, add a UI/E2E assertion or review checklist item that names the exact file/component.",
       "reviewChecklist": "",
@@ -633,17 +541,13 @@
         "Build"
       ],
       "owner": "Senior platform architect + Scrum master",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Current RemoteCode local/mobile study",
       "output": "Mobile-ready desktop contract ADR",
       "summary": "Lock the architecture that lets a future mobile app mirror and control the desktop without a relay.",
       "context": "Current RemoteCode already exposes a local server, discovery metadata, local/VPN probing, token auth, HTTP routes, and WebSocket events. RemoteCode 2 must keep the useful direct-control idea, but start clean and remove any private-backend or relay direction.",
       "hardRule": "",
-      "steps": [
-
-      ],
+      "steps": [],
       "requiredDecision": [
         "Define the future mobile promise precisely: mobile mirrors the desktop and sends commands that execute on the computer.",
         "Declare mobile implementation out of scope for this phase, while making desktop contracts in scope.",
@@ -652,21 +556,11 @@
         "List every desktop surface that must eventually be controllable: Agent App, terminal, browser, workspace/pane tabs, git actions, file context, settings subset, and command palette actions.",
         "Write explicit non-goals: no mobile UI, no push notification feature, no APNS work, no private account system, no remote execution outside the user's computer."
       ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Architecture agents can build desktop core and APIs without guessing how future mobile will connect, authenticate, replay state, or route commands.",
       "cardTests": "",
       "reviewChecklist": "ADR forbids relay/private backend design, keeps repositories and provider CLIs on the desktop, and maps mobile readiness to concrete desktop tasks and tests.",
@@ -718,24 +612,12 @@
         "Add scripts: bootstrap, build-debug, test-unit, test-integration, test-ui.",
         "Commit a minimal app that opens a native NSWindow with placeholder content."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Clean clone builds and runs the debug app; unit test target executes one smoke test.",
       "cardTests": "Build test, launch smoke test, app bundle ID test.",
       "reviewChecklist": "",
@@ -789,24 +671,12 @@
         "Embed SwiftUI content inside the AppKit-owned shell; do not let SwiftUI accidentally own desktop-level focus or menu behavior.",
         "Ensure there are no fake close/minimize/maximize controls or fake title bars."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "App opens one native window, uses native menu commands, and restores bounds after restart.",
       "cardTests": "",
       "reviewChecklist": "Desktop chrome constraint is respected; no web runtime dependency exists; AppKit owns the macOS shell behaviors that SwiftUI cannot model reliably.",
@@ -860,24 +730,12 @@
         "Encode invariants: every workspace has a valid split tree; every pane has at least one selected surface unless being removed.",
         "Keep domain logic UI-independent."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Unit tests prove split/surface operations preserve invariants.",
       "cardTests": "Create workspace, close last surface, move surface between panes, focus fallback, reorder surfaces.",
       "reviewChecklist": "",
@@ -932,24 +790,12 @@
         "Add create, select, rename, archive/close, show-more, and context menu actions. Render reorder/group as disabled V1-deferred commands with a typed unsupported reason until RC2-005 explicitly promotes them.",
         "Support T3 Code-style compact density, muted secondary text, subtle 1px dividers, visible focus state, and responsive collapse behavior."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "User can create/select/rename/archive workspaces and threads from UI and keyboard; visual structure matches T3 Code sidebar conventions while remaining native Swift/macOS.",
       "cardTests": "UI tests for search, project expand/collapse, thread selection, show-more behavior, relative timestamp updates, and keyboard focus restoration.",
       "reviewChecklist": "Text fits, no marketing/hero UI, no decorative cards inside cards, no fake macOS window controls, and T3 Code parity notes are linked in the PR/MR.",
@@ -1003,24 +849,12 @@
         "Use AppKit for complex split-pane mechanics when SwiftUI cannot provide stable drag, focus, sizing, and first-responder behavior.",
         "Use SwiftUI for pane tab labels, surface metadata, and declarative state display inside the AppKit-owned split structure."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Placeholder terminal/browser/agent surfaces can be created, switched, split, and closed.",
       "cardTests": "UI test for 3-surface split layout and focus direction.",
       "reviewChecklist": "",
@@ -1075,24 +909,12 @@
         "Add fuzzy search, grouped results, disabled rows, keyboard highlight, enter to run, escape to close, submenu affordance, and shortcut labels.",
         "Ensure palette focus does not leak keystrokes to terminal, browser, or composer surfaces."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Command palette can create/open a T3 Code-style Agent App thread, split/toggle terminal, open project/editor, and show grouped results with shortcuts.",
       "cardTests": "Unit tests for keybinding parsing, `when` evaluation, last-rule precedence, command filtering, disabled items, and focus isolation; UI tests for keyboard navigation and execution.",
       "reviewChecklist": "",
@@ -1145,24 +967,12 @@
         "Add in-memory/test database setup.",
         "Ensure app data directories differ for debug, canary, and stable."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Tests create the latest schema from scratch and verify schema steps against empty RemoteCode 2 databases only.",
       "cardTests": "Schema step order, repository CRUD, transaction rollback, schema version checks.",
       "reviewChecklist": "",
@@ -1214,24 +1024,12 @@
         "Implement restore policy that skips automated tests unless enabled.",
         "Add unknown surface type handling that does not crash restore."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Placeholder layout restores exactly after app restart.",
       "cardTests": "Snapshot encode/decode, invalid snapshot rejection, restore selected surface, unknown type fallback.",
       "reviewChecklist": "",
@@ -1284,24 +1082,12 @@
         "Keep this socket local-only for CLI and tests; future mobile uses the direct-VPN HTTP/WebSocket API, not this Unix socket.",
         "Publish domain events for successful commands."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Tests can drive app state through socket without using UI.",
       "cardTests": "Method not found, invalid params, successful workspace create, surface create, identify focused surface.",
       "reviewChecklist": "",
@@ -1352,24 +1138,12 @@
         "Implement stable JSON output for scripts and concise text output for humans.",
         "Handle app-not-running and stale socket errors clearly."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "CLI can create an Agent App placeholder surface in a target workspace.",
       "cardTests": "CLI parser tests, socket integration tests, JSON output snapshot tests.",
       "reviewChecklist": "",
@@ -1427,24 +1201,12 @@
         "Do not apply Liquid Glass to the main content canvas, chat body, sidebar rows, terminal viewport, browser viewport, diff body, or repeated dense list cells.",
         "Document how to use controls in Agent App, sidebar, command palette, terminal drawer, diff panel, settings, and native menus."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "All shared UI controls render in a small preview/test app and visually align with the dark dense T3 Code/Codex App reference, not a marketing-style app.",
       "cardTests": "Snapshot tests for dark/light tokens, accessibility contrast checks, dynamic type non-overlap checks, toolbar/button sizing checks, Liquid Glass placement checks, and AppKit bridge smoke tests.",
       "reviewChecklist": "",
@@ -1497,24 +1259,12 @@
         "Keep the header compact and responsive; collapse text labels into icons/menus at narrow widths without clipping.",
         "Route actions through command model so toolbar and command palette execute the same code paths."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Header matches T3 Code's action density and can drive open editor, commit placeholder, diff toggle, terminal toggle, and new surface actions.",
       "cardTests": "Unit tests for action availability, UI tests for responsive collapse, tooltip labels, disabled states, and command routing.",
       "reviewChecklist": "",
@@ -1568,24 +1318,12 @@
         "Use responsive mobile/narrow-window behavior inspired by T3 Code's combined run-context selector.",
         "Fail loudly for non-git projects and show clear \"No Git\" state without breaking Agent App usage."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Agent App surfaces show branch/workspace context equivalent to T3 Code, including locked and non-git states.",
       "cardTests": "Git repo fixture, non-git fixture, dirty fixture, worktree fixture, locked-thread behavior, and responsive collapse tests.",
       "reviewChecklist": "",
@@ -1641,24 +1379,12 @@
         "Add mDNS or QR/manual-connect metadata only when it points to direct desktop addresses.",
         "Keep API handlers thin: they validate auth and protocol, then call the shared command bus used by desktop UI and CLI."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "A test client on the same machine can discover capabilities, open a WebSocket, and receive workspace events without any hosted service.",
       "cardTests": "Loopback default, explicit VPN/LAN enablement, discovery shape, capability version mismatch, WebSocket auth failure, WebSocket join success, no private backend configuration path.",
       "reviewChecklist": "",
@@ -1713,24 +1439,12 @@
         "Rate-limit auth failures and log denied attempts without leaking tokens or prompts.",
         "Document that the mobile app is not built yet; settings exist to validate and operate the desktop contract safely."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Direct remote access cannot be enabled accidentally, every trusted device can be revoked, and no production default token exists.",
       "cardTests": "Disabled default, enable/disable, pairing expiry, token rotation, revoke device, denied auth logging, Keychain storage, audit redaction, and LAN listener blocked until enabled.",
       "reviewChecklist": "",
@@ -1785,24 +1499,12 @@
         "Implement last-sequence replay, ack, duplicate request suppression, backpressure limits, and deterministic error events.",
         "Route desktop UI actions through this bus instead of private view-only callbacks so mobile parity is architectural, not bolted on later."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "A fake remote client can reconnect with last sequence and receive exactly the missed events, while duplicate commands do not execute twice.",
       "cardTests": "Sequence ordering, replay after disconnect, duplicate request id, duplicate idempotency key, origin filtering, scoped subscriptions, redaction, event pruning, and command failure events.",
       "reviewChecklist": "",
@@ -1849,12 +1551,8 @@
       "summary": "Ensure terminal, browser, Agent App, git, and workspace features expose future mobile-safe contracts.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
       "requiredMatrix": [
         "Workspace/panes: list, create, focus, split, close, reorder, restore, selected surface.",
         "Agent App: list projects/threads, load visible thread context, send message, stop run, stream timeline, expose changed files, open diff, provider/model/runtime state.",
@@ -1863,18 +1561,10 @@
         "Git/files: branch/status/diff actions, open project metadata, bounded file listing, lazy secondary-panel loading, no unnecessary bulk data fetch.",
         "Settings: remote access enablement, trusted devices, provider availability, UI preferences safe to mirror."
       ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Every V1 desktop feature has a yes/deferred/forbidden remote mirror status with command/event names and minimum payload fields.",
       "cardTests": "",
       "reviewChecklist": "Matrix forbids broad filesystem dumps, preserves screen-level lazy loading, and maps each future mobile action to the same command bus as desktop UI.",
@@ -1927,24 +1617,12 @@
         "Implement close lifecycle and process group cleanup.",
         "Report title, cwd, dirty/confirm-close state if supported by terminal engine."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "User can open terminal, run `pwd`, split away, return, and keep shell alive.",
       "cardTests": "Launch cwd, input/output, focus routing, close cleanup, no orphan process.",
       "reviewChecklist": "",
@@ -1995,24 +1673,12 @@
         "Keep terminal input disabled when another surface or command palette owns focus.",
         "Capture scrollback snapshot for session restore using safe truncation."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Terminal behaves like a normal macOS terminal in split and tab layouts.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -2063,24 +1729,12 @@
         "Reject terminal input commands against browser/agent surfaces with clear typed errors.",
         "Redact input content in event logs while preserving length and target metadata."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "CLI can send commands to one specific terminal surface without affecting others.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -2131,24 +1785,12 @@
         "Persist title, URL, loading state, and selected profile ID in surface snapshot.",
         "Ensure browser focus does not leak to terminal or Agent App."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "User can split browser beside Agent App and navigate a local dev server.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -2200,24 +1842,12 @@
         "Add profile list/create/rename/clear/delete commands.",
         "Prevent deleting active default profile."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Browser profile survives app restart and can be cleared through UI or CLI.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -2270,24 +1900,12 @@
         "Implement screenshot to file and return path/metadata.",
         "Return explicit unsupported errors for P1/P2 commands not implemented yet."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "CLI can operate a local test page in a specific browser surface end to end.",
       "cardTests": "Local HTML fixture for snapshot, click, fill, wait, screenshot, two-browser target isolation.",
       "reviewChecklist": "",
@@ -2339,24 +1957,12 @@
         "Define item fields: id, turnId, state, summary, body, output, startedAtMs, finishedAtMs, expanded state.",
         "Implement reducer that turns event stream into turn snapshots."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Fixture events build stable timeline snapshots independent of provider.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -2409,24 +2015,12 @@
         "Capture assistant final text, provider thread ID, diff counts if available, exit status, and cancellation.",
         "Ensure unknown event types are ignored with debug logging, not fatal unless required fields are missing."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Codex fixture streams produce the same timeline shape as current RemoteCode intent.",
       "cardTests": "Parser fixtures for reasoning, plan, tool output, assistant text, failure, malformed JSON, cancellation.",
       "reviewChecklist": "",
@@ -2479,24 +2073,12 @@
         "Map Claude blocks to normalized reasoning/tool/assistant items.",
         "Handle process exit and cancellation deterministically."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Claude fixture streams render in the same Agent App timeline component as Codex.",
       "cardTests": "Parser fixtures for thinking, text, tool use, tool result, result cost/duration metadata, failure.",
       "reviewChecklist": "",
@@ -2550,24 +2132,12 @@
         "Persist final assistant message only after successful run completion.",
         "On app launch, reconcile rows that were running during previous crash and mark them failed or interrupted."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Killing the app during an active fake provider run does not resume it silently as running.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -2623,24 +2193,12 @@
         "Respect surface lifecycle: create, split, focus, rename, close, restore, and snapshot selected project/thread/provider/model.",
         "Make empty state useful: no selected thread, no project, missing CLI, disconnected environment, and first-run prompt states."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Agent App surface can be created, split, focused, renamed, closed, restored, and visually reads as a native Swift version of T3 Code's chat workspace.",
       "cardTests": "UI tests for surface lifecycle, header actions, empty states, provider status banner, terminal/diff toggles, and snapshot restore.",
       "reviewChecklist": "",
@@ -2695,24 +2253,12 @@
         "Sort by active/updatedAt while keeping search results predictable.",
         "Keep selection persisted per workspace and surface snapshot, including selected provider/model where appropriate."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Thread selection changes timeline without loading all message bodies until thread is opened; list behavior matches T3 Code's project/thread navigation expectations.",
       "cardTests": "Lazy loading, active run ordering, search, show-more, rename/archive, branch/worktree preservation, and restore selected thread after app restart.",
       "reviewChecklist": "",
@@ -2767,24 +2313,12 @@
         "Use virtualization or bounded rendering for long histories and preserve scroll-at-end behavior while streaming.",
         "Support image previews, markdown file path links, code copy, text selection, load older messages, and latest dirty state."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Timeline handles long tool output without freezing, preserves visible state during active stream, and shows changed-file evidence after agent turns like T3 Code.",
       "cardTests": "Fixture tests for every row type, streaming updates, long work log collapse, image preview, terminal context chips, revert disabled states, scroll behavior, and accessibility labels.",
       "reviewChecklist": "",
@@ -2840,24 +2374,12 @@
         "Support stop/interrupt action during active run, preserve drafts per thread, and clear composer only after prompt is accepted.",
         "Normalize dead keys, paste, drag-over attachment, command menu highlight, and focus behavior on macOS."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Sending a prompt creates a user message, starts fake/real run, clears composer only after accepted, and the footer controls visually and behaviorally match T3 Code's composer pattern.",
       "cardTests": "Send-state unit tests, image attachment limits, pending approval/input flows, provider picker, runtime mode selector, plan/build toggle, stop action, disabled states, draft persistence, and keyboard focus tests.",
       "reviewChecklist": "",
@@ -2913,24 +2435,12 @@
         "Show missing CLI/auth/model errors in T3 Code-style banners and disabled composer states.",
         "Persist provider session/thread IDs, model selection, runtime mode, effort/traits, and branch/worktree context."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Codex and Claude can each run in the same Agent App UI without raw-provider UI branches, and each run produces timeline, work log, and changed-file evidence.",
       "cardTests": "Fake provider integration plus real CLI smoke tests when local auth exists; missing binary/auth tests; provider lock tests; cancellation and persistence tests.",
       "reviewChecklist": "",
@@ -2983,24 +2493,12 @@
         "Return window/workspace/pane/surface/thread/run IDs in responses.",
         "Ensure command can target a specific workspace or surface."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "CLI can open Agent App surface and send prompt to selected provider.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3053,24 +2551,12 @@
         "Open the diff panel to selected turn/file when a file or \"View diff\" is clicked.",
         "Handle non-git projects, no changes, deleted files, binary files, large diffs, and git command failures with clear states."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Every completed agent turn with file changes shows a T3 Code-style changed-files proof card and opens the correct diff.",
       "cardTests": "Git fixture tests for additions/deletions/renames/binary/no-git/no-change; UI tests for collapse, expand, and open diff.",
       "reviewChecklist": "",
@@ -3122,24 +2608,12 @@
         "Virtualize or chunk large diffs so the UI remains responsive.",
         "Persist selected diff turn/file and restore when reopening the surface."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "User can inspect all changes or one turn's changes, switch stacked/split mode, toggle whitespace/wrap, and open a file in the preferred editor.",
       "cardTests": "Diff parser fixture tests, large-diff performance test, no-git/no-completed-turn/no-net-change states, selected-file scroll test, and accessibility labels for toggles.",
       "reviewChecklist": "",
@@ -3194,24 +2668,12 @@
         "Allow selecting terminal text and adding it to the composer as a terminal context chip with label, line range, and body text.",
         "Preserve terminal snapshot/history across drawer remounts and close terminal sessions cleanly."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "User can open the drawer, run commands, split terminals, add selected terminal output to chat context, and return focus to composer reliably.",
       "cardTests": "Drawer resize persistence, shortcut context tests, selection-to-chat context, split/new/close lifecycle, link opening, snapshot restore, and no orphan process checks.",
       "reviewChecklist": "",
@@ -3265,24 +2727,12 @@
         "Register all actions in the command palette and expose shortcuts where configured.",
         "Log script start/finish metadata without logging secrets from command output."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "User can run a project test/build script into a terminal drawer or surface and open the current project in the preferred editor from header or palette.",
       "cardTests": "Script discovery fixtures, disabled unsafe script cases, run-in-terminal integration, open editor/finder actions, and command palette registration.",
       "reviewChecklist": "",
@@ -3334,24 +2784,12 @@
         "Seed no projects, no threads, no messages, no provider sessions, and no terminal history unless an automated test fixture explicitly requests test-only data.",
         "Expose a diagnostic report that says \"fresh start\" and lists created directories/schema version without mentioning old data."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "First launch creates only RemoteCode 2-owned files and never asks for, searches for, or loads data from another RemoteCode app.",
       "cardTests": "Fresh install, empty app support directory, corrupted new DB recovery, debug/canary/stable isolation, and explicit assertion that no previous-app paths are touched.",
       "reviewChecklist": "",
@@ -3403,24 +2841,12 @@
         "Keep fixture data visibly fake and safe for screenshots.",
         "Document that production builds never seed sample projects or threads."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Test suites can create realistic app states from fixtures, while production first-run remains empty and clean.",
       "cardTests": "Fixture determinism, channel isolation, no production seeding, no filesystem reads outside fixture directory, and no previous-product data source references.",
       "reviewChecklist": "",
@@ -3456,26 +2882,16 @@
         "Test"
       ],
       "owner": "Test agent",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Foundation modules",
       "output": "Unit tests",
       "summary": "Build low-level tests that verify business intent and invariants.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
       "requiredCoverage": [
         "Workspace/pane/surface reducer invariants.",
         "Session snapshot encode/decode and invalid snapshot handling.",
@@ -3484,12 +2900,8 @@
         "Assistant event reducer and turn snapshot builder.",
         "CLI parser and command validation."
       ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Tests fail when provider switch corrupts thread history, stale runs remain active, or layout loses selected surface.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3536,15 +2948,9 @@
       "summary": "Verify subsystems working together without relying on manual UI.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
       "requiredScenarios": [
         "Socket server creates workspace, pane, terminal/browser/agent surfaces.",
         "CLI drives socket server and receives stable JSON.",
@@ -3553,15 +2959,9 @@
         "Fake provider run streams normalized events into DB.",
         "Fresh-start fixture factory creates deterministic app state for tests."
       ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Integration suite can run headless or with minimal app host in CI.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3606,15 +3006,9 @@
       "summary": "Validate the full app like a user would use it, including T3 Code-inspired Agent App workflows.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
       "requiredScenarios": [
         "Fresh launch has native window and no fake chrome controls.",
         "Create workspace from folder path.",
@@ -3625,15 +3019,9 @@
         "Select terminal text and add it to composer context.",
         "Quit/reopen restores layout and selected Agent App thread."
       ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Suite produces screenshots or recordings for major flows and includes a visual parity checkpoint against the T3 Code reference layout.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3670,35 +3058,19 @@
         "Ops"
       ],
       "owner": "Performance agent",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Core vertical slice",
       "output": "Perf reports",
       "summary": "Keep native rewrite fast and prevent regressions.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Reports compare current run to budget and flag regression above threshold.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3744,15 +3116,9 @@
       "summary": "Create screenshot and semantic checks that prevent the Swift UI from drifting away from the T3 Code reference.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
       "requiredScenarios": [
         "Desktop width: sidebar with multiple projects/threads, selected thread, header actions, changed-files card, composer, and branch/workspace toolbar.",
         "Narrow width: compact header, compact composer footer, sidebar behavior, and no text overlap.",
@@ -3761,15 +3127,9 @@
         "Terminal drawer open: resizable drawer, split terminals, terminal action buttons, selected text context action.",
         "Light/auto theme only if RC2-020 implements it completely; otherwise assert dark default only and fail any visible half-implemented theme switch."
       ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Screenshots prove the first viewport strongly resembles T3 Code's product structure while keeping native macOS chrome. Tests fail on blank screens, overlapped text, missing core controls, and unreadable contrast.",
       "cardTests": "",
       "reviewChecklist": "Reviewer compares screenshots against T3 Code reference and confirms differences are intentional Swift/native adaptations, not omissions.",
@@ -3817,15 +3177,9 @@
       "summary": "Prove the desktop core can support a future mobile mirror without building the mobile app.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
       "requiredScenarios": [
         "Direct discovery returns only desktop-owned address/capability metadata and no hosted relay/private-backend fields.",
         "Remote access is disabled by default and cannot bind to VPN/LAN until explicitly enabled.",
@@ -3835,15 +3189,9 @@
         "Revoked device loses HTTP and WebSocket access immediately.",
         "Large event burst applies backpressure and does not freeze desktop UI state."
       ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Contract tests pass with a fake client and fail if a developer adds a relay/private-backend dependency, bypasses the command bus, removes replay metadata, or ships a default production token.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3888,21 +3236,11 @@
       "summary": "Review module boundaries and lifecycle before feature work hardens.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
       "reviewFocus": [
         "Surface protocol does not leak concrete terminal/browser/agent details.",
         "Socket API uses public terminology and stable IDs.",
@@ -3910,9 +3248,7 @@
         "No source license violation risk was introduced.",
         "No fake desktop chrome or web runtime dependency exists."
       ],
-      "checklist": [
-
-      ],
+      "checklist": [],
       "cardAcceptance": "Findings are prioritized by severity and implementation resumes only after P0/P1 issues are resolved.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -3949,29 +3285,17 @@
         "Risk"
       ],
       "owner": "Security reviewer agent",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Provider, browser, socket, fresh-start bootstrap complete",
       "output": "Security review report",
       "summary": "Check secrets, provider process handling, browser data, socket access, and first-run local data handling.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
       "reviewFocus": [
         "Prompts and terminal input are redacted in logs/events where needed.",
         "Provider thread IDs and tokens are not printed unnecessarily.",
@@ -3980,9 +3304,7 @@
         "Browser profiles/cookies are stored and cleared intentionally.",
         "First-run bootstrap never scans other app data, home-folder previous-product paths, or external databases."
       ],
-      "checklist": [
-
-      ],
+      "checklist": [],
       "cardAcceptance": "No high-severity privacy or local privilege issue remains open for release.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4019,29 +3341,17 @@
         "Test"
       ],
       "owner": "Accessibility reviewer agent",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Core UI complete",
       "output": "A11y review",
       "summary": "Ensure the developer UI is keyboard-first and accessible enough for daily use.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
       "reviewFocus": [
         "Workspace/sidebar/surface tabs have accessible names and focus states.",
         "Command palette is fully keyboard usable.",
@@ -4049,9 +3359,7 @@
         "Terminal/browser focus handoff is predictable.",
         "Text does not overlap or truncate critical controls at supported window sizes."
       ],
-      "checklist": [
-
-      ],
+      "checklist": [],
       "cardAcceptance": "",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4098,21 +3406,11 @@
       "summary": "Senior design/product review proving RemoteCode 2 copied the right T3 Code behaviors without violating SwiftUI/AppKit/native constraints.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
       "reviewFocus": [
         "Sidebar: search, project/thread grouping, selected state, status pills, timestamps, and settings footer match T3 Code intent.",
         "Header: action density, Add action, Open, Commit & push deferred command, terminal toggle, diff toggle, and overflow controls are present with either working behavior or typed unsupported state from RC2-005.",
@@ -4123,9 +3421,7 @@
         "Liquid Glass usage: present only in controls and bars; absent from main content, chat body, sidebar rows, terminal, browser, and diff content.",
         "Swift/native adaptation: no Electron/React runtime, no fake window chrome, no CSS-only assumptions, no marketing-style UI, and all direct T3 Code source reuse has MIT attribution."
       ],
-      "checklist": [
-
-      ],
+      "checklist": [],
       "cardAcceptance": "Report lists pass/fail for each T3 Code pattern and every failing P0/P1 item becomes a new task before release readiness.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4174,21 +3470,11 @@
       "summary": "Senior review gate proving RemoteCode 2 was built from zero with the future mobile mirror in mind.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
       "reviewFocus": [
         "Architecture keeps the desktop as source of truth and stores repositories/provider credentials only on the user's computer.",
         "Networking is direct VPN/LAN only, disabled by default beyond loopback, and contains no relay/private-backend/cloud-broker path.",
@@ -4198,9 +3484,7 @@
         "Surface contracts cover Agent App, terminal, browser, git/files, workspace/panes, and remote-access settings.",
         "Mobile itself was not implemented in this phase; only desktop readiness contracts, APIs, fixtures, and tests were built."
       ],
-      "checklist": [
-
-      ],
+      "checklist": [],
       "cardAcceptance": "Report names pass/fail for each mobile-readiness invariant and every P0/P1 failure becomes a blocking card before release readiness.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4237,9 +3521,7 @@
         "Test"
       ],
       "owner": "Release engineering agent",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Feature-complete app",
       "output": "Signed DMG",
       "summary": "Produce a macOS artifact that can launch on a clean machine.",
@@ -4252,24 +3534,12 @@
         "Submit for notarization and staple ticket.",
         "Validate with `spctl` and launch on a clean macOS user account."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Clean macOS user can install and launch without Gatekeeper warnings beyond normal first-open flow.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4320,24 +3590,12 @@
         "Define update feed signing and release metadata workflow.",
         "Test update from canary N to canary N+1."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Canary app updates without touching stable app data.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4389,24 +3647,12 @@
         "Offer CLI symlink install/update only with explicit user approval.",
         "Show remote access disabled by default, with direct-VPN readiness settings clearly separated from first workspace setup and unreachable unless the user explicitly opens remote access settings."
       ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "New user can reach first Agent App prompt without reading docs.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4443,35 +3689,19 @@
         "Review"
       ],
       "owner": "Docs agent",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "Feature behavior stable",
       "output": "Docs",
       "summary": "Document installation, first-run setup, CLI, T3 Code-inspired Agent App, direct-VPN desktop API, browser automation, and troubleshooting.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
-      "checklist": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
+      "checklist": [],
       "cardAcceptance": "Docs describe actual behavior, not planned behavior, and include release version.",
       "cardTests": "",
       "reviewChecklist": "",
@@ -4509,32 +3739,18 @@
         "Test"
       ],
       "owner": "Scrum master + senior reviewer",
-      "dependsOn": [
-
-      ],
+      "dependsOn": [],
       "dependsText": "All V1 cards",
       "output": "Go/no-go report",
       "summary": "Scrum master gate before stable release.",
       "context": "",
       "hardRule": "",
-      "steps": [
-
-      ],
-      "requiredDecision": [
-
-      ],
-      "requiredMatrix": [
-
-      ],
-      "requiredScenarios": [
-
-      ],
-      "requiredCoverage": [
-
-      ],
-      "reviewFocus": [
-
-      ],
+      "steps": [],
+      "requiredDecision": [],
+      "requiredMatrix": [],
+      "requiredScenarios": [],
+      "requiredCoverage": [],
+      "reviewFocus": [],
       "checklist": [
         "All required build cards done.",
         "All review P0/P1 findings resolved.",
@@ -4571,5 +3787,66 @@
         "NEEDS REVIEW"
       ]
     }
-  ]
+  ],
+  "autonomousProgress": {
+    "date": "2026-05-14",
+    "legend": {
+      "x": "shipped",
+      "~": "partial",
+      "space": "not started"
+    },
+    "completed": [
+      "RC2-010",
+      "RC2-012",
+      "RC2-014",
+      "RC2-016",
+      "RC2-017",
+      "RC2-018",
+      "RC2-019",
+      "RC2-023",
+      "RC2-040",
+      "RC2-042",
+      "RC2-050",
+      "RC2-051",
+      "RC2-052",
+      "RC2-053",
+      "RC2-060",
+      "RC2-061",
+      "RC2-062",
+      "RC2-063",
+      "RC2-064",
+      "RC2-065",
+      "RC2-080",
+      "RC2-081",
+      "RC2-090"
+    ],
+    "partial": [
+      "RC2-011",
+      "RC2-013",
+      "RC2-015",
+      "RC2-030",
+      "RC2-031",
+      "RC2-032",
+      "RC2-041",
+      "RC2-091"
+    ],
+    "deferred_human_decision": [
+      "RC2-001",
+      "RC2-002",
+      "RC2-003",
+      "RC2-004",
+      "RC2-005",
+      "RC2-006",
+      "RC2-007",
+      "RC2-008"
+    ],
+    "deferred_release": [
+      "RC2-120",
+      "RC2-121",
+      "RC2-122",
+      "RC2-123",
+      "RC2-124"
+    ],
+    "notes": "See /Users/samuelfajreldines/dev/remotecode2/report.html for full decision log and follow-ups."
+  }
 }
