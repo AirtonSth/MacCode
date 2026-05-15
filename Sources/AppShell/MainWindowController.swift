@@ -72,6 +72,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private var paneControllers: [PaneTabsView] = []
     private var sidebarCollapsed = false
     private var sidebarWidth: CGFloat = 260
+    private let collapsedHeaderHeight: CGFloat = 34
+    private var splitTopConstraint: NSLayoutConstraint?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -112,18 +114,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     @objc private func handleToggleSidebar() {
         sidebarCollapsed.toggle()
-	        NSAnimationContext.runAnimationGroup { ctx in
-	            ctx.duration = 0.18
-	            ctx.allowsImplicitAnimation = true
-	            sidebar.view.isHidden = sidebarCollapsed
-	            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
-	            visiblePlusButton.isHidden = sidebarCollapsed
-	            visibleSidebarButton.isHidden = sidebarCollapsed
-	            updateCollapsedWorkspaceHeader()
-	            if !sidebarCollapsed {
-	                split.setPosition(sidebarWidth, ofDividerAt: 0)
-	            }
-            split.layoutSubtreeIfNeeded()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.allowsImplicitAnimation = true
+            sidebar.view.isHidden = sidebarCollapsed
+            splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
+            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
+            visiblePlusButton.isHidden = sidebarCollapsed
+            visibleSidebarButton.isHidden = sidebarCollapsed
+            updateCollapsedWorkspaceHeader()
+            if !sidebarCollapsed {
+                split.setPosition(sidebarWidth, ofDividerAt: 0)
+            }
+            window.contentView?.layoutSubtreeIfNeeded()
         }
         NotificationCenter.default.post(
             name: .rc2SidebarVisibility, object: nil,
@@ -142,35 +145,37 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         sidebar.view.translatesAutoresizingMaskIntoConstraints = false
         workspaceContainer.translatesAutoresizingMaskIntoConstraints = false
 
-	        workspaceContainer.wantsLayer = true
-	        workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
-	        configureCollapsedWorkspaceHeader()
-	        configureVisibleSidebarHeaderButtons()
-	        split.addArrangedSubview(sidebar.view)
-	        split.addArrangedSubview(workspaceContainer)
-	        split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+        workspaceContainer.wantsLayer = true
+        workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
+        configureCollapsedWorkspaceHeader()
+        configureVisibleSidebarHeaderButtons()
+        split.addArrangedSubview(sidebar.view)
+        split.addArrangedSubview(workspaceContainer)
+        split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
 
-	        content.addSubview(split)
-	        content.addSubview(collapsedWorkspaceHeader)
-	        content.addSubview(visiblePlusButton)
-	        content.addSubview(visibleSidebarButton)
-	        NSLayoutConstraint.activate([
-	            split.topAnchor.constraint(equalTo: content.topAnchor),
-	            split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-	            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-	            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-	            sidebar.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
-	            collapsedWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
-	            collapsedWorkspaceHeader.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-	            collapsedWorkspaceHeader.widthAnchor.constraint(equalToConstant: sidebarWidth),
-	            collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: 34),
-	            visibleSidebarButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
-	            visibleSidebarButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: sidebarWidth - 34),
-	            visiblePlusButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
-	            visiblePlusButton.trailingAnchor.constraint(equalTo: visibleSidebarButton.leadingAnchor, constant: -DS.Space.xs)
-	        ])
-	        collapsedWorkspaceHeader.isHidden = true
-	        window.contentView = content
+        content.addSubview(split)
+        content.addSubview(collapsedWorkspaceHeader)
+        content.addSubview(visiblePlusButton)
+        content.addSubview(visibleSidebarButton)
+        let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor)
+        splitTopConstraint = splitTop
+        NSLayoutConstraint.activate([
+            splitTop,
+            split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            sidebar.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            collapsedWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
+            collapsedWorkspaceHeader.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            collapsedWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight),
+            visibleSidebarButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
+            visibleSidebarButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: sidebarWidth - 34),
+            visiblePlusButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
+            visiblePlusButton.trailingAnchor.constraint(equalTo: visibleSidebarButton.leadingAnchor, constant: -DS.Space.xs)
+        ])
+        collapsedWorkspaceHeader.isHidden = true
+        window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {
             self.split.setPosition(self.sidebarWidth, ofDividerAt: 0)
