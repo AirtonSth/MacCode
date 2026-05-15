@@ -76,6 +76,23 @@ final class PaneActionTests: XCTestCase {
         XCTAssertTrue(types.contains(.agentApp))
     }
 
+    func test_focusSurface_switchesSelectedTab() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "s", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let termID = pane0.surfaces.first!.id              // default terminal
+        let v = PaneTabsView(pane: pane0, router: router)
+        let agent = v.performAdd(.agentApp, title: "Agent App")!
+        // Adding selects the new tab.
+        guard case .pane(let p1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(p1.selectedSurfaceID, agent.id)
+        // Clicking the terminal tab must switch the selection back.
+        try router.focusSurface(workspace: ws.id, surface: termID)
+        guard case .pane(let p2) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(p2.selectedSurfaceID, termID,
+                       "focusing another tab must change the visible surface")
+    }
+
     func test_closeSurface_removesTabFromPane() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "c", cwd: NSTemporaryDirectory())

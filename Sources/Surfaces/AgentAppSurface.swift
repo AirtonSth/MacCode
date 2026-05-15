@@ -143,7 +143,7 @@ public struct AgentAppView: View {
     public var body: some View {
         HSplitView {
             threadRail
-                .frame(minWidth: 200, idealWidth: 230, maxWidth: 320)
+                .frame(minWidth: 150, idealWidth: 165, maxWidth: 220)
             conversationColumn
                 .frame(minWidth: 460)
             if vm.showPlanSidebar {

@@ -177,6 +177,10 @@ public final class AppCommandRouter: CommandRouting {
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
         try context?.apply(.focusSurface(workspace, surface))
+        // Rebuild the pane so the newly selected tab's surface actually
+        // becomes the visible content (the custom tab strip has no
+        // built-in content switching like NSTabView did).
+        windowController?.refreshFromState()
         windowController?.focusSurface(surface)
     }
 
