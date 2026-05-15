@@ -119,6 +119,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
         }
 
+        // Read remaining body bytes if Content-Length declares more
+        // than we already have.
+        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        let bodyStartAbsolute = headerEnd.upperBound
+        var bodyHave = buffer.count - bodyStartAbsolute
+        while running, bodyHave < contentLength {
+            let n = read(fd, &tmp, tmp.count)
+            if n <= 0 { break }
+            buffer.append(tmp, count: n)
+            bodyHave += n
+        }
+
         // WebSocket upgrade
         if method == "GET", path == "/v1/ws",
            headers["upgrade"]?.lowercased() == "websocket",
@@ -155,9 +167,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
         }
 
-        // POST body for pair endpoints
-        let bodyStart = headerEnd.upperBound
-        let bodyData = buffer.subdata(in: bodyStart..<buffer.endIndex)
+        // POST body for pair endpoints; honor Content-Length read above.
+        let bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
 
         switch (method, path) {
         case ("GET", "/healthz"):
