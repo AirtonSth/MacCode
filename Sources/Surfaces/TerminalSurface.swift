@@ -18,6 +18,8 @@ public final class TerminalSurface: NSObject, Surface {
     private var masterFD: Int32 = -1
     private var childPID: pid_t = -1
     private var readSource: DispatchSourceRead?
+    private let renderer = ANSIRenderer(rows: 40, cols: 120)
+    private var pendingFlush = false
 
     public init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         self.descriptor = SurfaceDescriptor(
@@ -123,46 +125,27 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func appendDataAsync(_ data: Data) {
-        let s = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
-        appendString(s)
+        renderer.feed(data)
+        descriptor.hasUnreadActivity = true
+        scheduleFlush()
+    }
+
+    private func scheduleFlush() {
+        if pendingFlush { return }
+        pendingFlush = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.pendingFlush = false
+            let snap = self.renderer.snapshot()
+            self.textView.textStorage?.setAttributedString(snap)
+            self.textView.scrollToEndOfDocument(nil)
+        }
     }
 
     private func appendString(_ raw: String) {
-        let clean = stripAnsi(raw)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.white
-        ]
-        textView.textStorage?.append(NSAttributedString(string: clean, attributes: attrs))
-        textView.scrollToEndOfDocument(nil)
-        descriptor.hasUnreadActivity = true
-    }
-
-    private func stripAnsi(_ s: String) -> String {
-        var out = ""
-        var i = s.startIndex
-        while i < s.endIndex {
-            let c = s[i]
-            if c == "\u{1B}" {
-                var j = s.index(after: i)
-                if j < s.endIndex, s[j] == "[" {
-                    j = s.index(after: j)
-                    while j < s.endIndex {
-                        let cc = s[j]
-                        if cc.isLetter || cc == "~" { j = s.index(after: j); break }
-                        j = s.index(after: j)
-                    }
-                    i = j
-                    continue
-                } else {
-                    i = j
-                    continue
-                }
-            }
-            out.append(c)
-            i = s.index(after: i)
-        }
-        return out
+        guard let data = raw.data(using: .utf8) else { return }
+        renderer.feed(data)
+        scheduleFlush()
     }
 
     @objc private func submit() {

@@ -78,6 +78,11 @@ let package = Package(
             name: "SocketServerTests",
             dependencies: ["SocketServer", "CoreModel", "Persistence"],
             path: "Tests/SocketServerTests"
+        ),
+        .testTarget(
+            name: "SurfacesTests",
+            dependencies: ["Surfaces", "CoreModel"],
+            path: "Tests/SurfacesTests"
         )
     ],
     swiftLanguageVersions: [.v5]
