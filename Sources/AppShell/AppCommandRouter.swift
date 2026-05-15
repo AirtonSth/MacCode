@@ -210,10 +210,12 @@ public final class AppCommandRouter: CommandRouting {
             case .agentApp:
                 guard let ctx = context else { return descriptor }
                 surface = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: baseTitle)
-            case .markdown, .filePreview, .rightSidebarTool:
-                // V1-deferred surface types; we still return the descriptor
-                // so callers receive a typed unsupported state instead of a
-                // crash. See project/14-reference-repos-distillation.md.
+            case .markdown:
+                let path = title // optional: pass file path via title for now
+                surface = MarkdownSurface(workspaceID: workspace, filePath: path, title: baseTitle)
+            case .filePreview:
+                surface = FilePreviewSurface(workspaceID: workspace, filePath: title, title: baseTitle)
+            case .rightSidebarTool:
                 return descriptor
             }
             let finalDescriptor = SurfaceDescriptor(id: surface.descriptor.id, type: type, title: baseTitle, iconName: surface.descriptor.iconName, metadata: surface.descriptor.metadata)
