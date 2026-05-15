@@ -31,7 +31,7 @@
   <table>
     <tr><th>cmux capability</th><th>RemoteCode 2 V1 target</th><th>Notes</th></tr>
     <tr><td>Native macOS Swift/AppKit app</td><td>Required</td><td>Core rewrite requirement.</td></tr>
-    <tr><td>Vertical workspaces/sidebar</td><td>Required</td><td>Workspace rows show cwd, git branch, notifications, active agent state, and optional port metadata.</td></tr>
+    <tr><td>Vertical workspaces/sidebar</td><td>Required</td><td>Workspace rows show cwd, git branch, notifications, active agent state, and port metadata when a detector exists; otherwise show a typed unavailable state.</td></tr>
     <tr><td>Horizontal surface tabs inside panes</td><td>Required</td><td>Surfaces include terminal, browser, agentApp.</td></tr>
     <tr><td>Split panes</td><td>Required</td><td>Split right/down and directional focus are core workflows.</td></tr>
     <tr><td>Ghostty terminal</td><td>Required if license path allows</td><td>Use cmux-style libghostty. Fallback must meet terminal pass criteria before V1.</td></tr>
@@ -41,7 +41,7 @@
     <tr><td>Notifications and unread routing</td><td>Required</td><td>Agent completion/attention should light workspace/surface like cmux.</td></tr>
     <tr><td>Session restore</td><td>Required</td><td>Add Agent App snapshots to cmux-style snapshot tree.</td></tr>
     <tr><td>SSH/remote daemon/cloud VM</td><td>Defer unless explicitly required</td><td>Keep API placeholders only if needed for future parity.</td></tr>
-    <tr><td>Markdown/file preview/right sidebar tools</td><td>Defer or import after core</td><td>Not central to requested RemoteCode value. Document if omitted from V1.</td></tr>
+    <tr><td>Markdown/file preview/right sidebar tools</td><td>Defer until after core</td><td>Not central to requested RemoteCode value. Document if omitted from V1.</td></tr>
   </table>
 
   <h2>Socket API Families</h2>

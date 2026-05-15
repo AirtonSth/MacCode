@@ -1,0 +1,4575 @@
+{
+  "schemaVersion": "1.0",
+  "generatedFrom": "11-ai-agent-trello-board.html",
+  "generatedAt": "2026-05-15T00:59:29Z",
+  "confidenceTarget": "98%+ with Trello + TODO + machine-readable JSON",
+  "productTarget": "Native Swift macOS cmux-like developer tool with terminal, browser, and T3 Code/Codex App-style Agent App for Codex and Claude.",
+  "hardRules": [
+    "Start from zero; do not read, scan, transform, transfer, or depend on previous app data.",
+    "No fake desktop chrome and no web runtime for the app shell.",
+    "SwiftUI owns data-driven UI; AppKit owns window, responder chain, menus, focus, terminal host, complex splits, and panels.",
+    "Liquid Glass only on controls and bars, never main content.",
+    "Future mobile is not built now; desktop core must be direct-VPN-ready from day zero.",
+    "No relay, no private backend, no cloud broker, no connector id, no hosted repository mirror, no cloud command queue.",
+    "No task is done without acceptance, automated tests, E2E/proof, and fail-signal evidence."
+  ],
+  "requiredCommandGates": [
+    "./scripts/bootstrap",
+    "./scripts/build-debug",
+    "./scripts/test-unit",
+    "./scripts/test-integration",
+    "./scripts/test-ui",
+    "./scripts/test-visual",
+    "./scripts/test-direct-vpn-contract",
+    "./scripts/test-security",
+    "./scripts/test-performance",
+    "./scripts/release-candidate-check"
+  ],
+  "phases": [
+    {
+      "name": "Phase 0 - Decisions",
+      "taskIds": [
+        "RC2-001",
+        "RC2-002",
+        "RC2-003",
+        "RC2-004",
+        "RC2-005",
+        "RC2-006",
+        "RC2-007",
+        "RC2-008"
+      ]
+    },
+    {
+      "name": "Phase 1 - Native Shell",
+      "taskIds": [
+        "RC2-010",
+        "RC2-011",
+        "RC2-020"
+      ]
+    },
+    {
+      "name": "Phase 2 - Domain And Persistence",
+      "taskIds": [
+        "RC2-012",
+        "RC2-016",
+        "RC2-017",
+        "RC2-080",
+        "RC2-081"
+      ]
+    },
+    {
+      "name": "Phase 3 - Layout And Navigation",
+      "taskIds": [
+        "RC2-013",
+        "RC2-014",
+        "RC2-015",
+        "RC2-021",
+        "RC2-022"
+      ]
+    },
+    {
+      "name": "Phase 4 - Automation Core",
+      "taskIds": [
+        "RC2-018",
+        "RC2-019",
+        "RC2-023",
+        "RC2-024",
+        "RC2-025",
+        "RC2-026"
+      ]
+    },
+    {
+      "name": "Phase 5 - Surfaces",
+      "taskIds": [
+        "RC2-030",
+        "RC2-031",
+        "RC2-032",
+        "RC2-040",
+        "RC2-041",
+        "RC2-042"
+      ]
+    },
+    {
+      "name": "Phase 6 - Agent App Runtime",
+      "taskIds": [
+        "RC2-050",
+        "RC2-051",
+        "RC2-052",
+        "RC2-053",
+        "RC2-060",
+        "RC2-061",
+        "RC2-062",
+        "RC2-063",
+        "RC2-064",
+        "RC2-065"
+      ]
+    },
+    {
+      "name": "Phase 7 - Work Evidence And Project Actions",
+      "taskIds": [
+        "RC2-066",
+        "RC2-067",
+        "RC2-068",
+        "RC2-069"
+      ]
+    },
+    {
+      "name": "Phase 8 - Quality Gates",
+      "taskIds": [
+        "RC2-090",
+        "RC2-091",
+        "RC2-092",
+        "RC2-093",
+        "RC2-094",
+        "RC2-095",
+        "RC2-100",
+        "RC2-101",
+        "RC2-102",
+        "RC2-103",
+        "RC2-104"
+      ]
+    },
+    {
+      "name": "Phase 9 - Release",
+      "taskIds": [
+        "RC2-120",
+        "RC2-121",
+        "RC2-122",
+        "RC2-123",
+        "RC2-124"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "RC2-001",
+      "title": "Resolve cmux Licensing Strategy",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Risk",
+        "Review"
+      ],
+      "owner": "Senior analyst + project owner",
+      "dependsOn": [
+
+      ],
+      "dependsText": "None",
+      "output": "License decision record",
+      "summary": "Make the legal/source-reuse decision before any implementation agent uses cmux source code.",
+      "context": "cmux is GPL-3.0-or-later or commercial. RemoteCode 2 can either become GPL-compatible, use a commercial license, or clean-room implement behavior without source copy.",
+      "hardRule": "",
+      "steps": [
+        "Document whether RemoteCode 2 will copy cmux code, depend on cmux packages, or only use behavioral reference.",
+        "List affected components: Bonsplit/layout, Ghostty integration, browser automation, socket/CLI API, session restore.",
+        "Write allowed and forbidden actions for implementation agents.",
+        "Update the board with the chosen constraint."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "A human-readable decision exists and every later card can tell whether source reuse is allowed.",
+      "cardTests": "",
+      "reviewChecklist": "No cmux source is copied before this card is complete; the decision names license obligations and distribution impact.",
+      "verification": {
+        "acceptanceCriteria": "License decision names allowed source use, dependency use, notices, and distribution impact.",
+        "automatedTests": "Script checks source-use inventory and required third-party notice placeholders.",
+        "e2eProofGate": "E2E: proof gate - a dry-run implementation agent can classify cmux allowed/forbidden actions without asking.",
+        "failSignal": "Any cmux code copy starts before approval, or obligations remain ambiguous."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-002",
+      "title": "Choose Layout Engine Strategy",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Risk",
+        "Build"
+      ],
+      "owner": "Architecture agent",
+      "dependsOn": [
+        "RC2-001"
+      ],
+      "dependsText": "RC2-001",
+      "output": "Layout ADR + prototype criteria",
+      "summary": "Decide how RemoteCode 2 will implement workspaces, panes, splits, and surface tabs.",
+      "context": "The app must behave like cmux: vertical workspaces, split panes, and horizontal surface tabs. Do not assume Bonsplit by default; choose between Bonsplit, licensed cmux layout code, and custom split-tree only after the license/package review is written.",
+      "hardRule": "",
+      "steps": [
+        "Evaluate Bonsplit, licensed cmux layout code, and a custom split-tree implementation.",
+        "Define core model types: Window, Workspace, Pane, Surface, SplitNode, PaneNode.",
+        "Specify drag/drop, keyboard focus, tab reorder, close behavior, and session snapshot needs.",
+        "Write a decision with implementation cost and risks."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "A chosen layout strategy can support terminal, browser, and Agent App surfaces without per-surface special cases.",
+      "cardTests": "Prototype test plan covers create split, close split, move surface, restore layout, and focus direction.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Chosen layout model supports workspaces, split panes, tabs, focus, restore, and all surface types.",
+        "automatedTests": "Prototype reducer tests for split, close, move, focus, restore, and invalid layout rejection.",
+        "e2eProofGate": "E2E: prototype app creates terminal, browser, and Agent App placeholders in a 3-pane layout and restores after relaunch.",
+        "failSignal": "Any surface needs special layout handling or focus is lost after split/restore."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-003",
+      "title": "Choose Terminal Engine Strategy",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Risk",
+        "Build",
+        "Test"
+      ],
+      "owner": "Terminal architecture agent",
+      "dependsOn": [
+        "RC2-001"
+      ],
+      "dependsText": "RC2-001",
+      "output": "Terminal ADR + proof checklist",
+      "summary": "Prove the terminal technology before building the rest of the shell around it.",
+      "context": "cmux quality depends on a real terminal. Current RemoteCode used xterm through Electrobun; RemoteCode 2 should be native.",
+      "hardRule": "",
+      "steps": [
+        "Evaluate libghostty integration, SwiftTerm, and minimal PTY+view alternatives.",
+        "Confirm build requirements for arm64 and x86_64 if universal release is required.",
+        "Define PTY lifecycle, shell selection, env injection, scrollback, copy/paste, and resize behavior.",
+        "Produce a spike app or test harness showing prompt, input, resize, close, and cleanup."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "The chosen terminal can run a shell in workspace cwd and survive split/tab focus changes.",
+      "cardTests": "PTY launch, command output, resize, SIGINT, close, and no orphan child process.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Terminal engine can launch shell, render prompt, route input, resize, signal, and clean up.",
+        "automatedTests": "PTY lifecycle tests for cwd, output, resize, SIGINT, close, and orphan detection.",
+        "e2eProofGate": "E2E: spike app opens terminal, runs `pwd`, resizes pane, sends interrupt, closes, and proves no child remains.",
+        "failSignal": "Terminal view blanks, input leaks, resize breaks prompt, or process survives close."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-004",
+      "title": "Define Provider Runtime Contract",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Build",
+        "Review"
+      ],
+      "owner": "Agent runtime architect",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Source inventory",
+      "output": "Provider protocol spec",
+      "summary": "Specify how Codex and Claude runners behave before implementing either provider.",
+      "context": "Current RemoteCode has separate Codex and Claude parsers that emit one assistant event model. Swift must preserve that separation.",
+      "hardRule": "",
+      "steps": [
+        "Define `AgentProviderRunner`, `AgentRunRequest`, `AgentRunHandle`, and `AgentProviderEvent`.",
+        "Define supported provider options: model, reasoning effort, permission mode, cwd, prompt, provider thread ID.",
+        "Define cancellation semantics and process cleanup.",
+        "Define missing CLI and auth error mapping."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Codex and Claude can be implemented behind the same protocol without UI branching beyond provider-specific settings.",
+      "cardTests": "",
+      "reviewChecklist": "No UI model depends on raw Codex or Claude JSON.",
+      "verification": {
+        "acceptanceCriteria": "Provider contract covers Codex and Claude request fields, stream events, errors, cancellation, and missing auth.",
+        "automatedTests": "Contract fixture tests assert both providers map into the same normalized event schema.",
+        "e2eProofGate": "E2E: proof gate - fake provider run renders in Agent App timeline without provider-specific UI branches.",
+        "failSignal": "UI depends on raw Codex/Claude JSON or cancellation semantics differ silently."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-005",
+      "title": "Define V1 Scope And Deferred cmux Features",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Review",
+        "Ops"
+      ],
+      "owner": "Scrum master",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Product requirements",
+      "output": "V1 scope contract",
+      "summary": "Protect the project from scope creep while preserving a complete V1.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Classify all cmux families as V1 required, V1 partial, or post-V1.",
+        "Confirm terminal, browser P0, Agent App, CLI/socket, persistence, clean first-run bootstrap, QA, signing are V1 required.",
+        "Mark SSH/cloud VM, markdown/file preview, and advanced browser P2 as post-V1 unless owner changes priority.",
+        "Add unsupported-method response rules for deferred APIs."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Every missing cmux feature has an explicit status and no agent has to infer scope.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "V1 scope lists required, partial, and deferred cmux features with unsupported-method rules.",
+        "automatedTests": "Scope lint verifies every feature family has status and every deferred API has an error rule.",
+        "e2eProofGate": "E2E: proof gate - unsupported API smoke call returns typed not-supported error with docs link.",
+        "failSignal": "Agent must infer scope or missing feature appears as silent no-op."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-006",
+      "title": "Create T3 Code UX Reference Spec",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Review",
+        "Build",
+        "Risk"
+      ],
+      "owner": "Senior product analyst + Scrum master",
+      "dependsOn": [
+
+      ],
+      "dependsText": "T3 Code source review",
+      "output": "T3 UX parity spec + attribution decision",
+      "summary": "Turn the T3 Code research into a precise Swift UI implementation contract before UI agents start building.",
+      "context": "RemoteCode 2 must be a Swift-native app, but the Agent App and general interface should copy T3 Code's product behavior and visual structure. T3 Code is MIT; source translation requires attribution. This card prevents vague \"inspired by\" work.",
+      "hardRule": "",
+      "steps": [
+        "Read T3 Code README, KEYBINDINGS, LICENSE, `apps/web/src/components/Sidebar.tsx`, `AppSidebarLayout.tsx`, `ChatView.tsx`, `chat/ChatHeader.tsx`, `chat/ChatComposer.tsx`, `chat/MessagesTimeline.tsx`, `DiffPanel.tsx`, `ThreadTerminalDrawer.tsx`, `CommandPaletteResults.tsx`, and `BranchToolbar.tsx`.",
+        "Write a Swift-facing UX spec mapping each T3 Code surface to RemoteCode 2 components: sidebar, header toolbar, branch/workspace toolbar, timeline, composer, diff panel, terminal drawer, command palette, settings.",
+        "Define exact visual tokens to reproduce: dense dark surface, 1px borders, subtle muted text, compact icon buttons, small rounded controls, project/thread rows, status pills, diff additions/deletions, and bottom composer proportions.",
+        "Define what must not be copied: Electron runtime, React state architecture, fake web chrome, web-only CSS implementation details, or provider support beyond Codex and Claude for V1.",
+        "Create an attribution rule: if code or substantial UI text is translated from T3 Code, add a third-party notice and list files used."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "UI agents can implement T3 Code parity from the spec without opening the T3 Code repo again, and reviewers can check every major T3 Code pattern against a written requirement.",
+      "cardTests": "",
+      "reviewChecklist": "Spec separates UX copying from source copying, includes license obligations, and preserves RemoteCode 2 native Swift/macOS constraints.",
+      "verification": {
+        "acceptanceCriteria": "T3 Code UX spec maps sidebar, header, timeline, composer, diff, terminal drawer, command palette, settings, and attribution.",
+        "automatedTests": "Spec lint checks required T3 sections, file references, license decision, and forbidden copy list.",
+        "e2eProofGate": "E2E: proof gate - visual checklist can evaluate a full Agent App screenshot against T3 Code structure.",
+        "failSignal": "Implementation agent still needs to reopen T3 Code to know core UI behavior."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-007",
+      "title": "Define SwiftUI, AppKit, And Liquid Glass UI Ownership",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Review",
+        "Build",
+        "Risk"
+      ],
+      "owner": "Senior macOS UI architect",
+      "dependsOn": [
+        "RC2-006"
+      ],
+      "dependsText": "RC2-006",
+      "output": "UI ownership ADR",
+      "summary": "Lock the UI implementation boundary before any visual or shell code is built.",
+      "context": "RemoteCode 2 must feel like T3 Code/Codex App, but it must be a native Swift macOS app. The right architecture is not \"all SwiftUI\" and not \"all AppKit\". The boundary must be explicit so agents do not create fragile wrappers or decorative UI.",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+        "Use SwiftUI for sidebar, chat timeline, composer, data lists, settings, command palette, banners, empty states, model/provider controls, and dense state-driven content.",
+        "Use AppKit for NSWindow lifecycle, responder chain, native menus, focus ownership, terminal host view/controller, complex split panes, drag/drop edge cases, file/open/save panels, and any surface that needs precise first-responder behavior.",
+        "Use Liquid Glass only for controls and bars: toolbars, compact segmented controls, icon buttons, command palette shell, modal/action surfaces, and native chrome-adjacent controls.",
+        "Do not use Liquid Glass for main content: chat transcript, timeline body, sidebar rows, diff body, terminal viewport, browser viewport, file trees, or dense repeated list cells.",
+        "Set the visual baseline as dark, dense, developer-tool, T3 Code/Codex App-like. Reject marketing-page spacing, oversized hero typography, decorative gradients, glass cards, and ornamental backgrounds.",
+        "Define the interop boundary: SwiftUI views receive state/actions; AppKit coordinators own imperative focus/window/terminal/split behavior; shared state lives outside both UI frameworks."
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "ADR includes a component-by-component table naming SwiftUI, AppKit, or mixed ownership, plus a \"forbidden UI patterns\" list that implementation agents must follow.",
+      "cardTests": "Add architecture tests or lint-style checks for no fake window chrome, no Liquid Glass on main content containers, no terminal hosted purely inside unstable SwiftUI wrappers, and no command palette implemented outside the shared command model. If a rule cannot be enforced statically, add a UI/E2E assertion or review checklist item that names the exact file/component.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "ADR assigns SwiftUI/AppKit/Liquid Glass ownership per component and forbids marketing UI patterns.",
+        "automatedTests": "Static checks for fake chrome, Liquid Glass on main content, and terminal hosted only in SwiftUI.",
+        "e2eProofGate": "E2E: screenshot proves dense dark developer UI with native chrome and no decorative glass content.",
+        "failSignal": "Window/focus/split ownership is unclear or main content uses decorative glass."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-008",
+      "title": "Define Future Mobile Direct-VPN Mirror Contract",
+      "phase": "Phase 0 - Decisions",
+      "labels": [
+        "Review",
+        "Risk",
+        "Build"
+      ],
+      "owner": "Senior platform architect + Scrum master",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Current RemoteCode local/mobile study",
+      "output": "Mobile-ready desktop contract ADR",
+      "summary": "Lock the architecture that lets a future mobile app mirror and control the desktop without a relay.",
+      "context": "Current RemoteCode already exposes a local server, discovery metadata, local/VPN probing, token auth, HTTP routes, and WebSocket events. RemoteCode 2 must keep the useful direct-control idea, but start clean and remove any private-backend or relay direction.",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+        "Define the future mobile promise precisely: mobile mirrors the desktop and sends commands that execute on the computer.",
+        "Declare mobile implementation out of scope for this phase, while making desktop contracts in scope.",
+        "Define direct-only networking: desktop-hosted HTTP/WebSocket over VPN or trusted LAN, no relay, no private backend, no cloud command queue, no hosted repository sync.",
+        "Define mobile-ready primitives: server identity, capabilities version, command envelope, event envelope, request id, origin client id, sequence, replay, ack, idempotency, and device trust.",
+        "List every desktop surface that must eventually be controllable: Agent App, terminal, browser, workspace/pane tabs, git actions, file context, settings subset, and command palette actions.",
+        "Write explicit non-goals: no mobile UI, no push notification feature, no APNS work, no private account system, no remote execution outside the user's computer."
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Architecture agents can build desktop core and APIs without guessing how future mobile will connect, authenticate, replay state, or route commands.",
+      "cardTests": "",
+      "reviewChecklist": "ADR forbids relay/private backend design, keeps repositories and provider CLIs on the desktop, and maps mobile readiness to concrete desktop tasks and tests.",
+      "verification": {
+        "acceptanceCriteria": "Future mobile contract defines direct VPN/LAN transport, identity, command/event envelopes, replay, and non-goals.",
+        "automatedTests": "ADR lint verifies no relay/private-backend path and all required protocol fields are named.",
+        "e2eProofGate": "E2E: proof gate - fake future-mobile sequence diagram can execute discovery, pair, command, event replay on paper.",
+        "failSignal": "Any mobile path assumes a hosted relay or desktop-only private action path."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-010",
+      "title": "Create Swift macOS Project Skeleton",
+      "phase": "Phase 1 - Native Shell",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Foundation agent",
+      "dependsOn": [
+        "RC2-001"
+      ],
+      "dependsText": "RC2-001",
+      "output": "Xcode project + Swift packages",
+      "summary": "Initialize the native app and test structure from zero.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create `RemoteCode2.xcodeproj` or SwiftPM-driven Xcode project with macOS app target.",
+        "Add modules/folders: App, Windowing, Workspace, Surfaces, AgentRuntime, Persistence, SocketAutomation, CLI, Tests, UITests.",
+        "Configure app bundle IDs for debug, canary, stable.",
+        "Add scripts: bootstrap, build-debug, test-unit, test-integration, test-ui.",
+        "Commit a minimal app that opens a native NSWindow with placeholder content."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Clean clone builds and runs the debug app; unit test target executes one smoke test.",
+      "cardTests": "Build test, launch smoke test, app bundle ID test.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Clean clone builds, launches debug app, and includes app/test targets and scripts.",
+        "automatedTests": "Build smoke, unit smoke, bundle id checks, script existence checks.",
+        "e2eProofGate": "E2E: launch app from built artifact and assert native window appears with placeholder content.",
+        "failSignal": "Build requires manual local state or app opens no window."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-011",
+      "title": "Implement App Lifecycle, Menus, And Native Window Shell",
+      "phase": "Phase 1 - Native Shell",
+      "labels": [
+        "Build",
+        "Review"
+      ],
+      "owner": "AppKit shell agent",
+      "dependsOn": [
+        "RC2-010"
+      ],
+      "dependsText": "RC2-010",
+      "output": "Native window shell",
+      "summary": "Build the macOS shell without fake in-app window chrome.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create AppDelegate or SwiftUI App lifecycle with explicit NSWindow management.",
+        "Add native menus for app, file, edit, view, workspace, surface, window, help.",
+        "Add settings window stub and about/version metadata.",
+        "Persist and restore window bounds per release channel.",
+        "Use AppKit as the owner for NSWindow, responder chain, menu validation, first responder, focus handoff, and native window commands.",
+        "Embed SwiftUI content inside the AppKit-owned shell; do not let SwiftUI accidentally own desktop-level focus or menu behavior.",
+        "Ensure there are no fake close/minimize/maximize controls or fake title bars."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "App opens one native window, uses native menu commands, and restores bounds after restart.",
+      "cardTests": "",
+      "reviewChecklist": "Desktop chrome constraint is respected; no web runtime dependency exists; AppKit owns the macOS shell behaviors that SwiftUI cannot model reliably.",
+      "verification": {
+        "acceptanceCriteria": "Native NSWindow, menus, responder chain, settings stub, bounds restore, and no fake chrome.",
+        "automatedTests": "Menu command tests, window restore tests, focus bridge tests, fake-chrome DOM/view scan.",
+        "e2eProofGate": "E2E: open app, use menu command, focus content, resize/relaunch, verify bounds and native chrome.",
+        "failSignal": "Menu command misses target, focus leaks, or fake close/minimize/maximize controls appear."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-012",
+      "title": "Implement Workspace Domain Model",
+      "phase": "Phase 2 - Domain And Persistence",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Domain model agent",
+      "dependsOn": [
+        "RC2-002",
+        "RC2-010"
+      ],
+      "dependsText": "RC2-002, RC2-010",
+      "output": "WorkspaceCore module",
+      "summary": "Create the model and reducer/store for windows, workspaces, panes, and surfaces.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Define stable IDs for window, workspace, pane, split, and surface.",
+        "Define immutable actions for create, select, rename, close, split, move, reorder, focus.",
+        "Attach command metadata needed by local UI, CLI, tests, and future mobile: request id, origin client id, actor kind, issuedAt, target ids, idempotency key, and audit category.",
+        "Define surface type enum: terminal, browser, agentApp.",
+        "Encode invariants: every workspace has a valid split tree; every pane has at least one selected surface unless being removed.",
+        "Keep domain logic UI-independent."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Unit tests prove split/surface operations preserve invariants.",
+      "cardTests": "Create workspace, close last surface, move surface between panes, focus fallback, reorder surfaces.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Workspace reducer preserves IDs, split invariants, selected surface, command metadata, and UI independence.",
+        "automatedTests": "Reducer property tests and invariant tests for create/select/close/split/move/reorder/focus.",
+        "e2eProofGate": "E2E: command bus drives workspace changes and UI reflects exact selected surface after reload.",
+        "failSignal": "Invalid split tree persists or action lacks request/origin metadata."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-013",
+      "title": "Implement T3 Code-Style Workspace Sidebar UI",
+      "phase": "Phase 3 - Layout And Navigation",
+      "labels": [
+        "Build",
+        "Review"
+      ],
+      "owner": "UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-011",
+        "RC2-012"
+      ],
+      "dependsText": "RC2-006, RC2-011, RC2-012",
+      "output": "Sidebar view",
+      "summary": "Build vertical workspace/project/thread navigation using T3 Code's dense sidebar as the reference.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Render a T3 Code-like left rail with app identity, search row, project section header, project rows, nested thread rows, relative timestamps, status pills, and settings footer.",
+        "For each project row show icon/fallback, name, expanded state, active run indicator, latest thread preview, and git/branch metadata for git projects; show a clear \"No Git\" state for non-git projects.",
+        "For each thread row show title or generated summary, provider/status indicator, elapsed/relative time, completion/working state, and selected hover/focus styling.",
+        "Add search across projects and threads with keyboard navigation and command-key shortcut hint.",
+        "Add create, select, rename, archive/close, show-more, and context menu actions. Render reorder/group as disabled V1-deferred commands with a typed unsupported reason until RC2-005 explicitly promotes them.",
+        "Support T3 Code-style compact density, muted secondary text, subtle 1px dividers, visible focus state, and responsive collapse behavior."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "User can create/select/rename/archive workspaces and threads from UI and keyboard; visual structure matches T3 Code sidebar conventions while remaining native Swift/macOS.",
+      "cardTests": "UI tests for search, project expand/collapse, thread selection, show-more behavior, relative timestamp updates, and keyboard focus restoration.",
+      "reviewChecklist": "Text fits, no marketing/hero UI, no decorative cards inside cards, no fake macOS window controls, and T3 Code parity notes are linked in the PR/MR.",
+      "verification": {
+        "acceptanceCriteria": "Sidebar supports project/thread hierarchy, search, timestamps, statuses, keyboard navigation, and settings footer.",
+        "automatedTests": "View model tests for filtering, sorting, expand/collapse, rename/archive, timestamp updates.",
+        "e2eProofGate": "E2E: create projects/threads, search/select/show-more, navigate by keyboard, compare screenshot to T3 sidebar.",
+        "failSignal": "Search loses selection, text overlaps, or status/timestamp data is missing."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-014",
+      "title": "Implement Pane Split And Surface Tab UI",
+      "phase": "Phase 3 - Layout And Navigation",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Layout UI agent",
+      "dependsOn": [
+        "RC2-002",
+        "RC2-012"
+      ],
+      "dependsText": "RC2-002, RC2-012",
+      "output": "PaneLayout UI",
+      "summary": "Expose the cmux-like work area where all surface types live.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Render split tree with resizable dividers.",
+        "Render horizontal surface tabs per pane with icon, title, dirty/unread state, close button, and selected state.",
+        "Add commands for split right/down, focus directionally, close surface, close pane, equalize splits.",
+        "Route selected surface to SurfaceRenderer by type.",
+        "Use AppKit for complex split-pane mechanics when SwiftUI cannot provide stable drag, focus, sizing, and first-responder behavior.",
+        "Use SwiftUI for pane tab labels, surface metadata, and declarative state display inside the AppKit-owned split structure."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Placeholder terminal/browser/agent surfaces can be created, switched, split, and closed.",
+      "cardTests": "UI test for 3-surface split layout and focus direction.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Pane/tab UI can create, switch, split, close, move, and focus all placeholder surfaces.",
+        "automatedTests": "Layout reducer tests, split geometry tests, tab lifecycle tests, focus direction tests.",
+        "e2eProofGate": "E2E: build terminal left, Agent App top-right, browser bottom-right; switch tabs and close panes safely.",
+        "failSignal": "Closing last surface crashes or focus goes to wrong pane."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-015",
+      "title": "Implement T3 Code-Style Command Palette And Keybindings",
+      "phase": "Phase 3 - Layout And Navigation",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Command palette agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-013",
+        "RC2-014"
+      ],
+      "dependsText": "RC2-006, RC2-013, RC2-014",
+      "output": "Command palette + keybinding resolver",
+      "summary": "Add T3 Code-like keyboard-first access to commands, projects, threads, terminal actions, and scripts.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Define command contribution model with id, title, subtitle/description, icon, keywords, shortcut command, timestamp/trailing metadata, availability predicate, and action.",
+        "Register commands for search/open project, search/open thread, new chat/thread, new local/worktree thread, split terminal, new terminal, close terminal, toggle terminal, toggle diff, open editor, run project script, workspace/surface actions, browser actions, and Agent App actions.",
+        "Implement T3 Code-compatible keybinding concepts: shortcut string, command id, nullable boolean `when` expression, contexts for terminal focus/open state, invalid-rule warnings, and last matching rule wins.",
+        "Use T3 Code default shortcuts as the reference: terminal toggle, terminal split/new/close, command palette toggle, new chat, new local chat, open favorite editor, and script run commands.",
+        "Add fuzzy search, grouped results, disabled rows, keyboard highlight, enter to run, escape to close, submenu affordance, and shortcut labels.",
+        "Ensure palette focus does not leak keystrokes to terminal, browser, or composer surfaces."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Command palette can create/open a T3 Code-style Agent App thread, split/toggle terminal, open project/editor, and show grouped results with shortcuts.",
+      "cardTests": "Unit tests for keybinding parsing, `when` evaluation, last-rule precedence, command filtering, disabled items, and focus isolation; UI tests for keyboard navigation and execution.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Command palette registers commands, shortcuts, when-rules, grouping, disabled states, and focus isolation.",
+        "automatedTests": "Parser, precedence, availability, fuzzy-search, disabled-row, and focus-isolation tests.",
+        "e2eProofGate": "E2E: open palette, create Agent App thread, split terminal, toggle diff, and verify no keystrokes leak.",
+        "failSignal": "Shortcut triggers in wrong context or disabled command runs."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-016",
+      "title": "Implement SQLite Persistence Foundation",
+      "phase": "Phase 2 - Domain And Persistence",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Persistence agent",
+      "dependsOn": [
+        "RC2-010",
+        "RC2-012"
+      ],
+      "dependsText": "RC2-010, RC2-012",
+      "output": "Persistence module",
+      "summary": "Create the database layer, schema versioning, and repositories used by all later features.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Choose and configure GRDB or direct SQLite based on the architecture decision.",
+        "Create versioned schema steps for projects, agent threads, messages, runs, events, snapshots, settings, and session snapshots.",
+        "Implement repository protocols and concrete SQLite repositories.",
+        "Add in-memory/test database setup.",
+        "Ensure app data directories differ for debug, canary, and stable."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Tests create the latest schema from scratch and verify schema steps against empty RemoteCode 2 databases only.",
+      "cardTests": "Schema step order, repository CRUD, transaction rollback, schema version checks.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "SQLite schema creates from zero, repositories work, transactions rollback, channels isolate data.",
+        "automatedTests": "Schema version, CRUD, rollback, in-memory DB, channel path, and corruption recovery tests.",
+        "e2eProofGate": "E2E: first launch creates empty RemoteCode 2 database, creates workspace/thread, relaunches with data intact.",
+        "failSignal": "Schema reads outside owned directory or transaction leaves partial rows."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-017",
+      "title": "Implement Session Snapshot Foundation",
+      "phase": "Phase 2 - Domain And Persistence",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Session restore agent",
+      "dependsOn": [
+        "RC2-012",
+        "RC2-016"
+      ],
+      "dependsText": "RC2-012, RC2-016",
+      "output": "Snapshot model + store",
+      "summary": "Persist and restore window/workspace/pane/surface layout independent of surface implementation details.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Define Codable snapshot schema with version, createdAt, windows, workspaces, layout tree, and surface snapshots.",
+        "Implement save debounce/autosave and explicit save on app quit.",
+        "Implement restore policy that skips automated tests unless enabled.",
+        "Add unknown surface type handling that does not crash restore."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Placeholder layout restores exactly after app restart.",
+      "cardTests": "Snapshot encode/decode, invalid snapshot rejection, restore selected surface, unknown type fallback.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Session snapshots save/restore windows, layouts, selected surfaces, and unknown types safely.",
+        "automatedTests": "Encode/decode, invalid snapshot, unknown surface, debounce, and restore-policy tests.",
+        "e2eProofGate": "E2E: create multi-pane layout, quit, reopen, verify exact selection and surface order.",
+        "failSignal": "Layout changes after relaunch or invalid snapshot crashes app."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-018",
+      "title": "Implement JSON-RPC Socket Server",
+      "phase": "Phase 4 - Automation Core",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Socket automation agent",
+      "dependsOn": [
+        "RC2-012",
+        "RC2-014"
+      ],
+      "dependsText": "RC2-012, RC2-014",
+      "output": "Socket server",
+      "summary": "Add external automation API compatible with cmux concepts.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create local Unix socket server with JSON-RPC request/response envelope.",
+        "Implement `system.ping`, `system.capabilities`, and `system.identify`.",
+        "Implement workspace, pane, and surface list/create/focus/close methods for placeholder surfaces.",
+        "Keep this socket local-only for CLI and tests; future mobile uses the direct-VPN HTTP/WebSocket API, not this Unix socket.",
+        "Publish domain events for successful commands."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Tests can drive app state through socket without using UI.",
+      "cardTests": "Method not found, invalid params, successful workspace create, surface create, identify focused surface.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Local JSON-RPC socket supports ping, capabilities, identify, workspace/pane/surface methods, and events.",
+        "automatedTests": "Protocol tests for invalid JSON, method missing, invalid params, auth/local-only guard, event emission.",
+        "e2eProofGate": "E2E: CLI/test client creates workspace and Agent App placeholder through socket without UI.",
+        "failSignal": "Socket binds non-local unexpectedly or response schema is unstable."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-019",
+      "title": "Implement CLI Client",
+      "phase": "Phase 4 - Automation Core",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "CLI agent",
+      "dependsOn": [
+        "RC2-018"
+      ],
+      "dependsText": "RC2-018",
+      "output": "CLI binary",
+      "summary": "Create the `remotecode2` CLI as a thin socket client.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Implement global flags: socket path, json output, id format, window/workspace/surface target.",
+        "Implement commands: ping, capabilities, identify, list-workspaces, new-workspace, new-surface, new-split, focus, close.",
+        "Implement stable JSON output for scripts and concise text output for humans.",
+        "Handle app-not-running and stale socket errors clearly."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "CLI can create an Agent App placeholder surface in a target workspace.",
+      "cardTests": "CLI parser tests, socket integration tests, JSON output snapshot tests.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "CLI wraps socket with stable JSON, clear text output, targeting flags, and stale-app errors.",
+        "automatedTests": "Parser tests, JSON snapshots, socket integration tests, app-not-running tests.",
+        "e2eProofGate": "E2E: run CLI to create and focus an Agent App surface in the running app.",
+        "failSignal": "CLI output cannot be scripted or stale socket error is unclear."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-020",
+      "title": "Create T3 Code-Inspired Swift Design System",
+      "phase": "Phase 1 - Native Shell",
+      "labels": [
+        "Build",
+        "Review",
+        "Test"
+      ],
+      "owner": "Design system agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-007",
+        "RC2-011"
+      ],
+      "dependsText": "RC2-006, RC2-007, RC2-011",
+      "output": "DesignSystem module",
+      "summary": "Define reusable SwiftUI/AppKit tokens and controls that make the whole app feel like T3 Code without using a web runtime.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create color tokens for dark default plus an explicit theme decision for light/auto: either implement light/auto tokens fully or document them as disabled with tests asserting dark default only.",
+        "Create typography tokens using system UI and SF Mono equivalents; use compact developer-tool sizes, not marketing scale.",
+        "Create SwiftUI reusable controls: icon button, split button, segmented toggle, pill/status label, sidebar row, command row, toolbar button, diff stat label, popover/menu shell, tooltip, empty state, loading state, and error banner.",
+        "Create AppKit bridge components only where needed: focus bridge, menu command bridge, terminal host wrapper, split-pane host, file/open panel bridge, and first-responder coordinator.",
+        "Match T3 Code density: 1px borders, small radii, compact spacing, low-contrast dividers, hover/selected states, and no decorative gradient/orb backgrounds.",
+        "Apply Liquid Glass only to controls and bars where useful: toolbar clusters, compact command palette chrome, segmented controls, and modal/action surfaces.",
+        "Do not apply Liquid Glass to the main content canvas, chat body, sidebar rows, terminal viewport, browser viewport, diff body, or repeated dense list cells.",
+        "Document how to use controls in Agent App, sidebar, command palette, terminal drawer, diff panel, settings, and native menus."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "All shared UI controls render in a small preview/test app and visually align with the dark dense T3 Code/Codex App reference, not a marketing-style app.",
+      "cardTests": "Snapshot tests for dark/light tokens, accessibility contrast checks, dynamic type non-overlap checks, toolbar/button sizing checks, Liquid Glass placement checks, and AppKit bridge smoke tests.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Design system exposes T3-like tokens, controls, AppKit bridges, accessibility, and Liquid Glass limits.",
+        "automatedTests": "Snapshot, contrast, sizing, no-overlap, Liquid Glass placement, and bridge smoke tests.",
+        "e2eProofGate": "E2E: preview app renders all controls in dark mode and screenshot passes visual density checklist.",
+        "failSignal": "Control text clips, color contrast fails, or main content receives glass styling."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-021",
+      "title": "Implement T3 Code-Style Top Action Header",
+      "phase": "Phase 3 - Layout And Navigation",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Header UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-020"
+      ],
+      "dependsText": "RC2-006, RC2-020",
+      "output": "ActionHeader component",
+      "summary": "Create the compact top bar used across workspaces and Agent App threads.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Render current thread/workspace title, project badge, and exactly one git status badge: branch/dirty state for git projects or \"No Git\" for non-git projects.",
+        "Add T3 Code-style actions: Add action, Open with dropdown, Commit & push with dropdown, terminal toggle, diff toggle, new/split surface actions, and overflow menu.",
+        "Use icon-first controls with tooltips, disabled states, and keyboard shortcuts where available.",
+        "Keep the header compact and responsive; collapse text labels into icons/menus at narrow widths without clipping.",
+        "Route actions through command model so toolbar and command palette execute the same code paths."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Header matches T3 Code's action density and can drive open editor, commit placeholder, diff toggle, terminal toggle, and new surface actions.",
+      "cardTests": "Unit tests for action availability, UI tests for responsive collapse, tooltip labels, disabled states, and command routing.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Top header shows thread/project context, core actions, responsive collapse, tooltips, and command routing.",
+        "automatedTests": "Action availability, responsive layout, tooltip, disabled-state, and command routing tests.",
+        "e2eProofGate": "E2E: use header to open editor placeholder, toggle diff, toggle terminal, create surface, and inspect screenshot.",
+        "failSignal": "Header action bypasses command model or clips at narrow width."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-022",
+      "title": "Implement Branch, Workspace, And Environment Toolbar",
+      "phase": "Phase 3 - Layout And Navigation",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Git/workspace UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-012",
+        "RC2-020"
+      ],
+      "dependsText": "RC2-006, RC2-012, RC2-020",
+      "output": "BranchWorkspaceToolbar",
+      "summary": "Copy T3 Code's lower context toolbar pattern for branch, local/worktree mode, and environment selection.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Detect git repository, active branch, dirty state, and worktree path for the selected project/workspace.",
+        "Render compact controls for environment, local vs worktree mode, current workspace path, current branch, checkout pull request placeholder, and focus composer action.",
+        "Support locked states when a thread is already bound to a worktree or provider session.",
+        "Use responsive mobile/narrow-window behavior inspired by T3 Code's combined run-context selector.",
+        "Fail loudly for non-git projects and show clear \"No Git\" state without breaking Agent App usage."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Agent App surfaces show branch/workspace context equivalent to T3 Code, including locked and non-git states.",
+      "cardTests": "Git repo fixture, non-git fixture, dirty fixture, worktree fixture, locked-thread behavior, and responsive collapse tests.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Toolbar shows git/workspace/environment context, locked state, non-git state, and responsive collapse.",
+        "automatedTests": "Git/non-git/dirty/worktree/locked fixtures and collapse tests.",
+        "e2eProofGate": "E2E: open git and non-git projects; verify branch/no-git/locked states and no clipped controls.",
+        "failSignal": "Non-git project breaks Agent App or worktree lock can be changed incorrectly."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-023",
+      "title": "Implement Direct-VPN Desktop API Foundation",
+      "phase": "Phase 4 - Automation Core",
+      "labels": [
+        "Build",
+        "Test",
+        "Risk"
+      ],
+      "owner": "Networking foundation agent",
+      "dependsOn": [
+        "RC2-008",
+        "RC2-012",
+        "RC2-016"
+      ],
+      "dependsText": "RC2-008, RC2-012, RC2-016",
+      "output": "DirectDesktopAPI module",
+      "summary": "Create the desktop-hosted HTTP/WebSocket foundation that a future mobile app will use over VPN.",
+      "context": "",
+      "hardRule": "This API is direct desktop access only. Do not add hosted relay, private backend forwarding, connector ids, cloud command queues, or repository mirroring.",
+      "steps": [
+        "Create a desktop HTTP server owned by the macOS app, disabled for non-loopback access until the user explicitly enables VPN/LAN access.",
+        "Add `/v1/discovery` with server id, app version, capabilities version, auth mode, enabled transports, host/port, VPN/LAN connect hints, and health status.",
+        "Add `/v1/capabilities` covering available surfaces, command versions, provider availability, terminal/browser support, git support, and feature flags.",
+        "Add direct WebSocket endpoint `/v1/ws` with authenticated join/leave, ping/pong, and protocol-version negotiation.",
+        "Add mDNS or QR/manual-connect metadata only when it points to direct desktop addresses.",
+        "Keep API handlers thin: they validate auth and protocol, then call the shared command bus used by desktop UI and CLI."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "A test client on the same machine can discover capabilities, open a WebSocket, and receive workspace events without any hosted service.",
+      "cardTests": "Loopback default, explicit VPN/LAN enablement, discovery shape, capability version mismatch, WebSocket auth failure, WebSocket join success, no private backend configuration path.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Desktop API exposes direct discovery, capabilities, WebSocket, protocol negotiation, and loopback default.",
+        "automatedTests": "Discovery schema, capability mismatch, auth failure, WebSocket join, explicit enablement, no relay config tests.",
+        "e2eProofGate": "E2E: fake client connects over loopback/VPN-enabled path, reads capabilities, joins WebSocket, receives event.",
+        "failSignal": "API contains relay/private-backend fields or listens beyond loopback without opt-in."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-024",
+      "title": "Implement Pairing, Device Trust, And Remote Access Settings",
+      "phase": "Phase 4 - Automation Core",
+      "labels": [
+        "Build",
+        "Test",
+        "Risk"
+      ],
+      "owner": "Security/platform agent",
+      "dependsOn": [
+        "RC2-008",
+        "RC2-023"
+      ],
+      "dependsText": "RC2-008, RC2-023",
+      "output": "Device trust store + settings UI",
+      "summary": "Add the desktop-side security model needed before any future mobile client can control the computer.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create device trust model: device id, display name, public key or token hash, createdAt, lastSeenAt, revokedAt, capabilities granted, and audit metadata.",
+        "Create pairing flow contract for future mobile: desktop generates short-lived pairing material, future client redeems it directly over VPN/LAN, desktop stores only revocable trust material.",
+        "Add remote access settings: disabled by default, loopback-only default, explicit VPN/LAN enablement, visible host/port, rotate credentials, revoke device, and audit log viewer.",
+        "Store secrets in Keychain or equivalent secure storage; never store production tokens in plain SQLite.",
+        "Rate-limit auth failures and log denied attempts without leaking tokens or prompts.",
+        "Document that the mobile app is not built yet; settings exist to validate and operate the desktop contract safely."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Direct remote access cannot be enabled accidentally, every trusted device can be revoked, and no production default token exists.",
+      "cardTests": "Disabled default, enable/disable, pairing expiry, token rotation, revoke device, denied auth logging, Keychain storage, audit redaction, and LAN listener blocked until enabled.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Remote access has explicit enablement, pairing, revocation, rotation, device audit, and secure storage.",
+        "automatedTests": "Pairing expiry, revoke, rotate, Keychain, rate limit, audit redaction, denied auth tests.",
+        "e2eProofGate": "E2E: pair fake device, run one command, revoke device, prove HTTP/WS access stops immediately.",
+        "failSignal": "Default production token exists or revoked device remains connected."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-025",
+      "title": "Implement Mobile-Ready Command Bus And Event Replay",
+      "phase": "Phase 4 - Automation Core",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Command/event platform agent",
+      "dependsOn": [
+        "RC2-012",
+        "RC2-016",
+        "RC2-023"
+      ],
+      "dependsText": "RC2-012, RC2-016, RC2-023",
+      "output": "Command bus + event log",
+      "summary": "Make all UI, CLI, and future mobile commands use the same ordered domain/event model.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create command envelope with command id, schema version, request id, origin client id, actor kind, target ids, payload, idempotency key, and issuedAt.",
+        "Create event envelope with monotonic sequence, timestamp, event type, target ids, payload, origin client id, request id, and redaction class.",
+        "Persist enough event history to replay workspace and active-thread state for reconnecting future mobile clients.",
+        "Implement WebSocket subscription by scope: app, workspace, Agent App thread, terminal session, browser surface, and git status.",
+        "Implement last-sequence replay, ack, duplicate request suppression, backpressure limits, and deterministic error events.",
+        "Route desktop UI actions through this bus instead of private view-only callbacks so mobile parity is architectural, not bolted on later."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "A fake remote client can reconnect with last sequence and receive exactly the missed events, while duplicate commands do not execute twice.",
+      "cardTests": "Sequence ordering, replay after disconnect, duplicate request id, duplicate idempotency key, origin filtering, scoped subscriptions, redaction, event pruning, and command failure events.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Command bus and event log support envelopes, sequence, replay, ack, idempotency, scopes, and redaction.",
+        "automatedTests": "Ordering, replay, duplicate request, duplicate idempotency key, origin filter, pruning, and failure-event tests.",
+        "e2eProofGate": "E2E: fake mobile disconnects, desktop changes state, reconnects with last sequence, receives missed events once.",
+        "failSignal": "Command executes twice or reconnect misses/duplicates events."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-026",
+      "title": "Define Remote Mirror Coverage For Every Desktop Surface",
+      "phase": "Phase 4 - Automation Core",
+      "labels": [
+        "Review",
+        "Build",
+        "Test"
+      ],
+      "owner": "Surface contract agent",
+      "dependsOn": [
+        "RC2-008",
+        "RC2-025"
+      ],
+      "dependsText": "RC2-008, RC2-025",
+      "output": "Remote mirror capability matrix",
+      "summary": "Ensure terminal, browser, Agent App, git, and workspace features expose future mobile-safe contracts.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+        "Workspace/panes: list, create, focus, split, close, reorder, restore, selected surface.",
+        "Agent App: list projects/threads, load visible thread context, send message, stop run, stream timeline, expose changed files, open diff, provider/model/runtime state.",
+        "Terminal: list sessions, create, resize, input, signal, restart, read bounded scrollback, stream output metadata, redact sensitive input.",
+        "Browser: create/open, navigate, reload, go back/forward, title/url state, screenshot/metadata if allowed, automation-safe errors.",
+        "Git/files: branch/status/diff actions, open project metadata, bounded file listing, lazy secondary-panel loading, no unnecessary bulk data fetch.",
+        "Settings: remote access enablement, trusted devices, provider availability, UI preferences safe to mirror."
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Every V1 desktop feature has a yes/deferred/forbidden remote mirror status with command/event names and minimum payload fields.",
+      "cardTests": "",
+      "reviewChecklist": "Matrix forbids broad filesystem dumps, preserves screen-level lazy loading, and maps each future mobile action to the same command bus as desktop UI.",
+      "verification": {
+        "acceptanceCriteria": "Capability matrix names remote status, commands, events, payload fields, and deferred/forbidden items per surface.",
+        "automatedTests": "Matrix lint checks all V1 surfaces and commands have status, payload, and test owner.",
+        "e2eProofGate": "E2E: proof gate - fake client script can plan one remote flow per surface from the matrix alone.",
+        "failSignal": "Any surface has unknown mobile-readiness status or requires bulk data fetch."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-030",
+      "title": "Implement Terminal Surface Host",
+      "phase": "Phase 5 - Surfaces",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Terminal agent",
+      "dependsOn": [
+        "RC2-003",
+        "RC2-014"
+      ],
+      "dependsText": "RC2-003, RC2-014",
+      "output": "TerminalSurface",
+      "summary": "Replace placeholder terminal surfaces with a real terminal surface.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create `TerminalSurface` conforming to common Surface protocol.",
+        "Launch shell in workspace cwd with env variables for window, workspace, pane, and surface IDs.",
+        "Render terminal view and route keyboard/mouse input only when focused.",
+        "Implement close lifecycle and process group cleanup.",
+        "Report title, cwd, dirty/confirm-close state if supported by terminal engine."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "User can open terminal, run `pwd`, split away, return, and keep shell alive.",
+      "cardTests": "Launch cwd, input/output, focus routing, close cleanup, no orphan process.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Terminal surface launches shell in cwd, routes focus, reports metadata, and cleans process groups.",
+        "automatedTests": "PTY cwd, input/output, focus, close cleanup, metadata, and orphan-process tests.",
+        "e2eProofGate": "E2E: open terminal, run `pwd`, split away, return, close, and verify no child remains.",
+        "failSignal": "Input reaches unfocused terminal or process survives close."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-031",
+      "title": "Implement Terminal Copy, Paste, Resize, And Scrollback",
+      "phase": "Phase 5 - Surfaces",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Terminal UX agent",
+      "dependsOn": [
+        "RC2-030"
+      ],
+      "dependsText": "RC2-030",
+      "output": "Terminal UX features",
+      "summary": "Make terminal surfaces production-usable.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Implement copy with selection, paste, select all when the chosen terminal engine exposes selection ranges; if it does not, create a typed unsupported state and E2E proof that the control is hidden or disabled. Implement clear scrollback and font size controls either way.",
+        "Resize PTY when pane size changes.",
+        "Keep terminal input disabled when another surface or command palette owns focus.",
+        "Capture scrollback snapshot for session restore using safe truncation."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Terminal behaves like a normal macOS terminal in split and tab layouts.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Terminal copy/paste/select all/clear/font/resize/scrollback behave like normal macOS terminal use.",
+        "automatedTests": "Selection, paste, resize, font, clear history, scrollback truncation, and focus guard tests.",
+        "e2eProofGate": "E2E: select/copy output, paste command, resize pane, change font, relaunch with bounded scrollback.",
+        "failSignal": "Paste goes to wrong surface or scrollback grows unbounded."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-032",
+      "title": "Implement Terminal Socket Commands",
+      "phase": "Phase 5 - Surfaces",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Terminal automation agent",
+      "dependsOn": [
+        "RC2-030",
+        "RC2-018"
+      ],
+      "dependsText": "RC2-030, RC2-018",
+      "output": "Terminal command handlers",
+      "summary": "Expose terminal automation through the surface API.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Implement `surface.send_text`, `surface.send_key`, `surface.read_text`, and `surface.clear_history` for terminal surfaces.",
+        "Reject terminal input commands against browser/agent surfaces with clear typed errors.",
+        "Redact input content in event logs while preserving length and target metadata."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "CLI can send commands to one specific terminal surface without affecting others.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Terminal automation commands target one terminal and reject wrong surface types with typed errors.",
+        "automatedTests": "Command handler tests for send text/key/read/clear, wrong target, redaction, and target isolation.",
+        "e2eProofGate": "E2E: socket/CLI sends command to terminal A while terminal B remains unchanged.",
+        "failSignal": "Terminal command affects wrong surface or logs raw sensitive input."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-040",
+      "title": "Implement WKWebView Browser Surface",
+      "phase": "Phase 5 - Surfaces",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Browser agent",
+      "dependsOn": [
+        "RC2-014"
+      ],
+      "dependsText": "RC2-014",
+      "output": "BrowserSurface",
+      "summary": "Replace placeholder browser surfaces with a real in-app browser.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create `BrowserSurface` with WKWebView, address bar, back, forward, reload, stop/loading state.",
+        "Support local dev URLs, localhost, file URLs when allowed, and external navigation policy.",
+        "Persist title, URL, loading state, and selected profile ID in surface snapshot.",
+        "Ensure browser focus does not leak to terminal or Agent App."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "User can split browser beside Agent App and navigate a local dev server.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "WKWebView browser supports navigation, state persistence, profiles, local URLs, and focus isolation.",
+        "automatedTests": "Navigation policy, state snapshot, focus guard, URL/title persistence, and profile hook tests.",
+        "e2eProofGate": "E2E: open local dev page, navigate back/forward/reload, split with Agent App, relaunch with URL restored.",
+        "failSignal": "Browser focus leaks to terminal or forbidden URL opens silently."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-041",
+      "title": "Implement Browser Profiles And Cookie Storage",
+      "phase": "Phase 5 - Surfaces",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Browser persistence agent",
+      "dependsOn": [
+        "RC2-040",
+        "RC2-016"
+      ],
+      "dependsText": "RC2-040, RC2-016",
+      "output": "Browser profile store",
+      "summary": "Support persistent browser sessions without mixing all users into one opaque store.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Define browser profile model: id, display name, createdAt, default flag.",
+        "Create WKWebsiteDataStore per profile when the chosen WKWebView API supports it. If full cookie isolation is not available, block release until the limitation is documented, the maximum available isolation is implemented, and the E2E profile-isolation test records the exact remaining shared state.",
+        "Add profile list/create/rename/clear/delete commands.",
+        "Prevent deleting active default profile."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Browser profile survives app restart and can be cleared through UI or CLI.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Browser profiles persist, isolate available data, can be renamed/cleared/deleted, and protect default profile.",
+        "automatedTests": "Profile CRUD, active default guard, clear data, persistence, and isolation-limit tests.",
+        "e2eProofGate": "E2E: create two profiles, set cookie in one, verify other profile does not share it where WKWebView permits.",
+        "failSignal": "Deleting active default succeeds or profile state mixes unexpectedly without documented limitation."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-042",
+      "title": "Implement Browser P0 Automation",
+      "phase": "Phase 5 - Surfaces",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Browser automation agent",
+      "dependsOn": [
+        "RC2-040",
+        "RC2-018"
+      ],
+      "dependsText": "RC2-040, RC2-018",
+      "output": "Browser automation handlers",
+      "summary": "Give agents an automation surface similar to cmux's agent-browser port.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Implement `browser.open_split`, navigate, back, forward, reload, URL get, title get.",
+        "Implement DOM snapshot with stable element refs.",
+        "Implement eval, wait, click, double click, hover, focus, fill, type, press, select, check/uncheck.",
+        "Implement screenshot to file and return path/metadata.",
+        "Return explicit unsupported errors for P1/P2 commands not implemented yet."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "CLI can operate a local test page in a specific browser surface end to end.",
+      "cardTests": "Local HTML fixture for snapshot, click, fill, wait, screenshot, two-browser target isolation.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Browser P0 automation supports navigate, snapshot, element actions, eval, wait, screenshot, and unsupported errors.",
+        "automatedTests": "Local HTML fixture tests for snapshot, click, fill, wait, screenshot, target isolation, unsupported methods.",
+        "e2eProofGate": "E2E: CLI drives a browser surface through form fill, click, wait, screenshot, and verifies expected DOM.",
+        "failSignal": "Element refs are unstable or action hits wrong browser surface."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-050",
+      "title": "Implement Normalized Assistant Event Model",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Agent runtime agent",
+      "dependsOn": [
+        "RC2-004",
+        "RC2-016"
+      ],
+      "dependsText": "RC2-004, RC2-016",
+      "output": "AssistantEvent model",
+      "summary": "Create provider-independent events for the Agent App timeline.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Define event types: threadStarted, turnStarted, itemStarted, itemDelta, itemState, itemCompleted, turnCompleted, error.",
+        "Define item types: reasoning, plan, tool, assistantMessage.",
+        "Define item fields: id, turnId, state, summary, body, output, startedAtMs, finishedAtMs, expanded state.",
+        "Implement reducer that turns event stream into turn snapshots."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Fixture events build stable timeline snapshots independent of provider.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Normalized event model builds provider-independent thread/turn/item snapshots.",
+        "automatedTests": "Reducer fixture tests for all event/item types, malformed events, ordering, and unknown event handling.",
+        "e2eProofGate": "E2E: proof gate - fake provider stream renders a full timeline without provider-specific conditionals.",
+        "failSignal": "Timeline needs raw provider fields or malformed event crashes reducer."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-051",
+      "title": "Implement Codex Runner And Parser",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Codex provider agent",
+      "dependsOn": [
+        "RC2-004",
+        "RC2-050"
+      ],
+      "dependsText": "RC2-004, RC2-050",
+      "output": "CodexProviderRunner",
+      "summary": "Run Codex CLI and convert its JSON events into normalized assistant events.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Resolve `codex` executable from PATH and surface missing binary errors.",
+        "Spawn Codex with cwd, prompt, model, reasoning effort, permission mode, and provider thread ID when resuming an existing Codex thread; omit provider thread ID only for a new thread.",
+        "Parse line-delimited JSON for thread, turn, item, delta, completed, failed, and error events.",
+        "Capture assistant final text, provider thread ID, diff counts if available, exit status, and cancellation.",
+        "Ensure unknown event types are ignored with debug logging, not fatal unless required fields are missing."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Codex fixture streams produce the same timeline shape as current RemoteCode intent.",
+      "cardTests": "Parser fixtures for reasoning, plan, tool output, assistant text, failure, malformed JSON, cancellation.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Codex runner resolves CLI, spawns with correct options, parses JSON events, captures status, and cancels.",
+        "automatedTests": "Parser fixtures for reasoning, tools, assistant text, failure, malformed JSON, cancellation, missing binary.",
+        "e2eProofGate": "E2E: fake Codex fixture and real Codex smoke when authenticated produce identical normalized timeline shape.",
+        "failSignal": "Unknown event kills run or missing CLI error is not actionable."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-052",
+      "title": "Implement Claude Runner And Parser",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Claude provider agent",
+      "dependsOn": [
+        "RC2-004",
+        "RC2-050"
+      ],
+      "dependsText": "RC2-004, RC2-050",
+      "output": "ClaudeProviderRunner",
+      "summary": "Run Claude CLI and normalize stream events into the same timeline model.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Resolve `claude` executable from PATH and surface missing binary errors.",
+        "Spawn Claude with cwd, prompt, every supported model/runtime option from the provider contract, and session resume ID when resuming an existing Claude session; omit session resume ID only for a new session.",
+        "Parse system init session ID, stream content blocks, thinking deltas, text deltas, tool uses, tool results, result events, and errors.",
+        "Map Claude blocks to normalized reasoning/tool/assistant items.",
+        "Handle process exit and cancellation deterministically."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Claude fixture streams render in the same Agent App timeline component as Codex.",
+      "cardTests": "Parser fixtures for thinking, text, tool use, tool result, result cost/duration metadata, failure.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Claude runner resolves CLI, spawns with supported options, parses stream blocks, maps events, and cancels.",
+        "automatedTests": "Parser fixtures for thinking, text, tool use/result, cost metadata, failure, missing binary, cancellation.",
+        "e2eProofGate": "E2E: fake Claude fixture and real Claude smoke when authenticated render in the same Agent App timeline.",
+        "failSignal": "Claude UI branch diverges from shared event model."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-053",
+      "title": "Implement Agent Run Supervisor",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Agent runtime agent",
+      "dependsOn": [
+        "RC2-051",
+        "RC2-052",
+        "RC2-016"
+      ],
+      "dependsText": "RC2-051, RC2-052, RC2-016",
+      "output": "AgentRunCoordinator",
+      "summary": "Own active run lifecycle so app restarts and cancellations never leave stale state.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Implement start run, stop run, mark completed, mark failed, mark cancelled, and crash recovery.",
+        "Persist user message before provider process starts.",
+        "Persist stream events and snapshots during run.",
+        "Persist final assistant message only after successful run completion.",
+        "On app launch, reconcile rows that were running during previous crash and mark them failed or interrupted."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Killing the app during an active fake provider run does not resume it silently as running.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Run supervisor persists lifecycle, handles stop/fail/complete/cancel, and reconciles crashes.",
+        "automatedTests": "Lifecycle state-machine, DB persistence, cancellation, crash recovery, and final-message tests.",
+        "e2eProofGate": "E2E: kill app during fake run, relaunch, verify run is marked interrupted and no process remains.",
+        "failSignal": "Stale run remains active after crash or final assistant message persists before success."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-060",
+      "title": "Implement T3 Code-Style Agent App Surface Shell",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Review"
+      ],
+      "owner": "Agent App UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-014",
+        "RC2-020",
+        "RC2-050"
+      ],
+      "dependsText": "RC2-006, RC2-014, RC2-020, RC2-050",
+      "output": "AgentAppSurface",
+      "summary": "Create the native Agent App surface using T3 Code's ChatView structure as the product reference.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Create `AgentAppSurface` conforming to Surface protocol.",
+        "Assemble T3 Code-like layout: left sidebar already available, compact top action header, branch/workspace toolbar, central messages timeline, bottom composer, right/inline diff panel, and terminal drawer.",
+        "Add provider/model controls, runtime permission controls, plan/build mode control, run state, stop/interruption action, missing provider status banner, and thread error banner.",
+        "Add commands: add action, open editor, commit/push placeholder, open terminal split/drawer, open browser split, reveal project in Finder, toggle diff, toggle plan sidebar, and new Agent App thread.",
+        "Respect surface lifecycle: create, split, focus, rename, close, restore, and snapshot selected project/thread/provider/model.",
+        "Make empty state useful: no selected thread, no project, missing CLI, disconnected environment, and first-run prompt states."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Agent App surface can be created, split, focused, renamed, closed, restored, and visually reads as a native Swift version of T3 Code's chat workspace.",
+      "cardTests": "UI tests for surface lifecycle, header actions, empty states, provider status banner, terminal/diff toggles, and snapshot restore.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Agent App surface supports lifecycle, T3-like shell, provider controls, errors, commands, restore, and snapshots.",
+        "automatedTests": "Surface lifecycle, header actions, empty states, provider status, diff/terminal toggles, snapshot tests.",
+        "e2eProofGate": "E2E: create/split/focus/rename/close/restore Agent App surface and compare first viewport to T3 Code.",
+        "failSignal": "Surface cannot restore selected thread/provider or visual structure misses core T3 regions."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-061",
+      "title": "Implement T3 Code-Style Agent Thread List And Selection",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Agent App data UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-013",
+        "RC2-016",
+        "RC2-060"
+      ],
+      "dependsText": "RC2-006, RC2-013, RC2-016, RC2-060",
+      "output": "Thread list UI",
+      "summary": "Show project-scoped Codex/Claude threads using T3 Code's project/thread sidebar patterns.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Load only thread fields required for visible list: id, title, updatedAt, status, provider, project id/name, branch/worktree label, unread state, active run state, and latest preview.",
+        "Render thread rows under projects with T3 Code-like active selection, muted previews, relative timestamps, working/completed status, and show-more controls.",
+        "Add create thread, create local/worktree thread, select thread, rename thread, archive/delete if in V1 scope, and preserve active thread's branch/worktree state when requested.",
+        "Sort by active/updatedAt while keeping search results predictable.",
+        "Keep selection persisted per workspace and surface snapshot, including selected provider/model where appropriate."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Thread selection changes timeline without loading all message bodies until thread is opened; list behavior matches T3 Code's project/thread navigation expectations.",
+      "cardTests": "Lazy loading, active run ordering, search, show-more, rename/archive, branch/worktree preservation, and restore selected thread after app restart.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Thread list lazy-loads visible fields, supports project grouping, search, selection, rename/archive, ordering, restore.",
+        "automatedTests": "Lazy loading, active ordering, search, rename/archive, branch/worktree preservation, restore tests.",
+        "e2eProofGate": "E2E: create projects/threads, search, show more, select thread, relaunch, verify same active thread.",
+        "failSignal": "Opening list loads full message bodies or loses branch/worktree context."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-062",
+      "title": "Implement T3 Code-Style Agent Timeline Rendering",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Timeline UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-050",
+        "RC2-061"
+      ],
+      "dependsText": "RC2-006, RC2-050, RC2-061",
+      "output": "Timeline view",
+      "summary": "Render messages and structured streaming turns using T3 Code's MessagesTimeline as the UX model.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Render user message bubbles aligned right with attachments, terminal context chips, copy action, revert-to-message action when checkpoint exists, timestamp, and long-message collapse/expand.",
+        "Render assistant messages as markdown with streaming state, copy action on hover, timestamp plus elapsed duration, completion divider, and empty-response fallback.",
+        "Render work log/tool calls as compact grouped rows with icon/tone, collapsed overflow, show-more/show-less, normalized tool labels, and stable row identity.",
+        "Render proposed plan cards, working row with live timer, pending approval/user-input rows when applicable, and terminal context inline chips.",
+        "Use virtualization or bounded rendering for long histories and preserve scroll-at-end behavior while streaming.",
+        "Support image previews, markdown file path links, code copy, text selection, load older messages, and latest dirty state."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Timeline handles long tool output without freezing, preserves visible state during active stream, and shows changed-file evidence after agent turns like T3 Code.",
+      "cardTests": "Fixture tests for every row type, streaming updates, long work log collapse, image preview, terminal context chips, revert disabled states, scroll behavior, and accessibility labels.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Timeline renders all row types, streaming, long output collapse, markdown, images, scrolling, and accessibility.",
+        "automatedTests": "Fixture rendering, virtualization, stream update, long output, image preview, copy/link, a11y label tests.",
+        "e2eProofGate": "E2E: run fake provider with long tool output and image; verify smooth scroll, collapse, and final evidence rows.",
+        "failSignal": "Streaming freezes UI or long output expands unbounded by default."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-063",
+      "title": "Implement T3 Code-Style Agent Composer",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Composer UI agent",
+      "dependsOn": [
+        "RC2-006",
+        "RC2-060",
+        "RC2-053"
+      ],
+      "dependsText": "RC2-006, RC2-060, RC2-053",
+      "output": "Message composer",
+      "summary": "Create the native prompt composer using T3 Code's ChatComposer as the reference.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Add rounded bottom composer with multiline prompt editor, send shortcut, accessible submit/stop button, collapsed/narrow-width mode, and disabled environment states.",
+        "Add provider/model picker, provider trait/reasoning controls, plan/build mode toggle, runtime permission mode selector with Supervised, Auto-accept edits, and Full access options.",
+        "Add context path mention support, file/folder tagging, terminal context chips, image attachments with preview/remove/warning state, and native file dialogs. Skill/command menu is V1-deferred unless RC2-005 explicitly promotes it; if deferred, expose a typed unsupported command and no visible broken control.",
+        "Add pending approval panel, pending user-input panel, plan follow-up banner, \"implement plan in new thread\" action, and context window meter where provider metadata supports it.",
+        "Disable submit when no workspace path, no provider, missing CLI/auth, unsupported model, empty prompt, environment disconnected, or active run for selected thread.",
+        "Support stop/interrupt action during active run, preserve drafts per thread, and clear composer only after prompt is accepted.",
+        "Normalize dead keys, paste, drag-over attachment, command menu highlight, and focus behavior on macOS."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Sending a prompt creates a user message, starts fake/real run, clears composer only after accepted, and the footer controls visually and behaviorally match T3 Code's composer pattern.",
+      "cardTests": "Send-state unit tests, image attachment limits, pending approval/input flows, provider picker, runtime mode selector, plan/build toggle, stop action, disabled states, draft persistence, and keyboard focus tests.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Composer handles prompt, attachments, provider/model/runtime controls, pending panels, disabled states, drafts, stop.",
+        "automatedTests": "Send-state, attachment limit, pending approval/input, provider picker, mode selector, stop, draft, focus tests.",
+        "e2eProofGate": "E2E: send prompt, attach image/path, stop active run, restore draft, verify composer clears only after accept.",
+        "failSignal": "Submit is enabled in invalid state or prompt is lost on failed send."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-064",
+      "title": "Integrate T3 Code-Like Agent App With Codex And Claude",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Agent integration agent",
+      "dependsOn": [
+        "RC2-051",
+        "RC2-052",
+        "RC2-062",
+        "RC2-063"
+      ],
+      "dependsText": "RC2-051, RC2-052, RC2-062, RC2-063",
+      "output": "Real agent runs",
+      "summary": "Wire real provider runners into the Agent App surface while keeping the T3 Code provider-agnostic UI model.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Add provider selector and provider-specific model loading while preserving a shared model picker UI shape.",
+        "Lock provider selection for threads with existing provider thread IDs.",
+        "Start Codex and Claude runs from composer.",
+        "Stream normalized events into timeline and persist final messages.",
+        "Show missing CLI/auth/model errors in T3 Code-style banners and disabled composer states.",
+        "Persist provider session/thread IDs, model selection, runtime mode, effort/traits, and branch/worktree context."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Codex and Claude can each run in the same Agent App UI without raw-provider UI branches, and each run produces timeline, work log, and changed-file evidence.",
+      "cardTests": "Fake provider integration plus real CLI smoke tests when local auth exists; missing binary/auth tests; provider lock tests; cancellation and persistence tests.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Codex and Claude run in one Agent App UI, stream normalized events, persist state, lock provider when needed.",
+        "automatedTests": "Fake provider integration, missing auth/binary, provider lock, cancellation, persistence tests.",
+        "e2eProofGate": "E2E: run fake Codex then fake Claude in separate threads and verify identical timeline/work evidence behavior.",
+        "failSignal": "Provider switch corrupts thread history or UI forks into raw-provider screens."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-065",
+      "title": "Implement Agent Socket And CLI Commands",
+      "phase": "Phase 6 - Agent App Runtime",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Agent automation agent",
+      "dependsOn": [
+        "RC2-018",
+        "RC2-019",
+        "RC2-064"
+      ],
+      "dependsText": "RC2-018, RC2-019, RC2-064",
+      "output": "`agent.*` API",
+      "summary": "Allow external agents/scripts to create and drive Agent App surfaces.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Implement socket methods: `agent.open`, `agent.thread.create`, `agent.thread.list`, `agent.message.send`, `agent.run.stop`, `agent.state.current`, `agent.models.list`.",
+        "Add CLI wrappers under `remotecode2 agent`.",
+        "Return window/workspace/pane/surface/thread/run IDs in responses.",
+        "Ensure command can target a specific workspace or surface."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "CLI can open Agent App surface and send prompt to selected provider.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Agent socket/CLI commands can open Agent App, create/list threads, send message, stop run, and list models.",
+        "automatedTests": "API handler, CLI wrapper, target resolution, response schema, error handling, and provider state tests.",
+        "e2eProofGate": "E2E: CLI opens Agent App, sends prompt to fake provider, waits for completion, stops another active run.",
+        "failSignal": "Command cannot target a specific workspace/surface or returns unstable IDs."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-066",
+      "title": "Implement T3 Code-Style Changed Files Summary",
+      "phase": "Phase 7 - Work Evidence And Project Actions",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Diff evidence UI agent",
+      "dependsOn": [
+        "RC2-022",
+        "RC2-062"
+      ],
+      "dependsText": "RC2-022, RC2-062",
+      "output": "ChangedFilesSummary component",
+      "summary": "Add the changed-files card shown after agent turns, matching T3 Code's proof-of-work pattern.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "After each completed provider turn, compute git diff summary for the relevant checkpoint, branch, or working tree range.",
+        "Render a compact card titled \"Changed files (N)\" with additions/deletions totals, collapse all/expand all, view diff, and a nested file tree.",
+        "Show file icons/fallbacks, directory nesting, per-file additions/deletions, created/deleted/modified/renamed states, and selected hover/focus styling.",
+        "Open the diff panel to selected turn/file when a file or \"View diff\" is clicked.",
+        "Handle non-git projects, no changes, deleted files, binary files, large diffs, and git command failures with clear states."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Every completed agent turn with file changes shows a T3 Code-style changed-files proof card and opens the correct diff.",
+      "cardTests": "Git fixture tests for additions/deletions/renames/binary/no-git/no-change; UI tests for collapse, expand, and open diff.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Changed-files summary shows totals, tree, per-file state, empty/no-git errors, collapse, and diff opening.",
+        "automatedTests": "Git fixtures for add/delete/rename/binary/no-git/no-change and UI state tests.",
+        "e2eProofGate": "E2E: fake agent changes files; timeline shows changed-files card; clicking file opens correct diff.",
+        "failSignal": "Completed file-changing run lacks proof card or wrong file opens."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-067",
+      "title": "Implement T3 Code-Style Diff Panel",
+      "phase": "Phase 7 - Work Evidence And Project Actions",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Diff panel agent",
+      "dependsOn": [
+        "RC2-066"
+      ],
+      "dependsText": "RC2-066",
+      "output": "DiffPanel surface/pane",
+      "summary": "Build the dedicated diff inspection surface inspired by T3 Code's DiffPanel.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Render turn selector chips including all turns and individual turns with timestamp/checkpoint labels.",
+        "Render stacked and split diff modes, word-wrap toggle, ignore-whitespace toggle, file collapse/expand controls, and open-file-in-editor action.",
+        "Support raw patch fallback when parser cannot render a diff, with a clear reason.",
+        "Virtualize or chunk large diffs so the UI remains responsive.",
+        "Persist selected diff turn/file and restore when reopening the surface."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "User can inspect all changes or one turn's changes, switch stacked/split mode, toggle whitespace/wrap, and open a file in the preferred editor.",
+      "cardTests": "Diff parser fixture tests, large-diff performance test, no-git/no-completed-turn/no-net-change states, selected-file scroll test, and accessibility labels for toggles.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Diff panel supports turns, files, stacked/split mode, wrap/whitespace, large diffs, fallback, restore.",
+        "automatedTests": "Diff parser fixtures, large-diff performance, no-git/no-change, selected-file scroll, accessibility tests.",
+        "e2eProofGate": "E2E: open diff from changed-files card, toggle modes/options, reopen, verify selected file persists.",
+        "failSignal": "Large diff freezes UI or fallback hides parser failure reason."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-068",
+      "title": "Implement T3 Code-Style Terminal Drawer And Chat Context Bridge",
+      "phase": "Phase 7 - Work Evidence And Project Actions",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Terminal drawer agent",
+      "dependsOn": [
+        "RC2-030",
+        "RC2-031",
+        "RC2-063"
+      ],
+      "dependsText": "RC2-030, RC2-031, RC2-063",
+      "output": "ThreadTerminalDrawer",
+      "summary": "Add the T3 Code terminal drawer behavior on top of RemoteCode 2 terminal surfaces.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Add a resizable bottom terminal drawer attached to the active Agent App thread with persisted height and visible/hidden state.",
+        "Support terminal toggle, split, new, close, active terminal selection, group sidebar when multiple terminals exist, and max split limit.",
+        "Route terminal shortcuts only when terminal focus/open context matches the keybinding resolver.",
+        "Open file paths and URLs from terminal output using preferred editor/external browser rules.",
+        "Allow selecting terminal text and adding it to the composer as a terminal context chip with label, line range, and body text.",
+        "Preserve terminal snapshot/history across drawer remounts and close terminal sessions cleanly."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "User can open the drawer, run commands, split terminals, add selected terminal output to chat context, and return focus to composer reliably.",
+      "cardTests": "Drawer resize persistence, shortcut context tests, selection-to-chat context, split/new/close lifecycle, link opening, snapshot restore, and no orphan process checks.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Terminal drawer supports toggle, split/new/close, resize persistence, shortcuts, link open, selection-to-context.",
+        "automatedTests": "Drawer state, resize, shortcuts, selection context, link open, lifecycle, restore, orphan-process tests.",
+        "e2eProofGate": "E2E: open drawer, split terminals, select output into composer context, hide/show, verify focus returns.",
+        "failSignal": "Drawer steals composer focus or terminal process leaks on close."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-069",
+      "title": "Implement T3 Code-Style Project Scripts And Open-In Controls",
+      "phase": "Phase 7 - Work Evidence And Project Actions",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Project actions agent",
+      "dependsOn": [
+        "RC2-015",
+        "RC2-021",
+        "RC2-030"
+      ],
+      "dependsText": "RC2-015, RC2-021, RC2-030",
+      "output": "Project actions controls",
+      "summary": "Add header actions that let users run project scripts and open the project like T3 Code.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Discover project scripts from package metadata, Makefile, or configured scripts file without executing untrusted commands automatically.",
+        "Render an \"Add action\" or scripts control in the top header with script name, command preview, and run-in-terminal behavior.",
+        "Render an \"Open\" control for preferred editor, Finder, Terminal, and external browser where applicable.",
+        "Register all actions in the command palette and expose shortcuts where configured.",
+        "Log script start/finish metadata without logging secrets from command output."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "User can run a project test/build script into a terminal drawer or surface and open the current project in the preferred editor from header or palette.",
+      "cardTests": "Script discovery fixtures, disabled unsafe script cases, run-in-terminal integration, open editor/finder actions, and command palette registration.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Project actions discover scripts safely, render Add action/Open controls, run in terminal, and log safely.",
+        "automatedTests": "Script discovery fixtures, unsafe disabled cases, open actions, command registration, log redaction tests.",
+        "e2eProofGate": "E2E: run project test script from header into terminal drawer and open project in preferred editor placeholder.",
+        "failSignal": "Untrusted script executes automatically or secrets appear in logs."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-080",
+      "title": "Implement Clean First-Run Data Bootstrap",
+      "phase": "Phase 2 - Domain And Persistence",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Persistence bootstrap agent",
+      "dependsOn": [
+        "RC2-016"
+      ],
+      "dependsText": "RC2-016",
+      "output": "Fresh data bootstrap",
+      "summary": "Start RemoteCode 2 from a clean database with no previous-app data path.",
+      "context": "",
+      "hardRule": "Do not read, scan, transform, transfer, or accept data from any previous app. RemoteCode 2 starts from zero.",
+      "steps": [
+        "Create the app support directory for debug, canary, and stable channels when absent.",
+        "Create the latest schema from scratch without probing external database locations.",
+        "Initialize required settings with explicit defaults: theme, command shortcuts, provider defaults, first-run completed flag, and direct-VPN mobile-readiness flags.",
+        "Seed no projects, no threads, no messages, no provider sessions, and no terminal history unless an automated test fixture explicitly requests test-only data.",
+        "Expose a diagnostic report that says \"fresh start\" and lists created directories/schema version without mentioning old data."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "First launch creates only RemoteCode 2-owned files and never asks for, searches for, or loads data from another RemoteCode app.",
+      "cardTests": "Fresh install, empty app support directory, corrupted new DB recovery, debug/canary/stable isolation, and explicit assertion that no previous-app paths are touched.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "First run creates only RemoteCode 2-owned files, clean schema, explicit defaults, and empty production data.",
+        "automatedTests": "Fresh install, empty support directory, corrupt new DB recovery, channel isolation, no previous-path touch tests.",
+        "e2eProofGate": "E2E: launch as clean user, verify empty workspace state and filesystem trace touches only RemoteCode 2 paths.",
+        "failSignal": "App reads or probes another product data path."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-081",
+      "title": "Create Test-Only Data Fixture Factory",
+      "phase": "Phase 2 - Domain And Persistence",
+      "labels": [
+        "Build",
+        "Test"
+      ],
+      "owner": "Test infrastructure agent",
+      "dependsOn": [
+        "RC2-080"
+      ],
+      "dependsText": "RC2-080",
+      "output": "Fixture factory",
+      "summary": "Provide deterministic seed data for tests without using any previous app data.",
+      "context": "",
+      "hardRule": "Fixtures must be generated from code and static test assets only. They must not load other app databases, exports, user home folders, or external product data sources.",
+      "steps": [
+        "Create fixture builders for projects, workspaces, panes, surfaces, agent threads, messages, provider events, terminal sessions, browser snapshots, and mobile connection targets.",
+        "Make fixtures deterministic with stable IDs and explicit timestamps.",
+        "Allow tests to request minimal fixtures by scenario instead of booting with sample user data.",
+        "Keep fixture data visibly fake and safe for screenshots.",
+        "Document that production builds never seed sample projects or threads."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Test suites can create realistic app states from fixtures, while production first-run remains empty and clean.",
+      "cardTests": "Fixture determinism, channel isolation, no production seeding, no filesystem reads outside fixture directory, and no previous-product data source references.",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Test fixtures create deterministic fake projects, surfaces, threads, events, terminal/browser state, and connection targets.",
+        "automatedTests": "Determinism, no production seeding, channel isolation, fixture directory guard, fake-data visibility tests.",
+        "e2eProofGate": "E2E: proof gate - UI suite boots from fixture scenario and production first run remains empty.",
+        "failSignal": "Fixture reads user home data or appears in production build."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-090",
+      "title": "Create Unit Test Suite",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Test"
+      ],
+      "owner": "Test agent",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Foundation modules",
+      "output": "Unit tests",
+      "summary": "Build low-level tests that verify business intent and invariants.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+        "Workspace/pane/surface reducer invariants.",
+        "Session snapshot encode/decode and invalid snapshot handling.",
+        "SQLite repository operations and schema versioning.",
+        "Codex and Claude parser fixtures.",
+        "Assistant event reducer and turn snapshot builder.",
+        "CLI parser and command validation."
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Tests fail when provider switch corrupts thread history, stale runs remain active, or layout loses selected surface.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Unit suite covers reducers, snapshots, DB, providers, event model, CLI, and command validation intent.",
+        "automatedTests": "CI unit command fails on missing required test family or shallow no-intent tests.",
+        "e2eProofGate": "E2E: proof gate - mutation-style spot checks prove tests fail when key invariants are broken.",
+        "failSignal": "Suite passes while stale run, bad layout, or provider-history corruption is injected."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-091",
+      "title": "Create Integration Test Suite",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Test"
+      ],
+      "owner": "Integration test agent",
+      "dependsOn": [
+        "RC2-018",
+        "RC2-030",
+        "RC2-040",
+        "RC2-053"
+      ],
+      "dependsText": "RC2-018, RC2-030, RC2-040, RC2-053",
+      "output": "Integration tests",
+      "summary": "Verify subsystems working together without relying on manual UI.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+        "Socket server creates workspace, pane, terminal/browser/agent surfaces.",
+        "CLI drives socket server and receives stable JSON.",
+        "Terminal launches shell in workspace cwd and cleans up process.",
+        "Browser P0 automation operates a local fixture page.",
+        "Fake provider run streams normalized events into DB.",
+        "Fresh-start fixture factory creates deterministic app state for tests."
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Integration suite can run headless or with minimal app host in CI.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Integration suite proves socket, CLI, terminal, browser, fake provider, and fixture factory work together.",
+        "automatedTests": "Headless/minimal-host integration tests for each required scenario with deterministic fixtures.",
+        "e2eProofGate": "E2E: CI launches minimal app host and drives full socket-to-UI-state workflow.",
+        "failSignal": "Subsystem tests pass individually but integrated workflow cannot run."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-092",
+      "title": "Create UI Automation Suite With T3 Code Parity Flows",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Test",
+        "Review"
+      ],
+      "owner": "UI test agent",
+      "dependsOn": [
+        "RC2-006"
+      ],
+      "dependsText": "Core UI complete, RC2-006",
+      "output": "XCTest UI suite",
+      "summary": "Validate the full app like a user would use it, including T3 Code-inspired Agent App workflows.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+        "Fresh launch has native window and no fake chrome controls.",
+        "Create workspace from folder path.",
+        "Create terminal left, Agent App top-right, browser bottom-right.",
+        "Use command palette to split and switch surfaces.",
+        "Run fake provider from Agent App and inspect streaming timeline.",
+        "Use provider/model picker, runtime mode selector, plan/build toggle, changed-files card, diff panel, and terminal drawer.",
+        "Select terminal text and add it to composer context.",
+        "Quit/reopen restores layout and selected Agent App thread."
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Suite produces screenshots or recordings for major flows and includes a visual parity checkpoint against the T3 Code reference layout.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "UI automation covers fresh launch, workspace, surfaces, command palette, fake provider, diff, drawer, restore.",
+        "automatedTests": "XCTest UI suite with fixture setup, screenshots, recordings, and deterministic selectors.",
+        "e2eProofGate": "E2E: full happy path creates terminal/Agent App/browser layout, runs fake provider, inspects diff, relaunches.",
+        "failSignal": "Any core daily workflow lacks UI automation or produces blank/overlapped screenshots."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-093",
+      "title": "Create Performance Test Suite",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Test",
+        "Ops"
+      ],
+      "owner": "Performance agent",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Core vertical slice",
+      "output": "Perf reports",
+      "summary": "Keep native rewrite fast and prevent regressions.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Reports compare current run to budget and flag regression above threshold.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Performance suite measures launch, idle memory, terminal/browser creation, timeline, diff, and large events against budgets.",
+        "automatedTests": "Automated perf benchmarks with baseline comparison and regression thresholds.",
+        "e2eProofGate": "E2E: scripted heavy workspace run records timings and screenshots, then flags regression above threshold.",
+        "failSignal": "Perf data is manual-only or regressions do not fail CI/review gate."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-094",
+      "title": "Create T3 Code UI Parity Screenshot Suite",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Test",
+        "Review"
+      ],
+      "owner": "Visual QA agent",
+      "dependsOn": [
+        "RC2-020",
+        "RC2-069"
+      ],
+      "dependsText": "RC2-020 through RC2-069",
+      "output": "Visual parity test suite",
+      "summary": "Create screenshot and semantic checks that prevent the Swift UI from drifting away from the T3 Code reference.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+        "Desktop width: sidebar with multiple projects/threads, selected thread, header actions, changed-files card, composer, and branch/workspace toolbar.",
+        "Narrow width: compact header, compact composer footer, sidebar behavior, and no text overlap.",
+        "Active run: working timer, disabled controls, stop button, provider status banner, and streaming message.",
+        "Diff panel open: turn chips, stacked/split toggle, wrap/whitespace toggles, file diff collapsed/expanded states.",
+        "Terminal drawer open: resizable drawer, split terminals, terminal action buttons, selected text context action.",
+        "Light/auto theme only if RC2-020 implements it completely; otherwise assert dark default only and fail any visible half-implemented theme switch."
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Screenshots prove the first viewport strongly resembles T3 Code's product structure while keeping native macOS chrome. Tests fail on blank screens, overlapped text, missing core controls, and unreadable contrast.",
+      "cardTests": "",
+      "reviewChecklist": "Reviewer compares screenshots against T3 Code reference and confirms differences are intentional Swift/native adaptations, not omissions.",
+      "verification": {
+        "acceptanceCriteria": "Visual suite proves T3-like desktop/narrow/active/diff/drawer views with contrast and no overlap.",
+        "automatedTests": "Screenshot comparison, semantic control checks, blank-screen detection, contrast, and layout bounds tests.",
+        "e2eProofGate": "E2E: capture canonical screenshots for each major viewport and compare to approved T3 parity references.",
+        "failSignal": "Missing core control, unreadable contrast, blank area, or overlapped text passes unnoticed."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-095",
+      "title": "Create Future Mobile Direct-VPN Contract Test Suite",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Test",
+        "Risk"
+      ],
+      "owner": "Contract test agent",
+      "dependsOn": [
+        "RC2-023",
+        "RC2-024",
+        "RC2-025",
+        "RC2-026"
+      ],
+      "dependsText": "RC2-023, RC2-024, RC2-025, RC2-026",
+      "output": "Direct-VPN API contract tests",
+      "summary": "Prove the desktop core can support a future mobile mirror without building the mobile app.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+        "Direct discovery returns only desktop-owned address/capability metadata and no hosted relay/private-backend fields.",
+        "Remote access is disabled by default and cannot bind to VPN/LAN until explicitly enabled.",
+        "Paired fake device can authenticate, subscribe to workspace events, send one workspace command, and receive the resulting event.",
+        "Fake mobile client reconnects with last sequence and receives missed Agent App timeline events exactly once.",
+        "Terminal input, terminal resize, browser navigate, Agent App send message, stop run, git status, and workspace focus commands all route through the shared command bus.",
+        "Revoked device loses HTTP and WebSocket access immediately.",
+        "Large event burst applies backpressure and does not freeze desktop UI state."
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Contract tests pass with a fake client and fail if a developer adds a relay/private-backend dependency, bypasses the command bus, removes replay metadata, or ships a default production token.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Direct-VPN contract suite proves discovery, auth, pairing, WS replay, command bus routing, revocation, and backpressure.",
+        "automatedTests": "Fake-client HTTP/WS contract tests plus negative tests for relay/private-backend fields.",
+        "e2eProofGate": "E2E: paired fake mobile drives workspace, Agent App, terminal, browser, git/status flows over direct API.",
+        "failSignal": "Relay dependency appears, default token ships, replay metadata missing, or command bypasses bus."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-100",
+      "title": "Run Architecture Review",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Review"
+      ],
+      "owner": "Senior reviewer agent",
+      "dependsOn": [
+        "RC2-010",
+        "RC2-019"
+      ],
+      "dependsText": "RC2-010 through RC2-019",
+      "output": "Review report",
+      "summary": "Review module boundaries and lifecycle before feature work hardens.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+        "Surface protocol does not leak concrete terminal/browser/agent details.",
+        "Socket API uses public terminology and stable IDs.",
+        "Persistence layer is testable and schema steps are deterministic.",
+        "No source license violation risk was introduced.",
+        "No fake desktop chrome or web runtime dependency exists."
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Findings are prioritized by severity and implementation resumes only after P0/P1 issues are resolved.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Architecture review lists P0/P1/P2 findings for module boundaries, source use, persistence, socket, and native constraints.",
+        "automatedTests": "Review checklist lint verifies all required focus areas are answered with evidence links.",
+        "e2eProofGate": "E2E: proof gate - reviewer runs one vertical slice smoke before approving architecture readiness.",
+        "failSignal": "P0/P1 issue remains open or review lacks file/test evidence."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-101",
+      "title": "Run Security And Privacy Review",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Review",
+        "Risk"
+      ],
+      "owner": "Security reviewer agent",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Provider, browser, socket, fresh-start bootstrap complete",
+      "output": "Security review report",
+      "summary": "Check secrets, provider process handling, browser data, socket access, and first-run local data handling.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+        "Prompts and terminal input are redacted in logs/events where needed.",
+        "Provider thread IDs and tokens are not printed unnecessarily.",
+        "Local automation socket remains local-only; direct-VPN HTTP/WebSocket access requires explicit enablement, pairing, revocable device trust, and strong auth.",
+        "No relay, private backend, connector id, cloud command queue, or hosted repository mirror exists in the remote-control path.",
+        "Browser profiles/cookies are stored and cleared intentionally.",
+        "First-run bootstrap never scans other app data, home-folder previous-product paths, or external databases."
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "No high-severity privacy or local privilege issue remains open for release.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Security review clears secrets, auth, remote access, browser data, logging, first-run paths, and provider handling.",
+        "automatedTests": "Secret scan, auth negative tests, log redaction tests, denied remote access tests, path touch audit.",
+        "e2eProofGate": "E2E: attempted unauthorized HTTP/WS/CLI access fails; authorized paired device audit trail is visible.",
+        "failSignal": "High severity issue open, token logged, or remote control works without explicit trust."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-102",
+      "title": "Run Accessibility And Keyboard Review",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Review",
+        "Test"
+      ],
+      "owner": "Accessibility reviewer agent",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Core UI complete",
+      "output": "A11y review",
+      "summary": "Ensure the developer UI is keyboard-first and accessible enough for daily use.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+        "Workspace/sidebar/surface tabs have accessible names and focus states.",
+        "Command palette is fully keyboard usable.",
+        "Agent composer, stop button, provider selectors, and copy buttons are accessible.",
+        "Terminal/browser focus handoff is predictable.",
+        "Text does not overlap or truncate critical controls at supported window sizes."
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Keyboard and accessibility review confirms names, focus, command palette, composer, terminal/browser handoff, and no truncation.",
+        "automatedTests": "Accessibility tree checks, focus-order tests, keyboard-only navigation tests, text bounds checks.",
+        "e2eProofGate": "E2E: keyboard-only user completes create workspace, run fake provider, inspect diff, operate terminal drawer.",
+        "failSignal": "Mouse-only required path or inaccessible critical control remains."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-103",
+      "title": "Run T3 Code UX Parity Review",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Review",
+        "Risk"
+      ],
+      "owner": "Senior UX reviewer + Scrum master",
+      "dependsOn": [
+        "RC2-060",
+        "RC2-069",
+        "RC2-094"
+      ],
+      "dependsText": "RC2-060 through RC2-069, RC2-094",
+      "output": "T3 parity review report",
+      "summary": "Senior design/product review proving RemoteCode 2 copied the right T3 Code behaviors without violating SwiftUI/AppKit/native constraints.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+        "Sidebar: search, project/thread grouping, selected state, status pills, timestamps, and settings footer match T3 Code intent.",
+        "Header: action density, Add action, Open, Commit & push deferred command, terminal toggle, diff toggle, and overflow controls are present with either working behavior or typed unsupported state from RC2-005.",
+        "Agent App: timeline rows, work log, changed-files card, diff panel, composer footer, provider/model/runtime controls, and pending approvals match T3 Code intent.",
+        "Terminal drawer: split/new/close, selection-to-chat, focus/keybinding behavior, and height persistence match T3 Code intent.",
+        "SwiftUI usage: sidebar, chat, composer, lists, settings, command palette, controls, and data-driven content are SwiftUI unless a documented AppKit need exists.",
+        "AppKit usage: window, responder chain, menus, focus, terminal host, complex split panes, and native panels are AppKit-owned where SwiftUI is weak.",
+        "Liquid Glass usage: present only in controls and bars; absent from main content, chat body, sidebar rows, terminal, browser, and diff content.",
+        "Swift/native adaptation: no Electron/React runtime, no fake window chrome, no CSS-only assumptions, no marketing-style UI, and all direct T3 Code source reuse has MIT attribution."
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Report lists pass/fail for each T3 Code pattern and every failing P0/P1 item becomes a new task before release readiness.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "T3 parity review passes sidebar, header, Agent App, drawer, SwiftUI/AppKit, Liquid Glass, and native adaptation checks.",
+        "automatedTests": "Parity checklist lint ties every required T3 pattern to screenshots/tests or explicit deferral.",
+        "e2eProofGate": "E2E: reviewer compares canonical app recording against T3 Code reference flow and marks each pattern pass/fail.",
+        "failSignal": "Major T3 behavior missing without deferral or UI drifts into marketing style."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-104",
+      "title": "Run Future Mobile Readiness Review",
+      "phase": "Phase 8 - Quality Gates",
+      "labels": [
+        "Review",
+        "Risk",
+        "Test"
+      ],
+      "owner": "Senior platform reviewer + Scrum master",
+      "dependsOn": [
+        "RC2-008",
+        "RC2-023",
+        "RC2-026",
+        "RC2-095"
+      ],
+      "dependsText": "RC2-008, RC2-023 through RC2-026, RC2-095",
+      "output": "Mobile readiness review report",
+      "summary": "Senior review gate proving RemoteCode 2 was built from zero with the future mobile mirror in mind.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+        "Architecture keeps the desktop as source of truth and stores repositories/provider credentials only on the user's computer.",
+        "Networking is direct VPN/LAN only, disabled by default beyond loopback, and contains no relay/private-backend/cloud-broker path.",
+        "Every desktop action that future mobile needs is routed through the shared command bus and emits replayable events.",
+        "Event envelopes include sequence, request id, origin client id, actor, target ids, replay semantics, and redaction class.",
+        "Device trust is explicit, revocable, auditable, and does not rely on production default credentials.",
+        "Surface contracts cover Agent App, terminal, browser, git/files, workspace/panes, and remote-access settings.",
+        "Mobile itself was not implemented in this phase; only desktop readiness contracts, APIs, fixtures, and tests were built."
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Report names pass/fail for each mobile-readiness invariant and every P0/P1 failure becomes a blocking card before release readiness.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Mobile readiness review proves direct-only networking, command bus, replay, device trust, surface coverage, and deferred mobile scope.",
+        "automatedTests": "Review checklist plus contract test report from RC2-095 and static scan for forbidden network paths.",
+        "e2eProofGate": "E2E: fake mobile readiness run pairs, reconnects, replays missed events, revokes access, and records evidence.",
+        "failSignal": "Any mobile-critical invariant fails or mobile app work is accidentally added to scope."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-120",
+      "title": "Implement Signing, Notarization, And DMG Packaging",
+      "phase": "Phase 9 - Release",
+      "labels": [
+        "Ops",
+        "Test"
+      ],
+      "owner": "Release engineering agent",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Feature-complete app",
+      "output": "Signed DMG",
+      "summary": "Produce a macOS artifact that can launch on a clean machine.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Configure signing identities, entitlements, hardened runtime, and app sandbox status if used.",
+        "Sign app bundle and CLI helper.",
+        "Create DMG with Applications drag target.",
+        "Submit for notarization and staple ticket.",
+        "Validate with `spctl` and launch on a clean macOS user account."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Clean macOS user can install and launch without Gatekeeper warnings beyond normal first-open flow.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Signed/notarized DMG installs and launches cleanly with correct entitlements and CLI helper signing.",
+        "automatedTests": "Codesign, notarization, staple, entitlement, Gatekeeper, bundle structure, and CLI helper checks.",
+        "e2eProofGate": "E2E: install DMG on clean macOS account, launch app, run smoke flow, and verify Gatekeeper acceptance.",
+        "failSignal": "Unsigned helper, unstapled ticket, or clean machine launch fails."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-121",
+      "title": "Implement Update Channel Strategy",
+      "phase": "Phase 9 - Release",
+      "labels": [
+        "Ops",
+        "Build"
+      ],
+      "owner": "Release engineering agent",
+      "dependsOn": [
+        "RC2-120"
+      ],
+      "dependsText": "RC2-120",
+      "output": "Updater config",
+      "summary": "Prepare debug/canary/stable channel separation and updater behavior.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Set separate bundle IDs and app support directories for debug, canary, stable.",
+        "Integrate Sparkle or approved updater.",
+        "Define update feed signing and release metadata workflow.",
+        "Test update from canary N to canary N+1."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Canary app updates without touching stable app data.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Update channels isolate bundle ids/data and canary updates from N to N+1 safely.",
+        "automatedTests": "Bundle id, app support path, update feed signing, canary update, stable isolation tests.",
+        "e2eProofGate": "E2E: install canary N, create data, update to N+1, verify data persists and stable remains untouched.",
+        "failSignal": "Canary touches stable data or update requires manual repair."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-122",
+      "title": "Create Clean First-Run UX",
+      "phase": "Phase 9 - Release",
+      "labels": [
+        "Build",
+        "Review"
+      ],
+      "owner": "Onboarding agent",
+      "dependsOn": [
+        "RC2-080"
+      ],
+      "dependsText": "RC2-080, provider checks",
+      "output": "First-run flow",
+      "summary": "Guide users through dependency checks and first workspace creation from zero.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+        "Detect Codex and Claude CLI availability.",
+        "State clearly that RemoteCode 2 starts clean and does not connect to another RemoteCode app's data.",
+        "Allow opening a folder and choosing initial surface: Agent App, terminal, browser.",
+        "Offer CLI symlink install/update only with explicit user approval.",
+        "Show remote access disabled by default, with direct-VPN readiness settings clearly separated from first workspace setup and unreachable unless the user explicitly opens remote access settings."
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "New user can reach first Agent App prompt without reading docs.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "First-run UX reaches first Agent App prompt from zero and keeps remote-access settings disabled and separate from onboarding.",
+        "automatedTests": "Dependency detection, provider missing states, folder chooser, initial surface, remote disabled default tests.",
+        "e2eProofGate": "E2E: clean user completes onboarding, opens folder, creates Agent App, sends fake prompt, sees response.",
+        "failSignal": "User cannot reach first prompt without docs or remote access is enabled by default."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-123",
+      "title": "Create User And Developer Documentation",
+      "phase": "Phase 9 - Release",
+      "labels": [
+        "Ops",
+        "Review"
+      ],
+      "owner": "Docs agent",
+      "dependsOn": [
+
+      ],
+      "dependsText": "Feature behavior stable",
+      "output": "Docs",
+      "summary": "Document installation, first-run setup, CLI, T3 Code-inspired Agent App, direct-VPN desktop API, browser automation, and troubleshooting.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+
+      ],
+      "cardAcceptance": "Docs describe actual behavior, not planned behavior, and include release version.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Docs match actual behavior for install, first run, CLI/socket, Agent App, direct VPN, tests, limits, and notices.",
+        "automatedTests": "Docs lint for required sections, broken links, stale planned wording, command snippets, notice references.",
+        "e2eProofGate": "E2E: proof gate - new-agent dry run follows docs to complete first workspace and one direct-API fake-client check.",
+        "failSignal": "Docs describe planned behavior as shipped or omit critical direct-VPN/no-relay constraints."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    },
+    {
+      "id": "RC2-124",
+      "title": "Run Final Release Readiness Review",
+      "phase": "Phase 9 - Release",
+      "labels": [
+        "Review",
+        "Ops",
+        "Test"
+      ],
+      "owner": "Scrum master + senior reviewer",
+      "dependsOn": [
+
+      ],
+      "dependsText": "All V1 cards",
+      "output": "Go/no-go report",
+      "summary": "Scrum master gate before stable release.",
+      "context": "",
+      "hardRule": "",
+      "steps": [
+
+      ],
+      "requiredDecision": [
+
+      ],
+      "requiredMatrix": [
+
+      ],
+      "requiredScenarios": [
+
+      ],
+      "requiredCoverage": [
+
+      ],
+      "reviewFocus": [
+
+      ],
+      "checklist": [
+        "All required build cards done.",
+        "All review P0/P1 findings resolved.",
+        "Unit, integration, UI, fresh-start, performance suites pass.",
+        "Signed/notarized app launches on clean macOS user.",
+        "Fresh-start bootstrap and channel isolation have been tested.",
+        "Direct-VPN mobile-readiness contract tests and review have passed, with the mobile app explicitly deferred.",
+        "Deferred scope is documented and unsupported APIs fail loudly."
+      ],
+      "cardAcceptance": "Go/no-go report names release version, commit, artifacts, known risks, and recovery path.",
+      "cardTests": "",
+      "reviewChecklist": "",
+      "verification": {
+        "acceptanceCriteria": "Final go/no-go report names version, commit, artifacts, tests, reviews, risks, and recovery path.",
+        "automatedTests": "Release checklist validates all blocking cards, test reports, notarization, screenshots, and review signoffs exist.",
+        "e2eProofGate": "E2E: final release candidate runs clean install, first prompt, terminal/browser/diff/drawer, direct-VPN fake-client, update smoke.",
+        "failSignal": "Any P0/P1 open, missing artifact, missing evidence, or unsupported API fails silently."
+      },
+      "doneReportRequiredFields": [
+        "contextProof",
+        "changedArtifacts",
+        "acceptanceStatus",
+        "automatedTests",
+        "e2eProof",
+        "regressionGuard",
+        "securityPrivacyCheck",
+        "freshStartCheck",
+        "mobileReadinessCheck",
+        "exitStatus"
+      ],
+      "validExitStatuses": [
+        "DONE",
+        "BLOCKED",
+        "NEEDS REVIEW"
+      ]
+    }
+  ]
+}

@@ -66,7 +66,7 @@
   <h2>Phase 4: Persistence And Socket Core</h2>
   <table>
     <tr><th>Work</th><th>Pass criteria</th></tr>
-    <tr><td>SQLite migrations and repositories.</td><td>All domain stores covered by unit tests and migration tests.</td></tr>
+    <tr><td>SQLite schema steps and repositories.</td><td>All domain stores covered by unit tests and schema-step tests.</td></tr>
     <tr><td>JSON-RPC socket server and CLI.</td><td>CLI can drive windows, workspaces, panes, surfaces, notifications, and browser P0.</td></tr>
     <tr><td>Event stream.</td><td>CLI can reconnect and continue after last seen event sequence.</td></tr>
     <tr><td>Session snapshot writer/loader.</td><td>Window/workspace/pane/surface state restores deterministically.</td></tr>
@@ -91,12 +91,12 @@
     <tr><td>Agent session restore.</td><td>Reopen restores selected thread without duplicating active run.</td></tr>
   </table>
 
-  <h2>Phase 7: Migration</h2>
+  <h2>Phase 7: Clean First Run And Fixtures</h2>
   <table>
     <tr><th>Work</th><th>Pass criteria</th></tr>
-    <tr><td>Import current RemoteCode DB with backup.</td><td>Projects, chats, messages, provider thread IDs, selection, and turn snapshots import with count report.</td></tr>
-    <tr><td>Read-only preview mode.</td><td>User can see what would import before writing target DB.</td></tr>
-    <tr><td>Regression fixture from current schema.</td><td>Migration test covers real-like current schema and malformed rows.</td></tr>
+    <tr><td>Clean first-run bootstrap.</td><td>Production first launch creates only RemoteCode 2-owned directories, schema, settings, and no sample user data.</td></tr>
+    <tr><td>Generated fixture factory.</td><td>Tests can generate deterministic projects, Agent App threads, terminal sessions, browser state, event streams, and direct-VPN targets.</td></tr>
+    <tr><td>Filesystem trace test.</td><td>Automated proof shows first run does not read or probe previous app paths, exports, or user home data sources.</td></tr>
   </table>
 
   <h2>Phase 8: Polish, QA, Release</h2>
@@ -105,7 +105,7 @@
     <tr><td>Keyboard shortcuts and command palette parity.</td><td>Core cmux shortcuts work or are documented as changed.</td></tr>
     <tr><td>Performance tuning.</td><td>Meets cold start, memory, scrolling, and streaming budgets.</td></tr>
     <tr><td>Signing, notarization, updater, installer.</td><td>Fresh install and update path pass on clean macOS test user.</td></tr>
-    <tr><td>Release docs and rollback.</td><td>Migration backup/restore and known limitations documented.</td></tr>
+    <tr><td>Release docs and rollback.</td><td>Clean first-run behavior, fixture-only test data, known limitations, and recovery path documented.</td></tr>
   </table>
 </main>
 </body>

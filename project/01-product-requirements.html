@@ -43,7 +43,7 @@
     <tr><td>R4</td><td>Browser surface</td><td>User can open a browser surface, navigate, split it beside terminal/agent surfaces, and use browser automation commands.</td></tr>
     <tr><td>R5</td><td>Agent App surface</td><td>User can open an Agent App surface in any pane and run Codex or Claude against the workspace cwd.</td></tr>
     <tr><td>R6</td><td>Provider parity</td><td>Codex and Claude both support model selection, permission/sandbox controls where supported, running state, streaming events, failure state, stop, and resume.</td></tr>
-    <tr><td>R7</td><td>State continuity</td><td>Projects, chats, messages, provider thread IDs, streaming turn snapshots, workspace selection, and terminal snapshots can migrate from current RemoteCode data.</td></tr>
+    <tr><td>R7</td><td>Clean state continuity</td><td>Projects, threads, messages, provider thread IDs, streaming turn snapshots, workspace selection, terminal snapshots, and browser state persist only after they are created by RemoteCode 2.</td></tr>
     <tr><td>R8</td><td>Automation</td><td>Socket/CLI can create workspaces, panes, terminal/browser/agent surfaces, focus surfaces, send input, read state, and automate browser surfaces.</td></tr>
     <tr><td>R9</td><td>Session restore</td><td>Quit/reopen restores windows, workspaces, panes, surfaces, browser URLs/history where possible, Agent App thread context, terminal scrollback, and focused surface.</td></tr>
     <tr><td>R10</td><td>Performance</td><td>Cold launch and memory use must be materially closer to cmux than to Electron/Electrobun. Performance budgets are defined in the QA plan.</td></tr>
@@ -55,7 +55,7 @@
     <li><span class="no">No</span> simulated desktop chrome inside the app. Use native macOS chrome and toolbar behavior.</li>
     <li><span class="no">No</span> generic plugin marketplace before the core Agent App surface is stable.</li>
     <li><span class="no">No</span> remote cloud VM feature unless cmux parity requires a stubbed API shape.</li>
-    <li><span class="no">No</span> retention of the React UI as a permanent WKWebView shell. Temporary reference harness is allowed only for migration comparison.</li>
+    <li><span class="no">No</span> retention of the React UI as a permanent WKWebView shell. Current local RemoteCode may be studied only as product behavior reference.</li>
   </ul>
 
   <h2>Target User Flows</h2>
@@ -72,7 +72,7 @@
   <h2>Definition Of Done</h2>
   <ul>
     <li><span class="must">Must</span> ship as a signed native macOS app with installer/update path.</li>
-    <li><span class="must">Must</span> include migration tooling and a reversible backup step for current RemoteCode state.</li>
+    <li><span class="must">Must</span> include clean first-run tooling, generated test fixtures, and filesystem-trace proof that no previous app data path is touched.</li>
     <li><span class="must">Must</span> pass unit, integration, socket CLI, UI automation, session restore, and performance gates.</li>
     <li><span class="must">Must</span> document any cmux behavior intentionally deferred from V1.</li>
   </ul>

@@ -43,11 +43,11 @@
     <tr><th>Risk</th><th>Impact</th><th>Mitigation</th><th>Status</th></tr>
     <tr><td>GPL/commercial license conflict with cmux source reuse</td><td><span class="bad">High</span></td><td>No source copy before license decision. Keep source inventory as behavior reference only.</td><td>Open</td></tr>
     <tr><td>Terminal engine takes longer than Agent App</td><td><span class="bad">High</span></td><td>Build terminal proof in Phase 0. Do not start broad Agent UI before terminal feasibility is proven.</td><td>Open</td></tr>
-    <tr><td>Swift rewrite loses current RemoteCode behavior</td><td><span class="bad">High</span></td><td>Use current tests/fixtures as behavioral spec. Add migration fixtures from current DB shape.</td><td>Open</td></tr>
+    <tr><td>Swift rewrite loses current RemoteCode behavior</td><td><span class="bad">High</span></td><td>Use current app behavior as a product reference only. Add generated RemoteCode 2 fixtures that cover equivalent user flows without reading old data.</td><td>Open</td></tr>
     <tr><td>Provider CLI event formats drift</td><td><span class="warn">Medium</span></td><td>Fixture tests for known versions plus tolerant parser with explicit unknown-event logging.</td><td>Open</td></tr>
     <tr><td>Session restore duplicates active runs</td><td><span class="bad">High</span></td><td>Persist run state separately and restore active runs only behind explicit resume policy.</td><td>Open</td></tr>
     <tr><td>Browser automation in WKWebView cannot match Playwright fully</td><td><span class="warn">Medium</span></td><td>Define P0/P1/P2 parity. Return explicit unsupported for impossible actions.</td><td>Open</td></tr>
-    <tr><td>Migration path cannot find current DB reliably</td><td><span class="warn">Medium</span></td><td>Support auto-detect plus explicit file picker and CLI source path.</td><td>Open</td></tr>
+    <tr><td>Fresh first-run path accidentally touches old data</td><td><span class="bad">High</span></td><td>Add filesystem trace tests and release blockers proving RemoteCode 2 does not probe previous app paths, exports, or user home data sources.</td><td>Open</td></tr>
     <tr><td>Native UI complexity exceeds V1 timeline</td><td><span class="warn">Medium</span></td><td>Build vertical slice first: workspace + split + Agent App fake provider + session restore.</td><td>Open</td></tr>
   </table>
 

@@ -35,7 +35,7 @@
     <tr><td><code>Sources/Workspace</code></td><td>Workspace/sidebar/domain state.</td></tr>
     <tr><td><code>Sources/Surfaces</code></td><td>Surface protocol and terminal/browser/agent implementations.</td></tr>
     <tr><td><code>Sources/AgentRuntime</code></td><td>Codex/Claude runners, parser, normalized events.</td></tr>
-    <tr><td><code>Sources/Persistence</code></td><td>SQLite, migrations, repositories, session snapshots.</td></tr>
+    <tr><td><code>Sources/Persistence</code></td><td>SQLite, schema steps, repositories, session snapshots, and generated fixtures.</td></tr>
     <tr><td><code>Sources/SocketAutomation</code></td><td>JSON-RPC socket server and command handlers.</td></tr>
     <tr><td><code>CLI/remotecode2.swift</code></td><td>Thin CLI client.</td></tr>
     <tr><td><code>Tests</code></td><td>Unit and integration tests.</td></tr>
@@ -59,13 +59,13 @@
   <table>
     <tr><th>Channel</th><th>Bundle ID</th><th>Purpose</th></tr>
     <tr><td>Debug</td><td><code>io.remotecode.RemoteCode2.debug</code></td><td>Local dev builds. Separate app data directory.</td></tr>
-    <tr><td>Canary</td><td><code>io.remotecode.RemoteCode2.canary</code></td><td>Early testing with migration preview and extra logging.</td></tr>
+    <tr><td>Canary</td><td><code>io.remotecode.RemoteCode2.canary</code></td><td>Early testing with clean first-run tracing and extra logging.</td></tr>
     <tr><td>Stable</td><td><code>io.remotecode.RemoteCode2</code></td><td>Signed user release.</td></tr>
   </table>
 
   <h2>Packaging Requirements</h2>
   <ul>
-    <li>Universal macOS app if feasible: arm64 first, x86_64 if dependencies support it.</li>
+    <li>Universal macOS app target: arm64 first; x86_64 support requires a dependency proof report before stable release.</li>
     <li>Signed app and signed CLI helper.</li>
     <li>Notarized DMG with app drag target.</li>
     <li>Updater configured before stable release. Sparkle is the default candidate.</li>
@@ -76,7 +76,7 @@
   <table>
     <tr><th>Step</th><th>Behavior</th></tr>
     <tr><td>Dependency check</td><td>Detect Codex CLI, Claude CLI, shell, terminal backend, browser profile permissions.</td></tr>
-    <tr><td>Migration prompt</td><td>Offer current RemoteCode import preview. Default is non-destructive backup first.</td></tr>
+    <tr><td>Fresh-start confirmation</td><td>State that RemoteCode 2 starts from zero and does not read previous app data. Remote access settings remain disabled by default.</td></tr>
     <tr><td>Workspace creation</td><td>Allow opening a folder and choosing initial surface: Agent App, terminal, or browser.</td></tr>
     <tr><td>CLI install</td><td>Offer to install/update <code>remotecode2</code> CLI symlink in a user-approved location.</td></tr>
   </table>
@@ -84,7 +84,7 @@
   <h2>Rollback Plan</h2>
   <table>
     <tr><th>Failure</th><th>Rollback</th></tr>
-    <tr><td>Migration bug</td><td>Use backup copy of source RemoteCode DB. Target DB can be deleted without touching source DB.</td></tr>
+    <tr><td>Fresh-start data bug</td><td>Delete the RemoteCode 2 target DB and app support directory for the affected channel. No previous app data is involved.</td></tr>
     <tr><td>Bad app release</td><td>Updater rollback to previous stable. Canary and stable data remain separated.</td></tr>
     <tr><td>Provider parser regression</td><td>Disable affected provider through feature flag and keep local thread data intact.</td></tr>
     <tr><td>Browser automation regression</td><td>Ship patch release with unsupported command guard instead of broken behavior.</td></tr>
@@ -93,7 +93,7 @@
   <h2>Release Checklist</h2>
   <ul>
     <li><span class="ok">Pass</span> all unit/integration/UI/performance gates.</li>
-    <li><span class="ok">Pass</span> migration dry run and real import on fixture copy.</li>
+    <li><span class="ok">Pass</span> clean first-run filesystem trace and generated fixture suite.</li>
     <li><span class="ok">Pass</span> clean macOS user install, launch, and first workspace flow.</li>
     <li><span class="ok">Pass</span> signed CLI socket commands against release app.</li>
     <li><span class="ok">Pass</span> updater install from previous canary build.</li>

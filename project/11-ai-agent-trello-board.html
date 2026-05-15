@@ -74,9 +74,9 @@
 <header>
   <div class="topbar">
     <div>
-      <p><a href="index.html">Back to index</a></p>
+      <p><a href="index.html">Back to index</a> · <a href="12-agent-execution-todo.html">Agent TODO</a> · <a href="13-agent-tasks.json">Tasks JSON</a></p>
       <h1>RemoteCode 2 AI Agent Trello Board</h1>
-      <p class="muted">English Scrum board for LLM agents to build the Swift cmux-like RemoteCode 2 app from zero. Agent App and general interface tasks are now based on T3 Code. Each card is written as an executable task with context, steps, deliverables, tests, review checks, and acceptance criteria.</p>
+      <p class="muted">English Scrum board for LLM agents to build the Swift cmux-like RemoteCode 2 app from zero. Use this Trello view for human planning; use <code>12-agent-execution-todo.md</code> and <code>13-agent-tasks.json</code> for agent execution and machine assignment.</p>
       <div class="legend">
         <span class="pill"><span class="dot" style="background:var(--build)"></span>Build</span>
         <span class="pill"><span class="dot" style="background:var(--review)"></span>Review</span>
@@ -117,7 +117,7 @@
       <tr><td>Target UI</td><td>Dark, dense, developer-tool UI. Copy T3 Code structure: searchable project/thread sidebar, compact action header, chat timeline, bottom composer, changed-files proof card, diff panel, terminal drawer, command palette, and provider/runtime controls.</td></tr>
       <tr><td>Swift boundary</td><td>Use SwiftUI for sidebar, chat, composer, lists, settings, command palette, controls, and data-driven content. Use AppKit for window ownership, responder chain, menus, focus, terminal host, complex split panes, panels, and fragile desktop mechanics.</td></tr>
       <tr><td>Liquid Glass boundary</td><td>Allowed only on controls and bars. Forbidden on main content, chat body, sidebar rows, terminal, browser, diff content, repeated lists, and dense data surfaces.</td></tr>
-      <tr><td>Previous-app boundary</td><td>Start from zero. Do not read, scan, transform, transfer, or depend on any previous RemoteCode app data, schema, source architecture, or runtime. The current local app may be studied only to understand product intent and direct-control behavior.</td></tr>
+      <tr><td>Previous-app boundary</td><td>Start from zero. Do not read, scan, transform, transfer, or depend on any previous app data, schema, source architecture, or runtime. The current local app may be studied only to understand product intent and direct-control behavior.</td></tr>
       <tr><td>Mobile boundary</td><td>Do not build the mobile app now. Build the desktop core so a future mobile app can directly connect to the desktop over VPN/LAN and mirror/control the same state through versioned HTTP/WebSocket contracts.</td></tr>
       <tr><td>Network boundary</td><td>No relay, no private backend, no cloud broker, no connector id, no hosted repository mirror, no cloud command queue. The desktop is the source of truth and the only machine touching repositories and provider CLIs.</td></tr>
       <tr><td>V1 success</td><td>A signed macOS app can open a clean first workspace, split terminal/browser/Agent App surfaces, run fake and real provider smoke flows where credentials exist, show changed-file evidence, restore session state, pass tests, and prove direct-VPN API readiness with a fake client.</td></tr>
@@ -155,7 +155,7 @@
       <tr><td>E2E/proof gate</td><td>Run the card's E2E/proof gate. For UI work, include screenshot or recording. For API work, include request/response or fake-client transcript. For review/spec work, include dry-run proof that another agent can follow it.</td></tr>
       <tr><td>Regression guard</td><td>State which future regression the new tests catch. If no automated regression guard is possible, explain why and add a manual release gate.</td></tr>
       <tr><td>Security/privacy check</td><td>Confirm no secrets, tokens, prompts, terminal input, browser cookies, or repository content are logged or exposed beyond the card's intended local/direct path.</td></tr>
-      <tr><td>Fresh-start check</td><td>Confirm no old RemoteCode data, schema, transfer path, user home probe, or compatibility bridge was added.</td></tr>
+      <tr><td>Fresh-start check</td><td>Confirm no old RemoteCode data, schema, transfer path, user home probe, or bridge for previous app data was added.</td></tr>
       <tr><td>Mobile-readiness check</td><td>For shared state/network/command/surface work, confirm the command bus and event envelopes remain future-mobile-ready and direct-VPN-only.</td></tr>
       <tr><td>Exit status</td><td>The final card report must end with exactly one status: <code>DONE</code>, <code>BLOCKED</code>, or <code>NEEDS REVIEW</code>. <code>DONE</code> requires all acceptance and proof gates to pass.</td></tr>
     </table>
@@ -1252,7 +1252,7 @@
           <div class="meta"><span>Owner</span><span>Persistence bootstrap agent</span><span>Depends</span><span>RC2-016</span><span>Output</span><span>Fresh data bootstrap</span></div>
           <details>
             <summary>Card details</summary>
-            <div class="section"><strong>Hard rule:</strong> Do not read, scan, convert, or accept data from any previous RemoteCode app. RemoteCode 2 starts from zero.</div>
+            <div class="section"><strong>Hard rule:</strong> Do not read, scan, transform, transfer, or accept data from any previous app. RemoteCode 2 starts from zero.</div>
             <div class="section"><strong>Steps:</strong>
               <ol>
                 <li>Create the app support directory for debug, canary, and stable channels when absent.</li>
@@ -1270,7 +1270,7 @@
         <article class="card" id="RC2-081">
           <div class="card-title"><h3>Create Test-Only Data Fixture Factory</h3><span class="card-id">RC2-081</span></div>
           <div class="labels"><span class="label build">Build</span><span class="label test">Test</span></div>
-          <p>Provide deterministic seed data for tests without using any previous RemoteCode data.</p>
+          <p>Provide deterministic seed data for tests without using any previous app data.</p>
           <div class="meta"><span>Owner</span><span>Test infrastructure agent</span><span>Depends</span><span>RC2-080</span><span>Output</span><span>Fixture factory</span></div>
           <details>
             <summary>Card details</summary>
@@ -1722,7 +1722,7 @@
       <tr><td>Small diffs</td><td>Implement only the card scope. Do not refactor adjacent modules unless required by the card.</td></tr>
       <tr><td>Tests verify intent</td><td>Write tests that fail when the product invariant breaks, not tests that only assert literal current output.</td></tr>
       <tr><td>Fail loud</td><td>If licensing, T3 Code attribution, signing, provider CLI, or terminal dependency cannot be verified, stop and report the blocker.</td></tr>
-      <tr><td>Fresh start</td><td>No card may support data reads, reuse, or transfer from any previous RemoteCode app. RemoteCode 2 starts from zero.</td></tr>
+      <tr><td>Fresh start</td><td>No card may support data reads, reuse, or transfer from any previous app. RemoteCode 2 starts from zero.</td></tr>
       <tr><td>Review loop</td><td>Any shared model, persistence, socket, provider, terminal, browser, or first-run data change requires a review card before release.</td></tr>
     </table>
   </section>

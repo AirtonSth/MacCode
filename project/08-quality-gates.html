@@ -31,8 +31,8 @@
   <h2>Test Layers</h2>
   <table>
     <tr><th>Layer</th><th>Scope</th><th>Required examples</th></tr>
-    <tr><td>Unit</td><td>Pure Swift domain logic.</td><td>Provider parsers, event normalization, migration mapping, snapshot encode/decode, command parameter validation.</td></tr>
-    <tr><td>Integration</td><td>SQLite, process runners, socket server, browser automation.</td><td>Codex/Claude fixture streams, SQLite migrations, JSON-RPC commands, WKWebView eval/screenshot.</td></tr>
+    <tr><td>Unit</td><td>Pure Swift domain logic.</td><td>Provider parsers, event normalization, schema steps, snapshot encode/decode, command parameter validation.</td></tr>
+    <tr><td>Integration</td><td>SQLite, process runners, socket server, browser automation.</td><td>Codex/Claude fixture streams, SQLite schema steps, JSON-RPC commands, WKWebView eval/screenshot.</td></tr>
     <tr><td>UI</td><td>SwiftUI/AppKit behavior.</td><td>Workspace selection, split creation, surface switching, Agent App send/stop, timeline virtualization, keyboard focus.</td></tr>
     <tr><td>End-to-end</td><td>Real app launched as signed/dev build.</td><td>Create workspace, split terminal/browser/agent, run fake provider, session restore, CLI automation.</td></tr>
     <tr><td>Performance</td><td>Measured budgets.</td><td>Cold launch, memory, terminal scrollback, browser creation, Agent App streaming under long output.</td></tr>
@@ -44,7 +44,7 @@
     <tr><td>Provider switch corrupts thread history</td><td>A thread with existing provider thread ID locks provider selection because provider-native resume IDs are not interchangeable.</td></tr>
     <tr><td>Cancelled run looks active after restart</td><td>Stopping a run records cancellation and app restart does not resume it as running.</td></tr>
     <tr><td>Agent App is not a real surface</td><td>CLI can move/split/focus/close Agent App exactly like terminal and browser.</td></tr>
-    <tr><td>Migration drops data silently</td><td>Fixture with bad rows imports valid rows and reports every skipped row with reason.</td></tr>
+    <tr><td>First run touches old data</td><td>Filesystem trace proves clean launch reads/writes only RemoteCode 2-owned paths and generated fixture directories.</td></tr>
     <tr><td>Browser automation targets wrong surface</td><td>Two browser surfaces exist; command with surface ID affects only the target.</td></tr>
     <tr><td>Terminal focus steals Agent App input</td><td>Switching from terminal to Agent App routes text input to composer, not shell.</td></tr>
   </table>
@@ -60,8 +60,8 @@
     <tr><td>A6</td><td>Claude real run</td><td>Claude CLI run streams normalized events and writes final assistant message.</td></tr>
     <tr><td>A7</td><td>Browser automation</td><td>CLI opens browser surface, navigates local server, snapshots, clicks, fills, screenshots.</td></tr>
     <tr><td>A8</td><td>Session restore</td><td>After app restart, layout and selected Agent App thread restore without starting a new run.</td></tr>
-    <tr><td>A9</td><td>Migration</td><td>Current RemoteCode fixture imports with exact counts and backup report.</td></tr>
-    <tr><td>A10</td><td>Release build</td><td>Signed/notarized app launches on clean user and migration preview works.</td></tr>
+    <tr><td>A9</td><td>Clean first run</td><td>Fresh user launch creates empty RemoteCode 2 state and no previous app path is touched.</td></tr>
+    <tr><td>A10</td><td>Release build</td><td>Signed/notarized app launches on clean user and first workspace flow works.</td></tr>
   </table>
 
   <h2>Performance Budgets</h2>
@@ -77,7 +77,7 @@
   <h2>Release Blockers</h2>
   <ul>
     <li><span class="bad">Block</span> if cmux license path is unresolved and cmux source was copied.</li>
-    <li><span class="bad">Block</span> if migration can lose messages or provider thread IDs silently.</li>
+    <li><span class="bad">Block</span> if first run reads, probes, or transfers previous app data.</li>
     <li><span class="bad">Block</span> if Agent App cannot be created as a normal surface through CLI/socket.</li>
     <li><span class="bad">Block</span> if app restart can duplicate provider runs.</li>
     <li><span class="bad">Block</span> if signed app cannot launch on a clean macOS account.</li>
