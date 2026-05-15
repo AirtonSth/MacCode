@@ -39,7 +39,8 @@
   <h2 style="border:0;padding:0;margin-top:0;">TL;DR</h2>
   <ul>
     <li><span class="badge ok">build</span> <code>swift build</code> on Swift 6.3 (language mode 5), arm64 macOS 26.</li>
-    <li><span class="badge ok">tests</span> 57 XCTest cases pass.</li>
+    <li><span class="badge ok">tests</span> 60 XCTest cases pass.</li>
+    <li><span class="badge ok">fixed</span> The pane toolbar buttons (<strong>+ Term / + Browser / + Agent / Split</strong>) did nothing because <code>MainWindowController</code> let each <code>PaneTabsView</code> deallocate, leaving NSButton/NSTabView weak targets dangling. Controllers are now retained; verified by <code>AppShellTests/PaneActionTests</code> and a live CLI end-to-end (1→2 panes on split, no crash).</li>
     <li><span class="badge ok">app</span> <code>swift run RemoteCode2</code> launches a native window with workspace+thread tree sidebar, panes, surface tabs (terminal/browser/agent/markdown/file-preview/diff-panel), command palette (⌘⇧K), Settings… window (⌘,), branch toolbar, plan sidebar, terminal drawer, multi-window (⌘-,N opens a sibling NSWindow).</li>
     <li><span class="badge ok">terminal</span> Real PTY via <code>forkpty(3)</code>, full ANSI renderer (SGR/cursor/erase/256-color/RGB), interactive shell.</li>
     <li><span class="badge ok">automation</span> Unix socket JSON-RPC (cmux v2 method names) + loopback HTTP <code>/v1/discovery</code>, <code>/v1/capabilities</code>, <code>/v1/pair</code>, <code>/v1/devices</code>, <code>/v1/ws</code> WebSocket. Events bus persisted to SQLite.</li>
