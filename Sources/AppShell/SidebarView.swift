@@ -29,6 +29,10 @@ public final class SidebarViewModel: ObservableObject {
         try? router?.selectWorkspace(wid)
     }
 
+    public func toggleSidebar() {
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+    }
+
     public func newWorkspace() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false; panel.canChooseDirectories = true
@@ -90,16 +94,19 @@ public struct SidebarRootView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: DS.Space.md) {
-                Image(systemName: "chevron.left.forwardslash.chevron.right")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(DS.Palette.accent)
+            HStack(spacing: DS.Space.sm) {
                 Text("RemoteCode 2")
                     .font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
-                Spacer()
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: DS.Space.sm)
                 DSIconButton("plus", help: "New workspace") { vm.newWorkspace() }
+                DSIconButton("sidebar.left", help: "Hide sidebar") { vm.toggleSidebar() }
             }
-            .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+            // Left inset clears the macOS traffic-light buttons; the row
+            // is fixed at titlebar height so the text sits level with
+            // them (the sidebar ignores the top safe area, below).
+            .padding(.leading, 84).padding(.trailing, DS.Space.lg)
+            .frame(height: 38)
             .dsBar(edge: .bottom)
 
             if vm.workspaces.isEmpty {
@@ -119,6 +126,10 @@ public struct SidebarRootView: View {
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
         .background(DS.Palette.surface.opacity(0.55))
+        // The host sits in a full-height window; without this SwiftUI
+        // treats the titlebar as a safe area and pushes the header
+        // below the traffic lights instead of beside them.
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     @ViewBuilder

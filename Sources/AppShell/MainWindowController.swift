@@ -4,6 +4,14 @@ import CoreModel
 import Surfaces
 import DesignSystemKit
 
+public extension Notification.Name {
+    /// Posted by any sidebar-toggle button (sidebar header or pane header).
+    static let rc2ToggleSidebar = Notification.Name("rc2.toggleSidebar")
+    /// Posted by the window controller after the sidebar collapses /
+    /// expands. userInfo["collapsed"] = Bool.
+    static let rc2SidebarVisibility = Notification.Name("rc2.sidebarVisibility")
+}
+
 @MainActor
 public final class MainWindowController: NSObject, NSWindowDelegate {
     public let window: NSWindow
@@ -17,6 +25,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     /// Retains the live pane controllers; their @objc button and tab
     /// targets die with them, so they must outlive a layout rebuild.
     private var paneControllers: [PaneTabsView] = []
+    private var sidebarCollapsed = false
+    private var sidebarWidth: CGFloat = 260
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -31,7 +41,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         win.title = "RemoteCode 2"
-        win.titlebarAppearsTransparent = false
+        // Unified titlebar: content runs full height, the system title
+        // bar is transparent and titleless, so the traffic-light buttons
+        // float over the app's own header row (the sidebar header).
+        win.styleMask.insert(.fullSizeContentView)
+        win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
         win.minSize = NSSize(width: 900, height: 600)
         self.window = win
 
@@ -40,6 +55,27 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         setupLayout()
         refreshFromState()
         win.center()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleToggleSidebar),
+            name: .rc2ToggleSidebar, object: nil)
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    @objc private func handleToggleSidebar() {
+        sidebarCollapsed.toggle()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.allowsImplicitAnimation = true
+            sidebar.view.isHidden = sidebarCollapsed
+            if !sidebarCollapsed {
+                split.setPosition(sidebarWidth, ofDividerAt: 0)
+            }
+            split.layoutSubtreeIfNeeded()
+        }
+        NotificationCenter.default.post(
+            name: .rc2SidebarVisibility, object: nil,
+            userInfo: ["collapsed": sidebarCollapsed])
     }
 
     private func setupLayout() {
@@ -71,7 +107,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {
-            self.split.setPosition(240, ofDividerAt: 0)
+            self.split.setPosition(self.sidebarWidth, ofDividerAt: 0)
         }
     }
 
@@ -136,6 +172,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         layoutView.translatesAutoresizingMaskIntoConstraints = false
         workspaceContainer.addSubview(layoutView)
         pin(layoutView, to: workspaceContainer)
+        // Freshly built pane headers default to "sidebar visible"; if it
+        // is actually collapsed, re-sync them so the workspace name shows.
+        if sidebarCollapsed {
+            NotificationCenter.default.post(
+                name: .rc2SidebarVisibility, object: nil,
+                userInfo: ["collapsed": true])
+        }
     }
 
     private func makeEmptyState() -> NSView {

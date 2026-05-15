@@ -11,6 +11,11 @@ public final class PaneTabsView: NSObject {
     public weak var router: AppCommandRouter?
     private let tabStrip = NSStackView()
     private let contentArea = NSView()
+    // Shown only when the sidebar is collapsed: a sidebar-restore button
+    // plus the current workspace name, at the header's leading edge.
+    private let leadingBox = NSStackView()
+    private let wsLabel = NSTextField(labelWithString: "")
+    private var leadingZeroWidth: NSLayoutConstraint?
 
     public init(pane: PaneNode, router: AppCommandRouter?) {
         self.pane = pane
@@ -149,6 +154,27 @@ public final class PaneTabsView: NSObject {
         rightCluster.translatesAutoresizingMaskIntoConstraints = false
         rightCluster.setContentHuggingPriority(.required, for: .horizontal)
 
+        // Leading block (collapsed-sidebar only): restore button + the
+        // active workspace name, so the user still knows where they are.
+        let sidebarToggle = Self.makeIconButton(
+            symbol: "sidebar.left", help: "Show sidebar",
+            target: self, action: #selector(toggleSidebar))
+        wsLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        wsLabel.textColor = DS.NS.text
+        wsLabel.lineBreakMode = .byTruncatingTail
+        wsLabel.translatesAutoresizingMaskIntoConstraints = false
+        wsLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        leadingBox.orientation = .horizontal
+        leadingBox.spacing = DS.Space.sm
+        leadingBox.alignment = .centerY
+        // Left inset clears the traffic lights: with the sidebar gone,
+        // this pane header sits at the window's left edge.
+        leadingBox.edgeInsets = NSEdgeInsets(top: 0, left: 84, bottom: 0, right: DS.Space.sm)
+        leadingBox.translatesAutoresizingMaskIntoConstraints = false
+        leadingBox.addArrangedSubview(sidebarToggle)
+        leadingBox.addArrangedSubview(wsLabel)
+        leadingBox.isHidden = true
+
         let headerBG = NSView()
         headerBG.wantsLayer = true
         headerBG.layer?.backgroundColor = DS.NS.surface.cgColor
@@ -160,17 +186,26 @@ public final class PaneTabsView: NSObject {
         divider.translatesAutoresizingMaskIntoConstraints = false
 
         v.addSubview(headerBG)
+        headerBG.addSubview(leadingBox)
         headerBG.addSubview(stripScroll)
         headerBG.addSubview(rightCluster)
         v.addSubview(divider)
         v.addSubview(contentArea)
+        let zeroWidth = leadingBox.widthAnchor.constraint(equalToConstant: 0)
+        zeroWidth.isActive = true
+        self.leadingZeroWidth = zeroWidth
         NSLayoutConstraint.activate([
             headerBG.topAnchor.constraint(equalTo: v.topAnchor),
             headerBG.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             headerBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             headerBG.heightAnchor.constraint(equalToConstant: 34),
 
-            stripScroll.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
+            leadingBox.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
+            leadingBox.topAnchor.constraint(equalTo: headerBG.topAnchor),
+            leadingBox.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
+            wsLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 200),
+
+            stripScroll.leadingAnchor.constraint(equalTo: leadingBox.trailingAnchor),
             stripScroll.topAnchor.constraint(equalTo: headerBG.topAnchor),
             stripScroll.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
             stripScroll.trailingAnchor.constraint(equalTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
@@ -188,6 +223,10 @@ public final class PaneTabsView: NSObject {
             contentArea.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
+
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sidebarVisibilityChanged(_:)),
+            name: .rc2SidebarVisibility, object: nil)
     }
 
     private func selectSurface(_ id: SurfaceID) {
@@ -250,6 +289,26 @@ public final class PaneTabsView: NSObject {
             b.heightAnchor.constraint(equalToConstant: 22)
         ])
         return b
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    @objc private func toggleSidebar() {
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+    }
+
+    @objc private func sidebarVisibilityChanged(_ note: Notification) {
+        let collapsed = (note.userInfo?["collapsed"] as? Bool) ?? false
+        leadingBox.isHidden = !collapsed
+        leadingZeroWidth?.isActive = !collapsed
+        if collapsed { wsLabel.stringValue = currentWorkspaceName() }
+    }
+
+    private func currentWorkspaceName() -> String {
+        guard let ctx = router?.context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid] else { return "" }
+        return ws.name
     }
 
     @objc private func showAddMenu(_ sender: NSButton) {
