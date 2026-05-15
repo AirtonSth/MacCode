@@ -11,19 +11,29 @@ import CryptoKit
 /// - GET  /v1/discovery
 /// - GET  /v1/capabilities
 /// - GET  /healthz
+public protocol DirectAuthProvider: AnyObject {
+    func verify(token: String) -> Bool
+    func createPairingCode() -> String?
+    func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)?
+    func listDevices() -> [[String: Any]]
+    func revokeDevice(_ id: String)
+}
+
 public final class DirectHTTPServer: @unchecked Sendable {
     public let port: UInt16
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
+    public weak var auth: DirectAuthProvider?
 
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher) {
+    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
+        self.auth = auth
     }
 
     public func start() throws {
@@ -132,9 +142,54 @@ public final class DirectHTTPServer: @unchecked Sendable {
             return
         }
 
+        // Auth gate: when not loopback-only, require valid token for /v1/*
+        // (except /v1/discovery, /v1/pair, /v1/pair/redeem).
+        if !bindLoopbackOnly, path.hasPrefix("/v1"),
+           !["/v1/discovery", "/v1/pair", "/v1/pair/redeem"].contains(path),
+           let auth = auth {
+            let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
+            if let t = token, auth.verify(token: t) {
+                // ok
+            } else {
+                send(fd: fd, status: 401, contentType: "text/plain", body: "unauthorized\n".data(using: .utf8)!); return
+            }
+        }
+
+        // POST body for pair endpoints
+        let bodyStart = headerEnd.upperBound
+        let bodyData = buffer.subdata(in: bodyStart..<buffer.endIndex)
+
         switch (method, path) {
         case ("GET", "/healthz"):
             send(fd: fd, status: 200, contentType: "text/plain", body: "ok\n".data(using: .utf8)!)
+        case ("POST", "/v1/pair"):
+            guard let auth = auth, let code = auth.createPairingCode() else {
+                send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
+            }
+            sendJSON(fd: fd, status: 200, body: ["code": code, "expires_in": 600])
+        case ("POST", "/v1/pair/redeem"):
+            guard let auth = auth,
+                  let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+                  let code = obj["code"] as? String,
+                  let name = obj["device_name"] as? String else {
+                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+            }
+            if let (deviceId, token) = auth.redeemPairingCode(code, deviceName: name) {
+                sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token])
+            } else {
+                send(fd: fd, status: 410, contentType: "text/plain", body: "code expired or already redeemed\n".data(using: .utf8)!)
+            }
+        case ("GET", "/v1/devices"):
+            guard let auth = auth else { send(fd: fd, status: 503, contentType: "text/plain", body: "disabled\n".data(using: .utf8)!); return }
+            sendJSON(fd: fd, status: 200, body: ["devices": auth.listDevices()])
+        case ("POST", "/v1/devices/revoke"):
+            guard let auth = auth,
+                  let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+                  let id = obj["id"] as? String else {
+                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+            }
+            auth.revokeDevice(id)
+            sendJSON(fd: fd, status: 200, body: ["revoked": id])
         case ("GET", "/v1/discovery"):
             let body: [String: Any] = [
                 "server_id": ProcessInfo.processInfo.globallyUniqueString,

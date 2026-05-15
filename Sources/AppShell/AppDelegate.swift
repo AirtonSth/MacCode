@@ -71,7 +71,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // Start direct HTTP server bound to loopback by default.
         let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
         let loopbackOnly = remoteEnabled != "1"
-        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly, dispatcher: dispatcher)
+        let trustRepo = DeviceTrustRepository(db: context.db)
+        let auth = LocalAuthAdapter(repo: trustRepo)
+        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly, dispatcher: dispatcher, auth: auth)
         do {
             try http.start()
             httpServer = http

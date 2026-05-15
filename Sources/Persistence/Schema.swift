@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 1
+    public static let currentVersion: Int = 2
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -129,6 +129,44 @@ public enum Schema {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
+        """),
+        SchemaStep(2, """
+        CREATE TABLE IF NOT EXISTS device_trust (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            capabilities TEXT NOT NULL DEFAULT '*'
+        );
+        CREATE INDEX IF NOT EXISTS idx_device_trust_token ON device_trust(token_hash);
+        CREATE TABLE IF NOT EXISTS pairing_codes (
+            code TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            redeemed_at TEXT,
+            redeemed_device_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            actor TEXT,
+            action TEXT NOT NULL,
+            detail TEXT
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT,
+            surface_id TEXT,
+            title TEXT NOT NULL,
+            body TEXT,
+            category TEXT,
+            created_at TEXT NOT NULL,
+            read_at TEXT,
+            dismissed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_notifications_workspace ON notifications(workspace_id);
         """)
     ]
 
