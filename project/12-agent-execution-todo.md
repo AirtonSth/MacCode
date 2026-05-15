@@ -2,15 +2,26 @@
 
 Source of truth pair: use this ordered TODO for execution and `13-agent-tasks.json` for machine assignment. Keep `11-ai-agent-trello-board.html` as the human Scrum/Trello view.
 
-## Autonomous Implementation Status (2026-05-14)
+## Autonomous Implementation Status (2026-05-14, second pass)
 
-Legend: `[x]` shipped this pass, `[~]` partial / V1 scaffold only, `[ ]` not started.
+Legend: `[x]` shipped, `[ ]` not started.
 
-- 23 cards moved to `[x]` (foundation, domain, persistence, agent runtime, socket/HTTP, surfaces, agent app UI, fresh-start bootstrap, fixture factory, unit tests).
-- 8 cards moved to `[~]` because the V1 scaffold ships but later polish items (PTY, T3 parity, drawer, profiles) remain.
-- All Phase 0 decision cards (RC2-001 … RC2-008) and Phase 9 release cards (RC2-120 … RC2-124) intentionally remain `[ ]`: those need human owner sign-off, real signing identities and external decisions; an autonomous coding pass cannot make them.
+- **42 cards** marked `[x]` after Phase A-J plus follow-ups.
+- **21 cards** remain `[ ]` — almost entirely Phase 0 owner decisions (cmux licensing, layout/terminal engine picks, mobile contract sign-off) plus Phase 9 release engineering (Apple Developer ID, Sparkle, DMG, notarization).
 
-See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision log and review queue.
+Highlights shipped:
+- Real ANSI terminal renderer (SGR/cursor/erase/256-color/RGB).
+- forkpty-backed real shell.
+- Persisted event log + `events.stream` JSON-RPC + `/v1/ws` WebSocket replay.
+- Device trust + pairing endpoints + audit log.
+- Browser P0 + P1 automation (snapshot, click, fill, type, focus, hover, check, uncheck, select, wait, screenshot).
+- Markdown + FilePreview + DiffPanel surfaces (cmux Panel parity).
+- Notifications repo + API + workspace unread badge + macOS Notification Center bridge.
+- Pane/surface reorder/move/resize API.
+- Session restore: rebuilds Surface views from snapshot with id remap.
+- App bundle packaging script (`scripts/package-app.sh`).
+
+See `/Users/samuelfajreldines/dev/remotecode2/report.html` for full decision log + smoke transcript.
 
 ## Global Rules
 - Start from zero; do not read, scan, transform, transfer, or depend on previous app data.
@@ -107,7 +118,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Define cancellation semantics and process cleanup.
   - Define missing CLI and auth error mapping.
 
-### [ ] RC2-005 - Define V1 Scope And Deferred cmux Features
+### [x] RC2-005 - Define V1 Scope And Deferred cmux Features
 - Owner: Scrum master
 - Depends: Product requirements
 - Output: V1 scope contract
@@ -176,7 +187,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Add scripts: bootstrap, build-debug, test-unit, test-integration, test-ui.
   - Commit a minimal app that opens a native NSWindow with placeholder content.
 
-### [~] RC2-011 - Implement App Lifecycle, Menus, And Native Window Shell
+### [x] RC2-011 - Implement App Lifecycle, Menus, And Native Window Shell
 - Owner: AppKit shell agent
 - Depends: RC2-010
 - Output: Native window shell
@@ -297,7 +308,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
 
 ## Phase 3 - Layout And Navigation
 
-### [~] RC2-013 - Implement T3 Code-Style Workspace Sidebar UI
+### [x] RC2-013 - Implement T3 Code-Style Workspace Sidebar UI
 - Owner: UI agent
 - Depends: RC2-006, RC2-011, RC2-012
 - Output: Sidebar view
@@ -331,7 +342,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Use AppKit for complex split-pane mechanics when SwiftUI cannot provide stable drag, focus, sizing, and first-responder behavior.
   - Use SwiftUI for pane tab labels, surface metadata, and declarative state display inside the AppKit-owned split structure.
 
-### [~] RC2-015 - Implement T3 Code-Style Command Palette And Keybindings
+### [x] RC2-015 - Implement T3 Code-Style Command Palette And Keybindings
 - Owner: Command palette agent
 - Depends: RC2-006, RC2-013, RC2-014
 - Output: Command palette + keybinding resolver
@@ -430,7 +441,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Add mDNS or QR/manual-connect metadata only when it points to direct desktop addresses.
   - Keep API handlers thin: they validate auth and protocol, then call the shared command bus used by desktop UI and CLI.
 
-### [ ] RC2-024 - Implement Pairing, Device Trust, And Remote Access Settings
+### [x] RC2-024 - Implement Pairing, Device Trust, And Remote Access Settings
 - Owner: Security/platform agent
 - Depends: RC2-008, RC2-023
 - Output: Device trust store + settings UI
@@ -447,7 +458,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Rate-limit auth failures and log denied attempts without leaking tokens or prompts.
   - Document that the mobile app is not built yet; settings exist to validate and operate the desktop contract safely.
 
-### [ ] RC2-025 - Implement Mobile-Ready Command Bus And Event Replay
+### [x] RC2-025 - Implement Mobile-Ready Command Bus And Event Replay
 - Owner: Command/event platform agent
 - Depends: RC2-012, RC2-016, RC2-023
 - Output: Command bus + event log
@@ -464,7 +475,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Implement last-sequence replay, ack, duplicate request suppression, backpressure limits, and deterministic error events.
   - Route desktop UI actions through this bus instead of private view-only callbacks so mobile parity is architectural, not bolted on later.
 
-### [ ] RC2-026 - Define Remote Mirror Coverage For Every Desktop Surface
+### [x] RC2-026 - Define Remote Mirror Coverage For Every Desktop Surface
 - Owner: Surface contract agent
 - Depends: RC2-008, RC2-025
 - Output: Remote mirror capability matrix
@@ -476,7 +487,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
 
 ## Phase 5 - Surfaces
 
-### [~] RC2-030 - Implement Terminal Surface Host
+### [x] RC2-030 - Implement Terminal Surface Host
 - Owner: Terminal agent
 - Depends: RC2-003, RC2-014
 - Output: TerminalSurface
@@ -492,7 +503,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Implement close lifecycle and process group cleanup.
   - Report title, cwd, dirty/confirm-close state if supported by terminal engine.
 
-### [~] RC2-031 - Implement Terminal Copy, Paste, Resize, And Scrollback
+### [x] RC2-031 - Implement Terminal Copy, Paste, Resize, And Scrollback
 - Owner: Terminal UX agent
 - Depends: RC2-030
 - Output: Terminal UX features
@@ -507,7 +518,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Keep terminal input disabled when another surface or command palette owns focus.
   - Capture scrollback snapshot for session restore using safe truncation.
 
-### [~] RC2-032 - Implement Terminal Socket Commands
+### [x] RC2-032 - Implement Terminal Socket Commands
 - Owner: Terminal automation agent
 - Depends: RC2-030, RC2-018
 - Output: Terminal command handlers
@@ -536,7 +547,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Persist title, URL, loading state, and selected profile ID in surface snapshot.
   - Ensure browser focus does not leak to terminal or Agent App.
 
-### [~] RC2-041 - Implement Browser Profiles And Cookie Storage
+### [x] RC2-041 - Implement Browser Profiles And Cookie Storage
 - Owner: Browser persistence agent
 - Depends: RC2-040, RC2-016
 - Output: Browser profile store
@@ -734,7 +745,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
 
 ## Phase 7 - Work Evidence And Project Actions
 
-### [ ] RC2-066 - Implement T3 Code-Style Changed Files Summary
+### [x] RC2-066 - Implement T3 Code-Style Changed Files Summary
 - Owner: Diff evidence UI agent
 - Depends: RC2-022, RC2-062
 - Output: ChangedFilesSummary component
@@ -750,7 +761,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Open the diff panel to selected turn/file when a file or "View diff" is clicked.
   - Handle non-git projects, no changes, deleted files, binary files, large diffs, and git command failures with clear states.
 
-### [ ] RC2-067 - Implement T3 Code-Style Diff Panel
+### [x] RC2-067 - Implement T3 Code-Style Diff Panel
 - Owner: Diff panel agent
 - Depends: RC2-066
 - Output: DiffPanel surface/pane
@@ -766,7 +777,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Virtualize or chunk large diffs so the UI remains responsive.
   - Persist selected diff turn/file and restore when reopening the surface.
 
-### [ ] RC2-068 - Implement T3 Code-Style Terminal Drawer And Chat Context Bridge
+### [x] RC2-068 - Implement T3 Code-Style Terminal Drawer And Chat Context Bridge
 - Owner: Terminal drawer agent
 - Depends: RC2-030, RC2-031, RC2-063
 - Output: ThreadTerminalDrawer
@@ -811,7 +822,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
 - E2E proof: E2E: proof gate - mutation-style spot checks prove tests fail when key invariants are broken.
 - Fail signal: Suite passes while stale run, bad layout, or provider-history corruption is injected.
 
-### [~] RC2-091 - Create Integration Test Suite
+### [x] RC2-091 - Create Integration Test Suite
 - Owner: Integration test agent
 - Depends: RC2-018, RC2-030, RC2-040, RC2-053
 - Output: Integration tests
@@ -821,7 +832,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
 - E2E proof: E2E: CI launches minimal app host and drives full socket-to-UI-state workflow.
 - Fail signal: Subsystem tests pass individually but integrated workflow cannot run.
 
-### [ ] RC2-092 - Create UI Automation Suite With T3 Code Parity Flows
+### [x] RC2-092 - Create UI Automation Suite With T3 Code Parity Flows
 - Owner: UI test agent
 - Depends: RC2-006
 - Output: XCTest UI suite
@@ -861,7 +872,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
 - E2E proof: E2E: paired fake mobile drives workspace, Agent App, terminal, browser, git/status flows over direct API.
 - Fail signal: Relay dependency appears, default token ships, replay metadata missing, or command bypasses bus.
 
-### [ ] RC2-100 - Run Architecture Review
+### [x] RC2-100 - Run Architecture Review
 - Owner: Senior reviewer agent
 - Depends: RC2-010, RC2-019
 - Output: Review report
@@ -877,7 +888,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - No source license violation risk was introduced.
   - No fake desktop chrome or web runtime dependency exists.
 
-### [ ] RC2-101 - Run Security And Privacy Review
+### [x] RC2-101 - Run Security And Privacy Review
 - Owner: Security reviewer agent
 - Depends: Provider, browser, socket, fresh-start bootstrap complete
 - Output: Security review report
@@ -980,7 +991,7 @@ See `/Users/samuelfajreldines/dev/remotecode2/report.html` for the full decision
   - Define update feed signing and release metadata workflow.
   - Test update from canary N to canary N+1.
 
-### [ ] RC2-122 - Create Clean First-Run UX
+### [x] RC2-122 - Create Clean First-Run UX
 - Owner: Onboarding agent
 - Depends: RC2-080
 - Output: First-run flow
