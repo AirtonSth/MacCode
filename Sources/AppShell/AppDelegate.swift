@@ -57,8 +57,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         windowController = MainWindowController(context: context, router: router)
         router.windowController = windowController
-        // Rebuild Surface objects from restored layout descriptors.
+        // Rebuild Surface objects from restored layout descriptors, then
+        // refresh so the restored workspaces + tabs actually render
+        // (the controller's init refresh ran before surfaces existed).
         router.reinstantiateRestoredSurfaces()
+        windowController.refreshFromState()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)

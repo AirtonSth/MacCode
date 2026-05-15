@@ -51,11 +51,27 @@ public final class AppContext {
         }
     }
 
+    private var pendingSave: DispatchWorkItem?
+
     public func apply(_ action: LayoutAction) throws {
         state = try reducer.reduce(state, action)
+        // Every layout mutation (workspace create/close/select, surface
+        // add/close/split/move, etc.) schedules a debounced snapshot
+        // write so workspaces and tabs survive a restart even if the app
+        // is killed before a clean quit.
+        scheduleSnapshotSave()
+    }
+
+    public func scheduleSnapshotSave(delay: TimeInterval = 0.4) {
+        pendingSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.saveSnapshot() }
+        pendingSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     public func saveSnapshot() {
+        pendingSave?.cancel()
+        pendingSave = nil
         let snap = SessionSnapshot(layout: state)
         _ = try? snapshotRepo.save(snap)
     }
