@@ -42,6 +42,22 @@ final class ClaudeParserCLITests: XCTestCase {
                        "the top-level result string is the authoritative final answer")
     }
 
+    func test_hookLinesBeforeInit_keepSessionIdForResume() {
+        // The cmux claude wrapper emits hook_started/hook_response BEFORE
+        // init — these must not strip the resume id.
+        let evs = collect([
+            #"{"type":"system","subtype":"hook_started","session_id":"sess-X","hook_name":"SessionStart"}"#,
+            #"{"type":"system","subtype":"hook_response","session_id":"sess-X","output":"OK"}"#,
+            #"{"type":"system","subtype":"init","session_id":"sess-X"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+            #"{"type":"result","subtype":"success","result":"hi","session_id":"sess-X"}"#
+        ])
+        var ptid: String?
+        for e in evs { if case .threadStarted(_, let p) = e { ptid = p } }
+        XCTAssertEqual(ptid, "sess-X",
+                       "session id from init must survive preceding hook_* lines → becomes the resume id")
+    }
+
     func test_resultOnly_stillCompletesTurn() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s2"}"#,

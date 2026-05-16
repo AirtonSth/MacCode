@@ -70,6 +70,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         h?.cancel()
     }
 
+    private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+        guard !text.isEmpty else { return }
+        let existing = (try? messageRepo.list(threadId: threadId)) ?? []
+        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return }
+        _ = try? messageRepo.append(AgentMessage(threadId: threadId, role: .assistant, content: text))
+    }
+
     private func handle(event: AgentRunEvent, runId: AgentRunID, threadId: AgentThreadID) {
         switch event {
         case .event(let ev):
@@ -81,14 +88,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if let data = try? JSONEncoder().encode(ev), let json = String(data: data, encoding: .utf8) {
                 _ = try? runRepo.appendStreamEvent(runId: runId, seq: s, kind: ev.debugDescription, payloadJSON: json)
             }
+            if case .turnCompleted(_, let finalMessage) = ev, let msg = finalMessage {
+                persistAssistantIfMissing(msg, threadId: threadId)
+            }
             observer?.runCoordinator(self, didReceive: ev, run: runId)
         case .status(let st):
             observer?.runCoordinator(self, didChangeStatus: st, runId: runId)
         case .finished(let status, let finalMessage, let providerThreadId):
             // persist final assistant message only on success
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
-                let am = AgentMessage(threadId: threadId, role: .assistant, content: msg)
-                _ = try? messageRepo.append(am)
+                persistAssistantIfMissing(msg, threadId: threadId)
             }
             // update run row
             var run = AgentRun(id: runId, threadId: threadId, provider: .codex, model: "")

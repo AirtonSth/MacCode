@@ -14,6 +14,11 @@ public protocol Surface: AnyObject {
     func snapshot() -> [String: String]
 }
 
+public extension Surface {
+    /// A3: surface has work in flight (agent run, etc.) → spinner on tab.
+    var isBusy: Bool { false }
+}
+
 @MainActor
 public final class SurfaceRegistry {
     public static let shared = SurfaceRegistry()

@@ -23,6 +23,31 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(state.turns[0].items[0].body, "Hello")
     }
 
+    func test_realExecSchema_agentMessageSurfacesAsFinal() {
+        // `codex exec --json`: reply arrives as item.completed{item:…},
+        // turn.completed carries NO message.
+        let p = CodexParser()
+        var state = AssistantTimelineState()
+        for l in [
+            #"{"type":"thread.started","thread_id":"019e-abc"}"#,
+            #"{"type":"turn.started"}"#,
+            #"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"HELLO123"}}"#,
+            #"{"type":"turn.completed"}"#
+        ] { for ev in p.parseLine(l) { state.apply(ev) } }
+        XCTAssertEqual(state.providerThreadId, "019e-abc",
+                       "thread_id must persist for `codex exec resume`")
+        XCTAssertEqual(state.turns.count, 1)
+        XCTAssertEqual(state.turns[0].finalAssistantMessage, "HELLO123",
+                       "agent_message item must become the turn's final reply")
+    }
+
+    func test_turnFailed_isLoudError() {
+        let p = CodexParser()
+        let evs = p.parseLine(#"{"type":"turn.failed","error":{"message":"model blocked"}}"#)
+        guard case .error(let m, _)? = evs.first else { return XCTFail("turn.failed must error") }
+        XCTAssertEqual(m, "model blocked")
+    }
+
     func test_unknownEvent_ignored() {
         let p = CodexParser()
         XCTAssertEqual(p.parseLine(#"{"type":"unknown.event","payload":1}"#).count, 0)

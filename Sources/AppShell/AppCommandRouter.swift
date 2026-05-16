@@ -46,6 +46,9 @@ public final class AppCommandRouter: CommandRouting {
                         agent.viewModel.onReviewRequested = { [weak self] in
                             _ = try? self?.createSurface(workspace: wid, type: .rightSidebarTool, paneID: nil, title: "Git")
                         }
+                        agent.viewModel.onRunStateChange = { [weak self] in
+                            self?.windowController?.refreshFromState()
+                        }
                         surface = agent
                     case .markdown:
                         surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
@@ -161,6 +164,21 @@ public final class AppCommandRouter: CommandRouting {
 
     public func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws {
         try context?.apply(.setWorkspaceDescription(id, text))
+        windowController?.refreshFromState()
+    }
+
+    public func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {
+        try context?.apply(.setWorkspaceColor(id, color))
+        windowController?.refreshFromState()
+    }
+
+    public func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {
+        try context?.apply(.renameSurface(wid, sid, title))
+        windowController?.refreshFromState()
+    }
+
+    public func setSurfaceColor(_ wid: WorkspaceID, _ sid: SurfaceID, _ color: String) throws {
+        try context?.apply(.setSurfaceColor(wid, sid, color))
         windowController?.refreshFromState()
     }
 
@@ -506,6 +524,9 @@ public final class AppCommandRouter: CommandRouting {
                 agent.subscriptionToken = AnyHashable(token)
                 agent.viewModel.onReviewRequested = { [weak self] in
                     _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
+                }
+                agent.viewModel.onRunStateChange = { [weak self] in
+                    self?.windowController?.refreshFromState()
                 }
                 surface = agent
             case .markdown:

@@ -32,13 +32,18 @@ public final class ClaudeParser {
 
         var out: [AssistantEvent] = []
 
-        if type == "system", (obj["subtype"] as? String) == "init" {
-            if let sid = obj["session_id"] as? String {
-                sessionId = sid
-                if !threadEmitted {
-                    threadEmitted = true
-                    out.append(.threadStarted(threadId: sid, providerThreadId: sid))
-                }
+        // Every line (incl. the cmux shim's hook_started/hook_response
+        // lines that arrive BEFORE init) carries session_id — capture it
+        // so the resume id is never lost.
+        if let sid = obj["session_id"] as? String, !sid.isEmpty { sessionId = sid }
+
+        if type == "system" {
+            // Emit threadStarted only on init (the shim's hook_* lines must
+            // NOT trip the fallback before the real session id is known).
+            if (obj["subtype"] as? String) == "init", !threadEmitted {
+                threadEmitted = true
+                out.append(.threadStarted(threadId: sessionId ?? UUID().uuidString,
+                                          providerThreadId: sessionId))
             }
             return out
         }

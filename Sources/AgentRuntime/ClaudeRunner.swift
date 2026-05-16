@@ -24,7 +24,15 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     public static func buildArgs(_ request: AgentRunRequest) -> [String] {
         var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
         args.append(contentsOf: ["--model", request.model])
-        if let ptid = request.providerThreadId {
+        // claude accepts --effort low|medium|high|xhigh|max.
+        switch request.reasoningEffort {
+        case .some(.minimal), .some(.low): args.append(contentsOf: ["--effort", "low"])
+        case .some(.high): args.append(contentsOf: ["--effort", "high"])
+        case .some(.xhigh): args.append(contentsOf: ["--effort", "xhigh"])
+        case .some(.medium), .none: args.append(contentsOf: ["--effort", "medium"])
+        }
+        // Resume the prior session so the model keeps full context.
+        if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
         }
         switch request.permissionMode {
@@ -60,13 +68,13 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
 
         let parser = ClaudeParser()
         let timeline = TimelineAggregator()
+        let outBuf = LineBuffer()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty { return }
-            guard let str = String(data: data, encoding: .utf8) else { return }
-            for line in str.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-                for ev in parser.parseLine(String(line)) {
+            for line in outBuf.take(data) {
+                for ev in parser.parseLine(line) {
                     timeline.apply(ev)
                     onEvent(.event(ev))
                 }
@@ -82,6 +90,15 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         proc.terminationHandler = { p in
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
+            // Drain bytes that arrived between the last read and EOF, plus
+            // the final unterminated line, before finalizing the parser.
+            let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            for line in outBuf.take(tail) + outBuf.flush() {
+                for ev in parser.parseLine(line) {
+                    timeline.apply(ev)
+                    onEvent(.event(ev))
+                }
+            }
             for ev in parser.finalize() {
                 timeline.apply(ev)
                 onEvent(.event(ev))

@@ -11,6 +11,23 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
     case low
     case medium
     case high
+    case xhigh
+
+    public static var supportedCases: [AgentReasoningEffort] {
+        [.low, .medium, .high, .xhigh]
+    }
+
+    /// Human label for menus. `xhigh` is shown as "Extra High" to match
+    /// the Codex CLI's effort picker.
+    public var displayName: String {
+        switch self {
+        case .minimal: return "Minimal"
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High"
+        case .xhigh: return "Extra High"
+        }
+    }
 }
 
 public struct AgentRunRequest: Codable, Sendable, Equatable {
@@ -84,6 +101,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var diffAdditions: Int
     public var diffDeletions: Int
     public var hasUnread: Bool
+    public var color: String?
 
     public init(
         id: AgentThreadID = AgentThreadID(),
@@ -98,7 +116,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         updatedAt: Date = Date(),
         diffAdditions: Int = 0,
         diffDeletions: Int = 0,
-        hasUnread: Bool = false
+        hasUnread: Bool = false,
+        color: String? = nil
     ) {
         self.id = id
         self.projectId = projectId
@@ -113,6 +132,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         self.diffAdditions = diffAdditions
         self.diffDeletions = diffDeletions
         self.hasUnread = hasUnread
+        self.color = color
     }
 }
 

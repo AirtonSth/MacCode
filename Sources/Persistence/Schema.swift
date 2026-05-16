@@ -167,6 +167,9 @@ public enum Schema {
             dismissed_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_workspace ON notifications(workspace_id);
+        """),
+        SchemaStep(3, """
+        ALTER TABLE agent_threads ADD COLUMN color TEXT;
         """)
     ]
 

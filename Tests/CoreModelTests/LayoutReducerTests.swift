@@ -9,6 +9,29 @@ final class LayoutReducerTests: XCTestCase {
         XCTAssertNotNil(s.window.selectedWorkspaceID)
     }
 
+    func test_setWorkspaceColor_setsAndClears() throws {
+        let r = LayoutReducer()
+        var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws1", cwd: "/tmp", initial: nil))
+        let wid = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .setWorkspaceColor(wid, "purple"))
+        XCTAssertEqual(s.workspaces[wid]?.metadata["color"], "purple")
+        s = try r.reduce(s, .setWorkspaceColor(wid, ""))
+        XCTAssertNil(s.workspaces[wid]?.metadata["color"], "empty clears the color key")
+    }
+
+    func test_setSurfaceColor_writesToDescriptorMetadata() throws {
+        let r = LayoutReducer()
+        var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws1", cwd: "/tmp", initial: nil))
+        let wid = s.window.selectedWorkspaceID!
+        let surf = SurfaceDescriptor(type: .terminal, title: "term")
+        s = try r.reduce(s, .addSurface(wid, paneID: nil, descriptor: surf))
+        s = try r.reduce(s, .setSurfaceColor(wid, surf.id, "green"))
+        let found = s.workspaces[wid]?.layout.paneIDs().compactMap {
+            s.workspaces[wid]?.layout.find(paneID: $0)?.surfaces.first { $0.id == surf.id }
+        }.first
+        XCTAssertEqual(found?.metadata["color"], "green")
+    }
+
     func test_addSurface_setsSelected() throws {
         let r = LayoutReducer()
         var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws1", cwd: "/tmp", initial: nil))

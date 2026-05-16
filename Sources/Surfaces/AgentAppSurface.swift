@@ -15,7 +15,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var timeline = AssistantTimelineState()
     @Published public var prompt: String = ""
     @Published public var provider: AgentProvider = .codex
-    @Published public var model: String = "gpt-5"
+    @Published public var model: String = "gpt-5.5"
     @Published public var availableModels: [AgentModelDescriptor] = []
     @Published public var permissionMode: AgentPermissionMode = .supervised
     @Published public var reasoningEffort: AgentReasoningEffort = .medium
@@ -31,6 +31,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var gitSummary: GitSummary?
     /// Wired by AppCommandRouter — "Review here" opens a Git/Diff surface.
     public var onReviewRequested: (() -> Void)?
+    /// A3: fired when a run starts/ends so the tab + workspace chrome can
+    /// show/hide a spinner (AppKit tab strip / sidebar don't observe VM).
+    public var onRunStateChange: (() -> Void)?
     /// B3: file paths attached to the next message (composer chips).
     @Published public var attachments: [String] = []
     /// When the active run started — drives the "Working for Xs" line.
@@ -148,6 +151,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// A1: the provider (source) is fixed once the thread has a
+    /// conversation — only model/effort stay changeable after that.
+    public var providerLocked: Bool { selectedThreadId != nil && !messages.isEmpty }
+
+    /// Persist the chosen provider/model onto the selected thread so a
+    /// resumed run uses the right source + model.
+    public func persistThreadConfig() {
+        guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
+        t.provider = provider
+        t.model = model
+        t.updatedAt = Date()
+        try? threadRepo.upsert(t)
+        if let i = threads.firstIndex(where: { $0.id == id }) {
+            threads[i].provider = provider
+            threads[i].model = model
+        }
+    }
+
     public func createThread(title: String) {
         let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider, model: model)
         try? threadRepo.upsert(t)
@@ -159,6 +180,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty, var t = try? threadRepo.get(id: id) else { return }
         t.title = title
+        t.updatedAt = Date()
+        try? threadRepo.upsert(t)
+        reloadThreads()
+    }
+
+    /// A2: set/clear a thread's swatch color (empty string clears).
+    public func setThreadColor(_ id: AgentThreadID, _ color: String) {
+        guard var t = try? threadRepo.get(id: id) else { return }
+        t.color = color.isEmpty ? nil : color
         t.updatedAt = Date()
         try? threadRepo.upsert(t)
         reloadThreads()
@@ -304,6 +334,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runThreads[runId] = tid
                 self.status = .running
                 self.runStartedAt = Date()
+                self.onRunStateChange?()
             }
         } catch {
             await MainActor.run { self.statusMessage = "Failed to start: \(error)"; self.status = .failed }
@@ -312,6 +343,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func stop() {
         if let r = currentRunId { coordinator.stopRun(r) }
+    }
+
+    private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+        let existing = (try? messageRepo.list(threadId: threadId)) ?? []
+        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return }
+        try? messageRepo.append(AgentMessage(threadId: threadId, role: .assistant, content: text))
     }
 
     // MARK: AgentRunObserver
@@ -327,6 +364,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.status = status
             let finishedTid = self.runThreads[runId] ?? self.selectedThreadId
             self.runThreads[runId] = nil
+            if status == .completed, let msg = finalMessage, !msg.isEmpty, let tid = finishedTid {
+                // The coordinator is normally the persistence owner, but
+                // live provider completions can arrive after stream drain on
+                // a background handler. Keep the restart contract here too.
+                self.persistFinalAssistantIfMissing(msg, threadId: tid)
+            }
             if status == .completed, let _ = finalMessage, let tid = finishedTid,
                tid != self.selectedThreadId, var t = try? self.threadRepo.get(id: tid) {
                 // B6: finished on a thread the user left → mark unread.
@@ -340,6 +383,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.runStartedAt = nil
             self.reloadThreads()
             self.loadGitBranch()   // the run may have changed the tree
+            self.onRunStateChange?()
         }
     }
 
@@ -347,6 +391,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Task { @MainActor in
             self.status = status
             if status == .running, self.runStartedAt == nil { self.runStartedAt = Date() }
+            self.onRunStateChange?()
         }
     }
 }
@@ -406,13 +451,19 @@ public struct AgentAppView: View {
             renameRow(t)
         } else {
             let selected = vm.selectedThreadId == t.id
+            let running = t.status == .running || (selected && vm.status == .running)
             Button { vm.selectThread(t.id) } label: {
                 HStack(spacing: DS.Space.md) {
-                    Circle()
-                        .fill(t.status == .running ? DS.Palette.success
-                              : t.status == .failed ? DS.Palette.danger
-                              : DS.Palette.textTertiary)
-                        .frame(width: 6, height: 6)
+                    if running {
+                        // A3: spinner while this thread has a run in flight.
+                        ProgressView().controlSize(.small).scaleEffect(0.5)
+                            .frame(width: 8, height: 8)
+                    } else {
+                        Circle()
+                            .fill(TabColor.from(t.color).map { Color(hex: $0.hex) }
+                                  ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary))
+                            .frame(width: 7, height: 7)
+                    }
                     VStack(alignment: .leading, spacing: 1) {
                         Text(t.title).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
                             .foregroundColor(DS.Palette.text).lineLimit(1)
@@ -434,6 +485,13 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .contextMenu {
                 Button("Rename…") { renameText = t.title; renamingThreadId = t.id }
+                Menu("Color") {
+                    Button("None") { vm.setThreadColor(t.id, "") }
+                    ForEach(TabColor.allCases, id: \.self) { c in
+                        Button(c.label) { vm.setThreadColor(t.id, c.rawValue) }
+                    }
+                }
+                Divider()
                 Button("Delete", role: .destructive) { vm.deleteThread(t.id) }
             }
         }
@@ -523,7 +581,7 @@ public struct AgentAppView: View {
         case .fullAccess: return DS.Palette.danger
         }
     }
-    private var effortLabel: String { vm.reasoningEffort.rawValue.capitalized }
+    private var effortLabel: String { vm.reasoningEffort.displayName }
 
     private func statusTone(_ s: AgentRunStatus) -> DSPill.Tone {
         switch s {
@@ -648,6 +706,10 @@ public struct AgentAppView: View {
     private func messageRow(_ msg: AgentMessage) -> some View {
         switch msg.role {
         case .user:
+            // Right-aligned bubble. The HStack MUST fill the reading column
+            // (.infinity) — otherwise the LazyVStack collapses to this
+            // row's intrinsic width and every message renders as a tiny
+            // pill centered in an empty pane.
             HStack(spacing: 0) {
                 Spacer(minLength: DS.Space.huge)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
@@ -660,7 +722,10 @@ public struct AgentAppView: View {
                         .padding(.vertical, DS.Space.md)
                         .background(DS.Palette.surfaceRaised)
                         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-                        .frame(maxWidth: 600, alignment: .leading)
+                        // Bubble wraps its content and caps at 600; it must
+                        // hug the RIGHT edge (trailing), else a short message
+                        // floats in the middle of a 600-wide invisible box.
+                        .frame(maxWidth: 600, alignment: .trailing)
                     Button { copyToPasteboard(msg.content) } label: {
                         Image(systemName: "doc.on.doc").font(.system(size: 10))
                     }
@@ -669,6 +734,7 @@ public struct AgentAppView: View {
                     .accessibilityLabel("Copy message")
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
             assistantProse(msg.content)
         case .system:
@@ -779,20 +845,15 @@ public struct AgentAppView: View {
                     .padding(.horizontal, DS.Space.lg)
                     .padding(.top, DS.Space.md)
             }
-            ZStack(alignment: .topLeading) {
-                if vm.prompt.isEmpty {
-                    Text("Ask \(vm.provider.rawValue.capitalized) for changes…")
-                        .font(DS.Font.body).foregroundColor(DS.Palette.textTertiary)
-                        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
-                        .allowsHitTesting(false)
-                }
-                TextEditor(text: $vm.prompt)
-                    .font(DS.Font.body)
-                    .scrollContentBackground(.hidden)
-                    .padding(.horizontal, DS.Space.md)
-                    .padding(.vertical, DS.Space.sm)
-                    .frame(minHeight: 50, maxHeight: 150)
-            }
+            // A4: starts at one line, grows with content up to ~10 lines.
+            TextField("Ask \(vm.provider.rawValue.capitalized) for changes…",
+                      text: $vm.prompt, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...10)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.vertical, DS.Space.md)
             composerToolbar
         }
         .background(DS.Palette.surface)
@@ -872,21 +933,30 @@ public struct AgentAppView: View {
 
     private var modelMenu: some View {
         Menu {
-            Picker("Provider", selection: $vm.provider) {
+            Picker("Source", selection: $vm.provider) {
                 Text("Codex").tag(AgentProvider.codex)
                 Text("Claude").tag(AgentProvider.claude)
             }
-            .onChange(of: vm.provider) { _ in Task { await vm.loadModels() } }
+            .disabled(vm.providerLocked || vm.status == .running)
+            .onChange(of: vm.provider) { _ in
+                Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
+            }
             if !vm.availableModels.isEmpty {
                 Picker("Model", selection: $vm.model) {
                     ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
                 }
+                .onChange(of: vm.model) { _ in vm.persistThreadConfig() }
+                .disabled(vm.status == .running)
             }
             Divider()
-            Picker("Reasoning", selection: $vm.reasoningEffort) {
-                ForEach(AgentReasoningEffort.allCases, id: \.self) { e in
-                    Text(e.rawValue.capitalized).tag(e)
+            Picker("Reasoning effort", selection: $vm.reasoningEffort) {
+                ForEach(AgentReasoningEffort.supportedCases, id: \.self) { e in
+                    Text(e.displayName).tag(e)
                 }
+            }
+            if vm.providerLocked {
+                Divider()
+                Text("Source locked — \(vm.provider.rawValue.capitalized) thread")
             }
         } label: {
             HStack(spacing: DS.Space.xs) {
@@ -1053,5 +1123,7 @@ public final class AgentAppSurface: NSObject, Surface {
          "provider": viewModel.provider.rawValue,
          "model": viewModel.model]
     }
-}
 
+    // A3: drives the tab/workspace spinner.
+    public var isBusy: Bool { viewModel.status == .running }
+}

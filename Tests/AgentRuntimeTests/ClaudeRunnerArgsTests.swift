@@ -46,4 +46,20 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let r = a.firstIndex(of: "--resume")!
         XCTAssertEqual(a[a.index(after: r)], "thread-abc")
     }
+
+    func test_effortAlwaysForwarded() {
+        func eff(_ e: AgentReasoningEffort?) -> String {
+            let r = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
+                                    model: "opus", cwd: "/tmp", prompt: "x",
+                                    permissionMode: .supervised, reasoningEffort: e)
+            let a = ClaudeRunner.buildArgs(r)
+            return a[a.index(after: a.firstIndex(of: "--effort")!)]
+        }
+        XCTAssertEqual(eff(.minimal), "low")
+        XCTAssertEqual(eff(.low), "low")
+        XCTAssertEqual(eff(.medium), "medium")
+        XCTAssertEqual(eff(.high), "high")
+        XCTAssertEqual(eff(.xhigh), "xhigh", "Extra High must reach claude as --effort xhigh")
+        XCTAssertEqual(eff(nil), "medium", "no effort → a sane default, never omitted")
+    }
 }

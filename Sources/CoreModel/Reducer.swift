@@ -4,6 +4,8 @@ public enum LayoutAction: Sendable {
     case createWorkspace(name: String, cwd: String, initial: SurfaceDescriptor?)
     case renameWorkspace(WorkspaceID, String)
     case setWorkspaceDescription(WorkspaceID, String)
+    case setWorkspaceColor(WorkspaceID, String)
+    case setSurfaceColor(WorkspaceID, SurfaceID, String)
     case closeWorkspace(WorkspaceID)
     case selectWorkspace(WorkspaceID)
     case addSurface(WorkspaceID, paneID: PaneID?, descriptor: SurfaceDescriptor)
@@ -88,6 +90,21 @@ public struct LayoutReducer {
             if text.isEmpty { ws.metadata.removeValue(forKey: "description") }
             else { ws.metadata["description"] = text }
             ws.updatedAt = Date()
+            next.workspaces[wid] = ws
+            return next
+        case let .setWorkspaceColor(wid, color):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            if color.isEmpty { ws.metadata.removeValue(forKey: "color") }
+            else { ws.metadata["color"] = color }
+            ws.updatedAt = Date()
+            next.workspaces[wid] = ws
+            return next
+        case let .setSurfaceColor(wid, sid, color):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            ws.layout = try mutateSurface(in: ws.layout, surfaceID: sid) {
+                if color.isEmpty { $0.metadata.removeValue(forKey: "color") }
+                else { $0.metadata["color"] = color }
+            }
             next.workspaces[wid] = ws
             return next
         case .closeWorkspace(let wid):

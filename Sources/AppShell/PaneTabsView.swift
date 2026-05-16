@@ -33,12 +33,22 @@ public final class PaneTabsView: NSObject {
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
         for desc in pane.surfaces {
             let isSel = desc.id == selectedID
+            let busy = SurfaceRegistry.shared.surface(desc.id)?.isBusy ?? false
+            let colorHex = TabColor.from(desc.metadata["color"])?.hex
+            let sid = desc.id
             let tab = PaneTabButton(
                 title: desc.title,
                 symbol: Self.symbol(for: desc.type),
                 selected: isSel,
-                onSelect: { [weak self] in self?.selectSurface(desc.id) },
-                onClose: { [weak self] in self?.closeSurface(desc.id) }
+                busy: busy,
+                colorHex: colorHex,
+                onSelect: { [weak self] in self?.selectSurface(sid) },
+                onClose: { [weak self] in self?.closeSurface(sid) },
+                onRename: { [weak self] in self?.promptRenameSurface(sid, current: desc.title) },
+                onSetColor: { [weak self] raw in
+                    guard let wid = self?.currentWorkspaceID() else { return }
+                    try? self?.router?.setSurfaceColor(wid, sid, raw)
+                }
             )
             tabStrip.addArrangedSubview(tab)
         }
@@ -157,6 +167,21 @@ public final class PaneTabsView: NSObject {
         try? router?.focusSurface(workspace: wid, surface: id)
     }
 
+    private func promptRenameSurface(_ id: SurfaceID, current: String) {
+        guard let wid = currentWorkspaceID() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename tab"
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        field.stringValue = current
+        alert.accessoryView = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !v.isEmpty { try? router?.renameSurface(wid, id, v) }
+        }
+    }
+
     private func closeSurface(_ id: SurfaceID) {
         guard let wid = currentWorkspaceID() else { return }
         try? router?.closeSurface(workspace: wid, surface: id)
@@ -261,23 +286,41 @@ public final class PaneTabsView: NSObject {
 final class PaneTabButton: NSView {
     private let onSelect: () -> Void
     private let onClose: () -> Void
+    private let onRename: (() -> Void)?
+    private let onSetColor: ((String) -> Void)?
     private var hovering = false
     private let selected: Bool
 
-    init(title: String, symbol: String, selected: Bool,
-         onSelect: @escaping () -> Void, onClose: @escaping () -> Void) {
+    init(title: String, symbol: String, selected: Bool, busy: Bool = false,
+         colorHex: UInt32? = nil,
+         onSelect: @escaping () -> Void, onClose: @escaping () -> Void,
+         onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil) {
         self.onSelect = onSelect
         self.onClose = onClose
+        self.onRename = onRename
+        self.onSetColor = onSetColor
         self.selected = selected
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = (selected ? DS.NS.bg : DS.NS.surface).cgColor
 
-        let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        icon.symbolConfiguration = .init(pointSize: 11, weight: .regular)
-        icon.contentTintColor = selected ? DS.NS.text : DS.NS.textTertiary
+        // A3: a busy surface shows a spinner where its icon would be.
+        let icon: NSView
+        if busy {
+            let spin = NSProgressIndicator()
+            spin.style = .spinning
+            spin.controlSize = .small
+            spin.isIndeterminate = true
+            spin.startAnimation(nil)
+            icon = spin
+        } else {
+            let iv = NSImageView()
+            iv.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            iv.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+            iv.contentTintColor = selected ? DS.NS.text : DS.NS.textTertiary
+            icon = iv
+        }
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.setContentHuggingPriority(.required, for: .horizontal)
 
@@ -348,10 +391,54 @@ final class PaneTabButton: NSView {
             ])
         }
 
+        if let hex = colorHex {
+            let rail = NSView()
+            rail.wantsLayer = true
+            rail.layer?.backgroundColor = NSColor(hex: hex).cgColor
+            rail.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(rail)
+            NSLayoutConstraint.activate([
+                rail.leadingAnchor.constraint(equalTo: leadingAnchor),
+                rail.topAnchor.constraint(equalTo: topAnchor),
+                rail.bottomAnchor.constraint(equalTo: bottomAnchor),
+                rail.widthAnchor.constraint(equalToConstant: 3)
+            ])
+        }
+
         let tracking = NSTrackingArea(rect: .zero,
                                       options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                       owner: self, userInfo: nil)
         addTrackingArea(tracking)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard onRename != nil || onSetColor != nil else { return }
+        let menu = NSMenu()
+        if onRename != nil {
+            let r = NSMenuItem(title: "Rename…", action: #selector(renameTab), keyEquivalent: "")
+            r.target = self
+            menu.addItem(r)
+        }
+        if onSetColor != nil {
+            let colorItem = NSMenuItem(title: "Color", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            let none = NSMenuItem(title: "None", action: #selector(colorTab(_:)), keyEquivalent: "")
+            none.target = self; none.representedObject = ""
+            sub.addItem(none)
+            for c in TabColor.allCases {
+                let mi = NSMenuItem(title: c.label, action: #selector(colorTab(_:)), keyEquivalent: "")
+                mi.target = self; mi.representedObject = c.rawValue
+                sub.addItem(mi)
+            }
+            colorItem.submenu = sub
+            menu.addItem(colorItem)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func renameTab() { onRename?() }
+    @objc private func colorTab(_ sender: NSMenuItem) {
+        onSetColor?((sender.representedObject as? String) ?? "")
     }
 
     required init?(coder: NSCoder) { fatalError() }

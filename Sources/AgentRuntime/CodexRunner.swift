@@ -36,11 +36,54 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
+        // Real Codex CLI models (codex 0.130.0, ~/.codex/models_cache.json).
+        // id "" = account default (always works regardless of plan). The
+        // earlier ids (gpt-5/gpt-5-codex/o3) are dead on this CLI and made
+        // `codex --model …` fail with no output.
         [
-            AgentModelDescriptor(id: "gpt-5", label: "GPT-5", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5-mini", label: "GPT-5 Mini", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "o4-mini", label: "o4-mini", provider: .codex, supportsReasoning: true)
+            AgentModelDescriptor(id: "", label: "Default (account)", provider: .codex, supportsReasoning: true),
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true),
+            AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true),
+            AgentModelDescriptor(id: "gpt-5.4-mini", label: "GPT-5.4-Mini", provider: .codex, supportsReasoning: true),
+            AgentModelDescriptor(id: "gpt-5.3-codex", label: "GPT-5.3-Codex", provider: .codex, supportsReasoning: true),
+            AgentModelDescriptor(id: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark", provider: .codex, supportsReasoning: true),
+            AgentModelDescriptor(id: "gpt-5.2", label: "GPT-5.2", provider: .codex, supportsReasoning: true)
         ]
+    }
+
+    /// Builds the `codex` argv. Pure + static for regression tests.
+    /// With a prior session id it uses `exec resume <id>` so the model
+    /// keeps full context; otherwise a fresh `exec`. An empty model id
+    /// means "account default" (omit -m).
+    public static func buildArgs(_ request: AgentRunRequest) -> [String] {
+        let ptid = request.providerThreadId
+        let resuming = (ptid?.isEmpty == false)
+        // `codex exec resume` usage:
+        //   exec resume [FLAGS] -c k=v <SESSION_ID> [PROMPT]
+        // It does NOT accept --model/--sandbox (the session keeps the
+        // model + sandbox it was created with — that's correct for a
+        // continued conversation).
+        var args: [String] = ["exec"]
+        if resuming { args.append("resume") }
+        args += ["--json", "--skip-git-repo-check"]
+        if let r = request.reasoningEffort?.rawValue {
+            args += ["-c", "model_reasoning_effort=\"\(r)\""]
+        }
+        if !resuming {
+            let model = request.model.trimmingCharacters(in: .whitespaces)
+            if !model.isEmpty, model.lowercased() != "default" {
+                args += ["--model", model]
+            }
+            switch request.permissionMode {
+            case .supervised:      args += ["--sandbox", "read-only"]
+            case .autoAcceptEdits: args += ["--sandbox", "workspace-write"]
+            case .fullAccess:      args += ["--sandbox", "danger-full-access"]
+            }
+        }
+        args += request.extraArgs
+        if resuming, let ptid { args.append(ptid) }   // SESSION_ID before PROMPT
+        args.append(request.prompt)
+        return args
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
@@ -51,25 +94,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             throw AgentRunError.missingBinary(binary)
         }
 
-        // `codex exec` flag surface (current CLI): --model, --json,
-        // --sandbox <mode>, and config overrides via `-c key=value`.
-        // `--reasoning` / `--permission` are NOT valid flags (they made
-        // every run fail with "unexpected argument").
-        var args: [String] = ["exec", "--json", "--skip-git-repo-check"]
-        args.append(contentsOf: ["--model", request.model])
-        if let r = request.reasoningEffort?.rawValue {
-            args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(r)\""])
-        }
-        switch request.permissionMode {
-        case .supervised:
-            args.append(contentsOf: ["--sandbox", "read-only"])
-        case .autoAcceptEdits:
-            args.append(contentsOf: ["--sandbox", "workspace-write"])
-        case .fullAccess:
-            args.append(contentsOf: ["--sandbox", "danger-full-access"])
-        }
-        args.append(contentsOf: request.extraArgs)
-        args.append(request.prompt)
+        let args = Self.buildArgs(request)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -84,13 +109,13 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
 
         let parser = CodexParser()
         let timeline = TimelineAggregator()
+        let outBuf = LineBuffer()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty { return }
-            guard let str = String(data: data, encoding: .utf8) else { return }
-            for line in str.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-                for ev in parser.parseLine(String(line)) {
+            for line in outBuf.take(data) {
+                for ev in parser.parseLine(line) {
                     timeline.apply(ev)
                     onEvent(.event(ev))
                 }
@@ -108,6 +133,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         proc.terminationHandler = { p in
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
+            // Foundation may not deliver the bytes between the last read
+            // and EOF via the handler — drain them explicitly, then flush
+            // the final unterminated line. Without this the closing
+            // `turn.completed` (and the answer) is regularly lost.
+            let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            for line in outBuf.take(tail) + outBuf.flush() {
+                for ev in parser.parseLine(line) {
+                    timeline.apply(ev)
+                    onEvent(.event(ev))
+                }
+            }
             let status: AgentRunStatus
             if p.terminationReason == .uncaughtSignal { status = .cancelled }
             else if p.terminationStatus == 0 { status = .completed }
@@ -132,12 +168,55 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     }
 }
 
+/// Reassembles newline-delimited JSON from a pipe. The
+/// `readabilityHandler` hands us arbitrary byte chunks: a single read
+/// routinely splits a JSON line — and even a multi-byte UTF-8 sequence —
+/// across two deliveries. Decoding each raw chunk directly (the previous
+/// behaviour) silently dropped every straddling event, so large agent
+/// outputs lost their terminal `agent_message`/`turn.completed` and the
+/// run hung "running" forever. Only complete lines are emitted; the
+/// trailing partial is held until the next read (or `flush()` at EOF).
+final class LineBuffer {
+    private var buffer = Data()
+
+    /// Append a chunk, return any now-complete lines (trimmed, non-empty).
+    func take(_ data: Data) -> [String] {
+        buffer.append(data)
+        var lines: [String] = []
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer.subdata(in: buffer.startIndex..<nl)
+            buffer.removeSubrange(buffer.startIndex...nl)
+            if let s = Self.decode(lineData) { lines.append(s) }
+        }
+        return lines
+    }
+
+    /// Emit any final, unterminated line (last record before EOF).
+    func flush() -> [String] {
+        guard !buffer.isEmpty else { return [] }
+        let rest = buffer
+        buffer.removeAll()
+        return Self.decode(rest).map { [$0] } ?? []
+    }
+
+    private static func decode(_ data: Data) -> String? {
+        var d = data
+        if d.last == 0x0D { d.removeLast() }   // strip a CRLF's CR
+        // Lines are now complete, so no UTF-8 sequence is split; decode
+        // is lossless. (Lossy `String(decoding:)` never returns nil — far
+        // safer than the old guard that dropped the whole chunk.)
+        let s = String(decoding: d, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
+}
+
 final class TimelineAggregator: @unchecked Sendable {
     private var state = AssistantTimelineState()
     private let lock = NSLock()
     var finalAssistantMessage: String? {
         lock.lock(); defer { lock.unlock() }
-        return state.turns.last?.finalAssistantMessage
+        return state.latestAssistantMessage
     }
     var providerThreadId: String? {
         lock.lock(); defer { lock.unlock() }

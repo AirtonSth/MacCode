@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import CoreModel
 import Persistence
+import Surfaces
 import DesignSystemKit
 
 @MainActor
@@ -69,6 +70,10 @@ public final class SidebarViewModel: ObservableObject {
                                 message: "Optional note for “\(ws.name)”.",
                                 initial: current) else { return }
         try? router?.setWorkspaceDescription(ws.id, text)
+    }
+
+    public func setWorkspaceColor(_ ws: Workspace, _ color: String) {
+        try? router?.setWorkspaceColor(ws.id, color)
     }
 
     public func removeWorkspace(_ ws: Workspace) {
@@ -156,12 +161,19 @@ public struct SidebarRootView: View {
     private func workspaceRow(_ ws: Workspace) -> some View {
         let selected = vm.selectedWorkspaceID == ws.id
         let desc = ws.metadata["description"]
+        // A3: spinner when any surface in this workspace is busy.
+        let busy = ws.layout.paneIDs().contains { pid in
+            (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
+                SurfaceRegistry.shared.surface($0.id)?.isBusy == true
+            }
+        }
         Button { vm.select(ws.id) } label: {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: "folder")
-                    .font(.system(size: 15, weight: .regular))
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 14, weight: .regular))
                     .frame(width: 20, height: 20)
-                    .foregroundColor(DS.Palette.textSecondary)
+                    .foregroundColor(TabColor.from(ws.metadata["color"]).map { Color(hex: $0.hex) }
+                                     ?? DS.Palette.textSecondary)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(ws.name).font(selected ? DS.Font.bodyStrong : DS.Font.body)
                         .foregroundColor(DS.Palette.text).lineLimit(1)
@@ -171,6 +183,9 @@ public struct SidebarRootView: View {
                     }
                 }
                 Spacer(minLength: 0)
+                if busy {
+                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                }
                 if ws.notificationsUnread > 0 {
                     DSPill("\(ws.notificationsUnread)", tone: .accent)
                 }
@@ -187,6 +202,12 @@ public struct SidebarRootView: View {
         .contextMenu {
             Button("Rename…") { vm.renameWorkspace(ws) }
             Button("Edit description…") { vm.editDescription(ws) }
+            Menu("Color") {
+                Button("None") { vm.setWorkspaceColor(ws, "") }
+                ForEach(TabColor.allCases, id: \.self) { c in
+                    Button(c.label) { vm.setWorkspaceColor(ws, c.rawValue) }
+                }
+            }
             Divider()
             Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
         }

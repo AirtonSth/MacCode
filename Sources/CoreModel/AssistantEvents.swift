@@ -75,6 +75,17 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
 
     public init() { self.turns = [] }
 
+    public var latestAssistantMessage: String? {
+        for turn in turns.reversed() {
+            if let final = turn.finalAssistantMessage, !final.isEmpty { return final }
+            for item in turn.items.reversed()
+            where item.type == .assistantMessage && !item.body.isEmpty {
+                return item.body
+            }
+        }
+        return nil
+    }
+
     public mutating func apply(_ ev: AssistantEvent) {
         switch ev {
         case .threadStarted(let tid, let ptid):

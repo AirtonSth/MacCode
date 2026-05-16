@@ -26,4 +26,15 @@ final class AssistantTimelineTests: XCTestCase {
         s.apply(.error(message: "boom", recoverable: false))
         XCTAssertEqual(s.error, "boom")
     }
+
+    func test_latestAssistantMessage_skipsEmptyTrailingTurns() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "real"))
+        s.apply(.itemStarted(item: AssistantItem(id: "a1", turnId: "real", type: .assistantMessage, startedAtMs: 1)))
+        s.apply(.itemDelta(itemId: "a1", bodyAppend: "final answer", outputAppend: nil, summary: nil))
+        s.apply(.turnCompleted(turnId: "real", finalMessage: "final answer"))
+        s.apply(.itemStarted(item: AssistantItem(id: "empty", turnId: "", type: .assistantMessage, startedAtMs: 2)))
+        XCTAssertEqual(s.latestAssistantMessage, "final answer",
+                       "persistence must use the last real assistant reply, not a trailing empty turn")
+    }
 }

@@ -37,6 +37,37 @@ final class AgentAppViewModelTests: XCTestCase {
                        "rename must persist to the repository, not just the view")
     }
 
+    func test_providerLocked_onlyAfterConversationStarts() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        XCTAssertFalse(vm.providerLocked, "an empty thread can still switch source")
+        let id = vm.selectedThreadId!
+        vm.messages.append(AgentMessage(threadId: id, role: .user, content: "hi"))
+        XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
+    }
+
+    func test_persistThreadConfig_writesProviderModelToThread() throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "t")
+        let id = vm.selectedThreadId!
+        vm.provider = .claude
+        vm.model = "claude-opus-4-7"
+        vm.persistThreadConfig()
+        let t = try repo.get(id: id)
+        XCTAssertEqual(t?.provider, .claude)
+        XCTAssertEqual(t?.model, "claude-opus-4-7", "model change must persist for resume")
+    }
+
+    func test_setThreadColor_persistsAndClears() throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "t")
+        let id = vm.selectedThreadId!
+        vm.setThreadColor(id, "purple")
+        XCTAssertEqual(try repo.get(id: id)?.color, "purple")
+        vm.setThreadColor(id, "")
+        XCTAssertNil(try repo.get(id: id)?.color, "empty selection clears the color")
+    }
+
     func test_renameThread_blankIsNoOp() throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "keep")
@@ -93,6 +124,27 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(try repo.get(id: id)?.title, "Refactor the auth module please",
                        "the first message must rename a still-default thread")
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
+    }
+
+    func test_finishCallback_persistsAssistantReplyForRestart() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        let id = vm.selectedThreadId!
+        let runId = AgentRunID()
+        vm.runCoordinator(vm.coordinator, didFinish: runId, status: .completed,
+                          finalMessage: "final answer", providerThreadId: "session-1")
+        await waitAsync("assistant reply persisted") {
+            ((try? vm.messageRepo.list(threadId: id)) ?? []).contains {
+                $0.role == .assistant && $0.content == "final answer"
+            }
+        }
+        vm.runCoordinator(vm.coordinator, didFinish: runId, status: .completed,
+                          finalMessage: "final answer", providerThreadId: "session-1")
+        await waitAsync("assistant reply remains deduplicated") {
+            (((try? vm.messageRepo.list(threadId: id)) ?? []).filter {
+                $0.role == .assistant && $0.content == "final answer"
+            }.count) == 1
+        }
     }
 
     // MARK: B2 — slash commands
@@ -269,5 +321,16 @@ final class AgentAppViewModelTests: XCTestCase {
         await waitAsync("fake run completes") { vm.status == .completed }
         let assistants = ((try? vm.messageRepo.list(threadId: tid)) ?? []).filter { $0.role == .assistant }
         XCTAssertEqual(assistants.count, 1, "the assistant reply must be persisted exactly once, not double-written")
+    }
+
+    /// Regression: the VM defaulted to "gpt-5" — a dead id on codex
+    /// 0.130.0, so a brand-new Codex thread's first run failed with no
+    /// output. The default must be a model the CLI actually accepts.
+    func test_defaultModel_isARealCodexModel() async throws {
+        let (vm, _) = try makeVM()
+        XCTAssertEqual(vm.model, "gpt-5.5", "fresh threads must start on a live codex model")
+        await vm.loadModels()
+        XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
+                      "the default model must be one the picker actually offers")
     }
 }
