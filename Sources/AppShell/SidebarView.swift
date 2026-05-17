@@ -54,6 +54,10 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
+    public func toggleSidebar() {
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+    }
+
     // MARK: cmux-style workspace editing (AppKit prompts — reliable,
     // no SwiftUI sheet plumbing).
 
@@ -130,12 +134,25 @@ public struct SidebarRootView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button { vm.newWorkspace() } label: {
-                sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+            Color.clear.frame(height: 44)
+
+            HStack(spacing: DS.Space.xs) {
+                Button { vm.newWorkspace() } label: {
+                    sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+                }
+                .buttonStyle(.plain)
+
+                Button { vm.toggleSidebar() } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Toggle sidebar")
             }
-            .buttonStyle(.plain)
             .padding(.horizontal, DS.Space.md)
-            .padding(.top, DS.Space.lg)
             .padding(.bottom, DS.Space.lg)
 
             HStack(spacing: DS.Space.sm) {
@@ -178,9 +195,8 @@ public struct SidebarRootView: View {
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
         .background(DS.Palette.surface.opacity(0.55))
-        // The AppKit window reserves a permanent top header, so the
-        // sidebar starts below it and does not need its own titlebar
-        // spacer.
+        // The sidebar material reaches the top edge; only its controls
+        // start below the traffic-light band.
         .ignoresSafeArea(.container, edges: .top)
     }
 

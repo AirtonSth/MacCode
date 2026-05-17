@@ -90,10 +90,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private let sidebar: SidebarView
     private let workspaceContainer = NSView()
+    private let workspaceContent = NSView()
     private let collapsedWorkspaceHeader = NoDragView()
     private let collapsedWorkspaceLabel = NSTextField(labelWithString: "")
     private let collapsedPlusButton = NoDragButton(frame: .zero)
     private let collapsedSidebarButton = NoDragButton(frame: .zero)
+    private let visibleWorkspaceHeader = NoDragView()
+    private let visibleWorkspaceLabel = NSTextField(labelWithString: "")
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
     /// Retains the live pane controllers; their @objc button and tab
@@ -103,6 +106,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private var sidebarWidth: CGFloat = 260
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
+    private var workspaceContentTopConstraint: NSLayoutConstraint?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -147,7 +151,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             ctx.duration = 0.18
             ctx.allowsImplicitAnimation = true
             sidebar.view.isHidden = sidebarCollapsed
-            splitTopConstraint?.constant = collapsedHeaderHeight
+            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
+            visibleWorkspaceHeader.isHidden = sidebarCollapsed
+            splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
+            workspaceContentTopConstraint?.constant = sidebarCollapsed ? 0 : collapsedHeaderHeight
             updateCollapsedWorkspaceHeader()
             if !sidebarCollapsed {
                 split.setPosition(sidebarWidth, ofDividerAt: 0)
@@ -170,17 +177,32 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         split.translatesAutoresizingMaskIntoConstraints = false
         sidebar.view.translatesAutoresizingMaskIntoConstraints = false
         workspaceContainer.translatesAutoresizingMaskIntoConstraints = false
+        workspaceContent.translatesAutoresizingMaskIntoConstraints = false
 
         workspaceContainer.wantsLayer = true
         workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
+        workspaceContent.wantsLayer = true
+        workspaceContent.layer?.backgroundColor = DS.NS.bg.cgColor
+        workspaceContainer.addSubview(workspaceContent)
+        let workspaceTop = workspaceContent.topAnchor.constraint(equalTo: workspaceContainer.topAnchor, constant: collapsedHeaderHeight)
+        workspaceContentTopConstraint = workspaceTop
+        NSLayoutConstraint.activate([
+            workspaceTop,
+            workspaceContent.bottomAnchor.constraint(equalTo: workspaceContainer.bottomAnchor),
+            workspaceContent.leadingAnchor.constraint(equalTo: workspaceContainer.leadingAnchor),
+            workspaceContent.trailingAnchor.constraint(equalTo: workspaceContainer.trailingAnchor)
+        ])
         configureCollapsedWorkspaceHeader()
+        configureVisibleWorkspaceHeader()
         split.addArrangedSubview(sidebar.view)
         split.addArrangedSubview(workspaceContainer)
         split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
 
         content.addSubview(split)
+        content.addSubview(visibleWorkspaceHeader)
         content.addSubview(collapsedWorkspaceHeader)
-        let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor, constant: collapsedHeaderHeight)
+        collapsedWorkspaceHeader.isHidden = true
+        let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor, constant: 0)
         splitTopConstraint = splitTop
         NSLayoutConstraint.activate([
             splitTop,
@@ -188,6 +210,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             sidebar.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            visibleWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
+            visibleWorkspaceHeader.leadingAnchor.constraint(equalTo: workspaceContainer.leadingAnchor),
+            visibleWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            visibleWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight),
             collapsedWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
             collapsedWorkspaceHeader.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             collapsedWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -249,6 +275,38 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	        updateCollapsedWorkspaceHeader()
 	    }
 
+        private func configureVisibleWorkspaceHeader() {
+            visibleWorkspaceHeader.translatesAutoresizingMaskIntoConstraints = false
+            visibleWorkspaceHeader.wantsLayer = true
+            visibleWorkspaceHeader.layer?.backgroundColor = DS.NS.surface.cgColor
+            visibleWorkspaceHeader.layer?.masksToBounds = true
+
+            visibleWorkspaceLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+            visibleWorkspaceLabel.textColor = DS.NS.text
+            visibleWorkspaceLabel.alignment = .center
+            visibleWorkspaceLabel.lineBreakMode = .byTruncatingTail
+            visibleWorkspaceLabel.translatesAutoresizingMaskIntoConstraints = false
+
+            let divider = NSView()
+            divider.wantsLayer = true
+            divider.layer?.backgroundColor = DS.NS.line.cgColor
+            divider.translatesAutoresizingMaskIntoConstraints = false
+
+            visibleWorkspaceHeader.addSubview(visibleWorkspaceLabel)
+            visibleWorkspaceHeader.addSubview(divider)
+            NSLayoutConstraint.activate([
+                visibleWorkspaceLabel.centerXAnchor.constraint(equalTo: visibleWorkspaceHeader.centerXAnchor),
+                visibleWorkspaceLabel.centerYAnchor.constraint(equalTo: visibleWorkspaceHeader.centerYAnchor),
+                visibleWorkspaceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: visibleWorkspaceHeader.leadingAnchor, constant: DS.Space.lg),
+                visibleWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: visibleWorkspaceHeader.trailingAnchor, constant: -DS.Space.lg),
+                divider.leadingAnchor.constraint(equalTo: visibleWorkspaceHeader.leadingAnchor),
+                divider.trailingAnchor.constraint(equalTo: visibleWorkspaceHeader.trailingAnchor),
+                divider.bottomAnchor.constraint(equalTo: visibleWorkspaceHeader.bottomAnchor),
+                divider.heightAnchor.constraint(equalToConstant: 1)
+            ])
+            updateCollapsedWorkspaceHeader()
+        }
+
 	    private func configureHeaderButton(_ button: NSButton, symbol: String, help: String, action: Selector) {
 	        button.translatesAutoresizingMaskIntoConstraints = false
 	        button.isBordered = false
@@ -273,9 +331,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	              let wid = ctx.state.window.selectedWorkspaceID,
 	              let ws = ctx.state.workspaces[wid] else {
 	            collapsedWorkspaceLabel.stringValue = "RemoteCode 2"
+	            visibleWorkspaceLabel.stringValue = "RemoteCode 2"
 	            return
 	        }
 	        collapsedWorkspaceLabel.stringValue = ws.name
+	        visibleWorkspaceLabel.stringValue = ws.name
 	    }
 
 	    @objc private func newWorkspace() {
@@ -329,7 +389,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private func rebuildWorkspaceContainer() {
         window.disableScreenUpdatesUntilFlush()
-        for sub in workspaceContainer.subviews { sub.removeFromSuperview() }
+        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
         // Drop references to the previous pane controllers; new ones are
         // created below. Without retaining them their @objc button/tab
         // targets are deallocated and clicks silently no-op.
@@ -338,8 +398,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
               let wid = ctx.state.window.selectedWorkspaceID,
               let ws = ctx.state.workspaces[wid] else {
             let empty = makeEmptyState()
-            workspaceContainer.addSubview(empty)
-            pin(empty, to: workspaceContainer)
+            workspaceContent.addSubview(empty)
+            pin(empty, to: workspaceContent)
             return
         }
         var primaryControlsAvailable = true
@@ -356,13 +416,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 
     private func attachRootLayoutView(_ layoutView: NSView) {
         layoutView.translatesAutoresizingMaskIntoConstraints = true
-        layoutView.frame = workspaceContainer.bounds
+        layoutView.frame = workspaceContent.bounds
         layoutView.autoresizingMask = [.width, .height]
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0
             ctx.allowsImplicitAnimation = false
-            workspaceContainer.addSubview(layoutView)
+            workspaceContent.addSubview(layoutView)
             layoutView.needsLayout = true
             layoutView.layoutSubtreeIfNeeded()
             if let split = layoutView as? RatioSplitView {
