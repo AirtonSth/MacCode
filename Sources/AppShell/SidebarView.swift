@@ -13,8 +13,8 @@ public final class SidebarViewModel: ObservableObject {
 
     @Published public var workspaces: [Workspace] = []
     @Published public var selectedWorkspaceID: WorkspaceID?
-    @Published public var multiSelectEnabled = false
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
+    private var selectionAnchorID: WorkspaceID?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -29,21 +29,30 @@ public final class SidebarViewModel: ObservableObject {
         selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
     }
 
-    public func toggleMultiSelect() {
-        multiSelectEnabled.toggle()
-        if !multiSelectEnabled { selectedWorkspaceIDs.removeAll() }
+    public func select(_ wid: WorkspaceID) {
+        selectedWorkspaceIDs.removeAll()
+        selectionAnchorID = wid
+        try? router?.selectWorkspace(wid)
     }
 
-    public func toggleWorkspaceSelection(_ ws: Workspace) {
-        if selectedWorkspaceIDs.contains(ws.id) {
-            selectedWorkspaceIDs.remove(ws.id)
+    public func selectWorkspaceRow(_ ws: Workspace, extendingSelection: Bool) {
+        if extendingSelection {
+            extendWorkspaceSelection(to: ws.id)
         } else {
-            selectedWorkspaceIDs.insert(ws.id)
+            select(ws.id)
         }
     }
 
-    public func select(_ wid: WorkspaceID) {
-        try? router?.selectWorkspace(wid)
+    private func extendWorkspaceSelection(to id: WorkspaceID) {
+        let anchor = selectionAnchorID ?? selectedWorkspaceID ?? id
+        guard let start = workspaces.firstIndex(where: { $0.id == anchor }),
+              let end = workspaces.firstIndex(where: { $0.id == id }) else {
+            selectedWorkspaceIDs.insert(id)
+            selectionAnchorID = id
+            return
+        }
+        let range = start <= end ? start...end : end...start
+        selectedWorkspaceIDs = Set(range.map { workspaces[$0].id })
     }
 
     public func newWorkspace() {
@@ -123,7 +132,7 @@ public final class SidebarViewModel: ObservableObject {
             try? router?.closeWorkspace(id)
         }
         selectedWorkspaceIDs.removeAll()
-        multiSelectEnabled = false
+        selectionAnchorID = nil
         reload()
     }
 }
@@ -160,17 +169,12 @@ public struct SidebarRootView: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
-                if vm.multiSelectEnabled {
+                if !vm.selectedWorkspaceIDs.isEmpty {
                     Button("Remove") { vm.removeSelectedWorkspaces() }
                         .buttonStyle(.plain)
                         .font(DS.Font.caption)
-                        .foregroundColor(vm.selectedWorkspaceIDs.isEmpty ? DS.Palette.textTertiary : DS.Palette.danger)
-                        .disabled(vm.selectedWorkspaceIDs.isEmpty)
+                        .foregroundColor(DS.Palette.danger)
                 }
-                Button(vm.multiSelectEnabled ? "Done" : "Select") { vm.toggleMultiSelect() }
-                    .buttonStyle(.plain)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
@@ -233,18 +237,14 @@ public struct SidebarRootView: View {
             }
         }
         Button {
-            if vm.multiSelectEnabled {
-                vm.toggleWorkspaceSelection(ws)
-            } else {
-                vm.select(ws.id)
-            }
+            vm.selectWorkspaceRow(ws, extendingSelection: NSEvent.modifierFlags.contains(.shift))
         } label: {
             HStack(spacing: DS.Space.sm) {
-                if vm.multiSelectEnabled {
+                if checked {
                     Image(systemName: checked ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 14, weight: .regular))
                         .frame(width: 20, height: 20)
-                        .foregroundColor(checked ? DS.Palette.accent : DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.accent)
                 }
                 Image(systemName: "folder.fill")
                     .font(.system(size: 14, weight: .regular))
@@ -271,7 +271,9 @@ public struct SidebarRootView: View {
             .frame(height: 38)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(selected ? DS.Palette.selection.opacity(0.75) : Color.white.opacity(0.001))
+                    .fill(checked ? DS.Palette.accent.opacity(0.22)
+                          : selected ? DS.Palette.selection.opacity(0.75)
+                          : Color.white.opacity(0.001))
             )
             .contentShape(Rectangle())
         }

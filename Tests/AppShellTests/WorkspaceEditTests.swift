@@ -38,21 +38,27 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertFalse(ctx.state.window.workspaces.contains(ws.id))
     }
 
-    func test_sidebarMultiSelect_tracksMultipleWorkspacesWithoutOpeningThem() throws {
+    func test_sidebarShiftSelection_tracksRangeWithoutOpeningWorkspace() throws {
         let (ctx, router) = try make()
         let first = try router.createWorkspace(name: "one", cwd: "/tmp")
         let second = try router.createWorkspace(name: "two", cwd: "/tmp")
+        let third = try router.createWorkspace(name: "three", cwd: "/tmp")
         let selectedBefore = ctx.state.window.selectedWorkspaceID
 
         let vm = SidebarViewModel(context: ctx, router: router)
-        vm.toggleMultiSelect()
-        vm.toggleWorkspaceSelection(first)
-        vm.toggleWorkspaceSelection(second)
+        vm.select(first.id)
+        vm.selectWorkspaceRow(third, extendingSelection: true)
 
-        XCTAssertEqual(vm.selectedWorkspaceIDs, [first.id, second.id],
-                       "bulk-delete mode must allow selecting several workspaces before one destructive confirmation")
-        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, selectedBefore,
-                       "selecting rows for bulk deletion must not switch the active workspace")
+        XCTAssertEqual(vm.selectedWorkspaceIDs, [first.id, second.id, third.id],
+                       "Shift-click selection must select the workspace range for bulk deletion without a separate Select mode")
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, first.id,
+                       "Shift-clicking rows for bulk deletion must not switch the active workspace")
+
+        vm.select(second.id)
+        XCTAssertTrue(vm.selectedWorkspaceIDs.isEmpty,
+                      "a normal click must clear the Shift-selected bulk set and open that workspace")
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, second.id)
+        XCTAssertNotEqual(ctx.state.window.selectedWorkspaceID, selectedBefore)
     }
 
     func test_edits_persistAcrossRestart() throws {
