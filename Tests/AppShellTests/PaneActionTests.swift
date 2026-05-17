@@ -193,20 +193,28 @@ final class PaneActionTests: XCTestCase {
         XCTAssertTrue(tooltips.contains("Split down (stacked)"))
     }
 
-    func test_visibleSidebarHeader_hasOnlyToggleBecauseWorkspaceCreationLivesInSidebarList() throws {
+    func test_visibleSidebar_usesPermanentFullWidthHeaderAboveTabs() throws {
         let (ctx, router) = try makeContext()
         _ = try router.createWorkspace(name: "visible", cwd: NSTemporaryDirectory())
         let controller = MainWindowController(context: ctx, router: router)
         controller.window.contentView?.layoutSubtreeIfNeeded()
 
-        let visibleButtons = visibleSubviews(of: controller.window.contentView!)
+        let content = try XCTUnwrap(controller.window.contentView)
+        let visibleButtons = visibleSubviews(of: content)
             .compactMap { $0 as? NSButton }
         let visibleTooltips = visibleButtons.compactMap(\.toolTip)
 
         XCTAssertEqual(visibleTooltips.filter { $0 == "Toggle sidebar" }.count, 1,
-                       "the visible sidebar must keep one collapse affordance")
-        XCTAssertFalse(visibleTooltips.contains("New workspace"),
-                       "workspace creation moved into the sidebar body as New Workspace; the top + must stay removed")
+                       "the permanent header must expose one sidebar toggle even when the sidebar is visible")
+        XCTAssertEqual(visibleTooltips.filter { $0 == "New workspace" }.count, 1,
+                       "the permanent header keeps the workspace + on the right")
+
+        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
+        let splitTop = try XCTUnwrap(content.constraints.first {
+            ($0.firstItem as? NSSplitView) === split && $0.firstAttribute == .top && $0.secondAttribute == .top
+        })
+        XCTAssertEqual(splitTop.constant, 34, accuracy: 0.1,
+                       "tabs must sit below the permanent header so tab dragging cannot become window dragging")
     }
 
     func test_sidebarViewModel_listsWindowWorkspacesAndSelectedWorkspaceForSidebarBody() throws {
@@ -263,7 +271,7 @@ final class PaneActionTests: XCTestCase {
             ($0.firstItem as? NSSplitView) === split && $0.firstAttribute == .top && $0.secondAttribute == .top
         })
         XCTAssertEqual(splitTop.constant, 34, accuracy: 0.1,
-                       "when the sidebar is hidden, tabs must move below the full-width workspace header")
+                       "collapsed and visible sidebar modes share the same permanent header above tabs")
     }
 
     func test_ratioSplit_laysOutSideBySideWithoutFreeSpace() {

@@ -5,11 +5,47 @@ import Surfaces
 import DesignSystemKit
 
 final class InteractiveTitlebarWindow: NSWindow {
+    private weak var titlebarTabDragTarget: PaneTabButton?
+
     override func sendEvent(_ event: NSEvent) {
+        if routeTitlebarTabDrag(event) {
+            return
+        }
         if event.type == .leftMouseDown, dispatchInteractiveTitlebarClick(event) {
             return
         }
         super.sendEvent(event)
+    }
+
+    private func routeTitlebarTabDrag(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .leftMouseDown:
+            guard let tab = titlebarTab(at: event) else { return false }
+            titlebarTabDragTarget = tab
+            tab.mouseDown(with: event)
+            return true
+        case .leftMouseDragged:
+            guard let tab = titlebarTabDragTarget else { return false }
+            tab.mouseDragged(with: event)
+            return true
+        case .leftMouseUp:
+            guard let tab = titlebarTabDragTarget else { return false }
+            tab.mouseUp(with: event)
+            titlebarTabDragTarget = nil
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func titlebarTab(at event: NSEvent) -> PaneTabButton? {
+        guard styleMask.contains(.fullSizeContentView),
+              let contentView else { return nil }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard point.y >= contentView.bounds.height - 44,
+              let hit = contentView.hitTest(point),
+              enclosingView(from: hit, as: NoDragButton.self) == nil else { return nil }
+        return enclosingView(from: hit, as: PaneTabButton.self)
     }
 
     private func dispatchInteractiveTitlebarClick(_ event: NSEvent) -> Bool {
@@ -58,7 +94,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private let collapsedWorkspaceLabel = NSTextField(labelWithString: "")
     private let collapsedPlusButton = NoDragButton(frame: .zero)
     private let collapsedSidebarButton = NoDragButton(frame: .zero)
-    private let visibleSidebarButton = NoDragButton(frame: .zero)
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
     /// Retains the live pane controllers; their @objc button and tab
@@ -112,9 +147,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             ctx.duration = 0.18
             ctx.allowsImplicitAnimation = true
             sidebar.view.isHidden = sidebarCollapsed
-            splitTopConstraint?.constant = sidebarCollapsed ? collapsedHeaderHeight : 0
-            collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
-            visibleSidebarButton.isHidden = sidebarCollapsed
+            splitTopConstraint?.constant = collapsedHeaderHeight
             updateCollapsedWorkspaceHeader()
             if !sidebarCollapsed {
                 split.setPosition(sidebarWidth, ofDividerAt: 0)
@@ -141,15 +174,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         workspaceContainer.wantsLayer = true
         workspaceContainer.layer?.backgroundColor = DS.NS.bg.cgColor
         configureCollapsedWorkspaceHeader()
-        configureVisibleSidebarHeaderButtons()
         split.addArrangedSubview(sidebar.view)
         split.addArrangedSubview(workspaceContainer)
         split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
 
         content.addSubview(split)
         content.addSubview(collapsedWorkspaceHeader)
-        content.addSubview(visibleSidebarButton)
-        let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor)
+        let splitTop = split.topAnchor.constraint(equalTo: content.topAnchor, constant: collapsedHeaderHeight)
         splitTopConstraint = splitTop
         NSLayoutConstraint.activate([
             splitTop,
@@ -160,11 +191,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             collapsedWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
             collapsedWorkspaceHeader.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             collapsedWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight),
-            visibleSidebarButton.topAnchor.constraint(equalTo: content.topAnchor, constant: 6),
-            visibleSidebarButton.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: sidebarWidth - 34)
+            collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight)
         ])
-        collapsedWorkspaceHeader.isHidden = true
         window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {
@@ -219,12 +247,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	            divider.heightAnchor.constraint(equalToConstant: 1)
 	        ])
 	        updateCollapsedWorkspaceHeader()
-	    }
-
-    private func configureVisibleSidebarHeaderButtons() {
-        configureHeaderButton(visibleSidebarButton, symbol: "sidebar.left",
-                              help: "Toggle sidebar",
-                              action: #selector(handleToggleSidebar))
 	    }
 
 	    private func configureHeaderButton(_ button: NSButton, symbol: String, help: String, action: Selector) {

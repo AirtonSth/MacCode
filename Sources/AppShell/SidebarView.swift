@@ -130,13 +130,12 @@ public struct SidebarRootView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Color.clear.frame(height: 44)
-
             Button { vm.newWorkspace() } label: {
                 sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
             }
             .buttonStyle(.plain)
             .padding(.horizontal, DS.Space.md)
+            .padding(.top, DS.Space.lg)
             .padding(.bottom, DS.Space.lg)
 
             HStack(spacing: DS.Space.sm) {
@@ -179,9 +178,9 @@ public struct SidebarRootView: View {
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
         .background(DS.Palette.surface.opacity(0.55))
-        // The host sits in a full-height window; without this SwiftUI
-        // treats the titlebar as a safe area and pushes the header
-        // below the traffic lights instead of beside them.
+        // The AppKit window reserves a permanent top header, so the
+        // sidebar starts below it and does not need its own titlebar
+        // spacer.
         .ignoresSafeArea(.container, edges: .top)
     }
 
