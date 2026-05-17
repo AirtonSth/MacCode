@@ -5,6 +5,8 @@ public enum LayoutAction: Sendable {
     case renameWorkspace(WorkspaceID, String)
     case setWorkspaceDescription(WorkspaceID, String)
     case setWorkspaceColor(WorkspaceID, String)
+    case setWorkspacePinned(WorkspaceID, Bool)
+    case reorderWorkspace(WorkspaceID, position: Int)
     case setSurfaceColor(WorkspaceID, SurfaceID, String)
     case closeWorkspace(WorkspaceID)
     case selectWorkspace(WorkspaceID)
@@ -98,6 +100,22 @@ public struct LayoutReducer {
             else { ws.metadata["color"] = color }
             ws.updatedAt = Date()
             next.workspaces[wid] = ws
+            return next
+        case let .setWorkspacePinned(wid, pinned):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            if pinned { ws.metadata["pinned"] = "true" }
+            else { ws.metadata.removeValue(forKey: "pinned") }
+            ws.updatedAt = Date()
+            next.workspaces[wid] = ws
+            next.window.workspaces = pinSorted(next.window.workspaces, workspaces: next.workspaces)
+            return next
+        case let .reorderWorkspace(wid, position):
+            guard next.workspaces[wid] != nil else { throw LayoutError.workspaceNotFound }
+            guard let current = next.window.workspaces.firstIndex(of: wid) else { throw LayoutError.workspaceNotFound }
+            var order = next.window.workspaces
+            order.remove(at: current)
+            order.insert(wid, at: max(0, min(position, order.count)))
+            next.window.workspaces = pinSorted(order, workspaces: next.workspaces)
             return next
         case let .setSurfaceColor(wid, sid, color):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
@@ -286,6 +304,15 @@ public struct LayoutReducer {
     }
 
     // MARK: helpers
+
+    private func isPinned(_ id: WorkspaceID, workspaces: [WorkspaceID: Workspace]) -> Bool {
+        workspaces[id]?.metadata["pinned"] == "true"
+    }
+
+    private func pinSorted(_ ids: [WorkspaceID], workspaces: [WorkspaceID: Workspace]) -> [WorkspaceID] {
+        ids.filter { isPinned($0, workspaces: workspaces) }
+            + ids.filter { !isPinned($0, workspaces: workspaces) }
+    }
 
     private func addSurface(in node: LayoutNode, paneID: PaneID, descriptor: SurfaceDescriptor) throws -> LayoutNode {
         switch node {

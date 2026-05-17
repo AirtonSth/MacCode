@@ -97,7 +97,17 @@ public final class AppCommandRouter: CommandRouting {
 
     public func listWorkspaces() throws -> [Workspace] {
         guard let ctx = context else { return [] }
-        return ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
+        return ctx.state.window.workspaces.compactMap { id in
+            guard var ws = ctx.state.workspaces[id] else { return nil }
+            let busy = ws.layout.paneIDs().contains { pid in
+                (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
+                    SurfaceRegistry.shared.surface($0.id)?.isBusy == true
+                }
+            }
+            if busy { ws.metadata["busy"] = "true" }
+            else { ws.metadata.removeValue(forKey: "busy") }
+            return ws
+        }
     }
 
     public func currentWindow() throws -> AppWindow {
@@ -169,6 +179,16 @@ public final class AppCommandRouter: CommandRouting {
 
     public func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {
         try context?.apply(.setWorkspaceColor(id, color))
+        windowController?.refreshFromState()
+    }
+
+    public func setWorkspacePinned(_ id: WorkspaceID, _ pinned: Bool) throws {
+        try context?.apply(.setWorkspacePinned(id, pinned))
+        windowController?.refreshFromState()
+    }
+
+    public func reorderWorkspace(_ id: WorkspaceID, position: Int) throws {
+        try context?.apply(.reorderWorkspace(id, position: position))
         windowController?.refreshFromState()
     }
 

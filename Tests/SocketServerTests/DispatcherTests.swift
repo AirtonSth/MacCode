@@ -27,6 +27,24 @@ final class FakeRouter: CommandRouting {
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {}
     func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws {}
     func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {}
+    func setWorkspacePinned(_ id: WorkspaceID, _ pinned: Bool) throws {
+        guard let idx = workspaces.firstIndex(where: { $0.id == id }) else { throw LayoutError.workspaceNotFound }
+        if pinned { workspaces[idx].metadata["pinned"] = "true" }
+        else { workspaces[idx].metadata.removeValue(forKey: "pinned") }
+        let pinnedItems = workspaces.filter { $0.metadata["pinned"] == "true" }
+        let normalItems = workspaces.filter { $0.metadata["pinned"] != "true" }
+        workspaces = pinnedItems + normalItems
+        window.workspaces = workspaces.map(\.id)
+    }
+    func reorderWorkspace(_ id: WorkspaceID, position: Int) throws {
+        guard let idx = workspaces.firstIndex(where: { $0.id == id }) else { throw LayoutError.workspaceNotFound }
+        let item = workspaces.remove(at: idx)
+        workspaces.insert(item, at: max(0, min(position, workspaces.count)))
+        let pinnedItems = workspaces.filter { $0.metadata["pinned"] == "true" }
+        let normalItems = workspaces.filter { $0.metadata["pinned"] != "true" }
+        workspaces = pinnedItems + normalItems
+        window.workspaces = workspaces.map(\.id)
+    }
     func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: type, title: title ?? type.rawValue)
     }

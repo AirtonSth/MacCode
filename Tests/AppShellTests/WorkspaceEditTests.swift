@@ -29,6 +29,22 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertNil(ctx.state.workspaces[ws.id]?.metadata["description"])
     }
 
+    func test_workspacePinAndDragOrder_useSharedWindowOrder() throws {
+        let (ctx, router) = try make()
+        let first = try router.createWorkspace(name: "one", cwd: "/tmp")
+        let second = try router.createWorkspace(name: "two", cwd: "/tmp")
+        let third = try router.createWorkspace(name: "three", cwd: "/tmp")
+        let vm = SidebarViewModel(context: ctx, router: router)
+
+        vm.setWorkspacePinned(second, true)
+        XCTAssertEqual(ctx.state.window.workspaces, [second.id, first.id, third.id],
+                       "pinning from the sidebar must sort pinned workspaces above unpinned ones")
+
+        vm.reorderWorkspace(third.id, before: first.id)
+        XCTAssertEqual(ctx.state.window.workspaces, [second.id, third.id, first.id],
+                       "dragging a workspace row must update the host window order while preserving pinned-first sorting")
+    }
+
     func test_remove_dropsWorkspace() throws {
         let (ctx, router) = try make()
         let ws = try router.createWorkspace(name: "w", cwd: "/tmp")

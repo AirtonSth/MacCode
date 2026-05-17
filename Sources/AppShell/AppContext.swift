@@ -52,15 +52,22 @@ public final class AppContext {
         func itemJSON(_ item: AssistantItem) -> JSONValue {
             (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(item))) ?? .null
         }
+        func agentRunPayload(threadId: AgentThreadID) -> JSONValue {
+            var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
+            if let wid = try? threadRepo.get(id: threadId)?.workspaceId {
+                payload["workspace_id"] = .string(wid.value.uuidString)
+            }
+            return .object(payload)
+        }
         coordinator.onRunStarted = { tid, _ in
             EventBus.shared.publish(kind: "agent.run.started",
-                                    payload: .object(["thread_id": .string(tid.value.uuidString)]))
+                                    payload: agentRunPayload(threadId: tid))
         }
         coordinator.onAssistantEvent = { ev, tid, _ in
             let t = tid.value.uuidString
             switch ev {
             case .threadStarted:
-                EventBus.shared.publish(kind: "agent.run.started", payload: .object(["thread_id": .string(t)]))
+                EventBus.shared.publish(kind: "agent.run.started", payload: agentRunPayload(threadId: tid))
             case .turnStarted(let turnId):
                 EventBus.shared.publish(kind: "agent.turn.started",
                                         payload: .object(["thread_id": .string(t), "turn_id": .string(turnId)]))
@@ -86,14 +93,13 @@ public final class AppContext {
                 if let f = final { p["final"] = .string(f) }
                 EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
             case .error:
-                EventBus.shared.publish(kind: "agent.run.failed", payload: .object(["thread_id": .string(t)]))
+                EventBus.shared.publish(kind: "agent.run.failed", payload: agentRunPayload(threadId: tid))
             }
         }
         coordinator.onRunFinished = { tid, _, status in
-            let t = tid.value.uuidString
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
-            EventBus.shared.publish(kind: kind, payload: .object(["thread_id": .string(t)]))
-            EventBus.shared.publish(kind: "agent.run.finished", payload: .object(["thread_id": .string(t)]))
+            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid))
+            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid))
         }
 
         // HC-1: stream terminal/surface PTY output to the mirror so iOS

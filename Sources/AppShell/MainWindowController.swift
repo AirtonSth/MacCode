@@ -6,8 +6,13 @@ import DesignSystemKit
 
 final class InteractiveTitlebarWindow: NSWindow {
     private weak var titlebarTabDragTarget: PaneTabButton?
+    private var frameBeforeTitlebarZoom: NSRect?
+    private var lastTitlebarClick: (time: TimeInterval, point: NSPoint)?
 
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, dispatchTitlebarDoubleClick(event) {
+            return
+        }
         if routeTitlebarTabDrag(event) {
             return
         }
@@ -35,6 +40,52 @@ final class InteractiveTitlebarWindow: NSWindow {
             return true
         default:
             return false
+        }
+    }
+
+    private func dispatchTitlebarDoubleClick(_ event: NSEvent) -> Bool {
+        guard let point = titlebarZoomPoint(for: event) else { return false }
+
+        let isDoubleClick = event.clickCount == 2 || isRepeatedTitlebarClick(event, at: point)
+        lastTitlebarClick = (event.timestamp, point)
+        guard isDoubleClick else { return false }
+
+        toggleTitlebarZoom()
+        lastTitlebarClick = nil
+        return true
+    }
+
+    private func titlebarZoomPoint(for event: NSEvent) -> NSPoint? {
+        guard styleMask.contains(.fullSizeContentView),
+              let contentView else { return nil }
+
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard point.y >= contentView.bounds.height - 44 else { return nil }
+        guard let hit = contentView.hitTest(point) else { return point }
+        guard enclosingView(from: hit, as: NoDragButton.self) == nil,
+              enclosingView(from: hit, as: PaneTabButton.self) == nil else { return nil }
+        return point
+    }
+
+    private func isRepeatedTitlebarClick(_ event: NSEvent, at point: NSPoint) -> Bool {
+        guard let last = lastTitlebarClick else { return false }
+        let interval = event.timestamp - last.time
+        let distance = hypot(point.x - last.point.x, point.y - last.point.y)
+        return interval <= NSEvent.doubleClickInterval && distance <= 4
+    }
+
+    private func toggleTitlebarZoom() {
+        guard let screen else {
+            performZoom(nil)
+            return
+        }
+        let target = screen.visibleFrame
+        if frame.isNearlyEqual(to: target), let previous = frameBeforeTitlebarZoom {
+            setFrame(previous, display: true, animate: true)
+            frameBeforeTitlebarZoom = nil
+        } else {
+            frameBeforeTitlebarZoom = frame
+            setFrame(target, display: true, animate: true)
         }
     }
 
@@ -71,6 +122,15 @@ final class InteractiveTitlebarWindow: NSWindow {
             current = candidate.superview
         }
         return nil
+    }
+}
+
+private extension NSRect {
+    func isNearlyEqual(to other: NSRect) -> Bool {
+        abs(origin.x - other.origin.x) < 2 &&
+        abs(origin.y - other.origin.y) < 2 &&
+        abs(size.width - other.size.width) < 2 &&
+        abs(size.height - other.size.height) < 2
     }
 }
 

@@ -20,6 +20,8 @@ public protocol CommandRouting: AnyObject {
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws
     func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws
     func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws
+    func setWorkspacePinned(_ id: WorkspaceID, _ pinned: Bool) throws
+    func reorderWorkspace(_ id: WorkspaceID, position: Int) throws
     func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor
     func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor
     func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws
@@ -224,6 +226,31 @@ public final class JSONRPCDispatcher {
                 EventBus.shared.publish(kind: "workspace.updated", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["color": .string(color)])
+                ]))
+                return .init(id: id, result: .bool(true))
+            case "workspace.set_pinned":
+                guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let pinned = params["pinned"]?.boolValue else { throw JSONRPCError.invalidParams }
+                try router.setWorkspacePinned(wid, pinned)
+                EventBus.shared.publish(kind: "workspace.updated", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "metadata": .object(["pinned": pinned ? .string("true") : .string("")])
+                ]))
+                let order = try router.currentWindow().workspaces
+                EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "order": .array(order.map { .string($0.value.uuidString) })
+                ]))
+                return .init(id: id, result: .bool(true))
+            case "workspace.reorder":
+                guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let pos = params["position"]?.intValue ?? 0
+                try router.reorderWorkspace(wid, position: pos)
+                let order = try router.currentWindow().workspaces
+                EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "position": .number(Double(pos)),
+                    "order": .array(order.map { .string($0.value.uuidString) })
                 ]))
                 return .init(id: id, result: .bool(true))
             case "surface.create":

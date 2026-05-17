@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import CoreModel
 import Persistence
 import Surfaces
@@ -14,6 +15,7 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var workspaces: [Workspace] = []
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
+    public var draggingWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
 
     public init(context: AppContext, router: AppCommandRouter) {
@@ -103,6 +105,19 @@ public final class SidebarViewModel: ObservableObject {
 
     public func setWorkspaceColor(_ ws: Workspace, _ color: String) {
         try? router?.setWorkspaceColor(ws.id, color)
+    }
+
+    public func setWorkspacePinned(_ ws: Workspace, _ pinned: Bool) {
+        try? router?.setWorkspacePinned(ws.id, pinned)
+        reload()
+    }
+
+    public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {
+        guard dragged != target,
+              let targetIndex = workspaces.firstIndex(where: { $0.id == target }) else { return }
+        try? router?.reorderWorkspace(dragged, position: targetIndex)
+        draggingWorkspaceID = nil
+        reload()
     }
 
     public func removeWorkspace(_ ws: Workspace) {
@@ -230,6 +245,7 @@ public struct SidebarRootView: View {
         let selected = vm.selectedWorkspaceID == ws.id
         let checked = vm.selectedWorkspaceIDs.contains(ws.id)
         let desc = ws.metadata["description"]
+        let pinned = ws.metadata["pinned"] == "true"
         // A3: spinner when any surface in this workspace is busy.
         let busy = ws.layout.paneIDs().contains { pid in
             (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
@@ -246,11 +262,12 @@ public struct SidebarRootView: View {
                         .frame(width: 20, height: 20)
                         .foregroundColor(DS.Palette.accent)
                 }
-                Image(systemName: "folder.fill")
+                Image(systemName: pinned ? "pin.fill" : "folder.fill")
                     .font(.system(size: 14, weight: .regular))
                     .frame(width: 20, height: 20)
-                    .foregroundColor(TabColor.from(ws.metadata["color"]).map { Color(hex: $0.hex) }
-                                     ?? DS.Palette.textSecondary)
+                    .foregroundColor(pinned ? DS.Palette.accent :
+                        TabColor.from(ws.metadata["color"]).map { Color(hex: $0.hex) }
+                        ?? DS.Palette.textSecondary)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(ws.name).font(selected ? DS.Font.bodyStrong : DS.Font.body)
                         .foregroundColor(DS.Palette.text).lineLimit(1)
@@ -278,7 +295,16 @@ public struct SidebarRootView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onDrag {
+            vm.draggingWorkspaceID = ws.id
+            return NSItemProvider(object: ws.id.value.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: WorkspaceDropDelegate(vm: vm, target: ws))
         .contextMenu {
+            Button { vm.setWorkspacePinned(ws, !pinned) } label: {
+                Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
+            }
+            Divider()
             Button("Rename…") { vm.renameWorkspace(ws) }
             Button("Edit description…") { vm.editDescription(ws) }
             Menu("Color") {
@@ -290,6 +316,25 @@ public struct SidebarRootView: View {
             Divider()
             Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
         }
+    }
+}
+
+private struct WorkspaceDropDelegate: DropDelegate {
+    @ObservedObject var vm: SidebarViewModel
+    let target: Workspace
+
+    func dropEntered(info: DropInfo) {
+        guard let dragged = vm.draggingWorkspaceID else { return }
+        vm.reorderWorkspace(dragged, before: target.id)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        vm.draggingWorkspaceID = nil
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
     }
 }
 

@@ -19,6 +19,25 @@ final class LayoutReducerTests: XCTestCase {
         XCTAssertNil(s.workspaces[wid]?.metadata["color"], "empty clears the color key")
     }
 
+    func test_workspacePinningAndReorder_keepPinnedWorkspacesFirst() throws {
+        let r = LayoutReducer()
+        var s = LayoutState()
+        s = try r.reduce(s, .createWorkspace(name: "one", cwd: "/tmp", initial: nil))
+        let one = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "two", cwd: "/tmp", initial: nil))
+        let two = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "three", cwd: "/tmp", initial: nil))
+        let three = s.window.selectedWorkspaceID!
+
+        s = try r.reduce(s, .setWorkspacePinned(two, true))
+        XCTAssertEqual(s.window.workspaces, [two, one, three],
+                       "pinning a workspace must move it above unpinned workspaces without losing relative order")
+
+        s = try r.reduce(s, .reorderWorkspace(three, position: 0))
+        XCTAssertEqual(s.window.workspaces, [two, three, one],
+                       "drag reorder must respect the pinned-first sort boundary")
+    }
+
     func test_setSurfaceColor_writesToDescriptorMetadata() throws {
         let r = LayoutReducer()
         var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws1", cwd: "/tmp", initial: nil))
