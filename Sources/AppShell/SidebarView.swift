@@ -13,6 +13,8 @@ public final class SidebarViewModel: ObservableObject {
 
     @Published public var workspaces: [Workspace] = []
     @Published public var selectedWorkspaceID: WorkspaceID?
+    @Published public var multiSelectEnabled = false
+    @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -24,6 +26,20 @@ public final class SidebarViewModel: ObservableObject {
         guard let ctx = context else { return }
         workspaces = ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
+        selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+    }
+
+    public func toggleMultiSelect() {
+        multiSelectEnabled.toggle()
+        if !multiSelectEnabled { selectedWorkspaceIDs.removeAll() }
+    }
+
+    public func toggleWorkspaceSelection(_ ws: Workspace) {
+        if selectedWorkspaceIDs.contains(ws.id) {
+            selectedWorkspaceIDs.remove(ws.id)
+        } else {
+            selectedWorkspaceIDs.insert(ws.id)
+        }
     }
 
     public func select(_ wid: WorkspaceID) {
@@ -87,6 +103,25 @@ public final class SidebarViewModel: ObservableObject {
             try? router?.closeWorkspace(ws.id)
         }
     }
+
+    public func removeSelectedWorkspaces() {
+        let ids = selectedWorkspaceIDs
+        guard !ids.isEmpty else { return }
+        let names = workspaces.filter { ids.contains($0.id) }.map(\.name)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove \(ids.count) workspaces?"
+        alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode 2. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        for id in ids {
+            try? router?.closeWorkspace(id)
+        }
+        selectedWorkspaceIDs.removeAll()
+        multiSelectEnabled = false
+        reload()
+    }
 }
 
 public struct SidebarRootView: View {
@@ -104,11 +139,25 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
 
-            Text("Workspaces")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.bottom, DS.Space.sm)
+            HStack(spacing: DS.Space.sm) {
+                Text("Workspaces")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
+                if vm.multiSelectEnabled {
+                    Button("Remove") { vm.removeSelectedWorkspaces() }
+                        .buttonStyle(.plain)
+                        .font(DS.Font.caption)
+                        .foregroundColor(vm.selectedWorkspaceIDs.isEmpty ? DS.Palette.textTertiary : DS.Palette.danger)
+                        .disabled(vm.selectedWorkspaceIDs.isEmpty)
+                }
+                Button(vm.multiSelectEnabled ? "Done" : "Select") { vm.toggleMultiSelect() }
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.bottom, DS.Space.sm)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
@@ -160,6 +209,7 @@ public struct SidebarRootView: View {
     @ViewBuilder
     private func workspaceRow(_ ws: Workspace) -> some View {
         let selected = vm.selectedWorkspaceID == ws.id
+        let checked = vm.selectedWorkspaceIDs.contains(ws.id)
         let desc = ws.metadata["description"]
         // A3: spinner when any surface in this workspace is busy.
         let busy = ws.layout.paneIDs().contains { pid in
@@ -167,8 +217,20 @@ public struct SidebarRootView: View {
                 SurfaceRegistry.shared.surface($0.id)?.isBusy == true
             }
         }
-        Button { vm.select(ws.id) } label: {
+        Button {
+            if vm.multiSelectEnabled {
+                vm.toggleWorkspaceSelection(ws)
+            } else {
+                vm.select(ws.id)
+            }
+        } label: {
             HStack(spacing: DS.Space.sm) {
+                if vm.multiSelectEnabled {
+                    Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 14, weight: .regular))
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(checked ? DS.Palette.accent : DS.Palette.textTertiary)
+                }
                 Image(systemName: "folder.fill")
                     .font(.system(size: 14, weight: .regular))
                     .frame(width: 20, height: 20)

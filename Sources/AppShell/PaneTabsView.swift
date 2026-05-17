@@ -9,7 +9,7 @@ public final class PaneTabsView: NSObject {
     public let view: NSView
     public let pane: PaneNode
     public weak var router: AppCommandRouter?
-    private let tabStrip = NoDragStack()
+    private let tabStrip = PaneTabDropStack()
     private let contentArea = NSView()
     private let addMenu = NSMenu()
 
@@ -31,12 +31,14 @@ public final class PaneTabsView: NSObject {
         tabStrip.spacing = 0
         tabStrip.alignment = .centerY
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
+        tabStrip.onDropSurface = { [weak self] sid in self?.appendDroppedSurface(sid) ?? false }
         for desc in pane.surfaces {
             let isSel = desc.id == selectedID
             let busy = SurfaceRegistry.shared.surface(desc.id)?.isBusy ?? false
             let colorHex = TabColor.from(desc.metadata["color"])?.hex
             let sid = desc.id
             let tab = PaneTabButton(
+                surfaceID: sid,
                 title: desc.title,
                 symbol: Self.symbol(for: desc.type),
                 selected: isSel,
@@ -48,6 +50,9 @@ public final class PaneTabsView: NSObject {
                 onSetColor: { [weak self] raw in
                     guard let wid = self?.currentWorkspaceID() else { return }
                     try? self?.router?.setSurfaceColor(wid, sid, raw)
+                },
+                onDropSurface: { [weak self] draggedID in
+                    self?.dropSurface(draggedID, before: sid) ?? false
                 }
             )
             tabStrip.addArrangedSubview(tab)
@@ -278,27 +283,81 @@ public final class PaneTabsView: NSObject {
         return try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
     }
 
+    /// Testable drop-position math. The index is the count of tab
+    /// midpoints strictly left of the drop point.
+    public static func dropInsertionIndex(tabMidXs: [CGFloat], dropX: CGFloat) -> Int {
+        tabMidXs.filter { dropX > $0 }.count
+    }
+
+    @discardableResult
+    public func performReorderSurface(_ surface: SurfaceID, toPane targetPane: PaneID, position: Int) -> Bool {
+        guard let wid = currentWorkspaceID() else { return false }
+        do {
+            try router?.surfaceReorder(workspace: wid, surface: surface, toPane: targetPane, position: position)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func dropSurface(_ surface: SurfaceID, before target: SurfaceID) -> Bool {
+        guard surface != target,
+              let position = dropPosition(for: surface, before: target) else { return false }
+        return performReorderSurface(surface, toPane: pane.id, position: position)
+    }
+
+    private func appendDroppedSurface(_ surface: SurfaceID) -> Bool {
+        let position = adjustedPositionForSamePane(surface, targetPosition: pane.surfaces.count)
+        return performReorderSurface(surface, toPane: pane.id, position: position)
+    }
+
+    private func dropPosition(for surface: SurfaceID, before target: SurfaceID) -> Int? {
+        guard let targetIndex = pane.surfaces.firstIndex(where: { $0.id == target }) else { return nil }
+        return adjustedPositionForSamePane(surface, targetPosition: targetIndex)
+    }
+
+    private func adjustedPositionForSamePane(_ surface: SurfaceID, targetPosition: Int) -> Int {
+        guard let sourceIndex = pane.surfaces.firstIndex(where: { $0.id == surface }),
+              sourceIndex < targetPosition else { return targetPosition }
+        return max(0, targetPosition - 1)
+    }
+
 }
 
 // MARK: - Custom tab button (icon · truncating title · close ×)
 
 @MainActor
 final class PaneTabButton: NSView {
+    static let pasteboardType = NSPasteboard.PasteboardType("io.remotecode2.surface-id")
+    private static weak var highlightedTab: PaneTabButton?
+    private static weak var highlightedStrip: PaneTabDropStack?
+    private static weak var dragGhost: TabDragGhostView?
+    private let surfaceID: SurfaceID
+    private let title: String
+    private let symbol: String
     private let onSelect: () -> Void
     private let onClose: () -> Void
     private let onRename: (() -> Void)?
     private let onSetColor: ((String) -> Void)?
+    private let onDropSurface: ((SurfaceID) -> Bool)?
+    private let dropIndicator = NSView()
     private var hovering = false
+    private var dragStarted = false
     private let selected: Bool
 
-    init(title: String, symbol: String, selected: Bool, busy: Bool = false,
+    init(surfaceID: SurfaceID, title: String, symbol: String, selected: Bool, busy: Bool = false,
          colorHex: UInt32? = nil,
          onSelect: @escaping () -> Void, onClose: @escaping () -> Void,
-         onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil) {
+         onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil,
+         onDropSurface: ((SurfaceID) -> Bool)? = nil) {
+        self.surfaceID = surfaceID
+        self.title = title
+        self.symbol = symbol
         self.onSelect = onSelect
         self.onClose = onClose
         self.onRename = onRename
         self.onSetColor = onSetColor
+        self.onDropSurface = onDropSurface
         self.selected = selected
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
@@ -405,10 +464,23 @@ final class PaneTabButton: NSView {
             ])
         }
 
+        dropIndicator.wantsLayer = true
+        dropIndicator.layer?.backgroundColor = DS.NS.accent.cgColor
+        dropIndicator.translatesAutoresizingMaskIntoConstraints = false
+        dropIndicator.isHidden = true
+        addSubview(dropIndicator)
+        NSLayoutConstraint.activate([
+            dropIndicator.leadingAnchor.constraint(equalTo: leadingAnchor),
+            dropIndicator.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            dropIndicator.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+            dropIndicator.widthAnchor.constraint(equalToConstant: 3)
+        ])
+
         let tracking = NSTrackingArea(rect: .zero,
                                       options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                       owner: self, userInfo: nil)
         addTrackingArea(tracking)
+        registerForDraggedTypes([Self.pasteboardType])
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -448,8 +520,125 @@ final class PaneTabButton: NSView {
     override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
-        // Selection only fires if the close button didn't consume the click.
-        onSelect()
+        dragStarted = false
+        Self.clearDragFeedback()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        dragStarted = true
+        updateDragGhost(with: event)
+        updateManualDropFeedback(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragStarted {
+            performManualDrop(with: event)
+            Self.clearDragFeedback()
+        } else {
+            onSelect()
+        }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        draggedSurface(from: sender).map { $0 == surfaceID ? [] : .move } ?? []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let dragged = draggedSurface(from: sender) else { return false }
+        return onDropSurface?(dragged) ?? false
+    }
+
+    private func draggedSurface(from info: NSDraggingInfo) -> SurfaceID? {
+        guard let raw = info.draggingPasteboard.string(forType: Self.pasteboardType),
+              let uuid = UUID(uuidString: raw) else { return nil }
+        return SurfaceID(uuid)
+    }
+
+    private func performManualDrop(with event: NSEvent) {
+        guard let contentView = window?.contentView else { return }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard let hit = contentView.hitTest(point) else { return }
+        if let target = enclosingView(from: hit, as: PaneTabButton.self), target !== self {
+            _ = target.onDropSurface?(surfaceID)
+            return
+        }
+        if let strip = enclosingView(from: hit, as: PaneTabDropStack.self) {
+            _ = strip.onDropSurface?(surfaceID)
+        }
+    }
+
+    private func updateManualDropFeedback(with event: NSEvent) {
+        guard let contentView = window?.contentView else {
+            Self.clearDragFeedback()
+            return
+        }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard let hit = contentView.hitTest(point) else {
+            Self.clearDragFeedback()
+            return
+        }
+        if let target = enclosingView(from: hit, as: PaneTabButton.self), target !== self {
+            Self.highlight(tab: target, strip: nil)
+            return
+        }
+        if let strip = enclosingView(from: hit, as: PaneTabDropStack.self) {
+            Self.highlight(tab: nil, strip: strip)
+            return
+        }
+        Self.clearDragFeedback()
+    }
+
+    private func updateDragGhost(with event: NSEvent) {
+        guard let contentView = window?.contentView else { return }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        if Self.dragGhost == nil {
+            let ghost = TabDragGhostView(title: title, symbol: symbol)
+            contentView.addSubview(ghost)
+            Self.dragGhost = ghost
+        }
+        Self.dragGhost?.move(near: point, in: contentView.bounds)
+    }
+
+    private static func highlight(tab: PaneTabButton?, strip: PaneTabDropStack?) {
+        if highlightedTab !== tab {
+            highlightedTab?.setDropHighlighted(false)
+            highlightedTab = tab
+            highlightedTab?.setDropHighlighted(true)
+        }
+        if highlightedStrip !== strip {
+            highlightedStrip?.setAppendHighlighted(false)
+            highlightedStrip = strip
+            highlightedStrip?.setAppendHighlighted(true)
+        }
+    }
+
+    private static func clearDragFeedback() {
+        highlightedTab?.setDropHighlighted(false)
+        highlightedTab = nil
+        highlightedStrip?.setAppendHighlighted(false)
+        highlightedStrip = nil
+        dragGhost?.removeFromSuperview()
+        dragGhost = nil
+    }
+
+    private func setDropHighlighted(_ active: Bool) {
+        dropIndicator.isHidden = !active
+        if active {
+            layer?.backgroundColor = DS.NS.surfaceRaised.cgColor
+        } else if hovering && !selected {
+            layer?.backgroundColor = DS.NS.surfaceRaised.cgColor
+        } else {
+            layer?.backgroundColor = (selected ? DS.NS.bg : DS.NS.surface).cgColor
+        }
+    }
+
+    private func enclosingView<T: NSView>(from view: NSView, as type: T.Type) -> T? {
+        var current: NSView? = view
+        while let candidate = current {
+            if let typed = candidate as? T { return typed }
+            current = candidate.superview
+        }
+        return nil
     }
 
     func performSelectFromTitlebarClick() { onSelect() }
@@ -457,10 +646,70 @@ final class PaneTabButton: NSView {
     @objc private func closeClicked() { onClose() }
 
     override func mouseEntered(with event: NSEvent) {
+        hovering = true
         if !selected { layer?.backgroundColor = DS.NS.surfaceRaised.cgColor }
     }
     override func mouseExited(with event: NSEvent) {
+        hovering = false
         if !selected { layer?.backgroundColor = DS.NS.surface.cgColor }
+    }
+}
+
+@MainActor
+final class TabDragGhostView: NSView {
+    private let width: CGFloat = 210
+    private let height: CGFloat = 30
+
+    init(title: String, symbol: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        wantsLayer = true
+        layer?.backgroundColor = DS.NS.surfaceRaised.withAlphaComponent(0.92).cgColor
+        layer?.borderColor = DS.NS.accent.withAlphaComponent(0.65).cgColor
+        layer?.borderWidth = 1
+        layer?.cornerRadius = DS.Radius.control
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.32
+        layer?.shadowRadius = 8
+        layer?.shadowOffset = NSSize(width: 0, height: -2)
+        alphaValue = 0.96
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+        icon.contentTintColor = DS.NS.textSecondary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.textColor = DS.NS.text
+        label.lineBreakMode = .byTruncatingTail
+        label.cell?.truncatesLastVisibleLine = true
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [icon, label])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    func move(near point: NSPoint, in bounds: NSRect) {
+        let x = min(max(point.x + 12, bounds.minX + 6), bounds.maxX - width - 6)
+        let y = min(max(point.y - height - 10, bounds.minY + 6), bounds.maxY - height - 6)
+        frame.origin = NSPoint(x: x, y: y)
     }
 }
 
@@ -487,8 +736,53 @@ final class PaneRootView: NoDragView {
     }
 }
 
-final class NoDragStack: NSStackView {
+class NoDragStack: NSStackView {
     override var mouseDownCanMoveWindow: Bool { false }
+}
+
+@MainActor
+final class PaneTabDropStack: NoDragStack {
+    var onDropSurface: ((SurfaceID) -> Bool)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureDropFeedback()
+        registerForDraggedTypes([PaneTabButton.pasteboardType])
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureDropFeedback()
+        registerForDraggedTypes([PaneTabButton.pasteboardType])
+    }
+
+    func setAppendHighlighted(_ active: Bool) {
+        layer?.borderWidth = active ? 1 : 0
+        layer?.backgroundColor = active ? DS.NS.surfaceRaised.withAlphaComponent(0.45).cgColor : NSColor.clear.cgColor
+    }
+
+    private func configureDropFeedback() {
+        wantsLayer = true
+        layer?.cornerRadius = DS.Radius.control
+        layer?.borderColor = DS.NS.accent.cgColor
+        layer?.borderWidth = 0
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        draggedSurface(from: sender) == nil ? [] : .move
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let dragged = draggedSurface(from: sender) else { return false }
+        return onDropSurface?(dragged) ?? false
+    }
+
+    private func draggedSurface(from info: NSDraggingInfo) -> SurfaceID? {
+        guard let raw = info.draggingPasteboard.string(forType: PaneTabButton.pasteboardType),
+              let uuid = UUID(uuidString: raw) else { return nil }
+        return SurfaceID(uuid)
+    }
 }
 
 final class NoDragScroll: NSScrollView {

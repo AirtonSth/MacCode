@@ -38,6 +38,23 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertFalse(ctx.state.window.workspaces.contains(ws.id))
     }
 
+    func test_sidebarMultiSelect_tracksMultipleWorkspacesWithoutOpeningThem() throws {
+        let (ctx, router) = try make()
+        let first = try router.createWorkspace(name: "one", cwd: "/tmp")
+        let second = try router.createWorkspace(name: "two", cwd: "/tmp")
+        let selectedBefore = ctx.state.window.selectedWorkspaceID
+
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.toggleMultiSelect()
+        vm.toggleWorkspaceSelection(first)
+        vm.toggleWorkspaceSelection(second)
+
+        XCTAssertEqual(vm.selectedWorkspaceIDs, [first.id, second.id],
+                       "bulk-delete mode must allow selecting several workspaces before one destructive confirmation")
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, selectedBefore,
+                       "selecting rows for bulk deletion must not switch the active workspace")
+    }
+
     func test_edits_persistAcrossRestart() throws {
         let dir = NSTemporaryDirectory() + "RC2WSEdit-" + UUID().uuidString
         do {

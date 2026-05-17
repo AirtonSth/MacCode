@@ -25,11 +25,6 @@ final class InteractiveTitlebarWindow: NSWindow {
             return true
         }
 
-        if let tab = enclosingView(from: hit, as: PaneTabButton.self) {
-            tab.performSelectFromTitlebarClick()
-            return true
-        }
-
         return false
     }
 

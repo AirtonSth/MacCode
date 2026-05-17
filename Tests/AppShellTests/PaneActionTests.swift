@@ -95,6 +95,43 @@ final class PaneActionTests: XCTestCase {
                        "focusing another tab must change the visible surface")
     }
 
+    func test_performReorderSurface_movesTabBeforeTargetInSamePane() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "drag", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let first = pane0.surfaces.first!.id
+        let v = PaneTabsView(pane: pane0, router: router)
+        let second = try XCTUnwrap(v.performAdd(.browser, title: "browser"))
+
+        guard case .pane(let pane1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        let dragView = PaneTabsView(pane: pane1, router: router)
+        XCTAssertTrue(dragView.performReorderSurface(second.id, toPane: pane1.id, position: 0),
+                      "dragging a tab before another tab must change the host-visible pane order")
+
+        guard case .pane(let pane2) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(pane2.surfaces.map(\.id), [second.id, first])
+    }
+
+    func test_performReorderSurface_movesTabAcrossSplitPanes() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "split-drag", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let sourceSurface = pane0.surfaces.first!.id
+        let v = PaneTabsView(pane: pane0, router: router)
+        let right = try XCTUnwrap(v.performSplit(.right, type: .browser, title: "browser"))
+
+        let updated = ctx.state.workspaces[ws.id]!
+        let targetPane = try XCTUnwrap(updated.layout.paneIDs().first {
+            updated.layout.find(paneID: $0)?.surfaces.contains(where: { $0.id == right.id }) == true
+        })
+        let dragView = PaneTabsView(pane: updated.layout.find(paneID: pane0.id)!, router: router)
+        XCTAssertTrue(dragView.performReorderSurface(sourceSurface, toPane: targetPane, position: 0),
+                      "dragging a tab into another split pane must move ownership, not only local order")
+
+        let final = ctx.state.workspaces[ws.id]!
+        XCTAssertEqual(final.layout.find(paneID: targetPane)?.surfaces.first?.id, sourceSurface)
+    }
+
     func test_closeSurface_removesTabFromPane() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "c", cwd: NSTemporaryDirectory())
