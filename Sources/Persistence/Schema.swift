@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 2
+    public static let currentVersion: Int = 4
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -170,6 +170,19 @@ public enum Schema {
         """),
         SchemaStep(3, """
         ALTER TABLE agent_threads ADD COLUMN color TEXT;
+        """),
+        SchemaStep(4, """
+        CREATE TABLE IF NOT EXISTS pairing_requests (
+            id TEXT PRIMARY KEY,
+            code TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            device_id TEXT,
+            decided_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pairing_requests_status ON pairing_requests(status);
         """)
     ]
 

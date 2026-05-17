@@ -17,6 +17,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// silently disables pairing AND bypasses the LAN auth gate. The
     /// app delegate must own it for the process lifetime.
     private var authProvider: DirectAuthProvider?
+    private var localAuth: LocalAuthAdapter?
     private var bonjour: NetService?
     private let bonjourDelegate = BonjourDelegate()
     public var palette: CommandPalette?
@@ -87,6 +88,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let trustRepo = DeviceTrustRepository(db: context.db)
         let auth = LocalAuthAdapter(repo: trustRepo)
         authProvider = auth   // GAP-5: retain for process lifetime
+        localAuth = auth
+        // A device-initiated pair request pops an approve/deny modal on
+        // the Mac. The HTTP handler invokes this off the listener thread;
+        // hop to main for AppKit. The device polls /v1/pair/status mean-
+        // while, so the server never blocks on the user's decision.
+        auth.onPairingRequest = { [weak self] prompt in
+            DispatchQueue.main.async { self?.presentPairingPrompt(prompt) }
+        }
         // GAP-2: a stable host identity persisted across launches so the
         // mobile client's identity pin (RCA-022) does not break on every
         // restart and force a re-pair.
@@ -209,6 +218,29 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "RemoteCode 2"
         alert.informativeText = "Native Swift macOS rewrite. cmux-style panes + Agent App surface."
         alert.runModal()
+    }
+
+    /// Approve/deny modal for a device-initiated pairing request. The
+    /// device shows the SAME code — the user confirms they match before
+    /// approving (anti-MITM). Decision routes to the auth adapter; once
+    /// approved the device's token is trusted and it never re-pairs.
+    private func presentPairingPrompt(_ prompt: PairingPrompt) {
+        let alert = NSAlert()
+        alert.messageText = "Allow “\(prompt.deviceName)” to connect?"
+        alert.informativeText = """
+        A device wants to remote-control this Mac.
+
+        Confirm this code matches the one shown on the device:
+
+        \(prompt.code)
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Approve")
+        alert.addButton(withTitle: "Deny")
+        NSApp.activate(ignoringOtherApps: true)
+        let approved = alert.runModal() == .alertFirstButtonReturn
+        if approved { localAuth?.approvePairingRequest(prompt.requestId) }
+        else { localAuth?.denyPairingRequest(prompt.requestId) }
     }
 
     private func applyKeybindingOverride(to item: NSMenuItem, command: String) {

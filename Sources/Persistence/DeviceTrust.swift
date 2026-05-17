@@ -25,6 +25,25 @@ public struct PairingCode: Codable, Sendable, Equatable {
     public var redeemedDeviceID: String?
 }
 
+/// A device-initiated pairing request the Mac user must approve or deny
+/// in a modal. `status` ∈ pending|approved|denied; `expired` is derived
+/// from `expiresAt`, never stored, so a stale pending request can never
+/// be approved after the fact.
+public struct PairingRequest: Codable, Sendable, Equatable {
+    public let id: String
+    public let code: String
+    public let deviceName: String
+    public let createdAt: Date
+    public let expiresAt: Date
+    public var status: String
+    public var deviceID: String?
+    public var decidedAt: Date?
+
+    public var isExpired: Bool { status == "pending" && expiresAt <= Date() }
+    /// Status as the wire reports it (pending collapses to expired once TTL passes).
+    public var effectiveStatus: String { isExpired ? "expired" : status }
+}
+
 public final class DeviceTrustRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -84,6 +103,83 @@ public final class DeviceTrustRepository {
 
         let trust = DeviceTrust(id: deviceId, displayName: deviceName, tokenHash: hash, createdAt: now)
         return (trust, token: token)
+    }
+
+    // MARK: device-initiated request → user approves/denies in a modal
+
+    /// Create a pending request. The 6-digit code is shown on BOTH the
+    /// Mac modal and the device so the user can visually confirm they
+    /// match before approving (anti-MITM, like Bluetooth pairing).
+    public func createPairingRequest(deviceName: String, ttlSeconds: TimeInterval = 300) throws -> PairingRequest {
+        let id = UUID().uuidString
+        let code = String(format: "%06d", Int.random(in: 0..<1_000_000))
+        let now = Date()
+        let exp = now.addingTimeInterval(ttlSeconds)
+        let st = try db.prepare("""
+            INSERT INTO pairing_requests(id, code, device_name, created_at, expires_at, status)
+            VALUES(?, ?, ?, ?, ?, 'pending');
+        """)
+        try st.bind(1, id); try st.bind(2, code); try st.bind(3, deviceName)
+        try st.bind(4, iso.string(from: now)); try st.bind(5, iso.string(from: exp))
+        _ = try st.step()
+        return PairingRequest(id: id, code: code, deviceName: deviceName,
+                              createdAt: now, expiresAt: exp, status: "pending")
+    }
+
+    public func pairingRequest(id: String) throws -> PairingRequest? {
+        let st = try db.prepare("""
+            SELECT code, device_name, created_at, expires_at, status, device_id, decided_at
+            FROM pairing_requests WHERE id = ?;
+        """)
+        try st.bind(1, id)
+        guard try st.step() else { return nil }
+        return PairingRequest(
+            id: id,
+            code: st.columnText(0) ?? "",
+            deviceName: st.columnText(1) ?? "",
+            createdAt: iso.date(from: st.columnText(2) ?? "") ?? Date(),
+            expiresAt: iso.date(from: st.columnText(3) ?? "") ?? Date(),
+            status: st.columnText(4) ?? "pending",
+            deviceID: st.columnText(5),
+            decidedAt: (st.columnText(6)).flatMap { iso.date(from: $0) }
+        )
+    }
+
+    /// Approve a pending, non-expired request: mint a device token and
+    /// persist trust (hash only). Returns the plaintext token exactly
+    /// once to the caller — it is never written to the DB.
+    public func approvePairingRequest(id: String) throws -> (DeviceTrust, token: String)? {
+        guard let req = try pairingRequest(id: id), req.status == "pending", !req.isExpired else { return nil }
+        let deviceId = UUID().uuidString
+        let token = DeviceTrustRepository.generateToken()
+        let hash = DeviceTrustRepository.hash(token)
+        let now = Date()
+        let now_s = iso.string(from: now)
+
+        let ins = try db.prepare("""
+            INSERT INTO device_trust(id, display_name, token_hash, created_at, capabilities)
+            VALUES(?, ?, ?, ?, '*');
+        """)
+        try ins.bind(1, deviceId); try ins.bind(2, req.deviceName)
+        try ins.bind(3, hash); try ins.bind(4, now_s)
+        _ = try ins.step()
+
+        let upd = try db.prepare("""
+            UPDATE pairing_requests SET status = 'approved', device_id = ?, decided_at = ? WHERE id = ?;
+        """)
+        try upd.bind(1, deviceId); try upd.bind(2, now_s); try upd.bind(3, id)
+        _ = try upd.step()
+
+        let trust = DeviceTrust(id: deviceId, displayName: req.deviceName, tokenHash: hash, createdAt: now)
+        return (trust, token: token)
+    }
+
+    public func denyPairingRequest(id: String) throws {
+        let st = try db.prepare("""
+            UPDATE pairing_requests SET status = 'denied', decided_at = ? WHERE id = ? AND status = 'pending';
+        """)
+        try st.bind(1, iso.string(from: Date())); try st.bind(2, id)
+        _ = try st.step()
     }
 
     public func verify(token: String) throws -> DeviceTrust? {

@@ -15,8 +15,21 @@ public protocol DirectAuthProvider: AnyObject {
     func verify(token: String) -> Bool
     func createPairingCode() -> String?
     func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)?
+    /// Device-initiated: create a request and surface a Mac-side
+    /// approve/deny modal. Returns the request id + the code to display.
+    func createPairingRequest(deviceName: String) -> (requestId: String, code: String)?
+    /// Poll a request. `token` is non-nil exactly once, on the first
+    /// poll after approval, and is never persisted server-side.
+    func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)?
     func listDevices() -> [[String: Any]]
     func revokeDevice(_ id: String)
+}
+
+/// Defaulted so existing conformers (e.g. test doubles) need no change
+/// until they opt into the request/approve flow.
+public extension DirectAuthProvider {
+    func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? { nil }
+    func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? { nil }
 }
 
 public final class DirectHTTPServer: @unchecked Sendable {
@@ -172,7 +185,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // it makes every LAN connect fail with 401 → permanent
         // "Not authorized". It must be exempt like discovery.
         if !bindLoopbackOnly, path.hasPrefix("/v1"),
-           !["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem"].contains(path),
+           !["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem", "/v1/pair/status"].contains(path),
            let auth = auth {
             let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
             if let t = token, auth.verify(token: t) {
@@ -195,10 +208,31 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let respData = dispatchRPCSync(bodyData)
             send(fd: fd, status: 200, contentType: "application/json", body: respData)
         case ("POST", "/v1/pair"):
-            guard let auth = auth, let code = auth.createPairingCode() else {
+            // Device-initiated request → Mac shows an approve/deny modal.
+            // Returns immediately; the device polls /v1/pair/status. The
+            // server never blocks on the user's decision.
+            guard let auth = auth else {
                 send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
             }
-            sendJSON(fd: fd, status: 200, body: ["code": code, "expires_in": 600])
+            let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any]
+            let deviceName = (obj?["device_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Unnamed device"
+            guard let r = auth.createPairingRequest(deviceName: deviceName) else {
+                send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
+            }
+            sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300])
+        case ("POST", "/v1/pair/status"):
+            guard let auth = auth,
+                  let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+                  let requestId = obj["request_id"] as? String else {
+                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+            }
+            guard let s = auth.pairingRequestStatus(requestId: requestId) else {
+                send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!); return
+            }
+            var resp: [String: Any] = ["status": s.status]
+            if let d = s.deviceId { resp["device_id"] = d }
+            if let t = s.token { resp["token"] = t }
+            sendJSON(fd: fd, status: 200, body: resp)
         case ("POST", "/v1/pair/redeem"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
