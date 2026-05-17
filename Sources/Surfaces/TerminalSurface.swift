@@ -208,6 +208,8 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendDataAsync(_ data: Data) {
         renderer.feed(data)
         descriptor.hasUnreadActivity = true
+        // HC-1: stream raw PTY output to the mirror in real time.
+        SurfaceOutputBus.shared.emit(descriptor.id, data)
         scheduleFlush()
     }
 

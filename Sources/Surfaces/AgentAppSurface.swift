@@ -370,6 +370,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // a background handler. Keep the restart contract here too.
                 self.persistFinalAssistantIfMissing(msg, threadId: tid)
             }
+            if status == .completed, let tid = finishedTid, tid == self.selectedThreadId {
+                self.loadWindow(tid)
+                self.timeline = AssistantTimelineState()
+            }
             if status == .completed, let _ = finalMessage, let tid = finishedTid,
                tid != self.selectedThreadId, var t = try? self.threadRepo.get(id: tid) {
                 // B6: finished on a thread the user left → mark unread.

@@ -251,12 +251,56 @@ public final class AppCommandRouter: CommandRouting {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let t = AgentThread(workspaceId: workspace, title: title, provider: provider, model: model)
         try ctx.threadRepo.upsert(t)
+        try selectAgentThread(thread: t.id)
         return t
     }
 
-    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?) async throws -> AgentRunID {
+    public func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        if let provider, provider != t.provider {
+            t.provider = provider
+            t.providerThreadId = nil
+        }
+        if let model, model != t.model {
+            t.model = model
+            t.providerThreadId = nil
+        }
+        t.updatedAt = Date()
+        try ctx.threadRepo.upsert(t)
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            if agent.viewModel.selectedThreadId == thread {
+                if let provider { agent.viewModel.provider = provider }
+                if let model { agent.viewModel.model = model }
+                if let permissionMode { agent.viewModel.permissionMode = permissionMode }
+                if let reasoningEffort { agent.viewModel.reasoningEffort = reasoningEffort }
+            }
+            agent.viewModel.reloadThreads()
+        }
+        windowController?.refreshFromState()
+        return t
+    }
+
+    public func selectAgentThread(thread: AgentThreadID) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            agent.viewModel.reloadThreads()
+            agent.viewModel.selectThread(thread)
+        }
+        windowController?.refreshFromState()
+    }
+
+    public func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.messageRepo.listRecent(threadId: thread, limit: max(0, min(limit, 500)))
+    }
+
+    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
         let prov = provider ?? t.provider
         let m = model ?? t.model
         let cwd = ctx.state.workspaces.first { $0.value.id == t.workspaceId }?.value.cwd ?? FileManager.default.currentDirectoryPath
@@ -266,9 +310,25 @@ public final class AppCommandRouter: CommandRouting {
             model: m,
             cwd: cwd,
             prompt: text,
-            providerThreadId: t.providerThreadId
+            providerThreadId: t.providerThreadId,
+            permissionMode: permissionMode ?? .supervised,
+            reasoningEffort: reasoningEffort
         )
-        return try await ctx.coordinator.startRun(req)
+        let runId = try await ctx.coordinator.startRun(req)
+        // HC-5 (R1): a message sent from the mobile mirror must be
+        // visible on the Mac. Route it into the live Agent surface for
+        // this workspace exactly like a local action — select the
+        // thread + reload so the just-persisted user message and the
+        // streaming turn render in the macOS window, not only over the
+        // wire.
+        for s in SurfaceRegistry.shared.all() {
+            if let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId {
+                agent.viewModel.reloadThreads()
+                agent.viewModel.selectThread(thread)
+                windowController?.refreshFromState()
+            }
+        }
+        return runId
     }
 
     public func stopAgentRun(thread: AgentThreadID) throws {
@@ -297,6 +357,7 @@ public final class AppCommandRouter: CommandRouting {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         if t.hasUnread { t.hasUnread = false; try ctx.threadRepo.upsert(t) }
+        try selectAgentThread(thread: thread)
     }
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
@@ -420,12 +481,31 @@ public final class AppCommandRouter: CommandRouting {
 
     public func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]] {
         guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return [] }
-        return ws.layout.paneIDs().map { pid in
+        let panes: [[String: JSONValue]] = ws.layout.paneIDs().map { pid in
             let count = (ws.layout.find(paneID: pid)?.surfaces.count) ?? 0
             return [
+                "kind": .string("pane"),
                 "id": .string(pid.value.uuidString),
                 "surface_count": .number(Double(count))
             ]
+        }
+        let splits = splitEntries(in: ws.layout)
+        return panes + splits
+    }
+
+    private func splitEntries(in node: LayoutNode) -> [[String: JSONValue]] {
+        switch node {
+        case .pane:
+            return []
+        case .split(let split):
+            var rows: [[String: JSONValue]] = [[
+                "kind": .string("split"),
+                "id": .string(split.id.uuidString),
+                "orientation": .string(split.orientation.rawValue),
+                "ratios": .array(split.ratios.map { .number($0) })
+            ]]
+            rows.append(contentsOf: split.children.flatMap { splitEntries(in: $0) })
+            return rows
         }
     }
 
@@ -492,6 +572,20 @@ public final class AppCommandRouter: CommandRouting {
     public func notificationDismiss(id: String) throws {
         guard let ctx = context else { return }
         try NotificationRepository(db: ctx.db).dismiss(id: id)
+    }
+
+    public func settingsGet(keys: [String]) throws -> [String: String] {
+        guard let ctx = context else { return [:] }
+        var values: [String: String] = [:]
+        for key in keys {
+            values[key] = (try? ctx.settingsRepo.get(key)) ?? ""
+        }
+        return values
+    }
+
+    public func settingsSet(key: String, value: String) throws {
+        guard let ctx = context else { return }
+        try ctx.settingsRepo.set(key, value)
     }
 
     public func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String {

@@ -45,6 +45,75 @@ public final class AppContext {
             providers: [.codex: codex, .claude: claude]
         )
         try coordinator.reconcileOnLaunch()
+
+        // GAP-7: stream agent run lifecycle + timeline to the network
+        // event bus so the iOS mirror renders agent output in real time
+        // (kinds/payloads match the iOS MirrorEventReducer contract).
+        func itemJSON(_ item: AssistantItem) -> JSONValue {
+            (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(item))) ?? .null
+        }
+        coordinator.onRunStarted = { tid, _ in
+            EventBus.shared.publish(kind: "agent.run.started",
+                                    payload: .object(["thread_id": .string(tid.value.uuidString)]))
+        }
+        coordinator.onAssistantEvent = { ev, tid, _ in
+            let t = tid.value.uuidString
+            switch ev {
+            case .threadStarted:
+                EventBus.shared.publish(kind: "agent.run.started", payload: .object(["thread_id": .string(t)]))
+            case .turnStarted(let turnId):
+                EventBus.shared.publish(kind: "agent.turn.started",
+                                        payload: .object(["thread_id": .string(t), "turn_id": .string(turnId)]))
+            case .itemStarted(let item):
+                EventBus.shared.publish(kind: "agent.item.started",
+                                        payload: .object(["thread_id": .string(t), "item": itemJSON(item)]))
+            case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
+                var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
+                if let b = bodyAppend { p["body_append"] = .string(b) }
+                if let o = outputAppend { p["output_append"] = .string(o) }
+                if let s = summary { p["summary"] = .string(s) }
+                EventBus.shared.publish(kind: "agent.item.delta", payload: .object(p))
+            case .itemState(let itemId, let state):
+                if state != .streaming {
+                    EventBus.shared.publish(kind: "agent.item.completed",
+                                            payload: .object(["thread_id": .string(t), "item_id": .string(itemId)]))
+                }
+            case .itemCompleted(let itemId, _):
+                EventBus.shared.publish(kind: "agent.item.completed",
+                                        payload: .object(["thread_id": .string(t), "item_id": .string(itemId)]))
+            case .turnCompleted(let turnId, let final):
+                var p: [String: JSONValue] = ["thread_id": .string(t), "turn_id": .string(turnId)]
+                if let f = final { p["final"] = .string(f) }
+                EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
+            case .error:
+                EventBus.shared.publish(kind: "agent.run.failed", payload: .object(["thread_id": .string(t)]))
+            }
+        }
+        coordinator.onRunFinished = { tid, _, status in
+            let t = tid.value.uuidString
+            let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
+            EventBus.shared.publish(kind: kind, payload: .object(["thread_id": .string(t)]))
+            EventBus.shared.publish(kind: "agent.run.finished", payload: .object(["thread_id": .string(t)]))
+        }
+
+        // HC-1: stream terminal/surface PTY output to the mirror so iOS
+        // renders a live terminal (not a poll). Raw bytes, base64 +
+        // monotonic seq per surface for ordered incremental rendering.
+        let surfaceSeqLock = NSLock()
+        var surfaceSeq: [String: Int] = [:]
+        SurfaceOutputBus.shared.sink = { sid, chunk in
+            let key = sid.value.uuidString
+            surfaceSeqLock.lock()
+            let s = (surfaceSeq[key] ?? 0) + 1
+            surfaceSeq[key] = s
+            surfaceSeqLock.unlock()
+            EventBus.shared.publish(kind: "surface.output", payload: .object([
+                "surface_id": .string(key),
+                "seq": .number(Double(s)),
+                "base64": .string(chunk.base64EncodedString())
+            ]))
+        }
+
         // restore last snapshot if any
         if let snap = try snapshotRepo.latest() {
             self.state = snap.layout

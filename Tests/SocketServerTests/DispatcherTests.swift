@@ -25,6 +25,8 @@ final class FakeRouter: CommandRouting {
     func selectWorkspace(_ id: WorkspaceID) throws { window.selectedWorkspaceID = id }
     func closeWorkspace(_ id: WorkspaceID) throws { workspaces.removeAll { $0.id == id } }
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {}
+    func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws {}
+    func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {}
     func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: type, title: title ?? type.rawValue)
     }
@@ -33,6 +35,8 @@ final class FakeRouter: CommandRouting {
     }
     func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {}
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {}
+    func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {}
+    func setSurfaceColor(_ wid: WorkspaceID, _ sid: SurfaceID, _ color: String) throws {}
     func sendText(surface: SurfaceID, text: String) throws {}
     func readText(surface: SurfaceID) throws -> String { "" }
     func surfaceHealth(surface: SurfaceID) -> Bool { true }
@@ -44,7 +48,35 @@ final class FakeRouter: CommandRouting {
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String) throws -> AgentThread {
         AgentThread(workspaceId: workspace, title: title, provider: provider, model: model)
     }
-    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?) async throws -> AgentRunID { AgentRunID() }
+    var lastSendPermission: AgentPermissionMode?
+    var lastSendReasoning: AgentReasoningEffort?
+    var messageStore: [AgentMessage] = []
+    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) throws -> AgentThread {
+        guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        if let provider, provider != threadStore[idx].provider {
+            threadStore[idx].provider = provider
+            threadStore[idx].providerThreadId = nil
+        }
+        if let model, model != threadStore[idx].model {
+            threadStore[idx].model = model
+            threadStore[idx].providerThreadId = nil
+        }
+        return threadStore[idx]
+    }
+    var selectedThread: AgentThreadID?
+    func selectAgentThread(thread: AgentThreadID) throws {
+        guard threadStore.contains(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        selectedThread = thread
+    }
+    func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
+        Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
+    }
+    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
+        _ = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        lastSendPermission = permissionMode
+        lastSendReasoning = reasoningEffort
+        return AgentRunID()
+    }
     func stopAgentRun(thread: AgentThreadID) throws {}
     var threadStore: [AgentThread] = []
     func deleteAgentThread(thread: AgentThreadID) throws { threadStore.removeAll { $0.id == thread } }
@@ -56,6 +88,7 @@ final class FakeRouter: CommandRouting {
     func markAgentThreadRead(thread: AgentThreadID) throws {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].hasUnread = false
+        selectedThread = thread
     }
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         [AgentModelDescriptor(id: "x", label: "X", provider: provider)]
@@ -94,6 +127,11 @@ final class FakeRouter: CommandRouting {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] { [] }
     func notificationMarkRead(id: String) throws {}
     func notificationDismiss(id: String) throws {}
+    var settings: [String: String] = [:]
+    func settingsGet(keys: [String]) throws -> [String: String] {
+        Dictionary(uniqueKeysWithValues: keys.map { ($0, settings[$0] ?? "") })
+    }
+    func settingsSet(key: String, value: String) throws { settings[key] = value }
     func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]] { [] }
     func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor] { [] }
     func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {}
@@ -276,5 +314,99 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(r.result, .bool(true))
         XCTAssertEqual(router.threadStore.first?.hasUnread, false,
                        "mark_read over the socket must clear the unread flag")
+    }
+
+    @MainActor
+    func test_agentThreadConfigureAndSendCarryModelPermissionAndReasoning() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "cfg", provider: .codex, model: "gpt-5")
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+        let tid = JSONValue.string(t.id.value.uuidString)
+
+        let cfg = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.configure", params: [
+            "thread_id": tid,
+            "provider": .string("claude"),
+            "model": .string("claude-sonnet-4-6"),
+            "permission_mode": .string("full_access"),
+            "reasoning_effort": .string("high")
+        ]))
+        guard case .object(let cfgObj)? = cfg.result else { return XCTFail("configure must echo the updated host thread") }
+        XCTAssertEqual(cfgObj["provider"], .string("claude"))
+        XCTAssertEqual(cfgObj["model"], .string("claude-sonnet-4-6"))
+
+        let send = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.send", params: [
+            "thread_id": tid,
+            "text": .string("run on host"),
+            "provider": .string("codex"),
+            "model": .string("gpt-5.5"),
+            "permission_mode": .string("auto_accept_edits"),
+            "reasoning_effort": .string("xhigh")
+        ]))
+        guard case .object(let sendObj)? = send.result else { return XCTFail("send must return host run object") }
+        XCTAssertNotNil(sendObj["run_id"]?.stringValue, "send must return host run id")
+        XCTAssertEqual(router.threadStore.first?.provider, .codex)
+        XCTAssertEqual(router.threadStore.first?.model, "gpt-5.5")
+        XCTAssertEqual(router.lastSendPermission, .autoAcceptEdits)
+        XCTAssertEqual(router.lastSendReasoning, .xhigh)
+    }
+
+    @MainActor
+    func test_agentMessageListReturnsPersistedHistoryForSelectedThread() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "history", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        router.messageStore = [
+            AgentMessage(threadId: t.id, role: .user, content: "old prompt"),
+            AgentMessage(threadId: t.id, role: .assistant, content: "old answer")
+        ]
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(20)
+        ]))
+
+        guard case .array(let messages)? = resp.result,
+              case .object(let first)? = messages.first,
+              case .object(let last)? = messages.last else { return XCTFail("message list must expose persisted macOS thread history") }
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(first["role"], .string("user"))
+        XCTAssertEqual(first["content"], .string("old prompt"))
+        XCTAssertEqual(last["role"], .string("assistant"))
+        XCTAssertEqual(last["content"], .string("old answer"))
+    }
+
+    @MainActor
+    func test_agentThreadSelectRoutesSelectionToMacSurface() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "load prior", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.select", params: [
+            "thread_id": .string(t.id.value.uuidString)
+        ]))
+
+        XCTAssertEqual(resp.result, .bool(true))
+        XCTAssertEqual(router.selectedThread, t.id, "selecting an existing iOS thread must select the same macOS Agent App thread")
+    }
+
+    @MainActor
+    func test_agentThreadConfigureClearsProviderSessionWhenProviderOrModelChanges() async throws {
+        let router = FakeRouter()
+        var t = AgentThread(workspaceId: nil, title: "switch provider", provider: .claude, model: "claude-sonnet-4-6")
+        t.providerThreadId = "claude-session"
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.configure", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "provider": .string("codex"),
+            "model": .string("gpt-5.5")
+        ]))
+
+        XCTAssertNil(resp.error)
+        XCTAssertNil(router.threadStore.first?.providerThreadId, "changing provider/model must not resume an incompatible provider session")
     }
 }

@@ -18,6 +18,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let lock = NSLock()
     public weak var observer: AgentRunObserver?
 
+    /// GAP-7: bridge agent run lifecycle + timeline to the network event
+    /// bus so the iOS mirror receives streaming agent output in real
+    /// time. Kept as primitive closures (no SocketServer dependency in
+    /// this module); AppShell maps them onto EventBus.
+    public var onRunStarted: ((AgentThreadID, AgentRunID) -> Void)?
+    public var onAssistantEvent: ((AssistantEvent, AgentThreadID, AgentRunID) -> Void)?
+    public var onRunFinished: ((AgentThreadID, AgentRunID, AgentRunStatus) -> Void)?
+
     public init(
         runRepo: AgentRunRepository,
         messageRepo: AgentMessageRepository,
@@ -50,6 +58,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // persist run
         let run = AgentRun(id: request.runId, threadId: request.threadId, provider: request.provider, model: request.model, status: .running)
         try runRepo.upsert(run)
+        onRunStarted?(request.threadId, request.runId)
 
         let runId = request.runId
         let coordinator = self
@@ -92,6 +101,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 persistAssistantIfMissing(msg, threadId: threadId)
             }
             observer?.runCoordinator(self, didReceive: ev, run: runId)
+            onAssistantEvent?(ev, threadId, runId)
         case .status(let st):
             observer?.runCoordinator(self, didChangeStatus: st, runId: runId)
         case .finished(let status, let finalMessage, let providerThreadId):
@@ -117,8 +127,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             seq.removeValue(forKey: runId)
             lock.unlock()
             observer?.runCoordinator(self, didFinish: runId, status: status, finalMessage: finalMessage, providerThreadId: providerThreadId)
+            onRunFinished?(threadId, runId, status)
         case .error(let m):
             observer?.runCoordinator(self, didReceive: .error(message: m, recoverable: false), run: runId)
+            onAssistantEvent?(.error(message: m, recoverable: false), threadId, runId)
         }
     }
 }

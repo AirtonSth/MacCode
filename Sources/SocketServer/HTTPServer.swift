@@ -24,16 +24,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
     public weak var auth: DirectAuthProvider?
+    /// Stable, persisted host identity. iOS pins this (RCA-022); it must
+    /// survive process restarts or every relaunch looks like a different
+    /// Mac and forces a re-pair (GAP-2).
+    public let serverId: String
 
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil) {
+    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
         self.auth = auth
+        self.serverId = serverId
     }
 
     public func start() throws {
@@ -136,7 +141,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
            headers["upgrade"]?.lowercased() == "websocket",
            let key = headers["sec-websocket-key"] {
             performWSHandshake(fd: fd, key: key)
-            // bind subscription
+            // GAP-6: EventBus.publish fans out to subscribers from many
+            // threads (RPC dispatch, agent runner, …). Writing frames to
+            // one socket from concurrent threads interleaves bytes and
+            // permanently desyncs the client's WS stream (observed: the
+            // stream dies the moment an agent run emits rapid events).
+            // Serialize every write for this connection onto one queue.
+            let wsQueue = DispatchQueue(label: "rc2.ws.write")
             let id = EventBus.shared.subscribe(since: 0) { [weak self] ev in
                 guard let self else { return }
                 let obj: [String: Any] = [
@@ -146,18 +157,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     "payload": Self.jsonValueToAny(ev.payload)
                 ]
                 guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
-                self.sendWSText(fd: fd, data: data)
+                wsQueue.async { self.sendWSText(fd: fd, data: data) }
             }
             subID = id
             // keep connection open; read incoming frames (ping/pong/close)
-            wsServeLoop(fd: fd)
+            wsServeLoop(fd: fd, writeQueue: wsQueue)
             return
         }
 
         // Auth gate: when not loopback-only, require valid token for /v1/*
-        // (except /v1/discovery, /v1/pair, /v1/pair/redeem).
+        // except the pre-token discovery/pairing surface. GAP-9:
+        // /v1/capabilities is fetched UNauthenticated by the mobile
+        // client before a token exists (mirrors /v1/discovery); gating
+        // it makes every LAN connect fail with 401 → permanent
+        // "Not authorized". It must be exempt like discovery.
         if !bindLoopbackOnly, path.hasPrefix("/v1"),
-           !["/v1/discovery", "/v1/pair", "/v1/pair/redeem"].contains(path),
+           !["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem"].contains(path),
            let auth = auth {
             let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
             if let t = token, auth.verify(token: t) {
@@ -173,6 +188,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         switch (method, path) {
         case ("GET", "/healthz"):
             send(fd: fd, status: 200, contentType: "text/plain", body: "ok\n".data(using: .utf8)!)
+        case ("POST", "/v1/rpc"):
+            // GAP-1: the authenticated JSON-RPC surface the mobile client
+            // uses for every feature call. Routes to the same dispatcher
+            // the Unix socket uses, hopping to the main actor.
+            let respData = dispatchRPCSync(bodyData)
+            send(fd: fd, status: 200, contentType: "application/json", body: respData)
         case ("POST", "/v1/pair"):
             guard let auth = auth, let code = auth.createPairingCode() else {
                 send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
@@ -203,31 +224,65 @@ public final class DirectHTTPServer: @unchecked Sendable {
             sendJSON(fd: fd, status: 200, body: ["revoked": id])
         case ("GET", "/v1/discovery"):
             let body: [String: Any] = [
-                "server_id": ProcessInfo.processInfo.globallyUniqueString,
+                "server_id": serverId,                                  // GAP-2: stable, persisted
                 "app": "remotecode2",
                 "version": "0.1.0",
                 "api_version": "2",
                 "capabilities_version": "1",
-                "auth_mode": "loopback-anonymous",
+                "auth_mode": bindLoopbackOnly ? "loopback-anonymous" : "token-required",
                 "transports": ["http", "ws"],
-                "host": "127.0.0.1",
+                "host": bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0",
                 "port": port,
                 "vpn_required": !bindLoopbackOnly,
                 "relay": false
             ]
             sendJSON(fd: fd, status: 200, body: body)
         case ("GET", "/v1/capabilities"):
+            // GAP-3: advertise what the dispatcher actually implements.
+            // git mutations + full browser automation are real (see
+            // Dispatcher.swift git.*/browser.*); hiding them on the
+            // client breaks parity.
             let body: [String: Any] = [
-                "surface_types": ["terminal", "browser", "agentApp"],
-                "agent": ["providers": ["codex", "claude"]],
-                "browser_automation": ["p0": ["navigate", "back", "forward", "reload", "url.get"], "p1_unsupported": true],
-                "git": ["read_only": true],
+                "surface_types": ["terminal", "browser", "agentApp", "markdown", "filePreview", "rightSidebarTool"],
+                "agent": ["providers": ["codex", "claude"], "supports_stream_events": true, "supports_resume": true],
+                "browser_automation": [
+                    "p0": ["navigate", "back", "forward", "reload", "url.get"],
+                    "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],
+                    "p1_unsupported": false
+                ],
+                "git": ["read_only": false],
                 "feature_flags": ["remote_access_enabled": !bindLoopbackOnly]
             ]
             sendJSON(fd: fd, status: 200, body: body)
         default:
             send(fd: fd, status: 404, contentType: "text/plain", body: "not found\n".data(using: .utf8)!)
         }
+    }
+
+    /// Decode + dispatch one JSON-RPC request on the main actor and
+    /// return the encoded response bytes. Mirrors UnixSocketServer's
+    /// hop pattern so synchronous AppKit/SwiftUI calls stay on main.
+    private func dispatchRPCSync(_ bodyData: Data) -> Data {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        guard let req = try? decoder.decode(JSONRPCRequest.self, from: bodyData) else {
+            let resp = JSONRPCResponse(id: nil, error: .parseError)
+            return (try? encoder.encode(resp)) ?? Data("{}".utf8)
+        }
+        let semaphore = DispatchSemaphore(value: 0)
+        final class Slot: @unchecked Sendable { var value: JSONRPCResponse? }
+        let slot = Slot()
+        DispatchQueue.main.async {
+            let task = Task { @MainActor in
+                let resp = await self.dispatcher.dispatch(req)
+                slot.value = resp
+                semaphore.signal()
+            }
+            _ = task
+        }
+        semaphore.wait()
+        let resp = slot.value ?? JSONRPCResponse(id: req.id, error: .internalError)
+        return (try? encoder.encode(resp)) ?? Data("{}".utf8)
     }
 
     private func send(fd: Int32, status: Int, contentType: String, body: Data) {
@@ -279,7 +334,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
     }
 
-    private func wsServeLoop(fd: Int32) {
+    private func wsServeLoop(fd: Int32, writeQueue: DispatchQueue) {
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while running {
@@ -290,9 +345,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 buf.removeFirst(consumed)
                 switch frame.opcode {
                 case 0x8: // close
-                    sendCloseFrame(fd: fd); return
+                    writeQueue.sync { sendCloseFrame(fd: fd) }; return
                 case 0x9: // ping -> pong
-                    sendPongFrame(fd: fd, payload: frame.payload)
+                    writeQueue.async { self.sendPongFrame(fd: fd, payload: frame.payload) }
                 case 0xA: // pong
                     continue
                 case 0x1, 0x2:

@@ -12,6 +12,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public var windowController: MainWindowController!
     public var socketServer: UnixSocketServer?
     public var httpServer: DirectHTTPServer?
+    /// GAP-5: `DirectHTTPServer.auth` is a weak ref. Without an owner the
+    /// LocalAuthAdapter deallocates the instant launch returns, which
+    /// silently disables pairing AND bypasses the LAN auth gate. The
+    /// app delegate must own it for the process lifetime.
+    private var authProvider: DirectAuthProvider?
+    private var bonjour: NetService?
+    private let bonjourDelegate = BonjourDelegate()
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public let channel: ReleaseChannel
@@ -79,14 +86,30 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let loopbackOnly = remoteEnabled != "1"
         let trustRepo = DeviceTrustRepository(db: context.db)
         let auth = LocalAuthAdapter(repo: trustRepo)
-        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly, dispatcher: dispatcher, auth: auth)
+        authProvider = auth   // GAP-5: retain for process lifetime
+        // GAP-2: a stable host identity persisted across launches so the
+        // mobile client's identity pin (RCA-022) does not break on every
+        // restart and force a re-pair.
+        let stableServerId: String
+        if let existing = (try? context.settingsRepo.get("server_id")) ?? nil, !existing.isEmpty {
+            stableServerId = existing
+        } else {
+            let fresh = UUID().uuidString
+            try? context.settingsRepo.set("server_id", fresh)
+            stableServerId = fresh
+        }
+        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly, dispatcher: dispatcher, auth: auth, serverId: stableServerId)
         do {
             try http.start()
             httpServer = http
-            NSLog("Direct HTTP server listening on 127.0.0.1:18217 (loopback=\(loopbackOnly))")
+            NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
         }
+
+        // GAP-4: advertise on the LAN via Bonjour so the mobile app can
+        // auto-detect this Mac without manual IP entry.
+        publishBonjour(serverId: stableServerId)
 
         palette = CommandPalette(router: router)
         settings = SettingsWindowController(context: context)
@@ -100,6 +123,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         context?.saveSnapshot()
         socketServer?.stop()
         httpServer?.stop()
+        bonjour?.stop()
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -228,6 +252,36 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func newSurface(type: SurfaceType) {
         guard let wid = context.state.window.selectedWorkspaceID else { NSSound.beep(); return }
         _ = try? router.createSurface(workspace: wid, type: type, paneID: nil, title: nil)
+    }
+
+    /// GAP-4: publish `_remotecode2._tcp` so the iOS app can find this
+    /// Mac on the LAN. TXT carries the stable identity + version so the
+    /// client can show it before connecting.
+    private func publishBonjour(serverId: String) {
+        let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        let svc = NetService(domain: "", type: "_remotecode2._tcp.", name: name, port: 18217)
+        let txt: [String: Data] = [
+            "server_id": Data(serverId.utf8),
+            "app": Data("remotecode2".utf8),
+            "version": Data("0.1.0".utf8),
+            "api": Data("2".utf8)
+        ]
+        svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
+        svc.delegate = bonjourDelegate
+        svc.publish()
+        bonjour = svc
+        NSLog("Bonjour published: \(name) _remotecode2._tcp:18217")
+    }
+}
+
+/// Logs Bonjour publish outcome; a publish failure must be loud, not
+/// silent, or the iOS app simply never sees this Mac (Rule 6).
+final class BonjourDelegate: NSObject, NetServiceDelegate {
+    func netServiceDidPublish(_ sender: NetService) {
+        NSLog("Bonjour: did publish \(sender.name)")
+    }
+    func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
+        NSLog("Bonjour: FAILED to publish \(sender.name): \(errorDict)")
     }
 }
 
