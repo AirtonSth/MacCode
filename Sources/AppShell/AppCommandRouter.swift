@@ -259,6 +259,15 @@ public final class AppCommandRouter: CommandRouting {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         if let provider, provider != t.provider {
+            // A1 (iOS+macOS parity): the provider is fixed once the
+            // thread has a conversation. Only model/effort stay
+            // changeable after that. Enforced host-side so no client
+            // can bypass the UI lock.
+            let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
+            guard !started else {
+                throw JSONRPCError(code: -32010,
+                    message: "Provider is locked once the thread has started; only model and effort can change.")
+            }
             t.provider = provider
             t.providerThreadId = nil
         }

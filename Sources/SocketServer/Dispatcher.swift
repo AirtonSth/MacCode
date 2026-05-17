@@ -175,6 +175,11 @@ public final class JSONRPCDispatcher {
                     "value": .string(value)
                 ]))
                 return .init(id: id, result: .bool(true))
+            case "fs.roots":
+                return .init(id: id, result: .object(["roots": fsRoots()]))
+            case "fs.list":
+                let raw = params["path"]?.stringValue
+                return .init(id: id, result: try fsList(raw))
             case "workspace.list":
                 let ws = try router.listWorkspaces()
                 return .init(id: id, result: encode(ws))
@@ -606,6 +611,58 @@ public final class JSONRPCDispatcher {
         case "browser": return "browser"
         default: return s
         }
+    }
+
+    /// Top-level entry points the iOS file browser starts from. The app
+    /// is not sandboxed, so any of these is fully readable.
+    private func fsRoots() -> JSONValue {
+        let home = NSHomeDirectory()
+        let roots: [(String, String)] = [(home, "Home"), ("/", "Root"), ("/tmp", "/tmp")]
+        return .array(roots.map { path, label in
+            .object(["id": .string(path), "label": .string(label), "path": .string(path)])
+        })
+    }
+
+    /// List one directory for the iOS workspace picker. Directories
+    /// sort before files, then case-insensitive by name (parity with
+    /// the remotecode.io desktop `listPath`). `parent` is null at "/".
+    private func fsList(_ raw: String?) throws -> JSONValue {
+        let fm = FileManager.default
+        let input = (raw?.isEmpty == false) ? raw! : NSHomeDirectory()
+        // expandingTildeInPath handles "~"/"~user"; standardizingPath
+        // resolves "." / ".." and symlinks to a canonical absolute path.
+        let path = ((input as NSString).expandingTildeInPath as NSString).standardizingPath
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
+            throw JSONRPCError(code: -32602, message: "not found", data: .string(path))
+        }
+        guard isDir.boolValue else {
+            throw JSONRPCError(code: -32602, message: "not a directory", data: .string(path))
+        }
+        let names = try fm.contentsOfDirectory(atPath: path)
+        let entries = names.map { name -> (Bool, String, JSONValue) in
+            let child = (path as NSString).appendingPathComponent(name)
+            var childDir: ObjCBool = false
+            _ = fm.fileExists(atPath: child, isDirectory: &childDir)
+            let isDirectory = childDir.boolValue
+            return (isDirectory, name, .object([
+                "name": .string(name),
+                "path": .string(child),
+                "type": .string(isDirectory ? "directory" : "file"),
+            ]))
+        }
+        .sorted { l, r in
+            if l.0 != r.0 { return l.0 && !r.0 }   // directories first
+            return l.1.localizedCaseInsensitiveCompare(r.1) == .orderedAscending
+        }
+        .map { $0.2 }
+        let parent: JSONValue = path == "/" ? .null
+            : .string((path as NSString).deletingLastPathComponent)
+        return .object([
+            "path": .string(path),
+            "parentPath": parent,
+            "entries": .array(entries),
+        ])
     }
 
     private func encode<T: Encodable>(_ value: T) -> JSONValue {
