@@ -70,8 +70,11 @@ final class FakeRouter: CommandRouting {
             return $0.updatedAt > $1.updatedAt
         }
     }
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String) throws -> AgentThread {
-        AgentThread(workspaceId: workspace, title: title, provider: provider, model: model)
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort) throws -> AgentThread {
+        let thread = AgentThread(workspaceId: workspace, title: title, provider: provider, model: model,
+                                 permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        threadStore.append(thread)
+        return thread
     }
     var lastSendPermission: AgentPermissionMode?
     var lastSendReasoning: AgentReasoningEffort?
@@ -86,6 +89,8 @@ final class FakeRouter: CommandRouting {
             threadStore[idx].model = model
             threadStore[idx].providerThreadId = nil
         }
+        if let permissionMode { threadStore[idx].permissionMode = permissionMode }
+        if let reasoningEffort { threadStore[idx].reasoningEffort = reasoningEffort }
         return threadStore[idx]
     }
     var selectedThread: AgentThreadID?
@@ -98,8 +103,8 @@ final class FakeRouter: CommandRouting {
     }
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
         _ = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
-        lastSendPermission = permissionMode
-        lastSendReasoning = reasoningEffort
+        lastSendPermission = threadStore.first(where: { $0.id == thread })?.permissionMode
+        lastSendReasoning = threadStore.first(where: { $0.id == thread })?.reasoningEffort
         return AgentRunID()
     }
     func stopAgentRun(thread: AgentThreadID) throws {}
@@ -497,21 +502,21 @@ final class DispatcherTests: XCTestCase {
         guard case .object(let cfgObj)? = cfg.result else { return XCTFail("configure must echo the updated host thread") }
         XCTAssertEqual(cfgObj["provider"], .string("claude"))
         XCTAssertEqual(cfgObj["model"], .string("claude-sonnet-4-6"))
+        XCTAssertEqual(cfgObj["permissionMode"], .string("full_access"))
+        XCTAssertEqual(cfgObj["reasoningEffort"], .string("high"))
 
         let send = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.send", params: [
             "thread_id": tid,
-            "text": .string("run on host"),
-            "provider": .string("codex"),
-            "model": .string("gpt-5.5"),
-            "permission_mode": .string("auto_accept_edits"),
-            "reasoning_effort": .string("xhigh")
+            "text": .string("run on host")
         ]))
         guard case .object(let sendObj)? = send.result else { return XCTFail("send must return host run object") }
         XCTAssertNotNil(sendObj["run_id"]?.stringValue, "send must return host run id")
-        XCTAssertEqual(router.threadStore.first?.provider, .codex)
-        XCTAssertEqual(router.threadStore.first?.model, "gpt-5.5")
-        XCTAssertEqual(router.lastSendPermission, .autoAcceptEdits)
-        XCTAssertEqual(router.lastSendReasoning, .xhigh)
+        XCTAssertEqual(router.threadStore.first?.provider, .claude)
+        XCTAssertEqual(router.threadStore.first?.model, "claude-sonnet-4-6")
+        XCTAssertEqual(router.lastSendPermission, .fullAccess,
+                       "send must use the thread's persisted permission mode when no override is sent")
+        XCTAssertEqual(router.lastSendReasoning, .high,
+                       "send must use the thread's persisted reasoning effort when no override is sent")
     }
 
     @MainActor

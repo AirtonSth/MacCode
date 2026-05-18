@@ -60,9 +60,9 @@ public final class AgentThreadRepository {
 
     public func upsert(_ t: AgentThread) throws {
         let st = try db.prepare("""
-            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order;
+            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort;
         """)
         try st.bind(1, t.id.value.uuidString)
         try st.bind(2, t.projectId?.value.uuidString)
@@ -80,13 +80,15 @@ public final class AgentThreadRepository {
         try st.bind(14, t.color)
         try st.bind(15, t.pinned)
         try st.bind(16, Int64(t.sortOrder))
+        try st.bind(17, t.permissionMode.rawValue)
+        try st.bind(18, t.reasoningEffort.rawValue)
         _ = try st.step()
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
         let sql = workspaceId == nil
-            ? "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order FROM agent_threads ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
-            : "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order FROM agent_threads WHERE workspace_id = ? ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
+            ? "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort FROM agent_threads ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
+            : "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort FROM agent_threads WHERE workspace_id = ? ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
         let st = try db.prepare(sql)
         if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
         var out: [AgentThread] = []
@@ -110,14 +112,16 @@ public final class AgentThreadRepository {
                 hasUnread: st.columnInt64(12) != 0,
                 color: st.columnText(13),
                 pinned: st.columnInt64(14) != 0,
-                sortOrder: Int(st.columnInt64(15))
+                sortOrder: Int(st.columnInt64(15)),
+                permissionMode: AgentPermissionMode(rawValue: st.columnText(16) ?? "") ?? .supervised,
+                reasoningEffort: AgentReasoningEffort(rawValue: st.columnText(17) ?? "") ?? .medium
             ))
         }
         return out
     }
 
     public func get(id: AgentThreadID) throws -> AgentThread? {
-        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order FROM agent_threads WHERE id = ?;")
+        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         if try st.step() {
             let idVal = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
@@ -139,7 +143,9 @@ public final class AgentThreadRepository {
                 hasUnread: st.columnInt64(12) != 0,
                 color: st.columnText(13),
                 pinned: st.columnInt64(14) != 0,
-                sortOrder: Int(st.columnInt64(15))
+                sortOrder: Int(st.columnInt64(15)),
+                permissionMode: AgentPermissionMode(rawValue: st.columnText(16) ?? "") ?? .supervised,
+                reasoningEffort: AgentReasoningEffort(rawValue: st.columnText(17) ?? "") ?? .medium
             )
         }
         return nil

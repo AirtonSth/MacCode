@@ -96,6 +96,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
             model = t.model
+            permissionMode = t.permissionMode
+            reasoningEffort = t.reasoningEffort
             status = t.status
             if t.status == .running {
                 if runStartedAt == nil { runStartedAt = Date() }
@@ -194,16 +196,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
         t.provider = provider
         t.model = model
+        t.permissionMode = permissionMode
+        t.reasoningEffort = reasoningEffort
         t.updatedAt = Date()
         try? threadRepo.upsert(t)
         if let i = threads.firstIndex(where: { $0.id == id }) {
             threads[i].provider = provider
             threads[i].model = model
+            threads[i].permissionMode = permissionMode
+            threads[i].reasoningEffort = reasoningEffort
         }
     }
 
     public func createThread(title: String) {
-        let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider, model: model)
+        let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider, model: model,
+                            permissionMode: permissionMode, reasoningEffort: reasoningEffort)
         try? threadRepo.upsert(t)
         reloadThreads()
         selectThread(t.id)
@@ -290,7 +297,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let tid = selectedThreadId,
               let src = threads.first(where: { $0.id == tid }) else { return }
         let copy = AgentThread(workspaceId: workspaceID, title: "\(src.title) (fork)",
-                               provider: src.provider, model: src.model)
+                               provider: src.provider, model: src.model,
+                               permissionMode: src.permissionMode, reasoningEffort: src.reasoningEffort)
         try? threadRepo.upsert(copy)
         for m in (try? messageRepo.list(threadId: tid)) ?? [] {
             try? messageRepo.append(AgentMessage(threadId: copy.id, role: m.role, content: m.content))
@@ -318,6 +326,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 $0.id.localizedCaseInsensitiveContains(arg) || $0.label.localizedCaseInsensitiveContains(arg)
             }) {
                 model = m.id
+                persistThreadConfig()
                 systemNote("Model → \(m.label)")
             } else {
                 let names = availableModels.map { $0.label }.joined(separator: ", ")
@@ -326,6 +335,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         case "plan":
             showPlanSidebar.toggle()
             permissionMode = .supervised
+            persistThreadConfig()
             systemNote("Plan mode \(showPlanSidebar ? "on" : "off") · permission: supervised")
         case "status":
             systemNote(statusSummary())
@@ -376,6 +386,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist).
         messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display)))
+        persistThreadConfig()
         let req = AgentRunRequest(
             threadId: tid,
             provider: provider,
@@ -544,7 +555,11 @@ public struct AgentAppView: View {
         } else {
             let selected = vm.selectedThreadId == t.id
             let multiSelected = selectedThreadIds.contains(t.id)
-            let running = t.status == .running || (selected && vm.status == .running)
+            let running = AgentThreadRowPresentation.isRunning(
+                threadStatus: t.status,
+                selected: selected,
+                surfaceStatus: vm.status
+            )
             Button { selectThreadRow(t) } label: {
                 HStack(spacing: DS.Space.md) {
                     if running {
@@ -569,7 +584,12 @@ public struct AgentAppView: View {
                         Circle().fill(DS.Palette.accent).frame(width: 7, height: 7)
                             .accessibilityLabel("Unread activity")
                     }
-                    if multiSelected {
+                    if AgentThreadRowPresentation.showsSelectionCheck(
+                        threadStatus: t.status,
+                        selected: selected,
+                        surfaceStatus: vm.status,
+                        multiSelected: multiSelected
+                    ) {
                         Image(systemName: "checkmark.circle.fill")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundColor(DS.Palette.accent)
@@ -1420,6 +1440,21 @@ private struct TimelineBottomPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+enum AgentThreadRowPresentation {
+    static func isRunning(threadStatus: AgentRunStatus, selected: Bool, surfaceStatus: AgentRunStatus) -> Bool {
+        threadStatus == .running || (selected && surfaceStatus == .running)
+    }
+
+    static func showsSelectionCheck(
+        threadStatus: AgentRunStatus,
+        selected: Bool,
+        surfaceStatus: AgentRunStatus,
+        multiSelected: Bool
+    ) -> Bool {
+        multiSelected && !isRunning(threadStatus: threadStatus, selected: selected, surfaceStatus: surfaceStatus)
     }
 }
 

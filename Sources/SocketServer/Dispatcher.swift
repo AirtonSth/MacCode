@@ -35,7 +35,7 @@ public protocol CommandRouting: AnyObject {
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String) throws -> AgentThread
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort) throws -> AgentThread
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) throws -> AgentThread
     func selectAgentThread(thread: AgentThreadID) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
@@ -401,13 +401,17 @@ public final class JSONRPCDispatcher {
                 let title = params["title"]?.stringValue ?? "New thread"
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
                 let model = params["model"]?.stringValue ?? "fake-model"
-                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model)
+                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
+                let reasoning = params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
+                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
                     "title": .string(t.title),
                     "provider": .string(t.provider.rawValue),
-                    "model": .string(t.model)
+                    "model": .string(t.model),
+                    "permission_mode": .string(t.permissionMode.rawValue),
+                    "reasoning_effort": .string(t.reasoningEffort.rawValue)
                 ]))
                 return .init(id: id, result: encode(t))
             case "agent.thread.configure":
@@ -423,8 +427,8 @@ public final class JSONRPCDispatcher {
                     "provider": .string(t.provider.rawValue),
                     "model": .string(t.model)
                 ]
-                if let permission { payload["permission_mode"] = .string(permission.rawValue) }
-                if let reasoning { payload["reasoning_effort"] = .string(reasoning.rawValue) }
+                payload["permission_mode"] = .string(t.permissionMode.rawValue)
+                payload["reasoning_effort"] = .string(t.reasoningEffort.rawValue)
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
                 return .init(id: id, result: encode(t))
             case "agent.thread.select":

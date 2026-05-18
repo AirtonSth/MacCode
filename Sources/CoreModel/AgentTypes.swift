@@ -94,6 +94,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var title: String
     public var provider: AgentProvider
     public var model: String
+    public var permissionMode: AgentPermissionMode
+    public var reasoningEffort: AgentReasoningEffort
     public var providerThreadId: String?
     public var status: AgentRunStatus
     public var createdAt: Date
@@ -121,7 +123,9 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         hasUnread: Bool = false,
         color: String? = nil,
         pinned: Bool = false,
-        sortOrder: Int = 0
+        sortOrder: Int = 0,
+        permissionMode: AgentPermissionMode = .supervised,
+        reasoningEffort: AgentReasoningEffort = .medium
     ) {
         self.id = id
         self.projectId = projectId
@@ -129,6 +133,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         self.title = title
         self.provider = provider
         self.model = model
+        self.permissionMode = permissionMode
+        self.reasoningEffort = reasoningEffort
         self.providerThreadId = providerThreadId
         self.status = status
         self.createdAt = createdAt

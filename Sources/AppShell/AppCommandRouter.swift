@@ -274,9 +274,10 @@ public final class AppCommandRouter: CommandRouting {
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String) throws -> AgentThread {
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let t = AgentThread(workspaceId: workspace, title: title, provider: provider, model: model)
+        let t = AgentThread(workspaceId: workspace, title: title, provider: provider, model: model,
+                            permissionMode: permissionMode, reasoningEffort: reasoningEffort)
         try ctx.threadRepo.upsert(t)
         try selectAgentThread(thread: t.id)
         return t
@@ -301,6 +302,12 @@ public final class AppCommandRouter: CommandRouting {
         if let model, model != t.model {
             t.model = model
             t.providerThreadId = nil
+        }
+        if let permissionMode {
+            t.permissionMode = permissionMode
+        }
+        if let reasoningEffort {
+            t.reasoningEffort = reasoningEffort
         }
         t.updatedAt = Date()
         try ctx.threadRepo.upsert(t)
@@ -337,8 +344,8 @@ public final class AppCommandRouter: CommandRouting {
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
-        let prov = provider ?? t.provider
-        let m = model ?? t.model
+        let prov = t.provider
+        let m = t.model
         let cwd = ctx.state.workspaces.first { $0.value.id == t.workspaceId }?.value.cwd ?? FileManager.default.currentDirectoryPath
         let req = AgentRunRequest(
             threadId: thread,
@@ -347,8 +354,8 @@ public final class AppCommandRouter: CommandRouting {
             cwd: cwd,
             prompt: text,
             providerThreadId: t.providerThreadId,
-            permissionMode: permissionMode ?? .supervised,
-            reasoningEffort: reasoningEffort
+            permissionMode: t.permissionMode,
+            reasoningEffort: t.reasoningEffort
         )
         let runId = try await ctx.coordinator.startRun(req)
         // HC-5 (R1): a message sent from the mobile mirror must be

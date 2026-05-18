@@ -47,16 +47,45 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
     }
 
-    func test_persistThreadConfig_writesProviderModelToThread() throws {
+    func test_persistThreadConfig_writesProviderModelPermissionAndReasoningToThread() throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "t")
         let id = vm.selectedThreadId!
         vm.provider = .claude
         vm.model = "claude-opus-4-7"
+        vm.permissionMode = .fullAccess
+        vm.reasoningEffort = .high
         vm.persistThreadConfig()
         let t = try repo.get(id: id)
         XCTAssertEqual(t?.provider, .claude)
         XCTAssertEqual(t?.model, "claude-opus-4-7", "model change must persist for resume")
+        XCTAssertEqual(t?.permissionMode, .fullAccess)
+        XCTAssertEqual(t?.reasoningEffort, .high)
+
+        vm.permissionMode = .supervised
+        vm.reasoningEffort = .low
+        vm.selectThread(id)
+        XCTAssertEqual(vm.permissionMode, .fullAccess,
+                       "reopening an existing thread must restore its saved permission mode")
+        XCTAssertEqual(vm.reasoningEffort, .high,
+                       "reopening an existing thread must restore its saved reasoning effort")
+    }
+
+    func test_createThreadCopiesCurrentConfigFromLastThread() throws {
+        let (vm, repo) = try makeVM()
+        vm.provider = .codex
+        vm.model = "gpt-5.5"
+        vm.permissionMode = .fullAccess
+        vm.reasoningEffort = .medium
+        vm.createThread(title: "next")
+
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        let t = try repo.get(id: id)
+        XCTAssertEqual(t?.model, "gpt-5.5")
+        XCTAssertEqual(t?.permissionMode, .fullAccess,
+                       "new threads must inherit the last active permission mode")
+        XCTAssertEqual(t?.reasoningEffort, .medium,
+                       "new threads must inherit the last active reasoning effort")
     }
 
     func test_setThreadColor_persistsAndClears() throws {
@@ -165,6 +194,29 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.selectThread(id)
         XCTAssertEqual(try repo.get(id: id)?.hasUnread, false,
                        "clicking/opening the completed thread must clear the indicator")
+    }
+
+    func test_threadRowSelectionCheckOnlyAppearsAfterRunningWorkFinishes() {
+        XCTAssertFalse(AgentThreadRowPresentation.showsSelectionCheck(
+            threadStatus: .running,
+            selected: false,
+            surfaceStatus: .pending,
+            multiSelected: true
+        ), "running work must show the spinner without also implying completion")
+
+        XCTAssertFalse(AgentThreadRowPresentation.showsSelectionCheck(
+            threadStatus: .pending,
+            selected: true,
+            surfaceStatus: .running,
+            multiSelected: true
+        ), "the selected thread must suppress the check while its run is still active")
+
+        XCTAssertTrue(AgentThreadRowPresentation.showsSelectionCheck(
+            threadStatus: .completed,
+            selected: true,
+            surfaceStatus: .completed,
+            multiSelected: true
+        ), "successful finished work may show the selected/completed check")
     }
 
     func test_runningStatusTracksRunIdBeforeStartRunReturnsSoStopWorks() async throws {

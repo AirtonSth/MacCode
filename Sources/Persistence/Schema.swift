@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 5
+    public static let currentVersion: Int = 6
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -187,6 +187,10 @@ public enum Schema {
         SchemaStep(5, """
         ALTER TABLE agent_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE agent_threads ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+        """),
+        SchemaStep(6, """
+        ALTER TABLE agent_threads ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'supervised';
+        ALTER TABLE agent_threads ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium';
         """)
     ]
 
