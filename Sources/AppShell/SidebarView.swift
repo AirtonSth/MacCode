@@ -112,6 +112,15 @@ public final class SidebarViewModel: ObservableObject {
         reload()
     }
 
+    public func isWorkspaceBusy(_ ws: Workspace) -> Bool {
+        if ws.metadata["busy"] == "true" { return true }
+        return ws.layout.paneIDs().contains { pid in
+            (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
+                SurfaceRegistry.shared.surface($0.id)?.isBusy == true
+            }
+        }
+    }
+
     public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {
         guard dragged != target,
               let targetIndex = workspaces.firstIndex(where: { $0.id == target }) else { return }
@@ -247,12 +256,7 @@ public struct SidebarRootView: View {
         let checked = vm.selectedWorkspaceIDs.contains(ws.id)
         let desc = ws.metadata["description"]
         let pinned = ws.metadata["pinned"] == "true"
-        // A3: spinner when any surface in this workspace is busy.
-        let busy = ws.layout.paneIDs().contains { pid in
-            (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
-                SurfaceRegistry.shared.surface($0.id)?.isBusy == true
-            }
-        }
+        let busy = vm.isWorkspaceBusy(ws)
         Button {
             vm.selectWorkspaceRow(ws, extendingSelection: NSEvent.modifierFlags.contains(.shift))
         } label: {
@@ -312,11 +316,31 @@ public struct SidebarRootView: View {
             Menu("Color") {
                 Button("None") { vm.setWorkspaceColor(ws, "") }
                 ForEach(TabColor.allCases, id: \.self) { c in
-                    Button(c.label) { vm.setWorkspaceColor(ws, c.rawValue) }
+                    Button { vm.setWorkspaceColor(ws, c.rawValue) } label: {
+                        TabColorMenuLabel(c)
+                    }
                 }
             }
             Divider()
             Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
+        }
+    }
+}
+
+private struct TabColorMenuLabel: View {
+    let color: TabColor
+
+    init(_ color: TabColor) {
+        self.color = color
+    }
+
+    var body: some View {
+        Label {
+            Text(color.label)
+        } icon: {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(Color(hex: color.hex))
+                .frame(width: 12, height: 12)
         }
     }
 }

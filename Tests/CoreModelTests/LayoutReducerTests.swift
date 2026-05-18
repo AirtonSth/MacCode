@@ -38,6 +38,29 @@ final class LayoutReducerTests: XCTestCase {
                        "drag reorder must respect the pinned-first sort boundary")
     }
 
+    func test_promoteWorkspace_movesOnlyInsidePinnedGroup() throws {
+        let r = LayoutReducer()
+        var s = LayoutState()
+        s = try r.reduce(s, .createWorkspace(name: "one", cwd: "/tmp", initial: nil))
+        let one = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "two", cwd: "/tmp", initial: nil))
+        let two = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "three", cwd: "/tmp", initial: nil))
+        let three = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "four", cwd: "/tmp", initial: nil))
+        let four = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .setWorkspacePinned(two, true))
+        s = try r.reduce(s, .setWorkspacePinned(four, true))
+
+        s = try r.reduce(s, .promoteWorkspace(three))
+        XCTAssertEqual(s.window.workspaces, [two, four, three, one],
+                       "a completed unpinned workspace must jump to the top of unpinned workspaces without crossing pinned workspaces")
+
+        s = try r.reduce(s, .promoteWorkspace(four))
+        XCTAssertEqual(s.window.workspaces, [four, two, three, one],
+                       "a completed pinned workspace must jump to the top of pinned workspaces")
+    }
+
     func test_setSurfaceColor_writesToDescriptorMetadata() throws {
         let r = LayoutReducer()
         var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws1", cwd: "/tmp", initial: nil))

@@ -59,6 +59,8 @@ final class PaneActionTests: XCTestCase {
 
         XCTAssertEqual(vm.workspaces.first(where: { $0.id == ws.id })?.metadata["busy"], "true",
                        "a running agent thread must put the same spinner state on the workspace row, even before the Agent tab is rebuilt")
+        XCTAssertTrue(vm.isWorkspaceBusy(vm.workspaces.first(where: { $0.id == ws.id })!),
+                      "workspace row rendering must read the router's busy metadata, not only live SurfaceRegistry state")
     }
 
     func test_agentSurfaceBusyRollsUpRunningThreadForTabSpinner() throws {
@@ -74,6 +76,18 @@ final class PaneActionTests: XCTestCase {
 
         XCTAssertTrue(agent.isBusy,
                       "the tab strip reads AgentAppSurface.isBusy, so running threads must turn the Agent App tab into a spinner")
+    }
+
+    func test_agentTabBusyRollsUpRunningThreadFromRepository() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "tab-repo-busy", cwd: NSTemporaryDirectory())
+        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
+        var thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
+        thread.status = .running
+        try ctx.threadRepo.upsert(thread)
+
+        XCTAssertTrue(PaneTabsView.isSurfaceBusy(desc, router: router),
+                      "tab rendering must show a spinner when any thread in that Agent App workspace is running, even if the live surface VM has stale thread state")
     }
 
     func test_splitHorizontal_and_splitVertical_orientations() throws {

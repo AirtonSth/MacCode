@@ -49,6 +49,9 @@ public final class AppCommandRouter: CommandRouting {
                         agent.viewModel.onRunStateChange = { [weak self] in
                             self?.windowController?.refreshFromState()
                         }
+                        agent.viewModel.onRunCompleted = { [weak self] in
+                            self?.promoteWorkspaceAfterCompletedRun(wid)
+                        }
                         surface = agent
                     case .files:
                         surface = FilesSurface(workspaceID: wid, cwd: cwd, title: title, router: self, initialState: desc.metadata["files_state"])
@@ -395,6 +398,20 @@ public final class AppCommandRouter: CommandRouting {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         try ctx.threadRepo.setPinned(id: thread, pinned: pinned)
         guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            agent.viewModel.reloadThreads()
+        }
+        windowController?.refreshFromState()
+        return t
+    }
+
+    public func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        t.color = color.isEmpty ? nil : color
+        t.updatedAt = Date()
+        try ctx.threadRepo.upsert(t)
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
             agent.viewModel.reloadThreads()
@@ -872,6 +889,9 @@ public final class AppCommandRouter: CommandRouting {
                 agent.viewModel.onRunStateChange = { [weak self] in
                     self?.windowController?.refreshFromState()
                 }
+                agent.viewModel.onRunCompleted = { [weak self] in
+                    self?.promoteWorkspaceAfterCompletedRun(workspace)
+                }
                 surface = agent
             case .files:
                 surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: nil)
@@ -1038,6 +1058,19 @@ public final class AppCommandRouter: CommandRouting {
             "revision": state["revision"] ?? .number(0),
             "updated_by_device": .string("mac-host")
         ]))
+    }
+
+    public func promoteWorkspaceAfterCompletedRun(_ id: WorkspaceID) {
+        guard let ctx = context else { return }
+        let before = ctx.state.window.workspaces
+        try? ctx.apply(.promoteWorkspace(id))
+        let order = ctx.state.window.workspaces
+        guard order != before else { return }
+        EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
+            "workspace_id": .string(id.value.uuidString),
+            "order": .array(order.map { .string($0.value.uuidString) })
+        ]))
+        windowController?.refreshFromState()
     }
 }
 

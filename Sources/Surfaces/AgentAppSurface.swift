@@ -37,6 +37,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// A3: fired when a run starts/ends so the tab + workspace chrome can
     /// show/hide a spinner (AppKit tab strip / sidebar don't observe VM).
     public var onRunStateChange: (() -> Void)?
+    /// Fired when a run completes so the workspace can move up in its
+    /// pinned/unpinned group.
+    public var onRunCompleted: (() -> Void)?
     /// B3: file paths attached to the next message (composer chips).
     @Published public var attachments: [String] = []
     /// When the active run started — drives the "Working for Xs" line.
@@ -452,16 +455,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             self.reloadThreads()
             self.loadGitBranch()   // the run may have changed the tree
+            if status == .completed {
+                self.onRunCompleted?()
+            }
             self.onRunStateChange?()
         }
     }
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {
         Task { @MainActor in
-            guard threadId == self.selectedThreadId else { return }
-            self.status = status
-            if status == .running { self.currentRunId = runId }
-            if status == .running, self.runStartedAt == nil { self.runStartedAt = Date() }
+            let threadWorkspace = try? self.threadRepo.get(id: threadId)?.workspaceId
+            guard threadWorkspace == self.workspaceID else { return }
+            self.reloadThreads()
+            if threadId == self.selectedThreadId {
+                self.status = status
+                if status == .running { self.currentRunId = runId }
+                if status == .running, self.runStartedAt == nil { self.runStartedAt = Date() }
+            }
             self.onRunStateChange?()
         }
     }
@@ -582,7 +592,9 @@ public struct AgentAppView: View {
                 Menu("Color") {
                     Button("None") { vm.setThreadColor(t.id, "") }
                     ForEach(TabColor.allCases, id: \.self) { c in
-                        Button(c.label) { vm.setThreadColor(t.id, c.rawValue) }
+                        Button { vm.setThreadColor(t.id, c.rawValue) } label: {
+                            TabColorMenuLabel(c)
+                        }
                     }
                 }
                 Divider()
@@ -1473,4 +1485,22 @@ public final class AgentAppSurface: NSObject, Surface {
 
     // A3: drives the tab/workspace spinner.
     public var isBusy: Bool { viewModel.status == .running || viewModel.activeThreadCount > 0 }
+}
+
+private struct TabColorMenuLabel: View {
+    let color: TabColor
+
+    init(_ color: TabColor) {
+        self.color = color
+    }
+
+    var body: some View {
+        Label {
+            Text(color.label)
+        } icon: {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(Color(hex: color.hex))
+                .frame(width: 12, height: 12)
+        }
+    }
 }

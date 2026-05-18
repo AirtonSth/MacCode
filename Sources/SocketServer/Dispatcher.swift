@@ -45,6 +45,7 @@ public protocol CommandRouting: AnyObject {
     func deleteAgentThreads(_ threads: [AgentThreadID]) throws
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread
     func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread
+    func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread
     func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread]
     func markAgentThreadRead(thread: AgentThreadID) throws
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor]
@@ -483,6 +484,16 @@ public final class JSONRPCDispatcher {
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "order": .array(order.map { .string($0) })
+                ]))
+                return .init(id: id, result: encode(t))
+            case "agent.thread.set_color":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let color = params["color"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let t = try router.setAgentThreadColor(thread: tid, color: color)
+                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+                    "thread_id": .string(t.id.value.uuidString),
+                    "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
+                    "color": t.color.map { .string($0) } ?? .string("")
                 ]))
                 return .init(id: id, result: encode(t))
             case "agent.thread.reorder":

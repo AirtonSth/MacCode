@@ -62,7 +62,7 @@ public final class PaneTabsView: NSObject {
         tabStrip.onDropSurface = { [weak self] sid in self?.appendDroppedSurface(sid) ?? false }
         for desc in pane.surfaces {
             let isSel = desc.id == selectedID
-            let busy = SurfaceRegistry.shared.surface(desc.id)?.isBusy ?? false
+            let busy = Self.isSurfaceBusy(desc, router: router)
             let colorHex = TabColor.from(desc.metadata["color"])?.hex
             let sid = desc.id
             let tab = PaneTabButton(
@@ -328,6 +328,21 @@ public final class PaneTabsView: NSObject {
         case .filePreview: return "doc"
         case .rightSidebarTool: return "sidebar.right"
         }
+    }
+
+    static func isSurfaceBusy(_ desc: SurfaceDescriptor, router: AppCommandRouter?) -> Bool {
+        if SurfaceRegistry.shared.surface(desc.id)?.isBusy == true { return true }
+        guard desc.type == .agentApp,
+              let workspaceID = workspaceID(for: desc, router: router),
+              let context = router?.context else { return false }
+        return ((try? context.threadRepo.list(workspaceId: workspaceID)) ?? []).contains { $0.status == .running }
+    }
+
+    private static func workspaceID(for desc: SurfaceDescriptor, router: AppCommandRouter?) -> WorkspaceID? {
+        if let raw = desc.metadata["workspace"], let uuid = UUID(uuidString: raw) {
+            return WorkspaceID(uuid)
+        }
+        return router?.context?.state.window.selectedWorkspaceID
     }
 
     private func currentWorkspaceID() -> WorkspaceID? {
@@ -687,6 +702,7 @@ final class PaneTabButton: NSView {
             for c in TabColor.allCases {
                 let mi = NSMenuItem(title: c.label, action: #selector(colorTab(_:)), keyEquivalent: "")
                 mi.target = self; mi.representedObject = c.rawValue
+                mi.image = Self.colorSwatchImage(hex: c.hex)
                 sub.addItem(mi)
             }
             colorItem.submenu = sub
@@ -698,6 +714,19 @@ final class PaneTabButton: NSView {
     @objc private func renameTab() { onRename?() }
     @objc private func colorTab(_ sender: NSMenuItem) {
         onSetColor?((sender.representedObject as? String) ?? "")
+    }
+
+    private static func colorSwatchImage(hex: UInt32) -> NSImage {
+        let size = NSSize(width: 12, height: 12)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        let rect = NSRect(origin: .zero, size: size)
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), xRadius: 2, yRadius: 2)
+        NSColor(hex: hex).setFill()
+        path.fill()
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
     }
 
     required init?(coder: NSCoder) { fatalError() }
