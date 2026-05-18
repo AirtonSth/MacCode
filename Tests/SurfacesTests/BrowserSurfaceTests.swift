@@ -8,6 +8,18 @@ import CoreModel
 // for the whole SwiftPM test bundle — unrelated to git-tab work.)
 @MainActor
 final class BrowserSurfaceTests: XCTestCase {
+    func test_defaultInitialURL_isRemoteCodeFromApp() {
+        XCTAssertEqual(BrowserSurface.defaultInitialURL.absoluteString,
+                       "https://www.remotecode.io/from-app")
+    }
+
+    func test_normalizedInitialURL_mapsAboutBlankToRemoteCodeFromApp() throws {
+        let aboutBlank = try XCTUnwrap(URL(string: "about:blank"))
+
+        XCTAssertEqual(BrowserSurface.normalizedInitialURL(aboutBlank).absoluteString,
+                       "https://www.remotecode.io/from-app")
+    }
+
     func test_safariUserAgent_identifiesEmbeddedBrowserAsDesktopSafari() {
         let ua = BrowserSurface.safariLikeUserAgent(
             safariVersion: "26.3.1"

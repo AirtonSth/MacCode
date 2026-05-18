@@ -291,6 +291,32 @@ public final class AgentRunRepository {
         try st.bind(5, iso.string(from: Date()))
         _ = try st.step()
     }
+
+    public func listLatestStreamEvents(threadId: AgentThreadID, limit: Int = 500) throws -> [AssistantEvent] {
+        let st = try db.prepare("""
+            SELECT payload_json
+            FROM agent_stream_events
+            WHERE run_id = (
+                SELECT id FROM agent_runs
+                WHERE thread_id = ?
+                ORDER BY started_at DESC
+                LIMIT 1
+            )
+            ORDER BY seq ASC
+            LIMIT ?;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, Int64(limit))
+        var events: [AssistantEvent] = []
+        let decoder = JSONDecoder()
+        while try st.step() {
+            guard let json = st.columnText(0),
+                  let data = json.data(using: .utf8),
+                  let event = try? decoder.decode(AssistantEvent.self, from: data) else { continue }
+            events.append(event)
+        }
+        return events
+    }
 }
 
 public final class SessionSnapshotRepository {

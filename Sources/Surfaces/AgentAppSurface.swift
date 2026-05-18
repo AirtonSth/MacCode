@@ -14,6 +14,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var selectedThreadId: AgentThreadID?
     @Published public var messages: [AgentMessage] = []
     @Published public var timeline = AssistantTimelineState()
+    @Published public var timelineUpdateTick: Int = 0
+    @Published public var focusTick: Int = 0
     @Published public var prompt: String = ""
     @Published public var provider: AgentProvider = .codex
     @Published public var model: String = "gpt-5.5"
@@ -58,7 +60,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.coordinator = coordinator
         self.threadRepo = threadRepo
         self.messageRepo = messageRepo
-        self.coordinator.observer = self
+        self.coordinator.addObserver(self)
         reloadThreads()
         loadGitBranch()
     }
@@ -91,6 +93,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
             model = t.model
+            status = t.status
+            if t.status == .running {
+                if runStartedAt == nil { runStartedAt = Date() }
+            } else {
+                currentRunId = nil
+                runStartedAt = nil
+            }
         }
         // B6: opening a thread marks it read (persist + reflect in the rail
         // without re-querying, which would recurse through reloadThreads).
@@ -104,6 +113,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messageWindow = Self.baseMessageWindow
         loadWindow(id)
         timeline = AssistantTimelineState()
+        for event in coordinator.latestStreamEvents(threadId: id) {
+            timeline.apply(event)
+        }
+        suppressPersistedFinalDuplicatedByTimeline()
+        timelineUpdateTick = 0
     }
 
     // MARK: B4 — bounded message window
@@ -114,8 +128,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func loadWindow(_ id: AgentThreadID) {
         let total = (try? messageRepo.count(threadId: id)) ?? 0
-        messages = (try? messageRepo.listRecent(threadId: id, limit: messageWindow)) ?? []
+        messages = ((try? messageRepo.listRecent(threadId: id, limit: messageWindow)) ?? [])
+            .map(Self.displayMessage)
         hasMoreOlder = total > messages.count
+    }
+
+    private static func displayMessage(_ message: AgentMessage) -> AgentMessage {
+        var m = message
+        m.content = AssistantTimelineState.cappedText(m.content)
+        return m
+    }
+
+    private func suppressPersistedFinalDuplicatedByTimeline() {
+        guard let liveFinal = timeline.latestAssistantMessage,
+              let last = messages.last,
+              last.role == .assistant,
+              last.content == liveFinal else { return }
+        messages.removeLast()
     }
 
     public func loadEarlierMessages() {
@@ -211,8 +240,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         try? threadRepo.delete(id: id)
         if selectedThreadId == id {
             selectedThreadId = nil
-            messages = []
-            timeline = AssistantTimelineState()
+        messages = []
+        timeline = AssistantTimelineState()
+        timelineUpdateTick = 0
         }
         reloadThreads()
     }
@@ -222,8 +252,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         try? threadRepo.delete(ids: Array(ids))
         if let selectedThreadId, ids.contains(selectedThreadId) {
             self.selectedThreadId = nil
-            messages = []
-            timeline = AssistantTimelineState()
+        messages = []
+        timeline = AssistantTimelineState()
+        timelineUpdateTick = 0
         }
         reloadThreads()
     }
@@ -329,6 +360,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         prompt = ""
         timeline = AssistantTimelineState()
+        timelineUpdateTick = 0
         // B3: fold attachment paths into the prompt so the agent (which
         // has fs access per permission mode) can read them; show a friendly
         // chip summary in the transcript.
@@ -340,7 +372,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             : text + "\n\n📎 " + attached.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist).
-        messages.append(AgentMessage(threadId: tid, role: .user, content: display))
+        messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display)))
         let req = AgentRunRequest(
             threadId: tid,
             provider: provider,
@@ -366,10 +398,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func stop() {
-        if let r = currentRunId { coordinator.stopRun(r) }
+        if let r = currentRunId {
+            coordinator.stopRun(r)
+        }
+        if let tid = selectedThreadId {
+            coordinator.stopRun(threadId: tid)
+        }
     }
 
     private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+        let text = AssistantTimelineState.cappedText(text)
         let existing = (try? messageRepo.list(threadId: threadId)) ?? []
         guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return }
         try? messageRepo.append(AgentMessage(threadId: threadId, role: .assistant, content: text))
@@ -377,29 +415,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     // MARK: AgentRunObserver
 
-    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID) {
+    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {
         Task { @MainActor in
+            guard threadId == self.selectedThreadId else { return }
+            self.currentRunId = run
+            self.runThreads[run] = threadId
+            if self.status != .running { self.status = .running }
             self.timeline.apply(event)
+            self.timelineUpdateTick &+= 1
         }
     }
 
-    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
+    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         Task { @MainActor in
-            self.status = status
-            let finishedTid = self.runThreads[runId] ?? self.selectedThreadId
+            let finishedTid = threadId
             self.runThreads[runId] = nil
-            if status == .completed, let msg = finalMessage, !msg.isEmpty, let tid = finishedTid {
+            if status == .completed, let msg = finalMessage, !msg.isEmpty {
                 // The coordinator is normally the persistence owner, but
                 // live provider completions can arrive after stream drain on
                 // a background handler. Keep the restart contract here too.
-                self.persistFinalAssistantIfMissing(msg, threadId: tid)
+                self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
             }
-            if status == .completed, let tid = finishedTid, tid == self.selectedThreadId {
-                self.loadWindow(tid)
-                self.timeline = AssistantTimelineState()
-            }
-            if status == .completed, let _ = finalMessage, let tid = finishedTid,
-               tid != self.selectedThreadId, var t = try? self.threadRepo.get(id: tid) {
+            if status == .completed, finalMessage != nil, finishedTid != self.selectedThreadId,
+               var t = try? self.threadRepo.get(id: finishedTid) {
                 // B6: finished on a thread the user left → mark unread.
                 // The selected thread already shows the reply via the live
                 // turn items, so we do NOT mirror it into `messages`
@@ -407,17 +445,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 t.hasUnread = true
                 try? self.threadRepo.upsert(t)
             }
-            self.currentRunId = nil
-            self.runStartedAt = nil
+            if finishedTid == self.selectedThreadId {
+                self.status = status
+                self.currentRunId = nil
+                self.runStartedAt = nil
+            }
             self.reloadThreads()
             self.loadGitBranch()   // the run may have changed the tree
             self.onRunStateChange?()
         }
     }
 
-    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID) {
+    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {
         Task { @MainActor in
+            guard threadId == self.selectedThreadId else { return }
             self.status = status
+            if status == .running { self.currentRunId = runId }
             if status == .running, self.runStartedAt == nil { self.runStartedAt = Date() }
             self.onRunStateChange?()
         }
@@ -432,7 +475,9 @@ public struct AgentAppView: View {
     @State private var selectedThreadIds: Set<AgentThreadID> = []
     @State private var lastSelectedThreadId: AgentThreadID?
     @State private var draggingThreadId: AgentThreadID?
-    @FocusState private var promptFocused: Bool
+    @State private var timelineSticksToBottom = true
+    @State private var showScrollDownButton = false
+    @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -652,27 +697,78 @@ public struct AgentAppView: View {
     // prose, tools as one dim line. No per-item cards.
     private var timeline: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: DS.Space.huge) {
-                    if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
-                        emptyConversation.padding(.top, 56)
+            ZStack(alignment: .bottomTrailing) {
+                GeometryReader { viewport in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: DS.Space.huge) {
+                            if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
+                                emptyConversation.padding(.top, 56)
+                            }
+                            ForEach(vm.messages, id: \.id) { msg in messageRow(msg) }
+                            ForEach(vm.timeline.turns, id: \.turnId) { turn in turnView(turn) }
+                            if vm.status == .running { workingStatus }
+                            if let err = vm.timeline.error { errorRow(err) }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("BOTTOM")
+                                .background(
+                                    GeometryReader { marker in
+                                        Color.clear.preference(
+                                            key: TimelineBottomPreferenceKey.self,
+                                            value: marker.frame(in: .named("agentTimeline")).maxY
+                                        )
+                                    }
+                                )
+                        }
+                        .padding(.horizontal, DS.Space.lg)
+                        .padding(.vertical, DS.Space.xl)
+                        .frame(maxWidth: 920, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     }
-                    ForEach(vm.messages, id: \.id) { msg in messageRow(msg) }
-                    ForEach(vm.timeline.turns, id: \.turnId) { turn in turnView(turn) }
-                    if vm.status == .running { workingStatus }
-                    if let err = vm.timeline.error { errorRow(err) }
-                    Color.clear.frame(height: 1).id("BOTTOM")
+                    .coordinateSpace(name: "agentTimeline")
+                    .background(DS.Palette.bg)
+                    .onPreferenceChange(TimelineBottomPreferenceKey.self) { bottomY in
+                        let atBottom = bottomY <= viewport.size.height + 28
+                        timelineSticksToBottom = atBottom
+                        showScrollDownButton = !atBottom
+                    }
                 }
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.xl)
-                .frame(maxWidth: 920, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
+                if showScrollDownButton {
+                    Button {
+                        timelineSticksToBottom = true
+                        showScrollDownButton = false
+                        withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
+                    } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(DS.Palette.onAccent)
+                            .frame(width: 34, height: 34)
+                            .background(DS.Palette.accent)
+                            .clipShape(Circle())
+                            .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Scroll to latest message")
+                    .help("Scroll to latest message")
+                    .padding(.trailing, DS.Space.xl)
+                    .padding(.bottom, DS.Space.lg)
+                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                }
             }
-            .background(DS.Palette.bg)
-            .onChange(of: vm.messages.count) { _ in withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM") } }
-            .onChange(of: vm.timeline.turns.count) { _ in withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM") } }
-            .onChange(of: vm.status) { _ in withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM") } }
+            .onAppear { scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.focusTick) { _ in scrollTimelineToBottom(proxy, force: true) }
+            .onChange(of: vm.messages.count) { _ in scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.timeline.turns.count) { _ in scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.timelineUpdateTick) { _ in scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.status) { _ in scrollTimelineToBottom(proxy) }
         }
+    }
+
+    private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
+        guard force || timelineSticksToBottom else { return }
+        timelineSticksToBottom = true
+        showScrollDownButton = false
+        withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
     }
 
     // "Working for 2m 21s" + hairline, while a run is in flight.
@@ -899,16 +995,17 @@ public struct AgentAppView: View {
                     .padding(.horizontal, DS.Space.lg)
                     .padding(.top, DS.Space.md)
             }
-            // A4: starts at one line, grows with content up to ~10 lines.
-            TextField("Ask \(vm.provider.rawValue.capitalized) for changes…",
-                      text: $vm.prompt, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...10)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.md)
-                .focused($promptFocused)
+            PromptComposerEditor(
+                text: $vm.prompt,
+                height: $composerEditorHeight,
+                placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
+                isEnabled: vm.status != .running,
+                onSend: { Task { await vm.send() } }
+            )
+            .frame(height: composerEditorHeight)
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.sm)
+            .padding(.bottom, DS.Space.xs)
             composerToolbar
         }
         .background(DS.Palette.surface)
@@ -1108,7 +1205,6 @@ public struct AgentAppView: View {
             lastSelectedThreadId = thread.id
         }
         vm.selectThread(thread.id)
-        promptFocused = true
     }
 
     private func deleteSelectedThreads() {
@@ -1168,6 +1264,147 @@ public struct AgentAppView: View {
     }
 }
 
+enum PromptComposerKeyAction: Equatable {
+    case send
+    case insertNewline
+    case ignore
+
+    static func action(for event: NSEvent) -> PromptComposerKeyAction {
+        guard event.keyCode == 36 || event.keyCode == 76 else { return .ignore }
+        return event.modifierFlags.contains(.shift) ? .insertNewline : .send
+    }
+}
+
+private final class PromptComposerTextView: NSTextView {
+    var onSend: (() -> Void)?
+    var placeholderString: String = "" {
+        didSet { needsDisplay = true }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch PromptComposerKeyAction.action(for: event) {
+        case .send:
+            onSend?()
+        case .insertNewline:
+            insertNewlineIgnoringFieldEditor(self)
+        case .ignore:
+            super.keyDown(with: event)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !placeholderString.isEmpty else { return }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 13),
+            .foregroundColor: DS.NS.textTertiary
+        ]
+        placeholderString.draw(at: NSPoint(x: textContainerInset.width, y: textContainerInset.height), withAttributes: attrs)
+    }
+}
+
+private struct PromptComposerEditor: NSViewRepresentable {
+    static let minHeight: CGFloat = 30
+    static let maxHeight: CGFloat = 132
+
+    @Binding var text: String
+    @Binding var height: CGFloat
+    let placeholder: String
+    let isEnabled: Bool
+    let onSend: () -> Void
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = false
+        scroll.autohidesScrollers = true
+
+        let textView = PromptComposerTextView()
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.allowsUndo = true
+        textView.delegate = context.coordinator
+        textView.font = NSFont.systemFont(ofSize: 13)
+        textView.backgroundColor = .clear
+        textView.textColor = DS.NS.text
+        textView.insertionPointColor = DS.NS.text
+        textView.textContainerInset = NSSize(width: 0, height: 5)
+        textView.minSize = NSSize(width: 0, height: Self.minHeight)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.string = text
+        textView.onSend = onSend
+        textView.placeholderString = placeholder
+        context.coordinator.textView = textView
+        context.coordinator.recalculateHeight()
+        scroll.documentView = textView
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let textView = context.coordinator.textView ?? scroll.documentView as? PromptComposerTextView else { return }
+        textView.onSend = onSend
+        textView.isEditable = isEnabled
+        textView.placeholderString = placeholder
+        if textView.string != text {
+            let selectedRanges = textView.selectedRanges
+            textView.string = text
+            textView.selectedRanges = selectedRanges
+        }
+        context.coordinator.recalculateHeight()
+        scroll.hasVerticalScroller = height >= Self.maxHeight
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, height: $height)
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        @Binding var text: String
+        @Binding var height: CGFloat
+        weak var textView: PromptComposerTextView?
+
+        init(text: Binding<String>, height: Binding<CGFloat>) {
+            _text = text
+            _height = height
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            text = textView.string
+            textView.needsDisplay = true
+            recalculateHeight()
+        }
+
+        func recalculateHeight() {
+            guard let textView else { return }
+            guard let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer else { return }
+            layoutManager.ensureLayout(for: container)
+            let used = layoutManager.usedRect(for: container).height
+            let next = min(PromptComposerEditor.maxHeight,
+                           max(PromptComposerEditor.minHeight, ceil(used + textView.textContainerInset.height * 2)))
+            if abs(height - next) > 0.5 {
+                DispatchQueue.main.async { [weak self] in
+                    self?.height = next
+                }
+            }
+        }
+    }
+}
+
+private struct TimelineBottomPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 private struct AgentThreadDropDelegate: DropDelegate {
     let vm: AgentAppViewModel
     @Binding var draggingThreadId: AgentThreadID?
@@ -1216,7 +1453,10 @@ public final class AgentAppSurface: NSObject, Surface {
         super.init()
     }
 
-    public func focus() { view.window?.makeFirstResponder(view) }
+    public func focus() {
+        viewModel.focusTick &+= 1
+        view.window?.makeFirstResponder(view)
+    }
     public func unfocus() {}
     public func close() {}
     public func sendText(_ text: String) {

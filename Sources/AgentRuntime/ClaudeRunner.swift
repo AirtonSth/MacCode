@@ -69,6 +69,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let parser = ClaudeParser()
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
+        let cancelLock = NSLock()
+        var didCancel = false
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -104,7 +106,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
                 onEvent(.event(ev))
             }
             let status: AgentRunStatus
-            if p.terminationReason == .uncaughtSignal { status = .cancelled }
+            cancelLock.lock()
+            let cancelled = didCancel
+            cancelLock.unlock()
+            if cancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
             else if p.terminationStatus == 0 { status = .completed }
             else { status = .failed }
             onEvent(.status(status))
@@ -121,7 +126,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         return AgentRunHandle(runId: request.runId, process: proc) {
-            if proc.isRunning { proc.terminate() }
+            cancelLock.lock()
+            didCancel = true
+            cancelLock.unlock()
+            ProcessTerminator.terminateTree(proc)
         }
     }
 }

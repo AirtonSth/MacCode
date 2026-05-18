@@ -6,6 +6,8 @@ import DesignSystemKit
 
 @MainActor
 public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
+    public static let defaultInitialURLString = "https://www.remotecode.io/from-app"
+
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     private let webView: WKWebView
@@ -104,22 +106,24 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         reloadButton.target = self; reloadButton.action = #selector(reload)
         tf.target = self; tf.action = #selector(goAddress)
 
-        if let url = initialURL {
-            navigate(to: url)
-        } else {
-            let blank = """
-            <html><body style="background:#0F1419;color:#9DA9B5;font:14px/1.6 -apple-system;display:flex;align-items:center;justify-content:center;height:90vh;margin:0">
-            <div style="text-align:center;max-width:420px">
-            <div style="font-size:34px;margin-bottom:12px">🌐</div>
-            <h2 style="color:#E7EDF3;font-weight:600;font-size:18px">Browser surface</h2>
-            <p>Enter a URL above. Local dev URLs (localhost) and file:// URLs are allowed.</p>
-            </div></body></html>
-            """
-            webView.loadHTMLString(blank, baseURL: nil)
-        }
+        navigate(to: initialURL ?? Self.defaultInitialURL)
+    }
+
+    public static var defaultInitialURL: URL {
+        URL(string: defaultInitialURLString)!
+    }
+
+    static func normalizedInitialURL(_ url: URL?) -> URL {
+        guard let url else { return defaultInitialURL }
+        return isAboutBlank(url) ? defaultInitialURL : url
+    }
+
+    private static func isAboutBlank(_ url: URL) -> Bool {
+        url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "about:blank"
     }
 
     public func navigate(to url: URL) {
+        let url = Self.normalizedInitialURL(url)
         addressBar.stringValue = url.absoluteString
         webView.load(URLRequest(url: url))
         if Self.isGoogleHost(url.host) {

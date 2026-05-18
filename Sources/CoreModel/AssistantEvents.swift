@@ -68,6 +68,9 @@ public struct AssistantTurnSnapshot: Codable, Sendable, Equatable {
 }
 
 public struct AssistantTimelineState: Codable, Sendable, Equatable {
+    public static let liveTextLimit = 80_000
+    public static let liveOutputLimit = 120_000
+
     public var threadId: String?
     public var providerThreadId: String?
     public var turns: [AssistantTurnSnapshot]
@@ -99,8 +102,12 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
         case .itemDelta(let iid, let bodyAppend, let outputAppend, let summary):
             mutateItem(iid) { item in
-                if let b = bodyAppend { item.body += b }
-                if let o = outputAppend { item.output = (item.output ?? "") + o }
+                if let b = bodyAppend {
+                    item.body = Self.cappedText(item.body + b, limit: Self.liveTextLimit)
+                }
+                if let o = outputAppend {
+                    item.output = Self.cappedText((item.output ?? "") + o, limit: Self.liveOutputLimit)
+                }
                 if let s = summary { item.summary = s }
             }
         case .itemState(let iid, let state):
@@ -112,7 +119,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
         case .turnCompleted(let tid, let final):
             if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
-                turns[idx].finalAssistantMessage = final
+                turns[idx].finalAssistantMessage = final.map { Self.cappedText($0, limit: Self.liveTextLimit) }
                 turns[idx].finished = true
             }
         case .error(let m, _):
@@ -133,5 +140,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 return
             }
         }
+    }
+
+    public static func cappedText(_ value: String, limit: Int = liveTextLimit) -> String {
+        guard value.count > limit else { return value }
+        return String(value.suffix(limit))
     }
 }

@@ -26,7 +26,7 @@ public final class SidebarViewModel: ObservableObject {
 
     public func reload() {
         guard let ctx = context else { return }
-        workspaces = ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
+        workspaces = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
     }

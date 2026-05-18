@@ -3,9 +3,9 @@ import CoreModel
 import Persistence
 
 public protocol AgentRunObserver: AnyObject {
-    func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID)
-    func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?)
-    func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID)
+    func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)
+    func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?)
+    func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID)
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
@@ -14,9 +14,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let threadRepo: AgentThreadRepository
     private var providers: [AgentProvider: AgentProviderRunner]
     private var active: [AgentRunID: AgentRunHandle] = [:]
+    private var activeThreads: [AgentThreadID: AgentRunID] = [:]
+    private var pendingThreadStops: Set<AgentThreadID> = []
     private var seq: [AgentRunID: Int] = [:]
     private let lock = NSLock()
-    public weak var observer: AgentRunObserver?
+    private var observerRefs: [WeakAgentRunObserver] = []
+    public var observer: AgentRunObserver? {
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return observerRefs.compactMap(\.value).first
+        }
+        set {
+            if let newValue { addObserver(newValue) }
+        }
+    }
 
     /// GAP-7: bridge agent run lifecycle + timeline to the network event
     /// bus so the iOS mirror receives streaming agent output in real
@@ -41,6 +52,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func replaceProvider(_ provider: AgentProvider, runner: AgentProviderRunner) {
         lock.lock(); defer { lock.unlock() }
         providers[provider] = runner
+    }
+
+    public func addObserver(_ observer: AgentRunObserver) {
+        lock.lock()
+        observerRefs.removeAll { $0.value == nil }
+        if !observerRefs.contains(where: { $0.value === observer }) {
+            observerRefs.append(WeakAgentRunObserver(observer))
+        }
+        lock.unlock()
     }
 
     public func reconcileOnLaunch() throws {
@@ -72,8 +92,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         lock.lock()
         active[runId] = handle
+        activeThreads[request.threadId] = runId
         seq[runId] = 0
+        let shouldCancel = pendingThreadStops.remove(request.threadId) != nil
         lock.unlock()
+        if shouldCancel { handle.cancel() }
         return runId
     }
 
@@ -84,7 +107,23 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         h?.cancel()
     }
 
+    public func stopRun(threadId: AgentThreadID) {
+        lock.lock()
+        let runId = activeThreads[threadId]
+        let handle = runId.flatMap { active[$0] }
+        if handle == nil {
+            pendingThreadStops.insert(threadId)
+        }
+        lock.unlock()
+        handle?.cancel()
+    }
+
+    public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
+        (try? runRepo.listLatestStreamEvents(threadId: threadId)) ?? []
+    }
+
     private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+        let text = AssistantTimelineState.cappedText(text)
         guard !text.isEmpty else { return }
         let existing = (try? messageRepo.list(threadId: threadId)) ?? []
         guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return }
@@ -105,10 +144,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if case .turnCompleted(_, let finalMessage) = ev, let msg = finalMessage {
                 persistAssistantIfMissing(msg, threadId: threadId)
             }
-            observer?.runCoordinator(self, didReceive: ev, run: runId)
+            for observer in observersSnapshot() {
+                observer.runCoordinator(self, didReceive: ev, run: runId, threadId: threadId)
+            }
             onAssistantEvent?(ev, threadId, runId)
         case .status(let st):
-            observer?.runCoordinator(self, didChangeStatus: st, runId: runId)
+            for observer in observersSnapshot() {
+                observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
+            }
         case .finished(let status, let finalMessage, let providerThreadId):
             // persist final assistant message only on success
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
@@ -129,13 +172,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.lock()
             active.removeValue(forKey: runId)
+            activeThreads.removeValue(forKey: threadId)
+            pendingThreadStops.remove(threadId)
             seq.removeValue(forKey: runId)
             lock.unlock()
-            observer?.runCoordinator(self, didFinish: runId, status: status, finalMessage: finalMessage, providerThreadId: providerThreadId)
+            for observer in observersSnapshot() {
+                observer.runCoordinator(self, didFinish: runId, threadId: threadId, status: status, finalMessage: finalMessage, providerThreadId: providerThreadId)
+            }
             onRunFinished?(threadId, runId, status)
         case .error(let m):
-            observer?.runCoordinator(self, didReceive: .error(message: m, recoverable: false), run: runId)
+            for observer in observersSnapshot() {
+                observer.runCoordinator(self, didReceive: .error(message: m, recoverable: false), run: runId, threadId: threadId)
+            }
             onAssistantEvent?(.error(message: m, recoverable: false), threadId, runId)
         }
+    }
+
+    private func observersSnapshot() -> [AgentRunObserver] {
+        lock.lock()
+        observerRefs.removeAll { $0.value == nil }
+        let observers = observerRefs.compactMap(\.value)
+        lock.unlock()
+        return observers
+    }
+}
+
+private final class WeakAgentRunObserver {
+    weak var value: AgentRunObserver?
+
+    init(_ value: AgentRunObserver) {
+        self.value = value
     }
 }

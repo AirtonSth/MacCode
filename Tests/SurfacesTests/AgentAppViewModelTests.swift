@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import Surfaces
 import CoreModel
 import Persistence
@@ -131,20 +132,93 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.createThread(title: "t")
         let id = vm.selectedThreadId!
         let runId = AgentRunID()
-        vm.runCoordinator(vm.coordinator, didFinish: runId, status: .completed,
+        vm.runCoordinator(vm.coordinator, didFinish: runId, threadId: id, status: .completed,
                           finalMessage: "final answer", providerThreadId: "session-1")
         await waitAsync("assistant reply persisted") {
             ((try? vm.messageRepo.list(threadId: id)) ?? []).contains {
                 $0.role == .assistant && $0.content == "final answer"
             }
         }
-        vm.runCoordinator(vm.coordinator, didFinish: runId, status: .completed,
+        vm.runCoordinator(vm.coordinator, didFinish: runId, threadId: id, status: .completed,
                           finalMessage: "final answer", providerThreadId: "session-1")
         await waitAsync("assistant reply remains deduplicated") {
             (((try? vm.messageRepo.list(threadId: id)) ?? []).filter {
                 $0.role == .assistant && $0.content == "final answer"
             }.count) == 1
         }
+    }
+
+    func test_runningStatusTracksRunIdBeforeStartRunReturnsSoStopWorks() async throws {
+        let (vm, _) = try makeVM()
+        let runner = SlowStartRunner()
+        vm.coordinator.replaceProvider(.codex, runner: runner)
+        vm.createThread(title: "slow")
+        vm.prompt = "start slow run"
+
+        Task { await vm.send() }
+        await waitAsync("running status carries run id") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+        vm.stop()
+
+        await waitAsync("pending stop cancels after handle registration") {
+            runner.cancelled
+        }
+    }
+
+    func test_streamEventsFanOutToEveryAgentSurfaceViewingTheThread() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-fanout-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: HoldOpenStreamRunner()]
+        )
+        let workspaceID = WorkspaceID()
+        let firstSurface = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                             coordinator: coordinator, threadRepo: threadRepo,
+                                             messageRepo: messageRepo)
+        let secondSurface = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                              coordinator: coordinator, threadRepo: threadRepo,
+                                              messageRepo: messageRepo)
+        firstSurface.createThread(title: "shared")
+        let threadId = firstSurface.selectedThreadId!
+        secondSurface.reloadThreads()
+        secondSurface.selectThread(threadId)
+
+        firstSurface.prompt = "stream please"
+        await firstSurface.send()
+
+        await waitAsync("sender surface receives live partial stream") {
+            firstSurface.timeline.turns.flatMap(\.items).contains {
+                $0.type == .assistantMessage && $0.body.contains("partial stream")
+            }
+        }
+        await waitAsync("second surface viewing same thread receives live partial stream") {
+            secondSurface.timeline.turns.flatMap(\.items).contains {
+                $0.type == .assistantMessage && $0.body.contains("partial stream")
+            }
+        }
+    }
+
+    func test_promptComposerEnterSendsAndShiftEnterInsertsNewline() {
+        let enter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                     timestamp: 0, windowNumber: 0, context: nil,
+                                     characters: "\r", charactersIgnoringModifiers: "\r",
+                                     isARepeat: false, keyCode: 36)!
+        let shiftEnter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.shift],
+                                          timestamp: 0, windowNumber: 0, context: nil,
+                                          characters: "\r", charactersIgnoringModifiers: "\r",
+                                          isARepeat: false, keyCode: 36)!
+
+        XCTAssertEqual(PromptComposerKeyAction.action(for: enter), .send,
+                       "plain Enter must send the prompt")
+        XCTAssertEqual(PromptComposerKeyAction.action(for: shiftEnter), .insertNewline,
+                       "Shift+Enter must keep editing and insert a line break")
     }
 
     // MARK: B2 — slash commands
@@ -281,6 +355,22 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertFalse(vm.hasMoreOlder, "nothing older remains once all are loaded")
     }
 
+    func test_loadWindowClipsHugePersistedMessagesBeforeRendering() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "huge")
+        let tid = vm.selectedThreadId!
+        try vm.messageRepo.append(AgentMessage(
+            threadId: tid,
+            role: .assistant,
+            content: String(repeating: "x", count: AssistantTimelineState.liveTextLimit + 10)
+        ))
+
+        vm.selectThread(tid)
+
+        XCTAssertEqual(vm.messages.first?.content.count, AssistantTimelineState.liveTextLimit,
+                       "a huge persisted transcript must be clipped before SwiftUI renders it")
+    }
+
     // MARK: B3 — composer attachments
 
     func test_attachments_addDedupesAndRemove() throws {
@@ -323,6 +413,67 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(assistants.count, 1, "the assistant reply must be persisted exactly once, not double-written")
     }
 
+    func test_completedSelectedRunKeepsLiveTimelineVisible() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-completed-timeline-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: HoldOpenStreamRunner()]
+        )
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coordinator, threadRepo: threadRepo,
+                                   messageRepo: messageRepo)
+        vm.createThread(title: "live")
+        vm.prompt = "stream please"
+        await vm.send()
+
+        await waitAsync("run completes") { vm.status == .completed }
+
+        XCTAssertTrue(vm.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage && $0.body.contains("partial stream")
+        }, "the completed selected run must keep live stream/history items visible instead of collapsing to the final answer only")
+    }
+
+    func test_selectThreadReplaysPersistedStreamHistoryWithoutDuplicatingFinalAnswer() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-replay-timeline-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: HoldOpenStreamRunner()]
+        )
+        let workspaceID = WorkspaceID()
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                   coordinator: coordinator, threadRepo: threadRepo,
+                                   messageRepo: messageRepo)
+        vm.createThread(title: "live")
+        let streamedThread = vm.selectedThreadId!
+        vm.prompt = "stream please"
+        await vm.send()
+        await waitAsync("run completes") { vm.status == .completed }
+
+        vm.createThread(title: "other")
+        let reloadedVM = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                           coordinator: coordinator, threadRepo: threadRepo,
+                                           messageRepo: messageRepo)
+        reloadedVM.selectThread(streamedThread)
+
+        XCTAssertTrue(reloadedVM.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage && $0.body.contains("partial stream")
+        }, "reopening a thread must replay persisted stream items, not just show the final answer")
+        XCTAssertEqual(reloadedVM.messages.filter { $0.role == .assistant && $0.content == "partial stream final" }.count, 0,
+                       "the persisted final answer must not duplicate the replayed assistant stream")
+    }
+
     /// Regression: the VM defaulted to "gpt-5" — a dead id on codex
     /// 0.130.0, so a brand-new Codex thread's first run failed with no
     /// output. The default must be a model the CLI actually accepts.
@@ -332,5 +483,53 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.loadModels()
         XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
                       "the default model must be one the picker actually offers")
+    }
+}
+
+private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let lock = NSLock()
+    private var _cancelled = false
+    var cancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _cancelled
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        onEvent(.status(.running))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+            self?.lock.lock()
+            self?._cancelled = true
+            self?.lock.unlock()
+        }
+    }
+}
+
+private final class HoldOpenStreamRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        Task.detached {
+            let turnId = UUID().uuidString
+            let itemId = UUID().uuidString
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            onEvent(.status(.running))
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: turnId)))
+            onEvent(.event(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, startedAtMs: now))))
+            onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: "partial stream", outputAppend: nil, summary: nil)))
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+            onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "partial stream final")))
+            onEvent(.status(.completed))
+            onEvent(.finished(.completed, finalMessage: "partial stream final", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 }

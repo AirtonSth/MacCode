@@ -47,6 +47,35 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(updated.layout.paneIDs().count, 2)
     }
 
+    func test_sidebarWorkspaceRowsRollUpRunningThreads() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "busy", cwd: NSTemporaryDirectory())
+        var thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
+        thread.status = .running
+        try ctx.threadRepo.upsert(thread)
+
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.reload()
+
+        XCTAssertEqual(vm.workspaces.first(where: { $0.id == ws.id })?.metadata["busy"], "true",
+                       "a running agent thread must put the same spinner state on the workspace row, even before the Agent tab is rebuilt")
+    }
+
+    func test_agentSurfaceBusyRollsUpRunningThreadForTabSpinner() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "tab-busy", cwd: NSTemporaryDirectory())
+        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
+        let agent = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? AgentAppSurface)
+        var thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
+        thread.status = .running
+        try ctx.threadRepo.upsert(thread)
+
+        agent.viewModel.reloadThreads()
+
+        XCTAssertTrue(agent.isBusy,
+                      "the tab strip reads AgentAppSurface.isBusy, so running threads must turn the Agent App tab into a spinner")
+    }
+
     func test_splitHorizontal_and_splitVertical_orientations() throws {
         let (ctx, router) = try makeContext()
         // Horizontal split → side-by-side (orientation .horizontal)

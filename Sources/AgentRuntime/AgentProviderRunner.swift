@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CoreModel
 
 public enum AgentRunEvent: Sendable {
@@ -27,5 +28,40 @@ public final class AgentRunHandle: @unchecked Sendable {
 
     public func cancel() {
         cancelHandler()
+    }
+}
+
+enum ProcessTerminator {
+    static func terminateTree(_ process: Process) {
+        let root = process.processIdentifier
+        for pid in childPIDs(of: root).reversed() {
+            kill(pid, SIGTERM)
+        }
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
+    private static func childPIDs(of pid: Int32) -> [Int32] {
+        let direct = directChildPIDs(of: pid)
+        return direct + direct.flatMap(childPIDs(of:))
+    }
+
+    private static func directChildPIDs(of pid: Int32) -> [Int32] {
+        let p = Process()
+        let out = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-P", "\(pid)"]
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+        } catch {
+            return []
+        }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        return text.split(whereSeparator: \.isNewline).compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
     }
 }

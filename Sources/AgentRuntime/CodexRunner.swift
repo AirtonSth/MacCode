@@ -110,6 +110,8 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let parser = CodexParser()
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
+        let cancelLock = NSLock()
+        var didCancel = false
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -125,8 +127,8 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             let data = handle.availableData
             if data.isEmpty { return }
             let s = String(data: data, encoding: .utf8) ?? ""
-            if !s.isEmpty {
-                onEvent(.error("[codex stderr] " + s))
+            if let visible = Self.displayableStderr(s) {
+                onEvent(.error("[codex stderr] " + visible))
             }
         }
 
@@ -145,7 +147,10 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
                 }
             }
             let status: AgentRunStatus
-            if p.terminationReason == .uncaughtSignal { status = .cancelled }
+            cancelLock.lock()
+            let cancelled = didCancel
+            cancelLock.unlock()
+            if cancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
             else if p.terminationStatus == 0 { status = .completed }
             else { status = .failed }
             let finalMsg = timeline.finalAssistantMessage
@@ -163,8 +168,25 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         return AgentRunHandle(runId: request.runId, process: proc) {
-            if proc.isRunning { proc.terminate() }
+            cancelLock.lock()
+            didCancel = true
+            cancelLock.unlock()
+            ProcessTerminator.terminateTree(proc)
         }
+    }
+
+    public static func shouldDisplayStderr(_ raw: String) -> Bool {
+        displayableStderr(raw) != nil
+    }
+
+    public static func displayableStderr(_ raw: String) -> String? {
+        let kept = raw.split(whereSeparator: \.isNewline).map(String.init).filter { line in
+            let lower = line.lowercased()
+            return !(lower.contains(" warn ") && lower.contains("codex"))
+                && !lower.contains("reading additional input from stdin")
+        }
+        let text = kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 }
 

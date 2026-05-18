@@ -93,7 +93,7 @@ public final class AppContext {
                 if let f = final { p["final"] = .string(f) }
                 EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
             case .error:
-                EventBus.shared.publish(kind: "agent.run.failed", payload: agentRunPayload(threadId: tid))
+                EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid))
             }
         }
         coordinator.onRunFinished = { tid, _, status in
