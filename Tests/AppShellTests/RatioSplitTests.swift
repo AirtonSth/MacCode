@@ -100,4 +100,31 @@ final class RatioSplitTests: XCTestCase {
         XCTAssertEqual(surface.frame.width, pane.bounds.width, accuracy: 0.5,
                        "pane content must relayout immediately after a split changes pane width, or terminal text can bleed into neighboring panes")
     }
+
+    func test_ratioSplitView_collapsedStackedPaneKeepsOnlyTabRowHeight() {
+        let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 300, height: 500))
+        sv.isVertical = false
+        sv.ratios = [0.04, 0.96]
+        sv.addSubview(NSView())
+        sv.addSubview(NSView())
+        sv.adjustSubviews()
+
+        XCTAssertEqual(sv.subviews[0].frame.height, 35, accuracy: 0.5,
+                       "a minimized stacked split pane must collapse to the tab-row height instead of showing content")
+        XCTAssertEqual(sv.subviews[0].frame.width, 300, accuracy: 0.5)
+        XCTAssertGreaterThan(sv.subviews[1].frame.height, 450)
+    }
+
+    func test_ratioSplitView_collapsedSideBySidePaneKeepsUsableTabStripWidth() {
+        let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        sv.isVertical = true
+        sv.ratios = [0.04, 0.96]
+        sv.addSubview(NSView())
+        sv.addSubview(NSView())
+        sv.adjustSubviews()
+
+        XCTAssertEqual(sv.subviews[0].frame.width, 180, accuracy: 0.5,
+                       "a minimized side-by-side split pane must leave enough width for tabs and the restore control")
+        XCTAssertGreaterThan(sv.subviews[1].frame.width, 400)
+    }
 }

@@ -82,9 +82,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("Failed to start socket server: \(error)")
         }
 
-        // Start direct HTTP server bound to loopback by default.
-        let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
-        let loopbackOnly = remoteEnabled != "1"
         let trustRepo = DeviceTrustRepository(db: context.db)
         let auth = LocalAuthAdapter(repo: trustRepo)
         authProvider = auth   // GAP-5: retain for process lifetime
@@ -96,29 +93,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         auth.onPairingRequest = { [weak self] prompt in
             DispatchQueue.main.async { self?.presentPairingPrompt(prompt) }
         }
-        // GAP-2: a stable host identity persisted across launches so the
-        // mobile client's identity pin (RCA-022) does not break on every
-        // restart and force a re-pair.
-        let stableServerId: String
-        if let existing = (try? context.settingsRepo.get("server_id")) ?? nil, !existing.isEmpty {
-            stableServerId = existing
-        } else {
-            let fresh = UUID().uuidString
-            try? context.settingsRepo.set("server_id", fresh)
-            stableServerId = fresh
-        }
-        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly, dispatcher: dispatcher, auth: auth, serverId: stableServerId)
-        do {
-            try http.start()
-            httpServer = http
-            NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
-        } catch {
-            NSLog("Failed to start HTTP server: \(error)")
-        }
-
-        // GAP-4: advertise on the LAN via Bonjour so the mobile app can
-        // auto-detect this Mac without manual IP entry.
-        publishBonjour(serverId: stableServerId)
+        NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
+                                               name: .rc2RemoteAccessSettingChanged, object: nil)
+        configureDirectAccess()
 
         palette = CommandPalette(router: router)
         settings = SettingsWindowController(context: context)
@@ -133,6 +110,51 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         socketServer?.stop()
         httpServer?.stop()
         bonjour?.stop()
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func remoteAccessSettingChanged() {
+        configureDirectAccess()
+    }
+
+    private func configureDirectAccess() {
+        httpServer?.stop()
+        httpServer = nil
+        bonjour?.stop()
+        bonjour = nil
+
+        guard let context, let router, let auth = localAuth else { return }
+        let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
+        let loopbackOnly = remoteEnabled != "1"
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let serverId = stableServerId()
+        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly,
+                                    dispatcher: dispatcher, auth: auth, serverId: serverId)
+        do {
+            try http.start()
+            httpServer = http
+            NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
+        } catch {
+            NSLog("Failed to start HTTP server: \(error)")
+        }
+
+        if loopbackOnly {
+            NSLog("Bonjour not published: remote access is disabled")
+        } else {
+            publishBonjour(serverId: serverId)
+        }
+    }
+
+    /// GAP-2: a stable host identity persisted across launches so the
+    /// mobile client's identity pin (RCA-022) does not break on every
+    /// restart and force a re-pair.
+    private func stableServerId() -> String {
+        if let existing = (try? context.settingsRepo.get("server_id")) ?? nil, !existing.isEmpty {
+            return existing
+        }
+        let fresh = UUID().uuidString
+        try? context.settingsRepo.set("server_id", fresh)
+        return fresh
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

@@ -5,6 +5,10 @@ import CoreModel
 import Persistence
 import DesignSystemKit
 
+extension Notification.Name {
+    static let rc2RemoteAccessSettingChanged = Notification.Name("rc2RemoteAccessSettingChanged")
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -37,6 +41,7 @@ public final class SettingsViewModel: ObservableObject {
     public func setRemoteAccess(_ on: Bool) {
         remoteAccessEnabled = on
         try? settingsRepo.set("remote_access_enabled", on ? "1" : "0")
+        NotificationCenter.default.post(name: .rc2RemoteAccessSettingChanged, object: nil)
     }
 
     public func setDefaultProvider(_ p: AgentProvider) {

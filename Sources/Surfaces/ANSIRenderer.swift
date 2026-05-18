@@ -244,7 +244,17 @@ public final class ANSIRenderer {
     private func parseParams() -> [Int] {
         let trimmed = csiParams.replacingOccurrences(of: "?", with: "").replacingOccurrences(of: ">", with: "")
         if trimmed.isEmpty { return [] }
-        return trimmed.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+        var values: [Int] = []
+        for segment in trimmed.split(separator: ";", omittingEmptySubsequences: false) {
+            if segment.contains(":") {
+                for part in segment.split(separator: ":", omittingEmptySubsequences: false) where !part.isEmpty {
+                    values.append(Int(part) ?? 0)
+                }
+            } else {
+                values.append(Int(segment) ?? 0)
+            }
+        }
+        return values
     }
 
     private func clear(fromRow: Int, fromCol: Int, toEnd: Bool) {
@@ -350,7 +360,7 @@ public final class ANSIRenderer {
 
     public func snapshot() -> NSAttributedString {
         let out = NSMutableAttributedString()
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let font = DS.NS.terminalFont()
         let curRow = cursorRow
         let curCol = min(cursorCol, cols - 1)
         for (i, row) in grid.enumerated() {
@@ -378,7 +388,7 @@ public final class ANSIRenderer {
                 var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: fg, .backgroundColor: bg]
                 if cell.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
                 if cell.bold {
-                    attrs[.font] = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+                    attrs[.font] = DS.NS.terminalFont(weight: .bold)
                 }
                 out.append(NSAttributedString(string: String(cell.ch), attributes: attrs))
             }

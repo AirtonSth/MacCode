@@ -57,9 +57,22 @@ public enum DS {
         public static let success       = NSColor(hex: 0x8EE6A8)
         public static let warning       = NSColor(hex: 0xFFD37A)
         public static let danger        = NSColor(hex: 0xFF8F8F)
-        // Terminal palette (slightly brighter than chrome text)
-        public static let terminalBG    = NSColor(hex: 0x0B0F14)
-        public static let terminalFG    = NSColor(hex: 0xD8DEE6)
+        // Terminal palette: closer to Terminal.app's dark profile than app chrome.
+        public static let terminalBG    = NSColor(hex: 0x20242E)
+        public static let terminalFG    = NSColor(hex: 0xF2F2F2)
+
+        public static func terminalFont(weight: NSFont.Weight = .regular) -> NSFont {
+            if weight == .bold, let font = NSFont(name: "Menlo-Bold", size: 12) {
+                return font
+            }
+            if let font = NSFont(name: "Menlo-Regular", size: 12) {
+                return font
+            }
+            if let font = NSFont(name: "Menlo", size: 12) {
+                return font
+            }
+            return NSFont.monospacedSystemFont(ofSize: 12, weight: weight)
+        }
     }
 
     // MARK: Spacing — 4/8 rhythm

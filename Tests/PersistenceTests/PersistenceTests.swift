@@ -21,6 +21,15 @@ final class PersistenceTests: XCTestCase {
         XCTAssertTrue(threads.isEmpty)
     }
 
+    func test_bootstrapDefaultsRemoteAccessOffUntilExplicitOptIn() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+
+        let value = try SettingsRepository(db: db).get("remote_access_enabled")
+        XCTAssertEqual(value, "0", "LAN pairing must require explicit opt-in before the Mac advertises itself.")
+    }
+
     func test_schemaIsIdempotent() throws {
         let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }

@@ -5,17 +5,34 @@ import Surfaces
 import DesignSystemKit
 
 @MainActor
+public struct PaneSplitContext {
+    public let splitID: UUID
+    public let paneIndex: Int
+    public let ratios: [Double]
+    public let orientation: SplitOrientation
+
+    public init(splitID: UUID, paneIndex: Int, ratios: [Double], orientation: SplitOrientation = .horizontal) {
+        self.splitID = splitID
+        self.paneIndex = paneIndex
+        self.ratios = ratios
+        self.orientation = orientation
+    }
+}
+
+@MainActor
 public final class PaneTabsView: NSObject {
     public let view: NSView
     public let pane: PaneNode
     public weak var router: AppCommandRouter?
+    private let splitContext: PaneSplitContext?
     private let tabStrip = PaneTabDropStack()
     private let contentArea = NSView()
     private let addMenu = NSMenu()
 
-    public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true) {
+    public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil) {
         self.pane = pane
         self.router = router
+        self.splitContext = splitContext
         let v = PaneRootView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
@@ -57,11 +74,16 @@ public final class PaneTabsView: NSObject {
             )
             tabStrip.addArrangedSubview(tab)
         }
+        let paneMinimized = splitContext.map {
+            Self.isPaneMinimized(paneIndex: $0.paneIndex, ratios: $0.ratios)
+        } ?? false
+
         // Content area: the selected surface (or a styled placeholder).
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         contentArea.wantsLayer = true
         contentArea.layer?.backgroundColor = DS.NS.bg.cgColor
         contentArea.layer?.masksToBounds = true
+        contentArea.isHidden = paneMinimized
         if let selID = selectedID, let surface = SurfaceRegistry.shared.surface(selID) {
             let sv = surface.view
             sv.translatesAutoresizingMaskIntoConstraints = false
@@ -120,7 +142,17 @@ public final class PaneTabsView: NSObject {
             help: "Split down (stacked)",
             target: self, action: #selector(splitVertical))
 
-        let rightCluster = NoDragStack(views: [splitColumns, splitRows])
+        var rightControls: [NSView] = [splitColumns, splitRows]
+        if let splitContext {
+            let minimized = Self.isPaneMinimized(paneIndex: splitContext.paneIndex, ratios: splitContext.ratios)
+            let paneZoom = Self.makeIconButton(
+                symbol: minimized ? "arrow.up.left.and.arrow.down.right" : "minus",
+                help: minimized ? "Maximize pane" : "Minimize pane",
+                target: self, action: #selector(togglePaneMinimized))
+            rightControls.insert(paneZoom, at: 0)
+        }
+
+        let rightCluster = NoDragStack(views: rightControls)
         rightCluster.orientation = .horizontal
         rightCluster.spacing = DS.Space.sm
         rightCluster.translatesAutoresizingMaskIntoConstraints = false
@@ -281,6 +313,46 @@ public final class PaneTabsView: NSObject {
     public func performSplit(_ direction: SplitDirection, type: SurfaceType, title: String) -> SurfaceDescriptor? {
         guard let wid = currentWorkspaceID() else { return nil }
         return try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
+    }
+
+    @discardableResult
+    public func performTogglePaneMinimized() -> Bool {
+        guard let wid = currentWorkspaceID(), let splitContext else { return false }
+        let ratios = Self.toggledPaneMinimizedRatios(paneIndex: splitContext.paneIndex, ratios: splitContext.ratios)
+        do {
+            try router?.paneResize(workspace: wid, splitID: splitContext.splitID, ratios: ratios)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @objc private func togglePaneMinimized() {
+        _ = performTogglePaneMinimized()
+    }
+
+    public static func toggledPaneMinimizedRatios(paneIndex: Int, ratios: [Double]) -> [Double] {
+        guard ratios.indices.contains(paneIndex), ratios.count > 1 else { return ratios }
+        if isPaneMinimized(paneIndex: paneIndex, ratios: ratios) {
+            return Array(repeating: 1.0 / Double(ratios.count), count: ratios.count)
+        }
+        let minimized = 0.04
+        let remaining = 1.0 - minimized
+        let otherTotal = ratios.indices
+            .filter { $0 != paneIndex }
+            .map { ratios[$0] }
+            .reduce(0, +)
+        return ratios.indices.map {
+            if $0 == paneIndex { return minimized }
+            guard otherTotal > 0 else { return remaining / Double(ratios.count - 1) }
+            return remaining * ratios[$0] / otherTotal
+        }
+    }
+
+    public static func isPaneMinimized(paneIndex: Int, ratios: [Double]) -> Bool {
+        guard ratios.indices.contains(paneIndex) else { return false }
+        let normalized = SplitNode.normalize(ratios)
+        return normalized[paneIndex] <= 0.08
     }
 
     /// Testable drop-position math. The index is the count of tab

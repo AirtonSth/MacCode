@@ -527,7 +527,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         return v
     }
 
-    private func buildLayoutView(node: LayoutNode, primaryControlsAvailable: inout Bool) -> NSView {
+    private func buildLayoutView(node: LayoutNode, primaryControlsAvailable: inout Bool, splitContext: PaneSplitContext? = nil) -> NSView {
         switch node {
         case .pane(let p):
             let showsWorkspaceControls = primaryControlsAvailable
@@ -535,7 +535,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             let ptv = PaneTabsView(
                 pane: p,
                 router: router,
-                showsWorkspaceControls: showsWorkspaceControls
+                showsWorkspaceControls: showsWorkspaceControls,
+                splitContext: splitContext
             )
             paneControllers.append(ptv)
             return ptv.view
@@ -544,8 +545,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             split.isVertical = (s.orientation == .horizontal)
             split.dividerStyle = .thin
             split.ratios = s.ratios.map { CGFloat($0) }
-            for child in s.children {
-                let cv = buildLayoutView(node: child, primaryControlsAvailable: &primaryControlsAvailable)
+            for (index, child) in s.children.enumerated() {
+                let childSplitContext = PaneSplitContext(splitID: s.id, paneIndex: index, ratios: s.ratios, orientation: s.orientation)
+                let cv = buildLayoutView(node: child, primaryControlsAvailable: &primaryControlsAvailable, splitContext: childSplitContext)
                 // Frame-managed (NOT arranged / NOT autolayout): the
                 // RatioSplitView owns every subview frame so the split
                 // is exactly proportional.
@@ -582,6 +584,8 @@ final class RatioSplitView: NSView {
     var isVertical = true { didSet { needsLayout = true } }
     var dividerStyle: NSSplitView.DividerStyle = .thin
     var dividerThickness: CGFloat { 1 }
+    private let collapsedRatioThreshold: CGFloat = 0.08
+    private var collapsedExtent: CGFloat { isVertical ? 180 : 35 }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -622,22 +626,48 @@ final class RatioSplitView: NSView {
             return Array(repeating: 1.0 / CGFloat(n), count: n)
         }()
 
+        let collapsed = Set(norm.indices.filter { norm[$0] <= collapsedRatioThreshold && n > 1 })
+
         if isVertical {
-            let avail = max(0, bounds.width - dt * CGFloat(n - 1))
+            let fixed = min(bounds.width, CGFloat(collapsed.count) * collapsedExtent)
+            let avail = max(0, bounds.width - dt * CGFloat(n - 1) - fixed)
+            let flexibleTotal = norm.indices
+                .filter { !collapsed.contains($0) }
+                .map { norm[$0] }
+                .reduce(0, +)
             var x: CGFloat = 0
             for (i, sv) in subviews.enumerated() {
-                let w = (i == n - 1) ? max(0, bounds.width - x)
-                                     : (avail * norm[i]).rounded()
+                let w: CGFloat
+                if collapsed.contains(i) {
+                    w = min(collapsedExtent, max(0, bounds.width - x))
+                } else if i == n - 1 {
+                    w = max(0, bounds.width - x)
+                } else {
+                    let share = flexibleTotal > 0 ? norm[i] / flexibleTotal : 1.0 / CGFloat(max(1, n - collapsed.count))
+                    w = (avail * share).rounded()
+                }
                 sv.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
                 relayoutChild(sv)
                 x += w + dt
             }
         } else {
-            let avail = max(0, bounds.height - dt * CGFloat(n - 1))
+            let fixed = min(bounds.height, CGFloat(collapsed.count) * collapsedExtent)
+            let avail = max(0, bounds.height - dt * CGFloat(n - 1) - fixed)
+            let flexibleTotal = norm.indices
+                .filter { !collapsed.contains($0) }
+                .map { norm[$0] }
+                .reduce(0, +)
             var y: CGFloat = bounds.height
             for (i, sv) in subviews.enumerated() {
-                let h = (i == n - 1) ? max(0, y)
-                                     : (avail * norm[i]).rounded()
+                let h: CGFloat
+                if collapsed.contains(i) {
+                    h = min(collapsedExtent, max(0, y))
+                } else if i == n - 1 {
+                    h = max(0, y)
+                } else {
+                    let share = flexibleTotal > 0 ? norm[i] / flexibleTotal : 1.0 / CGFloat(max(1, n - collapsed.count))
+                    h = (avail * share).rounded()
+                }
                 y -= h
                 sv.frame = NSRect(x: 0, y: y, width: bounds.width, height: h)
                 relayoutChild(sv)

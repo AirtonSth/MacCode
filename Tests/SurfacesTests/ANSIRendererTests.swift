@@ -44,6 +44,34 @@ final class ANSIRendererTests: XCTestCase {
         XCTAssertEqual(r.grid[0][1].fg, ANSIRenderer.Cell.defaultFG)
     }
 
+    func test_colonSeparatedTrueColorSGR_isRenderedLikeModernTerminals() {
+        let r = ANSIRenderer(rows: 1, cols: 10)
+        r.showCursor = false
+
+        r.feed("\u{1B}[38:2::255:128:64mR\u{1B}[0mX".data(using: .utf8)!)
+
+        XCTAssertEqual(r.grid[0][0].ch, "R")
+        assertColor(r.grid[0][0].fg, red: 255, green: 128, blue: 64)
+        XCTAssertEqual(r.grid[0][1].ch, "X")
+        XCTAssertEqual(r.grid[0][1].fg, ANSIRenderer.Cell.defaultFG)
+    }
+
+    func test_snapshotPreservesForegroundAndBackgroundColors() {
+        let r = ANSIRenderer(rows: 1, cols: 10)
+        r.showCursor = false
+
+        r.feed("\u{1B}[38;5;208;48;2;32;36;48mA".data(using: .utf8)!)
+
+        let attrs = r.snapshot().attributes(at: 0, effectiveRange: nil)
+        let fg = attrs[.foregroundColor] as? NSColor
+        let bg = attrs[.backgroundColor] as? NSColor
+        XCTAssertNotNil(fg)
+        XCTAssertNotNil(bg)
+        XCTAssertNotEqual(fg, ANSIRenderer.Cell.defaultFG,
+                          "ANSI foreground must survive into NSTextView attributes, not collapse to plain text")
+        assertColor(bg, red: 32, green: 36, blue: 48)
+    }
+
     func test_carriageReturn_overwrites() {
         let r = ANSIRenderer(rows: 1, cols: 10)
         r.feed("abc\rXY".data(using: .utf8)!)
@@ -82,5 +110,15 @@ final class ANSIRendererTests: XCTestCase {
 
         XCTAssertLessThan(cursorOffset, (snap.string as NSString).length - 3,
                           "terminal panes must scroll the cursor into view, not scroll to trailing blank rows")
+    }
+
+    private func assertColor(_ color: NSColor?, red: CGFloat, green: CGFloat, blue: CGFloat, file: StaticString = #filePath, line: UInt = #line) {
+        guard let srgb = color?.usingColorSpace(.sRGB) else {
+            XCTFail("expected sRGB color", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(srgb.redComponent, red / 255.0, accuracy: 0.01, file: file, line: line)
+        XCTAssertEqual(srgb.greenComponent, green / 255.0, accuracy: 0.01, file: file, line: line)
+        XCTAssertEqual(srgb.blueComponent, blue / 255.0, accuracy: 0.01, file: file, line: line)
     }
 }

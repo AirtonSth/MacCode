@@ -127,11 +127,15 @@ public final class TerminalSurface: NSObject, Surface {
         let tv = TerminalTextView()
         tv.isEditable = false
         tv.isSelectable = true
-        tv.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.font = DS.NS.terminalFont()
         tv.backgroundColor = DS.NS.terminalBG
         tv.textColor = DS.NS.terminalFG
         tv.drawsBackground = true
         tv.insertionPointColor = DS.NS.terminalFG
+        tv.selectedTextAttributes = [
+            .backgroundColor: DS.NS.accent.withAlphaComponent(0.26),
+            .foregroundColor: DS.NS.terminalFG
+        ]
         tv.isAutomaticQuoteSubstitutionEnabled = false
         tv.isAutomaticDashSubstitutionEnabled = false
         tv.isAutomaticTextReplacementEnabled = false
@@ -139,7 +143,7 @@ public final class TerminalSurface: NSObject, Surface {
         tv.minSize = NSSize(width: 0, height: 0)
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
-        tv.textContainerInset = NSSize(width: 6, height: 6)
+        tv.textContainerInset = NSSize(width: 10, height: 10)
         tv.textContainer?.widthTracksTextView = true
         scroll.documentView = tv
         self.textView = tv
@@ -174,8 +178,14 @@ public final class TerminalSurface: NSObject, Surface {
         if pid == 0 {
             _ = chdir(cwd)
             setenv("TERM", "xterm-256color", 1)
+            setenv("COLORTERM", "truecolor", 1)
+            setenv("CLICOLOR", "1", 1)
+            setenv("TERM_PROGRAM", "RemoteCode", 1)
             setenv("RC2_WORKSPACE_ID", workspaceID.value.uuidString, 1)
             setenv("RC2_SURFACE_ID", descriptor.id.value.uuidString, 1)
+            if getenv("LANG") == nil {
+                setenv("LANG", "en_US.UTF-8", 1)
+            }
             let shellName = (shell as NSString).lastPathComponent
             shell.withCString { sPath in
                 ("-" + shellName).withCString { argv0 in

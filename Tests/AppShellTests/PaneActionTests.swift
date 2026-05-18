@@ -68,6 +68,53 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(sV.orientation, .vertical)
     }
 
+    func test_togglePaneMinimized_hidesCurrentPaneContent_thenRestoresSplit() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "minimize", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail() }
+
+        let root = PaneTabsView(pane: pane, router: router)
+        XCTAssertNotNil(root.performSplit(.right, type: .browser, title: "browser"))
+        guard case .split(let split) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+
+        let leftPane = try XCTUnwrap(split.children.first?.find(paneID: pane.id))
+        let minimize = PaneTabsView(
+            pane: leftPane,
+            router: router,
+            splitContext: PaneSplitContext(splitID: split.id, paneIndex: 0, ratios: split.ratios)
+        )
+        XCTAssertTrue(minimize.performTogglePaneMinimized(),
+                      "minimizing a pane must resize the owning split, not create a new surface")
+
+        guard case .split(let minimized) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertLessThan(minimized.ratios[0], 0.1)
+        XCTAssertGreaterThan(minimized.ratios[1], 0.9)
+
+        let restore = PaneTabsView(
+            pane: leftPane,
+            router: router,
+            splitContext: PaneSplitContext(splitID: minimized.id, paneIndex: 0, ratios: minimized.ratios)
+        )
+        XCTAssertTrue(restore.performTogglePaneMinimized(),
+                      "clicking the minimized pane control must restore a usable split")
+
+        guard case .split(let restored) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(restored.ratios[0], 0.5, accuracy: 0.0001)
+        XCTAssertEqual(restored.ratios[1], 0.5, accuracy: 0.0001)
+    }
+
+    func test_togglePaneRatios_encodesMinimizeAndRestoreIntent() {
+        let minimized = PaneTabsView.toggledPaneMinimizedRatios(paneIndex: 1, ratios: [0.25, 0.25, 0.5])
+        XCTAssertLessThan(minimized[1], 0.1,
+                          "minimizing one pane should leave it as a tab strip while siblings keep the usable content area")
+        XCTAssertGreaterThan(minimized[0], 0.1)
+        XCTAssertGreaterThan(minimized[2], 0.1)
+
+        let restored = PaneTabsView.toggledPaneMinimizedRatios(paneIndex: 1, ratios: minimized)
+        XCTAssertEqual(restored, [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+                       "restoring a minimized pane should return the split to usable equal panes")
+    }
+
     func test_surfaceChoices_haveSixDistinctTypes() {
         let types = PaneTabsView.surfaceChoices.map { $0.1 }
         XCTAssertEqual(Set(types).count, types.count)
@@ -189,6 +236,8 @@ final class PaneActionTests: XCTestCase {
                        "sidebar toggling belongs in the sidebar header, not pane tabs")
         XCTAssertFalse(tooltips.contains("Open Git (changed files & diff)"),
                        "Git is created from the + menu as a tab, not from a persistent pane header button")
+        XCTAssertFalse(tooltips.contains("Minimize pane"),
+                       "pane zoom is shown only for panes that are inside a split")
         XCTAssertTrue(tooltips.contains("Split right (side by side)"))
         XCTAssertTrue(tooltips.contains("Split down (stacked)"))
     }
