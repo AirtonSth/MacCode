@@ -190,6 +190,30 @@ final class FakeRouter: CommandRouting {
         Dictionary(uniqueKeysWithValues: keys.map { ($0, settings[$0] ?? "") })
     }
     func settingsSet(key: String, value: String) throws { settings[key] = value }
+    var filesState: [String: JSONValue] = [:]
+    func filesStateGet(surface: SurfaceID) throws -> JSONValue {
+        .object(filesState.isEmpty ? [
+            "surface_id": .string(surface.value.uuidString),
+            "revision": .number(0),
+            "dirty_paths": .array([])
+        ] : filesState)
+    }
+    func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue {
+        for (key, value) in patch { filesState[key] = value }
+        filesState["surface_id"] = .string(surface.value.uuidString)
+        filesState["revision"] = .number(Double((filesState["revision"]?.intValue ?? 0) + 1))
+        return .object(filesState)
+    }
+    func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue { try WorkspaceFileService().list(root: projectCwd, path: path) }
+    func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue { try WorkspaceFileService().read(root: projectCwd, path: path, maxBytes: maxBytes) }
+    func fsWorkspacePreviewURL(workspace: WorkspaceID, path: String) throws -> JSONValue { try WorkspaceFileService().previewURL(root: projectCwd, path: path) }
+    func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue { try FileEditSessionStore.shared.open(surfaceID: surface, workspaceID: WorkspaceID(), root: projectCwd, path: path) }
+    func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
+        try FileEditSessionStore.shared.applyPatch(sessionID: sessionID, baseDraftRevision: baseDraftRevision, rangeLocation: rangeLocation, rangeLength: rangeLength, replacement: replacement, deviceID: deviceID)
+    }
+    func filesEditSave(sessionID: String) throws -> JSONValue { try FileEditSessionStore.shared.save(sessionID: sessionID) }
+    func filesEditDiscard(sessionID: String) throws -> JSONValue { try FileEditSessionStore.shared.discard(sessionID: sessionID) }
+    func filesEditClose(sessionID: String) throws -> JSONValue { try FileEditSessionStore.shared.close(sessionID: sessionID) }
     func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]] { [] }
     func paneSurfaces(pane: PaneID, workspace: WorkspaceID) throws -> [SurfaceDescriptor] { [] }
     func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {}
@@ -212,6 +236,35 @@ final class DispatcherTests: XCTestCase {
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil))
         guard case .object(let o) = resp.result! else { return XCTFail() }
         XCTAssertEqual(o["app"], .string("remotecode"))
+    }
+
+    @MainActor
+    func test_capabilitiesAdvertiseFilesSurfaceForMirrorParity() async {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil))
+
+        guard case .object(let o)? = resp.result,
+              case .array(let surfaceTypes)? = o["surface_types"] else {
+            return XCTFail("capabilities must expose surface_types so iOS can render the same add-surface menu as macOS")
+        }
+        XCTAssertTrue(surfaceTypes.contains(.string("files")),
+                      "Files must be advertised by the host; otherwise iOS cannot discover or create the mirrored Files tab")
+    }
+
+    @MainActor
+    func test_surfaceCreateAcceptsFilesType() async throws {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        let wid = JSONValue.string(UUID().uuidString)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.create", params: [
+            "workspace_id": wid,
+            "type": .string("files")
+        ]))
+
+        XCTAssertNil(resp.error, "iOS must be able to create a Files tab through the same surface.create RPC as macOS")
+        guard case .object(let body)? = resp.result else { return XCTFail("surface.create must return the created Files descriptor") }
+        XCTAssertEqual(body["type"], .string("files"))
     }
 
     @MainActor

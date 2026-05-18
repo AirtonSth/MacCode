@@ -165,6 +165,7 @@ public struct SidebarRootView: View {
                     sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
                 }
                 .buttonStyle(.plain)
+                .help("Create new workspace")
 
                 Button { vm.toggleSidebar() } label: {
                     Image(systemName: "sidebar.left")
@@ -295,6 +296,7 @@ public struct SidebarRootView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(ws.cwd.isEmpty ? ws.name : ws.cwd)
         .onDrag {
             vm.draggingWorkspaceID = ws.id
             return NSItemProvider(object: ws.id.value.uuidString as NSString)

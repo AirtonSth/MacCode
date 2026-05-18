@@ -339,6 +339,7 @@ public struct DiffPanelView: View {
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textTertiary)
             .accessibilityLabel("Cancel new branch")
+            .help("Cancel new branch")
         }
         .padding(.horizontal, DS.Space.md)
         .padding(.vertical, DS.Space.sm)
@@ -421,6 +422,7 @@ public struct DiffPanelView: View {
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textTertiary)
             .accessibilityLabel("Dismiss error")
+            .help("Dismiss error")
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.md)
@@ -740,6 +742,7 @@ public struct DiffPanelView: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(binding.wrappedValue ? .isSelected : [])
+        .help(title == "Wrap" ? "Toggle line wrapping" : "Ignore whitespace in diff")
     }
 
     private func copyDiff() {

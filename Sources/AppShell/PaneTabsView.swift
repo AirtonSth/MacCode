@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreModel
+import SocketServer
 import Surfaces
 import DesignSystemKit
 
@@ -28,6 +29,8 @@ public final class PaneTabsView: NSObject {
     private let tabStrip = PaneTabDropStack()
     private let contentArea = NSView()
     private let addMenu = NSMenu()
+    private var tabButtons: [SurfaceID: PaneTabButton] = [:]
+    private var eventToken: UUID?
 
     public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil) {
         self.pane = pane
@@ -68,6 +71,7 @@ public final class PaneTabsView: NSObject {
                 symbol: Self.symbol(for: desc.type),
                 selected: isSel,
                 busy: busy,
+                dirty: surfaceIsUnsaved(sid),
                 colorHex: colorHex,
                 onSelect: { [weak self] in self?.selectSurface(sid) },
                 onClose: { [weak self] in self?.closeSurface(sid) },
@@ -80,6 +84,7 @@ public final class PaneTabsView: NSObject {
                     self?.dropSurface(draggedID, before: sid) ?? false
                 }
             )
+            tabButtons[sid] = tab
             tabStrip.addArrangedSubview(tab)
         }
 
@@ -123,6 +128,7 @@ public final class PaneTabsView: NSObject {
             ("Terminal", .terminal),
             ("Browser", .browser),
             ("Agent App", .agentApp),
+            ("Files", .files),
             ("Git", .rightSidebarTool)
         ]
         for (label, type) in addChoices {
@@ -202,6 +208,10 @@ public final class PaneTabsView: NSObject {
             contentArea.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
+
+        eventToken = EventBus.shared.subscribe(since: nil) { [weak self] event in
+            DispatchQueue.main.async { self?.receive(event) }
+        }
     }
 
     private func buildMinimizedSideRail(in root: NSView, selectedSurfaceID: SurfaceID?) {
@@ -270,7 +280,42 @@ public final class PaneTabsView: NSObject {
 
     private func closeSurface(_ id: SurfaceID) {
         guard let wid = currentWorkspaceID() else { return }
+        if surfaceIsUnsaved(id), !confirmCloseUnsavedSurface(id) { return }
         try? router?.closeSurface(workspace: wid, surface: id)
+    }
+
+    private func surfaceIsUnsaved(_ id: SurfaceID) -> Bool {
+        if let desc = pane.surfaces.first(where: { $0.id == id }) {
+            if desc.isDirty { return true }
+            if let count = Int(desc.metadata["dirty_count"] ?? "0"), count > 0 { return true }
+            guard desc.type == .files else { return false }
+        }
+        guard let state = try? router?.filesStateGet(surface: id).objectValue,
+              case .array(let values) = state["dirty_paths"] ?? .array([]) else { return false }
+        return values.contains { $0.stringValue != nil }
+    }
+
+    private func confirmCloseUnsavedSurface(_ id: SurfaceID) -> Bool {
+        let title = pane.surfaces.first(where: { $0.id == id })?.title ?? "this tab"
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Close “\(title)” with unsaved changes?"
+        alert.informativeText = "Unsaved file edits in this tab will be discarded if you close it."
+        alert.addButton(withTitle: "Close Without Saving")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func receive(_ event: EventBus.Event) {
+        guard event.kind == "files.state.updated",
+              let payload = event.payload.objectValue,
+              let raw = payload["surface_id"]?.stringValue,
+              let uuid = UUID(uuidString: raw) else { return }
+        let surfaceID = SurfaceID(uuid)
+        guard let tab = tabButtons[surfaceID],
+              let state = payload["state"]?.objectValue,
+              case .array(let values) = state["dirty_paths"] ?? .array([]) else { return }
+        tab.setDirty(values.contains { $0.stringValue != nil })
     }
 
     static func symbol(for type: SurfaceType) -> String {
@@ -278,6 +323,7 @@ public final class PaneTabsView: NSObject {
         case .terminal: return "terminal"
         case .browser: return "globe"
         case .agentApp: return "sparkles"
+        case .files: return "folder"
         case .markdown: return "doc.richtext"
         case .filePreview: return "doc"
         case .rightSidebarTool: return "sidebar.right"
@@ -293,6 +339,7 @@ public final class PaneTabsView: NSObject {
         ("Terminal", .terminal),
         ("Browser", .browser),
         ("Agent App", .agentApp),
+        ("Files", .files),
         ("Git", .rightSidebarTool),
         ("Markdown", .markdown),
         ("File Preview", .filePreview)
@@ -325,7 +372,10 @@ public final class PaneTabsView: NSObject {
         return b
     }
 
-    deinit { NotificationCenter.default.removeObserver(self) }
+    deinit {
+        if let eventToken { EventBus.shared.unsubscribe(eventToken) }
+        NotificationCenter.default.removeObserver(self)
+    }
 
     @objc private func showAddMenu(_ sender: NSButton) {
         // Defer: popping the menu inside the mouse-up that triggered the
@@ -469,6 +519,7 @@ final class PaneTabButton: NSView {
     private static let dragActivationDistance: CGFloat = 8
 
     init(surfaceID: SurfaceID, title: String, symbol: String, selected: Bool, busy: Bool = false,
+         dirty: Bool = false,
          colorHex: UInt32? = nil,
          onSelect: @escaping () -> Void, onClose: @escaping () -> Void,
          onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil,
@@ -514,6 +565,14 @@ final class PaneTabButton: NSView {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        let dirtyBadge = NSView()
+        dirtyBadge.wantsLayer = true
+        dirtyBadge.layer?.backgroundColor = DS.NS.warning.cgColor
+        dirtyBadge.layer?.cornerRadius = 3.5
+        dirtyBadge.translatesAutoresizingMaskIntoConstraints = false
+        dirtyBadge.isHidden = !dirty
+        dirtyBadge.toolTip = "Unsaved changes"
+
         let close = NoDragButton(frame: .zero)
         close.isBordered = false
         close.bezelStyle = .inline
@@ -526,7 +585,7 @@ final class PaneTabButton: NSView {
         close.action = #selector(closeClicked)
         close.toolTip = "Close tab"
 
-        addSubview(icon); addSubview(label); addSubview(close)
+        addSubview(icon); addSubview(label); addSubview(dirtyBadge); addSubview(close)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 34),
             widthAnchor.constraint(greaterThanOrEqualToConstant: 130),
@@ -539,7 +598,12 @@ final class PaneTabButton: NSView {
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            close.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+            dirtyBadge.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 7),
+            dirtyBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            dirtyBadge.widthAnchor.constraint(equalToConstant: 7),
+            dirtyBadge.heightAnchor.constraint(equalToConstant: 7),
+
+            close.leadingAnchor.constraint(equalTo: dirtyBadge.trailingAnchor, constant: 8),
             close.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             close.centerYAnchor.constraint(equalTo: centerYAnchor),
             close.widthAnchor.constraint(equalToConstant: 16),
@@ -774,6 +838,10 @@ final class PaneTabButton: NSView {
     func performSelectFromTitlebarClick() { onSelect() }
 
     @objc private func closeClicked() { onClose() }
+
+    func setDirty(_ dirty: Bool) {
+        subviews.first { $0.toolTip == "Unsaved changes" }?.isHidden = !dirty
+    }
 
     static func hasMovedBeyondDragThreshold(from start: NSPoint?, to current: NSPoint, threshold: CGFloat) -> Bool {
         guard let start else { return false }

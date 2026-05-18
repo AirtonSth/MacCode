@@ -4,6 +4,7 @@ public enum SurfaceType: String, Codable, Sendable, CaseIterable {
     case terminal
     case browser
     case agentApp
+    case files
     /// Deferred for V1; modelled here so the surface tree stays open to
     /// cmux parity (see project/14-reference-repos-distillation.md).
     case markdown

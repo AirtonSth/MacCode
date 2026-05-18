@@ -50,6 +50,8 @@ public final class AppCommandRouter: CommandRouting {
                             self?.windowController?.refreshFromState()
                         }
                         surface = agent
+                    case .files:
+                        surface = FilesSurface(workspaceID: wid, cwd: cwd, title: title, router: self, initialState: desc.metadata["files_state"])
                     case .markdown:
                         surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
                     case .filePreview:
@@ -744,6 +746,98 @@ public final class AppCommandRouter: CommandRouting {
         try ctx.settingsRepo.set(key, value)
     }
 
+    public func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue {
+        try WorkspaceFileService().list(root: try workspaceCwd(workspace), path: path)
+    }
+
+    public func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue {
+        try WorkspaceFileService().read(root: try workspaceCwd(workspace), path: path, maxBytes: maxBytes)
+    }
+
+    public func fsWorkspacePreviewURL(workspace: WorkspaceID, path: String) throws -> JSONValue {
+        try WorkspaceFileService().previewURL(root: try workspaceCwd(workspace), path: path)
+    }
+
+    public func filesStateGet(surface: SurfaceID) throws -> JSONValue {
+        let located = try locateSurface(surface)
+        let root = try workspaceCwd(located.workspaceID)
+        let state = decodeFilesState(located.descriptor.metadata["files_state"])
+            ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
+        return .object(state)
+    }
+
+    public func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue {
+        let located = try locateSurface(surface)
+        let root = try workspaceCwd(located.workspaceID)
+        var state = decodeFilesState(located.descriptor.metadata["files_state"])
+            ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
+        let currentRevision = state["revision"]?.intValue ?? 0
+        if let baseRevision, baseRevision != currentRevision {
+            throw JSONRPCError(code: -32012, message: "files state revision conflict", data: .object(state))
+        }
+        for (key, value) in patch { state[key] = value }
+        let revision = currentRevision + 1
+        state["revision"] = .number(Double(revision))
+        state["updated_at"] = .number(Date().timeIntervalSince1970)
+        state["updated_by_device"] = deviceID.map { .string($0) } ?? .null
+        try persistFilesState(surface: surface, workspace: located.workspaceID, state: state)
+        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+            "surface_id": .string(surface.value.uuidString),
+            "workspace_id": .string(located.workspaceID.value.uuidString),
+            "state": .object(state),
+            "revision": .number(Double(revision)),
+            "updated_by_device": deviceID.map { .string($0) } ?? .null
+        ]))
+        return .object(state)
+    }
+
+    public func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue {
+        let located = try locateSurface(surface)
+        let root = try workspaceCwd(located.workspaceID)
+        let opened = try FileEditSessionStore.shared.open(surfaceID: surface, workspaceID: located.workspaceID, root: root, path: path)
+        if let sessionID = opened.objectValue?["session_id"]?.stringValue {
+            let _ = try filesStateUpdate(surface: surface, patch: [
+                "selected_path": .string(path),
+                "edit_session_id": .string(sessionID)
+            ], baseRevision: nil, deviceID: "mac-host")
+        }
+        return opened
+    }
+
+    public func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
+        let result = try FileEditSessionStore.shared.applyPatch(sessionID: sessionID, baseDraftRevision: baseDraftRevision, rangeLocation: rangeLocation, rangeLength: rangeLength, replacement: replacement, deviceID: deviceID)
+        if let body = result.objectValue,
+           let sid = body["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+           let path = body["path"]?.stringValue {
+            try updateFilesDirty(surface: sid, path: path, dirty: true)
+        }
+        return result
+    }
+
+    public func filesEditSave(sessionID: String) throws -> JSONValue {
+        let result = try FileEditSessionStore.shared.save(sessionID: sessionID)
+        if let body = result.objectValue,
+           let sid = body["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+           let path = body["path"]?.stringValue {
+            try updateFilesDirty(surface: sid, path: path, dirty: false)
+        }
+        return result
+    }
+
+    public func filesEditDiscard(sessionID: String) throws -> JSONValue {
+        let result = try FileEditSessionStore.shared.discard(sessionID: sessionID)
+        if let body = result.objectValue,
+           let sid = body["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+           let path = body["path"]?.stringValue {
+            try updateFilesDirty(surface: sid, path: path, dirty: false)
+        }
+        return result
+    }
+
+    public func filesEditClose(sessionID: String) throws -> JSONValue {
+        try FileEditSessionStore.shared.close(sessionID: sessionID)
+    }
+
     public func browserWait(surface: SurfaceID, selector: String, timeoutMs: Int) async throws -> String {
         let s = try browserSurface(surface)
         return await withCheckedContinuation { cont in
@@ -779,6 +873,8 @@ public final class AppCommandRouter: CommandRouting {
                     self?.windowController?.refreshFromState()
                 }
                 surface = agent
+            case .files:
+                surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: nil)
             case .markdown:
                 let path = title // optional: pass file path via title for now
                 surface = MarkdownSurface(workspaceID: workspace, filePath: path, title: baseTitle)
@@ -825,5 +921,129 @@ public final class AppCommandRouter: CommandRouting {
             if let s = o["id"]?.stringValue { return s }
         }
         return ""
+    }
+
+    private func locateSurface(_ surfaceID: SurfaceID) throws -> (workspaceID: WorkspaceID, descriptor: SurfaceDescriptor) {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        for (wid, ws) in ctx.state.workspaces {
+            if let descriptor = findSurface(surfaceID, in: ws.layout) {
+                return (wid, descriptor)
+            }
+        }
+        if let surface = SurfaceRegistry.shared.surface(surfaceID),
+           let raw = surface.descriptor.metadata["workspace"],
+           let uuid = UUID(uuidString: raw) {
+            return (WorkspaceID(uuid), surface.descriptor)
+        }
+        throw LayoutError.surfaceNotFound
+    }
+
+    private func findSurface(_ surfaceID: SurfaceID, in node: LayoutNode) -> SurfaceDescriptor? {
+        switch node {
+        case .pane(let pane):
+            return pane.surfaces.first { $0.id == surfaceID }
+        case .split(let split):
+            for child in split.children {
+                if let found = findSurface(surfaceID, in: child) { return found }
+            }
+            return nil
+        }
+    }
+
+    private func defaultFilesState(surface: SurfaceID, workspace: WorkspaceID, root: String, descriptor: SurfaceDescriptor) -> [String: JSONValue] {
+        let selected = descriptor.metadata["selected_path"] ?? descriptor.metadata["selected_relative_path"]
+        return [
+            "surface_id": .string(surface.value.uuidString),
+            "workspace_id": .string(workspace.value.uuidString),
+            "root": .string(root),
+            "current_directory": .string(""),
+            "expanded_dirs": .array([]),
+            "selected_path": selected.map { .string($0) } ?? .null,
+            "search_query": .string(""),
+            "show_hidden": .bool(true),
+            "sort_key": .string("name"),
+            "sort_direction": .string("asc"),
+            "reader_mode": .string("source"),
+            "word_wrap": .bool(true),
+            "preview_zoom": .number(1),
+            "edit_session_id": descriptor.metadata["active_edit_session_id"].map { .string($0) } ?? .null,
+            "dirty_paths": .array([]),
+            "revision": .number(Double(descriptor.metadata["files_state_revision"].flatMap(Int.init) ?? 0)),
+            "updated_at": .number(Date().timeIntervalSince1970),
+            "updated_by_device": .null
+        ]
+    }
+
+    private func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
+        guard let raw, let data = raw.data(using: .utf8),
+              case .object(let state) = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            return nil
+        }
+        return state
+    }
+
+    private func encodeFilesState(_ state: [String: JSONValue]) -> String? {
+        guard let data = try? JSONEncoder().encode(JSONValue.object(state)) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func persistFilesState(surface: SurfaceID, workspace: WorkspaceID, state: [String: JSONValue], refreshWindow: Bool = true) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        var ws = try ctx.state.workspaces[workspace].orThrow(LayoutError.workspaceNotFound)
+        let encoded = encodeFilesState(state)
+        let result = updateSurface(in: ws.layout, surfaceID: surface) { descriptor in
+            if let encoded { descriptor.metadata["files_state"] = encoded }
+            descriptor.metadata["files_state_revision"] = "\(state["revision"]?.intValue ?? 0)"
+            if let selected = state["selected_path"]?.stringValue {
+                descriptor.metadata["selected_path"] = selected
+                descriptor.metadata["selected_relative_path"] = selected
+            }
+            if let session = state["edit_session_id"]?.stringValue {
+                descriptor.metadata["active_edit_session_id"] = session
+            }
+            if case .array(let dirty) = state["dirty_paths"] ?? .array([]) {
+                descriptor.metadata["dirty_count"] = "\(dirty.count)"
+                descriptor.isDirty = !dirty.isEmpty
+            }
+        }
+        ws.layout = result.node
+        ws.updatedAt = Date()
+        ctx.state.workspaces[workspace] = ws
+        ctx.scheduleSnapshotSave()
+        if refreshWindow {
+            windowController?.refreshFromState()
+        }
+    }
+
+    private func updateFilesDirty(surface: SurfaceID, path: String, dirty: Bool) throws {
+        let located = try locateSurface(surface)
+        var state = try filesStateGet(surface: surface).objectValue ?? [:]
+        var dirtyPaths: [String] = []
+        if case .array(let values) = state["dirty_paths"] ?? .array([]) {
+            dirtyPaths = values.compactMap(\.stringValue)
+        }
+        if dirty {
+            if !dirtyPaths.contains(path) { dirtyPaths.append(path) }
+        } else {
+            dirtyPaths.removeAll { $0 == path }
+        }
+        state["dirty_paths"] = .array(dirtyPaths.map { .string($0) })
+        state["revision"] = .number(Double((state["revision"]?.intValue ?? 0) + 1))
+        state["updated_at"] = .number(Date().timeIntervalSince1970)
+        try persistFilesState(surface: surface, workspace: located.workspaceID, state: state, refreshWindow: false)
+        EventBus.shared.publish(kind: "files.state.updated", payload: .object([
+            "surface_id": .string(surface.value.uuidString),
+            "workspace_id": .string(located.workspaceID.value.uuidString),
+            "state": .object(state),
+            "revision": state["revision"] ?? .number(0),
+            "updated_by_device": .string("mac-host")
+        ]))
+    }
+}
+
+private extension Optional {
+    func orThrow(_ error: Error) throws -> Wrapped {
+        guard let value = self else { throw error }
+        return value
     }
 }

@@ -88,6 +88,17 @@ public protocol CommandRouting: AnyObject {
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
+    // workspace Files surface
+    func filesStateGet(surface: SurfaceID) throws -> JSONValue
+    func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue
+    func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue
+    func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue
+    func fsWorkspacePreviewURL(workspace: WorkspaceID, path: String) throws -> JSONValue
+    func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue
+    func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue
+    func filesEditSave(sessionID: String) throws -> JSONValue
+    func filesEditDiscard(sessionID: String) throws -> JSONValue
+    func filesEditClose(sessionID: String) throws -> JSONValue
 }
 
 @MainActor
@@ -132,7 +143,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .object([
                     "app": .string("remotecode"),
                     "api_version": .string("2"),
-                    "surface_types": .array([.string("terminal"), .string("browser"), .string("agentApp"), .string("markdown"), .string("filePreview"), .string("rightSidebarTool")]),
+                    "surface_types": .array([.string("terminal"), .string("browser"), .string("agentApp"), .string("files"), .string("markdown"), .string("filePreview"), .string("rightSidebarTool")]),
                     "agent": .object([
                         "providers": .array([.string("codex"), .string("claude")]),
                         "supports_stream_events": .bool(true),
@@ -186,6 +197,45 @@ public final class JSONRPCDispatcher {
             case "fs.list":
                 let raw = params["path"]?.stringValue
                 return .init(id: id, result: try fsList(raw))
+            case "fs.workspace.list":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.fsWorkspaceList(workspace: wid, path: params["path"]?.stringValue))
+            case "fs.workspace.read":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.fsWorkspaceRead(workspace: wid, path: path, maxBytes: params["max_bytes"]?.intValue))
+            case "fs.workspace.preview_url":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.fsWorkspacePreviewURL(workspace: wid, path: path))
+            case "files.state.get":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesStateGet(surface: sid))
+            case "files.state.update":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let patch = params["patch"]?.objectValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesStateUpdate(surface: sid, patch: patch, baseRevision: params["base_revision"]?.intValue, deviceID: params["device_id"]?.stringValue))
+            case "files.edit.open":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditOpen(surface: sid, path: path))
+            case "files.edit.apply_patch":
+                guard let sessionID = params["session_id"]?.stringValue,
+                      let base = params["base_draft_revision"]?.intValue,
+                      let range = params["range_utf16"]?.objectValue,
+                      let location = range["location"]?.intValue,
+                      let length = range["length"]?.intValue,
+                      let replacement = params["replacement"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditApplyPatch(sessionID: sessionID, baseDraftRevision: base, rangeLocation: location, rangeLength: length, replacement: replacement, deviceID: params["device_id"]?.stringValue))
+            case "files.edit.save":
+                guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditSave(sessionID: sessionID))
+            case "files.edit.discard":
+                guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditDiscard(sessionID: sessionID))
+            case "files.edit.close":
+                guard let sessionID = params["session_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.filesEditClose(sessionID: sessionID))
             case "workspace.list":
                 let ws = try router.listWorkspaces()
                 return .init(id: id, result: encode(ws))
@@ -679,6 +729,7 @@ public final class JSONRPCDispatcher {
         case "agent", "agent_app", "agentapp": return "agentApp"
         case "rightsidebartool", "right_sidebar_tool", "diff", "git": return "rightSidebarTool"
         case "filepreview", "file_preview": return "filePreview"
+        case "files", "file_browser", "filebrowser": return "files"
         case "markdown": return "markdown"
         case "terminal": return "terminal"
         case "browser": return "browser"

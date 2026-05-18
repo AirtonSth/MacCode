@@ -524,6 +524,7 @@ public struct AgentAppView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help(t.title)
             .onDrag {
                 draggingThreadId = t.id
                 return NSItemProvider(object: t.id.value.uuidString as NSString)
@@ -562,6 +563,7 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textTertiary)
             .accessibilityLabel("Cancel rename")
+            .help("Cancel rename")
         }
         .padding(.horizontal, DS.Space.md)
         .padding(.vertical, DS.Space.sm)
@@ -782,6 +784,7 @@ public struct AgentAppView: View {
                     .buttonStyle(.plain)
                     .foregroundColor(DS.Palette.textTertiary)
                     .accessibilityLabel("Copy message")
+                    .help("Copy message")
                 }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -870,6 +873,7 @@ public struct AgentAppView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .help(hasOutput ? (expanded ? "Hide tool output" : "Show tool output") : "Tool output unavailable")
             if expanded, let o = item.output, !o.isEmpty {
                 Text(o)
                     .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
@@ -932,6 +936,7 @@ public struct AgentAppView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Review changes in the Git panel")
+                .help("Review changes in the Git panel")
             }
             .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -1049,6 +1054,7 @@ public struct AgentAppView: View {
         .disabled(vm.status != .running && sendIdleDisabled)
         .keyboardShortcut(.return, modifiers: [.command])
         .accessibilityLabel(vm.status == .running ? "Stop" : "Send")
+        .help(vm.status == .running ? "Stop running agent" : "Send prompt")
     }
 
     private var attachmentChips: some View {
@@ -1064,6 +1070,7 @@ public struct AgentAppView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Remove attachment")
+                        .help("Remove attachment")
                     }
                     .foregroundColor(DS.Palette.textSecondary)
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 3)

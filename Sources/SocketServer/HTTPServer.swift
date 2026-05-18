@@ -289,7 +289,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Dispatcher.swift git.*/browser.*); hiding them on the
             // client breaks parity.
             let body: [String: Any] = [
-                "surface_types": ["terminal", "browser", "agentApp", "markdown", "filePreview", "rightSidebarTool"],
+                "surface_types": ["terminal", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
                 "agent": ["providers": ["codex", "claude"], "supports_stream_events": true, "supports_resume": true],
                 "browser_automation": [
                     "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
@@ -565,7 +565,20 @@ public final class DirectStaticFileRegistry: @unchecked Sendable {
         case "png": return "image/png"
         case "jpg", "jpeg": return "image/jpeg"
         case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "bmp": return "image/bmp"
+        case "tif", "tiff": return "image/tiff"
+        case "heic": return "image/heic"
+        case "avif": return "image/avif"
         case "svg": return "image/svg+xml"
+        case "mp4", "m4v": return "video/mp4"
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "pdf": return "application/pdf"
+        case "md", "markdown": return "text/markdown; charset=utf-8"
+        case "wasm": return "application/wasm"
+        case "map": return "application/json"
+        case "ico": return "image/x-icon"
         case "txt": return "text/plain; charset=utf-8"
         default: return "application/octet-stream"
         }

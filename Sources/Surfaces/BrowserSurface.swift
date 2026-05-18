@@ -43,12 +43,17 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         let toolbar = NSView()
         toolbar.wantsLayer = true
         toolbar.layer?.backgroundColor = DS.NS.surface.cgColor
-        for (b, glyph) in [(backButton, "chevron.backward"), (forwardButton, "chevron.forward"), (reloadButton, "arrow.clockwise")] {
+        for (b, glyph, help) in [
+            (backButton, "chevron.backward", "Back"),
+            (forwardButton, "chevron.forward", "Forward"),
+            (reloadButton, "arrow.clockwise", "Reload")
+        ] {
             b.isBordered = false
             b.bezelStyle = .inline
-            b.image = NSImage(systemSymbolName: glyph, accessibilityDescription: glyph)
+            b.image = NSImage(systemSymbolName: glyph, accessibilityDescription: help)
             b.contentTintColor = DS.NS.textSecondary
             b.imageScaling = .scaleProportionallyDown
+            b.toolTip = help
         }
 
         let container = NSView()

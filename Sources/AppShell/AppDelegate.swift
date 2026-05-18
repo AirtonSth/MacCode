@@ -346,6 +346,7 @@ extension SurfaceType {
         case .terminal: return "Terminal"
         case .browser: return "Browser"
         case .agentApp: return "Agent App"
+        case .files: return "Files"
         case .markdown: return "Markdown"
         case .filePreview: return "File Preview"
         case .rightSidebarTool: return "Right Sidebar Tool"
