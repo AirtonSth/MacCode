@@ -328,7 +328,7 @@ public final class PaneTabsView: NSObject {
 
 @MainActor
 final class PaneTabButton: NSView {
-    static let pasteboardType = NSPasteboard.PasteboardType("io.remotecode2.surface-id")
+    static let pasteboardType = NSPasteboard.PasteboardType("io.remotecode.surface-id")
     private static weak var highlightedTab: PaneTabButton?
     private static weak var highlightedStrip: PaneTabDropStack?
     private static weak var dragGhost: TabDragGhostView?

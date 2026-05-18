@@ -7,17 +7,17 @@ public enum ReleaseChannel: String, Sendable {
 
     public var bundleID: String {
         switch self {
-        case .debug: return "io.remotecode.RemoteCode2.debug"
-        case .canary: return "io.remotecode.RemoteCode2.canary"
-        case .stable: return "io.remotecode.RemoteCode2"
+        case .debug: return "io.remotecode.desktop.debug"
+        case .canary: return "io.remotecode.desktop.canary"
+        case .stable: return "io.remotecode.desktop"
         }
     }
 
     public var displayName: String {
         switch self {
-        case .debug: return "RemoteCode2Debug"
-        case .canary: return "RemoteCode2Canary"
-        case .stable: return "RemoteCode2"
+        case .debug: return "RemoteCodeDebug"
+        case .canary: return "RemoteCodeCanary"
+        case .stable: return "RemoteCode"
         }
     }
 }
@@ -39,6 +39,6 @@ public enum AppPaths {
     public static func databasePath(for channel: ReleaseChannel, override: String? = nil) -> String {
         if let override { return override }
         let dir = appSupportDirectory(for: channel)
-        return dir.appendingPathComponent("remotecode2.sqlite").path
+        return dir.appendingPathComponent("remotecode.sqlite").path
     }
 }

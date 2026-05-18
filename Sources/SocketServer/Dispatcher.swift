@@ -129,7 +129,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .object(["pong": .bool(true), "ts": .number(Date().timeIntervalSince1970)]))
             case "system.capabilities":
                 return .init(id: id, result: .object([
-                    "app": .string("remotecode2"),
+                    "app": .string("remotecode"),
                     "api_version": .string("2"),
                     "surface_types": .array([.string("terminal"), .string("browser"), .string("agentApp"), .string("markdown"), .string("filePreview"), .string("rightSidebarTool")]),
                     "agent": .object([
@@ -145,7 +145,7 @@ public final class JSONRPCDispatcher {
                 ]))
             case "system.identify":
                 return .init(id: id, result: .object([
-                    "app": .string("remotecode2"),
+                    "app": .string("remotecode"),
                     "pid": .number(Double(ProcessInfo.processInfo.processIdentifier))
                 ]))
             case "events.recent":

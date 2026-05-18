@@ -6,7 +6,7 @@ public struct Keybinding: Codable, Equatable, Sendable {
     public let when: String?
 }
 
-/// Loads/parses `~/.remotecode2/keybindings.json` and resolves a key
+/// Loads/parses `~/.remotecode/keybindings.json` and resolves a key
 /// chord + UI context to a command. T3 Code semantics: `when` is a
 /// space-separated AND of identifiers, `!` negates; invalid rules are
 /// dropped with a warning; the last matching rule wins.
@@ -70,7 +70,7 @@ public struct KeybindingConfig: Equatable {
     }
 
     public static func loadDefaultPath() -> KeybindingConfig {
-        let path = NSHomeDirectory() + "/.remotecode2/keybindings.json"
+        let path = NSHomeDirectory() + "/.remotecode/keybindings.json"
         guard let data = FileManager.default.contents(atPath: path) else {
             return KeybindingConfig()
         }

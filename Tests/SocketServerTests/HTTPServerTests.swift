@@ -22,7 +22,7 @@ final class HTTPServerTests: XCTestCase {
         let disco = expectation(description: "discovery")
         URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/discovery")!) { data, _, _ in
             let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
-            XCTAssertEqual(obj?["app"] as? String, "remotecode2")
+            XCTAssertEqual(obj?["app"] as? String, "remotecode")
             XCTAssertEqual(obj?["relay"] as? Bool, false)
             disco.fulfill()
         }.resume()

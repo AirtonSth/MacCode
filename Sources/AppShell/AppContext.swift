@@ -100,6 +100,13 @@ public final class AppContext {
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
             EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid))
             EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid))
+            if let content = RemoteCodeNotificationContent.threadOutcome(
+                threadId: tid.value.uuidString,
+                title: try? self.threadRepo.get(id: tid)?.title,
+                phase: status
+            ) {
+                SystemNotifier.shared.post(content)
+            }
         }
 
         // HC-1: stream terminal/surface PTY output to the mirror so iOS

@@ -22,7 +22,7 @@ public enum SQLiteError: Error, CustomStringConvertible {
 public final class SQLiteDB {
     fileprivate var handle: OpaquePointer?
     public let path: String
-    private let queue = DispatchQueue(label: "RemoteCode2.SQLiteDB")
+    private let queue = DispatchQueue(label: "RemoteCode.SQLiteDB")
 
     public init(path: String) throws {
         self.path = path

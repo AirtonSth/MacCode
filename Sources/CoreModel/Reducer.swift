@@ -205,7 +205,7 @@ public struct LayoutReducer {
             next.workspaces[wid] = ws
             return next
         case .createWindow(let title):
-            let w = AppWindow(title: title ?? "RemoteCode 2")
+            let w = AppWindow(title: title ?? "RemoteCode")
             next.windows.append(w)
             next.focusedWindowID = w.id
             return next

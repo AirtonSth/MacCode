@@ -31,7 +31,7 @@ final class FixtureTests: XCTestCase {
     }
 
     /// Filesystem trace: bootstrap an isolated app-support directory and
-    /// assert RemoteCode 2 only writes inside that directory. The point
+    /// assert RemoteCode only writes inside that directory. The point
     /// is to verify that the fresh-start bootstrap never probes other
     /// product paths even though the user filesystem contains them.
     func test_filesystemTrace_onlyTouchesOwnedPaths() throws {

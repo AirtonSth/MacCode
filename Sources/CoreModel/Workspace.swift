@@ -45,7 +45,7 @@ public struct AppWindow: Codable, Sendable, Equatable, Identifiable {
     public var selectedWorkspaceID: WorkspaceID?
     public var title: String
 
-    public init(id: WindowID = WindowID(), workspaces: [WorkspaceID] = [], selectedWorkspaceID: WorkspaceID? = nil, title: String = "RemoteCode 2") {
+    public init(id: WindowID = WindowID(), workspaces: [WorkspaceID] = [], selectedWorkspaceID: WorkspaceID? = nil, title: String = "RemoteCode") {
         self.id = id
         self.workspaces = workspaces
         self.selectedWorkspaceID = selectedWorkspaceID

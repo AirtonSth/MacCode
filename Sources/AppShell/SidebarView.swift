@@ -124,7 +124,7 @@ public final class SidebarViewModel: ObservableObject {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Remove “\(ws.name)”?"
-        alert.informativeText = "This removes the workspace and its tabs from RemoteCode 2. Files on disk are not touched."
+        alert.informativeText = "This removes the workspace and its tabs from RemoteCode. Files on disk are not touched."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
@@ -139,7 +139,7 @@ public final class SidebarViewModel: ObservableObject {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Remove \(ids.count) workspaces?"
-        alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode 2. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
+        alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }

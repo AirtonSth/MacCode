@@ -38,7 +38,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             context = try AppContext(channel: channel, dbPathOverride: dbOverride, appSupportOverride: appSupportOverride)
         } catch {
             let alert = NSAlert()
-            alert.messageText = "Failed to bootstrap RemoteCode 2"
+            alert.messageText = "Failed to bootstrap RemoteCode"
             alert.informativeText = "\(error)"
             alert.runModal()
             NSApp.terminate(nil)
@@ -144,13 +144,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(NSMenuItem(title: "About RemoteCode 2", action: #selector(showAbout), keyEquivalent: ""))
+        appMenu.addItem(NSMenuItem(title: "About RemoteCode", action: #selector(showAbout), keyEquivalent: ""))
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
         appMenu.addItem(.separator())
-        appMenu.addItem(NSMenuItem(title: "Hide RemoteCode 2", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
-        appMenu.addItem(NSMenuItem(title: "Quit RemoteCode 2", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenu.addItem(NSMenuItem(title: "Hide RemoteCode", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+        appMenu.addItem(NSMenuItem(title: "Quit RemoteCode", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
 
         // File menu
@@ -182,7 +182,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let paletteItem = NSMenuItem(title: "Show Command Palette", action: #selector(togglePalette), keyEquivalent: "k")
         paletteItem.keyEquivalentModifierMask = [.command]
         paletteItem.target = self
-        // C5: ~/.remotecode2/keybindings.json may rebind the palette.
+        // C5: ~/.remotecode/keybindings.json may rebind the palette.
         applyKeybindingOverride(to: paletteItem, command: "commandPalette.toggle")
         viewMenu.addItem(paletteItem)
         viewItem.submenu = viewMenu
@@ -215,7 +215,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "RemoteCode 2"
+        alert.messageText = "RemoteCode"
         alert.informativeText = "Native Swift macOS rewrite. cmux-style panes + Agent App surface."
         alert.runModal()
     }
@@ -286,15 +286,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = try? router.createSurface(workspace: wid, type: type, paneID: nil, title: nil)
     }
 
-    /// GAP-4: publish `_remotecode2._tcp` so the iOS app can find this
+    /// GAP-4: publish `_remotecode._tcp` so the iOS app can find this
     /// Mac on the LAN. TXT carries the stable identity + version so the
     /// client can show it before connecting.
     private func publishBonjour(serverId: String) {
         let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-        let svc = NetService(domain: "", type: "_remotecode2._tcp.", name: name, port: 18217)
+        let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: 18217)
         let txt: [String: Data] = [
             "server_id": Data(serverId.utf8),
-            "app": Data("remotecode2".utf8),
+            "app": Data("remotecode".utf8),
             "version": Data("0.1.0".utf8),
             "api": Data("2".utf8)
         ]
@@ -302,7 +302,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         svc.delegate = bonjourDelegate
         svc.publish()
         bonjour = svc
-        NSLog("Bonjour published: \(name) _remotecode2._tcp:18217")
+        NSLog("Bonjour published: \(name) _remotecode._tcp:18217")
     }
 }
 

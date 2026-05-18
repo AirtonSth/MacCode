@@ -259,7 +259,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         case ("GET", "/v1/discovery"):
             let body: [String: Any] = [
                 "server_id": serverId,                                  // GAP-2: stable, persisted
-                "app": "remotecode2",
+                "app": "remotecode",
                 "version": "0.1.0",
                 "api_version": "2",
                 "capabilities_version": "1",

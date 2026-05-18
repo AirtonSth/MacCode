@@ -1,4 +1,4 @@
-# RemoteCode 2 Architecture (current state)
+# RemoteCode Architecture (current state)
 
 A walk through what's actually built right now. Use this together with `report.html` (the human-facing changelog) and `project/14-reference-repos-distillation.md` (cmux + T3 Code reference notes).
 
@@ -112,15 +112,15 @@ Tests/
 
 ## Packaging
 
-`scripts/package-app.sh` compiles in `release` (or whatever `RC2_CONFIG` you set) and assembles `dist/RemoteCode2.app`:
+`scripts/package-app.sh` compiles in `release` (or whatever `RC2_CONFIG` you set) and assembles `dist/RemoteCode.app`:
 
 ```
-dist/RemoteCode2.app/
+dist/RemoteCode.app/
 └── Contents/
     ├── Info.plist
     ├── PkgInfo
     └── MacOS/
-        ├── RemoteCode2
+        ├── RemoteCode
         └── rc2
 ```
 

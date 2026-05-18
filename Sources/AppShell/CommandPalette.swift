@@ -173,7 +173,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             }
         }
         cmds.append(PaletteCommand(id: "session.save", title: "Save Session Snapshot", keywords: ["snapshot", "session"]) { router.context?.saveSnapshot() })
-        cmds.append(PaletteCommand(id: "app.quit", title: "Quit RemoteCode 2", keywords: ["exit", "quit"]) { NSApp.terminate(nil) })
+        cmds.append(PaletteCommand(id: "app.quit", title: "Quit RemoteCode", keywords: ["exit", "quit"]) { NSApp.terminate(nil) })
         self.all = cmds
         applyFilter("")
     }

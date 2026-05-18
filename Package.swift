@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "RemoteCode2",
+    name: "RemoteCode",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "RemoteCode2", targets: ["AppShell"]),
+        .executable(name: "RemoteCode", targets: ["AppShell"]),
         .executable(name: "rc2", targets: ["RC2CLI"]),
         .library(name: "CoreModel", targets: ["CoreModel"]),
         .library(name: "Persistence", targets: ["Persistence"]),

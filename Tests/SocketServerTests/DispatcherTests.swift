@@ -203,11 +203,11 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_capabilities_listsRemoteCode2() async {
+    func test_capabilities_listsRemoteCode() async {
         let d = JSONRPCDispatcher(router: FakeRouter())
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil))
         guard case .object(let o) = resp.result! else { return XCTFail() }
-        XCTAssertEqual(o["app"], .string("remotecode2"))
+        XCTAssertEqual(o["app"], .string("remotecode"))
     }
 
     @MainActor

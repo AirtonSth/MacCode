@@ -196,7 +196,7 @@ public final class SettingsWindowController: NSObject {
         self.viewModel = SettingsViewModel(context: context)
         let host = NSHostingController(rootView: SettingsView(vm: viewModel))
         let win = NSWindow(contentViewController: host)
-        win.title = "RemoteCode 2 Settings"
+        win.title = "RemoteCode Settings"
         win.styleMask = [.titled, .closable, .resizable]
         win.setContentSize(NSSize(width: 540, height: 380))
         win.center()

@@ -4,7 +4,7 @@ import Persistence
 
 @main
 @MainActor
-struct RemoteCode2Main {
+struct RemoteCodeMain {
     static func main() {
         let envChannel = ProcessInfo.processInfo.environment["RC2_CHANNEL"] ?? "debug"
         let channel = ReleaseChannel(rawValue: envChannel) ?? .debug

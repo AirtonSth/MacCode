@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-/// RemoteCode 2 design tokens.
+/// RemoteCode design tokens.
 ///
 /// Aesthetic: dense, dark, developer-grade — the cmux / T3 Code lineage.
 /// One semantic palette (no raw hex in views), a 4/8 spacing rhythm, a

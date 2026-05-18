@@ -3,7 +3,7 @@ import Darwin
 import CoreModel
 
 let args = CommandLine.arguments
-let prog = (args.first as NSString?)?.lastPathComponent ?? "remotecode2"
+let prog = (args.first as NSString?)?.lastPathComponent ?? "remotecode"
 
 func usage(_ exit: Int32 = 0) -> Never {
     let text = """
@@ -74,9 +74,9 @@ func parseFlags(_ a: [String]) -> ([String: String], [String]) {
 let envChannel = ProcessInfo.processInfo.environment["RC2_CHANNEL"] ?? "debug"
 let defaultDisplay: String = {
     switch envChannel {
-    case "stable": return "RemoteCode2"
-    case "canary": return "RemoteCode2Canary"
-    default: return "RemoteCode2Debug"
+    case "stable": return "RemoteCode"
+    case "canary": return "RemoteCodeCanary"
+    default: return "RemoteCodeDebug"
     }
 }()
 var socketPath = "/tmp/\(defaultDisplay).sock"
@@ -121,7 +121,7 @@ struct RPC {
         if conn < 0 {
             let msg = String(cString: strerror(errno))
             close(fd)
-            return ["error": ["code": -1, "message": "connect(\(socketPath)): \(msg). Is the RemoteCode 2 app running?"]]
+            return ["error": ["code": -1, "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?"]]
         }
         defer { close(fd) }
         let payload: [String: Any] = [

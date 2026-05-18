@@ -158,7 +158,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private let visibleWorkspaceHeader = NoDragView()
     private let visibleWorkspaceLabel = NSTextField(labelWithString: "")
     private let split = NSSplitView()
-    private let toolbarLabel = NSTextField(labelWithString: "RemoteCode 2")
+    private let toolbarLabel = NSTextField(labelWithString: "RemoteCode")
     /// Retains the live pane controllers; their @objc button and tab
     /// targets die with them, so they must outlive a layout rebuild.
     private var paneControllers: [PaneTabsView] = []
@@ -180,7 +180,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        win.title = "RemoteCode 2"
+        win.title = "RemoteCode"
         // Unified titlebar: content runs full height, the system title
         // bar is transparent and titleless, so the traffic-light buttons
         // float over the app's own header row (the sidebar header).
@@ -390,8 +390,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	        guard let ctx = context,
 	              let wid = ctx.state.window.selectedWorkspaceID,
 	              let ws = ctx.state.workspaces[wid] else {
-	            collapsedWorkspaceLabel.stringValue = "RemoteCode 2"
-	            visibleWorkspaceLabel.stringValue = "RemoteCode 2"
+	            collapsedWorkspaceLabel.stringValue = "RemoteCode"
+	            visibleWorkspaceLabel.stringValue = "RemoteCode"
 	            return
 	        }
 	        collapsedWorkspaceLabel.stringValue = ws.name

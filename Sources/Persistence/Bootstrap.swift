@@ -31,7 +31,7 @@ public final class Bootstrap {
             createdAS = true
         }
         touched.append(supportURL.path)
-        let dbPath = dbPathOverride ?? supportURL.appendingPathComponent("remotecode2.sqlite").path
+        let dbPath = dbPathOverride ?? supportURL.appendingPathComponent("remotecode.sqlite").path
         let firstRun = !FileManager.default.fileExists(atPath: dbPath)
         touched.append(dbPath)
         let db = try SQLiteDB(path: dbPath)

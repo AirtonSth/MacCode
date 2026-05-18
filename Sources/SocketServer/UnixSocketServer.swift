@@ -22,7 +22,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         let pathBytes = socketPath.utf8CString
         let maxPath = MemoryLayout.size(ofValue: addr.sun_path)
         if pathBytes.count > maxPath {
-            throw NSError(domain: "RemoteCode2.Socket", code: 1, userInfo: [NSLocalizedDescriptionKey: "socket path too long: \(socketPath)"])
+            throw NSError(domain: "RemoteCode.Socket", code: 1, userInfo: [NSLocalizedDescriptionKey: "socket path too long: \(socketPath)"])
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { tp in
             tp.withMemoryRebound(to: CChar.self, capacity: maxPath) { tbase in
@@ -40,12 +40,12 @@ public final class UnixSocketServer: @unchecked Sendable {
         if bindResult < 0 {
             let msg = String(cString: strerror(errno))
             close(listenFD)
-            throw NSError(domain: "RemoteCode2.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "bind: \(msg)"])
+            throw NSError(domain: "RemoteCode.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "bind: \(msg)"])
         }
         if Darwin.listen(listenFD, 16) < 0 {
             let msg = String(cString: strerror(errno))
             close(listenFD)
-            throw NSError(domain: "RemoteCode2.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "listen: \(msg)"])
+            throw NSError(domain: "RemoteCode.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "listen: \(msg)"])
         }
         // tighten permissions
         chmod(socketPath, 0o600)
