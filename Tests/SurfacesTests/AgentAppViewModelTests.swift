@@ -148,6 +148,25 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
+    func test_finishCallback_marksCompletedThreadUnreadUntilOpened() async throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "done")
+        let id = vm.selectedThreadId!
+        vm.runCoordinator(vm.coordinator, didFinish: AgentRunID(), threadId: id, status: .completed,
+                          finalMessage: "done", providerThreadId: nil)
+
+        await waitAsync("completed thread marked unread") {
+            (try? repo.get(id: id)?.hasUnread) == true
+        }
+        vm.reloadThreads()
+        XCTAssertTrue(vm.threads.first { $0.id == id }?.hasUnread ?? false,
+                      "completed work must leave a visible unread indicator even for the currently selected thread")
+
+        vm.selectThread(id)
+        XCTAssertEqual(try repo.get(id: id)?.hasUnread, false,
+                       "clicking/opening the completed thread must clear the indicator")
+    }
+
     func test_runningStatusTracksRunIdBeforeStartRunReturnsSoStopWorks() async throws {
         let (vm, _) = try makeVM()
         let runner = SlowStartRunner()

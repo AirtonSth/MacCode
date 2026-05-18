@@ -439,12 +439,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // a background handler. Keep the restart contract here too.
                 self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
             }
-            if status == .completed, finalMessage != nil, finishedTid != self.selectedThreadId,
-               var t = try? self.threadRepo.get(id: finishedTid) {
-                // B6: finished on a thread the user left → mark unread.
-                // The selected thread already shows the reply via the live
-                // turn items, so we do NOT mirror it into `messages`
-                // (that caused the answer to render two/three times).
+            if status == .completed, var t = try? self.threadRepo.get(id: finishedTid) {
+                // Completed work leaves an unread marker until the user
+                // explicitly opens/clicks the thread row.
                 t.hasUnread = true
                 try? self.threadRepo.upsert(t)
             }
@@ -488,13 +485,16 @@ public struct AgentAppView: View {
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
+    @State private var showThreadRail = true
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
     public var body: some View {
         HSplitView {
-            threadRail
-                .frame(minWidth: 150, idealWidth: 165, maxWidth: 220)
+            if showThreadRail {
+                threadRail
+                    .frame(minWidth: 150, idealWidth: 165, maxWidth: 220)
+            }
             conversationColumn
                 .frame(minWidth: 460)
             if vm.showPlanSidebar {
@@ -512,7 +512,10 @@ public struct AgentAppView: View {
         VStack(alignment: .leading, spacing: 0) {
             DSSectionHeader(vm.activeThreadCount > 0 ? "Threads · \(vm.activeThreadCount) active" : "Threads",
                             trailing: AnyView(
-                DSIconButton("plus", help: "New thread") { vm.createThread(title: "New thread") }
+                HStack(spacing: DS.Space.xs) {
+                    DSIconButton("sidebar.left", help: "Hide threads") { showThreadRail = false }
+                    DSIconButton("plus", help: "New thread") { vm.createThread(title: "New thread") }
+                }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             if vm.threads.isEmpty {
@@ -652,6 +655,9 @@ public struct AgentAppView: View {
     // the composer footer now, Codex-style.
     private var header: some View {
         HStack(spacing: DS.Space.sm) {
+            if !showThreadRail {
+                DSIconButton("sidebar.left", help: "Show threads") { showThreadRail = true }
+            }
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
