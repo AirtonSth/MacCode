@@ -585,7 +585,7 @@ final class RatioSplitView: NSView {
     var dividerStyle: NSSplitView.DividerStyle = .thin
     var dividerThickness: CGFloat { 1 }
     private let collapsedRatioThreshold: CGFloat = 0.08
-    private var collapsedExtent: CGFloat { isVertical ? 180 : 35 }
+    private var collapsedExtent: CGFloat { isVertical ? 44 : 35 }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

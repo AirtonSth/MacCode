@@ -115,7 +115,7 @@ final class RatioSplitTests: XCTestCase {
         XCTAssertGreaterThan(sv.subviews[1].frame.height, 450)
     }
 
-    func test_ratioSplitView_collapsedSideBySidePaneKeepsUsableTabStripWidth() {
+    func test_ratioSplitView_collapsedSideBySidePaneKeepsCompactRailWidth() {
         let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
         sv.isVertical = true
         sv.ratios = [0.04, 0.96]
@@ -123,8 +123,8 @@ final class RatioSplitTests: XCTestCase {
         sv.addSubview(NSView())
         sv.adjustSubviews()
 
-        XCTAssertEqual(sv.subviews[0].frame.width, 180, accuracy: 0.5,
-                       "a minimized side-by-side split pane must leave enough width for tabs and the restore control")
-        XCTAssertGreaterThan(sv.subviews[1].frame.width, 400)
+        XCTAssertEqual(sv.subviews[0].frame.width, 44, accuracy: 0.5,
+                       "a minimized side-by-side split pane should become a compact restore rail, not a wide empty column")
+        XCTAssertGreaterThan(sv.subviews[1].frame.width, 550)
     }
 }

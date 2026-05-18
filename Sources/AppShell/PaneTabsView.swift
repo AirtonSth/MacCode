@@ -44,6 +44,14 @@ public final class PaneTabsView: NSObject {
 
         // Custom tab strip: icon + truncating title + close button.
         let selectedID = pane.selectedSurfaceID ?? pane.surfaces.first?.id
+        let paneMinimized = splitContext.map {
+            Self.isPaneMinimized(paneIndex: $0.paneIndex, ratios: $0.ratios)
+        } ?? false
+        if paneMinimized, splitContext?.orientation == .horizontal {
+            buildMinimizedSideRail(in: v, selectedSurfaceID: selectedID)
+            return
+        }
+
         tabStrip.orientation = .horizontal
         tabStrip.spacing = 0
         tabStrip.alignment = .centerY
@@ -74,9 +82,6 @@ public final class PaneTabsView: NSObject {
             )
             tabStrip.addArrangedSubview(tab)
         }
-        let paneMinimized = splitContext.map {
-            Self.isPaneMinimized(paneIndex: $0.paneIndex, ratios: $0.ratios)
-        } ?? false
 
         // Content area: the selected surface (or a styled placeholder).
         contentArea.translatesAutoresizingMaskIntoConstraints = false
@@ -196,6 +201,50 @@ public final class PaneTabsView: NSObject {
             contentArea.bottomAnchor.constraint(equalTo: v.bottomAnchor),
             contentArea.leadingAnchor.constraint(equalTo: v.leadingAnchor),
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
+        ])
+    }
+
+    private func buildMinimizedSideRail(in root: NSView, selectedSurfaceID: SurfaceID?) {
+        let restore = Self.makeIconButton(
+            symbol: "arrow.up.left.and.arrow.down.right",
+            help: "Maximize pane",
+            target: self, action: #selector(togglePaneMinimized))
+
+        let selected = selectedSurfaceID.flatMap { id in
+            pane.surfaces.first(where: { $0.id == id })
+        } ?? pane.surfaces.first
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: selected.map { Self.symbol(for: $0.type) } ?? "rectangle.dashed",
+                             accessibilityDescription: selected?.title ?? "Minimized pane")
+        icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
+        icon.contentTintColor = DS.NS.textSecondary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.toolTip = selected?.title ?? "Minimized pane"
+
+        let stack = NoDragStack(views: [restore, icon])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = DS.Space.md
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = DS.NS.line.cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        root.addSubview(stack)
+        root.addSubview(divider)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: DS.Space.sm),
+            stack.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+
+            icon.widthAnchor.constraint(equalToConstant: 18),
+            icon.heightAnchor.constraint(equalToConstant: 18),
+
+            divider.topAnchor.constraint(equalTo: root.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            divider.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1)
         ])
     }
 

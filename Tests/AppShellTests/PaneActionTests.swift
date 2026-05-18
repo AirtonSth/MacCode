@@ -115,6 +115,21 @@ final class PaneActionTests: XCTestCase {
                        "restoring a minimized pane should return the split to usable equal panes")
     }
 
+    func test_horizontalMinimizedPane_usesCompactRestoreRail() throws {
+        let (_, router) = try makeContext()
+        let pane = PaneNode(surfaces: [SurfaceDescriptor(type: .terminal, title: "terminal")])
+        let ptv = PaneTabsView(
+            pane: pane,
+            router: router,
+            splitContext: PaneSplitContext(splitID: UUID(), paneIndex: 0, ratios: [0.04, 0.96], orientation: .horizontal)
+        )
+
+        let buttonTooltips = allSubviews(of: ptv.view)
+            .compactMap { ($0 as? NSButton)?.toolTip }
+        XCTAssertEqual(buttonTooltips, ["Maximize pane"],
+                       "a minimized side-by-side pane should become a compact restore rail, not a cramped full toolbar")
+    }
+
     func test_surfaceChoices_haveSixDistinctTypes() {
         let types = PaneTabsView.surfaceChoices.map { $0.1 }
         XCTAssertEqual(Set(types).count, types.count)
