@@ -211,6 +211,25 @@ final class AgentAppViewModelTests: XCTestCase {
                        "clicking/opening the completed thread must clear the indicator")
     }
 
+    func test_runningThreadClearsPriorCompletedUnreadIndicator() async throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "rerun")
+        let id = vm.selectedThreadId!
+        vm.runCoordinator(vm.coordinator, didFinish: AgentRunID(), threadId: id, status: .completed,
+                          finalMessage: "done", providerThreadId: nil)
+        await waitAsync("completed thread marked unread") {
+            (try? repo.get(id: id)?.hasUnread) == true
+        }
+
+        vm.runCoordinator(vm.coordinator, didChangeStatus: .running, runId: AgentRunID(), threadId: id)
+
+        await waitAsync("running thread clears completed dot") {
+            (try? repo.get(id: id)?.hasUnread) == false
+        }
+        XCTAssertFalse(vm.threads.first { $0.id == id }?.hasUnread ?? true,
+                       "starting a new spinner must hide the prior completed dot until this run completes again")
+    }
+
     func test_threadRowSelectionCheckNeverAppearsForClickedThread() {
         XCTAssertFalse(AgentThreadRowPresentation.showsSelectionCheck(
             threadStatus: .running,
@@ -239,6 +258,24 @@ final class AgentAppViewModelTests: XCTestCase {
             surfaceStatus: .completed,
             multiSelected: true
         ), "bulk-selected, non-open rows can still show the selection check")
+    }
+
+    func test_completedUnreadThreadShowsOnlyTrailingDot() {
+        XCTAssertFalse(AgentThreadRowPresentation.showsLeadingStatus(
+            threadStatus: .completed,
+            selected: true,
+            surfaceStatus: .completed,
+            hasUnread: true,
+            pinned: false
+        ), "completed unread work must use the trailing dot only, without a second idle dot on the left")
+
+        XCTAssertTrue(AgentThreadRowPresentation.showsLeadingStatus(
+            threadStatus: .completed,
+            selected: true,
+            surfaceStatus: .completed,
+            hasUnread: true,
+            pinned: true
+        ), "pinned rows keep their pin because it is not a completion indicator")
     }
 
     func test_runningStatusTracksRunIdBeforeStartRunReturnsSoStopWorks() async throws {

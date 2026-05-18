@@ -80,6 +80,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try runRepo.upsert(run)
         if var thread = try threadRepo.get(id: request.threadId) {
             thread.status = .running
+            thread.hasUnread = false
             thread.updatedAt = Date()
             try threadRepo.upsert(thread)
         }

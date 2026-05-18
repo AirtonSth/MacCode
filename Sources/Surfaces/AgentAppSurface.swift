@@ -414,6 +414,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runThreads[runId] = tid
                 self.status = .running
                 self.runStartedAt = Date()
+                self.reloadThreads()
                 self.onRunStateChange?()
             }
         } catch {
@@ -484,6 +485,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         Task { @MainActor in
             let threadWorkspace = try? self.threadRepo.get(id: threadId)?.workspaceId
             guard threadWorkspace == self.workspaceID else { return }
+            if status == .running, var t = try? self.threadRepo.get(id: threadId), t.hasUnread {
+                t.hasUnread = false
+                try? self.threadRepo.upsert(t)
+            }
             self.reloadThreads()
             if threadId == self.selectedThreadId {
                 self.status = status
@@ -571,18 +576,27 @@ public struct AgentAppView: View {
                 selected: selected,
                 surfaceStatus: vm.status
             )
+            let showLeadingStatus = AgentThreadRowPresentation.showsLeadingStatus(
+                threadStatus: t.status,
+                selected: selected,
+                surfaceStatus: vm.status,
+                hasUnread: t.hasUnread,
+                pinned: t.pinned
+            )
             Button { selectThreadRow(t) } label: {
                 HStack(spacing: DS.Space.md) {
                     if running {
                         // A3: spinner while this thread has a run in flight.
                         ProgressView().controlSize(.small).scaleEffect(0.5)
                             .frame(width: 8, height: 8)
-                    } else {
+                    } else if showLeadingStatus {
                         Image(systemName: t.pinned ? "pin.fill" : "circle.fill")
                             .font(.system(size: t.pinned ? 9 : 7, weight: .semibold))
                             .foregroundColor(TabColor.from(t.color).map { Color(hex: $0.hex) }
                                              ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary))
                             .frame(width: 8, height: 8)
+                    } else {
+                        Color.clear.frame(width: 8, height: 8)
                     }
                     VStack(alignment: .leading, spacing: 1) {
                         Text(t.title).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
@@ -1458,6 +1472,17 @@ private struct TimelineBottomPreferenceKey: PreferenceKey {
 enum AgentThreadRowPresentation {
     static func isRunning(threadStatus: AgentRunStatus, selected: Bool, surfaceStatus: AgentRunStatus) -> Bool {
         threadStatus == .running || (selected && surfaceStatus == .running)
+    }
+
+    static func showsLeadingStatus(
+        threadStatus: AgentRunStatus,
+        selected: Bool,
+        surfaceStatus: AgentRunStatus,
+        hasUnread: Bool,
+        pinned: Bool
+    ) -> Bool {
+        pinned || threadStatus == .failed || !hasUnread
+            || isRunning(threadStatus: threadStatus, selected: selected, surfaceStatus: surfaceStatus)
     }
 
     static func showsSelectionCheck(
