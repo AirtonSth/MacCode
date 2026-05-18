@@ -190,8 +190,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// conversation — only model/effort stay changeable after that.
     public var providerLocked: Bool { selectedThreadId != nil && !messages.isEmpty }
 
-    /// Persist the chosen provider/model onto the selected thread so a
-    /// resumed run uses the right source + model.
+    /// Persist the chosen run configuration onto the selected thread so a
+    /// resumed run uses the right source, model, permission, and effort.
     public func persistThreadConfig() {
         guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
         t.provider = provider
@@ -206,6 +206,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             threads[i].permissionMode = permissionMode
             threads[i].reasoningEffort = reasoningEffort
         }
+    }
+
+    public func setPermissionMode(_ mode: AgentPermissionMode) {
+        permissionMode = mode
+        persistThreadConfig()
+    }
+
+    public func setReasoningEffort(_ effort: AgentReasoningEffort) {
+        reasoningEffort = effort
+        persistThreadConfig()
     }
 
     public func createThread(title: String) {
@@ -486,6 +496,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 }
 
 public struct AgentAppView: View {
+    private static let threadRailWidth: CGFloat = 220
     @ObservedObject var vm: AgentAppViewModel
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
@@ -504,7 +515,7 @@ public struct AgentAppView: View {
         HSplitView {
             if showThreadRail {
                 threadRail
-                    .frame(minWidth: 150, idealWidth: 165, maxWidth: 220)
+                    .frame(width: Self.threadRailWidth)
             }
             conversationColumn
                 .frame(minWidth: 460)
@@ -1102,9 +1113,9 @@ public struct AgentAppView: View {
 
     private var permissionMenu: some View {
         Menu {
-            Button("Supervised") { vm.permissionMode = .supervised }
-            Button("Auto-edit") { vm.permissionMode = .autoAcceptEdits }
-            Button("Full access") { vm.permissionMode = .fullAccess }
+            Button("Supervised") { vm.setPermissionMode(.supervised) }
+            Button("Auto-edit") { vm.setPermissionMode(.autoAcceptEdits) }
+            Button("Full access") { vm.setPermissionMode(.fullAccess) }
         } label: {
             HStack(spacing: DS.Space.xs) {
                 Image(systemName: vm.permissionMode == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield")
@@ -1145,6 +1156,7 @@ public struct AgentAppView: View {
                     Text(e.displayName).tag(e)
                 }
             }
+            .onChange(of: vm.reasoningEffort) { newValue in vm.setReasoningEffort(newValue) }
             if vm.providerLocked {
                 Divider()
                 Text("Source locked — \(vm.provider.rawValue.capitalized) thread")
@@ -1454,7 +1466,7 @@ enum AgentThreadRowPresentation {
         surfaceStatus: AgentRunStatus,
         multiSelected: Bool
     ) -> Bool {
-        multiSelected && !isRunning(threadStatus: threadStatus, selected: selected, surfaceStatus: surfaceStatus)
+        multiSelected && !selected && !isRunning(threadStatus: threadStatus, selected: selected, surfaceStatus: surfaceStatus)
     }
 }
 

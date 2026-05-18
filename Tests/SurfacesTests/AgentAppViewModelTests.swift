@@ -71,6 +71,21 @@ final class AgentAppViewModelTests: XCTestCase {
                        "reopening an existing thread must restore its saved reasoning effort")
     }
 
+    func test_settingPermissionPersistsImmediatelyBeforeAnyMessageIsSent() throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "t")
+        let id = vm.selectedThreadId!
+
+        vm.setPermissionMode(.fullAccess)
+        vm.permissionMode = .supervised
+        vm.selectThread(id)
+
+        XCTAssertEqual(try repo.get(id: id)?.permissionMode, .fullAccess,
+                       "permission changes must persist immediately so app restart does not reset to supervised")
+        XCTAssertEqual(vm.permissionMode, .fullAccess,
+                       "reopening the thread must restore the saved permission mode before any message is sent")
+    }
+
     func test_createThreadCopiesCurrentConfigFromLastThread() throws {
         let (vm, repo) = try makeVM()
         vm.provider = .codex
@@ -196,7 +211,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "clicking/opening the completed thread must clear the indicator")
     }
 
-    func test_threadRowSelectionCheckOnlyAppearsAfterRunningWorkFinishes() {
+    func test_threadRowSelectionCheckNeverAppearsForClickedThread() {
         XCTAssertFalse(AgentThreadRowPresentation.showsSelectionCheck(
             threadStatus: .running,
             selected: false,
@@ -211,12 +226,19 @@ final class AgentAppViewModelTests: XCTestCase {
             multiSelected: true
         ), "the selected thread must suppress the check while its run is still active")
 
-        XCTAssertTrue(AgentThreadRowPresentation.showsSelectionCheck(
+        XCTAssertFalse(AgentThreadRowPresentation.showsSelectionCheck(
             threadStatus: .completed,
             selected: true,
             surfaceStatus: .completed,
             multiSelected: true
-        ), "successful finished work may show the selected/completed check")
+        ), "clicking a thread selects it via highlight only; no trailing check icon")
+
+        XCTAssertTrue(AgentThreadRowPresentation.showsSelectionCheck(
+            threadStatus: .completed,
+            selected: false,
+            surfaceStatus: .completed,
+            multiSelected: true
+        ), "bulk-selected, non-open rows can still show the selection check")
     }
 
     func test_runningStatusTracksRunIdBeforeStartRunReturnsSoStopWorks() async throws {
