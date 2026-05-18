@@ -542,16 +542,43 @@ public final class AppCommandRouter: CommandRouting {
 
     public func paneList(workspace: WorkspaceID) throws -> [[String: JSONValue]] {
         guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return [] }
+        let mobileGroups = mobilePaneGroups(in: ws.layout)
+        var mobileGroupByPane: [PaneID: Int] = [:]
+        for (index, group) in mobileGroups.enumerated() {
+            for paneID in group { mobileGroupByPane[paneID] = index }
+        }
         let panes: [[String: JSONValue]] = ws.layout.paneIDs().map { pid in
             let count = (ws.layout.find(paneID: pid)?.surfaces.count) ?? 0
             return [
                 "kind": .string("pane"),
                 "id": .string(pid.value.uuidString),
-                "surface_count": .number(Double(count))
+                "surface_count": .number(Double(count)),
+                "mobile_group": .number(Double(mobileGroupByPane[pid] ?? 0))
             ]
         }
         let splits = splitEntries(in: ws.layout)
         return panes + splits
+    }
+
+    private func mobilePaneGroups(in node: LayoutNode) -> [[PaneID]] {
+        let groups = uncappedMobilePaneGroups(in: node)
+        guard groups.count > 2 else { return groups }
+        return [groups[0], groups.dropFirst().flatMap { $0 }]
+    }
+
+    private func uncappedMobilePaneGroups(in node: LayoutNode) -> [[PaneID]] {
+        switch node {
+        case .pane(let pane):
+            return [[pane.id]]
+        case .split(let split):
+            let childGroups = split.children.flatMap { uncappedMobilePaneGroups(in: $0) }
+            switch split.orientation {
+            case .horizontal:
+                return [childGroups.flatMap { $0 }]
+            case .vertical:
+                return childGroups
+            }
+        }
     }
 
     private func splitEntries(in node: LayoutNode) -> [[String: JSONValue]] {

@@ -115,6 +115,36 @@ final class PaneActionTests: XCTestCase {
                        "restoring a minimized pane should return the split to usable equal panes")
     }
 
+    func test_paneListMobileGroups_mergeHorizontalPanesForIOS() throws {
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ios-h", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail() }
+        _ = try router.splitPane(workspace: ws.id, paneID: pane.id, direction: .right, surfaceType: .browser, title: "browser")
+
+        let groups = try router.paneList(workspace: ws.id)
+            .filter { $0["kind"]?.stringValue == "pane" }
+            .compactMap { $0["mobile_group"]?.intValue }
+        XCTAssertEqual(groups, [0, 0],
+                       "iOS must merge desktop side-by-side panes into one mobile panel")
+    }
+
+    func test_paneListMobileGroups_capVerticalPanesAtTwoForIOS() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ios-v", cwd: NSTemporaryDirectory())
+        guard case .pane(let rootPane) = ws.layout else { return XCTFail() }
+        _ = try router.splitPane(workspace: ws.id, paneID: rootPane.id, direction: .down, surfaceType: .browser, title: "browser")
+
+        let afterFirst = ctx.state.workspaces[ws.id]!
+        let secondPane = try XCTUnwrap(afterFirst.layout.paneIDs().last)
+        _ = try router.splitPane(workspace: ws.id, paneID: secondPane, direction: .down, surfaceType: .agentApp, title: "Agent App")
+
+        let groups = try router.paneList(workspace: ws.id)
+            .filter { $0["kind"]?.stringValue == "pane" }
+            .compactMap { $0["mobile_group"]?.intValue }
+        XCTAssertEqual(groups, [0, 1, 1],
+                       "iOS supports only one vertical split; extra desktop vertical panes merge into the second mobile panel")
+    }
+
     func test_horizontalMinimizedPane_usesCompactRestoreRail() throws {
         let (_, router) = try makeContext()
         let pane = PaneNode(surfaces: [SurfaceDescriptor(type: .terminal, title: "terminal")])
