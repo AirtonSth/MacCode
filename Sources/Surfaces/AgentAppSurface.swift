@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import SwiftUI
 import Combine
+import UniformTypeIdentifiers
 import CoreModel
 import Persistence
 import AgentRuntime
@@ -194,10 +195,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
     }
 
+    public func setThreadPinned(_ id: AgentThreadID, _ pinned: Bool) {
+        try? threadRepo.setPinned(id: id, pinned: pinned)
+        reloadThreads()
+    }
+
+    public func reorderThread(_ id: AgentThreadID, before target: AgentThreadID) {
+        guard id != target,
+              let targetIndex = threads.firstIndex(where: { $0.id == target }) else { return }
+        try? threadRepo.reorder(id: id, position: targetIndex)
+        reloadThreads()
+    }
+
     public func deleteThread(_ id: AgentThreadID) {
         try? threadRepo.delete(id: id)
         if selectedThreadId == id {
             selectedThreadId = nil
+            messages = []
+            timeline = AssistantTimelineState()
+        }
+        reloadThreads()
+    }
+
+    public func deleteThreads(_ ids: Set<AgentThreadID>) {
+        guard !ids.isEmpty else { return }
+        try? threadRepo.delete(ids: Array(ids))
+        if let selectedThreadId, ids.contains(selectedThreadId) {
+            self.selectedThreadId = nil
             messages = []
             timeline = AssistantTimelineState()
         }
@@ -405,6 +429,10 @@ public struct AgentAppView: View {
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
+    @State private var selectedThreadIds: Set<AgentThreadID> = []
+    @State private var lastSelectedThreadId: AgentThreadID?
+    @State private var draggingThreadId: AgentThreadID?
+    @FocusState private var promptFocused: Bool
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -420,6 +448,7 @@ public struct AgentAppView: View {
         }
         .background(DS.Palette.bg)
         .task { await vm.loadModels() }
+        .onDeleteCommand { deleteSelectedThreads() }
     }
 
     // MARK: Thread rail
@@ -441,6 +470,7 @@ public struct AgentAppView: View {
                         ForEach(vm.threads, id: \.id) { t in threadRow(t) }
                     }.padding(DS.Space.sm)
                 }
+                .focusable()
             }
         }
         .background(DS.Palette.surface)
@@ -455,18 +485,20 @@ public struct AgentAppView: View {
             renameRow(t)
         } else {
             let selected = vm.selectedThreadId == t.id
+            let multiSelected = selectedThreadIds.contains(t.id)
             let running = t.status == .running || (selected && vm.status == .running)
-            Button { vm.selectThread(t.id) } label: {
+            Button { selectThreadRow(t) } label: {
                 HStack(spacing: DS.Space.md) {
                     if running {
                         // A3: spinner while this thread has a run in flight.
                         ProgressView().controlSize(.small).scaleEffect(0.5)
                             .frame(width: 8, height: 8)
                     } else {
-                        Circle()
-                            .fill(TabColor.from(t.color).map { Color(hex: $0.hex) }
-                                  ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary))
-                            .frame(width: 7, height: 7)
+                        Image(systemName: t.pinned ? "pin.fill" : "circle.fill")
+                            .font(.system(size: t.pinned ? 9 : 7, weight: .semibold))
+                            .foregroundColor(TabColor.from(t.color).map { Color(hex: $0.hex) }
+                                             ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary))
+                            .frame(width: 8, height: 8)
                     }
                     VStack(alignment: .leading, spacing: 1) {
                         Text(t.title).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
@@ -479,15 +511,27 @@ public struct AgentAppView: View {
                         Circle().fill(DS.Palette.accent).frame(width: 7, height: 7)
                             .accessibilityLabel("Unread activity")
                     }
+                    if multiSelected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(DS.Palette.accent)
+                    }
                 }
                 .padding(.horizontal, DS.Space.md)
                 .padding(.vertical, DS.Space.sm)
-                .background(selected ? DS.Palette.selection : Color.clear)
+                .background((selected || multiSelected) ? DS.Palette.selection : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .onDrag {
+                draggingThreadId = t.id
+                return NSItemProvider(object: t.id.value.uuidString as NSString)
+            }
+            .onDrop(of: [.text], delegate: AgentThreadDropDelegate(vm: vm, draggingThreadId: $draggingThreadId, target: t))
             .contextMenu {
+                Button(t.pinned ? "Unpin" : "Pin") { vm.setThreadPinned(t.id, !t.pinned) }
+                Divider()
                 Button("Rename…") { renameText = t.title; renamingThreadId = t.id }
                 Menu("Color") {
                     Button("None") { vm.setThreadColor(t.id, "") }
@@ -496,7 +540,9 @@ public struct AgentAppView: View {
                     }
                 }
                 Divider()
-                Button("Delete", role: .destructive) { vm.deleteThread(t.id) }
+                Button("Delete", role: .destructive) {
+                    deleteThreads(selectedThreadIds.isEmpty ? [t.id] : selectedThreadIds)
+                }
             }
         }
     }
@@ -858,6 +904,7 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.text)
                 .padding(.horizontal, DS.Space.lg)
                 .padding(.vertical, DS.Space.md)
+                .focused($promptFocused)
             composerToolbar
         }
         .background(DS.Palette.surface)
@@ -1042,6 +1089,35 @@ public struct AgentAppView: View {
         vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
     }
 
+    private func selectThreadRow(_ thread: AgentThread) {
+        if NSEvent.modifierFlags.contains(.shift),
+           let lastSelectedThreadId,
+           let last = vm.threads.firstIndex(where: { $0.id == lastSelectedThreadId }),
+           let current = vm.threads.firstIndex(where: { $0.id == thread.id }) {
+            let range = min(last, current)...max(last, current)
+            selectedThreadIds.formUnion(vm.threads[range].map(\.id))
+        } else {
+            selectedThreadIds = [thread.id]
+            lastSelectedThreadId = thread.id
+        }
+        vm.selectThread(thread.id)
+        promptFocused = true
+    }
+
+    private func deleteSelectedThreads() {
+        let fallback = vm.selectedThreadId.map { Set([$0]) } ?? []
+        deleteThreads(selectedThreadIds.isEmpty ? fallback : selectedThreadIds)
+    }
+
+    private func deleteThreads(_ ids: Set<AgentThreadID>) {
+        guard !ids.isEmpty else { return }
+        vm.deleteThreads(ids)
+        selectedThreadIds.subtract(ids)
+        if let lastSelectedThreadId, ids.contains(lastSelectedThreadId) {
+            self.lastSelectedThreadId = selectedThreadIds.first
+        }
+    }
+
     // MARK: Plan notes sidebar
 
     private var planSidebar: some View {
@@ -1082,6 +1158,26 @@ public struct AgentAppView: View {
         .overlay(alignment: .leading) {
             Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
         }
+    }
+}
+
+private struct AgentThreadDropDelegate: DropDelegate {
+    let vm: AgentAppViewModel
+    @Binding var draggingThreadId: AgentThreadID?
+    let target: AgentThread
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingThreadId, draggingThreadId != target.id else { return }
+        vm.reorderThread(draggingThreadId, before: target.id)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingThreadId = nil
+        return true
     }
 }
 
@@ -1129,5 +1225,5 @@ public final class AgentAppSurface: NSObject, Surface {
     }
 
     // A3: drives the tab/workspace spinner.
-    public var isBusy: Bool { viewModel.status == .running }
+    public var isBusy: Bool { viewModel.status == .running || viewModel.activeThreadCount > 0 }
 }

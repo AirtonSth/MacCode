@@ -42,7 +42,10 @@ public protocol CommandRouting: AnyObject {
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID
     func stopAgentRun(thread: AgentThreadID) throws
     func deleteAgentThread(thread: AgentThreadID) throws
+    func deleteAgentThreads(_ threads: [AgentThreadID]) throws
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread
+    func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread
+    func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread]
     func markAgentThreadRead(thread: AgentThreadID) throws
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor]
     // git
@@ -399,12 +402,50 @@ public final class JSONRPCDispatcher {
                 try router.deleteAgentThread(thread: tid)
                 EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
+            case "agent.thread.delete_many":
+                guard case .array(let values) = params["thread_ids"] ?? .null else { throw JSONRPCError.invalidParams }
+                let tids = values.compactMap { $0.stringValue.flatMap(UUID.init).map(AgentThreadID.init) }
+                guard !tids.isEmpty else { throw JSONRPCError.invalidParams }
+                try router.deleteAgentThreads(tids)
+                EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
+                    "thread_ids": .array(tids.map { .string($0.value.uuidString) })
+                ]))
+                return .init(id: id, result: .bool(true))
             case "agent.thread.rename":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let title = params["title"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let t = try router.renameAgentThread(thread: tid, title: title)
                 EventBus.shared.publish(kind: "agent.thread.renamed", payload: .object(["thread_id": .string(tid.value.uuidString), "title": .string(title)]))
                 return .init(id: id, result: encode(t))
+            case "agent.thread.set_pinned":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let pinned = params["pinned"]?.boolValue else { throw JSONRPCError.invalidParams }
+                let t = try router.setAgentThreadPinned(thread: tid, pinned: pinned)
+                let order = try router.listAgentThreads(workspace: t.workspaceId).map { $0.id.value.uuidString }
+                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+                    "thread_id": .string(t.id.value.uuidString),
+                    "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
+                    "pinned": .bool(t.pinned),
+                    "sort_order": .number(Double(t.sortOrder))
+                ]))
+                EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
+                    "thread_id": .string(t.id.value.uuidString),
+                    "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
+                    "order": .array(order.map { .string($0) })
+                ]))
+                return .init(id: id, result: encode(t))
+            case "agent.thread.reorder":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let pos = params["position"]?.intValue ?? 0
+                let list = try router.reorderAgentThread(thread: tid, position: pos)
+                let wid = list.first(where: { $0.id == tid })?.workspaceId
+                EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
+                    "position": .number(Double(pos)),
+                    "order": .array(list.map { .string($0.id.value.uuidString) })
+                ]))
+                return .init(id: id, result: .bool(true))
             case "agent.thread.mark_read":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 try router.markAgentThreadRead(thread: tid)

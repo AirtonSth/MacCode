@@ -343,7 +343,9 @@ final class PaneTabButton: NSView {
     private let dropIndicator = NSView()
     private var hovering = false
     private var dragStarted = false
+    private var mouseDownLocation: NSPoint?
     private let selected: Bool
+    private static let dragActivationDistance: CGFloat = 8
 
     init(surfaceID: SurfaceID, title: String, symbol: String, selected: Bool, busy: Bool = false,
          colorHex: UInt32? = nil,
@@ -521,16 +523,23 @@ final class PaneTabButton: NSView {
 
     override func mouseDown(with event: NSEvent) {
         dragStarted = false
+        mouseDownLocation = event.locationInWindow
         Self.clearDragFeedback()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        dragStarted = true
+        if !dragStarted {
+            guard Self.hasMovedBeyondDragThreshold(from: mouseDownLocation,
+                                                   to: event.locationInWindow,
+                                                   threshold: Self.dragActivationDistance) else { return }
+            dragStarted = true
+        }
         updateDragGhost(with: event)
         updateManualDropFeedback(with: event)
     }
 
     override func mouseUp(with event: NSEvent) {
+        defer { mouseDownLocation = nil }
         if dragStarted {
             performManualDrop(with: event)
             Self.clearDragFeedback()
@@ -644,6 +653,11 @@ final class PaneTabButton: NSView {
     func performSelectFromTitlebarClick() { onSelect() }
 
     @objc private func closeClicked() { onClose() }
+
+    static func hasMovedBeyondDragThreshold(from start: NSPoint?, to current: NSPoint, threshold: CGFloat) -> Bool {
+        guard let start else { return false }
+        return hypot(current.x - start.x, current.y - start.y) >= threshold
+    }
 
     override func mouseEntered(with event: NSEvent) {
         hovering = true

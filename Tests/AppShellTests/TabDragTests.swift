@@ -39,4 +39,20 @@ final class TabDragTests: XCTestCase {
         XCTAssertEqual(PaneTabsView.dropInsertionIndex(tabMidXs: [10, 30], dropX: 10), 0)
         XCTAssertEqual(PaneTabsView.dropInsertionIndex(tabMidXs: [10, 30], dropX: 30), 1)
     }
+
+    func test_dragThreshold_ignoresClickJitter() {
+        XCTAssertFalse(PaneTabButton.hasMovedBeyondDragThreshold(
+            from: NSPoint(x: 40, y: 12),
+            to: NSPoint(x: 43, y: 15),
+            threshold: 8
+        ), "small pointer jitter while selecting a tab must not start reorder mode")
+    }
+
+    func test_dragThreshold_allowsIntentionalDrag() {
+        XCTAssertTrue(PaneTabButton.hasMovedBeyondDragThreshold(
+            from: NSPoint(x: 40, y: 12),
+            to: NSPoint(x: 49, y: 12),
+            threshold: 8
+        ), "moving beyond the threshold should still allow intentional tab reordering")
+    }
 }

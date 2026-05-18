@@ -62,7 +62,14 @@ final class FakeRouter: CommandRouting {
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: .agentApp, title: "Agent App")
     }
-    func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] { [] }
+    func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] {
+        let list = workspace.map { wid in threadStore.filter { $0.workspaceId == wid } } ?? threadStore
+        return list.sorted {
+            if $0.pinned != $1.pinned { return $0.pinned && !$1.pinned }
+            if $0.sortOrder != $1.sortOrder { return $0.sortOrder < $1.sortOrder }
+            return $0.updatedAt > $1.updatedAt
+        }
+    }
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String) throws -> AgentThread {
         AgentThread(workspaceId: workspace, title: title, provider: provider, model: model)
     }
@@ -98,6 +105,28 @@ final class FakeRouter: CommandRouting {
     func stopAgentRun(thread: AgentThreadID) throws {}
     var threadStore: [AgentThread] = []
     func deleteAgentThread(thread: AgentThreadID) throws { threadStore.removeAll { $0.id == thread } }
+    func deleteAgentThreads(_ threads: [AgentThreadID]) throws {
+        threadStore.removeAll { threads.contains($0.id) }
+    }
+    func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread {
+        guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        threadStore[idx].pinned = pinned
+        try normalizeThreadOrder(workspaceId: threadStore[idx].workspaceId)
+        return threadStore[idx]
+    }
+    func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread] {
+        guard let current = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        let wid = current.workspaceId
+        var ordered = try listAgentThreads(workspace: wid)
+        guard let idx = ordered.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        let item = ordered.remove(at: idx)
+        ordered.insert(item, at: max(0, min(position, ordered.count)))
+        for (sortOrder, item) in ordered.enumerated() {
+            guard let storeIdx = threadStore.firstIndex(where: { $0.id == item.id }) else { continue }
+            threadStore[storeIdx].sortOrder = sortOrder
+        }
+        return try listAgentThreads(workspace: wid)
+    }
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].title = title
@@ -107,6 +136,13 @@ final class FakeRouter: CommandRouting {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].hasUnread = false
         selectedThread = thread
+    }
+    private func normalizeThreadOrder(workspaceId: WorkspaceID?) throws {
+        let ordered = try listAgentThreads(workspace: workspaceId)
+        for (sortOrder, thread) in ordered.enumerated() {
+            guard let idx = threadStore.firstIndex(where: { $0.id == thread.id }) else { continue }
+            threadStore[idx].sortOrder = sortOrder
+        }
     }
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         [AgentModelDescriptor(id: "x", label: "X", provider: provider)]
@@ -198,6 +234,42 @@ final class DispatcherTests: XCTestCase {
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "workspace.create", params: params))
         XCTAssertNil(resp.error)
         XCTAssertEqual(router.workspaces.count, 1)
+    }
+
+    @MainActor
+    func test_agentThreadPinReorderAndBulkDeleteRoundTripThroughDispatcher() async throws {
+        let wid = WorkspaceID()
+        var a = AgentThread(workspaceId: wid, title: "A", provider: .codex, model: "gpt-5", sortOrder: 0)
+        var b = AgentThread(workspaceId: wid, title: "B", provider: .codex, model: "gpt-5", sortOrder: 1)
+        let c = AgentThread(workspaceId: wid, title: "C", provider: .codex, model: "gpt-5", sortOrder: 2)
+        let router = FakeRouter()
+        router.threadStore = [a, b, c]
+        let d = JSONRPCDispatcher(router: router)
+
+        let pin = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.set_pinned", params: [
+            "thread_id": .string(b.id.value.uuidString),
+            "pinned": .bool(true),
+        ]))
+        XCTAssertNil(pin.error, "pinning a thread must be available over RPC so macOS and iOS can share the same UX")
+        b = try XCTUnwrap(router.threadStore.first { $0.id == b.id })
+        XCTAssertTrue(b.pinned)
+        XCTAssertEqual(try router.listAgentThreads(workspace: wid).map(\.id), [b.id, a.id, c.id],
+                       "pinned threads must sort ahead of normal threads")
+
+        let reorder = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.thread.reorder", params: [
+            "thread_id": .string(c.id.value.uuidString),
+            "position": .number(1),
+        ]))
+        XCTAssertNil(reorder.error, "drag reorder must be available over RPC for host and mirror parity")
+        XCTAssertEqual(try router.listAgentThreads(workspace: wid).map(\.id), [b.id, c.id, a.id])
+
+        let delete = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.thread.delete_many", params: [
+            "thread_ids": .array([.string(b.id.value.uuidString), .string(c.id.value.uuidString)]),
+        ]))
+        XCTAssertNil(delete.error, "shift-select delete must use one bulk delete command instead of racing multiple deletes")
+        XCTAssertEqual(router.threadStore.map(\.id), [a.id])
+        a = try XCTUnwrap(router.threadStore.first)
+        XCTAssertEqual(a.title, "A")
     }
 
     private func sh(_ a: [String]) {

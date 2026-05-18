@@ -58,6 +58,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // persist run
         let run = AgentRun(id: request.runId, threadId: request.threadId, provider: request.provider, model: request.model, status: .running)
         try runRepo.upsert(run)
+        if var thread = try threadRepo.get(id: request.threadId) {
+            thread.status = .running
+            thread.updatedAt = Date()
+            try threadRepo.upsert(thread)
+        }
         onRunStarted?(request.threadId, request.runId)
 
         let runId = request.runId

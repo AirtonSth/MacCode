@@ -102,6 +102,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var diffDeletions: Int
     public var hasUnread: Bool
     public var color: String?
+    public var pinned: Bool
+    public var sortOrder: Int
 
     public init(
         id: AgentThreadID = AgentThreadID(),
@@ -117,7 +119,9 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         diffAdditions: Int = 0,
         diffDeletions: Int = 0,
         hasUnread: Bool = false,
-        color: String? = nil
+        color: String? = nil,
+        pinned: Bool = false,
+        sortOrder: Int = 0
     ) {
         self.id = id
         self.projectId = projectId
@@ -133,6 +137,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         self.diffDeletions = diffDeletions
         self.hasUnread = hasUnread
         self.color = color
+        self.pinned = pinned
+        self.sortOrder = sortOrder
     }
 }
 

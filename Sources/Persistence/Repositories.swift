@@ -60,9 +60,9 @@ public final class AgentThreadRepository {
 
     public func upsert(_ t: AgentThread) throws {
         let st = try db.prepare("""
-            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color;
+            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order;
         """)
         try st.bind(1, t.id.value.uuidString)
         try st.bind(2, t.projectId?.value.uuidString)
@@ -78,13 +78,15 @@ public final class AgentThreadRepository {
         try st.bind(12, Int64(t.diffDeletions))
         try st.bind(13, t.hasUnread)
         try st.bind(14, t.color)
+        try st.bind(15, t.pinned)
+        try st.bind(16, Int64(t.sortOrder))
         _ = try st.step()
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
         let sql = workspaceId == nil
-            ? "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color FROM agent_threads ORDER BY updated_at DESC;"
-            : "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color FROM agent_threads WHERE workspace_id = ? ORDER BY updated_at DESC;"
+            ? "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order FROM agent_threads ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
+            : "SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order FROM agent_threads WHERE workspace_id = ? ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
         let st = try db.prepare(sql)
         if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
         var out: [AgentThread] = []
@@ -106,14 +108,16 @@ public final class AgentThreadRepository {
                 diffAdditions: Int(st.columnInt64(10)),
                 diffDeletions: Int(st.columnInt64(11)),
                 hasUnread: st.columnInt64(12) != 0,
-                color: st.columnText(13)
+                color: st.columnText(13),
+                pinned: st.columnInt64(14) != 0,
+                sortOrder: Int(st.columnInt64(15))
             ))
         }
         return out
     }
 
     public func get(id: AgentThreadID) throws -> AgentThread? {
-        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color FROM agent_threads WHERE id = ?;")
+        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         if try st.step() {
             let idVal = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
@@ -133,7 +137,9 @@ public final class AgentThreadRepository {
                 diffAdditions: Int(st.columnInt64(10)),
                 diffDeletions: Int(st.columnInt64(11)),
                 hasUnread: st.columnInt64(12) != 0,
-                color: st.columnText(13)
+                color: st.columnText(13),
+                pinned: st.columnInt64(14) != 0,
+                sortOrder: Int(st.columnInt64(15))
             )
         }
         return nil
@@ -143,6 +149,41 @@ public final class AgentThreadRepository {
         let st = try db.prepare("DELETE FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         _ = try st.step()
+    }
+
+    public func setPinned(id: AgentThreadID, pinned: Bool) throws {
+        guard var t = try get(id: id) else { return }
+        t.pinned = pinned
+        t.updatedAt = Date()
+        try upsert(t)
+        if let wid = t.workspaceId { try normalizeOrder(workspaceId: wid) }
+    }
+
+    public func reorder(id: AgentThreadID, position: Int) throws {
+        guard let t = try get(id: id), let wid = t.workspaceId else { return }
+        var list = try list(workspaceId: wid)
+        guard let current = list.firstIndex(where: { $0.id == id }) else { return }
+        let item = list.remove(at: current)
+        list.insert(item, at: max(0, min(position, list.count)))
+        try normalizeOrder(workspaceId: wid, ordered: list)
+    }
+
+    public func delete(ids: [AgentThreadID]) throws {
+        for id in ids { try delete(id: id) }
+    }
+
+    private func normalizeOrder(workspaceId: WorkspaceID, ordered: [AgentThread]? = nil) throws {
+        let list: [AgentThread]
+        if let ordered {
+            list = ordered
+        } else {
+            list = try self.list(workspaceId: workspaceId)
+        }
+        let sorted = list.filter(\.pinned) + list.filter { !$0.pinned }
+        for (idx, var t) in sorted.enumerated() {
+            t.sortOrder = idx
+            try upsert(t)
+        }
     }
 }
 

@@ -99,11 +99,13 @@ public final class AppCommandRouter: CommandRouting {
         guard let ctx = context else { return [] }
         return ctx.state.window.workspaces.compactMap { id in
             guard var ws = ctx.state.workspaces[id] else { return nil }
-            let busy = ws.layout.paneIDs().contains { pid in
+            let surfaceBusy = ws.layout.paneIDs().contains { pid in
                 (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
                     SurfaceRegistry.shared.surface($0.id)?.isBusy == true
                 }
             }
+            let threadBusy = ((try? ctx.threadRepo.list(workspaceId: id)) ?? []).contains { $0.status == .running }
+            let busy = surfaceBusy || threadBusy
             if busy { ws.metadata["busy"] = "true" }
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws
@@ -371,6 +373,11 @@ public final class AppCommandRouter: CommandRouting {
         try ctx.threadRepo.delete(id: thread)
     }
 
+    public func deleteAgentThreads(_ threads: [AgentThreadID]) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.threadRepo.delete(ids: threads)
+    }
+
     public func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -380,6 +387,31 @@ public final class AppCommandRouter: CommandRouting {
         t.updatedAt = Date()
         try ctx.threadRepo.upsert(t)
         return t
+    }
+
+    public func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.threadRepo.setPinned(id: thread, pinned: pinned)
+        guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            agent.viewModel.reloadThreads()
+        }
+        windowController?.refreshFromState()
+        return t
+    }
+
+    public func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread] {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.threadRepo.reorder(id: thread, position: position)
+        guard let t = try ctx.threadRepo.get(id: thread), let wid = t.workspaceId else { throw LayoutError.workspaceNotFound }
+        let list = try ctx.threadRepo.list(workspaceId: wid)
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == wid else { continue }
+            agent.viewModel.reloadThreads()
+        }
+        windowController?.refreshFromState()
+        return list
     }
 
     public func markAgentThreadRead(thread: AgentThreadID) throws {
