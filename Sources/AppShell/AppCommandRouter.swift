@@ -35,7 +35,7 @@ public final class AppCommandRouter: CommandRouting {
                     case .terminal:
                         surface = try TerminalSurface(workspaceID: wid, cwd: cwd, title: title)
                     case .browser:
-                        surface = BrowserSurface(workspaceID: wid, initialURL: nil, title: title)
+                        surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
                         let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: title)
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
@@ -489,6 +489,64 @@ public final class AppCommandRouter: CommandRouting {
         return s
     }
 
+    private func configureBrowserSurface(_ browser: BrowserSurface) -> BrowserSurface {
+        browser.onNavigationChange = { [weak self] surfaceID, url, title in
+            self?.persistBrowserNavigation(surfaceID: surfaceID, url: url, title: title)
+            var payload: [String: JSONValue] = [
+                "surface_id": .string(surfaceID.value.uuidString),
+                "url": .string(url)
+            ]
+            if let title { payload["title"] = .string(title) }
+            EventBus.shared.publish(kind: "surface.browser", payload: .object(payload))
+        }
+        return browser
+    }
+
+    private func restoredBrowserURL(from descriptor: SurfaceDescriptor) -> URL? {
+        guard let raw = descriptor.metadata["url"], !raw.isEmpty else { return nil }
+        return URL(string: raw)
+    }
+
+    private func persistBrowserNavigation(surfaceID: SurfaceID, url: String, title: String?) {
+        guard let ctx = context else { return }
+        for (wid, var ws) in ctx.state.workspaces {
+            let result = updateSurface(in: ws.layout, surfaceID: surfaceID) { descriptor in
+                descriptor.metadata["url"] = url
+                if let title, !title.isEmpty {
+                    descriptor.title = title
+                }
+            }
+            guard result.changed else { continue }
+            ws.layout = result.node
+            ws.updatedAt = Date()
+            ctx.state.workspaces[wid] = ws
+            ctx.scheduleSnapshotSave()
+            return
+        }
+    }
+
+    private func updateSurface(in node: LayoutNode,
+                               surfaceID: SurfaceID,
+                               _ update: (inout SurfaceDescriptor) -> Void) -> (node: LayoutNode, changed: Bool) {
+        switch node {
+        case .pane(var pane):
+            guard let index = pane.surfaces.firstIndex(where: { $0.id == surfaceID }) else {
+                return (node, false)
+            }
+            update(&pane.surfaces[index])
+            return (.pane(pane), true)
+        case .split(var split):
+            var changed = false
+            split.children = split.children.map { child in
+                guard !changed else { return child }
+                let result = updateSurface(in: child, surfaceID: surfaceID, update)
+                changed = result.changed
+                return result.node
+            }
+            return (.split(split), changed)
+        }
+    }
+
     public func browserNavigate(surface: SurfaceID, url: String) throws {
         let b = try browserSurface(surface)
         if !b.navigate(string: url) { throw LayoutError.invalidLayout }
@@ -497,6 +555,16 @@ public final class AppCommandRouter: CommandRouting {
     public func browserForward(surface: SurfaceID) throws { try browserSurface(surface).goForwardAction() }
     public func browserReload(surface: SurfaceID) throws { try browserSurface(surface).reloadAction() }
     public func browserURL(surface: SurfaceID) throws -> String { try browserSurface(surface).currentURL() }
+    public func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {
+        let raw = try browserSurface(surface).currentURL()
+        var out: [String: JSONValue] = ["url": .string(raw), "is_file": .bool(false)]
+        if let url = URL(string: raw), url.isFileURL,
+           let grant = DirectStaticFileRegistry.shared.register(fileURL: url) {
+            out["is_file"] = .bool(true)
+            out["static_path"] = .string(grant.routePath)
+        }
+        return out
+    }
 
     public func browserEval(surface: SurfaceID, script: String) async throws -> String {
         let s = try browserSurface(surface)
@@ -693,7 +761,7 @@ public final class AppCommandRouter: CommandRouting {
             case .terminal:
                 surface = try TerminalSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
             case .browser:
-                surface = BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle)
+                surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
                 let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: baseTitle)

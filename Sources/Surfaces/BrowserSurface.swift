@@ -14,6 +14,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     private let forwardButton = NSButton()
     private let reloadButton = NSButton()
     private var googleLegacyLayoutReloads = Set<String>()
+    public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
 
     public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
         self.descriptor = SurfaceDescriptor(
@@ -327,11 +328,19 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     // MARK: WKNavigationDelegate
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if let url = webView.url { addressBar.stringValue = url.absoluteString }
-        if let title = webView.title, !title.isEmpty {
-            descriptor.title = title
+        if let url = webView.url {
+            addressBar.stringValue = url.absoluteString
+            publishNavigationChange(url: url, title: webView.title)
         }
         reloadGoogleOnceAfterClearingLegacyLayoutCookie()
+    }
+
+    public func publishNavigationChange(url: URL, title: String?) {
+        descriptor.metadata["url"] = url.absoluteString
+        if let title, !title.isEmpty {
+            descriptor.title = title
+        }
+        onNavigationChange?(descriptor.id, url.absoluteString, title)
     }
 
     private func scheduleGoogleLegacyLayoutRefresh(for key: String) {

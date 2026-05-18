@@ -169,6 +169,10 @@ final class FakeRouter: CommandRouting {
     func browserForward(surface: SurfaceID) throws {}
     func browserReload(surface: SurfaceID) throws {}
     func browserURL(surface: SurfaceID) throws -> String { "about:blank" }
+    var browserURLString = "about:blank"
+    func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue] {
+        ["url": .string(browserURLString), "is_file": .bool(browserURLString.hasPrefix("file://"))]
+    }
     func browserEval(surface: SurfaceID, script: String) async throws -> String { "null" }
     func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String { savePath ?? "/tmp/x.png" }
     func browserSnapshot(surface: SurfaceID) async throws -> String { "{\"elements\":[]}" }
@@ -234,6 +238,22 @@ final class DispatcherTests: XCTestCase {
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "workspace.create", params: params))
         XCTAssertNil(resp.error)
         XCTAssertEqual(router.workspaces.count, 1)
+    }
+
+    @MainActor
+    func test_browserMirrorURLRoundTripsCurrentHostURL() async {
+        let router = FakeRouter()
+        router.browserURLString = "http://localhost:3000/demo"
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "browser.mirror_url.get", params: [
+            "id": .string(UUID().uuidString)
+        ]))
+
+        guard case .object(let body)? = resp.result else { return XCTFail("mirror URL must return render metadata") }
+        XCTAssertEqual(body["url"], .string("http://localhost:3000/demo"),
+                       "iOS needs the exact host browser URL before it can map localhost to the paired Mac")
+        XCTAssertEqual(body["is_file"], .bool(false))
     }
 
     @MainActor

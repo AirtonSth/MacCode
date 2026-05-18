@@ -68,6 +68,7 @@ public protocol CommandRouting: AnyObject {
     func browserForward(surface: SurfaceID) throws
     func browserReload(surface: SurfaceID) throws
     func browserURL(surface: SurfaceID) throws -> String
+    func browserMirrorURL(surface: SurfaceID) throws -> [String: JSONValue]
     func browserEval(surface: SurfaceID, script: String) async throws -> String
     func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String
     func browserSnapshot(surface: SurfaceID) async throws -> String
@@ -138,7 +139,7 @@ public final class JSONRPCDispatcher {
                         "supports_resume": .bool(true)
                     ]),
                     "browser_automation": .object([
-                        "p0": .array([.string("navigate"), .string("back"), .string("forward"), .string("reload"), .string("url.get")]),
+                        "p0": .array([.string("navigate"), .string("back"), .string("forward"), .string("reload"), .string("url.get"), .string("mirror_url.get")]),
                         "p1_unsupported": .bool(false)
                     ]),
                     "git": .object(["read_only": .bool(false)])
@@ -537,6 +538,10 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let url = try router.browserURL(surface: sid)
                 return .init(id: id, result: .string(url))
+            case "browser.mirror_url.get":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                let mirror = try router.browserMirrorURL(surface: sid)
+                return .init(id: id, result: .object(mirror))
             case "browser.eval":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let script = params["script"]?.stringValue else { throw JSONRPCError.invalidParams }

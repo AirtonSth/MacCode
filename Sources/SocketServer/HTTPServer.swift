@@ -11,6 +11,7 @@ import CryptoKit
 /// - GET  /v1/discovery
 /// - GET  /v1/capabilities
 /// - GET  /healthz
+/// - GET  /__rc2_static/<grant>/<relative-path>
 public protocol DirectAuthProvider: AnyObject {
     func verify(token: String) -> Bool
     func createPairingCode() -> String?
@@ -125,7 +126,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let parts = first.split(separator: " ")
         guard parts.count >= 2 else { return }
         let method = String(parts[0])
-        let path = String(parts[1])
+        let requestTarget = String(parts[1])
+        let path = requestTarget.split(separator: "?", maxSplits: 1).first.map(String.init) ?? requestTarget
 
         // Parse headers
         var headers: [String: String] = [:]
@@ -175,6 +177,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
             subID = id
             // keep connection open; read incoming frames (ping/pong/close)
             wsServeLoop(fd: fd, writeQueue: wsQueue)
+            return
+        }
+
+        if method == "GET", path.hasPrefix(DirectStaticFileRegistry.routePrefix) {
+            guard let file = DirectStaticFileRegistry.shared.resolve(routePath: path),
+                  let data = try? Data(contentsOf: file.url) else {
+                send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+                return
+            }
+            send(fd: fd, status: 200, contentType: file.contentType, body: data)
             return
         }
 
@@ -280,7 +292,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "surface_types": ["terminal", "browser", "agentApp", "markdown", "filePreview", "rightSidebarTool"],
                 "agent": ["providers": ["codex", "claude"], "supports_stream_events": true, "supports_resume": true],
                 "browser_automation": [
-                    "p0": ["navigate", "back", "forward", "reload", "url.get"],
+                    "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
                     "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],
                     "p1_unsupported": false
                 ],
@@ -453,6 +465,109 @@ public final class DirectHTTPServer: @unchecked Sendable {
             var out: [String: Any] = [:]
             for (k, vv) in o { out[k] = jsonValueToAny(vv) }
             return out
+        }
+    }
+}
+
+public struct DirectStaticFileGrant: Sendable, Equatable {
+    public let token: String
+    public let rootPath: String
+    public let routePath: String
+}
+
+public final class DirectStaticFileRegistry: @unchecked Sendable {
+    public static let shared = DirectStaticFileRegistry()
+    public static let routePrefix = "/__rc2_static/"
+
+    private struct Grant {
+        let rootPath: String
+        let createdAt: Date
+    }
+
+    private let lock = NSLock()
+    private var grants: [String: Grant] = [:]
+    private let ttl: TimeInterval = 60 * 60
+
+    public func register(fileURL: URL, now: Date = Date()) -> DirectStaticFileGrant? {
+        guard fileURL.isFileURL else { return nil }
+        let standardized = fileURL.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardized.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
+        let root = standardized.deletingLastPathComponent().path
+        let relative = standardized.lastPathComponent
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let routePath = Self.routePrefix + token + "/" + Self.encodeRelativePath(relative)
+
+        lock.lock()
+        purgeExpired(now: now)
+        grants[token] = Grant(rootPath: root, createdAt: now)
+        lock.unlock()
+
+        return DirectStaticFileGrant(token: token, rootPath: root, routePath: routePath)
+    }
+
+    public func resolve(routePath: String, now: Date = Date()) -> (url: URL, contentType: String)? {
+        guard routePath.hasPrefix(Self.routePrefix) else { return nil }
+        let rest = String(routePath.dropFirst(Self.routePrefix.count))
+        guard let slash = rest.firstIndex(of: "/") else { return nil }
+        let token = String(rest[..<slash])
+        let encodedRelative = String(rest[rest.index(after: slash)...])
+        guard !encodedRelative.isEmpty,
+              let relative = encodedRelative.removingPercentEncoding,
+              !relative.split(separator: "/").contains("..") else { return nil }
+
+        lock.lock()
+        purgeExpired(now: now)
+        guard let grant = grants[token] else { lock.unlock(); return nil }
+        lock.unlock()
+
+        let rootURL = URL(fileURLWithPath: grant.rootPath, isDirectory: true).standardizedFileURL
+        let candidate = rootURL.appendingPathComponent(relative).standardizedFileURL
+        let rootPath = rootURL.path
+        guard candidate.path == rootPath || candidate.path.hasPrefix(rootPath + "/") else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
+        return (candidate, Self.contentType(for: candidate.pathExtension))
+    }
+
+    public func resetForTests() {
+        lock.lock()
+        grants.removeAll()
+        lock.unlock()
+    }
+
+    private func purgeExpired(now: Date) {
+        grants = grants.filter { now.timeIntervalSince($0.value.createdAt) <= ttl }
+    }
+
+    private static func encodeRelativePath(_ relative: String) -> String {
+        relative.split(separator: "/", omittingEmptySubsequences: false)
+            .map { part in
+                String(part).addingPercentEncoding(withAllowedCharacters: pathComponentAllowed) ?? String(part)
+            }
+            .joined(separator: "/")
+    }
+
+    private static let pathComponentAllowed: CharacterSet = {
+        var set = CharacterSet.urlPathAllowed
+        set.remove(charactersIn: "/?#[]@!$&'()*+,;=")
+        return set
+    }()
+
+    private static func contentType(for ext: String) -> String {
+        switch ext.lowercased() {
+        case "html", "htm": return "text/html; charset=utf-8"
+        case "css": return "text/css; charset=utf-8"
+        case "js", "mjs": return "text/javascript; charset=utf-8"
+        case "json": return "application/json"
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "svg": return "image/svg+xml"
+        case "txt": return "text/plain; charset=utf-8"
+        default: return "application/octet-stream"
         }
     }
 }

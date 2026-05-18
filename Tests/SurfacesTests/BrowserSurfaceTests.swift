@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import Surfaces
 
 // BrowserSurface is @MainActor; its static helpers inherit that isolation.
@@ -23,5 +24,22 @@ final class BrowserSurfaceTests: XCTestCase {
         XCTAssertTrue(BrowserSurface.isGoogleHost("www.google.com"))
         XCTAssertFalse(BrowserSurface.isGoogleHost("evilgoogle.com"))
         XCTAssertFalse(BrowserSurface.isGoogleHost("google.com.example"))
+    }
+
+    func test_hostNavigationChangeCallbackCarriesExactURLAndTitle() throws {
+        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
+        var observed: (SurfaceID, String, String?)?
+        surface.onNavigationChange = { id, url, title in
+            observed = (id, url, title)
+        }
+
+        let url = try XCTUnwrap(URL(string: "file:///Users/dev/project/index.html"))
+        surface.publishNavigationChange(url: url, title: "Local file")
+
+        XCTAssertEqual(observed?.0, surface.descriptor.id)
+        XCTAssertEqual(observed?.1, "file:///Users/dev/project/index.html",
+                       "manual host browser navigation must emit the exact URL so iOS can mirror it")
+        XCTAssertEqual(observed?.2, "Local file")
+        XCTAssertEqual(surface.descriptor.title, "Local file")
     }
 }

@@ -49,4 +49,32 @@ final class PersistenceRestoreTests: XCTestCase {
         let ctx2 = try AppContext(channel: .debug, appSupportOverride: dir)
         XCTAssertTrue(ctx2.state.workspaces.values.contains { $0.name == "A" })
     }
+
+    func test_browserLastURL_persistsAcrossRestart() throws {
+        let dir = NSTemporaryDirectory() + "RC2Persist-" + UUID().uuidString
+        let target = "https://example.com/docs?tab=api"
+
+        do {
+            let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            let ws = try router.createWorkspace(name: "WEB", cwd: NSTemporaryDirectory())
+            let browser = try router.createSurface(workspace: ws.id, type: .browser, paneID: nil, title: "browser")
+            let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(browser.id) as? BrowserSurface)
+
+            surface.publishNavigationChange(url: try XCTUnwrap(URL(string: target)), title: "API Docs")
+            ctx.saveSnapshot()
+        }
+
+        let ctx2 = try AppContext(channel: .debug, appSupportOverride: dir)
+        let restored = try XCTUnwrap(ctx2.state.workspaces.values.first { $0.name == "WEB" })
+        guard case .pane(let pane) = restored.layout else {
+            return XCTFail("expected browser workspace to restore as pane")
+        }
+        let browser = try XCTUnwrap(pane.surfaces.first { $0.type == .browser })
+        XCTAssertEqual(browser.metadata["url"], target,
+                       "browser tabs must reopen on the last URL after RemoteCode restarts")
+        XCTAssertEqual(browser.title, "API Docs",
+                       "browser tab title must persist with the last visited page")
+    }
 }
