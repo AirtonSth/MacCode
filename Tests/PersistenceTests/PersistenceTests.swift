@@ -88,4 +88,30 @@ final class PersistenceTests: XCTestCase {
         let count = try runs.reconcileRunningOnLaunch()
         XCTAssertEqual(count, 1)
     }
+
+    func test_streamEventReplayIncludesEveryRunForThread() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threads = AgentThreadRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "history", provider: .codex, model: "m")
+        try threads.upsert(thread)
+
+        let firstRun = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 1))
+        let secondRun = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 2))
+        try runs.upsert(firstRun)
+        try runs.upsert(secondRun)
+        try runs.appendStreamEvent(runId: firstRun.id, seq: 1, kind: "turnStarted(first)", payloadJSON: #"{"turnStarted":{"turnId":"first"}}"#)
+        try runs.appendStreamEvent(runId: firstRun.id, seq: 2, kind: "error(first)", payloadJSON: #"{"error":{"message":"first update","recoverable":false}}"#)
+        try runs.appendStreamEvent(runId: secondRun.id, seq: 1, kind: "turnStarted(second)", payloadJSON: #"{"turnStarted":{"turnId":"second"}}"#)
+
+        let replayed = try runs.listLatestStreamEvents(threadId: thread.id)
+
+        XCTAssertEqual(replayed, [
+            .turnStarted(turnId: "first"),
+            .error(message: "first update", recoverable: false),
+            .turnStarted(turnId: "second")
+        ], "reopening or following up must replay every persisted run event, not only the latest response")
+    }
 }

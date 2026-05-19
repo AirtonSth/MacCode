@@ -300,15 +300,11 @@ public final class AgentRunRepository {
 
     public func listLatestStreamEvents(threadId: AgentThreadID, limit: Int = 500) throws -> [AssistantEvent] {
         let st = try db.prepare("""
-            SELECT payload_json
-            FROM agent_stream_events
-            WHERE run_id = (
-                SELECT id FROM agent_runs
-                WHERE thread_id = ?
-                ORDER BY started_at DESC
-                LIMIT 1
-            )
-            ORDER BY seq ASC
+            SELECT e.payload_json
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE r.thread_id = ?
+            ORDER BY r.started_at ASC, e.seq ASC
             LIMIT ?;
         """)
         try st.bind(1, threadId.value.uuidString)

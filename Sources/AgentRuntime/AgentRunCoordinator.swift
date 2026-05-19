@@ -36,6 +36,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onRunStarted: ((AgentThreadID, AgentRunID) -> Void)?
     public var onAssistantEvent: ((AssistantEvent, AgentThreadID, AgentRunID) -> Void)?
     public var onRunFinished: ((AgentThreadID, AgentRunID, AgentRunStatus) -> Void)?
+    public var onMessageAppended: ((AgentMessage) -> Void)?
 
     public init(
         runRepo: AgentRunRepository,
@@ -75,6 +76,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // persist user message
         let userMsg = AgentMessage(threadId: request.threadId, role: .user, content: request.prompt)
         try messageRepo.append(userMsg)
+        onMessageAppended?(userMsg)
         // persist run
         let run = AgentRun(id: request.runId, threadId: request.threadId, provider: request.provider, model: request.model, status: .running)
         try runRepo.upsert(run)
@@ -123,12 +125,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         (try? runRepo.listLatestStreamEvents(threadId: threadId)) ?? []
     }
 
-    private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
+    @discardableResult
+    private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID) -> AgentMessage? {
         let text = AssistantTimelineState.cappedText(text)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else { return nil }
         let existing = (try? messageRepo.list(threadId: threadId)) ?? []
-        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return }
-        _ = try? messageRepo.append(AgentMessage(threadId: threadId, role: .assistant, content: text))
+        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return nil }
+        let message = AgentMessage(threadId: threadId, role: .assistant, content: text)
+        guard (try? messageRepo.append(message)) != nil else { return nil }
+        onMessageAppended?(message)
+        return message
     }
 
     private func handle(event: AgentRunEvent, runId: AgentRunID, threadId: AgentThreadID) {

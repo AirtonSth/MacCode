@@ -52,6 +52,9 @@ public final class AppContext {
         func itemJSON(_ item: AssistantItem) -> JSONValue {
             (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(item))) ?? .null
         }
+        func messageJSON(_ message: AgentMessage) -> JSONValue {
+            (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(message))) ?? .null
+        }
         func agentRunPayload(threadId: AgentThreadID) -> JSONValue {
             var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
             if let wid = try? threadRepo.get(id: threadId)?.workspaceId {
@@ -62,6 +65,9 @@ public final class AppContext {
         coordinator.onRunStarted = { tid, _ in
             EventBus.shared.publish(kind: "agent.run.started",
                                     payload: agentRunPayload(threadId: tid))
+        }
+        coordinator.onMessageAppended = { message in
+            EventBus.shared.publish(kind: "agent.message.appended", payload: messageJSON(message))
         }
         coordinator.onAssistantEvent = { ev, tid, _ in
             let t = tid.value.uuidString

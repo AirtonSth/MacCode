@@ -89,6 +89,19 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         return nil
     }
 
+    public var assistantTexts: [String] {
+        turns.flatMap { turn in
+            var texts = turn.items.compactMap { item -> String? in
+                guard item.type == .assistantMessage, !item.body.isEmpty else { return nil }
+                return item.body
+            }
+            if let final = turn.finalAssistantMessage, !final.isEmpty {
+                texts.append(final)
+            }
+            return texts
+        }
+    }
+
     public mutating func apply(_ ev: AssistantEvent) {
         switch ev {
         case .threadStarted(let tid, let ptid):

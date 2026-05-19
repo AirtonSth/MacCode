@@ -72,6 +72,41 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "thread notifications are driven by terminal outcomes; streaming errors must not look like extra finishes")
     }
 
+    func testAgentMessageAppendEventsCarryDurableChatHistoryToMirrors() async throws {
+        let dir = NSTemporaryDirectory() + "RC2MessageEvents-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        ctx.coordinator.replaceProvider(.codex, runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "persisted answer")))
+        let thread = AgentThread(title: "Mirror history", provider: .codex, model: "fake-model")
+        try ctx.threadRepo.upsert(thread)
+
+        let startSeq = EventBus.shared.snapshot().lastSeq
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: startSeq) { event in
+            if event.kind == "agent.message.appended" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        _ = try await ctx.coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: dir,
+            prompt: "first prompt"
+        ))
+        await waitAsync("durable user and assistant messages are mirrored") {
+            events.count >= 2
+        }
+
+        XCTAssertTrue(events.contains { event in
+            guard case .object(let payload) = event.payload else { return false }
+            return payload["role"] == .string("user") && payload["content"] == .string("first prompt")
+        }, "the iOS mirror must receive the persisted user message, not only transient stream state")
+        XCTAssertTrue(events.contains { event in
+            guard case .object(let payload) = event.payload else { return false }
+            return payload["role"] == .string("assistant") && payload["content"] == .string("persisted answer")
+        }, "the iOS mirror must receive the persisted assistant answer before a follow-up clears live stream state")
+    }
+
     func testCodexWarningsAreNotUserVisibleErrors() {
         let warning = "[codex stderr] 2026-05-18T19:27:58Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt"
 

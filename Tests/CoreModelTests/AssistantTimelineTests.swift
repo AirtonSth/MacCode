@@ -38,6 +38,17 @@ final class AssistantTimelineTests: XCTestCase {
                        "persistence must use the last real assistant reply, not a trailing empty turn")
     }
 
+    func test_assistantTextsIncludesStreamBodyAndFinalsForDuplicateSuppression() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "streamed"))
+        s.apply(.itemStarted(item: AssistantItem(id: "a1", turnId: "streamed", type: .assistantMessage, startedAtMs: 1)))
+        s.apply(.itemDelta(itemId: "a1", bodyAppend: "stream body", outputAppend: nil, summary: nil))
+        s.apply(.turnCompleted(turnId: "streamed", finalMessage: "final body"))
+
+        XCTAssertEqual(s.assistantTexts, ["stream body", "final body"],
+                       "when replayed timeline already renders an answer, persisted assistant bubbles must be suppressible without hiding tool/history items")
+    }
+
     func test_liveTimelineCapsStreamingTextSoLongThreadsStayResponsive() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "long"))

@@ -151,11 +151,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func suppressPersistedFinalDuplicatedByTimeline() {
-        guard let liveFinal = timeline.latestAssistantMessage,
-              let last = messages.last,
-              last.role == .assistant,
-              last.content == liveFinal else { return }
-        messages.removeLast()
+        let timelineTexts = Set(timeline.assistantTexts)
+        guard !timelineTexts.isEmpty else { return }
+        messages.removeAll { $0.role == .assistant && timelineTexts.contains($0.content) }
     }
 
     public func loadEarlierMessages() {
@@ -395,8 +393,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
            ((try? messageRepo.list(threadId: tid))?.isEmpty ?? true) {
             renameThread(tid, to: Self.deriveTitle(from: text))
         }
+        loadWindow(tid)
+        suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
-        timeline = AssistantTimelineState()
         timelineUpdateTick = 0
         // B3: fold attachment paths into the prompt so the agent (which
         // has fs access per permission mode) can read them; show a friendly
@@ -563,6 +562,36 @@ public struct AgentAppView: View {
     @State private var showThreadRail = true
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
+
+    private enum TranscriptEntry: Identifiable {
+        case message(AgentMessage)
+        case turn(AssistantTurnSnapshot)
+
+        var id: String {
+            switch self {
+            case .message(let message): return "message-\(message.id.value.uuidString)"
+            case .turn(let turn): return "turn-\(turn.turnId)"
+            }
+        }
+
+        var sortTime: TimeInterval {
+            switch self {
+            case .message(let message):
+                return message.createdAt.timeIntervalSince1970
+            case .turn(let turn):
+                let started = turn.items.map(\.startedAtMs).min()
+                return started.map { TimeInterval($0) / 1000 } ?? 0
+            }
+        }
+    }
+
+    private var transcriptEntries: [TranscriptEntry] {
+        (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
+            .sorted { lhs, rhs in
+                if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
+                return lhs.sortTime < rhs.sortTime
+            }
+    }
 
     public var body: some View {
         HSplitView {
@@ -815,8 +844,12 @@ public struct AgentAppView: View {
                             if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
                                 emptyConversation.padding(.top, 56)
                             }
-                            ForEach(vm.messages, id: \.id) { msg in messageRow(msg) }
-                            ForEach(vm.timeline.turns, id: \.turnId) { turn in turnView(turn) }
+                            ForEach(transcriptEntries) { entry in
+                                switch entry {
+                                case .message(let msg): messageRow(msg)
+                                case .turn(let turn): turnView(turn)
+                                }
+                            }
                             if vm.status == .running { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
                             Color.clear

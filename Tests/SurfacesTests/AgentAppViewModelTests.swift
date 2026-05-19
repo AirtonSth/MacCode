@@ -704,6 +704,34 @@ final class AgentAppViewModelTests: XCTestCase {
         }, "the completed selected run must keep live stream/history items visible instead of collapsing to the final answer only")
     }
 
+    func test_secondSendKeepsPriorTimelineHistoryVisible() async throws {
+        let (vm, _) = try makeVM()
+        vm.coordinator.replaceProvider(.codex, runner: FakeProviderRunner(
+            provider: .codex,
+            scenario: .withTool(toolName: "Bash", output: "tool output", reply: "first answer")
+        ))
+        vm.createThread(title: "convo")
+
+        vm.prompt = "first prompt"
+        await vm.send()
+        await waitAsync("first answer completes") { vm.status == .completed }
+        XCTAssertTrue(vm.timeline.turns.flatMap(\.items).contains {
+            $0.type == .tool && $0.output == "tool output"
+        }, "after completion the selected thread may keep tools and updates in the live timeline")
+
+        vm.coordinator.replaceProvider(.codex, runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "second answer")))
+        vm.prompt = "second prompt"
+        await vm.send()
+
+        XCTAssertTrue(vm.timeline.turns.flatMap(\.items).contains {
+            $0.type == .tool && $0.output == "tool output"
+        }, "sending a follow-up must not clear prior agent timeline history such as tool calls and outputs")
+        XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "first prompt" })
+        XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "second prompt" })
+        XCTAssertFalse(vm.messages.contains { $0.role == .assistant && $0.content == "first answer" },
+                       "the final assistant bubble must not duplicate the replayed assistant timeline")
+    }
+
     func test_selectThreadReplaysPersistedStreamHistoryWithoutDuplicatingFinalAnswer() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-replay-timeline-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
