@@ -163,6 +163,7 @@ public final class SidebarViewModel: ObservableObject {
 
 public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
+
     public init(vm: SidebarViewModel) { self.vm = vm }
 
     public var body: some View {
@@ -219,8 +220,11 @@ public struct SidebarRootView: View {
                     }
                 }
                 .padding(.horizontal, DS.Space.sm)
-            }.padding(.bottom, DS.Space.md)
+            }
+            .frame(maxHeight: .infinity)
+            .padding(.bottom, 76)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
         .background(DS.Palette.surface.opacity(0.55))
@@ -371,6 +375,7 @@ public final class SidebarView: NSObject {
     public weak var router: AppCommandRouter?
     private let viewModel: SidebarViewModel
     private let host: NSHostingView<SidebarRootView>
+    private var settingsController: SettingsWindowController?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -399,9 +404,72 @@ public final class SidebarView: NSObject {
         ])
         self.view = container
         super.init()
+        configureSettingsFooter(in: container)
     }
 
     public func refresh() {
         viewModel.reload()
+    }
+
+    private func configureSettingsFooter(in container: NSView) {
+        let footer = NSHostingView(rootView: SidebarFooterSettingsButton { [weak self] in
+            self?.showSettings()
+        })
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.wantsLayer = true
+        footer.layer?.backgroundColor = NSColor.clear.cgColor
+        container.addSubview(footer)
+
+        NSLayoutConstraint.activate([
+            footer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 72)
+        ])
+    }
+
+    @objc private func showSettings() {
+        guard let context else { return }
+        let controller = settingsController ?? SettingsWindowController(context: context)
+        settingsController = controller
+        if let window = view.window {
+            controller.show(attachedTo: window)
+        } else {
+            controller.show()
+        }
+    }
+}
+
+private struct SidebarFooterSettingsButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: action) {
+                HStack(spacing: DS.Space.md) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 16, weight: .regular))
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(DS.Palette.text)
+                    Text("Settings")
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .frame(height: 42)
+                .contentShape(Rectangle())
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .fill(Color.white.opacity(0.001))
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+            .padding(.horizontal, DS.Space.md)
+            .padding(.top, DS.Space.md)
+            .padding(.bottom, DS.Space.lg)
+        }
     }
 }

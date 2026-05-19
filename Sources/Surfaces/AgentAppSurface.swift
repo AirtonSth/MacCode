@@ -50,19 +50,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let coordinator: AgentRunCoordinator
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
+    public let promptHistoryStore: PromptHistoryStore?
+    private var promptHistory: [String] = []
+    private var promptHistoryCursor: Int?
 
     public init(
         workspaceID: WorkspaceID,
         cwd: String,
         coordinator: AgentRunCoordinator,
         threadRepo: AgentThreadRepository,
-        messageRepo: AgentMessageRepository
+        messageRepo: AgentMessageRepository,
+        promptHistoryStore: PromptHistoryStore? = nil
     ) {
         self.workspaceID = workspaceID
         self.cwd = cwd
         self.coordinator = coordinator
         self.threadRepo = threadRepo
         self.messageRepo = messageRepo
+        self.promptHistoryStore = promptHistoryStore
+        self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
         self.coordinator.addObserver(self)
         reloadThreads()
         loadGitBranch()
@@ -360,6 +366,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     public func insertDroppedFilePaths(_ paths: [String]) {
         prompt = DroppedFilePaths.appending(DroppedFilePaths.composerInputText(for: paths), to: prompt)
+        promptHistoryCursor = nil
+    }
+    public func promptWasEdited() {
+        promptHistoryCursor = nil
     }
     public func removeAttachment(_ path: String) {
         attachments.removeAll { $0 == path }
@@ -368,6 +378,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func send() async {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
+        recordPromptHistory(text)
         // Slash commands never reach the provider.
         if text.hasPrefix("/") {
             prompt = ""
@@ -423,6 +434,38 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } catch {
             await MainActor.run { self.statusMessage = "Failed to start: \(error)"; self.status = .failed }
         }
+    }
+
+    private func recordPromptHistory(_ text: String) {
+        guard !text.isEmpty else { return }
+        promptHistory.append(text)
+        promptHistory = Array(promptHistory.suffix(PromptHistoryStore.limit))
+        promptHistoryStore?.save(promptHistory, workspaceID: workspaceID)
+        promptHistoryCursor = nil
+    }
+
+    @discardableResult
+    public func recallPreviousPrompt() -> Bool {
+        guard prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || promptHistoryCursor != nil else { return false }
+        guard !promptHistory.isEmpty else { return false }
+        let next = promptHistoryCursor.map { max($0 - 1, 0) } ?? (promptHistory.count - 1)
+        promptHistoryCursor = next
+        prompt = promptHistory[next]
+        return true
+    }
+
+    @discardableResult
+    public func recallNextPrompt() -> Bool {
+        guard let cursor = promptHistoryCursor else { return false }
+        let next = cursor + 1
+        guard next < promptHistory.count else {
+            promptHistoryCursor = nil
+            prompt = ""
+            return true
+        }
+        promptHistoryCursor = next
+        prompt = promptHistory[next]
+        return true
     }
 
     public func stop() {
@@ -514,6 +557,8 @@ public struct AgentAppView: View {
     @State private var draggingThreadId: AgentThreadID?
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
+    @State private var userIsDraggingTimeline = false
+    @State private var pendingScrollDownReveal: Task<Void, Never>?
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @State private var showThreadRail = true
 
@@ -794,16 +839,17 @@ public struct AgentAppView: View {
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
                     .onPreferenceChange(TimelineBottomPreferenceKey.self) { bottomY in
-                        let atBottom = bottomY <= viewport.size.height + 28
-                        timelineSticksToBottom = atBottom
-                        showScrollDownButton = !atBottom
+                        updateTimelineBottomVisibility(bottomY: bottomY, viewportHeight: viewport.size.height)
                     }
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 4)
+                            .onChanged { _ in userIsDraggingTimeline = true }
+                            .onEnded { _ in userIsDraggingTimeline = false }
+                    )
                 }
                 if showScrollDownButton {
                     Button {
-                        timelineSticksToBottom = true
-                        showScrollDownButton = false
-                        withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
+                        scrollTimelineToBottom(proxy, force: true)
                     } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 13, weight: .semibold))
@@ -832,9 +878,41 @@ public struct AgentAppView: View {
 
     private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
         guard force || timelineSticksToBottom else { return }
+        cancelPendingScrollDownReveal()
         timelineSticksToBottom = true
         showScrollDownButton = false
         withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
+    }
+
+    private func updateTimelineBottomVisibility(bottomY: CGFloat, viewportHeight: CGFloat) {
+        let atBottom = bottomY <= viewportHeight + 28
+        if atBottom {
+            cancelPendingScrollDownReveal()
+            timelineSticksToBottom = true
+            showScrollDownButton = false
+            return
+        }
+
+        if userIsDraggingTimeline {
+            cancelPendingScrollDownReveal()
+            timelineSticksToBottom = false
+            showScrollDownButton = true
+            return
+        }
+
+        guard pendingScrollDownReveal == nil else { return }
+        pendingScrollDownReveal = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            timelineSticksToBottom = false
+            showScrollDownButton = true
+            pendingScrollDownReveal = nil
+        }
+    }
+
+    private func cancelPendingScrollDownReveal() {
+        pendingScrollDownReveal?.cancel()
+        pendingScrollDownReveal = nil
     }
 
     // "Working for 2m 21s" + hairline, while a run is in flight.
@@ -1049,6 +1127,9 @@ public struct AgentAppView: View {
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
                 isEnabled: vm.status != .running,
                 onSend: { Task { await vm.send() } },
+                onPreviousHistory: { vm.recallPreviousPrompt() },
+                onNextHistory: { vm.recallNextPrompt() },
+                onTextEdited: { vm.promptWasEdited() },
                 onFileDrop: { paths in vm.insertDroppedFilePaths(paths) }
             )
             .frame(height: composerEditorHeight)
@@ -1317,9 +1398,15 @@ public struct AgentAppView: View {
 enum PromptComposerKeyAction: Equatable {
     case send
     case insertNewline
+    case previousHistory
+    case nextHistory
     case ignore
 
     static func action(for event: NSEvent) -> PromptComposerKeyAction {
+        if event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+            if event.keyCode == 126 { return .previousHistory }
+            if event.keyCode == 125 { return .nextHistory }
+        }
         guard event.keyCode == 36 || event.keyCode == 76 else { return .ignore }
         return event.modifierFlags.contains(.shift) ? .insertNewline : .send
     }
@@ -1327,6 +1414,8 @@ enum PromptComposerKeyAction: Equatable {
 
 private final class PromptComposerTextView: NSTextView {
     var onSend: (() -> Void)?
+    var onPreviousHistory: (() -> Bool)?
+    var onNextHistory: (() -> Bool)?
     var onFileDrop: (([String]) -> Void)?
     var placeholderString: String = "" {
         didSet { needsDisplay = true }
@@ -1338,6 +1427,10 @@ private final class PromptComposerTextView: NSTextView {
             onSend?()
         case .insertNewline:
             insertNewlineIgnoringFieldEditor(self)
+        case .previousHistory:
+            if onPreviousHistory?() != true { super.keyDown(with: event) }
+        case .nextHistory:
+            if onNextHistory?() != true { super.keyDown(with: event) }
         case .ignore:
             super.keyDown(with: event)
         }
@@ -1389,6 +1482,9 @@ private struct PromptComposerEditor: NSViewRepresentable {
     let placeholder: String
     let isEnabled: Bool
     let onSend: () -> Void
+    let onPreviousHistory: () -> Bool
+    let onNextHistory: () -> Bool
+    let onTextEdited: () -> Void
     let onFileDrop: ([String]) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -1419,6 +1515,8 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.textContainer?.widthTracksTextView = true
         textView.string = text
         textView.onSend = onSend
+        textView.onPreviousHistory = onPreviousHistory
+        textView.onNextHistory = onNextHistory
         textView.onFileDrop = onFileDrop
         textView.placeholderString = placeholder
         context.coordinator.textView = textView
@@ -1433,37 +1531,51 @@ private struct PromptComposerEditor: NSViewRepresentable {
             dropScroll.onFileDrop = onFileDrop
         }
         textView.onSend = onSend
+        textView.onPreviousHistory = onPreviousHistory
+        textView.onNextHistory = onNextHistory
         textView.onFileDrop = onFileDrop
         textView.isEditable = isEnabled
         textView.placeholderString = placeholder
         if textView.string != text {
-            let selectedRanges = textView.selectedRanges
-            textView.string = text
-            textView.selectedRanges = selectedRanges
+            context.coordinator.applyExternalText(text, to: textView)
         }
         context.coordinator.recalculateHeight()
         scroll.hasVerticalScroller = height >= Self.maxHeight
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, height: $height)
+        Coordinator(text: $text, height: $height, onTextEdited: onTextEdited)
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         @Binding var text: String
         @Binding var height: CGFloat
+        let onTextEdited: () -> Void
         weak var textView: PromptComposerTextView?
+        private var externallyAppliedText: String?
 
-        init(text: Binding<String>, height: Binding<CGFloat>) {
+        init(text: Binding<String>, height: Binding<CGFloat>, onTextEdited: @escaping () -> Void) {
             _text = text
             _height = height
+            self.onTextEdited = onTextEdited
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             text = textView.string
+            if textView.string == externallyAppliedText {
+                externallyAppliedText = nil
+            } else {
+                onTextEdited()
+            }
             textView.needsDisplay = true
             recalculateHeight()
+        }
+
+        func applyExternalText(_ value: String, to textView: NSTextView) {
+            externallyAppliedText = value
+            textView.string = value
+            textView.setSelectedRange(NSRange(location: (value as NSString).length, length: 0))
         }
 
         func recalculateHeight() {
@@ -1546,9 +1658,9 @@ public final class AgentAppSurface: NSObject, Surface {
     /// this already-open surface (wired by AppCommandRouter, like Feed).
     public var subscriptionToken: AnyHashable?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, title: String = "Agent App") {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, promptHistoryStore: PromptHistoryStore? = nil, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, promptHistoryStore: promptHistoryStore)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

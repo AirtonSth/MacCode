@@ -429,6 +429,40 @@ final class PaneActionTests: XCTestCase {
         wait(for: [exp], timeout: 0.2)
     }
 
+    func test_settingsController_presentsSettingsAsModalSheet() throws {
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "settings", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 700), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        let settings = SettingsWindowController(context: ctx)
+        settings.show(attachedTo: controller.window)
+
+        XCTAssertTrue(controller.window.attachedSheet === settings.window,
+                      "Settings must open as a modal sheet attached to the main window, not as another floating preferences window")
+        settings.close()
+        XCTAssertNil(controller.window.attachedSheet,
+                     "Settings must expose a close path that dismisses the modal sheet")
+    }
+
+    func test_settingsViewModel_persistsAllUserTunableAppSettings() throws {
+        let (ctx, _) = try makeContext()
+        let vm = SettingsViewModel(context: ctx)
+
+        vm.setDiffWordWrap(true)
+        vm.setDiffIgnoreWhitespace(true)
+        vm.setSidebarSort("manual")
+
+        let reloaded = SettingsViewModel(context: ctx)
+        XCTAssertTrue(reloaded.appSettings.diffWordWrap,
+                      "Settings must expose and persist the diff word-wrap preference used by the diff surface")
+        XCTAssertTrue(reloaded.appSettings.diffIgnoreWhitespace,
+                      "Settings must expose and persist the diff ignore-whitespace preference used by the diff surface")
+        XCTAssertEqual(reloaded.appSettings.sidebarSort, "manual",
+                       "Settings must expose and persist the sidebar ordering preference instead of leaving it hidden in storage")
+    }
+
     func test_ratioSplit_laysOutSideBySideWithoutFreeSpace() {
         let split = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 901, height: 300))
         split.isVertical = true

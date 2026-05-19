@@ -13,12 +13,14 @@ extension Notification.Name {
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
     public let trustRepo: DeviceTrustRepository
+    public let settingsStore: SettingsStore
     public let context: AppContext
 
     @Published public var theme: String = "dark"
     @Published public var remoteAccessEnabled: Bool = false
     @Published public var defaultProvider: AgentProvider = .codex
     @Published public var firstRunCompleted: Bool = false
+    @Published public var appSettings: AppSettings = AppSettings()
     @Published public var devices: [DeviceTrust] = []
     @Published public var newPairingCode: String?
 
@@ -26,6 +28,7 @@ public final class SettingsViewModel: ObservableObject {
         self.context = context
         self.settingsRepo = context.settingsRepo
         self.trustRepo = DeviceTrustRepository(db: context.db)
+        self.settingsStore = SettingsStore(db: context.db)
         reload()
     }
 
@@ -35,6 +38,7 @@ public final class SettingsViewModel: ObservableObject {
         let p = (try? settingsRepo.get("provider.default")) ?? "codex"
         defaultProvider = AgentProvider(rawValue: p) ?? .codex
         firstRunCompleted = (try? settingsRepo.get("first_run_completed")) == "1"
+        appSettings = settingsStore.load()
         devices = (try? trustRepo.list()) ?? []
     }
 
@@ -47,6 +51,21 @@ public final class SettingsViewModel: ObservableObject {
     public func setDefaultProvider(_ p: AgentProvider) {
         defaultProvider = p
         try? settingsRepo.set("provider.default", p.rawValue)
+    }
+
+    public func setDiffWordWrap(_ on: Bool) {
+        appSettings.diffWordWrap = on
+        settingsStore.update { $0.diffWordWrap = on }
+    }
+
+    public func setDiffIgnoreWhitespace(_ on: Bool) {
+        appSettings.diffIgnoreWhitespace = on
+        settingsStore.update { $0.diffIgnoreWhitespace = on }
+    }
+
+    public func setSidebarSort(_ value: String) {
+        appSettings.sidebarSort = value
+        settingsStore.update { $0.sidebarSort = value }
     }
 
     public func createPairingCode() {
@@ -63,16 +82,34 @@ public final class SettingsViewModel: ObservableObject {
 
 public struct SettingsView: View {
     @ObservedObject var vm: SettingsViewModel
-    public init(vm: SettingsViewModel) { self.vm = vm }
+    private let onClose: (() -> Void)?
+
+    public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
+        self.vm = vm
+        self.onClose = onClose
+    }
 
     public var body: some View {
-        TabView {
-            general.tabItem { Label("General", systemImage: "gearshape") }
-            providers.tabItem { Label("Providers", systemImage: "sparkle") }
-            remote.tabItem { Label("Remote Access", systemImage: "network") }
+        VStack(spacing: DS.Space.md) {
+            HStack {
+                Text("Settings")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer()
+                Button("Done") { onClose?() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            TabView {
+                general.tabItem { Label("General", systemImage: "gearshape") }
+                display.tabItem { Label("Display", systemImage: "sidebar.left") }
+                providers.tabItem { Label("Providers", systemImage: "sparkle") }
+                remote.tabItem { Label("Remote Access", systemImage: "network") }
+            }
         }
         .padding(DS.Space.xl)
-        .frame(width: 560, height: 400)
+        .frame(width: 600, height: 470)
         .background(DS.Palette.bg)
     }
 
@@ -103,6 +140,41 @@ public struct SettingsView: View {
             Text(vm.context.bootstrapReport.path)
                 .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
                 .textSelection(.enabled)
+            Spacer()
+        }
+    }
+
+    private var display: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Diff")
+            settingRow("Word wrap") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.diffWordWrap },
+                    set: { vm.setDiffWordWrap($0) }
+                ))
+                .labelsHidden()
+            }
+            settingRow("Ignore whitespace") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.diffIgnoreWhitespace },
+                    set: { vm.setDiffIgnoreWhitespace($0) }
+                ))
+                .labelsHidden()
+            }
+            Divider().overlay(DS.Palette.line)
+            DSSectionHeader("Sidebar")
+            settingRow("Workspace ordering") {
+                Picker("", selection: Binding(
+                    get: { vm.appSettings.sidebarSort },
+                    set: { vm.setSidebarSort($0) }
+                )) {
+                    Text("Updated").tag("updated")
+                    Text("Created").tag("created")
+                    Text("Manual").tag("manual")
+                }
+                .labelsHidden()
+                .frame(width: 150)
+            }
             Spacer()
         }
     }
@@ -206,10 +278,37 @@ public final class SettingsWindowController: NSObject {
         win.setContentSize(NSSize(width: 540, height: 380))
         win.center()
         self.window = win
+        host.rootView = SettingsView(vm: viewModel) { [weak win] in
+            guard let win else { return }
+            if let parent = win.sheetParent {
+                parent.endSheet(win)
+            } else {
+                win.close()
+            }
+        }
     }
 
     public func show() {
         viewModel.reload()
-        window.makeKeyAndOrderFront(nil)
+        if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
+            show(attachedTo: parent)
+        } else {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    public func show(attachedTo parent: NSWindow) {
+        viewModel.reload()
+        if parent.attachedSheet === window { return }
+        if window.sheetParent != nil { window.sheetParent?.endSheet(window) }
+        parent.beginSheet(window)
+    }
+
+    public func close() {
+        if let parent = window.sheetParent {
+            parent.endSheet(window)
+        } else {
+            window.close()
+        }
     }
 }

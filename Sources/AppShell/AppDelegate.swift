@@ -287,7 +287,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showSettings() {
-        settings?.show()
+        if let window = windowController?.window {
+            settings?.show(attachedTo: window)
+        } else {
+            settings?.show()
+        }
     }
 
     @objc private func newWorkspace() {

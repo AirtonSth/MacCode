@@ -37,7 +37,7 @@ public final class AppCommandRouter: CommandRouting {
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: title)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: title)
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") else { return }
                             DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
@@ -882,7 +882,7 @@ public final class AppCommandRouter: CommandRouting {
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: baseTitle)
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in

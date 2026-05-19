@@ -21,9 +21,11 @@ final class AgentAppViewModelTests: XCTestCase {
                                         threadRepo: threadRepo,
                                         providers: [.codex: FakeProviderRunner(provider: .codex),
                                                     .claude: FakeProviderRunner(provider: .claude)])
-        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+        let workspaceID = WorkspaceID()
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
                                    coordinator: coord, threadRepo: threadRepo,
-                                   messageRepo: messageRepo)
+                                   messageRepo: messageRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
         return (vm, threadRepo)
     }
 
@@ -349,6 +351,127 @@ final class AgentAppViewModelTests: XCTestCase {
                        "plain Enter must send the prompt")
         XCTAssertEqual(PromptComposerKeyAction.action(for: shiftEnter), .insertNewline,
                        "Shift+Enter must keep editing and insert a line break")
+    }
+
+    func test_promptComposerArrowKeysRequestHistoryNavigation() {
+        let up = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                  timestamp: 0, windowNumber: 0, context: nil,
+                                  characters: "", charactersIgnoringModifiers: "",
+                                  isARepeat: false, keyCode: 126)!
+        let down = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                                    timestamp: 0, windowNumber: 0, context: nil,
+                                    characters: "", charactersIgnoringModifiers: "",
+                                    isARepeat: false, keyCode: 125)!
+
+        XCTAssertEqual(PromptComposerKeyAction.action(for: up), .previousHistory,
+                       "Up arrow must behave like Terminal history when the composer is empty")
+        XCTAssertEqual(PromptComposerKeyAction.action(for: down), .nextHistory,
+                       "Down arrow must walk back toward the empty composer after history recall")
+    }
+
+    func test_emptyPromptRecallsSubmittedCommandHistoryLikeTerminal() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "history")
+        vm.prompt = "/status"
+        await vm.send()
+        vm.prompt = "/model none"
+        await vm.send()
+
+        XCTAssertTrue(vm.recallPreviousPrompt())
+        XCTAssertEqual(vm.prompt, "/model none",
+                       "an empty composer Up arrow must restore the last submitted command")
+        XCTAssertTrue(vm.recallPreviousPrompt())
+        XCTAssertEqual(vm.prompt, "/status",
+                       "a second Up arrow must continue through older submitted commands")
+        XCTAssertTrue(vm.recallNextPrompt())
+        XCTAssertEqual(vm.prompt, "/model none",
+                       "Down arrow must move forward through recalled command history")
+        XCTAssertTrue(vm.recallNextPrompt())
+        XCTAssertEqual(vm.prompt, "",
+                       "Down arrow after the newest recalled command must return to an empty composer")
+    }
+
+    func test_promptHistoryDoesNotOverwriteTypedDraft() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "history")
+        vm.prompt = "/status"
+        await vm.send()
+        vm.prompt = "typed draft"
+
+        XCTAssertFalse(vm.recallPreviousPrompt())
+
+        XCTAssertEqual(vm.prompt, "typed draft",
+                       "history recall must not replace text the user is already typing")
+    }
+
+    func test_typingAfterHistoryRecallTurnsRecalledPromptIntoEditableDraft() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "history")
+        vm.prompt = "/status"
+        await vm.send()
+
+        XCTAssertTrue(vm.recallPreviousPrompt())
+        vm.prompt += " now"
+        vm.promptWasEdited()
+
+        XCTAssertEqual(vm.prompt, "/status now",
+                       "after history recall the restored command must remain editable")
+        XCTAssertFalse(vm.recallNextPrompt(),
+                       "typing after recall must stop history navigation from owning the draft")
+        XCTAssertEqual(vm.prompt, "/status now",
+                       "history navigation must not clear or replace a recalled prompt after the user edits it")
+    }
+
+    func test_promptHistoryPersistsPerWorkspaceAndReloads() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-history-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let store = PromptHistoryStore(db: db)
+        let firstWorkspace = WorkspaceID()
+        let secondWorkspace = WorkspaceID()
+        let first = AgentAppViewModel(workspaceID: firstWorkspace, cwd: tmp,
+                                      coordinator: coord, threadRepo: threadRepo,
+                                      messageRepo: messageRepo, promptHistoryStore: store)
+        let second = AgentAppViewModel(workspaceID: secondWorkspace, cwd: tmp,
+                                       coordinator: coord, threadRepo: threadRepo,
+                                       messageRepo: messageRepo, promptHistoryStore: store)
+
+        first.createThread(title: "first")
+        first.prompt = "/status first"
+        await first.send()
+        second.createThread(title: "second")
+        second.prompt = "/status second"
+        await second.send()
+
+        let reloadedFirst = AgentAppViewModel(workspaceID: firstWorkspace, cwd: tmp,
+                                              coordinator: coord, threadRepo: threadRepo,
+                                              messageRepo: messageRepo, promptHistoryStore: store)
+        XCTAssertTrue(reloadedFirst.recallPreviousPrompt())
+        XCTAssertEqual(reloadedFirst.prompt, "/status first",
+                       "prompt history must persist by workspace and must not leak another workspace's commands")
+    }
+
+    func test_promptHistoryKeepsOnlyNewestTwentyEntries() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "history")
+        for index in 1...21 {
+            vm.prompt = "/status \(index)"
+            await vm.send()
+        }
+
+        for _ in 0..<20 {
+            XCTAssertTrue(vm.recallPreviousPrompt())
+        }
+        XCTAssertEqual(vm.prompt, "/status 2",
+                       "prompt history must retain the newest 20 entries and evict the oldest command")
+        XCTAssertTrue(vm.recallPreviousPrompt())
+        XCTAssertEqual(vm.prompt, "/status 2",
+                       "pressing Up past the retained history must stay on the oldest retained command")
     }
 
     // MARK: B2 — slash commands
