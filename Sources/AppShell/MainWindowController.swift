@@ -79,13 +79,12 @@ final class InteractiveTitlebarWindow: NSWindow {
             performZoom(nil)
             return
         }
-        let target = screen.visibleFrame
-        if frame.isNearlyEqual(to: target), let previous = frameBeforeTitlebarZoom {
+        if let previous = frameBeforeTitlebarZoom {
             setFrame(previous, display: true, animate: true)
             frameBeforeTitlebarZoom = nil
         } else {
             frameBeforeTitlebarZoom = frame
-            setFrame(target, display: true, animate: true)
+            setFrame(screen.visibleFrame, display: true, animate: true)
         }
     }
 
