@@ -13,6 +13,32 @@ import DesignSystemKit
 final class TerminalTextView: NSTextView {
     var onKey: ((Data) -> Void)?
 
+    convenience init() {
+        self.init(frame: .zero)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        hideAppKitCaret()
+    }
+
+    override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
+        super.init(frame: frameRect, textContainer: container)
+        hideAppKitCaret()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        hideAppKitCaret()
+    }
+
+    private func hideAppKitCaret() {
+        // The PTY cursor is drawn into the attributed terminal buffer by
+        // ANSIRenderer. Hiding AppKit's caret prevents a second cursor
+        // from appearing when the text view is first responder.
+        insertionPointColor = .clear
+    }
+
     override var acceptsFirstResponder: Bool { true }
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
@@ -200,7 +226,6 @@ public final class TerminalSurface: NSObject, Surface {
         tv.backgroundColor = DS.NS.terminalBG
         tv.textColor = DS.NS.terminalFG
         tv.drawsBackground = true
-        tv.insertionPointColor = DS.NS.terminalFG
         tv.selectedTextAttributes = [
             .backgroundColor: DS.NS.accent.withAlphaComponent(0.26),
             .foregroundColor: DS.NS.terminalFG

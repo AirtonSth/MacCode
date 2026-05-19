@@ -44,6 +44,15 @@ final class TerminalEncodeTests: XCTestCase {
         XCTAssertEqual(TerminalTextView.encode(e), Data([0x1B]) + Data("b".utf8))
     }
 
+    func test_terminalTextViewHidesAppKitCaretBecauseRendererOwnsCursor() {
+        let textView = TerminalTextView()
+
+        XCTAssertEqual(textView.insertionPointColor, .clear,
+                       "the terminal renderer draws the PTY cursor; AppKit's insertion caret must stay hidden so users never see two cursors")
+        XCTAssertTrue(textView.isEditable,
+                      "the terminal must remain editable enough for AppKit text input, paste, and drops while local mutations are routed to the PTY")
+    }
+
     func test_droppedFilePaths_areShellEscapedForTerminalInput() {
         let text = DroppedFilePaths.terminalInputText(for: [
             "/tmp/plain.txt",
