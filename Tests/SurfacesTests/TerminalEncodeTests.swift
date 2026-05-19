@@ -43,4 +43,35 @@ final class TerminalEncodeTests: XCTestCase {
         let e = key(0, chars: "b", ignoring: "b", flags: [.option])
         XCTAssertEqual(TerminalTextView.encode(e), Data([0x1B]) + Data("b".utf8))
     }
+
+    func test_droppedFilePaths_areShellEscapedForTerminalInput() {
+        let text = DroppedFilePaths.terminalInputText(for: [
+            "/tmp/plain.txt",
+            "/tmp/has space.txt",
+            "/tmp/it'works.swift"
+        ])
+
+        XCTAssertEqual(text, "/tmp/plain.txt '/tmp/has space.txt' '/tmp/it'\\''works.swift'",
+                       "dragged files must land as shell-safe path text without pressing Return")
+    }
+
+    func test_fileURLPasteboardReadsDraggedFilePaths() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name(UUID().uuidString))
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects([NSURL(fileURLWithPath: "/tmp/plain.txt")]))
+
+        XCTAssertEqual(DroppedFilePaths.paths(from: pasteboard), ["/tmp/plain.txt"],
+                       "Finder file-url drops must resolve to absolute path text")
+    }
+
+    func test_fileURLStringPasteboardReadsDraggedFilePaths() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name(UUID().uuidString))
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.clearContents()
+        pasteboard.setString("file:///tmp/plain.txt", forType: .fileURL)
+
+        XCTAssertEqual(DroppedFilePaths.paths(from: pasteboard), ["/tmp/plain.txt"],
+                       "Finder file-url string drops must resolve to absolute path text")
+    }
 }

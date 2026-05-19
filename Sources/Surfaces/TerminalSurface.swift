@@ -24,9 +24,45 @@ final class TerminalTextView: NSTextView {
         onKey?(bytes)
     }
 
-    // Block local editing entry points; the pty owns the buffer.
-    override func insertText(_ string: Any, replacementRange: NSRange) {}
+    // Forward direct text insertions (including AppKit text drops) to the pty;
+    // the shell still owns the rendered buffer through the read loop.
+    override func insertText(_ string: Any, replacementRange: NSRange) {
+        let text: String?
+        if let string = string as? String {
+            text = string
+        } else if let attributed = string as? NSAttributedString {
+            text = attributed.string
+        } else {
+            text = nil
+        }
+        guard let text, let data = text.data(using: .utf8) else { return }
+        onKey?(data)
+    }
     override func doCommand(by selector: Selector) {}
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let paths = DroppedFilePaths.paths(from: sender.draggingPasteboard)
+        guard !paths.isEmpty else { return super.performDragOperation(sender) }
+        guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return false }
+        onKey?(data)
+        return true
+    }
+
+    override func readSelection(from pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        let paths = DroppedFilePaths.paths(from: pasteboard)
+        guard !paths.isEmpty else { return super.readSelection(from: pasteboard, type: type) }
+        guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return false }
+        onKey?(data)
+        return true
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.command) {
@@ -91,6 +127,36 @@ final class TerminalTextView: NSTextView {
     }
 }
 
+@MainActor
+private final class TerminalDropContainerView: NSView {
+    var onFileDrop: (([String]) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : []
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let paths = DroppedFilePaths.paths(from: sender.draggingPasteboard)
+        guard !paths.isEmpty else { return false }
+        onFileDrop?(paths)
+        return true
+    }
+}
+
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
 /// and renders its output through `ANSIRenderer`. The terminal view is
 /// directly interactive — no separate input field (cmux model).
@@ -99,7 +165,7 @@ public final class TerminalSurface: NSObject, Surface {
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     private let textView: TerminalTextView
-    private let scroll: NSScrollView
+    private let scroll: FilePathDropScrollView
     private var masterFD: Int32 = -1
     private var childPID: pid_t = -1
     private var readSource: DispatchSourceRead?
@@ -114,7 +180,7 @@ public final class TerminalSurface: NSObject, Surface {
             metadata: ["cwd": cwd, "workspace": workspaceID.value.uuidString]
         )
 
-        let scroll = NSScrollView()
+        let scroll = FilePathDropScrollView()
         scroll.hasVerticalScroller = true
         scroll.borderType = .noBorder
         scroll.drawsBackground = true
@@ -125,7 +191,10 @@ public final class TerminalSurface: NSObject, Surface {
         scroll.contentView.layer?.masksToBounds = true
 
         let tv = TerminalTextView()
-        tv.isEditable = false
+        tv.registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
+        // Keep NSTextView editable so AppKit treats it as a live text drop target.
+        // Local text mutations are still blocked by insertText/doCommand/keyDown.
+        tv.isEditable = true
         tv.isSelectable = true
         tv.font = DS.NS.terminalFont()
         tv.backgroundColor = DS.NS.terminalBG
@@ -149,7 +218,7 @@ public final class TerminalSurface: NSObject, Surface {
         self.textView = tv
         self.scroll = scroll
 
-        let container = NSView()
+        let container = TerminalDropContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.terminalBG.cgColor
@@ -167,6 +236,14 @@ public final class TerminalSurface: NSObject, Surface {
         super.init()
 
         tv.onKey = { [weak self] data in self?.writeToPTY(data) }
+        scroll.onFileDrop = { [weak self] paths in
+            guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return }
+            self?.writeToPTY(data)
+        }
+        container.onFileDrop = { [weak self] paths in
+            guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return }
+            self?.writeToPTY(data)
+        }
 
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         var amaster: Int32 = -1

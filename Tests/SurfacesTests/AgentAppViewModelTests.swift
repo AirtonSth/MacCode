@@ -511,6 +511,18 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.attachments, ["/b.txt"])
     }
 
+    func test_droppedFilePaths_insertIntoPromptWithoutAttaching() throws {
+        let (vm, _) = try makeVM()
+        vm.prompt = "review"
+
+        vm.insertDroppedFilePaths(["/tmp/plain.txt", "/tmp/has space.txt"])
+
+        XCTAssertEqual(vm.prompt, "review /tmp/plain.txt /tmp/has space.txt",
+                       "dragging files into the composer must fill the input with file paths")
+        XCTAssertTrue(vm.attachments.isEmpty,
+                      "drop-to-input is text insertion, not the attachment-chip flow")
+    }
+
     func test_send_withAttachments_composesPromptAndClears() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "t")

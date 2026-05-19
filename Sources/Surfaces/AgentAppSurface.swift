@@ -358,6 +358,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func addAttachments(_ paths: [String]) {
         for p in paths where !attachments.contains(p) { attachments.append(p) }
     }
+    public func insertDroppedFilePaths(_ paths: [String]) {
+        prompt = DroppedFilePaths.appending(DroppedFilePaths.composerInputText(for: paths), to: prompt)
+    }
     public func removeAttachment(_ path: String) {
         attachments.removeAll { $0 == path }
     }
@@ -1045,7 +1048,8 @@ public struct AgentAppView: View {
                 height: $composerEditorHeight,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
                 isEnabled: vm.status != .running,
-                onSend: { Task { await vm.send() } }
+                onSend: { Task { await vm.send() } },
+                onFileDrop: { paths in vm.insertDroppedFilePaths(paths) }
             )
             .frame(height: composerEditorHeight)
             .padding(.horizontal, DS.Space.lg)
@@ -1323,6 +1327,7 @@ enum PromptComposerKeyAction: Equatable {
 
 private final class PromptComposerTextView: NSTextView {
     var onSend: (() -> Void)?
+    var onFileDrop: (([String]) -> Void)?
     var placeholderString: String = "" {
         didSet { needsDisplay = true }
     }
@@ -1336,6 +1341,32 @@ private final class PromptComposerTextView: NSTextView {
         case .ignore:
             super.keyDown(with: event)
         }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard isEditable else { return [] }
+        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard isEditable else { return [] }
+        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard isEditable else { return false }
+        let paths = DroppedFilePaths.paths(from: sender.draggingPasteboard)
+        guard !paths.isEmpty else { return super.performDragOperation(sender) }
+        onFileDrop?(paths)
+        return true
+    }
+
+    override func readSelection(from pasteboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        guard isEditable else { return false }
+        let paths = DroppedFilePaths.paths(from: pasteboard)
+        guard !paths.isEmpty else { return super.readSelection(from: pasteboard, type: type) }
+        onFileDrop?(paths)
+        return true
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1358,14 +1389,17 @@ private struct PromptComposerEditor: NSViewRepresentable {
     let placeholder: String
     let isEnabled: Bool
     let onSend: () -> Void
+    let onFileDrop: ([String]) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
+        let scroll = FilePathDropScrollView()
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = false
         scroll.autohidesScrollers = true
+        scroll.onFileDrop = onFileDrop
 
         let textView = PromptComposerTextView()
+        textView.registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
         textView.isRichText = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
@@ -1385,6 +1419,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.textContainer?.widthTracksTextView = true
         textView.string = text
         textView.onSend = onSend
+        textView.onFileDrop = onFileDrop
         textView.placeholderString = placeholder
         context.coordinator.textView = textView
         context.coordinator.recalculateHeight()
@@ -1394,7 +1429,11 @@ private struct PromptComposerEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let textView = context.coordinator.textView ?? scroll.documentView as? PromptComposerTextView else { return }
+        if let dropScroll = scroll as? FilePathDropScrollView {
+            dropScroll.onFileDrop = onFileDrop
+        }
         textView.onSend = onSend
+        textView.onFileDrop = onFileDrop
         textView.isEditable = isEnabled
         textView.placeholderString = placeholder
         if textView.string != text {
