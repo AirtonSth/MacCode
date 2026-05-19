@@ -343,7 +343,22 @@ public final class AppCommandRouter: CommandRouting {
 
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        if AgentThreadTitle.isPlaceholder(t.title),
+           ((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty {
+            t.title = AgentThreadTitle.titleFromFirstMessage(text)
+            t.updatedAt = Date()
+            try ctx.threadRepo.upsert(t)
+            EventBus.shared.publish(kind: "agent.thread.renamed", payload: .object([
+                "thread_id": .string(t.id.value.uuidString),
+                "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
+                "title": .string(t.title),
+                "display_title": .string(AgentThreadTitle.display(t.title)),
+                "displayTitle": .string(AgentThreadTitle.display(t.title)),
+                "provider_locked": .bool(true),
+                "providerLocked": .bool(true)
+            ]))
+        }
         let prov = t.provider
         let m = t.model
         let cwd = ctx.state.workspaces.first { $0.value.id == t.workspaceId }?.value.cwd ?? FileManager.default.currentDirectoryPath

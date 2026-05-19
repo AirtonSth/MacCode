@@ -92,8 +92,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func reloadThreads() {
         threads = (try? threadRepo.list(workspaceId: workspaceID)) ?? []
+        repairPlaceholderThreadTitles()
         if selectedThreadId == nil, let first = threads.first {
             selectThread(first.id)
+        }
+    }
+
+    private func repairPlaceholderThreadTitles() {
+        for index in threads.indices where AgentThreadTitle.isPlaceholder(threads[index].title) {
+            guard let firstUserMessage = ((try? messageRepo.list(threadId: threads[index].id)) ?? [])
+                .first(where: { $0.role == .user }) else { continue }
+            var thread = threads[index]
+            thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
+            thread.updatedAt = Date()
+            try? threadRepo.upsert(thread)
+            threads[index] = thread
         }
     }
 
@@ -283,14 +296,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
     }
 
-    /// Derive a concise thread title from the first user message: first
-    /// non-empty line, trimmed, clipped, stripped of trailing punctuation.
+    /// Derive the persisted thread title from the first user message.
+    /// Display truncation is handled separately by AgentThreadTitle.display.
     public static func deriveTitle(from text: String) -> String {
-        let firstLine = text.split(separator: "\n").first.map(String.init) ?? text
-        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        let clipped = String(trimmed.prefix(48))
-            .trimmingCharacters(in: CharacterSet(charactersIn: " \t.-:#*"))
-        return clipped.isEmpty ? "New thread" : clipped
+        AgentThreadTitle.titleFromFirstMessage(text)
     }
 
     public func statusSummary() -> String {
@@ -389,7 +398,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let tid = selectedThreadId else { return }
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
-           (t.title == "New thread" || t.title.isEmpty),
+           AgentThreadTitle.isPlaceholder(t.title),
            ((try? messageRepo.list(threadId: tid))?.isEmpty ?? true) {
             renameThread(tid, to: Self.deriveTitle(from: text))
         }
@@ -676,7 +685,7 @@ public struct AgentAppView: View {
                         Color.clear.frame(width: 8, height: 8)
                     }
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(t.title).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
+                        Text(AgentThreadTitle.display(t.title)).font(DS.Font.bodyDense.weight(t.hasUnread ? .semibold : .regular))
                             .foregroundColor(DS.Palette.text).lineLimit(1)
                         Text("\(t.provider.rawValue) · \(t.model)")
                             .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
@@ -1248,13 +1257,15 @@ public struct AgentAppView: View {
 
     private var modelMenu: some View {
         Menu {
-            Picker("Source", selection: $vm.provider) {
-                Text("Codex").tag(AgentProvider.codex)
-                Text("Claude").tag(AgentProvider.claude)
-            }
-            .disabled(vm.providerLocked || vm.status == .running)
-            .onChange(of: vm.provider) { _ in
-                Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
+            if !vm.providerLocked {
+                Picker("Source", selection: $vm.provider) {
+                    Text("Codex").tag(AgentProvider.codex)
+                    Text("Claude").tag(AgentProvider.claude)
+                }
+                .disabled(vm.status == .running)
+                .onChange(of: vm.provider) { _ in
+                    Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
+                }
             }
             if !vm.availableModels.isEmpty {
                 Picker("Model", selection: $vm.model) {
@@ -1270,10 +1281,6 @@ public struct AgentAppView: View {
                 }
             }
             .onChange(of: vm.reasoningEffort) { newValue in vm.setReasoningEffort(newValue) }
-            if vm.providerLocked {
-                Divider()
-                Text("Source locked — \(vm.provider.rawValue.capitalized) thread")
-            }
         } label: {
             HStack(spacing: DS.Space.xs) {
                 Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
@@ -1292,7 +1299,7 @@ public struct AgentAppView: View {
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .disabled(vm.status == .running)
-        .help("Provider · model · reasoning effort")
+        .help(vm.providerLocked ? "Model · reasoning effort" : "Provider · model · reasoning effort")
     }
 
     private var sendStopButton: some View {

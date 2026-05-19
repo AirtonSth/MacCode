@@ -150,16 +150,18 @@ final class AgentAppViewModelTests: XCTestCase {
 
     // MARK: B5 — draft title derivation
 
-    func test_deriveTitle_takesFirstLineTrimsClipsAndStripsPunctuation() {
-        XCTAssertEqual(AgentAppViewModel.deriveTitle(from: "  Fix the login bug.\nmore detail"),
-                       "Fix the login bug",
-                       "title must be the first line, trimmed, sans trailing period")
+    func test_deriveTitle_preservesFullFirstMessageForPersistence() {
+        let long = "  Fix the login bug and keep every detail in the persisted thread title.  "
+        XCTAssertEqual(AgentAppViewModel.deriveTitle(from: long),
+                       "Fix the login bug and keep every detail in the persisted thread title",
+                       "the persisted title must keep the full first message; only display should truncate")
         XCTAssertEqual(AgentAppViewModel.deriveTitle(from: "### Heading"),
                        "Heading", "leading markdown punctuation must be stripped")
         XCTAssertEqual(AgentAppViewModel.deriveTitle(from: "   \n  "),
                        "New thread", "an empty prompt must fall back, never be blank")
-        XCTAssertEqual(AgentAppViewModel.deriveTitle(from: String(repeating: "x", count: 80)).count, 48,
-                       "the title must be clipped to 48 characters")
+        XCTAssertEqual(AgentThreadTitle.display(String(repeating: "x", count: 80)),
+                       String(repeating: "x", count: AgentThreadTitle.displayLimit) + "...",
+                       "thread rows must show a bounded title while the stored title remains complete")
     }
 
     func test_send_firstMessage_derivesThreadTitleFromDefault() async throws {
@@ -171,6 +173,21 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(try repo.get(id: id)?.title, "Refactor the auth module please",
                        "the first message must rename a still-default thread")
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
+    }
+
+    func test_reloadThreadsBackfillsPlaceholderTitleFromFirstUserMessage() throws {
+        let (vm, repo) = try makeVM()
+        let thread = AgentThread(workspaceId: vm.workspaceID, title: "Thread", provider: .claude, model: "fake-model")
+        try repo.upsert(thread)
+        let firstMessage = "git add commit and push all repos here with this long exact wording"
+        try vm.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: firstMessage))
+
+        vm.reloadThreads()
+
+        XCTAssertEqual(vm.threads.first(where: { $0.id == thread.id })?.title, firstMessage,
+                       "existing placeholder threads must be repaired from the first user message")
+        XCTAssertEqual(try repo.get(id: thread.id)?.title, firstMessage,
+                       "the repair must persist the full title, not only update the visible rail")
     }
 
     func test_finishCallback_persistsAssistantReplyForRestart() async throws {

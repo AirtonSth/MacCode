@@ -551,6 +551,28 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentThreadListKeepsFullTitleAndAddsDisplayTitleForMirrors() async throws {
+        let router = FakeRouter()
+        let fullTitle = "git add commit and push all repos here with this long exact wording"
+        let thread = AgentThread(workspaceId: nil, title: fullTitle, provider: .claude, model: "fake-model")
+        router.threadStore = [thread]
+        router.messageStore = [AgentMessage(threadId: thread.id, role: .user, content: "start")]
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.list", params: nil))
+
+        guard case .array(let threads)? = resp.result,
+              case .object(let first)? = threads.first else { return XCTFail("thread list must return encoded threads") }
+        XCTAssertEqual(first["title"], .string(fullTitle),
+                       "host APIs must keep the full persisted title for macOS and iOS")
+        XCTAssertEqual(first["displayTitle"], .string("git add commit and push all ..."))
+        XCTAssertEqual(first["display_title"], .string("git add commit and push all ..."))
+        XCTAssertEqual(first["providerLocked"], .bool(true),
+                       "iOS mirrors must know when to hide the source picker for existing threads")
+        XCTAssertEqual(first["provider_locked"], .bool(true))
+    }
+
+    @MainActor
     func test_agentThreadSelectRoutesSelectionToMacSurface() async throws {
         let router = FakeRouter()
         let t = AgentThread(workspaceId: nil, title: "load prior", provider: .codex, model: "gpt-5.5")

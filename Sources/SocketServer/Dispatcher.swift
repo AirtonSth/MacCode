@@ -395,7 +395,7 @@ public final class JSONRPCDispatcher {
             case "agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let threads = try router.listAgentThreads(workspace: wid)
-                return .init(id: id, result: encode(threads))
+                return .init(id: id, result: .array(threads.map(encodeThread)))
             case "agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
@@ -404,16 +404,8 @@ public final class JSONRPCDispatcher {
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
                 let reasoning = params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
                 let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning)
-                EventBus.shared.publish(kind: "agent.thread.created", payload: .object([
-                    "thread_id": .string(t.id.value.uuidString),
-                    "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
-                    "title": .string(t.title),
-                    "provider": .string(t.provider.rawValue),
-                    "model": .string(t.model),
-                    "permission_mode": .string(t.permissionMode.rawValue),
-                    "reasoning_effort": .string(t.reasoningEffort.rawValue)
-                ]))
-                return .init(id: id, result: encode(t))
+                EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
+                return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let provider = params["provider"]?.stringValue.flatMap(AgentProvider.init)
@@ -429,8 +421,10 @@ public final class JSONRPCDispatcher {
                 ]
                 payload["permission_mode"] = .string(t.permissionMode.rawValue)
                 payload["reasoning_effort"] = .string(t.reasoningEffort.rawValue)
+                payload["provider_locked"] = .bool(providerLocked(t))
+                payload["providerLocked"] = .bool(providerLocked(t))
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
-                return .init(id: id, result: encode(t))
+                return .init(id: id, result: encodeThread(t))
             case "agent.thread.select":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 try router.selectAgentThread(thread: tid)
@@ -471,8 +465,8 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let title = params["title"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let t = try router.renameAgentThread(thread: tid, title: title)
-                EventBus.shared.publish(kind: "agent.thread.renamed", payload: .object(["thread_id": .string(tid.value.uuidString), "title": .string(title)]))
-                return .init(id: id, result: encode(t))
+                EventBus.shared.publish(kind: "agent.thread.renamed", payload: threadPayload(t))
+                return .init(id: id, result: encodeThread(t))
             case "agent.thread.set_pinned":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let pinned = params["pinned"]?.boolValue else { throw JSONRPCError.invalidParams }
@@ -482,14 +476,16 @@ public final class JSONRPCDispatcher {
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "pinned": .bool(t.pinned),
-                    "sort_order": .number(Double(t.sortOrder))
+                    "sort_order": .number(Double(t.sortOrder)),
+                    "provider_locked": .bool(providerLocked(t)),
+                    "providerLocked": .bool(providerLocked(t))
                 ]))
                 EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "order": .array(order.map { .string($0) })
                 ]))
-                return .init(id: id, result: encode(t))
+                return .init(id: id, result: encodeThread(t))
             case "agent.thread.set_color":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let color = params["color"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -497,9 +493,11 @@ public final class JSONRPCDispatcher {
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
-                    "color": t.color.map { .string($0) } ?? .string("")
+                    "color": t.color.map { .string($0) } ?? .string(""),
+                    "provider_locked": .bool(providerLocked(t)),
+                    "providerLocked": .bool(providerLocked(t))
                 ]))
-                return .init(id: id, result: encode(t))
+                return .init(id: id, result: encodeThread(t))
             case "agent.thread.reorder":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let pos = params["position"]?.intValue ?? 0
@@ -810,5 +808,41 @@ public final class JSONRPCDispatcher {
             return .null
         }
         return JSONValue.from(any)
+    }
+
+    private func encodeThread(_ thread: AgentThread) -> JSONValue {
+        guard case .object(var object) = encode(thread) else { return .null }
+        let display = AgentThreadTitle.display(thread.title)
+        object["displayTitle"] = .string(display)
+        object["display_title"] = .string(display)
+        let locked = providerLocked(thread)
+        object["providerLocked"] = .bool(locked)
+        object["provider_locked"] = .bool(locked)
+        return .object(object)
+    }
+
+    private func threadPayload(_ thread: AgentThread) -> JSONValue {
+        let locked = providerLocked(thread)
+        var payload: [String: JSONValue] = [
+            "thread_id": .string(thread.id.value.uuidString),
+            "workspace_id": thread.workspaceId.map { .string($0.value.uuidString) } ?? .null,
+            "title": .string(thread.title),
+            "display_title": .string(AgentThreadTitle.display(thread.title)),
+            "displayTitle": .string(AgentThreadTitle.display(thread.title)),
+            "provider": .string(thread.provider.rawValue),
+            "model": .string(thread.model),
+            "provider_locked": .bool(locked),
+            "providerLocked": .bool(locked),
+            "permission_mode": .string(thread.permissionMode.rawValue),
+            "reasoning_effort": .string(thread.reasoningEffort.rawValue)
+        ]
+        payload["color"] = thread.color.map { .string($0) } ?? .null
+        payload["pinned"] = .bool(thread.pinned)
+        payload["sort_order"] = .number(Double(thread.sortOrder))
+        return .object(payload)
+    }
+
+    private func providerLocked(_ thread: AgentThread) -> Bool {
+        !((try? router.listAgentMessages(thread: thread.id, limit: 1)) ?? []).isEmpty
     }
 }

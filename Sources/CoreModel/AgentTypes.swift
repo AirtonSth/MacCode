@@ -148,6 +148,28 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public enum AgentThreadTitle {
+    public static let defaultTitle = "New thread"
+    public static let legacyDefaultTitle = "Thread"
+    public static let displayLimit = 28
+
+    public static func isPlaceholder(_ title: String) -> Bool {
+        let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty || normalized == defaultTitle || normalized == legacyDefaultTitle
+    }
+
+    public static func titleFromFirstMessage(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: " \t.-:#*"))
+        return stripped.isEmpty ? defaultTitle : stripped
+    }
+
+    public static func display(_ title: String, limit: Int = displayLimit) -> String {
+        guard title.count > limit else { return title }
+        return String(title.prefix(max(0, limit))) + "..."
+    }
+}
+
 public enum AgentMessageRole: String, Codable, Sendable {
     case user
     case assistant

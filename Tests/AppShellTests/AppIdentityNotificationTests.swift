@@ -107,6 +107,32 @@ final class AppIdentityNotificationTests: XCTestCase {
         }, "the iOS mirror must receive the persisted assistant answer before a follow-up clears live stream state")
     }
 
+    func testHostSendTitlesPlaceholderThreadFromFullFirstUserMessage() async throws {
+        let dir = NSTemporaryDirectory() + "RC2ThreadTitle-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        ctx.coordinator.replaceProvider(.claude, runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok")))
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let thread = AgentThread(title: "Thread", provider: .claude, model: "fake-model")
+        try ctx.threadRepo.upsert(thread)
+
+        let firstMessage = "git add commit and push all repos here with this long exact wording"
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: firstMessage,
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+
+        XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.title, firstMessage,
+                       "if the agent/client never names a thread, the stored title must be the full first user message")
+        XCTAssertEqual(AgentThreadTitle.display(firstMessage),
+                       "git add commit and push all ...",
+                       "display truncation must be separate from the stored full title")
+    }
+
     func testCodexWarningsAreNotUserVisibleErrors() {
         let warning = "[codex stderr] 2026-05-18T19:27:58Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt"
 
