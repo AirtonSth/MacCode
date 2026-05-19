@@ -164,6 +164,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private var paneControllers: [PaneTabsView] = []
     private var sidebarCollapsed = false
     private var sidebarWidth: CGFloat = 260
+    private var sidebarWidthConstraint: NSLayoutConstraint?
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -269,7 +270,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             split.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            sidebar.view.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
             visibleWorkspaceHeader.topAnchor.constraint(equalTo: content.topAnchor),
             visibleWorkspaceHeader.leadingAnchor.constraint(equalTo: workspaceContainer.leadingAnchor),
             visibleWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -279,6 +279,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             collapsedWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight)
         ])
+        let fixedSidebarWidth = sidebar.view.widthAnchor.constraint(equalToConstant: sidebarWidth)
+        fixedSidebarWidth.priority = .defaultHigh
+        fixedSidebarWidth.isActive = true
+        sidebarWidthConstraint = fixedSidebarWidth
         window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {

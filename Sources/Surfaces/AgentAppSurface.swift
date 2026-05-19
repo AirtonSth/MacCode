@@ -866,8 +866,7 @@ public struct AgentAppView: View {
                         }
                         .padding(.horizontal, DS.Space.lg)
                         .padding(.vertical, DS.Space.xl)
-                        .frame(maxWidth: 920, alignment: .leading)
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
