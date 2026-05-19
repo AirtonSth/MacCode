@@ -757,6 +757,7 @@ public final class AppCommandRouter: CommandRouting {
             if let w = n.workspaceId { d["workspace_id"] = .string(w.value.uuidString) }
             if let s = n.surfaceId { d["surface_id"] = .string(s.value.uuidString) }
             if let r = n.readAt { d["read_at"] = .string(ISO8601DateFormatter().string(from: r)) }
+            d["push_policy"] = .string("background_only")
             return d
         }
     }

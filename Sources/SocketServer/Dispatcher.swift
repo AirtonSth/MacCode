@@ -638,8 +638,15 @@ public final class JSONRPCDispatcher {
                 let body = params["body"]?.stringValue
                 let category = params["category"]?.stringValue
                 let nid = try router.notificationCreate(workspaceId: wid, title: title, body: body, category: category)
-                EventBus.shared.publish(kind: "notification.created", payload: .object(["id": .string(nid), "title": .string(title)]))
-                return .init(id: id, result: .object(["id": .string(nid)]))
+                EventBus.shared.publish(kind: "notification.created", payload: .object([
+                    "id": .string(nid),
+                    "title": .string(title),
+                    "push_policy": .string("background_only")
+                ]))
+                return .init(id: id, result: .object([
+                    "id": .string(nid),
+                    "push_policy": .string("background_only")
+                ]))
             case "notification.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let unread = params["unread_only"]?.boolValue ?? false

@@ -29,7 +29,10 @@ final class DispatcherCoverageTests: XCTestCase {
             "title": .string("hello")
         ]))
         XCTAssertNil(resp.error)
-        if case .object(let o) = resp.result!, case .string = o["id"]! {} else { XCTFail() }
+        if case .object(let o) = resp.result!, case .string = o["id"]! {
+            XCTAssertEqual(o["push_policy"], .string("background_only"),
+                           "iOS must not present push UI while the app is foregrounded")
+        } else { XCTFail() }
     }
 
     func test_browser_action_sentinels_route_through_router() async {

@@ -410,16 +410,35 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	        }
 	    }
 
-	    public func refreshFromState() {
-	        sidebar.refresh()
-	        updateCollapsedWorkspaceHeader()
-	        rebuildWorkspaceContainer()
-	    }
+    public func refreshFromState() {
+        let focusedInput = protectedFocusedView()
+        sidebar.refresh()
+        updateCollapsedWorkspaceHeader()
+        rebuildWorkspaceContainer()
+        restoreProtectedFocus(focusedInput)
+    }
 
     public func focusSurface(_ id: SurfaceID) {
         if let s = SurfaceRegistry.shared.surface(id) {
             s.focus()
         }
+    }
+
+    public var hasProtectedInputFocus: Bool {
+        protectedFocusedView() != nil
+    }
+
+    private func protectedFocusedView() -> NSView? {
+        guard let responder = window.firstResponder as? NSView,
+              responder is NSTextView else { return nil }
+        return responder
+    }
+
+    private func restoreProtectedFocus(_ focusedView: NSView?) {
+        guard let focusedView,
+              focusedView.window === window,
+              focusedView.isDescendant(of: workspaceContent) else { return }
+        window.makeFirstResponder(focusedView)
     }
 
     private var extraWindows: [WindowID: NSWindow] = [:]

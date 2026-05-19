@@ -43,6 +43,13 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(completed?.userInfo["threadId"], "t1")
     }
 
+    func testForegroundNotificationsStayInAppOnly() {
+        XCTAssertEqual(SystemNotifier.presentationOptions(appIsForeground: true), [],
+                       "foreground clients must update the in-app feed without showing a system push")
+        XCTAssertEqual(SystemNotifier.presentationOptions(appIsForeground: false), [.banner, .list, .sound],
+                       "push presentation is reserved for background or closed app states")
+    }
+
     func testStreamingErrorsDoNotEmitTerminalRunNotificationsBeforeFinish() async throws {
         let dir = NSTemporaryDirectory() + "RC2Notify-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

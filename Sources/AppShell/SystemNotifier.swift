@@ -60,7 +60,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .list, .sound])
+        completionHandler(Self.presentationOptions(appIsForeground: true))
     }
 
     public func userNotificationCenter(
@@ -70,5 +70,9 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     ) {
         NSApp.activate(ignoringOtherApps: true)
         completionHandler()
+    }
+
+    public static func presentationOptions(appIsForeground: Bool) -> UNNotificationPresentationOptions {
+        appIsForeground ? [] : [.banner, .list, .sound]
     }
 }
