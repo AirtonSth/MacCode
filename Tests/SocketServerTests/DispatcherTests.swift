@@ -119,6 +119,11 @@ final class FakeRouter: CommandRouting {
         try normalizeThreadOrder(workspaceId: threadStore[idx].workspaceId)
         return threadStore[idx]
     }
+    func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread {
+        guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        threadStore[idx].color = color.isEmpty ? nil : color
+        return threadStore[idx]
+    }
     func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread] {
         guard let current = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         let wid = current.workspaceId
