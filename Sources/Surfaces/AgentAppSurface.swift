@@ -859,27 +859,10 @@ public struct AgentAppView: View {
         NSPasteboard.general.setString(s, forType: .string)
     }
 
-    /// Markdown → AttributedString with Codex-style inline code chips.
-    private func styledMarkdown(_ text: String) -> AttributedString {
-        let opts = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        guard var a = try? AttributedString(markdown: text, options: opts) else {
-            return AttributedString(text)
-        }
-        let codeRanges = a.runs.filter { $0.inlinePresentationIntent?.contains(.code) == true }.map(\.range)
-        for r in codeRanges {
-            a[r].font = DS.Font.monoSmall
-            a[r].backgroundColor = DS.Palette.surfaceOverlay
-            a[r].foregroundColor = DS.Palette.accent
-        }
-        return a
-    }
-
     @ViewBuilder
     private func assistantProse(_ text: String) -> some View {
-        Text(styledMarkdown(text))
-            .font(DS.Font.body)
+        AgentMessageMarkdownView(text: text)
             .foregroundColor(DS.Palette.text)
-            .lineSpacing(5)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -924,8 +907,7 @@ public struct AgentAppView: View {
             HStack(spacing: 0) {
                 Spacer(minLength: DS.Space.huge)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    Text(msg.content)
-                        .font(DS.Font.body)
+                    AgentMessageMarkdownView(text: msg.content, compact: true)
                         .foregroundColor(DS.Palette.text)
                         .textSelection(.enabled)
                         .multilineTextAlignment(.leading)
