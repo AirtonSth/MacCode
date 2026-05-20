@@ -26,6 +26,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private var dragStartSidebarWidth: CGFloat?
     private var terminal: TerminalSurface?
     static let hostSidebarWidthDefaultsKey = "ssh.hosts.sidebar.width.v1"
+    private static let transferSidebarExpandedWidth: CGFloat = 620
 
     private(set) var descriptor: SurfaceDescriptor
     let view: NSView
@@ -167,7 +168,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private func syncTransferSidebarWidth(animated: Bool) {
         let visible = viewModel.transferSidebarVisible
         transferDividerWidthConstraint?.constant = visible ? 1 : 0
-        transferWidthConstraint?.constant = visible ? (viewModel.transferSidebarCollapsed ? 44 : 620) : 0
+        transferWidthConstraint?.constant = visible ? (viewModel.transferSidebarCollapsed ? 44 : Self.transferSidebarExpandedWidth) : 0
         let changes = { self.view.layoutSubtreeIfNeeded() }
         if animated {
             NSAnimationContext.runAnimationGroup { context in
@@ -445,6 +446,26 @@ private struct SSHTransferQueueItem: Identifiable, Hashable {
     let remotePath: String
     let size: String
     let status: SSHTransferState
+}
+
+private struct SSHFileColumnWidths {
+    var name: CGFloat = 220
+    var size: CGFloat = 82
+    var type: CGFloat = 104
+    var modified: CGFloat = 132
+
+    var total: CGFloat { name + size + type + modified }
+}
+
+private struct SSHQueueColumnWidths {
+    var local: CGFloat = 210
+    var direction: CGFloat = 86
+    var remote: CGFloat = 180
+    var size: CGFloat = 70
+    var priority: CGFloat = 74
+    var status: CGFloat = 86
+
+    var total: CGFloat { local + direction + remote + size + priority + status }
 }
 
 @MainActor
@@ -736,6 +757,8 @@ private struct SSHSidebarView: View {
 
 private struct SSHTransferSidebarView: View {
     @ObservedObject var vm: SSHSurfaceViewModel
+    @State private var fileColumns = SSHFileColumnWidths()
+    @State private var queueColumns = SSHQueueColumnWidths()
 
     var body: some View {
         Group {
@@ -783,29 +806,31 @@ private struct SSHTransferSidebarView: View {
                 }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            VStack(spacing: 0) {
-                HStack(spacing: 0) {
-                    transferPane(title: "Local site",
-                                 path: $vm.localSitePath,
-                                 entries: vm.localEntries,
-                                 selected: vm.selectedLocalEntry,
-                                 refresh: { vm.onRefreshLocalFiles?() },
-                                 choose: { vm.onChooseLocalPath?() },
-                                 select: { vm.selectLocal($0) })
-                    Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
-                    transferPane(title: "Remote site",
-                                 path: $vm.remoteSitePath,
-                                 entries: vm.remoteEntries,
-                                 selected: vm.selectedRemoteEntry,
-                                 refresh: { vm.onRefreshRemoteFiles?() },
-                                 choose: nil,
-                                 select: { vm.selectRemote($0) })
+            ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        transferPane(title: "Local site",
+                                     path: $vm.localSitePath,
+                                     entries: vm.localEntries,
+                                     selected: vm.selectedLocalEntry,
+                                     refresh: { vm.onRefreshLocalFiles?() },
+                                     choose: { vm.onChooseLocalPath?() },
+                                     select: { vm.selectLocal($0) })
+                        Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+                        transferPane(title: "Remote site",
+                                     path: $vm.remoteSitePath,
+                                     entries: vm.remoteEntries,
+                                     selected: vm.selectedRemoteEntry,
+                                     refresh: { vm.onRefreshRemoteFiles?() },
+                                     choose: nil,
+                                     select: { vm.selectRemote($0) })
+                    }
+                    .frame(minHeight: 430)
+                    Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+                    actionStrip
+                    Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+                    queuePanel
                 }
-                .frame(height: 410)
-                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-                actionStrip
-                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-                queuePanel
             }
             Spacer()
         }
@@ -850,9 +875,10 @@ private struct SSHTransferSidebarView: View {
             .padding(DS.Space.xs)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             directoryTree(entries: entries, path: path.wrappedValue, select: select)
-                .frame(height: 116)
+                .frame(minHeight: 110, maxHeight: 132)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             fileTable(entries: entries, selected: selected, select: select)
+                .frame(minHeight: 248)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             paneStatus(entries: entries, selected: selected)
                 .frame(height: 28)
@@ -890,47 +916,59 @@ private struct SSHTransferSidebarView: View {
     }
 
     private func fileTable(entries: [SSHFileEntry], selected: SSHFileEntry?, select: @escaping (SSHFileEntry) -> Void) -> some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                tableHeader("Filename", width: nil)
-                tableHeader("Filesize", width: 72)
-                tableHeader("Filetype", width: 84)
-                tableHeader("Last modified", width: 104)
-            }
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if entries.isEmpty {
-                        Text("No files listed")
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .frame(maxWidth: .infinity, minHeight: 72)
-                    } else {
-                        ForEach(entries) { entry in
-                            Button { select(entry) } label: {
-                                HStack(spacing: 0) {
-                                    HStack(spacing: DS.Space.xs) {
-                                        Image(systemName: entry.isDirectory ? "folder" : "doc")
-                                            .foregroundColor(entry.isDirectory ? DS.Palette.textSecondary : DS.Palette.accent)
-                                            .frame(width: 16)
-                                        Text(entry.name)
-                                            .lineLimit(1)
-                                        Spacer()
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    Text(entry.size).frame(width: 72, alignment: .trailing)
-                                    Text(entry.fileType).frame(width: 84, alignment: .leading)
-                                    Text(entry.modified).frame(width: 104, alignment: .leading)
-                                }
+        ScrollView(.horizontal) {
+            VStack(spacing: 0) {
+                HStack(spacing: 0) {
+                    resizableHeader("Name", width: $fileColumns.name, minWidth: 150)
+                    resizableHeader("Size", width: $fileColumns.size, minWidth: 68, alignment: .trailing)
+                    resizableHeader("Kind", width: $fileColumns.type, minWidth: 82)
+                    resizableHeader("Modified", width: $fileColumns.modified, minWidth: 112)
+                }
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        if entries.isEmpty {
+                            Text("No files listed")
                                 .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.text)
-                                .padding(.horizontal, DS.Space.xs)
-                                .frame(height: 26)
-                                .background(selected?.id == entry.id ? DS.Palette.accent.opacity(0.18) : Color.clear)
-                            }
-                            .buttonStyle(.plain)
-                            .contextMenu {
-                                Button(entry.isDirectory ? "Open Folder" : "Select File") { select(entry) }
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .frame(width: fileColumns.total)
+                                .frame(minHeight: 72)
+                        } else {
+                            ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                                Button { select(entry) } label: {
+                                    HStack(spacing: 0) {
+                                        HStack(spacing: DS.Space.xs) {
+                                            Image(systemName: entry.isDirectory ? "folder" : "doc")
+                                                .foregroundColor(entry.isDirectory ? DS.Palette.textSecondary : DS.Palette.accent)
+                                                .frame(width: 16)
+                                            Text(entry.name)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                            Spacer(minLength: 0)
+                                        }
+                                        .frame(width: fileColumns.name, alignment: .leading)
+                                        Text(entry.size)
+                                            .lineLimit(1)
+                                            .monospacedDigit()
+                                            .frame(width: fileColumns.size, alignment: .trailing)
+                                        Text(entry.fileType)
+                                            .lineLimit(1)
+                                            .frame(width: fileColumns.type, alignment: .leading)
+                                        Text(entry.modified)
+                                            .lineLimit(1)
+                                            .monospacedDigit()
+                                            .frame(width: fileColumns.modified, alignment: .leading)
+                                    }
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.text)
+                                    .padding(.horizontal, DS.Space.xs)
+                                    .frame(width: fileColumns.total, height: 26, alignment: .leading)
+                                    .background(rowBackground(index: index, isSelected: selected?.id == entry.id))
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button(entry.isDirectory ? "Open Folder" : "Select File") { select(entry) }
+                                }
                             }
                         }
                     }
@@ -939,14 +977,16 @@ private struct SSHTransferSidebarView: View {
         }
     }
 
-    private func tableHeader(_ title: String, width: CGFloat?) -> some View {
-        Text(title)
-            .font(DS.Font.caption2.weight(.semibold))
-            .foregroundColor(DS.Palette.textSecondary)
-            .frame(width: width, alignment: title == "Filesize" ? .trailing : .leading)
-            .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
-            .padding(.horizontal, DS.Space.xs)
-            .frame(height: 26)
+    private func resizableHeader(_ title: String,
+                                 width: Binding<CGFloat>,
+                                 minWidth: CGFloat,
+                                 alignment: Alignment = .leading) -> some View {
+        SSHResizableHeader(title: title, width: width, minWidth: minWidth, alignment: alignment)
+    }
+
+    private func rowBackground(index: Int, isSelected: Bool) -> Color {
+        if isSelected { return DS.Palette.selection }
+        return index.isMultiple(of: 2) ? DS.Palette.surface.opacity(0.35) : Color.clear
     }
 
     private func paneStatus(entries: [SSHFileEntry], selected: SSHFileEntry?) -> some View {
@@ -963,7 +1003,17 @@ private struct SSHTransferSidebarView: View {
     }
 
     private var actionStrip: some View {
-        VStack(spacing: DS.Space.xs) {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack {
+                Label("Transfer selection or typed paths", systemImage: "arrow.left.arrow.right")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                Spacer()
+                Text(vm.transferStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
             HStack(spacing: DS.Space.sm) {
                 pathField("Local file", text: $vm.transferLocalPath)
                 pathField("Remote file", text: $vm.transferRemotePath)
@@ -975,10 +1025,6 @@ private struct SSHTransferSidebarView: View {
                 Button { vm.onTransfer?(false, vm.transferLocalPath, vm.transferRemotePath) } label: {
                     Label("Download", systemImage: "arrow.left")
                 }
-                Text(vm.transferStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
                 Spacer()
             }
             .disabled(vm.transferLocalPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
@@ -1020,42 +1066,86 @@ private struct SSHTransferSidebarView: View {
                     .padding(.trailing, DS.Space.sm)
             }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            HStack(spacing: 0) {
-                tableHeader("Server/Local file", width: nil)
-                tableHeader("Direction", width: 74)
-                tableHeader("Remote file", width: 150)
-                tableHeader("Size", width: 56)
-                tableHeader("Priority", width: 60)
-                tableHeader("Status", width: 76)
-            }
-            ScrollView {
-                let items = vm.queueItems.filter { $0.status == vm.selectedQueueState }
-                LazyVStack(spacing: 0) {
-                    if items.isEmpty {
-                        Text("No \(vm.selectedQueueState.rawValue.lowercased()) transfers")
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .frame(maxWidth: .infinity, minHeight: 66)
-                    } else {
-                        ForEach(items) { item in
-                            HStack(spacing: 0) {
-                                Text(item.localPath).frame(maxWidth: .infinity, alignment: .leading)
-                                Text(item.direction.rawValue).frame(width: 74, alignment: .leading)
-                                Text(item.remotePath).frame(width: 150, alignment: .leading)
-                                Text(item.size).frame(width: 56, alignment: .trailing)
-                                Text("Normal").frame(width: 60, alignment: .leading)
-                                Text(item.status.rawValue).frame(width: 76, alignment: .leading)
+            ScrollView(.horizontal) {
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        resizableHeader("Local", width: $queueColumns.local, minWidth: 150)
+                        resizableHeader("Direction", width: $queueColumns.direction, minWidth: 74)
+                        resizableHeader("Remote", width: $queueColumns.remote, minWidth: 140)
+                        resizableHeader("Size", width: $queueColumns.size, minWidth: 56, alignment: .trailing)
+                        resizableHeader("Priority", width: $queueColumns.priority, minWidth: 64)
+                        resizableHeader("Status", width: $queueColumns.status, minWidth: 74)
+                    }
+                    ScrollView(.vertical) {
+                        let items = vm.queueItems.filter { $0.status == vm.selectedQueueState }
+                        LazyVStack(spacing: 0) {
+                            if items.isEmpty {
+                                Text("No \(vm.selectedQueueState.rawValue.lowercased()) transfers")
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .frame(width: queueColumns.total)
+                                    .frame(minHeight: 66)
+                            } else {
+                                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                                    HStack(spacing: 0) {
+                                        Text(item.localPath).frame(width: queueColumns.local, alignment: .leading)
+                                        Text(item.direction.rawValue).frame(width: queueColumns.direction, alignment: .leading)
+                                        Text(item.remotePath).frame(width: queueColumns.remote, alignment: .leading)
+                                        Text(item.size).frame(width: queueColumns.size, alignment: .trailing)
+                                        Text("Normal").frame(width: queueColumns.priority, alignment: .leading)
+                                        Text(item.status.rawValue).frame(width: queueColumns.status, alignment: .leading)
+                                    }
+                                    .font(DS.Font.caption)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, DS.Space.xs)
+                                    .frame(width: queueColumns.total, height: 24, alignment: .leading)
+                                    .background(rowBackground(index: index, isSelected: false))
+                                }
                             }
-                            .font(DS.Font.caption)
-                            .lineLimit(1)
-                            .padding(.horizontal, DS.Space.xs)
-                            .frame(height: 24)
                         }
                     }
                 }
             }
         }
         .frame(height: 160)
+    }
+}
+
+private struct SSHResizableHeader: View {
+    let title: String
+    @Binding var width: CGFloat
+    let minWidth: CGFloat
+    let alignment: Alignment
+    @State private var startWidth: CGFloat?
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(title)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: alignment)
+            Rectangle()
+                .fill(DS.Palette.lineStrong.opacity(0.7))
+                .frame(width: 1, height: 18)
+                .padding(.horizontal, DS.Space.xs)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { value in
+                            let base = startWidth ?? width
+                            if startWidth == nil { startWidth = width }
+                            width = max(minWidth, base + value.translation.width)
+                        }
+                        .onEnded { _ in startWidth = nil }
+                )
+                .help("Drag to resize \(title)")
+        }
+        .font(DS.Font.caption2.weight(.semibold))
+        .foregroundColor(DS.Palette.textSecondary)
+        .frame(width: width, alignment: alignment)
+        .padding(.horizontal, DS.Space.xs)
+        .frame(height: 26)
+        .background(DS.Palette.surfaceRaised.opacity(0.42))
     }
 }
 
