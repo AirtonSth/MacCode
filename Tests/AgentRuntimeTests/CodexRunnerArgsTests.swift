@@ -86,4 +86,23 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertNil(ProcessLocator.resolve("/no/such/codex"),
                      "CLI path settings must fail loud when the configured executable does not exist")
     }
+
+    func test_processLocatorFallsBackToCommonUserCliDirectoriesWhenGuiPathIsLimited() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-locator-\(UUID().uuidString)")
+        let bin = root.appendingPathComponent(".local/bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let cli = bin.appendingPathComponent("claude")
+        FileManager.default.createFile(atPath: cli.path, contents: Data("#!/bin/sh\n".utf8))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertEqual(
+            ProcessLocator.resolve("claude",
+                                   environmentPath: "/usr/bin:/bin:/usr/sbin:/sbin",
+                                   homeDirectory: root.path),
+            cli.path,
+            "macOS GUI launches often provide a limited PATH; agent CLIs installed in user bin dirs must still be discovered"
+        )
+    }
 }
