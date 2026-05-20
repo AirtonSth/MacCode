@@ -167,6 +167,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
+    private var workspaceWindows: [WorkspaceID: WorkspaceWindowController] = [:]
+    private var detachedWorkspaceIDs: Set<WorkspaceID> = []
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -415,6 +417,15 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         sidebar.refresh()
         updateCollapsedWorkspaceHeader()
         rebuildWorkspaceContainer()
+        for (workspaceID, controller) in Array(workspaceWindows) {
+            guard context?.state.workspaces[workspaceID] != nil else {
+                workspaceWindows.removeValue(forKey: workspaceID)
+                detachedWorkspaceIDs.remove(workspaceID)
+                controller.closeFromOwner()
+                continue
+            }
+            controller.refreshFromState()
+        }
         restoreProtectedFocus(focusedInput)
     }
 
@@ -469,6 +480,60 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         extraWindows[w.id] = win
     }
 
+    public func openWorkspaceInNewWindow(_ workspaceID: WorkspaceID) {
+        guard let ctx = context, let router, ctx.state.workspaces[workspaceID] != nil else { return }
+        if let existing = workspaceWindows[workspaceID] {
+            existing.window.makeKeyAndOrderFront(nil)
+            return
+        }
+        detachedWorkspaceIDs.insert(workspaceID)
+        if ctx.state.window.selectedWorkspaceID == workspaceID,
+           let fallback = ctx.state.window.workspaces.first(where: { $0 != workspaceID }) {
+            try? router.selectWorkspace(fallback)
+        } else {
+            refreshFromState()
+        }
+        let controller = WorkspaceWindowController(
+            workspaceID: workspaceID,
+            context: ctx,
+            router: router,
+            onBack: { [weak self] in self?.returnWorkspaceToSidebar(workspaceID) },
+            onClose: { [weak self] in self?.workspaceWindowClosed(workspaceID) }
+        )
+        workspaceWindows[workspaceID] = controller
+        controller.show()
+    }
+
+    public func workspaceWindow(for workspaceID: WorkspaceID) -> NSWindow? {
+        workspaceWindows[workspaceID]?.window
+    }
+
+    public func isWorkspaceOpenInNewWindow(_ workspaceID: WorkspaceID) -> Bool {
+        workspaceWindows[workspaceID] != nil
+    }
+
+    private func returnWorkspaceToSidebar(_ workspaceID: WorkspaceID) {
+        let controller = workspaceWindows.removeValue(forKey: workspaceID)
+        detachedWorkspaceIDs.remove(workspaceID)
+        if sidebarCollapsed {
+            handleToggleSidebar()
+        }
+        try? router?.selectWorkspace(workspaceID)
+        refreshFromState()
+        window.makeKeyAndOrderFront(nil)
+        controller?.closeFromOwner()
+    }
+
+    private func workspaceWindowClosed(_ workspaceID: WorkspaceID) {
+        workspaceWindows.removeValue(forKey: workspaceID)
+        detachedWorkspaceIDs.remove(workspaceID)
+        if context?.state.workspaces[workspaceID] != nil {
+            try? router?.selectWorkspace(workspaceID)
+        }
+        refreshFromState()
+        window.makeKeyAndOrderFront(nil)
+    }
+
     private func rebuildWorkspaceContainer() {
         window.disableScreenUpdatesUntilFlush()
         for sub in workspaceContent.subviews { sub.removeFromSuperview() }
@@ -478,7 +543,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         paneControllers.removeAll()
         guard let ctx = context,
               let wid = ctx.state.window.selectedWorkspaceID,
-              let ws = ctx.state.workspaces[wid] else {
+              let ws = ctx.state.workspaces[wid],
+              !detachedWorkspaceIDs.contains(wid) else {
             let empty = makeEmptyState()
             workspaceContent.addSubview(empty)
             pin(empty, to: workspaceContent)
@@ -593,6 +659,192 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     // MARK: NSWindowDelegate
     public func windowWillClose(_ notification: Notification) {
         context?.saveSnapshot()
+    }
+}
+
+@MainActor
+private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
+    let window: NSWindow
+    private let workspaceID: WorkspaceID
+    private weak var context: AppContext?
+    private weak var router: AppCommandRouter?
+    private let content = NSView()
+    private let workspaceContent = NSView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private var paneControllers: [PaneTabsView] = []
+    private var closingFromOwner = false
+    private let onBack: () -> Void
+    private let onClose: () -> Void
+
+    init(workspaceID: WorkspaceID, context: AppContext, router: AppCommandRouter, onBack: @escaping () -> Void, onClose: @escaping () -> Void) {
+        self.workspaceID = workspaceID
+        self.context = context
+        self.router = router
+        self.onBack = onBack
+        self.onClose = onClose
+        let win = InteractiveTitlebarWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
+            styleMask: [.titled, .resizable, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        win.styleMask.insert(.fullSizeContentView)
+        win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
+        win.isMovableByWindowBackground = false
+        win.minSize = NSSize(width: 760, height: 520)
+        self.window = win
+        super.init()
+        win.delegate = self
+        setupLayout()
+        refreshFromState()
+        win.center()
+    }
+
+    func show() {
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func closeFromOwner() {
+        closingFromOwner = true
+        window.orderOut(nil)
+    }
+
+    func refreshFromState() {
+        guard let ws = context?.state.workspaces[workspaceID] else {
+            closeFromOwner()
+            return
+        }
+        window.title = ws.name
+        titleLabel.stringValue = ws.name
+        for subview in workspaceContent.subviews { subview.removeFromSuperview() }
+        paneControllers.removeAll()
+        var primaryControlsAvailable = true
+        let layout = buildLayoutView(node: ws.layout, primaryControlsAvailable: &primaryControlsAvailable)
+        layout.translatesAutoresizingMaskIntoConstraints = true
+        layout.frame = workspaceContent.bounds
+        layout.autoresizingMask = [.width, .height]
+        workspaceContent.addSubview(layout)
+        if let split = layout as? RatioSplitView {
+            split.relayoutNow()
+        }
+    }
+
+    private func setupLayout() {
+        window.backgroundColor = DS.NS.bg
+        content.wantsLayer = true
+        content.layer?.backgroundColor = DS.NS.bg.cgColor
+        content.translatesAutoresizingMaskIntoConstraints = false
+        workspaceContent.wantsLayer = true
+        workspaceContent.layer?.backgroundColor = DS.NS.bg.cgColor
+        workspaceContent.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NoDragView()
+        header.wantsLayer = true
+        header.layer?.backgroundColor = DS.NS.surface.cgColor
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        let backButton = NoDragButton(frame: .zero)
+        backButton.translatesAutoresizingMaskIntoConstraints = false
+        backButton.isBordered = false
+        backButton.bezelStyle = .inline
+        backButton.imagePosition = .imageOnly
+        backButton.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Back to sidebar")
+        backButton.symbolConfiguration = .init(pointSize: 13, weight: .regular)
+        backButton.contentTintColor = DS.NS.textSecondary
+        backButton.toolTip = "Back to sidebar"
+        backButton.target = self
+        backButton.action = #selector(backToSidebar)
+
+        titleLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.textColor = DS.NS.text
+        titleLabel.alignment = .center
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let divider = NSView()
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = DS.NS.line.cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        header.addSubview(backButton)
+        header.addSubview(titleLabel)
+        header.addSubview(divider)
+        content.addSubview(header)
+        content.addSubview(workspaceContent)
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: content.topAnchor),
+            header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: 34),
+
+            backButton.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 92),
+            backButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            backButton.widthAnchor.constraint(equalToConstant: 26),
+            backButton.heightAnchor.constraint(equalToConstant: 22),
+
+            titleLabel.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+            titleLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            titleLabel.leadingAnchor.constraint(greaterThanOrEqualTo: backButton.trailingAnchor, constant: DS.Space.sm),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: header.trailingAnchor, constant: -DS.Space.lg),
+
+            divider.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            divider.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            divider.heightAnchor.constraint(equalToConstant: 1),
+
+            workspaceContent.topAnchor.constraint(equalTo: header.bottomAnchor),
+            workspaceContent.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            workspaceContent.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            workspaceContent.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+        ])
+        window.contentView = content
+    }
+
+    private func buildLayoutView(node: LayoutNode, primaryControlsAvailable: inout Bool, splitContext: PaneSplitContext? = nil) -> NSView {
+        switch node {
+        case .pane(let pane):
+            let showsWorkspaceControls = primaryControlsAvailable
+            primaryControlsAvailable = false
+            let ptv = PaneTabsView(
+                pane: pane,
+                router: router,
+                showsWorkspaceControls: showsWorkspaceControls,
+                splitContext: splitContext,
+                workspaceID: workspaceID
+            )
+            paneControllers.append(ptv)
+            return ptv.view
+        case .split(let splitNode):
+            let split = RatioSplitView()
+            split.isVertical = (splitNode.orientation == .horizontal)
+            split.dividerStyle = .thin
+            split.ratios = splitNode.ratios.map { CGFloat($0) }
+            for (index, child) in splitNode.children.enumerated() {
+                let childSplitContext = PaneSplitContext(splitID: splitNode.id, paneIndex: index, ratios: splitNode.ratios, orientation: splitNode.orientation)
+                let childView = buildLayoutView(node: child, primaryControlsAvailable: &primaryControlsAvailable, splitContext: childSplitContext)
+                childView.translatesAutoresizingMaskIntoConstraints = true
+                childView.autoresizingMask = []
+                split.addSubview(childView)
+            }
+            return split
+        }
+    }
+
+    @objc private func backToSidebar() {
+        onBack()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if !closingFromOwner {
+            onClose()
+        }
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard !closingFromOwner else { return true }
+        onBack()
+        return false
     }
 }
 

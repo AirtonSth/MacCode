@@ -26,16 +26,18 @@ public final class PaneTabsView: NSObject {
     public let pane: PaneNode
     public weak var router: AppCommandRouter?
     private let splitContext: PaneSplitContext?
+    private let workspaceIDOverride: WorkspaceID?
     private let tabStrip = PaneTabDropStack()
     private let contentArea = NSView()
     private let addMenu = NSMenu()
     private var tabButtons: [SurfaceID: PaneTabButton] = [:]
     private var eventToken: UUID?
 
-    public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil) {
+    public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil, workspaceID: WorkspaceID? = nil) {
         self.pane = pane
         self.router = router
         self.splitContext = splitContext
+        self.workspaceIDOverride = workspaceID
         let v = PaneRootView()
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
@@ -82,6 +84,9 @@ public final class PaneTabsView: NSObject {
                 },
                 onDropSurface: { [weak self] draggedID in
                     self?.dropSurface(draggedID, before: sid) ?? false
+                },
+                onSplitSurface: { [weak self] draggedID, direction in
+                    self?.performSplitSurface(draggedID, direction: direction) ?? false
                 }
             )
             tabButtons[sid] = tab
@@ -346,7 +351,7 @@ public final class PaneTabsView: NSObject {
     }
 
     private func currentWorkspaceID() -> WorkspaceID? {
-        router?.context?.state.window.selectedWorkspaceID
+        workspaceIDOverride ?? router?.context?.state.window.selectedWorkspaceID
     }
 
     /// Surfaces offered by the + and Split menus, in display order.
@@ -475,11 +480,30 @@ public final class PaneTabsView: NSObject {
         tabMidXs.filter { dropX > $0 }.count
     }
 
+    public static func splitDropDirection(in bounds: NSRect, at point: NSPoint) -> SplitDirection? {
+        guard bounds.contains(point) else { return nil }
+        let rightIntent = point.x - bounds.midX
+        let downIntent = bounds.midY - point.y
+        guard rightIntent > 0 || downIntent > 0 else { return nil }
+        return rightIntent >= downIntent ? .right : .down
+    }
+
     @discardableResult
     public func performReorderSurface(_ surface: SurfaceID, toPane targetPane: PaneID, position: Int) -> Bool {
         guard let wid = currentWorkspaceID() else { return false }
         do {
             try router?.surfaceReorder(workspace: wid, surface: surface, toPane: targetPane, position: position)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    public func performSplitSurface(_ surface: SurfaceID, direction: SplitDirection) -> Bool {
+        guard let wid = currentWorkspaceID() else { return false }
+        do {
+            try router?.splitSurface(workspace: wid, paneID: pane.id, surface: surface, direction: direction)
             return true
         } catch {
             return false
@@ -517,6 +541,7 @@ final class PaneTabButton: NSView {
     static let pasteboardType = NSPasteboard.PasteboardType("io.remotecode.surface-id")
     private static weak var highlightedTab: PaneTabButton?
     private static weak var highlightedStrip: PaneTabDropStack?
+    private static weak var highlightedSplitRoot: PaneRootView?
     private static weak var dragGhost: TabDragGhostView?
     private let surfaceID: SurfaceID
     private let title: String
@@ -526,6 +551,7 @@ final class PaneTabButton: NSView {
     private let onRename: (() -> Void)?
     private let onSetColor: ((String) -> Void)?
     private let onDropSurface: ((SurfaceID) -> Bool)?
+    private let onSplitSurface: ((SurfaceID, SplitDirection) -> Bool)?
     private let dropIndicator = NSView()
     private var hovering = false
     private var dragStarted = false
@@ -538,7 +564,8 @@ final class PaneTabButton: NSView {
          colorHex: UInt32? = nil,
          onSelect: @escaping () -> Void, onClose: @escaping () -> Void,
          onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil,
-         onDropSurface: ((SurfaceID) -> Bool)? = nil) {
+         onDropSurface: ((SurfaceID) -> Bool)? = nil,
+         onSplitSurface: ((SurfaceID, SplitDirection) -> Bool)? = nil) {
         self.surfaceID = surfaceID
         self.title = title
         self.symbol = symbol
@@ -547,6 +574,7 @@ final class PaneTabButton: NSView {
         self.onRename = onRename
         self.onSetColor = onSetColor
         self.onDropSurface = onDropSurface
+        self.onSplitSurface = onSplitSurface
         self.selected = selected
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
@@ -787,6 +815,10 @@ final class PaneTabButton: NSView {
         }
         if let strip = enclosingView(from: hit, as: PaneTabDropStack.self) {
             _ = strip.onDropSurface?(surfaceID)
+            return
+        }
+        if let direction = splitDirection(for: hit, contentPoint: point, in: contentView) {
+            _ = onSplitSurface?(surfaceID, direction)
         }
     }
 
@@ -808,7 +840,19 @@ final class PaneTabButton: NSView {
             Self.highlight(tab: nil, strip: strip)
             return
         }
+        if splitDirection(for: hit, contentPoint: point, in: contentView) != nil,
+           let root = enclosingView(from: self, as: PaneRootView.self) {
+            Self.highlight(tab: nil, strip: nil, splitRoot: root)
+            return
+        }
         Self.clearDragFeedback()
+    }
+
+    private func splitDirection(for hit: NSView, contentPoint: NSPoint, in contentView: NSView) -> SplitDirection? {
+        guard let root = enclosingView(from: hit, as: PaneRootView.self),
+              root === enclosingView(from: self, as: PaneRootView.self) else { return nil }
+        let point = root.convert(contentPoint, from: contentView)
+        return PaneTabsView.splitDropDirection(in: root.bounds, at: point)
     }
 
     private func updateDragGhost(with event: NSEvent) {
@@ -822,7 +866,7 @@ final class PaneTabButton: NSView {
         Self.dragGhost?.move(near: point, in: contentView.bounds)
     }
 
-    private static func highlight(tab: PaneTabButton?, strip: PaneTabDropStack?) {
+    private static func highlight(tab: PaneTabButton?, strip: PaneTabDropStack?, splitRoot: PaneRootView? = nil) {
         if highlightedTab !== tab {
             highlightedTab?.setDropHighlighted(false)
             highlightedTab = tab
@@ -833,6 +877,11 @@ final class PaneTabButton: NSView {
             highlightedStrip = strip
             highlightedStrip?.setAppendHighlighted(true)
         }
+        if highlightedSplitRoot !== splitRoot {
+            highlightedSplitRoot?.setSplitDropHighlighted(false)
+            highlightedSplitRoot = splitRoot
+            highlightedSplitRoot?.setSplitDropHighlighted(true)
+        }
     }
 
     private static func clearDragFeedback() {
@@ -840,6 +889,8 @@ final class PaneTabButton: NSView {
         highlightedTab = nil
         highlightedStrip?.setAppendHighlighted(false)
         highlightedStrip = nil
+        highlightedSplitRoot?.setSplitDropHighlighted(false)
+        highlightedSplitRoot = nil
         dragGhost?.removeFromSuperview()
         dragGhost = nil
     }
@@ -965,6 +1016,11 @@ final class PaneRootView: NoDragView {
         needsLayout = true
         updateConstraintsForSubtreeIfNeeded()
         layoutSubtreeIfNeeded()
+    }
+
+    func setSplitDropHighlighted(_ active: Bool) {
+        layer?.borderColor = active ? DS.NS.accent.cgColor : NSColor.clear.cgColor
+        layer?.borderWidth = active ? 2 : 0
     }
 }
 

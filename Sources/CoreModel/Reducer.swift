@@ -20,6 +20,7 @@ public enum LayoutAction: Sendable {
     case markUnread(WorkspaceID, SurfaceID, Bool)
     case reorderSurface(WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int)
     case moveSurfaceToPane(WorkspaceID, surface: SurfaceID, targetPane: PaneID)
+    case splitSurface(WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection)
     case resizeSplit(WorkspaceID, splitID: UUID, ratios: [Double])
     case createWindow(title: String?)
     case focusWindow(WindowID)
@@ -205,6 +206,13 @@ public struct LayoutReducer {
             ws.layout = try addSurface(in: ws.layout, paneID: target, descriptor: desc)
             next.workspaces[wid] = ws
             return next
+        case .splitSurface(let wid, let paneID, let sid, let direction):
+            guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            let (layout, newPaneID) = try splitExistingSurface(in: ws.layout, paneID: paneID, surfaceID: sid, direction: direction)
+            ws.layout = layout
+            ws.focusedPaneID = newPaneID
+            next.workspaces[wid] = ws
+            return next
         case .resizeSplit(let wid, let splitID, let ratios):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
             ws.layout = updateSplitRatios(node: ws.layout, splitID: splitID, ratios: ratios)
@@ -363,6 +371,43 @@ public struct LayoutReducer {
                 return mapped
             }
             return (.split(s), newID)
+        }
+    }
+
+    private func splitExistingSurface(in node: LayoutNode, paneID: PaneID, surfaceID: SurfaceID, direction: SplitDirection) throws -> (LayoutNode, PaneID) {
+        let neededOrientation: SplitOrientation = (direction == .right || direction == .left) ? .horizontal : .vertical
+        switch node {
+        case .pane(var p):
+            guard p.id == paneID else { return (.pane(p), paneID) }
+            guard let idx = p.surfaces.firstIndex(where: { $0.id == surfaceID }) else {
+                throw LayoutError.surfaceNotFound
+            }
+            guard p.surfaces.count > 1 else {
+                throw LayoutError.invalidLayout
+            }
+            let moved = p.surfaces.remove(at: idx)
+            if p.selectedSurfaceID == surfaceID {
+                p.selectedSurfaceID = p.surfaces.first?.id
+            }
+            let newPane = PaneNode(surfaces: [moved], selectedSurfaceID: moved.id)
+            let originalChild = LayoutNode.pane(p)
+            let newChild = LayoutNode.pane(newPane)
+            let kids: [LayoutNode] = (direction == .right || direction == .down) ? [originalChild, newChild] : [newChild, originalChild]
+            let split = SplitNode(orientation: neededOrientation, children: kids)
+            return (.split(split), newPane.id)
+        case .split(var s):
+            var newID = paneID
+            var found = false
+            s.children = try s.children.map { child in
+                let (mapped, candidateID) = try splitExistingSurface(in: child, paneID: paneID, surfaceID: surfaceID, direction: direction)
+                if candidateID != paneID {
+                    newID = candidateID
+                    found = true
+                }
+                return mapped
+            }
+            if found { return (.split(s), newID) }
+            return (.split(s), paneID)
         }
     }
 

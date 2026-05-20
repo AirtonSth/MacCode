@@ -24,6 +24,7 @@ public protocol CommandRouting: AnyObject {
     func reorderWorkspace(_ id: WorkspaceID, position: Int) throws
     func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor
     func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor
+    func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws
     func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws
     func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws
@@ -324,8 +325,16 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let pid = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init),
                       let dirStr = params["direction"]?.stringValue,
-                      let dir = SplitDirection(rawValue: dirStr),
-                      let tStr = params["type"]?.stringValue,
+                      let dir = SplitDirection(rawValue: dirStr) else { throw JSONRPCError.invalidParams }
+                if let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) {
+                    try router.splitSurface(workspace: wid, paneID: pid, surface: sid, direction: dir)
+                    EventBus.shared.publish(kind: "surface.moved", payload: .object([
+                        "workspace_id": .string(wid.value.uuidString),
+                        "id": .string(sid.value.uuidString)
+                    ]))
+                    return .init(id: id, result: .bool(true))
+                }
+                guard let tStr = params["type"]?.stringValue,
                       let type = SurfaceType(rawValue: normalizeSurfaceTypeString(tStr)) else { throw JSONRPCError.invalidParams }
                 let title = params["title"]?.stringValue
                 let s = try router.splitPane(workspace: wid, paneID: pid, direction: dir, surfaceType: type, title: title)

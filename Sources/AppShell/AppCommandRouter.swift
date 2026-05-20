@@ -225,6 +225,11 @@ public final class AppCommandRouter: CommandRouting {
         return desc
     }
 
+    public func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws {
+        try context?.apply(.splitSurface(workspace, paneID: paneID, surface: surface, direction: direction))
+        windowController?.refreshFromState()
+    }
+
     public func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
         try context?.apply(.closeSurface(workspace, surface))
         if let s = SurfaceRegistry.shared.surface(surface) {
@@ -724,6 +729,10 @@ public final class AppCommandRouter: CommandRouting {
     public func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws {
         try context?.apply(.reorderSurface(workspace, surface: surface, toPane: toPane, position: position))
         windowController?.refreshFromState()
+    }
+
+    public func openWorkspaceInNewWindow(_ workspace: WorkspaceID) {
+        windowController?.openWorkspaceInNewWindow(workspace)
     }
 
     public func notificationCreate(workspaceId: WorkspaceID?, title: String, body: String?, category: String?) throws -> String {

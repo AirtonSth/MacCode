@@ -51,6 +51,10 @@ final class FakeRouter: CommandRouting {
     func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: surfaceType, title: title ?? surfaceType.rawValue)
     }
+    var splitSurfaceCalls: [(WorkspaceID, PaneID, SurfaceID, SplitDirection)] = []
+    func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws {
+        splitSurfaceCalls.append((workspace, paneID, surface, direction))
+    }
     func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {}
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {}
     func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {}
@@ -301,6 +305,31 @@ final class DispatcherTests: XCTestCase {
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "workspace.create", params: params))
         XCTAssertNil(resp.error)
         XCTAssertEqual(router.workspaces.count, 1)
+    }
+
+    @MainActor
+    func test_surfaceSplitWithExistingIdRoutesToSplitSurface() async {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let wid = WorkspaceID()
+        let pid = PaneID()
+        let sid = SurfaceID()
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.split", params: [
+            "workspace_id": .string(wid.value.uuidString),
+            "pane_id": .string(pid.value.uuidString),
+            "id": .string(sid.value.uuidString),
+            "direction": .string("down"),
+        ]))
+
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(resp.result, .bool(true))
+        XCTAssertEqual(router.splitSurfaceCalls.count, 1,
+                       "iOS drag-down split sends an existing surface id, so the host must move that tab into the new vertical pane")
+        XCTAssertEqual(router.splitSurfaceCalls.first?.0, wid)
+        XCTAssertEqual(router.splitSurfaceCalls.first?.1, pid)
+        XCTAssertEqual(router.splitSurfaceCalls.first?.2, sid)
+        XCTAssertEqual(router.splitSurfaceCalls.first?.3, .down)
     }
 
     @MainActor

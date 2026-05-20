@@ -69,6 +69,10 @@ public final class SidebarViewModel: ObservableObject {
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
     }
 
+    public func openWorkspaceInNewWindow(_ ws: Workspace) {
+        router?.openWorkspaceInNewWindow(ws.id)
+    }
+
     // MARK: cmux-style workspace editing (AppKit prompts — reliable,
     // no SwiftUI sheet plumbing).
 
@@ -313,6 +317,10 @@ public struct SidebarRootView: View {
         .contextMenu {
             Button { vm.setWorkspacePinned(ws, !pinned) } label: {
                 Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
+            }
+            Divider()
+            Button { vm.openWorkspaceInNewWindow(ws) } label: {
+                Label("Open in New Window", systemImage: "macwindow")
             }
             Divider()
             Button("Rename…") { vm.renameWorkspace(ws) }

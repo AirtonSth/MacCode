@@ -267,6 +267,64 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(final.layout.find(paneID: targetPane)?.surfaces.first?.id, sourceSurface)
     }
 
+    func test_performSplitSurface_movesDraggedTabIntoNewSidePane() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "drag-split-right", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let terminal = pane0.surfaces.first!.id
+        let view = PaneTabsView(pane: pane0, router: router)
+        let browser = try XCTUnwrap(view.performAdd(.browser, title: "browser"))
+
+        guard case .pane(let pane1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        let dragView = PaneTabsView(pane: pane1, router: router)
+        XCTAssertTrue(dragView.performSplitSurface(browser.id, direction: .right),
+                      "dragging an existing tab to the side must move that tab into a new split pane, not create a blank duplicate")
+
+        guard case .split(let split) = ctx.state.workspaces[ws.id]!.layout else {
+            return XCTFail("expected a split after dragging a tab to the side")
+        }
+        XCTAssertEqual(split.orientation, .horizontal)
+        XCTAssertEqual(split.children.count, 2)
+        XCTAssertEqual(split.children.first?.find(paneID: pane1.id)?.surfaces.map(\.id), [terminal],
+                       "the source pane should keep the remaining tabs after the dragged tab is split out")
+        XCTAssertEqual(split.children.last?.paneIDs().compactMap { split.children.last?.find(paneID: $0)?.surfaces.first?.id }, [browser.id],
+                       "the dragged tab should become the selected surface of the new side pane")
+    }
+
+    func test_performSplitSurface_movesDraggedTabIntoNewLowerPane() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "drag-split-down", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let view = PaneTabsView(pane: pane0, router: router)
+        let browser = try XCTUnwrap(view.performAdd(.browser, title: "browser"))
+
+        guard case .pane(let pane1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        let dragView = PaneTabsView(pane: pane1, router: router)
+        XCTAssertTrue(dragView.performSplitSurface(browser.id, direction: .down),
+                      "dragging an existing tab downward must create a stacked split with the dragged tab in the lower pane")
+
+        guard case .split(let split) = ctx.state.workspaces[ws.id]!.layout else {
+            return XCTFail("expected a split after dragging a tab downward")
+        }
+        XCTAssertEqual(split.orientation, .vertical)
+        XCTAssertEqual(split.children.count, 2)
+    }
+
+    func test_performSplitSurface_singleTabDoesNotCreateEmptyPane() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "single-tab", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail() }
+        let only = pane.surfaces.first!.id
+        let view = PaneTabsView(pane: pane, router: router)
+
+        XCTAssertFalse(view.performSplitSurface(only, direction: .right),
+                       "a single-tab pane should not split itself into an empty source pane plus the same tab")
+        guard case .pane(let unchanged) = ctx.state.workspaces[ws.id]!.layout else {
+            return XCTFail("single-tab split attempts should leave the pane unchanged")
+        }
+        XCTAssertEqual(unchanged.surfaces.map(\.id), [only])
+    }
+
     func test_closeSurface_removesTabFromPane() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "c", cwd: NSTemporaryDirectory())
@@ -417,6 +475,53 @@ final class PaneActionTests: XCTestCase {
         })
         XCTAssertEqual(splitTop.constant, 34, accuracy: 0.1,
                        "collapsed mode still needs a full-width header so the user can restore the sidebar")
+    }
+
+    func test_openWorkspaceInNewWindow_usesSidebarlessHeaderWithBackButton() throws {
+        let (ctx, router) = try makeContext()
+        let detached = try router.createWorkspace(name: "detached", cwd: NSTemporaryDirectory())
+        _ = try router.createWorkspace(name: "main", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+
+        controller.openWorkspaceInNewWindow(detached.id)
+
+        let detachedWindow = try XCTUnwrap(controller.workspaceWindow(for: detached.id))
+        detachedWindow.contentView?.layoutSubtreeIfNeeded()
+        let content = try XCTUnwrap(detachedWindow.contentView)
+        let tooltips = visibleSubviews(of: content).compactMap { ($0 as? NSButton)?.toolTip }
+
+        XCTAssertTrue(controller.isWorkspaceOpenInNewWindow(detached.id))
+        XCTAssertTrue(tooltips.contains("Back to sidebar"),
+                      "a workspace-only window needs an explicit return path to the sidebar")
+        XCTAssertFalse(tooltips.contains("Toggle sidebar"),
+                       "workspace-only windows open without a sidebar, so the header button must not be the sidebar toggle")
+        XCTAssertNil(allSubviews(of: content).first { $0 is NSSplitView },
+                     "the new workspace window should not include the main sidebar split view")
+    }
+
+    func test_backButtonFromWorkspaceWindowReturnsToMainSidebarWithoutClosingAppWindow() throws {
+        let (ctx, router) = try makeContext()
+        let detached = try router.createWorkspace(name: "detached-back", cwd: NSTemporaryDirectory())
+        _ = try router.createWorkspace(name: "main-back", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+
+        controller.openWorkspaceInNewWindow(detached.id)
+        let detachedWindow = try XCTUnwrap(controller.workspaceWindow(for: detached.id))
+        let back = try XCTUnwrap(allSubviews(of: try XCTUnwrap(detachedWindow.contentView))
+            .compactMap { $0 as? NSButton }
+            .first { $0.toolTip == "Back to sidebar" })
+
+        back.performClick(nil)
+
+        XCTAssertFalse(controller.isWorkspaceOpenInNewWindow(detached.id),
+                       "Back to sidebar should close only the detached workspace window")
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, detached.id,
+                       "Back to sidebar should reselect the workspace in the main sidebar window")
+        XCTAssertTrue(controller.window.isVisible,
+                      "returning a workspace must leave the main app window open so macOS does not treat the detached close as last-window quit")
     }
 
     func test_sidebarViewModel_toggleSidebarPostsSharedNotification() throws {

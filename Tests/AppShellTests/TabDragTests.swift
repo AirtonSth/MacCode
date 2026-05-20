@@ -55,4 +55,15 @@ final class TabDragTests: XCTestCase {
             threshold: 8
         ), "moving beyond the threshold should still allow intentional tab reordering")
     }
+
+    func test_splitDropDirection_detectsRightAndDownZones() {
+        let bounds = NSRect(x: 0, y: 0, width: 400, height: 300)
+
+        XCTAssertEqual(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 340, y: 240)), .right,
+                       "dragging a tab toward the side of its pane should create a side-by-side split")
+        XCTAssertEqual(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 120, y: 40)), .down,
+                       "dragging a tab toward the bottom of its pane should create a stacked split")
+        XCTAssertNil(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 120, y: 240)),
+                     "the normal tab area must keep selecting/reordering instead of unexpectedly splitting")
+    }
 }
