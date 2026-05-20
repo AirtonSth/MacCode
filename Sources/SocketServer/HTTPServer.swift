@@ -289,7 +289,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Dispatcher.swift git.*/browser.*); hiding them on the
             // client breaks parity.
             let body: [String: Any] = [
-                "surface_types": ["terminal", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
+                "surface_types": ["terminal", "ssh", "browser", "agentApp", "files", "markdown", "filePreview", "rightSidebarTool"],
+                "ssh": [
+                    "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list"]
+                ],
                 "agent": ["providers": ["codex", "claude"], "supports_stream_events": true, "supports_resume": true],
                 "browser_automation": [
                     "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],

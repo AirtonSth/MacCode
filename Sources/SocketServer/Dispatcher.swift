@@ -33,6 +33,16 @@ public protocol CommandRouting: AnyObject {
     func readText(surface: SurfaceID) throws -> String
     func surfaceHealth(surface: SurfaceID) -> Bool
     func surfaceClearHistory(surface: SurfaceID)
+    // SSH
+    func sshHostList() throws -> [SSHHostProfile]
+    func sshHostUpsert(_ profile: SSHHostProfile) throws -> SSHHostProfile
+    func sshHostDelete(_ id: SSHHostID) throws
+    func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor
+    func sshDisconnect(surface: SurfaceID) throws
+    func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue
+    func sshTransferDownload(surface: SurfaceID, remotePath: String, localPath: String) throws -> JSONValue
+    func sshFilesLocalList(path: String?) throws -> JSONValue
+    func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
@@ -145,7 +155,20 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .object([
                     "app": .string("remotecode"),
                     "api_version": .string("2"),
-                    "surface_types": .array([.string("terminal"), .string("browser"), .string("agentApp"), .string("files"), .string("markdown"), .string("filePreview"), .string("rightSidebarTool")]),
+                    "surface_types": .array([.string("terminal"), .string("ssh"), .string("browser"), .string("agentApp"), .string("files"), .string("markdown"), .string("filePreview"), .string("rightSidebarTool")]),
+                    "ssh": .object([
+                        "methods": .array([
+                            .string("ssh.host.list"),
+                            .string("ssh.host.upsert"),
+                            .string("ssh.host.delete"),
+                            .string("ssh.connect"),
+                            .string("ssh.disconnect"),
+                            .string("ssh.transfer.upload"),
+                            .string("ssh.transfer.download"),
+                            .string("ssh.files.local.list"),
+                            .string("ssh.files.remote.list")
+                        ])
+                    ]),
                     "agent": .object([
                         "providers": .array([.string("codex"), .string("claude")]),
                         "supports_stream_events": .bool(true),
@@ -194,6 +217,58 @@ public final class JSONRPCDispatcher {
                     "value": .string(value)
                 ]))
                 return .init(id: id, result: .bool(true))
+            case "ssh.host.list":
+                return .init(id: id, result: encode(try router.sshHostList()))
+            case "ssh.host.upsert":
+                let profile = try sshProfile(from: params)
+                let saved = try router.sshHostUpsert(profile)
+                EventBus.shared.publish(kind: "ssh.host.updated", payload: encode(saved))
+                return .init(id: id, result: encode(saved))
+            case "ssh.host.delete":
+                guard let raw = params["id"]?.stringValue,
+                      let uuid = UUID(uuidString: raw) else { throw JSONRPCError.invalidParams }
+                try router.sshHostDelete(SSHHostID(uuid))
+                EventBus.shared.publish(kind: "ssh.host.deleted", payload: .object(["id": .string(raw)]))
+                return .init(id: id, result: .bool(true))
+            case "ssh.connect":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let pid: PaneID? = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
+                let profileID = params["profile_id"]?.stringValue.flatMap(UUID.init).map(SSHHostID.init)
+                let profile = try optionalSSHProfile(from: params)
+                let s = try router.sshConnect(workspace: wid, profileID: profileID, profile: profile, title: params["title"]?.stringValue, paneID: pid)
+                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface": encode(s)
+                ]))
+                EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+                    "surface_id": .string(s.id.value.uuidString),
+                    "status": .string(s.metadata["ssh_status"] ?? "connected"),
+                    "destination": .string(s.metadata["ssh_destination"] ?? "")
+                ]))
+                return .init(id: id, result: encode(s))
+            case "ssh.disconnect":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                try router.sshDisconnect(surface: sid)
+                EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "status": .string("disconnected")
+                ]))
+                return .init(id: id, result: .bool(true))
+            case "ssh.transfer.upload":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let local = params["local_path"]?.stringValue,
+                      let remote = params["remote_path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.sshTransferUpload(surface: sid, localPath: local, remotePath: remote))
+            case "ssh.transfer.download":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
+                      let remote = params["remote_path"]?.stringValue,
+                      let local = params["local_path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.sshTransferDownload(surface: sid, remotePath: remote, localPath: local))
+            case "ssh.files.local.list":
+                return .init(id: id, result: try router.sshFilesLocalList(path: params["path"]?.stringValue))
+            case "ssh.files.remote.list":
+                guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.sshFilesRemoteList(surface: sid, path: params["path"]?.stringValue))
             case "fs.roots":
                 return .init(id: id, result: .object(["roots": fsRoots()]))
             case "fs.list":
@@ -759,6 +834,7 @@ public final class JSONRPCDispatcher {
         case "rightsidebartool", "right_sidebar_tool", "diff", "git": return "rightSidebarTool"
         case "filepreview", "file_preview": return "filePreview"
         case "files", "file_browser", "filebrowser": return "files"
+        case "ssh": return "ssh"
         case "markdown": return "markdown"
         case "terminal": return "terminal"
         case "browser": return "browser"
@@ -824,6 +900,34 @@ public final class JSONRPCDispatcher {
             return .null
         }
         return JSONValue.from(any)
+    }
+
+    private func optionalSSHProfile(from params: [String: JSONValue]) throws -> SSHHostProfile? {
+        if params["destination"]?.stringValue == nil,
+           params["host"]?.stringValue == nil,
+           params["profile"]?.objectValue == nil {
+            return nil
+        }
+        return try sshProfile(from: params)
+    }
+
+    private func sshProfile(from params: [String: JSONValue]) throws -> SSHHostProfile {
+        let source = params["profile"]?.objectValue ?? params
+        guard let destination = source["destination"]?.stringValue ?? source["host"]?.stringValue else {
+            throw JSONRPCError.invalidParams
+        }
+        let id = (source["id"]?.stringValue).flatMap(UUID.init).map(SSHHostID.init) ?? SSHHostID()
+        let label = source["label"]?.stringValue ?? source["title"]?.stringValue ?? destination
+        let options = source["options"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        return SSHHostProfile(
+            id: id,
+            label: label,
+            destination: destination,
+            port: source["port"]?.intValue,
+            identityFile: source["identity_file"]?.stringValue ?? source["identityFile"]?.stringValue,
+            password: source["password"]?.stringValue,
+            options: options
+        )
     }
 
     private func encodeThread(_ thread: AgentThread) -> JSONValue {

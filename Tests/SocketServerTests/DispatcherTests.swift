@@ -46,7 +46,7 @@ final class FakeRouter: CommandRouting {
         window.workspaces = workspaces.map(\.id)
     }
     func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor {
-        SurfaceDescriptor(type: type, title: title ?? type.rawValue)
+        SurfaceDescriptor(type: type, title: title ?? type.rawValue, metadata: type == .ssh ? ["ssh_status": "disconnected"] : [:])
     }
     func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: surfaceType, title: title ?? surfaceType.rawValue)
@@ -63,6 +63,27 @@ final class FakeRouter: CommandRouting {
     func readText(surface: SurfaceID) throws -> String { "" }
     func surfaceHealth(surface: SurfaceID) -> Bool { true }
     func surfaceClearHistory(surface: SurfaceID) {}
+    var sshHosts: [SSHHostProfile] = []
+    func sshHostList() throws -> [SSHHostProfile] { sshHosts }
+    func sshHostUpsert(_ profile: SSHHostProfile) throws -> SSHHostProfile {
+        if let idx = sshHosts.firstIndex(where: { $0.id == profile.id }) { sshHosts[idx] = profile }
+        else { sshHosts.append(profile) }
+        return profile
+    }
+    func sshHostDelete(_ id: SSHHostID) throws { sshHosts.removeAll { $0.id == id } }
+    func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor {
+        let resolved = profile ?? profileID.flatMap { id in sshHosts.first { $0.id == id } } ?? SSHHostProfile(label: "SSH", destination: "example.test")
+        return SurfaceDescriptor(type: .ssh, title: title ?? resolved.label, iconName: "network", metadata: [
+            "ssh_profile_id": resolved.id.value.uuidString,
+            "ssh_destination": resolved.destination,
+            "ssh_status": "connecting"
+        ])
+    }
+    func sshDisconnect(surface: SurfaceID) throws {}
+    func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue { .object(["ok": .bool(true)]) }
+    func sshTransferDownload(surface: SurfaceID, remotePath: String, localPath: String) throws -> JSONValue { .object(["ok": .bool(true)]) }
+    func sshFilesLocalList(path: String?) throws -> JSONValue { .object(["path": .string(path ?? "/tmp"), "entries": .array([])]) }
+    func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue { .object(["path": .string(path ?? "/"), "entries": .array([])]) }
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: .agentApp, title: "Agent App")
     }
@@ -267,6 +288,30 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_capabilitiesAdvertiseSSHTabAndMethodsForMirrorParity() async {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil))
+
+        guard case .object(let o)? = resp.result,
+              case .array(let surfaceTypes)? = o["surface_types"],
+              case .object(let ssh)? = o["ssh"],
+              case .array(let methods)? = ssh["methods"] else {
+            return XCTFail("capabilities must expose the SSH surface and SSH methods so iOS can mirror the macOS tab")
+        }
+        XCTAssertTrue(surfaceTypes.contains(.string("ssh")),
+                      "SSH must be advertised by the host; otherwise iOS cannot discover or create the mirrored SSH tab")
+        XCTAssertTrue(methods.contains(.string("ssh.host.list")),
+                      "saved hosts must be reachable through the same host RPC contract on macOS and iOS")
+        XCTAssertTrue(methods.contains(.string("ssh.transfer.upload")))
+        XCTAssertTrue(methods.contains(.string("ssh.transfer.download")))
+        XCTAssertTrue(methods.contains(.string("ssh.files.local.list")),
+                      "the FileZilla-style local browser must be reachable from iOS through the host RPC contract")
+        XCTAssertTrue(methods.contains(.string("ssh.files.remote.list")),
+                      "the FileZilla-style remote browser must be reachable from iOS through the host RPC contract")
+    }
+
+    @MainActor
     func test_surfaceCreateAcceptsFilesType() async throws {
         let d = JSONRPCDispatcher(router: FakeRouter())
         let wid = JSONValue.string(UUID().uuidString)
@@ -279,6 +324,80 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNil(resp.error, "iOS must be able to create a Files tab through the same surface.create RPC as macOS")
         guard case .object(let body)? = resp.result else { return XCTFail("surface.create must return the created Files descriptor") }
         XCTAssertEqual(body["type"], .string("files"))
+    }
+
+    @MainActor
+    func test_surfaceCreateAcceptsSSHType() async throws {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+        let wid = JSONValue.string(UUID().uuidString)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.create", params: [
+            "workspace_id": wid,
+            "type": .string("ssh"),
+            "title": .string("SSH")
+        ]))
+
+        XCTAssertNil(resp.error, "iOS must be able to create an SSH tab through the same surface.create RPC as macOS")
+        guard case .object(let body)? = resp.result else { return XCTFail("surface.create must return the created SSH descriptor") }
+        XCTAssertEqual(body["type"], .string("ssh"))
+        guard case .object(let metadata)? = body["metadata"] else { return XCTFail("SSH descriptor must include metadata") }
+        XCTAssertEqual(metadata["ssh_status"], .string("disconnected"),
+                       "a bare SSH tab must be a real disconnected surface, not a dead descriptor")
+    }
+
+    @MainActor
+    func test_sshHostSaveListConnectAndTransferRoundTrip() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let wid = JSONValue.string(UUID().uuidString)
+
+        let saved = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "ssh.host.upsert", params: [
+            "label": .string("Prod"),
+            "destination": .string("root@example.test"),
+            "port": .number(2222),
+            "password": .string("saved-test-password")
+        ]))
+        guard case .object(let savedHost)? = saved.result,
+              case .object(let savedID)? = savedHost["id"],
+              let hostID = savedID["value"]?.stringValue else {
+            return XCTFail("saved SSH host must echo an id so iOS can reconnect without retyping")
+        }
+
+        let list = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "ssh.host.list", params: nil))
+        guard case .array(let hosts)? = list.result else { return XCTFail("ssh.host.list must return saved hosts") }
+        XCTAssertEqual(hosts.count, 1, "saving a host must make it available for reconnect")
+        guard case .object(let listedHost)? = hosts.first else { return XCTFail("ssh.host.list must return host objects") }
+        XCTAssertEqual(listedHost["password"], .string("saved-test-password"),
+                       "a saved password must stay on the saved host so reconnect can answer the SSH prompt without asking again")
+
+        let connected = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "ssh.connect", params: [
+            "workspace_id": wid,
+            "profile_id": .string(hostID)
+        ]))
+        guard case .object(let surface)? = connected.result,
+              case .object(let sidObject)? = surface["id"],
+              let surfaceID = sidObject["value"]?.stringValue else {
+            return XCTFail("ssh.connect must create a mirrored SSH surface")
+        }
+        XCTAssertEqual(surface["type"], .string("ssh"))
+        guard case .object(let metadata)? = surface["metadata"] else { return XCTFail("SSH descriptor must include metadata") }
+        XCTAssertEqual(metadata["ssh_destination"], .string("root@example.test"))
+
+        let upload = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "ssh.transfer.upload", params: [
+            "surface_id": .string(surfaceID),
+            "local_path": .string("/tmp/local.txt"),
+            "remote_path": .string("/tmp/remote.txt")
+        ]))
+        guard case .object(let uploadResult)? = upload.result else { return XCTFail("upload must return an object") }
+        XCTAssertEqual(uploadResult["ok"], .bool(true), "upload must be exposed as a host-owned terminal/scp RPC")
+
+        let download = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "ssh.transfer.download", params: [
+            "surface_id": .string(surfaceID),
+            "remote_path": .string("/tmp/remote.txt"),
+            "local_path": .string("/tmp/local.txt")
+        ]))
+        guard case .object(let downloadResult)? = download.result else { return XCTFail("download must return an object") }
+        XCTAssertEqual(downloadResult["ok"], .bool(true), "download must be exposed as a host-owned terminal/scp RPC")
     }
 
     @MainActor

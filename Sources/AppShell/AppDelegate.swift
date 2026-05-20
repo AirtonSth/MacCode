@@ -348,6 +348,7 @@ extension SurfaceType {
     public var displayLabel: String {
         switch self {
         case .terminal: return "Terminal"
+        case .ssh: return "SSH"
         case .browser: return "Browser"
         case .agentApp: return "Agent App"
         case .files: return "Files"

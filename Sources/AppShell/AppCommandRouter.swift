@@ -34,6 +34,12 @@ public final class AppCommandRouter: CommandRouting {
                     switch desc.type {
                     case .terminal:
                         surface = try TerminalSurface(workspaceID: wid, cwd: cwd, title: title)
+                    case .ssh:
+                        if let profile = sshProfile(from: desc) {
+                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd))
+                        } else {
+                            surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self)
+                        }
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
@@ -265,9 +271,103 @@ public final class AppCommandRouter: CommandRouting {
     public func surfaceClearHistory(surface: SurfaceID) {
         // Terminal-specific: replace scrollback by sending the clear
         // shortcut. Browser/agent surfaces ignore.
-        if let s = SurfaceRegistry.shared.surface(surface), s.descriptor.type == .terminal {
+        if let s = SurfaceRegistry.shared.surface(surface), s.descriptor.type == .terminal || s.descriptor.type == .ssh {
             s.sendText("\u{0C}") // ctrl-L
         }
+    }
+
+    public func sshHostList() throws -> [SSHHostProfile] {
+        guard let ctx = context else { return [] }
+        return try readSSHHosts(from: ctx.settingsRepo)
+    }
+
+    public func sshHostUpsert(_ profile: SSHHostProfile) throws -> SSHHostProfile {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        var hosts = try readSSHHosts(from: ctx.settingsRepo)
+        var saved = profile
+        saved.updatedAt = Date()
+        if let index = hosts.firstIndex(where: { $0.id == saved.id }) {
+            saved.createdAt = hosts[index].createdAt
+            hosts[index] = saved
+        } else {
+            hosts.append(saved)
+        }
+        try writeSSHHosts(hosts, to: ctx.settingsRepo)
+        return saved
+    }
+
+    public func sshHostDelete(_ id: SSHHostID) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        var hosts = try readSSHHosts(from: ctx.settingsRepo)
+        hosts.removeAll { $0.id == id }
+        try writeSSHHosts(hosts, to: ctx.settingsRepo)
+    }
+
+    public func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let hosts = try readSSHHosts(from: ctx.settingsRepo)
+        let resolved: SSHHostProfile
+        if let profileID, let found = hosts.first(where: { $0.id == profileID }) {
+            resolved = found
+        } else if let profile {
+            resolved = try sshHostUpsert(profile)
+        } else {
+            throw LayoutError.surfaceNotFound
+        }
+        let desc = try makeSSHSurface(profile: resolved, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
+        try ctx.apply(.addSurface(workspace, paneID: paneID, descriptor: desc))
+        windowController?.refreshFromState()
+        return desc
+    }
+
+    public func sshDisconnect(surface: SurfaceID) throws {
+        guard let s = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
+        s.close()
+    }
+
+    public func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue {
+        try runSSHTransfer(surface: surface, upload: true, localPath: localPath, remotePath: remotePath)
+    }
+
+    public func sshTransferDownload(surface: SurfaceID, remotePath: String, localPath: String) throws -> JSONValue {
+        try runSSHTransfer(surface: surface, upload: false, localPath: localPath, remotePath: remotePath)
+    }
+
+    public func sshFilesLocalList(path: String?) throws -> JSONValue {
+        try makeLocalSSHFileListing(path: path)
+    }
+
+    public func sshFilesRemoteList(surface: SurfaceID, path: String?) throws -> JSONValue {
+        let profile = try sshTransferProfile(for: surface)
+        let requested = (path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? path! : "."
+        let script = """
+        p=\(shellQuote(requested))
+        [ -z "$p" ] && p=.
+        cd "$p" 2>/dev/null || exit 2
+        pwd
+        for f in .. .* *; do
+          [ "$f" = "." ] && continue
+          [ -e "$f" ] || continue
+          if [ -d "$f" ]; then
+            kind=directory
+            type="File folder"
+            size=""
+          else
+            kind=file
+            ext="${f##*.}"
+            [ "$ext" = "$f" ] && type="File" || type="$ext file"
+            size=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+          fi
+          mod=$(date -r "$f" "+%Y-%m-%d %H:%M" 2>/dev/null || stat -c %y "$f" 2>/dev/null | cut -c1-16)
+          printf '%s\t%s\t%s\t%s\n' "$f" "$kind" "$size" "$mod"
+        done
+        """
+        let args = SSHCommandBuilder.sshArguments(for: profile) + ["sh", "-lc", script]
+        let result = try runCommand(executable: "/usr/bin/ssh", arguments: args, password: profile.password)
+        guard result.exitCode == 0 else {
+            throw JSONRPCError(code: -32020, message: "remote list failed", data: .string(result.output))
+        }
+        return makeRemoteSSHFileListing(output: result.output, requestedPath: requested)
     }
 
     public func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
@@ -903,6 +1003,8 @@ public final class AppCommandRouter: CommandRouting {
             switch type {
             case .terminal:
                 surface = try TerminalSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
+            case .ssh:
+                surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self)
             case .browser:
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
@@ -964,6 +1066,233 @@ public final class AppCommandRouter: CommandRouting {
 
     private func defaultTitle(for type: SurfaceType) -> String {
         type.displayLabel.lowercased() == "agent app" ? "Agent App" : type.displayLabel.lowercased()
+    }
+
+    private func makeSSHSurface(profile: SSHHostProfile, title: String?, workspace: WorkspaceID, cwd: String) throws -> SurfaceDescriptor {
+        let baseTitle = title ?? profile.label
+        let surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self)
+        surface.connectForRouter(profile)
+        SurfaceRegistry.shared.register(surface)
+        return surface.descriptor
+    }
+
+    private func readSSHHosts(from repo: SettingsRepository) throws -> [SSHHostProfile] {
+        guard let raw = try repo.get("ssh.hosts"),
+              let data = raw.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
+    }
+
+    private func writeSSHHosts(_ hosts: [SSHHostProfile], to repo: SettingsRepository) throws {
+        let data = try JSONEncoder().encode(hosts)
+        try repo.set("ssh.hosts", String(data: data, encoding: .utf8) ?? "[]")
+    }
+
+    private func runSSHTransfer(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) throws -> JSONValue {
+        let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
+        let args = upload
+            ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
+            : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
+        let kind = upload ? "upload" : "download"
+        EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+            "surface_id": .string(surface.value.uuidString),
+            "direction": .string(kind),
+            "local_path": .string(localPath),
+            "remote_path": .string(remotePath)
+        ]))
+        appendOutput("\n[ssh \(kind) started]\n")
+        let result = try runCommand(executable: "/usr/bin/scp", arguments: args, password: profile.password)
+        if !result.output.isEmpty { appendOutput(result.output) }
+        let ok = result.exitCode == 0
+        appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
+        EventBus.shared.publish(kind: ok ? "ssh.transfer.completed" : "ssh.transfer.failed", payload: .object([
+            "surface_id": .string(surface.value.uuidString),
+            "direction": .string(kind),
+            "local_path": .string(localPath),
+            "remote_path": .string(remotePath),
+            "exit_code": .number(Double(result.exitCode))
+        ]))
+        return .object([
+            "ok": .bool(ok),
+            "exit_code": .number(Double(result.exitCode)),
+            "output": .string(result.output)
+        ])
+    }
+
+    private func sshTransferProfile(for surface: SurfaceID) throws -> SSHHostProfile {
+        try sshTransferProfileAndOutput(for: surface).profile
+    }
+
+    private func sshTransferProfileAndOutput(for surface: SurfaceID) throws -> (profile: SSHHostProfile, appendOutput: (String) -> Void) {
+        guard let surfaceObject = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
+        let appendOutput: (String) -> Void
+        if let terminal = surfaceObject as? TerminalSurface {
+            guard let terminalProfile = sshProfile(from: terminal.descriptor) else { throw LayoutError.surfaceNotFound }
+            return (terminalProfile, { terminal.appendSystemText($0) })
+        } else if let sshSurface = surfaceObject as? SSHTransferSurface, let transferProfile = sshSurface.sshTransferProfile {
+            appendOutput = { sshSurface.appendSystemText($0) }
+            return (transferProfile, appendOutput)
+        } else {
+            throw LayoutError.surfaceNotFound
+        }
+    }
+
+    private func runCommand(executable: String, arguments: [String], password: String?) throws -> (exitCode: Int32, output: String) {
+        let process = Process()
+        var expectScriptURL: URL?
+        if let password, !password.isEmpty, FileManager.default.fileExists(atPath: "/usr/bin/expect") {
+            let scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("remotecode-ssh-expect-\(UUID().uuidString).tcl")
+            try """
+            set timeout -1
+            set password $env(RC_SSH_PASSWORD)
+            spawn {*}$argv
+            expect {
+              -re {(?i)(password|passphrase).*:} { send -- "$password\\r"; exp_continue }
+              eof
+            }
+            catch wait result
+            exit [lindex $result 3]
+            """.write(to: scriptURL, atomically: true, encoding: .utf8)
+            expectScriptURL = scriptURL
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/expect")
+            process.arguments = [scriptURL.path, executable] + arguments
+            var environment = ProcessInfo.processInfo.environment
+            environment["RC_SSH_PASSWORD"] = password
+            process.environment = environment
+        } else {
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+        }
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        if let expectScriptURL { try? FileManager.default.removeItem(at: expectScriptURL) }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return (process.terminationStatus, output)
+    }
+
+    private func makeLocalSSHFileListing(path rawPath: String?) throws -> JSONValue {
+        let fm = FileManager.default
+        let fallback = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
+        let input = (rawPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? rawPath! : fallback
+        let path = ((input as NSString).expandingTildeInPath as NSString).standardizingPath
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+            throw JSONRPCError(code: -32602, message: "not a directory", data: .string(path))
+        }
+        let urls = try fm.contentsOfDirectory(at: URL(fileURLWithPath: path), includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey], options: [.skipsPackageDescendants])
+        var entries: [JSONValue] = []
+        if let parent = makeParentEntry(for: path) { entries.append(parent) }
+        let children = urls.map { url -> JSONValue in
+            makeLocalEntry(url)
+        }.sorted(by: sortSSHEntries)
+        return .object([
+            "path": .string(path),
+            "parent_path": path == "/" ? .null : .string((path as NSString).deletingLastPathComponent),
+            "entries": .array(entries + children)
+        ])
+    }
+
+    private func makeParentEntry(for path: String) -> JSONValue? {
+        guard path != "/" else { return nil }
+        return .object([
+            "name": .string(".."),
+            "path": .string((path as NSString).deletingLastPathComponent),
+            "kind": .string("directory"),
+            "size": .string(""),
+            "file_type": .string("File folder"),
+            "modified": .string("")
+        ])
+    }
+
+    private func makeLocalEntry(_ url: URL) -> JSONValue {
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+        let isDirectory = values?.isDirectory == true
+        let size = isDirectory ? "" : "\(values?.fileSize ?? 0)"
+        let modified = values?.contentModificationDate.map(Self.shortDateFormatter.string(from:)) ?? ""
+        let type = isDirectory ? "File folder" : fileType(for: url.lastPathComponent)
+        return .object([
+            "name": .string(url.lastPathComponent),
+            "path": .string(url.path),
+            "kind": .string(isDirectory ? "directory" : "file"),
+            "size": .string(size),
+            "file_type": .string(type),
+            "modified": .string(modified)
+        ])
+    }
+
+    private func makeRemoteSSHFileListing(output: String, requestedPath: String) -> JSONValue {
+        var lines = output
+            .replacingOccurrences(of: "\r", with: "")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        while let first = lines.first, !first.hasPrefix("/") {
+            lines.removeFirst()
+        }
+        let path = lines.isEmpty ? requestedPath : lines.removeFirst()
+        let entries = lines.compactMap { line -> JSONValue? in
+            let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 4 else { return nil }
+            let name = parts[0]
+            let kind = parts[1]
+            let child = name == ".." ? ((path as NSString).deletingLastPathComponent.isEmpty ? "/" : (path as NSString).deletingLastPathComponent)
+                : (path as NSString).appendingPathComponent(name)
+            return .object([
+                "name": .string(name),
+                "path": .string(child),
+                "kind": .string(kind),
+                "size": .string(parts[2]),
+                "file_type": .string(kind == "directory" ? "File folder" : fileType(for: name)),
+                "modified": .string(parts[3])
+            ])
+        }.sorted(by: sortSSHEntries)
+        return .object([
+            "path": .string(path),
+            "parent_path": path == "/" ? .null : .string((path as NSString).deletingLastPathComponent),
+            "entries": .array(entries)
+        ])
+    }
+
+    private func sortSSHEntries(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
+        let lo = lhs.objectValue ?? [:]
+        let ro = rhs.objectValue ?? [:]
+        let ln = lo["name"]?.stringValue ?? ""
+        let rn = ro["name"]?.stringValue ?? ""
+        if ln == ".." { return true }
+        if rn == ".." { return false }
+        let ld = lo["kind"]?.stringValue == "directory"
+        let rd = ro["kind"]?.stringValue == "directory"
+        if ld != rd { return ld && !rd }
+        return ln.localizedCaseInsensitiveCompare(rn) == .orderedAscending
+    }
+
+    private func fileType(for name: String) -> String {
+        let ext = (name as NSString).pathExtension
+        return ext.isEmpty ? "File" : "\(ext.uppercased()) File"
+    }
+
+    private static let shortDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        return formatter
+    }()
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func sshProfile(from desc: SurfaceDescriptor) -> SSHHostProfile? {
+        guard let destination = desc.metadata["ssh_destination"] else { return nil }
+        let id = desc.metadata["ssh_profile_id"].flatMap(UUID.init).map(SSHHostID.init) ?? SSHHostID()
+        let port = desc.metadata["ssh_port"].flatMap(Int.init)
+        let options = desc.metadata["ssh_options"]?
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        return SSHHostProfile(id: id, label: desc.metadata["ssh_label"] ?? desc.title, destination: destination, port: port, identityFile: desc.metadata["ssh_identity_file"], options: options)
     }
 
     static func summary(of payload: JSONValue) -> String {

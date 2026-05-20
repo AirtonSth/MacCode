@@ -188,6 +188,12 @@ private final class TerminalDropContainerView: NSView {
 /// directly interactive — no separate input field (cmux model).
 @MainActor
 public final class TerminalSurface: NSObject, Surface {
+    public enum Launch {
+        case shell(cwd: String)
+        case ssh(profile: SSHHostProfile, cwd: String)
+        case sshPlaceholder(cwd: String)
+    }
+
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     private let textView: TerminalTextView
@@ -197,13 +203,51 @@ public final class TerminalSurface: NSObject, Surface {
     private var readSource: DispatchSourceRead?
     private let renderer = ANSIRenderer(rows: 40, cols: 120)
     private var pendingFlush = false
+    private var savedSSHPassword: String?
+    private var didSendSavedSSHPassword = false
 
-    public init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
+    public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
+        try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
+    }
+
+    public init(workspaceID: WorkspaceID, title: String, launch: Launch) throws {
+        let cwd: String
+        let type: SurfaceType
+        var metadata: [String: String]
+        switch launch {
+        case .shell(let shellCwd):
+            cwd = shellCwd
+            type = .terminal
+            metadata = ["cwd": shellCwd, "workspace": workspaceID.value.uuidString]
+        case .ssh(let profile, let shellCwd):
+            cwd = shellCwd
+            type = .ssh
+            savedSSHPassword = profile.password
+            metadata = [
+                "cwd": shellCwd,
+                "workspace": workspaceID.value.uuidString,
+                "ssh_profile_id": profile.id.value.uuidString,
+                "ssh_destination": profile.destination,
+                "ssh_label": profile.label,
+                "ssh_status": "connecting"
+            ]
+            if let port = profile.port { metadata["ssh_port"] = String(port) }
+            if let identity = profile.identityFile { metadata["ssh_identity_file"] = identity }
+            if !profile.options.isEmpty { metadata["ssh_options"] = profile.options.joined(separator: "\n") }
+        case .sshPlaceholder(let shellCwd):
+            cwd = shellCwd
+            type = .ssh
+            metadata = [
+                "cwd": shellCwd,
+                "workspace": workspaceID.value.uuidString,
+                "ssh_status": "disconnected"
+            ]
+        }
         self.descriptor = SurfaceDescriptor(
-            type: .terminal,
+            type: type,
             title: title,
-            iconName: "terminal",
-            metadata: ["cwd": cwd, "workspace": workspaceID.value.uuidString]
+            iconName: type == .ssh ? "network" : "terminal",
+            metadata: metadata
         )
 
         let scroll = FilePathDropScrollView()
@@ -270,7 +314,11 @@ public final class TerminalSurface: NSObject, Surface {
             self?.writeToPTY(data)
         }
 
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        if case .sshPlaceholder = launch {
+            appendString("[ssh disconnected]\nSelect a saved SSH host or add a new one to connect.\n")
+            return
+        }
+
         var amaster: Int32 = -1
         let pid = rc2_forkpty(&amaster)
         if pid < 0 {
@@ -288,11 +336,25 @@ public final class TerminalSurface: NSObject, Surface {
             if getenv("LANG") == nil {
                 setenv("LANG", "en_US.UTF-8", 1)
             }
-            let shellName = (shell as NSString).lastPathComponent
-            shell.withCString { sPath in
-                ("-" + shellName).withCString { argv0 in
-                    let argv: [UnsafeMutablePointer<CChar>?] = [strdup(argv0), nil]
-                    _ = execv(sPath, argv)
+            switch launch {
+            case .shell:
+                let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+                let shellName = (shell as NSString).lastPathComponent
+                shell.withCString { sPath in
+                    ("-" + shellName).withCString { argv0 in
+                        let argv: [UnsafeMutablePointer<CChar>?] = [strdup(argv0), nil]
+                        _ = execv(sPath, argv)
+                    }
+                }
+            case .sshPlaceholder:
+                _exit(0)
+            case .ssh(let profile, _):
+                let args = ["ssh"] + SSHCommandBuilder.sshArguments(for: profile)
+                "/usr/bin/ssh".withCString { sPath in
+                    let argv = args.map { strdup($0) } + [nil]
+                    argv.withUnsafeBufferPointer { ptr in
+                        _ = execv(sPath, ptr.baseAddress)
+                    }
                 }
             }
             _exit(127)
@@ -319,6 +381,7 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func appendDataAsync(_ data: Data) {
         renderer.feed(data)
+        autoSubmitSavedSSHPasswordIfNeeded(from: data)
         descriptor.hasUnreadActivity = true
         // HC-1: stream raw PTY output to the mirror in real time.
         SurfaceOutputBus.shared.emit(descriptor.id, data)
@@ -350,7 +413,22 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
         renderer.feed(data)
+        SurfaceOutputBus.shared.emit(descriptor.id, data)
         scheduleFlush()
+    }
+
+    public func appendSystemText(_ raw: String) {
+        appendString(raw)
+    }
+
+    private func autoSubmitSavedSSHPasswordIfNeeded(from data: Data) {
+        guard !didSendSavedSSHPassword,
+              let savedSSHPassword,
+              !savedSSHPassword.isEmpty,
+              let raw = String(data: data, encoding: .utf8)?.lowercased(),
+              raw.contains("password:") || raw.contains("passphrase") else { return }
+        didSendSavedSSHPassword = true
+        sendText(savedSSHPassword + "\n")
     }
 
     private func writeToPTY(_ data: Data) {

@@ -131,6 +131,7 @@ public final class PaneTabsView: NSObject {
             target: self, action: #selector(showAddMenu(_:)))
         let addChoices: [(String, SurfaceType)] = [
             ("Terminal", .terminal),
+            ("SSH", .ssh),
             ("Browser", .browser),
             ("Agent App", .agentApp),
             ("Files", .files),
@@ -326,6 +327,7 @@ public final class PaneTabsView: NSObject {
     static func symbol(for type: SurfaceType) -> String {
         switch type {
         case .terminal: return "terminal"
+        case .ssh: return "network"
         case .browser: return "globe"
         case .agentApp: return "sparkles"
         case .files: return "folder"
@@ -357,6 +359,7 @@ public final class PaneTabsView: NSObject {
     /// Surfaces offered by the + and Split menus, in display order.
     static let surfaceChoices: [(String, SurfaceType)] = [
         ("Terminal", .terminal),
+        ("SSH", .ssh),
         ("Browser", .browser),
         ("Agent App", .agentApp),
         ("Files", .files),

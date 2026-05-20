@@ -583,14 +583,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     private func attachRootLayoutView(_ layoutView: NSView) {
-        layoutView.translatesAutoresizingMaskIntoConstraints = true
-        layoutView.frame = workspaceContent.bounds
-        layoutView.autoresizingMask = [.width, .height]
+        layoutView.translatesAutoresizingMaskIntoConstraints = false
 
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0
             ctx.allowsImplicitAnimation = false
             workspaceContent.addSubview(layoutView)
+            NSLayoutConstraint.activate([
+                layoutView.topAnchor.constraint(equalTo: workspaceContent.topAnchor),
+                layoutView.bottomAnchor.constraint(equalTo: workspaceContent.bottomAnchor),
+                layoutView.leadingAnchor.constraint(equalTo: workspaceContent.leadingAnchor),
+                layoutView.trailingAnchor.constraint(equalTo: workspaceContent.trailingAnchor)
+            ])
             layoutView.needsLayout = true
             layoutView.layoutSubtreeIfNeeded()
             if let split = layoutView as? RatioSplitView {

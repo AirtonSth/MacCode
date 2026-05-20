@@ -24,6 +24,12 @@ public struct SurfaceID: Hashable, Codable, Sendable, CustomStringConvertible {
     public var description: String { value.uuidString }
 }
 
+public struct SSHHostID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
 public struct AgentThreadID: Hashable, Codable, Sendable, CustomStringConvertible {
     public let value: UUID
     public init(_ value: UUID = UUID()) { self.value = value }

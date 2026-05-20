@@ -78,6 +78,77 @@ final class PaneActionTests: XCTestCase {
                       "the tab strip reads AgentAppSurface.isBusy, so running threads must turn the Agent App tab into a spinner")
     }
 
+    func test_sshSurfaceCreatesSavedHostSidebarInsteadOfDisconnectedTerminalPlaceholder() throws {
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ssh", cwd: NSTemporaryDirectory())
+
+        let desc = try router.createSurface(workspace: ws.id, type: .ssh, paneID: nil, title: "SSH")
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? SSHSurface)
+
+        XCTAssertEqual(surface.view.subviews.count, 5,
+                       "an SSH tab must render hosts, resize handle, terminal, and transfer sidebar chrome instead of a blank terminal placeholder")
+        XCTAssertNil(surface.sshTransferProfile,
+                     "a new SSH tab starts disconnected until a saved host row is selected")
+        XCTAssertEqual(surface.transferSidebarWidthForTesting, 0,
+                       "file transfer controls must stay out of the way until an SSH connection is active")
+        XCTAssertEqual(surface.snapshot()["ssh_status"], "disconnected")
+    }
+
+    func test_sshHostSidebarWidthPersistsGloballyAfterUserResize() throws {
+        UserDefaults.standard.removeObject(forKey: SSHSurface.hostSidebarWidthDefaultsKey)
+        defer { UserDefaults.standard.removeObject(forKey: SSHSurface.hostSidebarWidthDefaultsKey) }
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ssh-width", cwd: NSTemporaryDirectory())
+        let firstDesc = try router.createSurface(workspace: ws.id, type: .ssh, paneID: nil, title: "SSH")
+        let first = try XCTUnwrap(SurfaceRegistry.shared.surface(firstDesc.id) as? SSHSurface)
+
+        first.setHostSidebarWidthForTesting(376)
+        let secondDesc = try router.createSurface(workspace: ws.id, type: .ssh, paneID: nil, title: "SSH")
+        let second = try XCTUnwrap(SurfaceRegistry.shared.surface(secondDesc.id) as? SSHSurface)
+
+        XCTAssertEqual(second.hostSidebarWidthForTesting, 376, accuracy: 1,
+                       "after the user resizes the SSH hosts sidebar, later SSH tabs must restore the global width")
+    }
+
+    func test_sshOpenNewConnectionUsesCurrentSurfaceThenCreatesNewTabWhenActive() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ssh-new-connection", cwd: NSTemporaryDirectory())
+        let desc = try router.createSurface(workspace: ws.id, type: .ssh, paneID: nil, title: "SSH")
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? SSHSurface)
+        let host = try router.sshHostUpsert(SSHHostProfile(label: "Example SSH", destination: "example.invalid"))
+
+        surface.openNewConnectionForTesting(host)
+
+        var updated = try XCTUnwrap(ctx.state.workspaces[ws.id])
+        let paneID = try XCTUnwrap(updated.layout.paneIDs().first)
+        var pane = try XCTUnwrap(updated.layout.find(paneID: paneID))
+        XCTAssertEqual(pane.surfaces.count, 2,
+                       "the first open-new-connection starts in the existing disconnected SSH tab without adding a second tab")
+        XCTAssertEqual(surface.snapshot()["ssh_status"], "connected")
+        XCTAssertEqual(surface.sshTransferProfile?.id, host.id,
+                       "the connected host row must be highlighted in the existing SSH tab")
+        XCTAssertGreaterThan(surface.transferSidebarWidthForTesting, 0,
+                             "connecting through SSH must reveal the collapsible file-transfer sidebar")
+
+        surface.openNewConnectionForTesting(host)
+
+        updated = try XCTUnwrap(ctx.state.workspaces[ws.id])
+        pane = try XCTUnwrap(updated.layout.find(paneID: paneID))
+        XCTAssertEqual(pane.surfaces.count, 3,
+                       "when an SSH connection is already active, Open New Connection must create a new SSH tab")
+        XCTAssertEqual(pane.selectedSurfaceID, pane.surfaces.last?.id,
+                       "the new SSH tab should become the selected tab so it is visible immediately")
+        let newSurfaceID = try XCTUnwrap(pane.surfaces.last?.id)
+        let newSurface = try XCTUnwrap(SurfaceRegistry.shared.surface(newSurfaceID) as? SSHSurface)
+        XCTAssertEqual(newSurface.view.subviews.count, 5,
+                       "new active SSH connections must open the full SSH tab chrome with hosts, terminal, and transfer sidebar")
+        XCTAssertEqual(newSurface.sshTransferProfile?.id, host.id,
+                       "the connected host row must be highlighted in the newly opened SSH tab")
+        XCTAssertGreaterThan(newSurface.transferSidebarWidthForTesting, 0,
+                             "new active SSH tabs must also reveal the file-transfer sidebar")
+        XCTAssertEqual(newSurface.snapshot()["ssh_status"], "connected")
+    }
+
     func test_agentTabBusyRollsUpRunningThreadFromRepository() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "tab-repo-busy", cwd: NSTemporaryDirectory())

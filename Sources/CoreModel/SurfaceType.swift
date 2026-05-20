@@ -2,6 +2,7 @@ import Foundation
 
 public enum SurfaceType: String, Codable, Sendable, CaseIterable {
     case terminal
+    case ssh
     case browser
     case agentApp
     case files
