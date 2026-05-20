@@ -307,15 +307,15 @@ private struct FilesSurfaceRoot: View {
     @ObservedObject var model: FilesViewModel
     @AppStorage("files.sidebar.width.v2") private var sidebarWidth: Double = 260
     @State private var pathInput = ""
-    @State private var dragStartSidebarWidth: Double?
     @State private var confirmDiscard = false
 
     var body: some View {
         HStack(spacing: 0) {
             sidebar
                 .frame(width: sidebarWidth)
-            FilesSidebarResizeHandle()
-                .gesture(sidebarResizeGesture)
+            DSResizeDivider(axis: .vertical, help: "Resize file list") { delta in
+                sidebarWidth = min(560, max(240, sidebarWidth + Double(delta)))
+            }
             reader
                 .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -391,16 +391,6 @@ private struct FilesSurfaceRoot: View {
             relative = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         }
         model.loadDirectory(relative)
-    }
-
-    private var sidebarResizeGesture: some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                if dragStartSidebarWidth == nil { dragStartSidebarWidth = sidebarWidth }
-                let next = (dragStartSidebarWidth ?? sidebarWidth) + Double(value.translation.width)
-                sidebarWidth = min(560, max(240, next))
-            }
-            .onEnded { _ in dragStartSidebarWidth = nil }
     }
 
     private var reader: some View {
@@ -547,20 +537,6 @@ private struct FilesSurfaceRoot: View {
         case "code": return "chevron.left.forwardslash.chevron.right"
         default: return "doc"
         }
-    }
-}
-
-private struct FilesSidebarResizeHandle: View {
-    @State private var hovering = false
-
-    var body: some View {
-        Rectangle()
-            .fill(hovering ? DS.Palette.accent.opacity(0.45) : DS.Palette.line)
-            .frame(width: hovering ? 3 : 1)
-            .frame(width: 8)
-            .contentShape(Rectangle())
-            .onHover { hovering = $0 }
-            .help("Resize file list")
     }
 }
 

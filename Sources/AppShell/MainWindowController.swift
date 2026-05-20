@@ -925,7 +925,7 @@ final class RatioSplitView: NSView {
     var onRatiosChanged: (([CGFloat]) -> Void)?
     var isVertical = true { didSet { needsLayout = true } }
     var dividerStyle: NSSplitView.DividerStyle = .thin
-    var dividerThickness: CGFloat { 1 }
+    var dividerThickness: CGFloat { DS.ResizeDivider.thickness }
     private let collapsedRatioThreshold: CGFloat = 0.08
     private var collapsedExtent: CGFloat { isVertical ? 44 : 35 }
     private let dividerHitSlop: CGFloat = 6
@@ -933,6 +933,8 @@ final class RatioSplitView: NSView {
     private var dragDividerIndex: Int?
     private var dragStartPoint: NSPoint?
     private var dragStartRatios: [CGFloat] = []
+    private var dividerLayers: [CALayer] = []
+    private var dividerGripLayers: [CALayer] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -967,6 +969,7 @@ final class RatioSplitView: NSView {
         for index in 0..<(subviews.count - 1) {
             addCursorRect(dividerRect(afterSubviewAt: index), cursor: isVertical ? .resizeLeftRight : .resizeUpDown)
         }
+        layoutDividerLayers()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1107,6 +1110,7 @@ final class RatioSplitView: NSView {
                 y -= dt
             }
         }
+        layoutDividerLayers()
     }
 
     private func relayoutChild(_ child: NSView) {
@@ -1124,5 +1128,57 @@ final class RatioSplitView: NSView {
             if total > 0 { return ratios.map { $0 / total } }
         }
         return Array(repeating: 1.0 / CGFloat(max(count, 1)), count: count)
+    }
+
+    private func layoutDividerLayers() {
+        let count = max(0, subviews.count - 1)
+        ensureDividerLayers(count: count)
+        guard count > 0 else { return }
+        for index in 0..<count {
+            let dividerFrame: CGRect
+            if isVertical {
+                dividerFrame = CGRect(x: subviews[index].frame.maxX,
+                                      y: bounds.minY,
+                                      width: dividerThickness,
+                                      height: bounds.height)
+            } else {
+                dividerFrame = CGRect(x: bounds.minX,
+                                      y: subviews[index].frame.minY - dividerThickness,
+                                      width: bounds.width,
+                                      height: dividerThickness)
+            }
+            let divider = dividerLayers[index]
+            let grip = dividerGripLayers[index]
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            divider.frame = dividerFrame
+            grip.frame = CGRect(
+                x: (dividerFrame.width - (isVertical ? DS.ResizeDivider.gripThickness : DS.ResizeDivider.gripLength)) / 2,
+                y: (dividerFrame.height - (isVertical ? DS.ResizeDivider.gripLength : DS.ResizeDivider.gripThickness)) / 2,
+                width: isVertical ? DS.ResizeDivider.gripThickness : DS.ResizeDivider.gripLength,
+                height: isVertical ? DS.ResizeDivider.gripLength : DS.ResizeDivider.gripThickness
+            )
+            CATransaction.commit()
+        }
+    }
+
+    private func ensureDividerLayers(count: Int) {
+        while dividerLayers.count < count {
+            let divider = CALayer()
+            divider.backgroundColor = DS.NS.line.cgColor
+            divider.zPosition = 999
+            let grip = CALayer()
+            grip.backgroundColor = DS.NS.lineStrong.cgColor
+            grip.cornerRadius = DS.ResizeDivider.gripThickness / 2
+            grip.zPosition = 1_000
+            divider.addSublayer(grip)
+            layer?.addSublayer(divider)
+            dividerLayers.append(divider)
+            dividerGripLayers.append(grip)
+        }
+        while dividerLayers.count > count {
+            dividerLayers.removeLast().removeFromSuperlayer()
+            dividerGripLayers.removeLast()
+        }
     }
 }

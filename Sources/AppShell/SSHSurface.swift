@@ -17,8 +17,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private let cwd: String
     private weak var router: AppCommandRouter?
     private let terminalContainer = NSView()
-    private let hostResizeHandle = SSHSidebarResizeHandleView()
-    private let transferDivider = SSHSidebarResizeHandleView()
+    private let hostResizeHandle = DSResizeHandleView(axis: .vertical)
+    private let transferDivider = DSResizeHandleView(axis: .vertical)
     private let viewModel: SSHSurfaceViewModel
     private var sidebarWidthConstraint: NSLayoutConstraint?
     private var transferWidthConstraint: NSLayoutConstraint?
@@ -92,7 +92,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             hostResizeHandle.topAnchor.constraint(equalTo: root.topAnchor),
             hostResizeHandle.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             hostResizeHandle.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            hostResizeHandle.widthAnchor.constraint(equalToConstant: 7),
+            hostResizeHandle.widthAnchor.constraint(equalToConstant: DS.ResizeDivider.thickness),
 
             terminalContainer.topAnchor.constraint(equalTo: root.topAnchor),
             terminalContainer.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -184,7 +184,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func syncTransferSidebarWidth(animated: Bool) {
         let visible = viewModel.transferSidebarVisible
-        transferDividerWidthConstraint?.constant = visible ? 7 : 0
+        transferDividerWidthConstraint?.constant = visible ? DS.ResizeDivider.thickness : 0
         transferWidthConstraint?.constant = visible ? (viewModel.transferSidebarCollapsed ? 44 : Self.persistedTransferSidebarWidth()) : 0
         let changes = { self.view.layoutSubtreeIfNeeded() }
         if animated {
@@ -900,7 +900,7 @@ private struct SSHTransferSidebarView: View {
                     VStack(spacing: 0) {
                         splitPanes
                             .frame(height: panesHeight)
-                        SSHPanelResizeHandle(axis: .vertical, help: "Resize transfer queue") { delta in
+                        DSResizeDivider(axis: .horizontal, help: "Resize transfer queue") { delta in
                             queueHeight = min(max(queueHeight - delta, 112), max(112, contentProxy.size.height * 0.56))
                         }
                         queuePanel
@@ -933,7 +933,7 @@ private struct SSHTransferSidebarView: View {
                              transferTitle: "Upload",
                              transfer: { vm.uploadLocalSelection(anchor: $0) })
                     .frame(width: leftWidth)
-                SSHPanelResizeHandle(axis: .horizontal, help: "Resize local and remote panes") { delta in
+                DSResizeDivider(axis: .vertical, help: "Resize local and remote panes") { delta in
                     localPaneWidth = min(max(localPaneWidth + delta, minPane), maxLeft)
                 }
                 transferPane(title: "Remote site",
@@ -989,7 +989,7 @@ private struct SSHTransferSidebarView: View {
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             directoryTree(entries: entries, path: path.wrappedValue, open: open)
                 .frame(height: treeHeight)
-            SSHPanelResizeHandle(axis: .vertical, help: "Resize directory tree") { delta in
+            DSResizeDivider(axis: .horizontal, help: "Resize directory tree") { delta in
                 treeHeight = min(max(treeHeight + delta, 76), 240)
             }
             fileTable(entries: entries,
@@ -1217,42 +1217,6 @@ private struct SSHTransferSidebarView: View {
     }
 }
 
-private struct SSHPanelResizeHandle: View {
-    enum Axis {
-        case horizontal
-        case vertical
-    }
-
-    let axis: Axis
-    let help: String
-    let onDrag: (CGFloat) -> Void
-    @State private var lastTranslation: CGFloat = 0
-
-    var body: some View {
-        Rectangle()
-            .fill(DS.Palette.line.opacity(0.75))
-            .overlay {
-                Capsule()
-                    .fill(DS.Palette.lineStrong.opacity(0.9))
-                    .frame(width: axis == .horizontal ? 2 : 34,
-                           height: axis == .horizontal ? 34 : 2)
-            }
-            .frame(width: axis == .horizontal ? 8 : nil,
-                   height: axis == .vertical ? 8 : nil)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { value in
-                        let current = axis == .horizontal ? value.translation.width : value.translation.height
-                        onDrag(current - lastTranslation)
-                        lastTranslation = current
-                    }
-                    .onEnded { _ in lastTranslation = 0 }
-            )
-            .help(help)
-    }
-}
-
 private struct SSHResizableHeader: View {
     let title: String
     @Binding var width: CGFloat
@@ -1267,8 +1231,8 @@ private struct SSHResizableHeader: View {
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: alignment)
             Rectangle()
-                .fill(DS.Palette.lineStrong.opacity(0.7))
-                .frame(width: 1, height: 18)
+                .fill(DS.Palette.lineStrong.opacity(0.92))
+                .frame(width: DS.ResizeDivider.gripThickness, height: 18)
                 .padding(.horizontal, DS.Space.xs)
                 .contentShape(Rectangle())
                 .gesture(
@@ -1288,43 +1252,6 @@ private struct SSHResizableHeader: View {
         .padding(.horizontal, DS.Space.xs)
         .frame(height: 26)
         .background(DS.Palette.surfaceRaised.opacity(0.42))
-    }
-}
-
-private final class SSHSidebarResizeHandleView: NSView {
-    var onDrag: ((CGFloat, Bool) -> Void)?
-    private let grip = NSView()
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layer?.backgroundColor = DS.NS.line.cgColor
-        grip.translatesAutoresizingMaskIntoConstraints = false
-        grip.wantsLayer = true
-        grip.layer?.backgroundColor = DS.NS.lineStrong.cgColor
-        grip.layer?.cornerRadius = 1
-        addSubview(grip)
-        NSLayoutConstraint.activate([
-            grip.centerXAnchor.constraint(equalTo: centerXAnchor),
-            grip.centerYAnchor.constraint(equalTo: centerYAnchor),
-            grip.widthAnchor.constraint(equalToConstant: 2),
-            grip.heightAnchor.constraint(equalToConstant: 34)
-        ])
-        let recognizer = NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
-        addGestureRecognizer(recognizer)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .resizeLeftRight)
-    }
-
-    @objc private func handlePan(_ recognizer: NSPanGestureRecognizer) {
-        let delta = recognizer.translation(in: self).x
-        onDrag?(delta, recognizer.state == .ended || recognizer.state == .cancelled)
     }
 }
 

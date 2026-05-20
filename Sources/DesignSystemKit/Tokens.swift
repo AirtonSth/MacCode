@@ -109,6 +109,14 @@ public enum DS {
         public static let hairline: CGFloat = 1
     }
 
+    // MARK: Resize dividers
+
+    public enum ResizeDivider {
+        public static let thickness: CGFloat = 5
+        public static let gripThickness: CGFloat = 2
+        public static let gripLength: CGFloat = 28
+    }
+
     // MARK: Typography — constrained developer-tool scale
 
     public enum Font {

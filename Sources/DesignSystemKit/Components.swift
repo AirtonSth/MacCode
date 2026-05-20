@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Surface containers
 
@@ -176,5 +177,105 @@ public struct DSEmptyState: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.bg)
+    }
+}
+
+// MARK: - Resize dividers
+
+public enum DSResizeAxis {
+    /// A vertical divider between left/right panes. Drag delta is horizontal.
+    case vertical
+    /// A horizontal divider between top/bottom panes. Drag delta is vertical.
+    case horizontal
+
+    var cursor: NSCursor {
+        switch self {
+        case .vertical: return .resizeLeftRight
+        case .horizontal: return .resizeUpDown
+        }
+    }
+}
+
+public struct DSResizeDivider: View {
+    private let axis: DSResizeAxis
+    private let help: String
+    private let onDrag: ((CGFloat) -> Void)?
+    @State private var lastTranslation: CGFloat = 0
+
+    public init(axis: DSResizeAxis, help: String = "", onDrag: ((CGFloat) -> Void)? = nil) {
+        self.axis = axis
+        self.help = help
+        self.onDrag = onDrag
+    }
+
+    public var body: some View {
+        Rectangle()
+            .fill(DS.Palette.line.opacity(0.78))
+            .overlay {
+                Capsule()
+                    .fill(DS.Palette.lineStrong.opacity(0.92))
+                    .frame(width: axis == .vertical ? DS.ResizeDivider.gripThickness : DS.ResizeDivider.gripLength,
+                           height: axis == .vertical ? DS.ResizeDivider.gripLength : DS.ResizeDivider.gripThickness)
+            }
+            .frame(width: axis == .vertical ? DS.ResizeDivider.thickness : nil,
+                   height: axis == .horizontal ? DS.ResizeDivider.thickness : nil)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        guard let onDrag else { return }
+                        let current = axis == .vertical ? value.translation.width : value.translation.height
+                        onDrag(current - lastTranslation)
+                        lastTranslation = current
+                    }
+                    .onEnded { _ in lastTranslation = 0 }
+            )
+            .help(help)
+            .accessibilityLabel(help)
+    }
+}
+
+public final class DSResizeHandleView: NSView {
+    public var onDrag: ((CGFloat, Bool) -> Void)?
+    public let axis: DSResizeAxis
+    private let grip = NSView()
+
+    public init(axis: DSResizeAxis) {
+        self.axis = axis
+        super.init(frame: .zero)
+        configure()
+    }
+
+    public required init?(coder: NSCoder) {
+        self.axis = .vertical
+        super.init(coder: coder)
+        configure()
+    }
+
+    private func configure() {
+        wantsLayer = true
+        layer?.backgroundColor = DS.NS.line.cgColor
+        grip.translatesAutoresizingMaskIntoConstraints = false
+        grip.wantsLayer = true
+        grip.layer?.backgroundColor = DS.NS.lineStrong.cgColor
+        grip.layer?.cornerRadius = DS.ResizeDivider.gripThickness / 2
+        addSubview(grip)
+        NSLayoutConstraint.activate([
+            grip.centerXAnchor.constraint(equalTo: centerXAnchor),
+            grip.centerYAnchor.constraint(equalTo: centerYAnchor),
+            grip.widthAnchor.constraint(equalToConstant: axis == .vertical ? DS.ResizeDivider.gripThickness : DS.ResizeDivider.gripLength),
+            grip.heightAnchor.constraint(equalToConstant: axis == .vertical ? DS.ResizeDivider.gripLength : DS.ResizeDivider.gripThickness)
+        ])
+        addGestureRecognizer(NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:))))
+    }
+
+    public override func resetCursorRects() {
+        addCursorRect(bounds, cursor: axis.cursor)
+    }
+
+    @objc private func handlePan(_ recognizer: NSPanGestureRecognizer) {
+        let translation = recognizer.translation(in: self)
+        let delta = axis == .vertical ? translation.x : translation.y
+        onDrag?(delta, recognizer.state == .ended || recognizer.state == .cancelled)
     }
 }
