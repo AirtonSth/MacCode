@@ -17,18 +17,39 @@ public enum AgentRunError: Error, CustomStringConvertible {
 
 public enum ProcessLocator {
     public static func resolve(_ name: String) -> String? {
+        resolve(name,
+                environmentPath: ProcessInfo.processInfo.environment["PATH"],
+                homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
+    public static func resolve(_ name: String, environmentPath: String?, homeDirectory: String) -> String? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.contains("/") {
             let expanded = (trimmed as NSString).expandingTildeInPath
             return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
         }
-        // search PATH
-        let envPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
-        for component in envPath.split(separator: ":") {
-            let full = String(component) + "/" + trimmed
+        for component in searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory) {
+            let full = component + "/" + trimmed
             if FileManager.default.isExecutableFile(atPath: full) { return full }
         }
         return nil
+    }
+
+    private static func searchPath(environmentPath: String?, homeDirectory: String) -> [String] {
+        var paths = (environmentPath ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        paths.append(contentsOf: [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "\(homeDirectory)/.local/bin",
+            "\(homeDirectory)/.npm-global/bin",
+            "\(homeDirectory)/.bun/bin",
+            "/usr/bin",
+            "/bin"
+        ])
+        var seen = Set<String>()
+        return paths.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 }
 
