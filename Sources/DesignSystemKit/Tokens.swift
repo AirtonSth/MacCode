@@ -30,6 +30,8 @@ public enum DS {
         // Brand / semantic accents
         public static let accent      = Color(hex: 0x7CC7FF)
         public static let onAccent    = Color(hex: 0x0A0E13)
+        public static let splitPreviewFill = Color(hex: 0x0099FB).opacity(0.34)
+        public static let splitPreviewStroke = Color(hex: 0x0099FB)
         public static let success     = Color(hex: 0x8EE6A8)
         public static let warning     = Color(hex: 0xFFD37A)
         public static let danger      = Color(hex: 0xFF8F8F)
@@ -54,6 +56,8 @@ public enum DS {
         public static let textTertiary  = NSColor(hex: 0x6B7785)
         public static let accent        = NSColor(hex: 0x7CC7FF)
         public static let onAccent      = NSColor(hex: 0x0A0E13)
+        public static let splitPreviewFill = NSColor(hex: 0x0099FB).withAlphaComponent(0.34)
+        public static let splitPreviewStroke = NSColor(hex: 0x0099FB)
         public static let success       = NSColor(hex: 0x8EE6A8)
         public static let warning       = NSColor(hex: 0xFFD37A)
         public static let danger        = NSColor(hex: 0xFF8F8F)

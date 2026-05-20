@@ -840,9 +840,9 @@ final class PaneTabButton: NSView {
             Self.highlight(tab: nil, strip: strip)
             return
         }
-        if splitDirection(for: hit, contentPoint: point, in: contentView) != nil,
+        if let direction = splitDirection(for: hit, contentPoint: point, in: contentView),
            let root = enclosingView(from: self, as: PaneRootView.self) {
-            Self.highlight(tab: nil, strip: nil, splitRoot: root)
+            Self.highlight(tab: nil, strip: nil, splitRoot: root, splitDirection: direction)
             return
         }
         Self.clearDragFeedback()
@@ -866,7 +866,7 @@ final class PaneTabButton: NSView {
         Self.dragGhost?.move(near: point, in: contentView.bounds)
     }
 
-    private static func highlight(tab: PaneTabButton?, strip: PaneTabDropStack?, splitRoot: PaneRootView? = nil) {
+    private static func highlight(tab: PaneTabButton?, strip: PaneTabDropStack?, splitRoot: PaneRootView? = nil, splitDirection: SplitDirection? = nil) {
         if highlightedTab !== tab {
             highlightedTab?.setDropHighlighted(false)
             highlightedTab = tab
@@ -880,7 +880,9 @@ final class PaneTabButton: NSView {
         if highlightedSplitRoot !== splitRoot {
             highlightedSplitRoot?.setSplitDropHighlighted(false)
             highlightedSplitRoot = splitRoot
-            highlightedSplitRoot?.setSplitDropHighlighted(true)
+            highlightedSplitRoot?.setSplitDropHighlighted(splitRoot != nil, direction: splitDirection)
+        } else if splitRoot != nil {
+            highlightedSplitRoot?.setSplitDropHighlighted(true, direction: splitDirection)
         }
     }
 
@@ -1010,6 +1012,20 @@ class NoDragView: NSView {
 }
 
 final class PaneRootView: NoDragView {
+    static let splitDropOverlayLayerName = "split-drop-preview"
+    private let splitDropOverlay = CALayer()
+    private var splitDropDirection: SplitDirection?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureSplitDropOverlay()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureSplitDropOverlay()
+    }
+
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         needsUpdateConstraints = true
@@ -1018,9 +1034,51 @@ final class PaneRootView: NoDragView {
         layoutSubtreeIfNeeded()
     }
 
-    func setSplitDropHighlighted(_ active: Bool) {
-        layer?.borderColor = active ? DS.NS.accent.cgColor : NSColor.clear.cgColor
-        layer?.borderWidth = active ? 2 : 0
+    override func layout() {
+        super.layout()
+        splitDropOverlay.frame = splitDropPreviewFrame(in: bounds, direction: splitDropDirection)
+    }
+
+    func setSplitDropHighlighted(_ active: Bool, direction: SplitDirection? = nil) {
+        if splitDropOverlay.superlayer == nil {
+            configureSplitDropOverlay()
+        }
+        splitDropDirection = active ? direction : nil
+        splitDropOverlay.isHidden = !active
+        splitDropOverlay.backgroundColor = DS.NS.splitPreviewFill.cgColor
+        splitDropOverlay.borderColor = DS.NS.splitPreviewStroke.cgColor
+        splitDropOverlay.borderWidth = active ? 2 : 0
+        splitDropOverlay.frame = splitDropPreviewFrame(in: bounds, direction: splitDropDirection)
+    }
+
+    private func configureSplitDropOverlay() {
+        wantsLayer = true
+        splitDropOverlay.name = Self.splitDropOverlayLayerName
+        splitDropOverlay.backgroundColor = DS.NS.splitPreviewFill.cgColor
+        splitDropOverlay.borderColor = DS.NS.splitPreviewStroke.cgColor
+        splitDropOverlay.borderWidth = 0
+        splitDropOverlay.cornerRadius = 6
+        splitDropOverlay.zPosition = 1_000
+        splitDropOverlay.isHidden = true
+        splitDropOverlay.masksToBounds = true
+        layer?.addSublayer(splitDropOverlay)
+    }
+
+    private func splitDropPreviewFrame(in bounds: NSRect, direction: SplitDirection?) -> NSRect {
+        let target: NSRect
+        switch direction {
+        case .left:
+            target = NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width / 2, height: bounds.height)
+        case .right:
+            target = NSRect(x: bounds.midX, y: bounds.minY, width: bounds.width / 2, height: bounds.height)
+        case .up:
+            target = NSRect(x: bounds.minX, y: bounds.midY, width: bounds.width, height: bounds.height / 2)
+        case .down:
+            target = NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: bounds.height / 2)
+        case nil:
+            target = bounds
+        }
+        return target.insetBy(dx: 2, dy: 2)
     }
 }
 

@@ -1,5 +1,6 @@
 import XCTest
 import CoreModel
+import DesignSystemKit
 @testable import AppShell
 
 /// Drop-position math for drag-to-reorder tabs. The returned index is
@@ -65,5 +66,29 @@ final class TabDragTests: XCTestCase {
                        "dragging a tab toward the bottom of its pane should create a stacked split")
         XCTAssertNil(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 120, y: 240)),
                      "the normal tab area must keep selecting/reordering instead of unexpectedly splitting")
+    }
+
+    func test_splitDropPreview_usesCmuxBluePaneOverlay() {
+        let root = PaneRootView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+
+        root.setSplitDropHighlighted(true, direction: .right)
+        root.layoutSubtreeIfNeeded()
+
+        let overlay = root.layer?.sublayers?.first { $0.name == PaneRootView.splitDropOverlayLayerName }
+        XCTAssertNotNil(overlay, "split preview must be a real overlay above pane content, not only a border behind it")
+        XCTAssertFalse(overlay?.isHidden ?? true)
+        XCTAssertEqual(overlay?.frame, NSRect(x: 202, y: 2, width: 196, height: 296),
+                       "side split preview must turn exactly the future right pane blue, matching cmux")
+        XCTAssertEqual(NSColor(cgColor: overlay?.borderColor ?? CGColor.clear), DS.NS.splitPreviewStroke,
+                       "split preview stroke must use the cmux/system blue, not the lighter app accent")
+        XCTAssertEqual(overlay?.borderWidth, 2)
+
+        root.setSplitDropHighlighted(true, direction: .down)
+        XCTAssertEqual(overlay?.frame, NSRect(x: 2, y: 2, width: 396, height: 146),
+                       "down split preview must turn exactly the future lower pane blue, matching cmux")
+
+        root.setSplitDropHighlighted(false)
+        XCTAssertTrue(overlay?.isHidden ?? false,
+                      "ending a drag must remove the blue preview without leaving stale pane chrome")
     }
 }
