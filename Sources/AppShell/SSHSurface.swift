@@ -71,7 +71,6 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
         transferDivider.translatesAutoresizingMaskIntoConstraints = false
         transferDivider.wantsLayer = true
-        transferDivider.layer?.backgroundColor = DS.NS.line.cgColor
 
         root.addSubview(sidebar)
         root.addSubview(hostResizeHandle)
@@ -1294,11 +1293,23 @@ private struct SSHResizableHeader: View {
 
 private final class SSHSidebarResizeHandleView: NSView {
     var onDrag: ((CGFloat, Bool) -> Void)?
+    private let grip = NSView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.backgroundColor = DS.NS.line.cgColor
+        grip.translatesAutoresizingMaskIntoConstraints = false
+        grip.wantsLayer = true
+        grip.layer?.backgroundColor = DS.NS.lineStrong.cgColor
+        grip.layer?.cornerRadius = 1
+        addSubview(grip)
+        NSLayoutConstraint.activate([
+            grip.centerXAnchor.constraint(equalTo: centerXAnchor),
+            grip.centerYAnchor.constraint(equalTo: centerYAnchor),
+            grip.widthAnchor.constraint(equalToConstant: 2),
+            grip.heightAnchor.constraint(equalToConstant: 34)
+        ])
         let recognizer = NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         addGestureRecognizer(recognizer)
     }
