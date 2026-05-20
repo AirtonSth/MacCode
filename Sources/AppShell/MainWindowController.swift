@@ -288,7 +288,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {
+            self.window.contentView?.layoutSubtreeIfNeeded()
             self.split.setPosition(self.sidebarWidth, ofDividerAt: 0)
+            self.split.layoutSubtreeIfNeeded()
             self.didApplyInitialSidebarWidth = true
         }
     }
