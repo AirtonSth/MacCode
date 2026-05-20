@@ -156,6 +156,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private let collapsedSidebarButton = NoDragButton(frame: .zero)
     private let visibleWorkspaceHeader = NoDragView()
     private let visibleWorkspaceLabel = NSTextField(labelWithString: "")
+    private let visibleNewWindowButton = NoDragButton(frame: .zero)
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode")
     /// Retains the live pane controllers; their @objc button and tab
@@ -351,6 +352,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             visibleWorkspaceLabel.alignment = .center
             visibleWorkspaceLabel.lineBreakMode = .byTruncatingTail
             visibleWorkspaceLabel.translatesAutoresizingMaskIntoConstraints = false
+            configureHeaderButton(
+                visibleNewWindowButton,
+                symbol: "rectangle.on.rectangle",
+                help: "Open in New Window",
+                action: #selector(openSelectedWorkspaceInNewWindow)
+            )
 
             let divider = NSView()
             divider.wantsLayer = true
@@ -358,12 +365,15 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             divider.translatesAutoresizingMaskIntoConstraints = false
 
             visibleWorkspaceHeader.addSubview(visibleWorkspaceLabel)
+            visibleWorkspaceHeader.addSubview(visibleNewWindowButton)
             visibleWorkspaceHeader.addSubview(divider)
             NSLayoutConstraint.activate([
                 visibleWorkspaceLabel.centerXAnchor.constraint(equalTo: visibleWorkspaceHeader.centerXAnchor),
                 visibleWorkspaceLabel.centerYAnchor.constraint(equalTo: visibleWorkspaceHeader.centerYAnchor),
                 visibleWorkspaceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: visibleWorkspaceHeader.leadingAnchor, constant: DS.Space.lg),
-                visibleWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: visibleWorkspaceHeader.trailingAnchor, constant: -DS.Space.lg),
+                visibleWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: visibleNewWindowButton.leadingAnchor, constant: -DS.Space.sm),
+                visibleNewWindowButton.trailingAnchor.constraint(equalTo: visibleWorkspaceHeader.trailingAnchor, constant: -DS.Space.sm),
+                visibleNewWindowButton.centerYAnchor.constraint(equalTo: visibleWorkspaceHeader.centerYAnchor),
                 divider.leadingAnchor.constraint(equalTo: visibleWorkspaceHeader.leadingAnchor),
                 divider.trailingAnchor.constraint(equalTo: visibleWorkspaceHeader.trailingAnchor),
                 divider.bottomAnchor.constraint(equalTo: visibleWorkspaceHeader.bottomAnchor),
@@ -397,10 +407,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	              let ws = ctx.state.workspaces[wid] else {
 	            collapsedWorkspaceLabel.stringValue = "RemoteCode"
 	            visibleWorkspaceLabel.stringValue = "RemoteCode"
+                visibleNewWindowButton.isHidden = true
 	            return
 	        }
 	        collapsedWorkspaceLabel.stringValue = ws.name
 	        visibleWorkspaceLabel.stringValue = ws.name
+            visibleNewWindowButton.isHidden = isWorkspaceOpenInNewWindow(wid)
 	    }
 
 	    @objc private func newWorkspace() {
@@ -411,6 +423,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
 	            _ = try? router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
 	        }
 	    }
+
+        @objc private func openSelectedWorkspaceInNewWindow() {
+            guard let wid = context?.state.window.selectedWorkspaceID,
+                  !isWorkspaceOpenInNewWindow(wid) else { return }
+            openWorkspaceInNewWindow(wid)
+        }
 
     public func refreshFromState() {
         let focusedInput = protectedFocusedView()
@@ -501,6 +519,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             onClose: { [weak self] in self?.workspaceWindowClosed(workspaceID) }
         )
         workspaceWindows[workspaceID] = controller
+        updateCollapsedWorkspaceHeader()
         controller.show()
     }
 

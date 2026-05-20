@@ -401,6 +401,8 @@ final class PaneActionTests: XCTestCase {
 
         XCTAssertFalse(visibleTooltips.contains("New workspace"),
                        "when the sidebar is visible, workspace creation belongs in the sidebar row, not a global + button")
+        XCTAssertTrue(visibleTooltips.contains("Open in New Window"),
+                      "attached workspaces need a header affordance to detach the current workspace")
 
         let titleLabels = visibleSubviews(of: content).compactMap { $0 as? NSTextField }
             .filter { $0.stringValue == "visible" }
@@ -418,6 +420,22 @@ final class PaneActionTests: XCTestCase {
         let rootFrame = rootPane.convert(rootPane.bounds, to: content)
         XCTAssertLessThanOrEqual(rootFrame.maxY, content.bounds.maxY - 33,
                                  "visible-sidebar mode keeps tabs below the right-side title band")
+    }
+
+    func test_visibleSidebar_hidesOpenInNewWindowButtonForDetachedWorkspace() throws {
+        let (ctx, router) = try makeContext()
+        let workspace = try router.createWorkspace(name: "detached", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.openWorkspaceInNewWindow(workspace.id)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        defer { controller.workspaceWindow(for: workspace.id)?.orderOut(nil) }
+
+        let content = try XCTUnwrap(controller.window.contentView)
+        let visibleTooltips = visibleSubviews(of: content)
+            .compactMap { ($0 as? NSButton)?.toolTip }
+
+        XCTAssertFalse(visibleTooltips.contains("Open in New Window"),
+                       "a workspace that is already detached must not offer a duplicate detached-window action")
     }
 
     func test_sidebarViewModel_listsWindowWorkspacesAndSelectedWorkspaceForSidebarBody() throws {
