@@ -142,7 +142,7 @@ public extension Notification.Name {
 }
 
 @MainActor
-public final class MainWindowController: NSObject, NSWindowDelegate {
+public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitViewDelegate {
     public let window: NSWindow
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
@@ -164,7 +164,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     private var paneControllers: [PaneTabsView] = []
     private var sidebarCollapsed = false
     private var sidebarWidth: CGFloat = 260
-    private var sidebarWidthConstraint: NSLayoutConstraint?
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -237,6 +236,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
         content.translatesAutoresizingMaskIntoConstraints = false
         split.isVertical = true
         split.dividerStyle = .thin
+        split.delegate = self
         split.translatesAutoresizingMaskIntoConstraints = false
         sidebar.view.translatesAutoresizingMaskIntoConstraints = false
         workspaceContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -281,10 +281,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             collapsedWorkspaceHeader.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             collapsedWorkspaceHeader.heightAnchor.constraint(equalToConstant: collapsedHeaderHeight)
         ])
-        let fixedSidebarWidth = sidebar.view.widthAnchor.constraint(equalToConstant: sidebarWidth)
-        fixedSidebarWidth.priority = .defaultHigh
-        fixedSidebarWidth.isActive = true
-        sidebarWidthConstraint = fixedSidebarWidth
         window.contentView = content
         // give sidebar a default size
         DispatchQueue.main.async {
@@ -652,6 +648,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
             split.isVertical = (s.orientation == .horizontal)
             split.dividerStyle = .thin
             split.ratios = s.ratios.map { CGFloat($0) }
+            let splitID = s.id
+            if let wid = context?.state.window.selectedWorkspaceID {
+                split.onRatiosChanged = { [weak self] ratios in
+                    try? self?.router?.paneResize(workspace: wid, splitID: splitID, ratios: ratios.map(Double.init))
+                }
+            }
             for (index, child) in s.children.enumerated() {
                 let childSplitContext = PaneSplitContext(splitID: s.id, paneIndex: index, ratios: s.ratios, orientation: s.orientation)
                 let cv = buildLayoutView(node: child, primaryControlsAvailable: &primaryControlsAvailable, splitContext: childSplitContext)
@@ -678,6 +680,28 @@ public final class MainWindowController: NSObject, NSWindowDelegate {
     // MARK: NSWindowDelegate
     public func windowWillClose(_ notification: Notification) {
         context?.saveSnapshot()
+    }
+
+    // MARK: NSSplitViewDelegate
+    public func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        guard splitView === split, dividerIndex == 0 else { return proposedMinimumPosition }
+        return 180
+    }
+
+    public func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        guard splitView === split, dividerIndex == 0 else { return proposedMaximumPosition }
+        return max(220, splitView.bounds.width - 520)
+    }
+
+    public func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        false
+    }
+
+    public func splitViewDidResizeSubviews(_ notification: Notification) {
+        guard let splitView = notification.object as? NSSplitView,
+              splitView === split,
+              !sidebarCollapsed else { return }
+        sidebarWidth = sidebar.view.frame.width
     }
 }
 
@@ -839,6 +863,11 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
             split.isVertical = (splitNode.orientation == .horizontal)
             split.dividerStyle = .thin
             split.ratios = splitNode.ratios.map { CGFloat($0) }
+            let splitID = splitNode.id
+            split.onRatiosChanged = { [weak self] ratios in
+                guard let self else { return }
+                try? self.router?.paneResize(workspace: self.workspaceID, splitID: splitID, ratios: ratios.map(Double.init))
+            }
             for (index, child) in splitNode.children.enumerated() {
                 let childSplitContext = PaneSplitContext(splitID: splitNode.id, paneIndex: index, ratios: splitNode.ratios, orientation: splitNode.orientation)
                 let childView = buildLayoutView(node: child, primaryControlsAvailable: &primaryControlsAvailable, splitContext: childSplitContext)
@@ -874,11 +903,17 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
 /// on live resize too.
 final class RatioSplitView: NSView {
     var ratios: [CGFloat] = []
+    var onRatiosChanged: (([CGFloat]) -> Void)?
     var isVertical = true { didSet { needsLayout = true } }
     var dividerStyle: NSSplitView.DividerStyle = .thin
     var dividerThickness: CGFloat { 1 }
     private let collapsedRatioThreshold: CGFloat = 0.08
     private var collapsedExtent: CGFloat { isVertical ? 44 : 35 }
+    private let dividerHitSlop: CGFloat = 6
+    private let minimumDragRatio: CGFloat = 0.08
+    private var dragDividerIndex: Int?
+    private var dragStartPoint: NSPoint?
+    private var dragStartRatios: [CGFloat] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -907,17 +942,103 @@ final class RatioSplitView: NSView {
         layoutByRatios()
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard subviews.count > 1 else { return }
+        for index in 0..<(subviews.count - 1) {
+            addCursorRect(dividerRect(afterSubviewAt: index), cursor: isVertical ? .resizeLeftRight : .resizeUpDown)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let index = dividerIndex(at: point) else {
+            super.mouseDown(with: event)
+            return
+        }
+        dragDividerIndex = index
+        dragStartPoint = point
+        dragStartRatios = normalizedRatios(for: subviews.count)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let index = dragDividerIndex,
+              let start = dragStartPoint else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        let delta = isVertical ? point.x - start.x : start.y - point.y
+        applyDividerDrag(dividerIndex: index, delta: delta)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if dragDividerIndex != nil {
+            onRatiosChanged?(ratios)
+        }
+        dragDividerIndex = nil
+        dragStartPoint = nil
+        dragStartRatios = []
+        super.mouseUp(with: event)
+    }
+
+    func applyDividerDrag(dividerIndex: Int, delta: CGFloat) {
+        let n = subviews.count
+        guard n > 1,
+              dividerIndex >= 0,
+              dividerIndex < n - 1 else { return }
+
+        let base = dragStartRatios.count == n ? dragStartRatios : normalizedRatios(for: n)
+        let extent = max(1, (isVertical ? bounds.width : bounds.height) - dividerThickness * CGFloat(n - 1))
+        let ratioDelta = delta / extent
+        var next = base
+        let first = max(minimumDragRatio, min(1 - minimumDragRatio, base[dividerIndex] + ratioDelta))
+        let pairTotal = base[dividerIndex] + base[dividerIndex + 1]
+        let second = pairTotal - first
+        guard second >= minimumDragRatio else {
+            next[dividerIndex] = pairTotal - minimumDragRatio
+            next[dividerIndex + 1] = minimumDragRatio
+            ratios = SplitNode.normalize(next.map(Double.init)).map { CGFloat($0) }
+            layoutByRatios()
+            return
+        }
+        next[dividerIndex] = first
+        next[dividerIndex + 1] = second
+        ratios = SplitNode.normalize(next.map(Double.init)).map { CGFloat($0) }
+        layoutByRatios()
+    }
+
+    private func dividerIndex(at point: NSPoint) -> Int? {
+        guard subviews.count > 1 else { return nil }
+        for index in 0..<(subviews.count - 1) where dividerRect(afterSubviewAt: index).contains(point) {
+            return index
+        }
+        return nil
+    }
+
+    private func dividerRect(afterSubviewAt index: Int) -> NSRect {
+        let frame = subviews[index].frame
+        if isVertical {
+            return NSRect(
+                x: frame.maxX - dividerHitSlop,
+                y: bounds.minY,
+                width: dividerHitSlop * 2 + dividerThickness,
+                height: bounds.height
+            )
+        }
+        return NSRect(
+            x: bounds.minX,
+            y: frame.minY - dividerHitSlop - dividerThickness,
+            width: bounds.width,
+            height: dividerHitSlop * 2 + dividerThickness
+        )
+    }
+
     private func layoutByRatios() {
         let n = subviews.count
         guard n >= 1, bounds.width > 0, bounds.height > 0 else { return }
         let dt = dividerThickness
-        let norm: [CGFloat] = {
-            if ratios.count == n {
-                let total = ratios.reduce(0, +)
-                if total > 0 { return ratios.map { $0 / total } }
-            }
-            return Array(repeating: 1.0 / CGFloat(n), count: n)
-        }()
+        let norm = normalizedRatios(for: n)
 
         let collapsed = Set(norm.indices.filter { norm[$0] <= collapsedRatioThreshold && n > 1 })
 
@@ -976,5 +1097,13 @@ final class RatioSplitView: NSView {
         } else {
             child.layoutSubtreeIfNeeded()
         }
+    }
+
+    private func normalizedRatios(for count: Int) -> [CGFloat] {
+        if ratios.count == count {
+            let total = ratios.reduce(0, +)
+            if total > 0 { return ratios.map { $0 / total } }
+        }
+        return Array(repeating: 1.0 / CGFloat(max(count, 1)), count: count)
     }
 }

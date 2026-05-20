@@ -127,4 +127,34 @@ final class RatioSplitTests: XCTestCase {
                        "a minimized side-by-side split pane should become a compact restore rail, not a wide empty column")
         XCTAssertGreaterThan(sv.subviews[1].frame.width, 550)
     }
+
+    func test_ratioSplitView_draggingDividerChangesPersistedRatiosAndFrames() {
+        let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        sv.isVertical = true
+        sv.ratios = [0.5, 0.5]
+        sv.addSubview(NSView())
+        sv.addSubview(NSView())
+
+        sv.adjustSubviews()
+        sv.applyDividerDrag(dividerIndex: 0, delta: 120)
+
+        XCTAssertEqual(sv.ratios[0], 0.7, accuracy: 0.01,
+                       "dragging the divider right must make the left pane wider instead of leaving a fixed 50/50 split")
+        XCTAssertEqual(sv.ratios[1], 0.3, accuracy: 0.01)
+        XCTAssertGreaterThan(sv.subviews[0].frame.width, sv.subviews[1].frame.width)
+    }
+
+    func test_ratioSplitView_draggingStackedDividerChangesTopAndBottomHeights() {
+        let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 300, height: 500))
+        sv.isVertical = false
+        sv.ratios = [0.5, 0.5]
+        sv.addSubview(NSView())
+        sv.addSubview(NSView())
+
+        sv.adjustSubviews()
+        sv.applyDividerDrag(dividerIndex: 0, delta: 100)
+
+        XCTAssertGreaterThan(sv.subviews[0].frame.height, sv.subviews[1].frame.height,
+                             "dragging a stacked divider down must resize the top and bottom panels, not only move a visual line")
+    }
 }

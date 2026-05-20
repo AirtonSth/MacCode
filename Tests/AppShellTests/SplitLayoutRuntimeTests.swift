@@ -12,6 +12,12 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         return nil
     }
 
+    private func findRootSplit(_ v: NSView) -> NSSplitView? {
+        if let s = v as? NSSplitView { return s }
+        for sub in v.subviews { if let f = findRootSplit(sub) { return f } }
+        return nil
+    }
+
     private func makeWindowController() throws -> (AppContext, AppCommandRouter, MainWindowController) {
         let dir = NSTemporaryDirectory() + "RC2Split-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -60,5 +66,19 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         let h1 = split.subviews[1].frame.height
         XCTAssertGreaterThan(h0, 0)
         XCTAssertEqual(h0, h1, accuracy: 1.5, "stacked panes must each be 50% height")
+    }
+
+    func test_sidebarDividerCanResizeWorkspaceList() throws {
+        let (ctx, _, wc) = try makeWindowController()
+        _ = ctx
+        wc.window.setContentSize(NSSize(width: 1200, height: 800))
+        wc.window.contentView?.layoutSubtreeIfNeeded()
+        let split = try XCTUnwrap(findRootSplit(wc.window.contentView!))
+
+        split.setPosition(340, ofDividerAt: 0)
+        split.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(split.subviews.first?.frame.width ?? 0, 340, accuracy: 2,
+                       "the workspace sidebar divider must be resizable; a fixed sidebar width makes the user drag do nothing")
     }
 }
