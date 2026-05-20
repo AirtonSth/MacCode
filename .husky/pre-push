@@ -1,5 +1,0 @@
-#!/usr/bin/env sh
-
-bun run lint
-bun run typecheck
-bun run test:quick

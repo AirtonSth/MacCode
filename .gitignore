@@ -1,49 +1,15 @@
-# dependencies
-node_modules/
-**/node_modules/
-
-# build outputs
+.build/
+.swiftpm/
+.references/
 dist/
-build/
-**/dist/
-**/build/
-desktop/playwright-e2e/artifacts/
-desktop/artifacts/
-
-# Expo
-.expo/
-**/.expo/
-web-build/
-**/web-build/
-.metro-health-check*
-expo-env.d.ts
-
-# native generated
-android/
-ios/
-**/android/
-**/ios/
-
-# logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.openlogs/
-
-# environment files
-.env
-.env.local
-.env.*.local
-desktop/.secrets/
-mobile/GoogleService-Info.plist
-mobile/google-services.json
-*.keystore
-
-# Bun
-bun.lockb
-
-# system
+artifacts/
+Package.resolved
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
 .DS_Store
-.remotecode
-REVENUECAT.md
-EVENUECAT.md
+*.dmg
+.idea/
+.vscode/
+fixtures.sqlite*
+*.log

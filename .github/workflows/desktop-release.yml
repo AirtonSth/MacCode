@@ -2,190 +2,157 @@ name: Desktop Build & Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
       - "[0-9]*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version override (e.g. 1.2.0). Defaults to desktop/package.json version."
+        description: "Version override (e.g. 2.0.0). Defaults to VERSION."
         required: false
 
 permissions:
   contents: write
 
+env:
+  APP_NAME: RemoteCode
+  BUNDLE_ID: io.remotecode.desktop
+
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            label: macOS-arm64
-            core-tarball: darwin-arm64
-            core-dist: dist-macos-arm64
-          - runner: ubuntu-latest
-            label: Linux-x64
-            core-tarball: linux-x64
-            core-dist: dist-linux-x64
-          - runner: windows-latest
-            label: Windows-x64
-            core-tarball: win-x64
-            core-dist: dist-win-x64
-
-    name: Build (${{ matrix.label }})
-    runs-on: ${{ matrix.runner }}
+    name: Build macOS
+    runs-on: macos-14
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install dependencies
-        shell: bash
+      - name: Show toolchain
         run: |
-          # --ignore-scripts avoids running postinstall shell scripts (Expo/mobile)
-          # that fail on Windows. Desktop build doesn't need them.
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            bun install --ignore-scripts
-          else
-            bun install
-          fi
+          xcode-select -p
+          swift --version
 
       - name: Resolve version
         id: version
         shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          elif [[ "${{ github.ref_name }}" == v* ]]; then
-            VERSION="${{ github.ref_name }}"
-            VERSION="${VERSION#v}"
+          if [ -n "${VERSION_INPUT:-}" ]; then
+            VERSION="$VERSION_INPUT"
+          elif [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [ -f VERSION ]; then
+            VERSION="$(tr -d '[:space:]' < VERSION)"
           else
-            VERSION=$(bun -e "console.log(require('./desktop/package.json').version)")
+            VERSION="0.1.0"
           fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "::error::Invalid version: $VERSION"
+            exit 1
+          fi
+
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $VERSION"
 
-      - name: Determine build environment
-        id: build-env
-        shell: bash
-        run: |
-          TAG="${{ github.ref_name }}"
-          if [[ "$TAG" == *"-canary"* ]]; then
-            echo "env=canary" >> "$GITHUB_OUTPUT"
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "env=stable" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Resolve Swift packages
+        run: swift package resolve
 
-      - name: Pre-download Electrobun binaries
-        shell: bash
-        run: |
-          # Electrobun CLI resolves core binaries via:
-          #   join(process.cwd(), "node_modules", "electrobun", "<dist-dir>")
-          # Bun workspaces hoists electrobun to root node_modules/.
-          EBUN_ROOT="node_modules/electrobun"
-          EBUN_VER=$(bun -e "console.log(require('./${EBUN_ROOT}/package.json').version)")
-          EBUN_TAG="v${EBUN_VER}"
-          echo "Electrobun version: $EBUN_VER"
+      - name: Run tests
+        run: ./scripts/test-unit.sh
 
-          # --- Pre-download CLI binary ---
-          # On Windows, --ignore-scripts skips postinstall so the CLI binary
-          # is missing. The lazy downloader uses tar with Windows paths which
-          # breaks GNU tar (D: interpreted as remote host). Pre-download it
-          # here using /tmp paths that work on all platforms.
-          BIN_EXT=""
-          CLI_PLATFORM="${{ matrix.core-tarball }}"
-          CLI_PLATFORM="${CLI_PLATFORM%%-*}"
-          if [ "$CLI_PLATFORM" = "win" ]; then BIN_EXT=".exe"; fi
-
-          CLI_BIN="${EBUN_ROOT}/bin/electrobun${BIN_EXT}"
-          if [ -f "$CLI_BIN" ]; then
-            echo "CLI binary already present at $CLI_BIN"
-          else
-            CLI_URL="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-cli-${{ matrix.core-tarball }}.tar.gz"
-            echo "Downloading CLI binary -> $CLI_BIN"
-            mkdir -p "${EBUN_ROOT}/bin" "${EBUN_ROOT}/.cache"
-            curl -fsSL "$CLI_URL" -o /tmp/ebun-cli.tar.gz
-            tar -xzf /tmp/ebun-cli.tar.gz -C "${EBUN_ROOT}/.cache"
-            cp "${EBUN_ROOT}/.cache/electrobun${BIN_EXT}" "$CLI_BIN"
-            if [ "$CLI_PLATFORM" != "win" ]; then chmod 755 "$CLI_BIN"; fi
-            rm -f /tmp/ebun-cli.tar.gz
-            echo "CLI binary installed"
-          fi
-
-          # --- Pre-download core binaries ---
-          DIST_DIR="${EBUN_ROOT}/${{ matrix.core-dist }}"
-          if [ -d "$DIST_DIR" ] && [ "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; then
-            echo "Core binaries already present in $DIST_DIR"
-          else
-            URL="https://github.com/blackboardsh/electrobun/releases/download/${EBUN_TAG}/electrobun-core-${{ matrix.core-tarball }}.tar.gz"
-            echo "Downloading ${{ matrix.core-tarball }} -> $DIST_DIR"
-            mkdir -p "$DIST_DIR"
-            curl -fsSL "$URL" -o /tmp/ebun-core.tar.gz
-            tar -xzf /tmp/ebun-core.tar.gz -C "$DIST_DIR"
-            rm -f /tmp/ebun-core.tar.gz
-            echo "Extracted: $(ls "$DIST_DIR" | head -5)..."
-          fi
-
-          # Symlink hoisted electrobun into desktop workspace so the CLI
-          # finds core binaries when running with working-directory: desktop
-          mkdir -p desktop/node_modules
-          ln -sfn ../../node_modules/electrobun desktop/node_modules/electrobun
-          ls "desktop/node_modules/electrobun/${{ matrix.core-dist }}/" | head -3
+      - name: Package app
+        env:
+          RC2_VERSION: ${{ steps.version.outputs.value }}
+          RC2_BUNDLE_ID: ${{ env.BUNDLE_ID }}
+          RC2_CONFIG: release
+        run: ./scripts/package-app.sh
 
       - name: Import signing certificate
-        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE != ''
+        shell: bash
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
           KEYCHAIN_PASSWORD: ${{ github.run_id }}
         run: |
-          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
-          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security import $CERTIFICATE_PATH -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
-          security list-keychain -d user -s $KEYCHAIN_PATH
+          if [ -z "${MACOS_CERTIFICATE:-}" ]; then
+            echo "Signing certificate not configured; build will remain unsigned."
+            exit 0
+          fi
 
-      - name: Build frontend
-        working-directory: desktop
-        run: bun run build:vite
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
 
-      - name: Build desktop
-        working-directory: desktop
+          if ! echo -n "$MACOS_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH" 2>/dev/null; then
+            echo -n "$MACOS_CERTIFICATE" | base64 -D > "$CERTIFICATE_PATH"
+          fi
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: Sign and notarize app
         shell: bash
         env:
-          APP_VERSION: ${{ steps.version.outputs.value }}
-          CODESIGN: ${{ secrets.MACOS_CERTIFICATE && 'true' || 'false' }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
           ELECTROBUN_TEAMID: ${{ secrets.ELECTROBUN_TEAMID }}
           ELECTROBUN_APPLEID: ${{ secrets.ELECTROBUN_APPLEID }}
           ELECTROBUN_APPLEIDPASS: ${{ secrets.ELECTROBUN_APPLEIDPASS }}
-        run: npx electrobun build --env=${{ steps.build-env.outputs.env }}
+        run: |
+          APP="dist/${APP_NAME}.app"
 
-      - name: List artifacts
-        working-directory: desktop
+          if [ -z "${MACOS_CERTIFICATE:-}" ]; then
+            echo "Signing skipped; MACOS_CERTIFICATE is not configured."
+            exit 0
+          fi
+
+          if [ -z "${ELECTROBUN_DEVELOPER_ID:-}" ]; then
+            echo "::error::ELECTROBUN_DEVELOPER_ID is required when MACOS_CERTIFICATE is configured."
+            exit 1
+          fi
+
+          codesign --force --deep --options runtime --timestamp --sign "$ELECTROBUN_DEVELOPER_ID" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          if [ -n "${ELECTROBUN_APPLEID:-}" ] && [ -n "${ELECTROBUN_APPLEIDPASS:-}" ] && [ -n "${ELECTROBUN_TEAMID:-}" ]; then
+            ditto -c -k --keepParent "$APP" "dist/${APP_NAME}-notary.zip"
+            xcrun notarytool submit "dist/${APP_NAME}-notary.zip" \
+              --apple-id "$ELECTROBUN_APPLEID" \
+              --password "$ELECTROBUN_APPLEIDPASS" \
+              --team-id "$ELECTROBUN_TEAMID" \
+              --wait
+            xcrun stapler staple "$APP"
+          else
+            echo "Notarization skipped; Apple ID, app password, or team ID is not configured."
+          fi
+
+      - name: Create release archive
         shell: bash
-        run: ls -lhR artifacts/
+        run: |
+          mkdir -p artifacts
+          ARCHIVE="artifacts/${APP_NAME}-${{ steps.version.outputs.value }}-macOS.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/${APP_NAME}.app" "$ARCHIVE"
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          ls -lh artifacts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-${{ matrix.label }}
-          path: desktop/artifacts/*
+          name: desktop-macOS
+          path: artifacts/*
 
   release:
+    name: Create GitHub Release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
 
     steps:
@@ -194,29 +161,12 @@ jobs:
 
       - name: Resolve version
         id: version
+        shell: bash
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          elif [[ "${{ github.ref_name }}" == v* ]]; then
-            VERSION="${{ github.ref_name }}"
-            VERSION="${VERSION#v}"
-          else
-            VERSION=$(cat desktop/package.json | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])")
-          fi
+          VERSION="${GITHUB_REF_NAME#v}"
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: $VERSION"
 
-      - name: Determine build environment
-        id: build-env
-        run: |
-          TAG="${{ github.ref_name }}"
-          if [[ "$TAG" == *"-canary"* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: release
@@ -231,7 +181,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: RemoteCode ${{ steps.version.outputs.value }}
           draft: false
-          prerelease: ${{ steps.build-env.outputs.prerelease }}
+          prerelease: ${{ contains(github.ref_name, '-canary') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
           generate_release_notes: true
           files: release/*
         env:

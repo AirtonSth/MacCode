@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Requirements</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --bad:#ff8f8f; --ok:#8ee6a8; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1120px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin:14px 0; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    a { color:var(--accent); text-decoration:none; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+    .must { color:var(--ok); font-weight:600; }
+    .no { color:var(--bad); font-weight:600; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>Product Requirements</h1>
+  <p class="muted">Defines the product contract before implementation. This is intentionally strict: RemoteCode 2 is cmux plus Agent App, not a generic rewrite.</p>
+
+  <h2>Goal Statement</h2>
+  <div class="card">
+    <p>RemoteCode 2 must be a native Swift macOS application with cmux-style workspaces, panes, terminal surfaces, browser surfaces, socket/CLI automation, notifications, and session restore. It must add an Agent App surface that provides the current RemoteCode graphical Codex/Claude workflow as a first-class tab/split surface.</p>
+  </div>
+
+  <h2>Hard Requirements</h2>
+  <table>
+    <tr><th>ID</th><th>Requirement</th><th>Pass criteria</th></tr>
+    <tr><td>R1</td><td>Native Swift rewrite</td><td>No Electrobun, Electron, Tauri, React runtime, Vite server, or Bun backend in the final desktop app process.</td></tr>
+    <tr><td>R2</td><td>cmux-like primitives</td><td>App exposes windows, vertical workspaces, panes, split layout, and surface tabs. Keyboard and command palette map to those primitives.</td></tr>
+    <tr><td>R3</td><td>Terminal surface</td><td>User can open a terminal surface in any pane, send input, resize, split, close, restore scrollback, and receive notifications.</td></tr>
+    <tr><td>R4</td><td>Browser surface</td><td>User can open a browser surface, navigate, split it beside terminal/agent surfaces, and use browser automation commands.</td></tr>
+    <tr><td>R5</td><td>Agent App surface</td><td>User can open an Agent App surface in any pane and run Codex or Claude against the workspace cwd.</td></tr>
+    <tr><td>R6</td><td>Provider parity</td><td>Codex and Claude both support model selection, permission/sandbox controls where supported, running state, streaming events, failure state, stop, and resume.</td></tr>
+    <tr><td>R7</td><td>Clean state continuity</td><td>Projects, threads, messages, provider thread IDs, streaming turn snapshots, workspace selection, terminal snapshots, and browser state persist only after they are created by RemoteCode 2.</td></tr>
+    <tr><td>R8</td><td>Automation</td><td>Socket/CLI can create workspaces, panes, terminal/browser/agent surfaces, focus surfaces, send input, read state, and automate browser surfaces.</td></tr>
+    <tr><td>R9</td><td>Session restore</td><td>Quit/reopen restores windows, workspaces, panes, surfaces, browser URLs/history where possible, Agent App thread context, terminal scrollback, and focused surface.</td></tr>
+    <tr><td>R10</td><td>Performance</td><td>Cold launch and memory use must be materially closer to cmux than to Electron/Electrobun. Performance budgets are defined in the QA plan.</td></tr>
+  </table>
+
+  <h2>Non-Goals For V1</h2>
+  <ul>
+    <li><span class="no">No</span> mobile rewrite in the first desktop release unless explicitly reprioritized.</li>
+    <li><span class="no">No</span> simulated desktop chrome inside the app. Use native macOS chrome and toolbar behavior.</li>
+    <li><span class="no">No</span> generic plugin marketplace before the core Agent App surface is stable.</li>
+    <li><span class="no">No</span> remote cloud VM feature unless cmux parity requires a stubbed API shape.</li>
+    <li><span class="no">No</span> retention of the React UI as a permanent WKWebView shell. Current local RemoteCode may be studied only as product behavior reference.</li>
+  </ul>
+
+  <h2>Target User Flows</h2>
+  <table>
+    <tr><th>Flow</th><th>Required path</th><th>Acceptance</th></tr>
+    <tr><td>Create workspace</td><td>Command menu, keyboard, CLI, or open folder.</td><td>Workspace appears in sidebar with cwd and an initial terminal or Agent App surface based on user action.</td></tr>
+    <tr><td>Split browser beside agent</td><td>From Agent App surface, run command palette or shortcut to split browser right/down.</td><td>Browser loads dev URL and Agent App remains active in neighboring pane.</td></tr>
+    <tr><td>Run Codex</td><td>Open Agent App, choose Codex, select model/reasoning/permission, send prompt.</td><td>Streaming timeline shows reasoning/plan/tool/output/assistant events and persists final message.</td></tr>
+    <tr><td>Run Claude</td><td>Open Agent App, choose Claude, send prompt in same workspace.</td><td>Claude stream maps to the same internal event model and resume behavior.</td></tr>
+    <tr><td>Use terminal with agent</td><td>Open terminal split in same workspace.</td><td>Terminal cwd matches workspace and environment exposes RemoteCode context IDs for automation.</td></tr>
+    <tr><td>Restore session</td><td>Quit app, reopen.</td><td>Layout, visible surfaces, selected thread, terminal scrollback, browser URL, and active/unread state restore without duplicate agent runs.</td></tr>
+  </table>
+
+  <h2>Definition Of Done</h2>
+  <ul>
+    <li><span class="must">Must</span> ship as a signed native macOS app with installer/update path.</li>
+    <li><span class="must">Must</span> include clean first-run tooling, generated test fixtures, and filesystem-trace proof that no previous app data path is touched.</li>
+    <li><span class="must">Must</span> pass unit, integration, socket CLI, UI automation, session restore, and performance gates.</li>
+    <li><span class="must">Must</span> document any cmux behavior intentionally deferred from V1.</li>
+  </ul>
+</main>
+</body>
+</html>

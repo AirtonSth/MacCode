@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 Source Inventory</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    a { color:var(--accent); text-decoration:none; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>Source Inventory</h1>
+  <p class="muted">Evidence used to build this plan. Current RemoteCode was inspected locally. cmux was cloned from GitHub at commit <code>6b0b97e200bfd87f3b85be202feed8fd74cb88ee</code>.</p>
+
+  <h2>Current RemoteCode Evidence</h2>
+  <table>
+    <tr><th>Area</th><th>Files inspected</th><th>Planning implication</th></tr>
+    <tr><td>Desktop runtime</td><td><code>/Users/samuelfajreldines/dev/remotecode.io/desktop/package.json</code>, <code>desktop/src/bun/index.ts</code></td><td>Current app is Electrobun with React/Vite frontend and Bun/Elysia backend. Final Swift rewrite must replace these runtime layers.</td></tr>
+    <tr><td>Main UI shell</td><td><code>desktop/src/react/app/App.tsx</code></td><td>Current Agent App has project sidebar, chat/thread selection, provider/model/permission controls, composer, git controls, active thread state, terminal panel integration, and workspace selection persistence.</td></tr>
+    <tr><td>Conversation UI</td><td><code>desktop/src/react/features/conversation/ui/ConversationPanel.tsx</code>, <code>StreamingTimeline.tsx</code></td><td>Native Swift Agent App needs message virtualization, markdown rendering, copy actions, streaming timeline, reasoning/plan/tool/assistant item states, and loading/error states.</td></tr>
+    <tr><td>Composer</td><td><code>desktop/src/react/features/composer/ui/MessageComposer.tsx</code>, attachment path tests</td><td>Native composer needs prompt entry, context path attachments, submit state, keyboard behavior, and provider-aware controls.</td></tr>
+    <tr><td>Providers</td><td><code>codex-provider-runner.ts</code>, <code>claude-provider-runner.ts</code>, <code>provider.controller.ts</code></td><td>Codex and Claude already have separate event parsers that converge into one assistant stream event shape. Swift should preserve the common event model.</td></tr>
+    <tr><td>WebSocket orchestration</td><td><code>desktop/src/bun/server/modules/ws/ws.service.ts</code>, <code>ws.controller.ts</code></td><td>Agent runs are started over a real-time channel, emit assistant deltas/events, persist stream snapshots, handle abort, and update chat status.</td></tr>
+    <tr><td>Terminal</td><td><code>ThreadTerminalPtyPanel.tsx</code>, <code>useThreadTerminalPtySession.ts</code>, <code>terminal-session.service.ts</code></td><td>Current RemoteCode has a per-chat PTY session. RemoteCode 2 should move terminal behavior to the cmux terminal surface and leave Agent App terminal affordances as links to terminal surfaces.</td></tr>
+    <tr><td>Persistence</td><td><code>desktop/src/bun/server/shared/db/db.schema.ts</code></td><td>Current SQLite tables include projects, chats, messages, selection, terminal commands/entries/sessions, workspace events, stream snapshots/events, and push subscription tables.</td></tr>
+    <tr><td>Contracts</td><td><code>packages/contracts/src/protocol.ts</code></td><td>Existing client/server protocol can be studied as product behavior reference, not copied as a data-transfer or previous-app bridge. Event names and DTO shapes should guide Swift models only when they fit the new command/event contracts.</td></tr>
+  </table>
+
+  <h2>cmux Evidence</h2>
+  <table>
+    <tr><th>Area</th><th>Files inspected</th><th>Planning implication</th></tr>
+    <tr><td>Product behavior</td><td><code>README.md</code></td><td>cmux is a native Swift/AppKit macOS app with Ghostty terminal rendering, vertical workspaces, horizontal surface tabs, split panes, notifications, browser panels, CLI/socket automation, and session restore.</td></tr>
+    <tr><td>Panel model</td><td><code>Sources/Panels/Panel.swift</code></td><td>cmux has <code>PanelType</code> for terminal, browser, markdown, file preview, and right sidebar tool. RemoteCode 2 adds <code>agentApp</code>.</td></tr>
+    <tr><td>Panel rendering</td><td><code>Sources/Panels/PanelContentView.swift</code></td><td>Rendering is type-dispatched. RemoteCode 2 adds <code>AgentAppPanelView</code> beside terminal/browser cases.</td></tr>
+    <tr><td>Terminal</td><td><code>Sources/Panels/TerminalPanel.swift</code>, <code>Sources/GhosttyTerminalView.swift</code></td><td>Terminal surface wraps a Ghostty terminal surface and supports focus, close, send input, scrollback persistence, and notification flash.</td></tr>
+    <tr><td>Browser</td><td><code>Sources/Panels/BrowserPanel.swift</code>, <code>BrowserPanelView.swift</code>, <code>BrowserAutomation.swift</code></td><td>Browser uses WKWebView and a broad automation command surface. RemoteCode 2 should keep this model.</td></tr>
+    <tr><td>Socket API</td><td><code>Sources/TerminalController.swift</code>, <code>CLI/cmux.swift</code>, <code>docs/cli-contract.md</code></td><td>cmux v2 methods define windows, workspaces, panes, surfaces, terminal input, browser automation, notifications, events, and session restore. RemoteCode 2 extends this with agent methods.</td></tr>
+    <tr><td>Session restore</td><td><code>Sources/SessionPersistence.swift</code></td><td>cmux serializes window/workspace/pane/surface state. RemoteCode 2 must add Agent App panel snapshots.</td></tr>
+    <tr><td>Agent hooks</td><td><code>docs/agent-hooks.md</code>, <code>CLI/CMUXCLI+AgentHookDefinitions.swift</code></td><td>cmux already integrates Codex and Claude-style agent lifecycle through hooks. RemoteCode 2 should reuse the concept but Agent App itself owns graphical thread state.</td></tr>
+    <tr><td>Browser API parity</td><td><code>docs/agent-browser-port-spec.md</code></td><td>Useful source for browser automation priorities and public terminology: window, workspace, pane, surface.</td></tr>
+    <tr><td>License</td><td><code>LICENSE</code></td><td>cmux is GPL-3.0-or-later or commercial. Direct code reuse requires GPL compliance or a commercial license. Clean-room reimplementation can use behavioral inspiration with caution.</td></tr>
+  </table>
+
+  <h2>Architecture Facts To Preserve</h2>
+  <ul>
+    <li>RemoteCode has one unified assistant event model for Codex and Claude. Keep that model.</li>
+    <li>cmux public terminology should win: window, workspace, pane, surface. Avoid exposing internal "panel" language in new APIs.</li>
+    <li>Agent App is a new surface type, not a new app mode or side panel.</li>
+    <li>Terminal and browser are not embedded inside Agent App. They are sibling surfaces in the cmux layout.</li>
+    <li>Current RemoteCode desktop UI behavior should inform RemoteCode 2 fixtures and acceptance tests, but no previous app state should transfer into native SQLite models.</li>
+  </ul>
+</main>
+</body>
+</html>

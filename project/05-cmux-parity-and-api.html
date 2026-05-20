@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 cmux Parity and API</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --warn:#ffd37a; }
+    body { margin:0; font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 72px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:18px; }
+    .muted { color:var(--muted); }
+    .warn { color:var(--warn); }
+    a { color:var(--accent); text-decoration:none; }
+    code { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="index.html">Back to index</a></p>
+  <h1>cmux Parity and API Plan</h1>
+  <p class="muted">RemoteCode 2 should look and behave like cmux, then add Agent App APIs. Public terms: window, workspace, pane, surface.</p>
+
+  <h2>Parity Matrix</h2>
+  <table>
+    <tr><th>cmux capability</th><th>RemoteCode 2 V1 target</th><th>Notes</th></tr>
+    <tr><td>Native macOS Swift/AppKit app</td><td>Required</td><td>Core rewrite requirement.</td></tr>
+    <tr><td>Vertical workspaces/sidebar</td><td>Required</td><td>Workspace rows show cwd, git branch, notifications, active agent state, and port metadata when a detector exists; otherwise show a typed unavailable state.</td></tr>
+    <tr><td>Horizontal surface tabs inside panes</td><td>Required</td><td>Surfaces include terminal, browser, agentApp.</td></tr>
+    <tr><td>Split panes</td><td>Required</td><td>Split right/down and directional focus are core workflows.</td></tr>
+    <tr><td>Ghostty terminal</td><td>Required if license path allows</td><td>Use cmux-style libghostty. Fallback must meet terminal pass criteria before V1.</td></tr>
+    <tr><td>WKWebView browser</td><td>Required</td><td>Must support navigation, profiles, local dev use, and automation subset.</td></tr>
+    <tr><td>Browser automation</td><td>P0 required, P1 planned</td><td>Use cmux agent-browser-port spec priorities.</td></tr>
+    <tr><td>Socket/CLI automation</td><td>Required</td><td>cmux-compatible command families plus agent extensions.</td></tr>
+    <tr><td>Notifications and unread routing</td><td>Required</td><td>Agent completion/attention should light workspace/surface like cmux.</td></tr>
+    <tr><td>Session restore</td><td>Required</td><td>Add Agent App snapshots to cmux-style snapshot tree.</td></tr>
+    <tr><td>SSH/remote daemon/cloud VM</td><td>Defer unless explicitly required</td><td>Keep API placeholders only if needed for future parity.</td></tr>
+    <tr><td>Markdown/file preview/right sidebar tools</td><td>Defer until after core</td><td>Not central to requested RemoteCode value. Document if omitted from V1.</td></tr>
+  </table>
+
+  <h2>Socket API Families</h2>
+  <table>
+    <tr><th>Family</th><th>Required methods</th></tr>
+    <tr><td>System</td><td><code>system.ping</code>, <code>system.capabilities</code>, <code>system.identify</code>, <code>events.stream</code></td></tr>
+    <tr><td>Window</td><td><code>window.list</code>, <code>window.current</code>, <code>window.focus</code>, <code>window.create</code>, <code>window.close</code></td></tr>
+    <tr><td>Workspace</td><td><code>workspace.list</code>, <code>workspace.create</code>, <code>workspace.select</code>, <code>workspace.current</code>, <code>workspace.close</code>, <code>workspace.rename</code>, <code>workspace.reorder</code>, <code>workspace.equalize_splits</code></td></tr>
+    <tr><td>Pane</td><td><code>pane.list</code>, <code>pane.focus</code>, <code>pane.surfaces</code>, <code>pane.create</code>, <code>pane.resize</code>, <code>pane.swap</code>, <code>pane.break</code>, <code>pane.join</code></td></tr>
+    <tr><td>Surface</td><td><code>surface.list</code>, <code>surface.current</code>, <code>surface.focus</code>, <code>surface.create</code>, <code>surface.split</code>, <code>surface.close</code>, <code>surface.move</code>, <code>surface.reorder</code>, <code>surface.send_text</code>, <code>surface.send_key</code>, <code>surface.read_text</code></td></tr>
+    <tr><td>Browser</td><td><code>browser.open_split</code>, <code>browser.navigate</code>, <code>browser.back</code>, <code>browser.forward</code>, <code>browser.reload</code>, <code>browser.url.get</code>, <code>browser.snapshot</code>, <code>browser.eval</code>, <code>browser.wait</code>, <code>browser.click</code>, <code>browser.fill</code>, <code>browser.type</code>, <code>browser.screenshot</code></td></tr>
+    <tr><td>Notification</td><td><code>notification.create</code>, <code>notification.list</code>, <code>notification.dismiss</code>, <code>notification.mark_read</code>, <code>notification.open</code>, <code>notification.jump_to_unread</code></td></tr>
+    <tr><td>Agent</td><td><code>agent.open</code>, <code>agent.thread.create</code>, <code>agent.thread.list</code>, <code>agent.message.send</code>, <code>agent.run.stop</code>, <code>agent.thread.resume</code>, <code>agent.state.current</code>, <code>agent.models.list</code></td></tr>
+  </table>
+
+  <h2>CLI Surface</h2>
+  <table>
+    <tr><th>Command</th><th>Contract</th></tr>
+    <tr><td><code>remotecode2 new-workspace --cwd PATH --name NAME</code></td><td>Create workspace.</td></tr>
+    <tr><td><code>remotecode2 new-surface --type terminal|browser|agent</code></td><td>Create a surface in the current or target pane.</td></tr>
+    <tr><td><code>remotecode2 new-split right --type agent</code></td><td>Split current pane and create Agent App surface.</td></tr>
+    <tr><td><code>remotecode2 browser ...</code></td><td>Mirror cmux browser command family where implemented.</td></tr>
+    <tr><td><code>remotecode2 agent open</code></td><td>Open/focus Agent App surface.</td></tr>
+    <tr><td><code>remotecode2 agent send --text TEXT --provider codex|claude</code></td><td>Create or use selected thread and start run.</td></tr>
+    <tr><td><code>remotecode2 notify</code></td><td>Send workspace/surface notification.</td></tr>
+  </table>
+
+  <h2>Surface Creation Rules</h2>
+  <table>
+    <tr><th>Input type</th><th>Result</th></tr>
+    <tr><td><code>terminal</code></td><td>Create terminal surface with workspace cwd, shell env, and RemoteCode context variables.</td></tr>
+    <tr><td><code>browser</code></td><td>Create browser surface. Optional <code>url</code> navigates after creation.</td></tr>
+    <tr><td><code>agent</code> or <code>agentApp</code></td><td>Create Agent App surface bound to workspace/project. Optional provider/thread fields select initial state.</td></tr>
+  </table>
+
+  <h2>Capability Response Extension</h2>
+  <pre><code>{
+  "app": "remotecode2",
+  "api_version": "2",
+  "surface_types": ["terminal", "browser", "agentApp"],
+  "agent": {
+    "providers": ["codex", "claude"],
+    "supports_stream_events": true,
+    "supports_resume": true
+  }
+}</code></pre>
+
+  <h2>Deferred Compatibility</h2>
+  <p class="warn">If RemoteCode 2 cannot directly reuse cmux code because of licensing, the V1 target remains behavioral parity, not source-level parity. Every deferred cmux command must return a clear unsupported error and appear in release notes.</p>
+</main>
+</body>
+</html>

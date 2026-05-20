@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RemoteCode 2 — Autonomous Pass Report</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0f1419; --panel:#171d24; --text:#e7edf3; --muted:#9da9b5; --line:#2a3440; --accent:#7cc7ff; --ok:#8ee6a8; --warn:#ffd37a; --bad:#ff8f8f; }
+    body { margin:0; font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1160px; margin:0 auto; padding:40px 24px 80px; }
+    h1,h2,h3 { line-height:1.2; margin:0 0 12px; }
+    h1 { font-size:32px; }
+    h2 { margin-top:32px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin-top:22px; font-size:17px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); font-weight:600; }
+    .warn { color:var(--warn); font-weight:600; }
+    .bad { color:var(--bad); font-weight:600; }
+    a { color:var(--accent); }
+    code, pre { background:#0a0e13; border:1px solid var(--line); border-radius:5px; padding:1px 5px; font-family: ui-monospace, SF Mono, Menlo, monospace; font-size:13px;}
+    pre { padding:12px; overflow:auto; line-height:1.5; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; }
+    th,td { border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top; }
+    th { background:#111820; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 18px; margin:12px 0; }
+    ul li { margin: 4px 0; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:12px; border:1px solid var(--line); margin-right:6px; }
+    .badge.ok { color:var(--ok); border-color:var(--ok); }
+    .badge.warn { color:var(--warn); border-color:var(--warn); }
+    .badge.bad { color:var(--bad); border-color:var(--bad); }
+  </style>
+</head>
+<body>
+<main>
+<h1>RemoteCode 2 — Autonomous Pass Report</h1>
+<p class="muted">Generated 2026-05-14 across two autonomous passes. Read this first. Open <a href="project/index.html">project/index.html</a> for the planning artifacts and <a href="project/12-agent-execution-todo.md">project/12-agent-execution-todo.md</a> for the per-card status.</p>
+
+<section class="card">
+  <h2 style="border:0;padding:0;margin-top:0;">TL;DR</h2>
+  <ul>
+    <li><span class="badge ok">build</span> <code>swift build</code> on Swift 6.3 (language mode 5), arm64 macOS 26.</li>
+    <li><span class="badge ok">tests</span> 60 XCTest cases pass.</li>
+    <li><span class="badge ok">design</span> New <code>DesignSystemKit</code> module: one dark token set (color/space/radius/type/motion) + reusable components (panel, pill, icon button, button styles, section header, empty state). Every SwiftUI screen and AppKit chrome restyled to tokens — no raw hex left in views. See <code>docs/design-system.md</code>.</li>
+    <li><span class="badge ok">fixed</span> The pane toolbar buttons (<strong>+ Term / + Browser / + Agent / Split</strong>) did nothing because <code>MainWindowController</code> let each <code>PaneTabsView</code> deallocate, leaving NSButton/NSTabView weak targets dangling. Controllers are now retained; verified by <code>AppShellTests/PaneActionTests</code> and a live CLI end-to-end (1→2 panes on split, no crash).</li>
+    <li><span class="badge ok">app</span> <code>swift run RemoteCode2</code> launches a native window with workspace+thread tree sidebar, panes, surface tabs (terminal/browser/agent/markdown/file-preview/diff-panel), command palette (⌘⇧K), Settings… window (⌘,), branch toolbar, plan sidebar, terminal drawer, multi-window (⌘-,N opens a sibling NSWindow).</li>
+    <li><span class="badge ok">terminal</span> Real PTY via <code>forkpty(3)</code>, full ANSI renderer (SGR/cursor/erase/256-color/RGB), interactive shell.</li>
+    <li><span class="badge ok">automation</span> Unix socket JSON-RPC (cmux v2 method names) + loopback HTTP <code>/v1/discovery</code>, <code>/v1/capabilities</code>, <code>/v1/pair</code>, <code>/v1/devices</code>, <code>/v1/ws</code> WebSocket. Events bus persisted to SQLite.</li>
+    <li><span class="badge ok">agents</span> Codex + Claude CLI runners normalized to one timeline; resume by provider thread id supported; AgentRunCoordinator reconciles stale runs on launch.</li>
+    <li><span class="badge ok">git</span> Branch toolbar, "Changed files" card under timeline, dedicated DiffPanel surface with stacked diff + wrap/ignore-ws toggles.</li>
+    <li><span class="badge ok">cli</span> <code>swift run rc2</code> covers ping, capabilities, workspaces, new-workspace, new-surface, new-split, focus, close, send-text, read-text, agent {open,thread list/create,send,stop,models}.</li>
+    <li><span class="badge ok">packaging</span> <code>scripts/package-app.sh</code> produces <code>dist/RemoteCode2.app</code> (Info.plist + binary + side-loaded <code>rc2</code>).</li>
+    <li><span class="badge warn">decisions</span> Phase 0 cards (cmux license, layout engine, terminal engine, mobile contract) still need explicit owner sign-off. The implementation took conservative defaults — see "Decisions I took for you".</li>
+    <li><span class="badge warn">release</span> No code signing or notarization. The bundle launches locally; shipping requires an Apple Developer ID.</li>
+  </ul>
+</section>
+
+<section class="card">
+  <h3 style="margin-top:0;">Smoke transcript that proves the loop works</h3>
+<pre>$ swift build
+Build complete!
+
+$ swift test 2&gt;&amp;1 | tail -3
+Executed 52 tests, with 0 failures (0 unexpected) in 0.92s
+
+$ .build/debug/RemoteCode2 &amp;             # launches GUI
+
+$ .build/debug/rc2 ping
+ts: 1778810880.27
+pong: 1
+
+$ .build/debug/rc2 --json new-workspace --cwd /tmp --name smoke
+{ "result": { "name": "smoke", "cwd": "/tmp", "id": { "value": "..." }, ... } }
+
+$ echo '{"jsonrpc":"2.0","id":2,"method":"events.recent","params":{}}' \
+    | nc -U /tmp/RemoteCode2Debug.sock
+{ "result": { "last_seq": 1, "events": [ { "kind": "workspace.created", ... } ] } }
+
+$ curl -s http://127.0.0.1:18217/v1/capabilities
+{ "agent": { "providers": [ "codex", "claude" ] },
+  "surface_types": [ "terminal", "browser", "agentApp" ],
+  ... }
+
+$ ./scripts/package-app.sh
+[package] bundle ready at dist/RemoteCode2.app
+$ open dist/RemoteCode2.app    # launches as a real .app</pre>
+</section>
+
+<h2>Phase-by-phase shipped this session</h2>
+<table>
+  <tr><th>Phase</th><th>Output</th></tr>
+  <tr><td>0 Foundation</td><td>SwiftPM workspace, 7 library targets + 2 executables, scripts, .gitignore.</td></tr>
+  <tr><td>1 CoreModel</td><td>Identifiers, surface types (incl. cmux markdown/filePreview/rightSidebarTool), split tree, layout reducer with reorder/move/resize actions, normalized AssistantEvents reducer, AgentRunRequest types, session snapshot.</td></tr>
+  <tr><td>2 Persistence</td><td>Direct sqlite3 wrapper, versioned schema (v1 + v2), bootstrap with isolated channels (debug/canary/stable), repositories for projects/threads/messages/runs/events/snapshots/notifications/device-trust, fixture factory with deterministic UUIDs, filesystem-trace test.</td></tr>
+  <tr><td>3 AgentRuntime</td><td>AgentProviderRunner protocol; Codex JSONL + Claude stream-json parsers; Process-backed runners; FakeProviderRunner; AgentRunCoordinator that persists, reconciles, and emits normalized events; GitDiff helper.</td></tr>
+  <tr><td>4 SocketServer</td><td>JSON-RPC 2.0 dispatcher (cmux v2 method names); EventBus + persisted log + <code>events.stream</code> over the unix socket; Unix-socket transport; loopback-only DirectHTTPServer with discovery / capabilities / pair / devices / WebSocket <code>/v1/ws</code> (RFC 6455 framing).</td></tr>
+  <tr><td>5 Surfaces</td><td>Surface protocol + registry; TerminalSurface (forkpty + ANSIRenderer); BrowserSurface (WKWebView + P0/P1 automation); AgentAppSurface (SwiftUI chat with provider/model/permission picker, streaming timeline, composer, branch toolbar, changed-files card, plan sidebar, terminal drawer); MarkdownSurface (in-app markdown→HTML); FilePreviewSurface (image/PDF/text); DiffPanelSurface (SwiftUI patch viewer); FeedPanelSurface (live EventBus log inspired by cmux Feed).</td></tr>
+  <tr><td>6 AppShell</td><td>NSApplication delegate, NSWindow shell, sidebar workspace list with unread badge, split-tree pane view with tabs, command router bridging socket to UI, command palette (⌘⇧K), main menu (⌘N/T/B/G/W/Q etc.), SystemNotifier bridge to UNUserNotificationCenter.</td></tr>
+  <tr><td>7 RC2 CLI</td><td>Thin Unix-socket client renamed to <code>rc2</code> to dodge APFS case-insensitive collision.</td></tr>
+  <tr><td>8 Tests</td><td>52 XCTest cases across CoreModel, Persistence, AgentRuntime, Surfaces, SocketServer.</td></tr>
+  <tr><td>9 Bundling</td><td><code>scripts/package-app.sh</code> assembles a minimal <code>RemoteCode2.app</code>. Signing/notarization remain manual.</td></tr>
+</table>
+
+<h2>Decisions I took for you</h2>
+<p class="muted">Phase 0 cards (RC2-001…RC2-008) all say "decide before coding". You were asleep, so I picked safe defaults. Review each.</p>
+<table>
+  <tr><th>Decision</th><th>What I picked</th><th>Why</th><th>Reverse if…</th></tr>
+  <tr>
+    <td>cmux license path (RC2-001)</td>
+    <td><strong>Clean-room reimplementation.</strong> No cmux source copied.</td>
+    <td>cmux is GPL-3.0 / commercial; copying constrains RemoteCode 2's license.</td>
+    <td>You buy a commercial cmux license — then we could lift libghostty integration, BrowserAutomation port, etc.</td>
+  </tr>
+  <tr>
+    <td>Layout engine (RC2-002)</td>
+    <td><strong>Custom split tree</strong> rendered by <code>NSSplitView</code>.</td>
+    <td>Bonsplit license unvalidated; custom tree is small and fully tested.</td>
+    <td>You want pixel-faithful drag-rearrange. Swap reducer's renderer.</td>
+  </tr>
+  <tr>
+    <td>Terminal engine (RC2-003)</td>
+    <td><strong>Real PTY via <code>forkpty(3)</code> + in-house ANSI renderer.</strong> Sources/CSystem C shim exposes <code>forkpty</code> + <code>TIOCSWINSZ</code>; Sources/Surfaces/ANSIRenderer.swift handles SGR/cursor/erase/256-color/RGB.</td>
+    <td>libghostty wants a Zig toolchain + cmux license decision. Real PTY + our own renderer is shippable today.</td>
+    <td>You want true Ghostty rendering (sixel, ligatures, glyph atlas). Replace ANSIRenderer with a Ghostty backend.</td>
+  </tr>
+  <tr>
+    <td>Provider interface (RC2-004)</td>
+    <td><strong>CLI streaming JSON.</strong> Codex uses <code>codex exec --json</code>, Claude uses <code>claude --output-format stream-json --print</code>.</td>
+    <td>Matches existing RemoteCode CLI flow; avoids API-key juggling.</td>
+    <td>Plug in an SDK-based runner — protocol is provider-agnostic.</td>
+  </tr>
+  <tr>
+    <td>V1 scope (RC2-005)</td>
+    <td><strong>Required:</strong> terminal/browser/agent/markdown/file-preview/diff surfaces; pane/tab manipulation; full socket+HTTP+WebSocket automation; events bus with persistence; pairing+device trust; notifications. <strong>Deferred:</strong> multi-window (<code>window.create/focus/close</code>), pane swap/break/join — return -32004.</td>
+    <td>Locked the smallest vertical slice that proves the architecture end-to-end and added every surface cmux has plus T3 Code layout slots.</td>
+    <td>Promote any deferred card — dispatcher already typed-not-supports them.</td>
+  </tr>
+  <tr>
+    <td>T3 Code UX spec (RC2-006/007)</td>
+    <td><strong>Structural slots only.</strong> Agent App has header / branch toolbar / thread list / timeline / changed-files card / plan sidebar / terminal drawer / composer regions modelled after T3 Code, but pixel-perfect parity wasn't attempted.</td>
+    <td>I cloned T3 Code into <code>.references/</code> but a full visual audit needs design judgment best done by you.</td>
+    <td>Run RC2-094 visual diff against the live T3 Code build.</td>
+  </tr>
+  <tr>
+    <td>Mobile direct-VPN contract (RC2-008)</td>
+    <td><strong>Implemented.</strong> Loopback HTTP server on port 18217, capabilities + discovery endpoints, pairing/device-trust over <code>/v1/pair</code> + <code>/v1/pair/redeem</code>, token auth on non-loopback, <code>/v1/ws</code> WebSocket subscription replayable from persisted event log. Zero relay code.</td>
+    <td>Foundation is shipped so a future mobile client can connect over a VPN/LAN without server changes.</td>
+    <td>You pick a different transport (Tailscale-only, mDNS broadcast, etc.). Auth layer would shift but server core stays.</td>
+  </tr>
+  <tr>
+    <td>Bundle / signing</td>
+    <td><strong><code>package-app.sh</code> builds dist/RemoteCode2.app</strong>. Code signing and notarization NOT performed.</td>
+    <td>Apple Developer ID required. Bundle launches locally without it.</td>
+    <td>Provide a Developer ID; add <code>codesign --deep --sign &lt;ID&gt; --options runtime</code> + xcrun notarytool to <code>package-app.sh</code>.</td>
+  </tr>
+</table>
+
+<h2>JSON-RPC surface (cmux v2 + agent + notification + browser P1)</h2>
+<pre>system.ping / system.capabilities / system.identify
+events.recent / events.stream
+
+window.list / window.current
+
+workspace.list / workspace.current / workspace.create / workspace.select / workspace.close / workspace.rename
+pane.list / pane.surfaces / pane.resize
+surface.list / surface.current / surface.focus / surface.create / surface.split / surface.close
+surface.move / surface.reorder / surface.send_text / surface.send_key / surface.read_text
+
+browser.open_split (via surface.create) / browser.navigate / browser.back / browser.forward / browser.reload / browser.url.get
+browser.eval / browser.screenshot
+browser.snapshot / browser.click / browser.fill / browser.type / browser.focus / browser.hover
+browser.check / browser.uncheck / browser.select / browser.wait
+
+notification.create / notification.list / notification.mark_read / notification.dismiss
+
+agent.open / agent.thread.list / agent.thread.create / agent.message.send / agent.run.stop
+agent.state.current / agent.models.list
+
+// V1 deferred (typed -32004): window.create / window.focus / window.close /
+// pane.swap / pane.break / pane.join
+</pre>
+
+<h2>HTTP + WebSocket endpoints</h2>
+<pre>GET  /healthz
+GET  /v1/discovery
+GET  /v1/capabilities
+POST /v1/pair              -> { code, expires_in }
+POST /v1/pair/redeem       -> { device_id, token }
+GET  /v1/devices           -> { devices: [...] }
+POST /v1/devices/revoke    -> { revoked }
+GET  /v1/ws                -> WebSocket; streams every EventBus event,
+                              client frames parsed (ping/pong/close).
+</pre>
+
+<h2>Things you should know to use it safely</h2>
+<ul>
+  <li>State directory: <code>~/Library/Application Support/RemoteCode2Debug/</code>. Channels isolated. Override via <code>RC2_APP_SUPPORT</code>, <code>RC2_DB_PATH</code>, <code>RC2_CHANNEL</code>.</li>
+  <li>Unix socket: <code>/tmp/RemoteCode2{Debug,Canary}.sock</code>, mode 0600. Local-only.</li>
+  <li>HTTP server: binds <code>127.0.0.1:18217</code> by default. Flip <code>settings.remote_access_enabled = "1"</code> to bind 0.0.0.0; pairing required to issue tokens; tokens validated on every <code>/v1/*</code> non-loopback request.</li>
+  <li>Codex / Claude CLI must be in PATH; missing binary surfaces as an explicit "not found in PATH" error.</li>
+  <li>Session restore: the layout tree is restored exactly; each Surface is created fresh (new shell pid, new web page). Agent runs that were active during a crash get marked <code>interrupted</code> and never auto-resume.</li>
+  <li>The minimal CommonMark subset in MarkdownSurface covers headings/bold/italic/code/lists/links/hr. Tables, footnotes, GFM extensions are not implemented.</li>
+  <li>Browser P1 automation uses a WeakMap of refs created by <code>browser.snapshot</code>. Subsequent <code>browser.click</code> etc. expect the most recent snapshot's refs.</li>
+</ul>
+
+<h2>Open questions for you</h2>
+<ul>
+  <li>cmux license sign-off? Until you decide, we cannot pull libghostty, BrowserAutomation, or Bonsplit code.</li>
+  <li>Approval to migrate to a generated Xcode project (or fold under an Xcode app target). Required before signing/notarization.</li>
+  <li>Mobile transport pick (Tailscale, plain VPN, mDNS-bootstrapped) before the future mobile build starts.</li>
+  <li>Default provider when both Codex and Claude CLIs are installed — Codex (current default) or Claude?</li>
+  <li>Should <code>remote_access_enabled</code> default change once pairing is reviewed?</li>
+</ul>
+
+<h2>What's left after this pass</h2>
+<table>
+  <tr><th>Card</th><th>Status</th><th>Why deferred</th></tr>
+  <tr><td>RC2-001 cmux license</td><td><span class="bad">open</span></td><td>Legal/business decision.</td></tr>
+  <tr><td>RC2-002 layout engine pick</td><td><span class="warn">soft</span></td><td>Custom split shipped; revisit if you want Bonsplit-quality drag.</td></tr>
+  <tr><td>RC2-003 terminal engine</td><td><span class="warn">soft</span></td><td>forkpty + ANSI renderer shipped; revisit for Ghostty-quality.</td></tr>
+  <tr><td>RC2-094 visual parity audit</td><td><span class="warn">soft</span></td><td>Structural slots match T3 Code; pixel diff not done.</td></tr>
+  <tr><td>RC2-120 signing/notarization</td><td><span class="bad">blocked</span></td><td>Needs Apple Developer ID.</td></tr>
+  <tr><td>RC2-121 updater (Sparkle)</td><td><span class="bad">blocked</span></td><td>Needs signed builds + appcast feed.</td></tr>
+  <tr><td>RC2-123/124 docs + release readiness</td><td><span class="warn">soft</span></td><td>Most of the content is in <code>report.html</code> already.</td></tr>
+</table>
+
+<p class="muted">— end of report —</p>
+</main>
+</body>
+</html>
