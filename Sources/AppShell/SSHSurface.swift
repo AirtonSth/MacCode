@@ -18,15 +18,18 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private weak var router: AppCommandRouter?
     private let terminalContainer = NSView()
     private let hostResizeHandle = SSHSidebarResizeHandleView()
-    private let transferDivider = NSView()
+    private let transferDivider = SSHSidebarResizeHandleView()
     private let viewModel: SSHSurfaceViewModel
     private var sidebarWidthConstraint: NSLayoutConstraint?
     private var transferWidthConstraint: NSLayoutConstraint?
     private var transferDividerWidthConstraint: NSLayoutConstraint?
     private var dragStartSidebarWidth: CGFloat?
+    private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface?
     static let hostSidebarWidthDefaultsKey = "ssh.hosts.sidebar.width.v1"
-    private static let transferSidebarExpandedWidth: CGFloat = 620
+    static let transferSidebarWidthDefaultsKey = "ssh.files.sidebar.width.v1"
+    static let transferSidebarExpandedDefaultsKey = "ssh.files.sidebar.expanded.v1"
+    private static let transferSidebarExpandedWidth: CGFloat = 680
 
     private(set) var descriptor: SurfaceDescriptor
     let view: NSView
@@ -114,6 +117,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         hostResizeHandle.onDrag = { [weak self] delta, ended in
             self?.resizeHostSidebar(delta: delta, ended: ended)
         }
+        transferDivider.onDrag = { [weak self] delta, ended in
+            self?.resizeTransferSidebar(delta: delta, ended: ended)
+        }
         viewModel.onRefresh = { [weak self] in self?.reloadHosts() }
         viewModel.onSave = { [weak self] draft in self?.save(draft) }
         viewModel.onConnect = { [weak self] host in self?.connect(host) }
@@ -122,7 +128,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         viewModel.onSidebarCollapsedChange = { [weak self] collapsed in
             self?.setSidebarCollapsed(collapsed)
         }
-        viewModel.onTransferSidebarCollapsedChange = { [weak self] _ in
+        viewModel.onTransferSidebarCollapsedChange = { [weak self] collapsed in
+            UserDefaults.standard.set(!collapsed, forKey: Self.transferSidebarExpandedDefaultsKey)
             self?.syncTransferSidebarWidth(animated: true)
         }
         viewModel.onTransfer = { [weak self] upload, localPath, remotePath in
@@ -151,6 +158,17 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         return min(520, max(220, stored))
     }
 
+    private static func persistedTransferSidebarWidth() -> CGFloat {
+        let stored = UserDefaults.standard.double(forKey: transferSidebarWidthDefaultsKey)
+        guard stored > 0 else { return transferSidebarExpandedWidth }
+        return min(1120, max(480, stored))
+    }
+
+    private static func persistedTransferSidebarCollapsed() -> Bool {
+        guard UserDefaults.standard.object(forKey: transferSidebarExpandedDefaultsKey) != nil else { return false }
+        return !UserDefaults.standard.bool(forKey: transferSidebarExpandedDefaultsKey)
+    }
+
     private func resizeHostSidebar(delta: CGFloat, ended: Bool) {
         guard !viewModel.sidebarCollapsed else { return }
         if dragStartSidebarWidth == nil {
@@ -167,8 +185,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func syncTransferSidebarWidth(animated: Bool) {
         let visible = viewModel.transferSidebarVisible
-        transferDividerWidthConstraint?.constant = visible ? 1 : 0
-        transferWidthConstraint?.constant = visible ? (viewModel.transferSidebarCollapsed ? 44 : Self.transferSidebarExpandedWidth) : 0
+        transferDividerWidthConstraint?.constant = visible ? 7 : 0
+        transferWidthConstraint?.constant = visible ? (viewModel.transferSidebarCollapsed ? 44 : Self.persistedTransferSidebarWidth()) : 0
         let changes = { self.view.layoutSubtreeIfNeeded() }
         if animated {
             NSAnimationContext.runAnimationGroup { context in
@@ -178,6 +196,20 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             }
         } else {
             changes()
+        }
+    }
+
+    private func resizeTransferSidebar(delta: CGFloat, ended: Bool) {
+        guard viewModel.transferSidebarVisible, !viewModel.transferSidebarCollapsed else { return }
+        if dragStartTransferWidth == nil {
+            dragStartTransferWidth = transferWidthConstraint?.constant ?? Self.persistedTransferSidebarWidth()
+        }
+        let start = dragStartTransferWidth ?? Self.persistedTransferSidebarWidth()
+        let next = min(1120, max(480, start - delta))
+        transferWidthConstraint?.constant = next
+        UserDefaults.standard.set(Double(next), forKey: Self.transferSidebarWidthDefaultsKey)
+        if ended {
+            dragStartTransferWidth = nil
         }
     }
 
@@ -243,6 +275,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             descriptor.metadata["ssh_status"] = "connected"
             viewModel.selectedHost = saved
             viewModel.status = "Connected"
+            viewModel.transferSidebarCollapsed = Self.persistedTransferSidebarCollapsed()
             viewModel.transferSidebarVisible = true
             viewModel.prepareTransferPanel(localPath: cwd, remotePath: "/")
             viewModel.error = nil
@@ -490,6 +523,8 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     @Published var remoteEntries: [SSHFileEntry] = []
     @Published var selectedLocalEntry: SSHFileEntry?
     @Published var selectedRemoteEntry: SSHFileEntry?
+    @Published var selectedLocalIDs: Set<String> = []
+    @Published var selectedRemoteIDs: Set<String> = []
     @Published var transferLocalPath = ""
     @Published var transferRemotePath = ""
     @Published var transferStatus = "Ready"
@@ -538,6 +573,10 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     func applyLocalListing(_ object: [String: JSONValue]) {
         localSitePath = object["path"]?.stringValue ?? localSitePath
         localEntries = decodeEntries(object["entries"]?.arrayValue)
+        selectedLocalIDs = selectedLocalIDs.intersection(Set(localEntries.map(\.id)))
+        if let selectedLocalEntry, !selectedLocalIDs.contains(selectedLocalEntry.id) {
+            self.selectedLocalEntry = nil
+        }
         transferStatus = "Local listed"
         addTransferLog("Local site: \(localSitePath)")
     }
@@ -545,33 +584,77 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     func applyRemoteListing(_ object: [String: JSONValue]) {
         remoteSitePath = object["path"]?.stringValue ?? remoteSitePath
         remoteEntries = decodeEntries(object["entries"]?.arrayValue)
+        selectedRemoteIDs = selectedRemoteIDs.intersection(Set(remoteEntries.map(\.id)))
+        if let selectedRemoteEntry, !selectedRemoteIDs.contains(selectedRemoteEntry.id) {
+            self.selectedRemoteEntry = nil
+        }
         transferStatus = "Remote listed"
         addTransferLog("Remote site: \(remoteSitePath)")
     }
 
-    func selectLocal(_ entry: SSHFileEntry) {
+    func selectLocal(_ entry: SSHFileEntry, additive: Bool = false) {
         selectedLocalEntry = entry
-        if entry.isDirectory {
-            localSitePath = entry.path
-            onRefreshLocalFiles?()
-        } else {
-            transferLocalPath = entry.path
-            if transferRemotePath.isEmpty || transferRemotePath == remoteSitePath {
-                transferRemotePath = (remoteSitePath as NSString).appendingPathComponent(entry.name)
+        if additive {
+            if selectedLocalIDs.contains(entry.id) {
+                selectedLocalIDs.remove(entry.id)
+            } else {
+                selectedLocalIDs.insert(entry.id)
             }
+        } else {
+            selectedLocalIDs = [entry.id]
         }
     }
 
-    func selectRemote(_ entry: SSHFileEntry) {
+    func selectRemote(_ entry: SSHFileEntry, additive: Bool = false) {
         selectedRemoteEntry = entry
+        if additive {
+            if selectedRemoteIDs.contains(entry.id) {
+                selectedRemoteIDs.remove(entry.id)
+            } else {
+                selectedRemoteIDs.insert(entry.id)
+            }
+        } else {
+            selectedRemoteIDs = [entry.id]
+        }
+    }
+
+    func openLocal(_ entry: SSHFileEntry) {
+        if entry.isDirectory {
+            localSitePath = entry.path
+            onRefreshLocalFiles?()
+        }
+    }
+
+    func openRemote(_ entry: SSHFileEntry) {
         if entry.isDirectory {
             remoteSitePath = entry.path
             onRefreshRemoteFiles?()
-        } else {
-            transferRemotePath = entry.path
-            if transferLocalPath.isEmpty || transferLocalPath == localSitePath {
-                transferLocalPath = (localSitePath as NSString).appendingPathComponent(entry.name)
-            }
+        }
+    }
+
+    func localTransferEntries(anchor: SSHFileEntry) -> [SSHFileEntry] {
+        let selected = localEntries.filter { selectedLocalIDs.contains($0.id) && !$0.isDirectory }
+        if selectedLocalIDs.contains(anchor.id), !selected.isEmpty { return selected }
+        return anchor.isDirectory ? [] : [anchor]
+    }
+
+    func remoteTransferEntries(anchor: SSHFileEntry) -> [SSHFileEntry] {
+        let selected = remoteEntries.filter { selectedRemoteIDs.contains($0.id) && !$0.isDirectory }
+        if selectedRemoteIDs.contains(anchor.id), !selected.isEmpty { return selected }
+        return anchor.isDirectory ? [] : [anchor]
+    }
+
+    func uploadLocalSelection(anchor: SSHFileEntry) {
+        for entry in localTransferEntries(anchor: anchor) {
+            let remotePath = (remoteSitePath as NSString).appendingPathComponent(entry.name)
+            onTransfer?(true, entry.path, remotePath)
+        }
+    }
+
+    func downloadRemoteSelection(anchor: SSHFileEntry) {
+        for entry in remoteTransferEntries(anchor: anchor) {
+            let localPath = (localSitePath as NSString).appendingPathComponent(entry.name)
+            onTransfer?(false, localPath, entry.path)
         }
     }
 
@@ -583,6 +666,8 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
             transferLocalPath = path
             localSitePath = (path as NSString).deletingLastPathComponent
         }
+        selectedLocalIDs.removeAll()
+        selectedLocalEntry = nil
     }
 
     func recordTransfer(direction: SSHTransferDirection, localPath: String, remotePath: String, status: SSHTransferState) {
@@ -759,6 +844,9 @@ private struct SSHTransferSidebarView: View {
     @ObservedObject var vm: SSHSurfaceViewModel
     @State private var fileColumns = SSHFileColumnWidths()
     @State private var queueColumns = SSHQueueColumnWidths()
+    @State private var localPaneWidth: CGFloat = 340
+    @State private var treeHeight: CGFloat = 126
+    @State private var queueHeight: CGFloat = 166
 
     var body: some View {
         Group {
@@ -793,60 +881,86 @@ private struct SSHTransferSidebarView: View {
     }
 
     private var panel: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            DSSectionHeader("Files", trailing: AnyView(
-                HStack(spacing: DS.Space.xs) {
-                    DSIconButton("arrow.clockwise", help: "Refresh local and remote files") {
-                        vm.onRefreshLocalFiles?()
-                        vm.onRefreshRemoteFiles?()
+        GeometryReader { proxy in
+            let boundedQueueHeight = min(max(queueHeight, 112), max(112, proxy.size.height * 0.42))
+            VStack(alignment: .leading, spacing: 0) {
+                DSSectionHeader("Files", trailing: AnyView(
+                    HStack(spacing: DS.Space.xs) {
+                        DSIconButton("arrow.clockwise", help: "Refresh local and remote files") {
+                            vm.onRefreshLocalFiles?()
+                            vm.onRefreshRemoteFiles?()
+                        }
+                        DSIconButton("sidebar.right", help: "Hide file transfer") {
+                            vm.transferSidebarCollapsed = true
+                        }
                     }
-                    DSIconButton("sidebar.right", help: "Hide file transfer") {
-                        vm.transferSidebarCollapsed = true
+                ))
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+                GeometryReader { contentProxy in
+                    let panesHeight = max(220, contentProxy.size.height - boundedQueueHeight - 9)
+                    VStack(spacing: 0) {
+                        splitPanes
+                            .frame(height: panesHeight)
+                        SSHPanelResizeHandle(axis: .vertical, help: "Resize transfer queue") { delta in
+                            queueHeight = min(max(queueHeight - delta, 112), max(112, contentProxy.size.height * 0.56))
+                        }
+                        queuePanel
+                            .frame(height: boundedQueueHeight)
                     }
-                }
-            ))
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            ScrollView(.vertical) {
-                VStack(spacing: 0) {
-                    HStack(spacing: 0) {
-                        transferPane(title: "Local site",
-                                     path: $vm.localSitePath,
-                                     entries: vm.localEntries,
-                                     selected: vm.selectedLocalEntry,
-                                     refresh: { vm.onRefreshLocalFiles?() },
-                                     choose: { vm.onChooseLocalPath?() },
-                                     select: { vm.selectLocal($0) })
-                        Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
-                        transferPane(title: "Remote site",
-                                     path: $vm.remoteSitePath,
-                                     entries: vm.remoteEntries,
-                                     selected: vm.selectedRemoteEntry,
-                                     refresh: { vm.onRefreshRemoteFiles?() },
-                                     choose: nil,
-                                     select: { vm.selectRemote($0) })
-                    }
-                    .frame(minHeight: 430)
-                    Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-                    actionStrip
-                    Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-                    queuePanel
                 }
             }
-            Spacer()
+            .frame(width: proxy.size.width, height: proxy.size.height)
         }
-        .frame(width: 620)
+        .frame(minWidth: 480)
         .overlay(alignment: .leading) {
             Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+        }
+    }
+
+    private var splitPanes: some View {
+        GeometryReader { proxy in
+            let minPane: CGFloat = min(230, max(180, proxy.size.width * 0.38))
+            let maxLeft = max(minPane, proxy.size.width - minPane - 8)
+            let leftWidth = min(max(localPaneWidth, minPane), maxLeft)
+            HStack(spacing: 0) {
+                transferPane(title: "Local site",
+                             path: $vm.localSitePath,
+                             entries: vm.localEntries,
+                             selectedIDs: vm.selectedLocalIDs,
+                             refresh: { vm.onRefreshLocalFiles?() },
+                             choose: { vm.onChooseLocalPath?() },
+                             open: { vm.openLocal($0) },
+                             select: { vm.selectLocal($0, additive: $1) },
+                             transferTitle: "Upload",
+                             transfer: { vm.uploadLocalSelection(anchor: $0) })
+                    .frame(width: leftWidth)
+                SSHPanelResizeHandle(axis: .horizontal, help: "Resize local and remote panes") { delta in
+                    localPaneWidth = min(max(localPaneWidth + delta, minPane), maxLeft)
+                }
+                transferPane(title: "Remote site",
+                             path: $vm.remoteSitePath,
+                             entries: vm.remoteEntries,
+                             selectedIDs: vm.selectedRemoteIDs,
+                             refresh: { vm.onRefreshRemoteFiles?() },
+                             choose: nil,
+                             open: { vm.openRemote($0) },
+                             select: { vm.selectRemote($0, additive: $1) },
+                             transferTitle: "Download",
+                             transfer: { vm.downloadRemoteSelection(anchor: $0) })
+            }
         }
     }
 
     private func transferPane(title: String,
                               path: Binding<String>,
                               entries: [SSHFileEntry],
-                              selected: SSHFileEntry?,
+                              selectedIDs: Set<String>,
                               refresh: @escaping () -> Void,
                               choose: (() -> Void)?,
-                              select: @escaping (SSHFileEntry) -> Void) -> some View {
+                              open: @escaping (SSHFileEntry) -> Void,
+                              select: @escaping (SSHFileEntry, Bool) -> Void,
+                              transferTitle: String,
+                              transfer: @escaping (SSHFileEntry) -> Void) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: DS.Space.xs) {
                 Text(title + ":")
@@ -874,18 +988,24 @@ private struct SSHTransferSidebarView: View {
             }
             .padding(DS.Space.xs)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            directoryTree(entries: entries, path: path.wrappedValue, select: select)
-                .frame(minHeight: 110, maxHeight: 132)
+            directoryTree(entries: entries, path: path.wrappedValue, open: open)
+                .frame(height: treeHeight)
+            SSHPanelResizeHandle(axis: .vertical, help: "Resize directory tree") { delta in
+                treeHeight = min(max(treeHeight + delta, 76), 240)
+            }
+            fileTable(entries: entries,
+                      selectedIDs: selectedIDs,
+                      select: select,
+                      open: open,
+                      transferTitle: transferTitle,
+                      transfer: transfer)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            fileTable(entries: entries, selected: selected, select: select)
-                .frame(minHeight: 248)
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            paneStatus(entries: entries, selected: selected)
+            paneStatus(entries: entries, selectedIDs: selectedIDs)
                 .frame(height: 28)
         }
     }
 
-    private func directoryTree(entries: [SSHFileEntry], path: String, select: @escaping (SSHFileEntry) -> Void) -> some View {
+    private func directoryTree(entries: [SSHFileEntry], path: String, open: @escaping (SSHFileEntry) -> Void) -> some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
                 Text(path.isEmpty ? "/" : path)
@@ -895,7 +1015,7 @@ private struct SSHTransferSidebarView: View {
                     .padding(.horizontal, DS.Space.sm)
                     .padding(.top, DS.Space.xs)
                 ForEach(entries.filter(\.isDirectory).prefix(24)) { entry in
-                    Button { select(entry) } label: {
+                    Button { open(entry) } label: {
                         HStack(spacing: DS.Space.xs) {
                             Image(systemName: entry.name == ".." ? "arrow.turn.up.left" : "folder")
                                 .foregroundColor(DS.Palette.textSecondary)
@@ -915,7 +1035,12 @@ private struct SSHTransferSidebarView: View {
         .background(DS.Palette.bg.opacity(0.42))
     }
 
-    private func fileTable(entries: [SSHFileEntry], selected: SSHFileEntry?, select: @escaping (SSHFileEntry) -> Void) -> some View {
+    private func fileTable(entries: [SSHFileEntry],
+                           selectedIDs: Set<String>,
+                           select: @escaping (SSHFileEntry, Bool) -> Void,
+                           open: @escaping (SSHFileEntry) -> Void,
+                           transferTitle: String,
+                           transfer: @escaping (SSHFileEntry) -> Void) -> some View {
         ScrollView(.horizontal) {
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
@@ -935,7 +1060,10 @@ private struct SSHTransferSidebarView: View {
                                 .frame(minHeight: 72)
                         } else {
                             ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
-                                Button { select(entry) } label: {
+                                Button {
+                                    let flags = NSEvent.modifierFlags
+                                    select(entry, flags.contains(.command) || flags.contains(.shift))
+                                } label: {
                                     HStack(spacing: 0) {
                                         HStack(spacing: DS.Space.xs) {
                                             Image(systemName: entry.isDirectory ? "folder" : "doc")
@@ -963,11 +1091,23 @@ private struct SSHTransferSidebarView: View {
                                     .foregroundColor(DS.Palette.text)
                                     .padding(.horizontal, DS.Space.xs)
                                     .frame(width: fileColumns.total, height: 26, alignment: .leading)
-                                    .background(rowBackground(index: index, isSelected: selected?.id == entry.id))
+                                    .background(rowBackground(index: index, isSelected: selectedIDs.contains(entry.id)))
                                 }
                                 .buttonStyle(.plain)
                                 .contextMenu {
-                                    Button(entry.isDirectory ? "Open Folder" : "Select File") { select(entry) }
+                                    if entry.isDirectory {
+                                        Button("Open Folder") { open(entry) }
+                                    } else {
+                                        Button(transferMenuTitle(transferTitle: transferTitle,
+                                                                 selectedIDs: selectedIDs,
+                                                                 entries: entries,
+                                                                 anchor: entry)) {
+                                            transfer(entry)
+                                        }
+                                    }
+                                    Button(selectedIDs.contains(entry.id) ? "Deselect" : "Select") {
+                                        select(entry, true)
+                                    }
                                 }
                             }
                         }
@@ -975,6 +1115,15 @@ private struct SSHTransferSidebarView: View {
                 }
             }
         }
+    }
+
+    private func transferMenuTitle(transferTitle: String,
+                                   selectedIDs: Set<String>,
+                                   entries: [SSHFileEntry],
+                                   anchor: SSHFileEntry) -> String {
+        let selectedFiles = entries.filter { selectedIDs.contains($0.id) && !$0.isDirectory }
+        guard selectedIDs.contains(anchor.id), selectedFiles.count > 1 else { return transferTitle }
+        return "\(transferTitle) \(selectedFiles.count) files"
     }
 
     private func resizableHeader(_ title: String,
@@ -989,59 +1138,18 @@ private struct SSHTransferSidebarView: View {
         return index.isMultiple(of: 2) ? DS.Palette.surface.opacity(0.35) : Color.clear
     }
 
-    private func paneStatus(entries: [SSHFileEntry], selected: SSHFileEntry?) -> some View {
+    private func paneStatus(entries: [SSHFileEntry], selectedIDs: Set<String>) -> some View {
         let files = entries.filter { !$0.isDirectory }
         let total = files.compactMap { Int($0.size) }.reduce(0, +)
+        let selectedCount = entries.filter { selectedIDs.contains($0.id) }.count
         return HStack {
-            Text(selected.map { $0.isDirectory ? "Selected 1 directory." : "Selected 1 file." } ?? "\(files.count) files. Total size: \(total) bytes")
+            Text(selectedCount > 0 ? "Selected \(selectedCount) item\(selectedCount == 1 ? "" : "s")." : "\(files.count) files. Total size: \(total) bytes")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1)
             Spacer()
         }
         .padding(.horizontal, DS.Space.sm)
-    }
-
-    private var actionStrip: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            HStack {
-                Label("Transfer selection or typed paths", systemImage: "arrow.left.arrow.right")
-                    .font(DS.Font.caption.weight(.semibold))
-                    .foregroundColor(DS.Palette.textSecondary)
-                Spacer()
-                Text(vm.transferStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-            }
-            HStack(spacing: DS.Space.sm) {
-                pathField("Local file", text: $vm.transferLocalPath)
-                pathField("Remote file", text: $vm.transferRemotePath)
-            }
-            HStack(spacing: DS.Space.sm) {
-                Button { vm.onTransfer?(true, vm.transferLocalPath, vm.transferRemotePath) } label: {
-                    Label("Upload", systemImage: "arrow.right")
-                }
-                Button { vm.onTransfer?(false, vm.transferLocalPath, vm.transferRemotePath) } label: {
-                    Label("Download", systemImage: "arrow.left")
-                }
-                Spacer()
-            }
-            .disabled(vm.transferLocalPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                      vm.transferRemotePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-        }
-        .padding(DS.Space.sm)
-    }
-
-    private func pathField(_ label: String, text: Binding<String>) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Text(label)
-                .font(DS.Font.caption2.weight(.semibold))
-                .foregroundColor(DS.Palette.textSecondary)
-            TextField(label, text: text)
-                .font(DS.Font.monoSmall)
-                .textFieldStyle(.roundedBorder)
-        }
     }
 
     private var queuePanel: some View {
@@ -1107,7 +1215,42 @@ private struct SSHTransferSidebarView: View {
                 }
             }
         }
-        .frame(height: 160)
+    }
+}
+
+private struct SSHPanelResizeHandle: View {
+    enum Axis {
+        case horizontal
+        case vertical
+    }
+
+    let axis: Axis
+    let help: String
+    let onDrag: (CGFloat) -> Void
+    @State private var lastTranslation: CGFloat = 0
+
+    var body: some View {
+        Rectangle()
+            .fill(DS.Palette.line.opacity(0.75))
+            .overlay {
+                Capsule()
+                    .fill(DS.Palette.lineStrong.opacity(0.9))
+                    .frame(width: axis == .horizontal ? 2 : 34,
+                           height: axis == .horizontal ? 34 : 2)
+            }
+            .frame(width: axis == .horizontal ? 8 : nil,
+                   height: axis == .vertical ? 8 : nil)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        let current = axis == .horizontal ? value.translation.width : value.translation.height
+                        onDrag(current - lastTranslation)
+                        lastTranslation = current
+                    }
+                    .onEnded { _ in lastTranslation = 0 }
+            )
+            .help(help)
     }
 }
 
