@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import CoreModel
 import Persistence
+import AgentRuntime
 import DesignSystemKit
 
 extension Notification.Name {
@@ -16,11 +17,10 @@ public final class SettingsViewModel: ObservableObject {
     public let settingsStore: SettingsStore
     public let context: AppContext
 
-    @Published public var theme: String = "dark"
     @Published public var remoteAccessEnabled: Bool = false
-    @Published public var defaultProvider: AgentProvider = .codex
-    @Published public var firstRunCompleted: Bool = false
     @Published public var appSettings: AppSettings = AppSettings()
+    @Published public var codexPath: String = ""
+    @Published public var claudePath: String = ""
     @Published public var devices: [DeviceTrust] = []
     @Published public var newPairingCode: String?
 
@@ -33,12 +33,10 @@ public final class SettingsViewModel: ObservableObject {
     }
 
     public func reload() {
-        theme = (try? settingsRepo.get("theme")) ?? "dark"
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
-        let p = (try? settingsRepo.get("provider.default")) ?? "codex"
-        defaultProvider = AgentProvider(rawValue: p) ?? .codex
-        firstRunCompleted = (try? settingsRepo.get("first_run_completed")) == "1"
         appSettings = settingsStore.load()
+        codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
+        claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
         devices = (try? trustRepo.list()) ?? []
     }
 
@@ -46,11 +44,6 @@ public final class SettingsViewModel: ObservableObject {
         remoteAccessEnabled = on
         try? settingsRepo.set("remote_access_enabled", on ? "1" : "0")
         NotificationCenter.default.post(name: .rc2RemoteAccessSettingChanged, object: nil)
-    }
-
-    public func setDefaultProvider(_ p: AgentProvider) {
-        defaultProvider = p
-        try? settingsRepo.set("provider.default", p.rawValue)
     }
 
     public func setDiffWordWrap(_ on: Bool) {
@@ -63,9 +56,14 @@ public final class SettingsViewModel: ObservableObject {
         settingsStore.update { $0.diffIgnoreWhitespace = on }
     }
 
-    public func setSidebarSort(_ value: String) {
-        appSettings.sidebarSort = value
-        settingsStore.update { $0.sidebarSort = value }
+    public func setCodexPath(_ path: String) {
+        codexPath = path
+        saveCLIPath(key: "cli.codex.path", provider: .codex, path: path)
+    }
+
+    public func setClaudePath(_ path: String) {
+        claudePath = path
+        saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
     }
 
     public func createPairingCode() {
@@ -77,6 +75,25 @@ public final class SettingsViewModel: ObservableObject {
     public func revoke(_ id: String) {
         try? trustRepo.revoke(id: id)
         reload()
+    }
+
+    public var codexAvailable: Bool { ProcessLocator.resolve(codexPath).map { !$0.isEmpty } ?? false }
+    public var claudeAvailable: Bool { ProcessLocator.resolve(claudePath).map { !$0.isEmpty } ?? false }
+
+    private func cliPath(key: String, fallback: String) -> String {
+        let stored = ((try? settingsRepo.get(key)) ?? "")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return stored.isEmpty ? (ProcessLocator.resolve(fallback) ?? fallback) : stored
+    }
+
+    private func saveCLIPath(key: String, provider: AgentProvider, path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? settingsRepo.set(key, trimmed)
+        switch provider {
+        case .codex:
+            context.coordinator.replaceProvider(.codex, runner: CodexRunner(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+        case .claude:
+            context.coordinator.replaceProvider(.claude, runner: ClaudeRunner(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+        }
     }
 }
 
@@ -101,15 +118,18 @@ public struct SettingsView: View {
                     .keyboardShortcut(.cancelAction)
             }
 
-            TabView {
-                general.tabItem { Label("General", systemImage: "gearshape") }
-                display.tabItem { Label("Display", systemImage: "sidebar.left") }
-                providers.tabItem { Label("Providers", systemImage: "sparkle") }
-                remote.tabItem { Label("Remote Access", systemImage: "network") }
+            ScrollView {
+                VStack(alignment: .leading, spacing: DS.Space.lg) {
+                    remoteAccessSection
+                    diffDefaultsSection
+                    trustedDevicesSection
+                    diagnosticsSection
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .padding(DS.Space.xl)
-        .frame(width: 600, height: 470)
+        .frame(width: 620, height: 560)
         .background(DS.Palette.bg)
     }
 
@@ -122,31 +142,26 @@ public struct SettingsView: View {
         .padding(.vertical, DS.Space.sm)
     }
 
-    private var general: some View {
+    private var remoteAccessSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Appearance")
-            settingRow("Theme") {
-                Picker("", selection: $vm.theme) {
-                    Text("Dark").tag("dark"); Text("Light").tag("light")
-                }.labelsHidden().frame(width: 140).disabled(true)
+            DSSectionHeader("Remote Access")
+            settingRow("Allow iPhone or iPad on your network") {
+                Toggle("", isOn: Binding(
+                    get: { vm.remoteAccessEnabled },
+                    set: { vm.setRemoteAccess($0) }
+                ))
+                .labelsHidden()
             }
-            settingRow("First-run completed") {
-                Image(systemName: vm.firstRunCompleted ? "checkmark.circle.fill" : "circle")
-                    .foregroundColor(vm.firstRunCompleted ? DS.Palette.success : DS.Palette.textTertiary)
-            }
-            Divider().overlay(DS.Palette.line)
-            Text("State directory")
-                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
-            Text(vm.context.bootstrapReport.path)
-                .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                .textSelection(.enabled)
-            Spacer()
+            Text("Off binds the host API to 127.0.0.1. On binds to 0.0.0.0:18217 and publishes Bonjour; paired-device tokens are still required.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
         }
+        .dsPanel(padding: DS.Space.lg)
     }
 
-    private var display: some View {
+    private var diffDefaultsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Diff")
+            DSSectionHeader("Diff Defaults")
             settingRow("Word wrap") {
                 Toggle("", isOn: Binding(
                     get: { vm.appSettings.diffWordWrap },
@@ -161,60 +176,16 @@ public struct SettingsView: View {
                 ))
                 .labelsHidden()
             }
-            Divider().overlay(DS.Palette.line)
-            DSSectionHeader("Sidebar")
-            settingRow("Workspace ordering") {
-                Picker("", selection: Binding(
-                    get: { vm.appSettings.sidebarSort },
-                    set: { vm.setSidebarSort($0) }
-                )) {
-                    Text("Updated").tag("updated")
-                    Text("Created").tag("created")
-                    Text("Manual").tag("manual")
-                }
-                .labelsHidden()
-                .frame(width: 150)
-            }
-            Spacer()
+            Text("These defaults seed new Git diff surfaces and match the toolbar toggles in the diff panel.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
         }
+        .dsPanel(padding: DS.Space.lg)
     }
 
-    private var providers: some View {
+    private var trustedDevicesSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Default Provider")
-            settingRow("Provider") {
-                Picker("", selection: $vm.defaultProvider) {
-                    Text("Codex").tag(AgentProvider.codex)
-                    Text("Claude").tag(AgentProvider.claude)
-                }.labelsHidden().frame(width: 140)
-                .onChange(of: vm.defaultProvider) { v in vm.setDefaultProvider(v) }
-            }
-            Divider().overlay(DS.Palette.line)
-            DSSectionHeader("CLI Availability")
-            HStack(spacing: DS.Space.md) {
-                DSPill("codex", tone: codexInstalled ? .success : .danger)
-                Text(codexInstalled ? "Found in PATH" : "Not in PATH")
-                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-            }
-            HStack(spacing: DS.Space.md) {
-                DSPill("claude", tone: claudeInstalled ? .success : .danger)
-                Text(claudeInstalled ? "Found in PATH" : "Not in PATH")
-                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-            }
-            Spacer()
-        }
-    }
-
-    private var remote: some View {
-        VStack(alignment: .leading, spacing: DS.Space.lg) {
-            DSSectionHeader("Direct Access")
-            settingRow("Enable remote access (0.0.0.0:18217)") {
-                Toggle("", isOn: $vm.remoteAccessEnabled)
-                    .labelsHidden()
-                    .onChange(of: vm.remoteAccessEnabled) { v in vm.setRemoteAccess(v) }
-            }
-            Text("Pairing required when remote access is on. Every non-loopback /v1/* request must carry a paired device token.")
-                .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+            DSSectionHeader("Trusted Devices")
             HStack(spacing: DS.Space.lg) {
                 Button("Generate pairing code") { vm.createPairingCode() }
                     .buttonStyle(DSSecondaryButtonStyle())
@@ -223,8 +194,6 @@ public struct SettingsView: View {
                         .foregroundColor(DS.Palette.success).textSelection(.enabled)
                 }
             }
-            Divider().overlay(DS.Palette.line)
-            DSSectionHeader("Paired Devices")
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.sm) {
                     if vm.devices.isEmpty {
@@ -252,15 +221,40 @@ public struct SettingsView: View {
                 }
             }.frame(maxHeight: 150)
         }
+        .dsPanel(padding: DS.Space.lg)
     }
 
-    private var codexInstalled: Bool {
-        FileManager.default.fileExists(atPath: "/opt/homebrew/bin/codex") ||
-        FileManager.default.fileExists(atPath: "/usr/local/bin/codex")
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Diagnostics")
+            cliPathRow(label: "Codex path",
+                       value: Binding(get: { vm.codexPath }, set: { vm.setCodexPath($0) }),
+                       available: vm.codexAvailable)
+            cliPathRow(label: "Claude path",
+                       value: Binding(get: { vm.claudePath }, set: { vm.setClaudePath($0) }),
+                       available: vm.claudeAvailable)
+            Text("State directory")
+                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
+            Text(vm.context.bootstrapReport.path)
+                .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
+                .textSelection(.enabled)
+        }
+        .dsPanel(padding: DS.Space.lg)
     }
-    private var claudeInstalled: Bool {
-        FileManager.default.fileExists(atPath: "/opt/homebrew/bin/claude") ||
-        FileManager.default.fileExists(atPath: "/usr/local/bin/claude")
+
+    private func cliPathRow(label: String, value: Binding<String>, available: Bool) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.md) {
+                Text(label)
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                DSPill(available ? "found" : "missing", tone: available ? .success : .danger)
+            }
+            TextField("", text: value)
+                .textFieldStyle(.roundedBorder)
+                .font(DS.Font.monoSmall)
+                .foregroundColor(DS.Palette.text)
+        }
     }
 }
 

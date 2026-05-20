@@ -17,10 +17,15 @@ public enum AgentRunError: Error, CustomStringConvertible {
 
 public enum ProcessLocator {
     public static func resolve(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("/") {
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
+        }
         // search PATH
         let envPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
         for component in envPath.split(separator: ":") {
-            let full = String(component) + "/" + name
+            let full = String(component) + "/" + trimmed
             if FileManager.default.isExecutableFile(atPath: full) { return full }
         }
         return nil

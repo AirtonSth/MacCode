@@ -79,4 +79,11 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertEqual(AgentReasoningEffort.supportedCases, [.low, .medium, .high, .xhigh],
                        "Codex CLI rejects minimal; the picker must expose only efforts that run")
     }
+
+    func test_processLocatorAcceptsAbsoluteExecutablePath() {
+        XCTAssertEqual(ProcessLocator.resolve("/usr/bin/env"), "/usr/bin/env",
+                       "CLI path settings must be able to point at a concrete executable, not only a name in PATH")
+        XCTAssertNil(ProcessLocator.resolve("/no/such/codex"),
+                     "CLI path settings must fail loud when the configured executable does not exist")
+    }
 }

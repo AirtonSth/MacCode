@@ -73,6 +73,22 @@ public final class SidebarViewModel: ObservableObject {
         router?.openWorkspaceInNewWindow(ws.id)
     }
 
+    public static func finderURL(for ws: Workspace) -> URL? {
+        guard !ws.cwd.isEmpty else { return nil }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: ws.cwd, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return nil }
+        return URL(fileURLWithPath: ws.cwd, isDirectory: true)
+    }
+
+    public func openWorkspaceInFinder(_ ws: Workspace) {
+        guard let url = Self.finderURL(for: ws) else {
+            NSSound.beep()
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
     // MARK: cmux-style workspace editing (AppKit prompts — reliable,
     // no SwiftUI sheet plumbing).
 
@@ -322,6 +338,9 @@ public struct SidebarRootView: View {
             Button { vm.openWorkspaceInNewWindow(ws) } label: {
                 Label("Open in New Window", systemImage: "macwindow")
             }
+            Button { vm.openWorkspaceInFinder(ws) } label: {
+                Label("Open in Finder", systemImage: "folder")
+            }
             Divider()
             Button("Rename…") { vm.renameWorkspace(ws) }
             Button("Edit description…") { vm.editDescription(ws) }
@@ -453,6 +472,9 @@ private struct SidebarFooterSettingsButton: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Rectangle()
+                .fill(DS.Palette.line.opacity(0.55))
+                .frame(height: DS.Border.hairline)
             Button(action: action) {
                 HStack(spacing: DS.Space.md) {
                     Image(systemName: "gearshape")
@@ -478,6 +500,9 @@ private struct SidebarFooterSettingsButton: View {
             .padding(.horizontal, DS.Space.md)
             .padding(.top, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.clear)
     }
 }

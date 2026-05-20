@@ -575,15 +575,20 @@ final class PaneActionTests: XCTestCase {
 
         vm.setDiffWordWrap(true)
         vm.setDiffIgnoreWhitespace(true)
-        vm.setSidebarSort("manual")
+        vm.setCodexPath("/usr/bin/env")
+        vm.setClaudePath("/usr/bin/env")
 
         let reloaded = SettingsViewModel(context: ctx)
         XCTAssertTrue(reloaded.appSettings.diffWordWrap,
                       "Settings must expose and persist the diff word-wrap preference used by the diff surface")
         XCTAssertTrue(reloaded.appSettings.diffIgnoreWhitespace,
                       "Settings must expose and persist the diff ignore-whitespace preference used by the diff surface")
-        XCTAssertEqual(reloaded.appSettings.sidebarSort, "manual",
-                       "Settings must expose and persist the sidebar ordering preference instead of leaving it hidden in storage")
+        XCTAssertEqual(reloaded.codexPath, "/usr/bin/env",
+                       "Settings must expose and persist the executable path used to launch Codex")
+        XCTAssertEqual(reloaded.claudePath, "/usr/bin/env",
+                       "Settings must expose and persist the executable path used to launch Claude")
+        XCTAssertTrue(reloaded.codexAvailable && reloaded.claudeAvailable,
+                      "valid configured CLI paths must be reflected in diagnostics")
     }
 
     func test_ratioSplit_laysOutSideBySideWithoutFreeSpace() {

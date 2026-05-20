@@ -54,6 +54,18 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertFalse(ctx.state.window.workspaces.contains(ws.id))
     }
 
+    func test_finderURL_requiresExistingWorkspaceDirectory() throws {
+        let (ctx, router) = try make()
+        let dir = NSTemporaryDirectory()
+        let ws = try router.createWorkspace(name: "finder", cwd: dir)
+        XCTAssertEqual(SidebarViewModel.finderURL(for: ws)?.path, URL(fileURLWithPath: dir, isDirectory: true).path,
+                       "Open in Finder must target the workspace cwd directory")
+
+        let missing = try router.createWorkspace(name: "missing", cwd: dir + "/missing-\(UUID().uuidString)")
+        XCTAssertNil(SidebarViewModel.finderURL(for: missing),
+                     "Open in Finder must fail loud instead of opening an invalid path")
+    }
+
     func test_sidebarShiftSelection_tracksRangeWithoutOpeningWorkspace() throws {
         let (ctx, router) = try make()
         let first = try router.createWorkspace(name: "one", cwd: "/tmp")

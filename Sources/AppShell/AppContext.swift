@@ -38,8 +38,8 @@ public final class AppContext {
         self.snapshotRepo = SessionSnapshotRepository(db: db)
         self.settingsRepo = SettingsRepository(db: db)
         self.eventLog = EventLogRepository(db: db)
-        let codex = CodexRunner()
-        let claude = ClaudeRunner()
+        let codex = CodexRunner(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
+        let claude = ClaudeRunner(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [.codex: codex, .claude: claude]

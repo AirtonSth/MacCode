@@ -163,7 +163,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// targets die with them, so they must outlive a layout rebuild.
     private var paneControllers: [PaneTabsView] = []
     private var sidebarCollapsed = false
-    private var sidebarWidth: CGFloat = 260
+    private static let defaultSidebarWidth: CGFloat = 444
+    private static let sidebarWidthSettingsKey = "sidebar.width"
+    private var sidebarWidth: CGFloat = MainWindowController.defaultSidebarWidth
+    private var didApplyInitialSidebarWidth = false
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -174,6 +177,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         self.context = context
         self.router = router
         self.sidebar = SidebarView(context: context, router: router)
+        self.sidebarWidth = Self.storedSidebarWidth(context: context)
 
         let style: NSWindow.StyleMask = [.titled, .resizable, .closable, .miniaturizable]
         let win = InteractiveTitlebarWindow(
@@ -285,6 +289,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         // give sidebar a default size
         DispatchQueue.main.async {
             self.split.setPosition(self.sidebarWidth, ofDividerAt: 0)
+            self.didApplyInitialSidebarWidth = true
         }
     }
 
@@ -700,8 +705,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     public func splitViewDidResizeSubviews(_ notification: Notification) {
         guard let splitView = notification.object as? NSSplitView,
               splitView === split,
+              didApplyInitialSidebarWidth,
               !sidebarCollapsed else { return }
         sidebarWidth = sidebar.view.frame.width
+        try? context?.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(sidebarWidth))")
+    }
+
+    private static func storedSidebarWidth(context: AppContext) -> CGFloat {
+        guard let raw = (try? context.settingsRepo.get(sidebarWidthSettingsKey)) ?? nil,
+              let value = Double(raw) else {
+            return defaultSidebarWidth
+        }
+        return min(560, max(180, CGFloat(value)))
     }
 }
 
