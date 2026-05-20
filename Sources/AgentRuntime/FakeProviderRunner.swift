@@ -23,8 +23,8 @@ public final class FakeProviderRunner: AgentProviderRunner, @unchecked Sendable 
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        var cancelled = false
-        let handle = AgentRunHandle(runId: request.runId, process: nil) { cancelled = true }
+        let cancellation = CancellationFlag()
+        let handle = AgentRunHandle(runId: request.runId, process: nil) { cancellation.cancel() }
         let scenario = self.scenario
 
         Task.detached {
@@ -34,13 +34,13 @@ public final class FakeProviderRunner: AgentProviderRunner, @unchecked Sendable 
             let now = { Int64(Date().timeIntervalSince1970 * 1000) }
             onEvent(.event(.threadStarted(threadId: threadId, providerThreadId: threadId)))
             onEvent(.event(.turnStarted(turnId: turnId)))
-            if cancelled { onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: threadId)); return }
+            if cancellation.isCancelled { onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: threadId)); return }
             switch scenario {
             case .simpleAssistant(let reply):
                 let id = UUID().uuidString
                 onEvent(.event(.itemStarted(item: AssistantItem(id: id, turnId: turnId, type: .assistantMessage, startedAtMs: now()))))
                 for chunk in chunked(reply, size: 8) {
-                    if cancelled { break }
+                    if cancellation.isCancelled { break }
                     onEvent(.event(.itemDelta(itemId: id, bodyAppend: chunk, outputAppend: nil, summary: nil)))
                     try? await Task.sleep(nanoseconds: 5_000_000)
                 }
@@ -61,7 +61,7 @@ public final class FakeProviderRunner: AgentProviderRunner, @unchecked Sendable 
                 onEvent(.finished(.failed, finalMessage: nil, providerThreadId: threadId))
                 return
             }
-            if cancelled {
+            if cancellation.isCancelled {
                 onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: threadId))
             } else {
                 onEvent(.status(.completed))

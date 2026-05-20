@@ -18,9 +18,9 @@ public protocol AgentProviderRunner: AnyObject {
 public final class AgentRunHandle: @unchecked Sendable {
     public let runId: AgentRunID
     public let process: Process?
-    private let cancelHandler: () -> Void
+    private let cancelHandler: @Sendable () -> Void
 
-    public init(runId: AgentRunID, process: Process?, cancel: @escaping () -> Void) {
+    public init(runId: AgentRunID, process: Process?, cancel: @escaping @Sendable () -> Void) {
         self.runId = runId
         self.process = process
         self.cancelHandler = cancel
@@ -28,6 +28,23 @@ public final class AgentRunHandle: @unchecked Sendable {
 
     public func cancel() {
         cancelHandler()
+    }
+}
+
+final class CancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func cancel() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
