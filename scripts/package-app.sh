@@ -33,7 +33,7 @@ if [ -x "$CLI" ]; then
   cp "$CLI" "$DIST/$BUNDLE/Contents/MacOS/rc2"
 fi
 if [ -d "$SURFACES_RESOURCES" ]; then
-  cp -R "$SURFACES_RESOURCES" "$DIST/$BUNDLE/RemoteCode_Surfaces.bundle"
+  cp -R "$SURFACES_RESOURCES" "$DIST/$BUNDLE/Contents/Resources/RemoteCode_Surfaces.bundle"
 fi
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$DIST/$BUNDLE/Contents/Resources/AppIcon.icns"

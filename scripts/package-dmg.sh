@@ -9,6 +9,7 @@ DIST="dist"
 APP_NAME="RemoteCode.app"
 DMG_ROOT="$DIST/dmg-root"
 OUTPUT="$DIST/$ASSET_NAME"
+SIGN_IDENTITY="${RC2_CODESIGN_IDENTITY:--}"
 
 "$(dirname "$0")/package-app.sh"
 
@@ -17,6 +18,9 @@ mkdir -p "$DMG_ROOT"
 
 cp -R "$DIST/$APP_NAME" "$DMG_ROOT/$APP_NAME"
 ln -s /Applications "$DMG_ROOT/Applications"
+
+codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime "$DMG_ROOT/$APP_NAME"
+codesign --verify --deep --strict --verbose=4 "$DMG_ROOT/$APP_NAME"
 
 hdiutil create \
   -volname "RemoteCode" \

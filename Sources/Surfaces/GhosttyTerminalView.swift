@@ -203,7 +203,7 @@ private final class RemoteCodeGhosttyRuntime {
 
     private func configureGhosttyEnvironment() {
         let fileManager = FileManager.default
-        let bundledGhosttyURL = Bundle.module.resourceURL?.appendingPathComponent("ghostty")
+        let bundledGhosttyURL = Self.bundledGhosttyResourcesURL(fileManager: fileManager)
         let ghosttyAppResources = "/Applications/Ghostty.app/Contents/Resources/ghostty"
 
         if getenv("GHOSTTY_RESOURCES_DIR") == nil {
@@ -233,6 +233,25 @@ private final class RemoteCodeGhosttyRuntime {
         }
         if getenv("TERM_PROGRAM") == nil {
             setenv("TERM_PROGRAM", "ghostty", 1)
+        }
+    }
+
+    private static func bundledGhosttyResourcesURL(fileManager: FileManager) -> URL? {
+        let candidates: [URL] = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("RemoteCode_Surfaces.bundle")
+                .appendingPathComponent("ghostty"),
+            Bundle.main.bundleURL
+                .appendingPathComponent("RemoteCode_Surfaces.bundle")
+                .appendingPathComponent("ghostty"),
+            URL(fileURLWithPath: CommandLine.arguments[0])
+                .deletingLastPathComponent()
+                .appendingPathComponent("RemoteCode_Surfaces.bundle")
+                .appendingPathComponent("ghostty")
+        ].compactMap { $0 }
+
+        return candidates.first { url in
+            fileManager.fileExists(atPath: url.appendingPathComponent("themes").path)
         }
     }
 
