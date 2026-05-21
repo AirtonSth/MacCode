@@ -762,11 +762,13 @@ public final class AppCommandRouter: CommandRouting {
             for paneID in group { mobileGroupByPane[paneID] = index }
         }
         let panes: [[String: JSONValue]] = ws.layout.paneIDs().map { pid in
-            let count = (ws.layout.find(paneID: pid)?.surfaces.count) ?? 0
+            let pane = ws.layout.find(paneID: pid)
+            let count = pane?.surfaces.count ?? 0
             return [
                 "kind": .string("pane"),
                 "id": .string(pid.value.uuidString),
                 "surface_count": .number(Double(count)),
+                "selected_surface_id": pane?.selectedSurfaceID.map { .string($0.value.uuidString) } ?? .null,
                 "mobile_group": .number(Double(mobileGroupByPane[pid] ?? 0))
             ]
         }

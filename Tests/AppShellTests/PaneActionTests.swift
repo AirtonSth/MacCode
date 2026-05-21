@@ -301,6 +301,22 @@ final class PaneActionTests: XCTestCase {
                        "focusing another tab must change the visible surface")
     }
 
+    func test_paneListExposesSelectedSurfaceForIOSWorkspaceOpen() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "ios-visible-tab", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let termID = pane0.surfaces.first!.id
+        let view = PaneTabsView(pane: pane0, router: router)
+        _ = view.performAdd(.browser, title: "Browser")
+        try router.focusSurface(workspace: ws.id, surface: termID)
+        let selected = try XCTUnwrap(ctx.state.workspaces[ws.id]?.layout.find(paneID: pane0.id)?.selectedSurfaceID)
+
+        let pane = try XCTUnwrap(try router.paneList(workspace: ws.id).first { $0["kind"]?.stringValue == "pane" })
+
+        XCTAssertEqual(pane["selected_surface_id"]?.stringValue, selected.value.uuidString,
+                       "pane.list must expose the visible macOS tab so iOS opens the same tab when entering a workspace")
+    }
+
     func test_performReorderSurface_movesTabBeforeTargetInSamePane() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "drag", cwd: NSTemporaryDirectory())
