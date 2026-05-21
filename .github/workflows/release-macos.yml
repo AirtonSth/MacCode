@@ -102,6 +102,14 @@ jobs:
           xcrun stapler staple "dist/$ASSET_NAME"
           spctl --assess --type open --context context:primary-signature --verbose=4 "dist/$ASSET_NAME"
 
+      - name: Verify mounted app Gatekeeper acceptance
+        run: |
+          MOUNT="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "dist/$ASSET_NAME"
+          trap 'hdiutil detach "$MOUNT"; rmdir "$MOUNT"' EXIT
+          codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
+          spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
+
       - name: Upload DMG to release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -124,4 +124,7 @@ dist/RemoteCode.app/
         └── rc2
 ```
 
-Code signing and notarization require an Apple Developer ID and stay manual.
+`scripts/package-app.sh` is only for local bundle assembly. Release artifacts must use
+`scripts/package-dmg.sh` and the GitHub release workflow. The DMG build fails unless a
+`Developer ID Application` signing identity is available, and upload happens only after
+notarization, stapling, and Gatekeeper verification pass.

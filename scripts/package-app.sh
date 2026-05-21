@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Package the SwiftPM-built executable as a minimal .app bundle.
-# Does NOT sign, notarize, or staple — those steps require an Apple
-# Developer ID. Produces RemoteCode.app under ./dist/.
+# Package the SwiftPM-built executable as a minimal local .app bundle.
+# This is not a release artifact. Release DMGs must be Developer ID signed
+# and notarized by scripts/package-dmg.sh plus the GitHub release workflow.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -68,4 +68,4 @@ EOF
 
 echo "[package] bundle ready at $DIST/$BUNDLE"
 echo "[package] launch: open '$DIST/$BUNDLE'  or  $DIST/$BUNDLE/Contents/MacOS/RemoteCode"
-echo "[package] sign + notarize is NOT performed; requires Apple Developer ID"
+echo "[package] release DMGs require Developer ID signing and notarization"

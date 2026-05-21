@@ -51,8 +51,8 @@
     <tr><td><code>./scripts/test-unit.sh</code></td><td>Run unit tests.</td></tr>
     <tr><td><code>./scripts/test-integration.sh</code></td><td>Run SQLite, provider fixture, socket, and browser automation tests.</td></tr>
     <tr><td><code>./scripts/test-ui.sh</code></td><td>Run XCTest UI suite against app.</td></tr>
-    <tr><td><code>./scripts/package-dmg.sh</code></td><td>Create distributable DMG.</td></tr>
-    <tr><td><code>./scripts/notarize.sh</code></td><td>Sign and notarize release artifact.</td></tr>
+    <tr><td><code>./scripts/package-dmg.sh</code></td><td>Create Developer ID-signed distributable DMG; fails if signing identity is missing.</td></tr>
+    <tr><td>GitHub release workflow</td><td>Notarize, staple, Gatekeeper-verify DMG and mounted app, then upload the release asset.</td></tr>
   </table>
 
   <h2>Release Channels</h2>

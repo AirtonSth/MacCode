@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build RemoteCode.app and wrap it in a distributable DMG.
-# Signing, notarization, and stapling are intentionally separate release steps.
+# Build RemoteCode.app and wrap it in a Developer ID-signed DMG.
+# This script must fail if a Developer ID Application identity is unavailable.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
