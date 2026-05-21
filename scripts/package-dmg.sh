@@ -34,6 +34,9 @@ hdiutil create \
   -format UDZO \
   "$OUTPUT"
 
+codesign --force --sign "$SIGN_IDENTITY" "$OUTPUT"
+codesign --verify --verbose=4 "$OUTPUT"
+
 rm -rf "$DMG_ROOT"
 
 echo "[package] dmg ready at $OUTPUT"
