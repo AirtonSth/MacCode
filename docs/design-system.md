@@ -16,6 +16,27 @@ Dark is the only V1 theme (the SKILL's `color-dark-mode` rule: design the
 dark palette intentionally, do not invert a light one). Light tokens are
 deliberately disabled and surfaced as such in Settings.
 
+## Apple Surface Parity Rules
+
+These rules are shared with the iOS design system in
+`../ios-app/docs/design-system.md`.
+
+- SSH and Agent App are the approved visual baseline: compact header, dense dark
+  content, direct controls, no marketing layout.
+- Surface headers use the full available width and stay compact. The active
+  surface body gets the rest of the window or device viewport.
+- Secondary task modes that become the user's main task must replace the active
+  body instead of floating as a partial overlay. On iOS this is mandatory for
+  SSH Files; on macOS sidebars/drawers are allowed only when they do not cover
+  the primary terminal/editor content.
+- Terminal UI is shown only for real usable terminal/session states. Empty or
+  disconnected states use a clear empty state and recovery action.
+- Host/thread/object menus are grouped by meaning: selection first, current
+  object actions next, destructive actions separated, creation last. Avoid
+  repeating the object name in every action label.
+- iOS may adapt layout for touch and screen size, but it must preserve every
+  host capability exposed by macOS.
+
 ## Color tokens (`DS.Palette` / `DS.NS`)
 
 | Token | Hex | Use |
