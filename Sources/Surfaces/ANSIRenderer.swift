@@ -11,6 +11,8 @@ import DesignSystemKit
 /// linear append-only ring of rows; CSI H / CSI A/B/C/D adjust the
 /// current row/col so simple TUIs render correctly enough for read use.
 public final class ANSIRenderer {
+    public static let defaultScrollbackLimit = 10_000
+
     public struct Cell {
         public var ch: Character
         public var fg: NSColor
@@ -31,6 +33,12 @@ public final class ANSIRenderer {
     public private(set) var grid: [[Cell]]
     public private(set) var cursorRow = 0
     public private(set) var cursorCol = 0
+    public private(set) var scrollback: [[Cell]]
+    public private(set) var usesAlternateScreen = false
+    private let scrollbackLimit: Int
+    private var savedGrid: [[Cell]]?
+    private var savedCursor: (row: Int, col: Int)?
+    private var savedNormalCursor: (row: Int, col: Int)?
 
     private var fg: NSColor = ANSIRenderer.Cell.defaultFG
     private var bg: NSColor = ANSIRenderer.Cell.defaultBG
@@ -38,10 +46,13 @@ public final class ANSIRenderer {
     private var italic = false
     private var underline = false
     private var inverse = false
+    private var cursorVisible = true
 
-    public init(rows: Int = 40, cols: Int = 120) {
+    public init(rows: Int = 40, cols: Int = 120, scrollbackLimit: Int = ANSIRenderer.defaultScrollbackLimit) {
         self.rows = rows
         self.cols = cols
+        self.scrollback = []
+        self.scrollbackLimit = max(0, scrollbackLimit)
         self.grid = Array(repeating: Array(repeating: Cell.empty, count: cols), count: rows)
     }
 
@@ -56,6 +67,12 @@ public final class ANSIRenderer {
     private var csiParams = ""
     private var csiIntermediate: UInt8 = 0
     private var oscBuffer = ""
+
+    private func emptyGrid(rows: Int? = nil, cols: Int? = nil) -> [[Cell]] {
+        let rowCount = max(1, rows ?? self.rows)
+        let colCount = max(1, cols ?? self.cols)
+        return Array(repeating: Array(repeating: Cell.empty, count: colCount), count: rowCount)
+    }
 
     public func feed(_ data: Data) {
         for byte in data {
@@ -130,8 +147,26 @@ public final class ANSIRenderer {
     }
 
     private func scrollUp() {
-        grid.removeFirst()
+        if usesAlternateScreen {
+            grid.removeFirst()
+            grid.append(Array(repeating: Cell.empty, count: cols))
+            return
+        }
+        appendScrollback(grid.removeFirst())
         grid.append(Array(repeating: Cell.empty, count: cols))
+    }
+
+    private func appendScrollback(_ row: [Cell], preserveBlank: Bool = true) {
+        guard scrollbackLimit > 0 else { return }
+        guard preserveBlank || row.contains(where: isVisibleContent) else { return }
+        scrollback.append(row)
+        if scrollback.count > scrollbackLimit {
+            scrollback.removeFirst(scrollback.count - scrollbackLimit)
+        }
+    }
+
+    private func isVisibleContent(_ cell: Cell) -> Bool {
+        cell.ch != " " || cell.bg != NSColor.clear
     }
 
     private func handleEsc(_ b: UInt8) {
@@ -144,6 +179,11 @@ public final class ANSIRenderer {
             state = .osc
             oscBuffer = ""
         case 0x37, 0x38, 0x44, 0x4D, 0x45, 0x5C, 0x63: // 7 8 D M E \ c — minor controls, ignore
+            if b == 0x37 {
+                saveCursor()
+            } else if b == 0x38 {
+                restoreCursor()
+            }
             state = .ground
         case 0x28, 0x29, 0x2A, 0x2B: // SCS — consume next byte
             csiIntermediate = b
@@ -190,6 +230,7 @@ public final class ANSIRenderer {
     }
 
     private func dispatchCSI(final: UInt8) {
+        let isPrivateMode = csiParams.contains("?")
         let params = parseParams()
         let f = Character(UnicodeScalar(final))
         switch f {
@@ -233,12 +274,83 @@ public final class ANSIRenderer {
                 grid[cursorRow] = Array(repeating: Cell.empty, count: cols)
             default: break
             }
+        case "s":
+            saveCursor()
+        case "u":
+            restoreCursor()
         case "h", "l":
-            // private modes — alt screen toggle etc.; ignore
-            break
+            if isPrivateMode {
+                setPrivateModes(params, enabled: f == "h")
+            }
         default:
             break
         }
+    }
+
+    private func setPrivateModes(_ params: [Int], enabled: Bool) {
+        for mode in params {
+            switch mode {
+            case 25:
+                cursorVisible = enabled
+            case 47, 1047:
+                if enabled {
+                    enterAlternateScreen()
+                } else {
+                    leaveAlternateScreen()
+                }
+            case 1048:
+                if enabled {
+                    saveCursor()
+                } else {
+                    restoreCursor()
+                }
+            case 1049:
+                if enabled {
+                    enterAlternateScreen(saveNormalCursor: true)
+                } else {
+                    leaveAlternateScreen(restoreNormalCursor: true)
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    private func enterAlternateScreen(saveNormalCursor: Bool = false) {
+        guard !usesAlternateScreen else { return }
+        savedGrid = grid
+        if saveNormalCursor {
+            savedNormalCursor = (cursorRow, cursorCol)
+        }
+        grid = emptyGrid()
+        cursorRow = 0
+        cursorCol = 0
+        usesAlternateScreen = true
+    }
+
+    private func leaveAlternateScreen(restoreNormalCursor: Bool = false) {
+        guard usesAlternateScreen else { return }
+        grid = resized(grid: savedGrid ?? emptyGrid(), rows: rows, cols: cols)
+        savedGrid = nil
+        if restoreNormalCursor, let savedNormalCursor {
+            cursorRow = min(rows - 1, max(0, savedNormalCursor.row))
+            cursorCol = min(cols - 1, max(0, savedNormalCursor.col))
+        } else {
+            cursorRow = min(cursorRow, rows - 1)
+            cursorCol = min(cursorCol, cols - 1)
+        }
+        savedNormalCursor = nil
+        usesAlternateScreen = false
+    }
+
+    private func saveCursor() {
+        savedCursor = (cursorRow, cursorCol)
+    }
+
+    private func restoreCursor() {
+        guard let savedCursor else { return }
+        cursorRow = min(rows - 1, max(0, savedCursor.row))
+        cursorCol = min(cols - 1, max(0, savedCursor.col))
     }
 
     private func parseParams() -> [Int] {
@@ -363,20 +475,22 @@ public final class ANSIRenderer {
         let font = DS.NS.terminalFont()
         let curRow = cursorRow
         let curCol = min(cursorCol, cols - 1)
-        for (i, row) in grid.enumerated() {
+        let allRows = usesAlternateScreen ? grid : scrollback + grid
+        let cursorRenderedRow = usesAlternateScreen ? curRow : scrollback.count + curRow
+        for (i, row) in allRows.enumerated() {
             // Trim trailing empties to keep lines tidy.
             var endCol = row.count - 1
             while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.clear { endCol -= 1 }
             // Always render up to (and including) the cursor on its row
             // so a caret at end-of-line / on a blank line still shows.
-            if showCursor, i == curRow { endCol = max(endCol, curCol) }
+            if showCursor, cursorVisible, i == cursorRenderedRow { endCol = max(endCol, curCol) }
             if endCol < 0 {
-                if i < grid.count - 1 { out.append(NSAttributedString(string: "\n")) }
+                if i < allRows.count - 1 { out.append(NSAttributedString(string: "\n")) }
                 continue
             }
             for c in 0...endCol {
                 let cell = row[c]
-                let isCursor = showCursor && i == curRow && c == curCol
+                let isCursor = showCursor && cursorVisible && i == cursorRenderedRow && c == curCol
                 var fg = cell.fg
                 var bg = cell.bg
                 if isCursor {
@@ -392,7 +506,7 @@ public final class ANSIRenderer {
                 }
                 out.append(NSAttributedString(string: String(cell.ch), attributes: attrs))
             }
-            if i < grid.count - 1 { out.append(NSAttributedString(string: "\n")) }
+            if i < allRows.count - 1 { out.append(NSAttributedString(string: "\n")) }
         }
         return out
     }
@@ -400,7 +514,8 @@ public final class ANSIRenderer {
     public func cursorOffset(in rendered: String) -> Int {
         let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard !lines.isEmpty else { return 0 }
-        let row = min(cursorRow, lines.count - 1)
+        let rowOffset = usesAlternateScreen ? 0 : scrollback.count
+        let row = min(rowOffset + cursorRow, lines.count - 1)
         var offset = 0
         for i in 0..<row {
             offset += (lines[i] as NSString).length + 1
@@ -411,16 +526,40 @@ public final class ANSIRenderer {
 
     public func resize(rows newRows: Int, cols newCols: Int) {
         guard newRows > 0, newCols > 0 else { return }
-        var newGrid = Array(repeating: Array(repeating: Cell.empty, count: newCols), count: newRows)
-        for r in 0..<min(rows, newRows) {
-            for c in 0..<min(cols, newCols) {
-                newGrid[r][c] = grid[r][c]
+        let removedTopRows = max(0, rows - newRows)
+        if removedTopRows > 0, !usesAlternateScreen {
+            for row in grid.prefix(removedTopRows) {
+                appendScrollback(resized(row: Array(row), cols: newCols), preserveBlank: false)
             }
         }
-        grid = newGrid
+        grid = resized(grid: grid, rows: newRows, cols: newCols)
+        if let savedGrid {
+            self.savedGrid = resized(grid: savedGrid, rows: newRows, cols: newCols)
+        }
         rows = newRows
         cols = newCols
-        cursorRow = min(cursorRow, newRows - 1)
+        cursorRow = min(max(0, cursorRow - removedTopRows), newRows - 1)
         cursorCol = min(cursorCol, newCols - 1)
+        if let savedNormalCursor {
+            self.savedNormalCursor = (
+                row: min(max(0, savedNormalCursor.row - removedTopRows), newRows - 1),
+                col: min(savedNormalCursor.col, newCols - 1)
+            )
+        }
+    }
+
+    private func resized(grid oldGrid: [[Cell]], rows newRows: Int, cols newCols: Int) -> [[Cell]] {
+        let keptRows = Array(oldGrid.suffix(min(oldGrid.count, newRows)))
+        var newGrid = keptRows.map { resized(row: $0, cols: newCols) }
+        while newGrid.count < newRows {
+            newGrid.append(Array(repeating: Cell.empty, count: newCols))
+        }
+        return newGrid
+    }
+
+    private func resized(row: [Cell], cols newCols: Int) -> [Cell] {
+        if row.count == newCols { return row }
+        if row.count > newCols { return Array(row.prefix(newCols)) }
+        return row + Array(repeating: Cell.empty, count: newCols - row.count)
     }
 }

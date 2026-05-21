@@ -156,6 +156,7 @@ final class TerminalTextView: NSTextView {
 @MainActor
 private final class TerminalDropContainerView: NSView {
     var onFileDrop: (([String]) -> Void)?
+    var onLayout: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -181,6 +182,16 @@ private final class TerminalDropContainerView: NSView {
         onFileDrop?(paths)
         return true
     }
+
+    override func layout() {
+        super.layout()
+        onLayout?()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onLayout?()
+    }
 }
 
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
@@ -196,13 +207,15 @@ public final class TerminalSurface: NSObject, Surface {
 
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
-    private let textView: TerminalTextView
-    private let scroll: FilePathDropScrollView
+    private let ghosttyView: GhosttyTerminalView
     private var masterFD: Int32 = -1
     private var childPID: pid_t = -1
     private var readSource: DispatchSourceRead?
-    private let renderer = ANSIRenderer(rows: 40, cols: 120)
-    private var pendingFlush = false
+    private let renderer = ANSIRenderer(
+        rows: TerminalViewportGeometry.fallbackSize.rows,
+        cols: TerminalViewportGeometry.fallbackSize.cols
+    )
+    private var terminalSize = TerminalViewportGeometry.fallbackSize
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
 
@@ -250,69 +263,46 @@ public final class TerminalSurface: NSObject, Surface {
             metadata: metadata
         )
 
-        let scroll = FilePathDropScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
-        scroll.drawsBackground = true
-        scroll.backgroundColor = DS.NS.terminalBG
-        scroll.wantsLayer = true
-        scroll.layer?.masksToBounds = true
-        scroll.contentView.wantsLayer = true
-        scroll.contentView.layer?.masksToBounds = true
-
-        let tv = TerminalTextView()
-        tv.registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
-        // Keep NSTextView editable so AppKit treats it as a live text drop target.
-        // Local text mutations are still blocked by insertText/doCommand/keyDown.
-        tv.isEditable = true
-        tv.isSelectable = true
-        tv.font = DS.NS.terminalFont()
-        tv.backgroundColor = DS.NS.terminalBG
-        tv.textColor = DS.NS.terminalFG
-        tv.drawsBackground = true
-        tv.selectedTextAttributes = [
-            .backgroundColor: DS.NS.accent.withAlphaComponent(0.26),
-            .foregroundColor: DS.NS.terminalFG
-        ]
-        tv.isAutomaticQuoteSubstitutionEnabled = false
-        tv.isAutomaticDashSubstitutionEnabled = false
-        tv.isAutomaticTextReplacementEnabled = false
-        tv.isAutomaticSpellingCorrectionEnabled = false
-        tv.minSize = NSSize(width: 0, height: 0)
-        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        tv.isVerticallyResizable = true
-        tv.textContainerInset = NSSize(width: 10, height: 10)
-        tv.textContainer?.widthTracksTextView = true
-        scroll.documentView = tv
-        self.textView = tv
-        self.scroll = scroll
-
-        let container = TerminalDropContainerView()
+        // Match cmux/Ghostty's defensive startup sizing: begin with a
+        // non-zero view so AppKit has real bounds before the first resize.
+        let initialFrame = NSRect(
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600
+        )
+        let terminalView = GhosttyTerminalView(frame: initialFrame)
+        terminalView.translatesAutoresizingMaskIntoConstraints = false
+        self.ghosttyView = terminalView
+        let container = TerminalDropContainerView(frame: initialFrame)
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.terminalBG.cgColor
         container.layer?.masksToBounds = true
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(scroll)
+        container.addSubview(terminalView)
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: container.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            terminalView.topAnchor.constraint(equalTo: container.topAnchor),
+            terminalView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            terminalView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            terminalView.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         self.view = container
 
         super.init()
 
-        tv.onKey = { [weak self] data in self?.writeToPTY(data) }
-        scroll.onFileDrop = { [weak self] paths in
-            guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return }
-            self?.writeToPTY(data)
+        terminalView.onInputData = { [weak self] data in self?.writeToPTY(data) }
+        terminalView.onTerminalSizeChange = { [weak self] size in
+            guard let self else { return }
+            self.applyTerminalSize(size, sendToPTY: self.masterFD >= 0)
         }
         container.onFileDrop = { [weak self] paths in
             guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return }
             self?.writeToPTY(data)
         }
+        container.onLayout = { [weak self] in
+            self?.ghosttyView.forceRefresh()
+        }
+        applyTerminalSize(TerminalViewportGeometry.fallbackSize, sendToPTY: false, force: true)
 
         if case .sshPlaceholder = launch {
             appendString("[ssh disconnected]\nSelect a saved SSH host or add a new one to connect.\n")
@@ -330,7 +320,8 @@ public final class TerminalSurface: NSObject, Surface {
             setenv("TERM", "xterm-256color", 1)
             setenv("COLORTERM", "truecolor", 1)
             setenv("CLICOLOR", "1", 1)
-            setenv("TERM_PROGRAM", "RemoteCode", 1)
+            unsetenv("NO_COLOR")
+            setenv("TERM_PROGRAM", "ghostty", 1)
             setenv("RC2_WORKSPACE_ID", workspaceID.value.uuidString, 1)
             setenv("RC2_SURFACE_ID", descriptor.id.value.uuidString, 1)
             if getenv("LANG") == nil {
@@ -361,8 +352,17 @@ public final class TerminalSurface: NSObject, Surface {
         }
         self.masterFD = amaster
         self.childPID = pid
-        _ = rc2_set_winsize(masterFD, 40, 120)
+        applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
+    }
+
+    private func applyTerminalSize(_ size: TerminalViewportSize, sendToPTY: Bool, force: Bool = false) {
+        guard force || size != terminalSize else { return }
+        terminalSize = size
+        renderer.resize(rows: size.rows, cols: size.cols)
+        if sendToPTY, masterFD >= 0 {
+            _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
+        }
     }
 
     private func startReader() {
@@ -385,36 +385,14 @@ public final class TerminalSurface: NSObject, Surface {
         descriptor.hasUnreadActivity = true
         // HC-1: stream raw PTY output to the mirror in real time.
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        scheduleFlush()
-    }
-
-    private func scheduleFlush() {
-        if pendingFlush { return }
-        pendingFlush = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.pendingFlush = false
-            let snap = self.renderer.snapshot()
-            // Preserve the user's selection across redraws when possible.
-            let sel = self.textView.selectedRange()
-            self.textView.textStorage?.setAttributedString(snap)
-            if sel.location + sel.length <= (self.textView.string as NSString).length {
-                self.textView.setSelectedRange(sel)
-            }
-            self.scrollCursorToVisible(in: snap)
-        }
-    }
-
-    private func scrollCursorToVisible(in snap: NSAttributedString) {
-        let location = renderer.cursorOffset(in: snap.string)
-        textView.scrollRangeToVisible(NSRange(location: location, length: 0))
+        ghosttyView.processOutput(data)
     }
 
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
         renderer.feed(data)
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        scheduleFlush()
+        ghosttyView.processOutput(data)
     }
 
     public func appendSystemText(_ raw: String) {
@@ -444,11 +422,12 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func readText() -> String {
-        textView.string
+        renderer.snapshot().string
     }
 
     public func focus() {
-        view.window?.makeFirstResponder(textView)
+        view.window?.makeFirstResponder(ghosttyView)
+        ghosttyView.forceRefresh()
         descriptor.hasUnreadActivity = false
     }
 
@@ -462,9 +441,10 @@ public final class TerminalSurface: NSObject, Surface {
             Darwin.close(masterFD)
             masterFD = -1
         }
+        ghosttyView.closeSurface()
     }
 
     public func snapshot() -> [String: String] {
-        ["cwd": descriptor.metadata["cwd"] ?? "", "scrollback_chars": String(textView.string.count)]
+        ["cwd": descriptor.metadata["cwd"] ?? "", "scrollback_chars": String(readText().count)]
     }
 }

@@ -167,6 +167,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private static let sidebarWidthSettingsKey = "sidebar.width"
     private var sidebarWidth: CGFloat = MainWindowController.defaultSidebarWidth
     private var didApplyInitialSidebarWidth = false
+    private var isApplyingInitialSidebarWidth = false
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -287,10 +288,15 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         ])
         window.contentView = content
         // give sidebar a default size
-        DispatchQueue.main.async {
-            self.split.setPosition(self.sidebarWidth, ofDividerAt: 0)
-            self.didApplyInitialSidebarWidth = true
-        }
+        DispatchQueue.main.async { self.applyInitialSidebarWidthIfNeeded() }
+    }
+
+    private func applyInitialSidebarWidthIfNeeded() {
+        guard !didApplyInitialSidebarWidth else { return }
+        isApplyingInitialSidebarWidth = true
+        didApplyInitialSidebarWidth = true
+        split.setPosition(sidebarWidth, ofDividerAt: 0)
+        isApplyingInitialSidebarWidth = false
     }
 
     public func show() {
@@ -708,9 +714,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     public func splitViewDidResizeSubviews(_ notification: Notification) {
         guard let splitView = notification.object as? NSSplitView,
-              splitView === split,
-              didApplyInitialSidebarWidth,
-              !sidebarCollapsed else { return }
+              splitView === split else { return }
+        guard didApplyInitialSidebarWidth else {
+            applyInitialSidebarWidthIfNeeded()
+            return
+        }
+        guard !isApplyingInitialSidebarWidth, !sidebarCollapsed else { return }
         sidebarWidth = sidebar.view.frame.width
         try? context?.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(sidebarWidth))")
     }

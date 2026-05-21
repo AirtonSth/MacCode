@@ -101,6 +101,66 @@ final class ANSIRendererTests: XCTestCase {
         XCTAssertEqual(r.grid[1][0].ch, "c")
     }
 
+    func test_snapshotKeepsScrollableHistoryWithColorsAfterOverflow() {
+        let r = ANSIRenderer(rows: 2, cols: 12)
+        r.showCursor = false
+
+        r.feed("\u{1B}[31mold-red\u{1B}[0m\nplain\nlive".data(using: .utf8)!)
+
+        let snap = r.snapshot()
+        XCTAssertTrue(snap.string.hasPrefix("old-red\nplain\nlive"),
+                      "terminal scrollback must keep older output instead of dropping it when the visible grid overflows")
+        let attrs = snap.attributes(at: 0, effectiveRange: nil)
+        let fg = attrs[.foregroundColor] as? NSColor
+        XCTAssertNotEqual(fg, ANSIRenderer.Cell.defaultFG,
+                          "ANSI colors in scrollback must survive into the NSTextView attributes")
+    }
+
+    func test_alternateScreenHidesShellScrollbackWhileTUIIsActive() {
+        let r = ANSIRenderer(rows: 8, cols: 20)
+        r.showCursor = false
+
+        r.feed("shell-history\n\u{1B}[?1049h\u{1B}[HClaude Code\n> ".data(using: .utf8)!)
+
+        let snap = r.snapshot()
+        XCTAssertTrue(r.usesAlternateScreen,
+                      "full-screen TUIs should switch the terminal renderer into alternate-screen mode")
+        XCTAssertTrue(snap.string.hasPrefix("Claude Code\n>"),
+                      "TUI content must own the viewport like cmux/Ghostty instead of rendering below prior shell output. Got: \(snap.string.debugDescription)")
+        XCTAssertFalse(snap.string.contains("shell-history"),
+                       "alternate-screen content must be isolated from shell scrollback while the TUI is active")
+    }
+
+    func test_alternateScreenExitRestoresShellAndCursorPosition() {
+        let r = ANSIRenderer(rows: 5, cols: 20)
+        r.showCursor = false
+
+        r.feed("shell\u{1B}[?1049h\u{1B}[HTUI\u{1B}[?1049l-after".data(using: .utf8)!)
+
+        XCTAssertFalse(r.usesAlternateScreen)
+        XCTAssertTrue(r.snapshot().string.hasPrefix("shell-after"),
+                      "exiting a full-screen TUI must restore the shell screen and continue output at the saved cursor")
+    }
+
+    func test_privateCursorVisibilityModeHidesRenderedCursorCell() {
+        let r = ANSIRenderer(rows: 2, cols: 10)
+
+        r.feed("ab\u{1B}[?25l".data(using: .utf8)!)
+
+        XCTAssertEqual(r.snapshot().string.split(separator: "\n", omittingEmptySubsequences: false).first.map(String.init), "ab",
+                       "private cursor hide mode must remove the synthetic cursor block from rendered output")
+    }
+
+    func test_resizeDoesNotRecordInitialBlankRowsAsScrollback() {
+        let r = ANSIRenderer(rows: 40, cols: 120)
+        r.showCursor = false
+
+        r.resize(rows: 1, cols: 120)
+
+        XCTAssertEqual(r.scrollback.count, 0,
+                       "first-layout resize must not create fake blank scrollback above the initial shell prompt")
+    }
+
     func test_cursorOffset_usesCursorRowNotTrailingBlankRows() {
         let r = ANSIRenderer(rows: 5, cols: 20)
         r.feed("prompt".data(using: .utf8)!)

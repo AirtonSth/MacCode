@@ -18,6 +18,10 @@ let package = Package(
     ],
     dependencies: [],
     targets: [
+        .binaryTarget(
+            name: "GhosttyKit",
+            path: "Vendor/GhosttyKit.xcframework"
+        ),
         .target(
             name: "CSystem",
             path: "Sources/CSystem",
@@ -51,8 +55,20 @@ let package = Package(
         ),
         .target(
             name: "Surfaces",
-            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "CSystem", "DesignSystemKit"],
-            path: "Sources/Surfaces"
+            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "CSystem", "DesignSystemKit", "GhosttyKit"],
+            path: "Sources/Surfaces",
+            resources: [
+                .copy("Resources/ghostty")
+            ],
+            linkerSettings: [
+                .linkedLibrary("c++"),
+                .linkedFramework("Metal"),
+                .linkedFramework("QuartzCore"),
+                .linkedFramework("IOSurface"),
+                .linkedFramework("UniformTypeIdentifiers"),
+                .linkedFramework("Carbon"),
+                .linkedFramework("GameController")
+            ]
         ),
         .executableTarget(
             name: "AppShell",

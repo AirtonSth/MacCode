@@ -34,9 +34,30 @@ final class TerminalEncodeTests: XCTestCase {
         XCTAssertEqual(TerminalTextView.encode(e), Data([0x03]))   // Ctrl-C → 0x03
     }
 
+    func test_ghosttyCtrlC_usesUnmodifiedTextForTerminalInterrupt() {
+        let e = key(8, chars: "\u{03}", ignoring: "c", flags: [.control])
+
+        XCTAssertEqual(GhosttyTerminalKeyInput.text(for: e), "c",
+                       "Ctrl-C must be delivered to Ghostty as the C key plus the Control modifier so Ghostty encodes ETX instead of printable CSI-u text")
+    }
+
     func test_ctrlD_isEOT() {
         let e = key(2, chars: "d", ignoring: "d", flags: [.control])
         XCTAssertEqual(TerminalTextView.encode(e), Data([0x04]))   // Ctrl-D → 0x04
+    }
+
+    func test_ghosttyCtrlD_usesUnmodifiedTextForTerminalEOF() {
+        let e = key(2, chars: "\u{04}", ignoring: "d", flags: [.control])
+
+        XCTAssertEqual(GhosttyTerminalKeyInput.text(for: e), "d",
+                       "Ctrl-D must stay key-based terminal control input so shells receive EOF instead of literal text")
+    }
+
+    func test_ghosttyPlainEscape_doesNotSendControlText() {
+        let e = key(53, chars: "\u{1B}", ignoring: "\u{1B}")
+
+        XCTAssertNil(GhosttyTerminalKeyInput.text(for: e),
+                     "Plain Escape is a key event, not printable text; sending it as text confuses TUI shortcut handling")
     }
 
     func test_optionAsMeta_prefixesEsc() {

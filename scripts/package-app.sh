@@ -17,9 +17,11 @@ fi
 
 echo "[package] building $CONFIG …"
 swift build -c "$CONFIG"
+BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
-BIN=".build/$CONFIG/RemoteCode"
-CLI=".build/$CONFIG/rc2"
+BIN="$BIN_DIR/RemoteCode"
+CLI="$BIN_DIR/rc2"
+SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 
 rm -rf "$DIST/$BUNDLE"
@@ -29,6 +31,9 @@ mkdir -p "$DIST/$BUNDLE/Contents/Resources"
 cp "$BIN" "$DIST/$BUNDLE/Contents/MacOS/RemoteCode"
 if [ -x "$CLI" ]; then
   cp "$CLI" "$DIST/$BUNDLE/Contents/MacOS/rc2"
+fi
+if [ -d "$SURFACES_RESOURCES" ]; then
+  cp -R "$SURFACES_RESOURCES" "$DIST/$BUNDLE/RemoteCode_Surfaces.bundle"
 fi
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$DIST/$BUNDLE/Contents/Resources/AppIcon.icns"
