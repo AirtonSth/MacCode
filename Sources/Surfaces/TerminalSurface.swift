@@ -422,7 +422,7 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func readText() -> String {
-        renderer.snapshot().string
+        ghosttyView.readViewportText() ?? renderer.snapshot().string
     }
 
     public func focus() {

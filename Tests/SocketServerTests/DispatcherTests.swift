@@ -59,7 +59,8 @@ final class FakeRouter: CommandRouting {
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {}
     func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {}
     func setSurfaceColor(_ wid: WorkspaceID, _ sid: SurfaceID, _ color: String) throws {}
-    func sendText(surface: SurfaceID, text: String) throws {}
+    var sentSurfaceText: [(SurfaceID, String)] = []
+    func sendText(surface: SurfaceID, text: String) throws { sentSurfaceText.append((surface, text)) }
     func readText(surface: SurfaceID) throws -> String { "" }
     func surfaceHealth(surface: SurfaceID) -> Bool { true }
     func surfaceClearHistory(surface: SurfaceID) {}
@@ -398,6 +399,22 @@ final class DispatcherTests: XCTestCase {
         ]))
         guard case .object(let downloadResult)? = download.result else { return XCTFail("download must return an object") }
         XCTAssertEqual(downloadResult["ok"], .bool(true), "download must be exposed as a host-owned terminal/scp RPC")
+    }
+
+    @MainActor
+    func test_surfaceSendKeyCtrlCMapsToInterruptByte() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let sid = SurfaceID()
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.send_key", params: [
+            "id": .string(sid.value.uuidString),
+            "key": .string("ctrl-c")
+        ]))
+
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(router.sentSurfaceText.first?.1, "\u{03}",
+                       "iOS Ctrl-C must reach the macOS PTY as ETX so Claude cancels instead of receiving printable CSI-u text")
     }
 
     @MainActor

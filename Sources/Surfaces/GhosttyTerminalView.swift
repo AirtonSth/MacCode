@@ -375,6 +375,40 @@ final class GhosttyTerminalView: NSView {
         }
     }
 
+    func readViewportText() -> String? {
+        readText(pointTag: GHOSTTY_POINT_VIEWPORT)
+    }
+
+    private func readText(pointTag: ghostty_point_tag_e) -> String? {
+        ensureSurface()
+        guard let surface else { return nil }
+        ghostty_surface_render_now(surface)
+
+        let topLeft = ghostty_point_s(
+            tag: pointTag,
+            coord: GHOSTTY_POINT_COORD_TOP_LEFT,
+            x: 0,
+            y: 0
+        )
+        let bottomRight = ghostty_point_s(
+            tag: pointTag,
+            coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+            x: 0,
+            y: 0
+        )
+        let selection = ghostty_selection_s(
+            top_left: topLeft,
+            bottom_right: bottomRight,
+            rectangle: false
+        )
+
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let ptr = text.text, text.text_len > 0 else { return "" }
+        return String(decoding: Data(bytes: ptr, count: Int(text.text_len)), as: UTF8.self)
+    }
+
     private func ensureSurface() {
         guard surface == nil else { return }
         guard window != nil else { return }
