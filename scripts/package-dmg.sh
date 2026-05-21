@@ -9,7 +9,12 @@ DIST="dist"
 APP_NAME="RemoteCode.app"
 DMG_ROOT="$DIST/dmg-root"
 OUTPUT="$DIST/$ASSET_NAME"
-SIGN_IDENTITY="${RC2_CODESIGN_IDENTITY:--}"
+SIGN_IDENTITY="${RC2_CODESIGN_IDENTITY:-}"
+
+if [[ "$SIGN_IDENTITY" != Developer\ ID\ Application:* ]]; then
+  echo "[package] RC2_CODESIGN_IDENTITY must be a Developer ID Application identity" >&2
+  exit 1
+fi
 
 "$(dirname "$0")/package-app.sh"
 

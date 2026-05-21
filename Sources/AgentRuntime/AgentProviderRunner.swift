@@ -31,6 +31,22 @@ public final class AgentRunHandle: @unchecked Sendable {
     }
 }
 
+final class AgentCancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 enum ProcessTerminator {
     static func terminateTree(_ process: Process) {
         let root = process.processIdentifier

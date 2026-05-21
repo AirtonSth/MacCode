@@ -136,8 +136,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let parser = CodexParser()
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
-        let cancelLock = NSLock()
-        var didCancel = false
+        let cancelFlag = AgentCancelFlag()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -173,10 +172,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
                 }
             }
             let status: AgentRunStatus
-            cancelLock.lock()
-            let cancelled = didCancel
-            cancelLock.unlock()
-            if cancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
+            if cancelFlag.isCancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
             else if p.terminationStatus == 0 { status = .completed }
             else { status = .failed }
             let finalMsg = timeline.finalAssistantMessage
@@ -194,9 +190,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         return AgentRunHandle(runId: request.runId, process: proc) {
-            cancelLock.lock()
-            didCancel = true
-            cancelLock.unlock()
+            cancelFlag.cancel()
             ProcessTerminator.terminateTree(proc)
         }
     }
