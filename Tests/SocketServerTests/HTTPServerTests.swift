@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import SocketServer
 
 final class HTTPServerTests: XCTestCase {
@@ -98,5 +99,84 @@ final class HTTPServerTests: XCTestCase {
         }.resume()
 
         wait(for: [served, blocked], timeout: 4)
+    }
+
+    @MainActor
+    func test_httpRejectsOversizedBodyFromContentLengthBeforeBodyRead() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher)
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let fd = try connectLocalhost(port: port)
+        defer { Darwin.close(fd) }
+        let request = """
+        POST /v1/rpc HTTP/1.1\r
+        Host: 127.0.0.1:\(port)\r
+        Content-Length: \(DirectHTTPServer.maxRequestBodyBytes + 1)\r
+        \r
+
+        """
+        try writeAll(fd: fd, data: Data(request.utf8))
+        let response = readResponse(fd: fd)
+
+        XCTAssertTrue(
+            response.hasPrefix("HTTP/1.1 413"),
+            "oversized iOS/HTTP requests must be rejected from Content-Length instead of buffering the body into Mac memory"
+        )
+    }
+
+    func test_webSocketPongFrameClampsOversizedPingPayload() {
+        let frame = DirectHTTPServer.pongFrame(payload: Data(repeating: 0x41, count: 300))
+
+        XCTAssertEqual(frame.first, 0x8A, "server pong frames must stay valid websocket control frames")
+        XCTAssertEqual(frame.dropFirst().first, 125, "oversized ping payloads must not trap while converting the pong length to UInt8")
+        XCTAssertEqual(frame.count, 127)
+    }
+
+    private func connectLocalhost(port: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let rc = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        if rc < 0 {
+            Darwin.close(fd)
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return fd
+    }
+
+    private func writeAll(fd: Int32, data: Data) throws {
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let n = Darwin.write(fd, base.advanced(by: written), data.count - written)
+                if n < 0, errno == EINTR { continue }
+                if n <= 0 {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                written += n
+            }
+        }
+    }
+
+    private func readResponse(fd: Int32) -> String {
+        var out = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = read(fd, &buf, buf.count)
+            if n <= 0 { break }
+            out.append(buf, count: n)
+            if out.range(of: Data("\r\n\r\n".utf8)) != nil { break }
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 }

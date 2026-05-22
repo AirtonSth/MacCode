@@ -34,6 +34,10 @@ public extension DirectAuthProvider {
 }
 
 public final class DirectHTTPServer: @unchecked Sendable {
+    static let maxRequestHeaderBytes = 64 * 1024
+    static let maxRequestBodyBytes = 1024 * 1024
+    static let maxClientFramePayloadBytes = 1024 * 1024
+
     public let port: UInt16
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
@@ -100,8 +104,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
             var clen = socklen_t(MemoryLayout<sockaddr>.size)
             let fd = Darwin.accept(listenFD, &caddr, &clen)
             if fd < 0 { if !running { return }; continue }
+            disableSIGPIPE(fd: fd)
             DispatchQueue.global().async { [weak self] in self?.handle(fd: fd) }
         }
+    }
+
+    private func disableSIGPIPE(fd: Int32) {
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
     }
 
     private func handle(fd: Int32) {
@@ -116,6 +126,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let n = read(fd, &tmp, tmp.count)
             if n <= 0 { return }
             buffer.append(tmp, count: n)
+            if buffer.count > Self.maxRequestHeaderBytes {
+                send(fd: fd, status: 431, contentType: "text/plain", body: Data("request header too large\n".utf8))
+                return
+            }
             if buffer.range(of: Data("\r\n\r\n".utf8)) != nil { break }
         }
         guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else { return }
@@ -141,7 +155,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         // Read remaining body bytes if Content-Length declares more
         // than we already have.
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        let contentLength: Int
+        if let rawContentLength = headers["content-length"] {
+            guard let parsed = Int(rawContentLength), parsed >= 0 else {
+                send(fd: fd, status: 400, contentType: "text/plain", body: Data("bad content length\n".utf8))
+                return
+            }
+            contentLength = parsed
+        } else {
+            contentLength = 0
+        }
+        guard contentLength <= Self.maxRequestBodyBytes else {
+            send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+            return
+        }
         let bodyStartAbsolute = headerEnd.upperBound
         var bodyHave = buffer.count - bodyStartAbsolute
         while running, bodyHave < contentLength {
@@ -177,16 +204,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
             subID = id
             // keep connection open; read incoming frames (ping/pong/close)
             wsServeLoop(fd: fd, writeQueue: wsQueue)
+            wsQueue.sync {}
             return
         }
 
         if method == "GET", path.hasPrefix(DirectStaticFileRegistry.routePrefix) {
-            guard let file = DirectStaticFileRegistry.shared.resolve(routePath: path),
-                  let data = try? Data(contentsOf: file.url) else {
+            guard let file = DirectStaticFileRegistry.shared.resolve(routePath: path) else {
                 send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
                 return
             }
-            send(fd: fd, status: 200, contentType: file.contentType, body: data)
+            sendFile(fd: fd, status: 200, contentType: file.contentType, url: file.url)
             return
         }
 
@@ -338,7 +365,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
         var out = Data(head.utf8)
         out.append(body)
-        out.withUnsafeBytes { ptr in _ = Darwin.write(fd, ptr.baseAddress, out.count) }
+        _ = writeAll(fd: fd, data: out)
+    }
+
+    private func sendFile(fd: Int32, status: Int, contentType: String, url: URL) {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            send(fd: fd, status: 404, contentType: "text/plain", body: Data("not found\n".utf8))
+            return
+        }
+        defer { try? handle.close() }
+        let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(size)\r\nConnection: close\r\n\r\n"
+        guard writeAll(fd: fd, data: Data(head.utf8)) else { return }
+        while true {
+            guard let chunk = try? handle.read(upToCount: 64 * 1024), !chunk.isEmpty else { return }
+            guard writeAll(fd: fd, data: chunk) else { return }
+        }
     }
 
     private func sendJSON(fd: Int32, status: Int, body: [String: Any]) {
@@ -347,7 +390,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func reasonPhrase(_ s: Int) -> String {
-        switch s { case 200: return "OK"; case 404: return "Not Found"; case 101: return "Switching Protocols"; default: return "OK" }
+        switch s {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 404: return "Not Found"
+        case 413: return "Payload Too Large"
+        case 431: return "Request Header Fields Too Large"
+        case 101: return "Switching Protocols"
+        default: return "OK"
+        }
     }
 
     // MARK: WebSocket
@@ -360,7 +411,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let accept = Data(digest).base64EncodedString()
         let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n"
         let data = Data(head.utf8)
-        data.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, data.count) }
+        _ = writeAll(fd: fd, data: data)
     }
 
     private func sendWSText(fd: Int32, data: Data) {
@@ -380,7 +431,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
         }
         frame.append(data)
-        frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
+        _ = writeAll(fd: fd, data: frame)
     }
 
     private func wsServeLoop(fd: Int32, writeQueue: DispatchQueue) {
@@ -396,6 +447,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 case 0x8: // close
                     writeQueue.sync { sendCloseFrame(fd: fd) }; return
                 case 0x9: // ping -> pong
+                    guard frame.payload.count <= 125 else {
+                        writeQueue.sync { sendCloseFrame(fd: fd) }
+                        return
+                    }
                     writeQueue.async { self.sendPongFrame(fd: fd, payload: frame.payload) }
                 case 0xA: // pong
                     continue
@@ -423,9 +478,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             idx = 4
         } else if len == 127 {
             guard buf.count >= 10 else { return nil }
-            len = 0
-            for i in 0..<8 { len = (len << 8) | Int(buf[buf.index(buf.startIndex, offsetBy: 2 + i)]) }
+            var wideLen: UInt64 = 0
+            for i in 0..<8 {
+                wideLen = (wideLen << 8) | UInt64(buf[buf.index(buf.startIndex, offsetBy: 2 + i)])
+            }
+            guard wideLen <= UInt64(Int.max) else {
+                return (WSFrame(opcode: 0x8, payload: Data()), 10)
+            }
+            len = Int(wideLen)
             idx = 10
+        }
+        if len > Self.maxClientFramePayloadBytes {
+            return (WSFrame(opcode: 0x8, payload: Data()), idx)
         }
         var maskKey: [UInt8] = [0, 0, 0, 0]
         if masked {
@@ -443,18 +507,38 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func sendPongFrame(fd: Int32, payload: Data) {
+        let frame = Self.pongFrame(payload: payload)
+        _ = writeAll(fd: fd, data: frame)
+    }
+
+    static func pongFrame(payload: Data) -> Data {
+        let safePayload = payload.prefix(125)
         var frame = Data()
         frame.append(0x8A) // FIN + pong
-        frame.append(UInt8(payload.count))
-        frame.append(payload)
-        frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
+        frame.append(UInt8(safePayload.count))
+        frame.append(safePayload)
+        return frame
     }
 
     private func sendCloseFrame(fd: Int32) {
         var frame = Data()
         frame.append(0x88) // FIN + close
         frame.append(0x00) // empty payload
-        frame.withUnsafeBytes { _ = Darwin.write(fd, $0.baseAddress, frame.count) }
+        _ = writeAll(fd: fd, data: frame)
+    }
+
+    private func writeAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return true }
+            var written = 0
+            while written < data.count {
+                let n = Darwin.write(fd, base.advanced(by: written), data.count - written)
+                if n < 0, errno == EINTR { continue }
+                if n <= 0 { return false }
+                written += n
+            }
+            return true
+        }
     }
 
     static func jsonValueToAny(_ v: JSONValue) -> Any {

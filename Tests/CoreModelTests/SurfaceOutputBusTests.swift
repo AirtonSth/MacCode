@@ -1,0 +1,28 @@
+import XCTest
+@testable import CoreModel
+
+final class SurfaceOutputBusTests: XCTestCase {
+    func testBurstTerminalOutputIsBatchedBeforeMirrorDelivery() {
+        let bus = SurfaceOutputBus()
+        let surfaceID = SurfaceID()
+        let delivered = expectation(description: "batched terminal output delivered")
+        var chunks: [String] = []
+
+        bus.sink = { id, data in
+            guard id == surfaceID else { return }
+            chunks.append(String(decoding: data, as: UTF8.self))
+            delivered.fulfill()
+        }
+
+        bus.emit(surfaceID, Data("long ".utf8))
+        bus.emit(surfaceID, Data("command ".utf8))
+        bus.emit(surfaceID, Data("output".utf8))
+
+        XCTAssertTrue(
+            chunks.isEmpty,
+            "Burst terminal output should not synchronously fan out one mirror event per PTY read; batching protects the Mac UI and iOS mirror during noisy commands."
+        )
+        wait(for: [delivered], timeout: 1.0)
+        XCTAssertEqual(chunks, ["long command output"])
+    }
+}

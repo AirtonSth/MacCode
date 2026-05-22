@@ -307,7 +307,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             throw JSONRPCError(code: -32602, message: reason, data: read)
         }
         let encoding = body["encoding"]?.stringValue ?? "utf-8"
-        let data = try Data(contentsOf: URL(fileURLWithPath: absPath))
+        let data = try readEditableFileData(path: absPath)
         let id = UUID().uuidString
         let session = Session(
             id: id,
@@ -369,7 +369,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             throw JSONRPCError(code: -32602, message: "edit session not found", data: .string(sessionID))
         }
         do {
-            let currentData = try Data(contentsOf: URL(fileURLWithPath: session.path))
+            let currentData = try readEditableFileData(path: session.path)
             guard hash(currentData) == session.baseHash else {
                 let payload = sessionJSON(session, includeContent: true)
                 lock.unlock()
@@ -399,7 +399,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             throw JSONRPCError(code: -32602, message: "edit session not found", data: .string(sessionID))
         }
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: session.path))
+            let data = try readEditableFileData(path: session.path)
             let decoded = try decodeText(data)
             session.draftText = decoded.text
             session.encoding = decoded.encoding
@@ -434,6 +434,16 @@ public final class FileEditSessionStore: @unchecked Sendable {
         let session = sessions[sessionID]
         lock.unlock()
         return session.map { .object(sessionJSON($0, includeContent: true)) }
+    }
+
+    private func readEditableFileData(path: String) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: WorkspaceFileLimits.editBytes + 1) ?? Data()
+        guard data.count <= WorkspaceFileLimits.editBytes else {
+            throw JSONRPCError(code: -32602, message: "file is too large to edit", data: .string(path))
+        }
+        return data
     }
 
     private func sessionJSON(_ s: Session, includeContent: Bool, patch: [String: JSONValue]? = nil, updatedBy: String? = nil) -> [String: JSONValue] {

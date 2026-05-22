@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import SocketServer
 
 final class WorkspaceFileServiceTests: XCTestCase {
@@ -62,5 +63,23 @@ final class WorkspaceFileServiceTests: XCTestCase {
         XCTAssertEqual(identity["kind"]?.stringValue, "binary")
         XCTAssertNil(read.objectValue?["content"]?.stringValue,
                      "unknown binary files must show metadata only; decoding arbitrary bytes can corrupt the reader and editor")
+    }
+
+    func testEditSaveRejectsExternallyGrownFileBeforeReadingWholeFile() throws {
+        let file = root.appendingPathComponent("notes.txt")
+        try "small".write(to: file, atomically: true, encoding: .utf8)
+        let opened = try FileEditSessionStore.shared.open(
+            surfaceID: SurfaceID(),
+            workspaceID: WorkspaceID(),
+            root: root.path,
+            path: "notes.txt"
+        )
+        let sessionID = try XCTUnwrap(opened.objectValue?["session_id"]?.stringValue)
+        defer { _ = try? FileEditSessionStore.shared.close(sessionID: sessionID) }
+
+        try Data(repeating: 0x61, count: WorkspaceFileLimits.editBytes + 1).write(to: file)
+
+        XCTAssertThrowsError(try FileEditSessionStore.shared.save(sessionID: sessionID),
+                             "save conflict checks must not read an externally-grown file without the edit size cap")
     }
 }

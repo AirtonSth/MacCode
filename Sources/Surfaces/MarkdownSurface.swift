@@ -5,6 +5,8 @@ import CoreModel
 
 @MainActor
 public final class MarkdownSurface: NSObject, Surface {
+    private nonisolated static let maxMarkdownBytes = 512 * 1024
+
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     private let webView: WKWebView
@@ -47,14 +49,27 @@ public final class MarkdownSurface: NSObject, Surface {
     }
 
     private func loadAndRender() {
-        let body: String
-        if let p = filePath, let content = try? String(contentsOfFile: p, encoding: .utf8) {
-            body = content
-        } else {
-            body = "# Markdown Preview\n\nNo file loaded."
-        }
+        let body = Self.loadMarkdownBody(filePath: filePath)
         let html = Self.renderHTML(markdown: body)
         webView.loadHTMLString(html, baseURL: filePath.flatMap { URL(fileURLWithPath: $0).deletingLastPathComponent() })
+    }
+
+    static func loadMarkdownBody(filePath: String?, maxBytes: Int = MarkdownSurface.maxMarkdownBytes) -> String {
+        guard let path = filePath,
+              let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return "# Markdown Preview\n\nNo file loaded."
+        }
+        defer { try? handle.close() }
+        let limit = max(1, maxBytes)
+        let data = (try? handle.read(upToCount: limit + 1)) ?? Data()
+        let clipped = Data(data.prefix(limit))
+        guard var body = String(data: clipped, encoding: .utf8) else {
+            return "# Markdown Preview\n\nUnable to render this file as UTF-8 markdown."
+        }
+        if data.count > limit {
+            body += "\n\n---\n\n_Preview truncated after \(limit) bytes._"
+        }
+        return body
     }
 
     /// Minimal Markdown -> HTML translator. Handles headings, code fences,

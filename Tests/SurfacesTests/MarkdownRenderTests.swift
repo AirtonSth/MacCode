@@ -24,4 +24,16 @@ final class MarkdownRenderTests: XCTestCase {
         let html = MarkdownSurface.renderHTML(markdown: "[foo](https://x.y)")
         XCTAssertTrue(html.contains("<a href=\"https://x.y\">foo</a>"))
     }
+
+    @MainActor func test_markdownPreviewReadsBoundedPrefixForLargeFiles() throws {
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-large-markdown-\(UUID().uuidString).md")
+        try ("# title\n" + String(repeating: "a", count: 128)).write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let body = MarkdownSurface.loadMarkdownBody(filePath: file.path, maxBytes: 32)
+
+        XCTAssertTrue(body.hasPrefix("# title"), "markdown preview should still render the useful beginning of a large file")
+        XCTAssertTrue(body.contains("Preview truncated"), "large markdown previews must disclose truncation instead of reading the whole file into memory")
+    }
 }

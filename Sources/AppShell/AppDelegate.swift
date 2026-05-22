@@ -49,7 +49,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Wire EventBus to the persisted event log so events survive restart.
         let log = context.eventLog
+        EventBus.shared.shouldRetainRecentEvent = { ev in
+            Self.shouldRetainRecentEvent(ev)
+        }
         EventBus.shared.persister = { ev in
+            guard Self.shouldPersistEvent(ev) else { return }
             let payloadData = (try? JSONEncoder().encode(ev.payload)) ?? Data("null".utf8)
             let json = String(data: payloadData, encoding: .utf8) ?? "null"
             _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
@@ -111,6 +115,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         httpServer?.stop()
         bonjour?.stop()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    static func shouldPersistEvent(_ event: EventBus.Event) -> Bool {
+        event.kind != "surface.output"
+    }
+
+    static func shouldRetainRecentEvent(_ event: EventBus.Event) -> Bool {
+        event.kind != "surface.output"
     }
 
     @objc private func remoteAccessSettingChanged() {

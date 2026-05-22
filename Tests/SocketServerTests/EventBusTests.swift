@@ -26,6 +26,24 @@ final class EventBusTests: XCTestCase {
         XCTAssertEqual(received.map(\.kind), ["c"])
     }
 
+    func test_liveOnlyEventsAreDeliveredButNotReplayed() {
+        let bus = EventBus()
+        bus.shouldRetainRecentEvent = { $0.kind != "surface.output" }
+        var live: [String] = []
+        _ = bus.subscribe(since: nil) { live.append($0.kind) }
+
+        bus.publish(kind: "surface.output", payload: .string("chunk"))
+        bus.publish(kind: "surface.created", payload: .null)
+
+        var replayed: [String] = []
+        _ = bus.subscribe(since: 0) { replayed.append($0.kind) }
+
+        XCTAssertEqual(live, ["surface.output", "surface.created"],
+                       "live terminal output must still reach active mirror subscribers")
+        XCTAssertEqual(replayed, ["surface.created"],
+                       "terminal output is high-volume mirror data and must not occupy the replay backlog")
+    }
+
     @MainActor
     func test_dispatcher_eventsRecent_returnsBus() async {
         // publish to shared bus then query

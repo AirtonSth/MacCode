@@ -5,6 +5,8 @@ import CoreModel
 
 @MainActor
 public final class FilePreviewSurface: NSObject, Surface {
+    private nonisolated static let maxTextPreviewBytes = 512 * 1024
+
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     public private(set) var filePath: String?
@@ -86,15 +88,27 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
         scroll.documentView = tv
-        if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-            tv.string = content
-        } else if let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
-            tv.string = "[binary file, \(data.count) bytes]"
-        } else {
-            tv.string = "[unable to read file]"
-        }
+        tv.string = Self.previewText(path: path)
         containerStack.addSubview(scroll)
         pin(scroll)
+    }
+
+    static func previewText(path: String, maxBytes: Int = FilePreviewSurface.maxTextPreviewBytes) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return "[unable to read file]"
+        }
+        defer { try? handle.close() }
+        let limit = max(1, maxBytes)
+        let data = (try? handle.read(upToCount: limit + 1)) ?? Data()
+        let clipped = Data(data.prefix(limit))
+        if var content = String(data: clipped, encoding: .utf8) {
+            if data.count > limit {
+                content += "\n\n[preview truncated after \(limit) bytes]"
+            }
+            return content
+        }
+        let suffix = data.count > limit ? "at least " : ""
+        return "[binary file, \(suffix)\(data.count) bytes]"
     }
 
     private func pin(_ v: NSView) {

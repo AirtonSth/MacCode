@@ -111,14 +111,7 @@ private final class RemoteCodeGhosttyRuntime {
         runtimeConfig.action_cb = { _, _, _ in
             return true
         }
-        runtimeConfig.read_clipboard_cb = unsafeBitCast(
-            ghosttyRuntimeReadClipboardCallback as @convention(c) (
-                UnsafeMutableRawPointer?,
-                ghostty_clipboard_e,
-                UnsafeMutableRawPointer?
-            ) -> Bool,
-            to: ghostty_runtime_read_clipboard_cb.self
-        )
+        runtimeConfig.read_clipboard_cb = ghosttyRuntimeReadClipboardCallback
         runtimeConfig.write_clipboard_cb = { _, _, content, length, _ in
             guard let content, length > 0 else { return }
             let items = UnsafeBufferPointer(start: content, count: Int(length))
@@ -302,8 +295,13 @@ final class GhosttyTerminalView: NSView {
     private var surface: ghostty_surface_t?
     private let ioContext = RemoteCodeGhosttyIOContext()
     private var pendingOutput = Data()
+    private var outputFlushScheduled = false
     private var lastPixelSize = NSSize(width: 0, height: 0)
     private var lastScale = NSSize(width: 0, height: 0)
+
+    private static let immediateOutputFlushBytes = 64 * 1024
+    private static let maxPendingOutputBytes = 1024 * 1024
+    private static let outputFlushDelay: TimeInterval = 0.02
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -365,11 +363,44 @@ final class GhosttyTerminalView: NSView {
 
     func processOutput(_ data: Data) {
         guard !data.isEmpty else { return }
+        appendPendingOutput(data)
         guard let surface else {
-            pendingOutput.append(data)
             return
         }
-        data.withUnsafeBytes { raw in
+        if pendingOutput.count >= Self.immediateOutputFlushBytes {
+            flushPendingOutput(to: surface)
+        } else {
+            scheduleOutputFlush()
+        }
+    }
+
+    private func appendPendingOutput(_ data: Data) {
+        pendingOutput.append(data)
+        if pendingOutput.count > Self.maxPendingOutputBytes {
+            pendingOutput.removeFirst(pendingOutput.count - Self.maxPendingOutputBytes)
+        }
+    }
+
+    private func scheduleOutputFlush() {
+        guard !outputFlushScheduled else { return }
+        outputFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.outputFlushDelay) { [weak self] in
+            self?.flushPendingOutput()
+        }
+    }
+
+    private func flushPendingOutput() {
+        outputFlushScheduled = false
+        ensureSurface()
+        guard let surface else { return }
+        flushPendingOutput(to: surface)
+    }
+
+    private func flushPendingOutput(to surface: ghostty_surface_t) {
+        guard !pendingOutput.isEmpty else { return }
+        let output = pendingOutput
+        pendingOutput.removeAll(keepingCapacity: true)
+        output.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             ghostty_surface_process_output(
                 surface,
@@ -388,6 +419,7 @@ final class GhosttyTerminalView: NSView {
     func forceRefresh() {
         ensureSurface()
         updateGhosttySize(force: true)
+        flushPendingOutput()
         if let surface {
             ghostty_surface_render_now(surface)
             ghostty_surface_refresh(surface)
@@ -401,6 +433,7 @@ final class GhosttyTerminalView: NSView {
     private func readText(pointTag: ghostty_point_tag_e) -> String? {
         ensureSurface()
         guard let surface else { return nil }
+        flushPendingOutput(to: surface)
         ghostty_surface_render_now(surface)
 
         let topLeft = ghostty_point_s(
@@ -433,6 +466,9 @@ final class GhosttyTerminalView: NSView {
         guard window != nil else { return }
         guard bounds.width > 0, bounds.height > 0 else { return }
         guard let app = RemoteCodeGhosttyRuntime.shared.app else { return }
+        guard Self.hasActiveDisplay() else { return }
+        guard let displayID = window?.screen?.displayID ?? NSScreen.main?.displayID,
+              displayID != 0 else { return }
 
         var config = ghostty_surface_config_new()
         config.platform_tag = GHOSTTY_PLATFORM_MACOS
@@ -461,17 +497,16 @@ final class GhosttyTerminalView: NSView {
         }
 
         surface = created
-        if let displayID = window?.screen?.displayID ?? NSScreen.main?.displayID, displayID != 0 {
-            ghostty_surface_set_display_id(created, displayID)
-        }
+        ghostty_surface_set_display_id(created, displayID)
         updateGhosttySize(force: true)
         updateFocus()
-        if !pendingOutput.isEmpty {
-            let replay = pendingOutput
-            pendingOutput.removeAll(keepingCapacity: true)
-            processOutput(replay)
-        }
+        flushPendingOutput(to: created)
         ghostty_surface_refresh(created)
+    }
+
+    private static func hasActiveDisplay() -> Bool {
+        var count: UInt32 = 0
+        return CGGetActiveDisplayList(0, nil, &count) == .success && count > 0
     }
 
     private func updateFocus() {

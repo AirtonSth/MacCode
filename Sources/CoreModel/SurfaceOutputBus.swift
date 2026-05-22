@@ -6,12 +6,66 @@ import Foundation
 /// `CoreModel`; `AppShell` wires `sink` to publish on `EventBus`.
 public final class SurfaceOutputBus: @unchecked Sendable {
     public static let shared = SurfaceOutputBus()
-    private init() {}
+
+    private let queue: DispatchQueue
+    private let flushDelay: TimeInterval
+    private let maxBatchBytes: Int
+    private var sinkStorage: ((_ surfaceId: SurfaceID, _ chunk: Data) -> Void)?
+    private var pending: [SurfaceID: Data] = [:]
+    private var flushScheduled = false
+
+    init(
+        queue: DispatchQueue = DispatchQueue(label: "RemoteCode.SurfaceOutputBus"),
+        flushDelay: TimeInterval = 0.02,
+        maxBatchBytes: Int = 64 * 1024
+    ) {
+        self.queue = queue
+        self.flushDelay = max(0, flushDelay)
+        self.maxBatchBytes = max(1, maxBatchBytes)
+    }
 
     /// Set by AppShell to forward to the network event bus.
-    public var sink: ((_ surfaceId: SurfaceID, _ chunk: Data) -> Void)?
+    public var sink: ((_ surfaceId: SurfaceID, _ chunk: Data) -> Void)? {
+        get { queue.sync { sinkStorage } }
+        set {
+            queue.async {
+                self.sinkStorage = newValue
+            }
+        }
+    }
 
     public func emit(_ surfaceId: SurfaceID, _ chunk: Data) {
-        sink?(surfaceId, chunk)
+        guard !chunk.isEmpty else { return }
+        queue.async {
+            var buffered = self.pending[surfaceId] ?? Data()
+            buffered.append(chunk)
+            self.pending[surfaceId] = buffered
+
+            if buffered.count >= self.maxBatchBytes {
+                self.flush(surfaceId)
+            } else {
+                self.scheduleFlush()
+            }
+        }
+    }
+
+    private func scheduleFlush() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        queue.asyncAfter(deadline: .now() + flushDelay) { [weak self] in
+            self?.flushAll()
+        }
+    }
+
+    private func flushAll() {
+        flushScheduled = false
+        for surfaceId in Array(pending.keys) {
+            flush(surfaceId)
+        }
+    }
+
+    private func flush(_ surfaceId: SurfaceID) {
+        guard let chunk = pending.removeValue(forKey: surfaceId), !chunk.isEmpty else { return }
+        sinkStorage?(surfaceId, chunk)
     }
 }

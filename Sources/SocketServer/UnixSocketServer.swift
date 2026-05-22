@@ -2,8 +2,10 @@ import Foundation
 import Darwin
 
 public final class UnixSocketServer: @unchecked Sendable {
+    private static let maxClientLineBytes = 1024 * 1024
+
     public let socketPath: String
-    nonisolated(unsafe) private let dispatcher: JSONRPCDispatcher
+    private let dispatcher: JSONRPCDispatcher
     private var listenFD: Int32 = -1
     private var acceptThread: Thread?
     private var running = false
@@ -76,16 +78,24 @@ public final class UnixSocketServer: @unchecked Sendable {
                 if !running { return }
                 continue
             }
+            disableSIGPIPE(fd: client)
             DispatchQueue.global().async { [weak self] in
                 self?.handleClient(fd: client)
             }
         }
     }
 
+    private func disableSIGPIPE(fd: Int32) {
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+    }
+
     private func handleClient(fd: Int32) {
         var streamSubID: UUID?
+        let writeQueue = DispatchQueue(label: "rc2.unix.write")
         defer {
             if let s = streamSubID { EventBus.shared.unsubscribe(s) }
+            writeQueue.sync {}
             close(fd)
         }
         var buffer = Data()
@@ -94,6 +104,9 @@ public final class UnixSocketServer: @unchecked Sendable {
             let n = read(fd, &tmp, tmp.count)
             if n <= 0 { break }
             buffer.append(tmp, count: n)
+            if buffer.count > Self.maxClientLineBytes {
+                return
+            }
             // process line-delimited JSON
             while let nlIdx = buffer.firstIndex(of: 0x0A) {
                 let lineData = buffer.subdata(in: buffer.startIndex..<nlIdx)
@@ -113,22 +126,22 @@ public final class UnixSocketServer: @unchecked Sendable {
                             "payload": ev.payload
                         ]
                         let resp = JSONRPCResponse(id: req.id, result: .object(payload))
-                        self.write(fd: fd, response: resp)
+                        writeQueue.async { self.write(fd: fd, response: resp) }
                     }
                     streamSubID = id
                     // ack
                     let ack = JSONRPCResponse(id: req.id, result: .object([
                         "subscribed": .bool(true)
                     ]))
-                    write(fd: fd, response: ack)
+                    writeQueue.sync { write(fd: fd, response: ack) }
                     continue
                 }
-                respond(fd: fd, lineData: lineData)
+                respond(fd: fd, lineData: lineData, writeQueue: writeQueue)
             }
         }
     }
 
-    private func respond(fd: Int32, lineData: Data) {
+    private func respond(fd: Int32, lineData: Data, writeQueue: DispatchQueue) {
         let decoder = JSONDecoder()
         do {
             let req = try decoder.decode(JSONRPCRequest.self, from: lineData)
@@ -151,19 +164,26 @@ public final class UnixSocketServer: @unchecked Sendable {
             }
             semaphore.wait()
             if let resp = slot.value {
-                write(fd: fd, response: resp)
+                writeQueue.sync { write(fd: fd, response: resp) }
             }
         } catch {
             let resp = JSONRPCResponse(id: nil, error: .parseError)
-            write(fd: fd, response: resp)
+            writeQueue.sync { write(fd: fd, response: resp) }
         }
     }
 
     private func write(fd: Int32, response: JSONRPCResponse) {
         guard var data = try? JSONEncoder().encode(response) else { return }
         data.append(0x0A)
-        data.withUnsafeBytes { ptr in
-            _ = Darwin.write(fd, ptr.baseAddress, data.count)
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let n = Darwin.write(fd, base.advanced(by: written), data.count - written)
+                if n < 0, errno == EINTR { continue }
+                if n <= 0 { return }
+                written += n
+            }
         }
     }
 }

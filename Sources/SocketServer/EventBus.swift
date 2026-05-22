@@ -25,13 +25,16 @@ public final class EventBus: @unchecked Sendable {
     private let recentLimit = 512
 
     public var persister: ((Event) -> Void)?
+    public var shouldRetainRecentEvent: ((Event) -> Bool)?
 
     public func publish(kind: String, payload: JSONValue) {
         lock.lock()
         lastSeq += 1
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: Date().timeIntervalSince1970)
-        recent.append(ev)
-        if recent.count > recentLimit { recent.removeFirst(recent.count - recentLimit) }
+        if shouldRetainRecentEvent?(ev) ?? true {
+            recent.append(ev)
+            if recent.count > recentLimit { recent.removeFirst(recent.count - recentLimit) }
+        }
         let subs = Array(subscribers.values)
         let p = persister
         lock.unlock()
@@ -44,7 +47,7 @@ public final class EventBus: @unchecked Sendable {
         self.lastSeq = max(self.lastSeq, lastSeq)
         // append unique events
         let known = Set(self.recent.map(\.seq))
-        for ev in recent where !known.contains(ev.seq) {
+        for ev in recent where !known.contains(ev.seq) && (shouldRetainRecentEvent?(ev) ?? true) {
             self.recent.append(ev)
         }
         self.recent.sort { $0.seq < $1.seq }

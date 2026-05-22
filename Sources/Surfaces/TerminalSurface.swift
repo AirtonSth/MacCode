@@ -372,11 +372,32 @@ public final class TerminalSurface: NSObject, Surface {
             guard let self else { return }
             var buf = [UInt8](repeating: 0, count: 4096)
             let n = read(self.masterFD, &buf, buf.count)
-            if n <= 0 { return }
+            if n <= 0 {
+                DispatchQueue.main.async { self.handlePTYEOF() }
+                return
+            }
             let data = Data(buf[0..<Int(n)])
             DispatchQueue.main.async { self.appendDataAsync(data) }
         }
         src.resume()
+    }
+
+    private func handlePTYEOF() {
+        readSource?.cancel()
+        readSource = nil
+        if masterFD >= 0 {
+            Darwin.close(masterFD)
+            masterFD = -1
+        }
+        reapChildIfExited()
+    }
+
+    private func reapChildIfExited() {
+        guard childPID > 0 else { return }
+        var status: Int32 = 0
+        if waitpid(childPID, &status, WNOHANG) == childPID {
+            childPID = -1
+        }
     }
 
     private func appendDataAsync(_ data: Data) {
@@ -436,7 +457,15 @@ public final class TerminalSurface: NSObject, Surface {
     public func close() {
         readSource?.cancel()
         readSource = nil
-        if childPID > 0 { kill(childPID, SIGHUP) }
+        if childPID > 0 {
+            let pid = childPID
+            childPID = -1
+            kill(pid, SIGHUP)
+            DispatchQueue.global(qos: .utility).async {
+                var status: Int32 = 0
+                _ = waitpid(pid, &status, 0)
+            }
+        }
         if masterFD >= 0 {
             Darwin.close(masterFD)
             masterFD = -1
