@@ -20,7 +20,12 @@ public final class EventBus: @unchecked Sendable {
 
     private let lock = NSLock()
     private var lastSeq: Int64 = 0
-    private var subscribers: [UUID: (Event) -> Void] = [:]
+    private struct Subscriber {
+        let filter: EventStreamFilter
+        let handler: (Event) -> Void
+    }
+
+    private var subscribers: [UUID: Subscriber] = [:]
     private var recent: [Event] = []
     private var recentBytes: Int = 0
     private let recentLimit: Int
@@ -29,6 +34,13 @@ public final class EventBus: @unchecked Sendable {
 
     public var persister: ((Event) -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
+
+    public struct RecentEventsResult: Sendable {
+        public let lastSeq: Int64
+        public let events: [Event]
+        public let truncated: Bool
+        public let requiresBaseline: Bool
+    }
 
     public init(recentLimit: Int = 512, recentByteLimit: Int = 2 * 1024 * 1024) {
         self.recentLimit = max(0, recentLimit)
@@ -46,7 +58,10 @@ public final class EventBus: @unchecked Sendable {
         let p = persister
         lock.unlock()
         p?(ev)
-        for s in subs { s(ev) }
+        for s in subs {
+            guard let mapped = s.filter.map(ev) else { continue }
+            s.handler(mapped)
+        }
     }
 
     public func reloadFromPersistence(lastSeq: Int64, recent: [Event]) {
@@ -64,11 +79,14 @@ public final class EventBus: @unchecked Sendable {
     }
 
     @discardableResult
-    public func subscribe(since: Int64?, _ handler: @escaping (Event) -> Void) -> UUID {
+    public func subscribe(since: Int64?, filter: EventStreamFilter = .full, _ handler: @escaping (Event) -> Void) -> UUID {
         let id = UUID()
         lock.lock()
-        subscribers[id] = handler
-        let backlog = recent.filter { $0.seq > (since ?? 0) }
+        subscribers[id] = Subscriber(filter: filter, handler: handler)
+        let backlog = recent.compactMap { event -> Event? in
+            guard event.seq > (since ?? 0) else { return nil }
+            return filter.map(event)
+        }
         lock.unlock()
         for ev in backlog { handler(ev) }
         return id
@@ -81,6 +99,37 @@ public final class EventBus: @unchecked Sendable {
     public func snapshot() -> (lastSeq: Int64, recent: [Event]) {
         lock.lock(); defer { lock.unlock() }
         return (lastSeq, recent)
+    }
+
+    public func recentEvents(since: Int64, maxBytes: Int?) -> RecentEventsResult {
+        lock.lock()
+        let currentLastSeq = lastSeq
+        let candidates = recent.filter { $0.seq > since }
+        lock.unlock()
+
+        guard let maxBytes, maxBytes > 0 else {
+            return RecentEventsResult(lastSeq: currentLastSeq,
+                                      events: candidates,
+                                      truncated: false,
+                                      requiresBaseline: false)
+        }
+
+        var selected: [Event] = []
+        var used = 0
+        var truncated = false
+        for event in candidates {
+            let size = encodedSize(event)
+            if used + size > maxBytes {
+                truncated = true
+                break
+            }
+            selected.append(event)
+            used += size
+        }
+        return RecentEventsResult(lastSeq: currentLastSeq,
+                                  events: selected,
+                                  truncated: truncated,
+                                  requiresBaseline: truncated)
     }
 
     private func retainRecent(_ ev: Event) {
@@ -111,5 +160,69 @@ public final class EventBus: @unchecked Sendable {
 
     private func encodedSize(_ ev: Event) -> Int {
         (try? encoder.encode(ev).count) ?? 0
+    }
+}
+
+public enum EventStreamFilter: Sendable, Equatable {
+    case full
+    case cellularSafe
+
+    public static func parse(_ raw: String?) -> EventStreamFilter {
+        guard raw?.lowercased().contains("cellular-safe") == true else { return .full }
+        return .cellularSafe
+    }
+
+    public func allows(_ event: EventBus.Event) -> Bool {
+        map(event) != nil
+    }
+
+    public func map(_ event: EventBus.Event) -> EventBus.Event? {
+        switch self {
+        case .full:
+            return event
+        case .cellularSafe:
+            let classification = EventStreamClassification.classify(kind: event.kind)
+            if event.kind == "surface.output" {
+                return Self.terminalOutputSummary(from: event)
+            }
+            guard classification.reducerRequired || classification.priority == .critical else { return nil }
+            return event
+        }
+    }
+
+    private static func terminalOutputSummary(from event: EventBus.Event) -> EventBus.Event? {
+        guard case .object(let payload) = event.payload,
+              let surfaceID = payload["surface_id"] else { return nil }
+        let base64Bytes = payload["base64"]?.stringValue?.utf8.count ?? 0
+        return EventBus.Event(seq: event.seq,
+                              kind: "surface.output.summary",
+                              payload: .object([
+                                  "surface_id": surfaceID,
+                                  "partial": .bool(true),
+                                  "encoded_bytes": .number(Double(base64Bytes))
+                              ]),
+                              ts: event.ts)
+    }
+}
+
+private struct EventStreamClassification {
+    enum Priority { case critical, interactive, state, bulk, diagnostic }
+
+    let priority: Priority
+    let reducerRequired: Bool
+
+    static func classify(kind: String) -> EventStreamClassification {
+        switch kind {
+        case let k where k.hasPrefix("diagnostic.") || k.hasPrefix("metrics."):
+            return EventStreamClassification(priority: .diagnostic, reducerRequired: false)
+        case "surface.output", "agent.item.delta":
+            return EventStreamClassification(priority: .bulk, reducerRequired: true)
+        case "surface.browser":
+            return EventStreamClassification(priority: .interactive, reducerRequired: true)
+        case "settings.updated":
+            return EventStreamClassification(priority: .state, reducerRequired: true)
+        default:
+            return EventStreamClassification(priority: .critical, reducerRequired: true)
+        }
     }
 }

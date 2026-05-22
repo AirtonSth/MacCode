@@ -183,6 +183,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
            headers["upgrade"]?.lowercased() == "websocket",
            let key = headers["sec-websocket-key"] {
             performWSHandshake(fd: fd, key: key)
+            let wsCompressionEnabled = headers["x-rc2-ws-encoding"]?
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .contains(PayloadCodec.lzfse.wireName) == true
+            let wsFilter = EventStreamFilter.parse(headers["x-rc2-ws-filter"])
             // GAP-6: EventBus.publish fans out to subscribers from many
             // threads (RPC dispatch, agent runner, …). Writing frames to
             // one socket from concurrent threads interleaves bytes and
@@ -190,7 +195,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // stream dies the moment an agent run emits rapid events).
             // Serialize every write for this connection onto one queue.
             let wsQueue = DispatchQueue(label: "rc2.ws.write")
-            let id = EventBus.shared.subscribe(since: 0) { [weak self] ev in
+            let id = EventBus.shared.subscribe(since: 0, filter: wsFilter) { [weak self] ev in
                 guard let self else { return }
                 let obj: [String: Any] = [
                     "seq": ev.seq,
@@ -199,7 +204,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     "payload": Self.jsonValueToAny(ev.payload)
                 ]
                 guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
-                wsQueue.async { self.sendWSText(fd: fd, data: data) }
+                wsQueue.async {
+                    self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
+                }
             }
             subID = id
             // keep connection open; read incoming frames (ping/pong/close)
@@ -235,7 +242,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
 
         // POST body for pair endpoints; honor Content-Length read above.
-        let bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
+        var bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
+        if let contentEncoding = headers["content-encoding"], !contentEncoding.isEmpty {
+            do {
+                bodyData = try PayloadCodec.codec(for: contentEncoding).decode(bodyData, expectedSize: nil)
+            } catch {
+                send(fd: fd, status: 400, contentType: "text/plain", body: Data("bad encoded body\n".utf8))
+                return
+            }
+            guard bodyData.count <= Self.maxRequestBodyBytes else {
+                send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+                return
+            }
+        }
 
         switch (method, path) {
         case ("GET", "/healthz"):
@@ -245,7 +264,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // uses for every feature call. Routes to the same dispatcher
             // the Unix socket uses, hopping to the main actor.
             let respData = dispatchRPCSync(bodyData)
-            send(fd: fd, status: 200, contentType: "application/json", body: respData)
+            send(fd: fd, status: 200, contentType: "application/json", body: respData, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair"):
             // Device-initiated request → Mac shows an approve/deny modal.
             // Returns immediately; the device polls /v1/pair/status. The
@@ -258,7 +277,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             guard let r = auth.createPairingRequest(deviceName: deviceName) else {
                 send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
             }
-            sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300])
+            sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair/status"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
@@ -271,7 +290,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             var resp: [String: Any] = ["status": s.status]
             if let d = s.deviceId { resp["device_id"] = d }
             if let t = s.token { resp["token"] = t }
-            sendJSON(fd: fd, status: 200, body: resp)
+            sendJSON(fd: fd, status: 200, body: resp, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair/redeem"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
@@ -280,13 +299,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
             if let (deviceId, token) = auth.redeemPairingCode(code, deviceName: name) {
-                sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token])
+                sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token], acceptEncoding: headers["accept-encoding"])
             } else {
                 send(fd: fd, status: 410, contentType: "text/plain", body: "code expired or already redeemed\n".data(using: .utf8)!)
             }
         case ("GET", "/v1/devices"):
             guard let auth = auth else { send(fd: fd, status: 503, contentType: "text/plain", body: "disabled\n".data(using: .utf8)!); return }
-            sendJSON(fd: fd, status: 200, body: ["devices": auth.listDevices()])
+            sendJSON(fd: fd, status: 200, body: ["devices": auth.listDevices()], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/devices/revoke"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
@@ -294,7 +313,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
             auth.revokeDevice(id)
-            sendJSON(fd: fd, status: 200, body: ["revoked": id])
+            sendJSON(fd: fd, status: 200, body: ["revoked": id], acceptEncoding: headers["accept-encoding"])
         case ("GET", "/v1/discovery"):
             let body: [String: Any] = [
                 "server_id": serverId,                                  // GAP-2: stable, persisted
@@ -309,7 +328,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "vpn_required": !bindLoopbackOnly,
                 "relay": false
             ]
-            sendJSON(fd: fd, status: 200, body: body)
+            sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("GET", "/v1/capabilities"):
             // GAP-3: advertise what the dispatcher actually implements.
             // git mutations + full browser automation are real (see
@@ -329,7 +348,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "git": ["read_only": false],
                 "feature_flags": ["remote_access_enabled": !bindLoopbackOnly]
             ]
-            sendJSON(fd: fd, status: 200, body: body)
+            sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         default:
             send(fd: fd, status: 404, contentType: "text/plain", body: "not found\n".data(using: .utf8)!)
         }
@@ -361,10 +380,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return (try? encoder.encode(resp)) ?? Data("{}".utf8)
     }
 
-    private func send(fd: Int32, status: Int, contentType: String, body: Data) {
-        let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+    private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil) {
+        var responseBody = body
+        var extraHeaders = ""
+        if contentType.contains("application/json"),
+           acceptEncoding?.lowercased().contains(PayloadCodec.lzfse.wireName) == true,
+           body.count >= 128,
+           let compressed = try? PayloadCodec.lzfse.encode(body),
+           compressed.count < body.count {
+            responseBody = compressed
+            extraHeaders += "Content-Encoding: \(PayloadCodec.lzfse.wireName)\r\n"
+        }
+        let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\n\(extraHeaders)Content-Length: \(responseBody.count)\r\nConnection: close\r\n\r\n"
         var out = Data(head.utf8)
-        out.append(body)
+        out.append(responseBody)
         _ = writeAll(fd: fd, data: out)
     }
 
@@ -384,9 +413,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func sendJSON(fd: Int32, status: Int, body: [String: Any]) {
+    private func sendJSON(fd: Int32, status: Int, body: [String: Any], acceptEncoding: String? = nil) {
         let data = (try? JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted, .sortedKeys])) ?? Data()
-        send(fd: fd, status: status, contentType: "application/json", body: data)
+        send(fd: fd, status: status, contentType: "application/json", body: data, acceptEncoding: acceptEncoding)
     }
 
     private func reasonPhrase(_ s: Int) -> String {
@@ -414,10 +443,24 @@ public final class DirectHTTPServer: @unchecked Sendable {
         _ = writeAll(fd: fd, data: data)
     }
 
+    private func sendWSEvent(fd: Int32, data: Data, compressed: Bool) {
+        if compressed,
+           let envelope = try? PayloadCodec.encodeWebSocketEnvelope(data),
+           envelope.count < data.count {
+            sendWSFrame(fd: fd, opcode: 0x2, data: envelope)
+            return
+        }
+        sendWSFrame(fd: fd, opcode: 0x1, data: data)
+    }
+
     private func sendWSText(fd: Int32, data: Data) {
+        sendWSFrame(fd: fd, opcode: 0x1, data: data)
+    }
+
+    private func sendWSFrame(fd: Int32, opcode: UInt8, data: Data) {
         // server frames are unmasked
         var frame = Data()
-        frame.append(0x81) // FIN + text
+        frame.append(0x80 | opcode)
         let len = data.count
         if len <= 125 {
             frame.append(UInt8(len))

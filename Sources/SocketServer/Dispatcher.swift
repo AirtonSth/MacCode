@@ -150,6 +150,29 @@ public final class JSONRPCDispatcher {
         let params = req.params ?? [:]
         do {
             switch req.method {
+            case "rpc.batch":
+                guard case .array(let calls) = params["calls"] ?? .null else { throw JSONRPCError.invalidParams }
+                var results: [JSONValue] = []
+                for (index, callValue) in calls.enumerated() {
+                    guard let call = callValue.objectValue,
+                          let method = call["method"]?.stringValue else { throw JSONRPCError.invalidParams }
+                    guard Self.isReadOnlyBatchMethod(method) else {
+                        return .init(id: id, error: JSONRPCError(code: -32602, message: "Batch only supports read-only RPC methods.", data: .string(method)))
+                    }
+                    let callParams = call["params"]?.objectValue ?? [:]
+                    let response = await dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(index), method: method, params: callParams))
+                    if let error = response.error {
+                        results.append(.object([
+                            "error": .object([
+                                "code": .number(Double(error.code)),
+                                "message": .string(error.message)
+                            ])
+                        ]))
+                    } else {
+                        results.append(response.result ?? .null)
+                    }
+                }
+                return .init(id: id, result: .array(results))
             case "system.ping":
                 return .init(id: id, result: .object(["pong": .bool(true), "ts": .number(Date().timeIntervalSince1970)]))
             case "system.capabilities":
@@ -187,8 +210,10 @@ public final class JSONRPCDispatcher {
                     "pid": .number(Double(ProcessInfo.processInfo.processIdentifier))
                 ]))
             case "events.recent":
-                let snap = EventBus.shared.snapshot()
-                let arr: [JSONValue] = snap.recent.map { ev in
+                let sinceSeq = params["since_seq"]?.intValue.map(Int64.init) ?? 0
+                let maxBytes = params["max_bytes"]?.intValue
+                let result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                let arr: [JSONValue] = result.events.map { ev in
                     .object([
                         "seq": .number(Double(ev.seq)),
                         "kind": .string(ev.kind),
@@ -197,8 +222,10 @@ public final class JSONRPCDispatcher {
                     ])
                 }
                 return .init(id: id, result: .object([
-                    "last_seq": .number(Double(snap.lastSeq)),
-                    "events": .array(arr)
+                    "last_seq": .number(Double(result.lastSeq)),
+                    "events": .array(arr),
+                    "truncated": .bool(result.truncated),
+                    "requires_baseline": .bool(result.requiresBaseline)
                 ]))
             case "settings.get":
                 let keys: [String]
@@ -840,6 +867,18 @@ public final class JSONRPCDispatcher {
         } catch {
             return .init(id: id, error: JSONRPCError(code: -32000, message: String(describing: error)))
         }
+    }
+
+    public static func isReadOnlyBatchMethod(_ method: String) -> Bool {
+        method.hasPrefix("system.")
+            || method == "workspace.list"
+            || method == "workspace.current"
+            || method == "events.recent"
+            || method == "settings.get"
+            || method.hasSuffix(".list")
+            || method.hasSuffix(".read")
+            || method.hasSuffix(".status")
+            || method.hasSuffix(".get")
     }
 
     /// Accept the lowercased/underscored tokens the CLI documents
