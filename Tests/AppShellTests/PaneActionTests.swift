@@ -34,6 +34,26 @@ final class PaneActionTests: XCTestCase {
         XCTAssertNotNil(SurfaceRegistry.shared.surface(p2.surfaces[1].id))
     }
 
+    func test_focusingAnotherTabUnloadsHiddenFilePreviewSurface() throws {
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "preview-memory", cwd: NSTemporaryDirectory())
+        guard case .pane(let initialPane) = ws.layout,
+              let terminalID = initialPane.surfaces.first?.id else { return XCTFail("expected default terminal") }
+        let file = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-preview-memory-\(UUID().uuidString).txt")
+        try String(repeating: "preview\n", count: 200).write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let previewDesc = try router.createSurface(workspace: ws.id, type: .filePreview, paneID: nil, title: file.path)
+        let preview = try XCTUnwrap(SurfaceRegistry.shared.surface(previewDesc.id) as? FilePreviewSurface)
+        XCTAssertFalse(preview.view.subviews.isEmpty, "selected preview tab should render the file while visible")
+
+        try router.focusSurface(workspace: ws.id, surface: terminalID)
+
+        XCTAssertTrue(preview.view.subviews.isEmpty,
+                      "switching away must unload heavyweight preview views so hidden tabs do not retain image/PDF/text content")
+    }
+
     func test_addAgent_then_splitRight_buildsSplitTree() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
