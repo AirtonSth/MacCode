@@ -22,18 +22,25 @@ public final class EventBus: @unchecked Sendable {
     private var lastSeq: Int64 = 0
     private var subscribers: [UUID: (Event) -> Void] = [:]
     private var recent: [Event] = []
-    private let recentLimit = 512
+    private var recentBytes: Int = 0
+    private let recentLimit: Int
+    private let recentByteLimit: Int
+    private let encoder = JSONEncoder()
 
     public var persister: ((Event) -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
+
+    public init(recentLimit: Int = 512, recentByteLimit: Int = 2 * 1024 * 1024) {
+        self.recentLimit = max(0, recentLimit)
+        self.recentByteLimit = max(0, recentByteLimit)
+    }
 
     public func publish(kind: String, payload: JSONValue) {
         lock.lock()
         lastSeq += 1
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: Date().timeIntervalSince1970)
         if shouldRetainRecentEvent?(ev) ?? true {
-            recent.append(ev)
-            if recent.count > recentLimit { recent.removeFirst(recent.count - recentLimit) }
+            retainRecent(ev)
         }
         let subs = Array(subscribers.values)
         let p = persister
@@ -48,10 +55,11 @@ public final class EventBus: @unchecked Sendable {
         // append unique events
         let known = Set(self.recent.map(\.seq))
         for ev in recent where !known.contains(ev.seq) && (shouldRetainRecentEvent?(ev) ?? true) {
-            self.recent.append(ev)
+            retainRecent(ev)
         }
         self.recent.sort { $0.seq < $1.seq }
-        if self.recent.count > recentLimit { self.recent.removeFirst(self.recent.count - recentLimit) }
+        rebuildRecentByteCount()
+        trimRecent()
         lock.unlock()
     }
 
@@ -73,5 +81,35 @@ public final class EventBus: @unchecked Sendable {
     public func snapshot() -> (lastSeq: Int64, recent: [Event]) {
         lock.lock(); defer { lock.unlock() }
         return (lastSeq, recent)
+    }
+
+    private func retainRecent(_ ev: Event) {
+        let bytes = encodedSize(ev)
+        guard recentLimit > 0, recentByteLimit > 0, bytes <= recentByteLimit else {
+            trimRecent()
+            return
+        }
+        recent.append(ev)
+        recentBytes += bytes
+        trimRecent()
+    }
+
+    private func trimRecent() {
+        while recent.count > recentLimit || recentBytes > recentByteLimit {
+            guard !recent.isEmpty else {
+                recentBytes = 0
+                return
+            }
+            let removed = recent.removeFirst()
+            recentBytes = max(0, recentBytes - encodedSize(removed))
+        }
+    }
+
+    private func rebuildRecentByteCount() {
+        recentBytes = recent.reduce(0) { $0 + encodedSize($1) }
+    }
+
+    private func encodedSize(_ ev: Event) -> Int {
+        (try? encoder.encode(ev).count) ?? 0
     }
 }

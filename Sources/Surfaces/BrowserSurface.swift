@@ -16,6 +16,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     private let forwardButton = NSButton()
     private let reloadButton = NSButton()
     private var googleLegacyLayoutReloads = Set<String>()
+    private var retainedURL: URL?
+    private var isVisible = true
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
 
     public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
@@ -124,7 +126,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
 
     public func navigate(to url: URL) {
         let url = Self.normalizedInitialURL(url)
+        retainedURL = url
         addressBar.stringValue = url.absoluteString
+        guard isVisible else { return }
         webView.load(URLRequest(url: url))
         if Self.isGoogleHost(url.host) {
             scheduleGoogleLegacyLayoutRefresh(for: url.absoluteString)
@@ -386,6 +390,18 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
 
     public func focus() { view.window?.makeFirstResponder(webView) }
     public func unfocus() {}
+    public func didBecomeVisible() {
+        guard !isVisible else { return }
+        isVisible = true
+        navigate(to: retainedURL ?? webView.url ?? Self.defaultInitialURL)
+    }
+    public func didBecomeHidden() {
+        guard isVisible else { return }
+        isVisible = false
+        retainedURL = webView.url ?? retainedURL
+        webView.stopLoading()
+        webView.loadHTMLString("", baseURL: nil)
+    }
     public func close() { webView.stopLoading() }
     public func sendText(_ text: String) { /* not applicable for browser */ }
     public func readText() -> String { webView.url?.absoluteString ?? "" }

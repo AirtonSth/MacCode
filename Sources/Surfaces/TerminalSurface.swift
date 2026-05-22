@@ -218,6 +218,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var terminalSize = TerminalViewportGeometry.fallbackSize
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
+    private var isVisible = true
 
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
@@ -406,14 +407,18 @@ public final class TerminalSurface: NSObject, Surface {
         descriptor.hasUnreadActivity = true
         // HC-1: stream raw PTY output to the mirror in real time.
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        ghosttyView.processOutput(data)
+        if isVisible {
+            ghosttyView.processOutput(data)
+        }
     }
 
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
         renderer.feed(data)
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        ghosttyView.processOutput(data)
+        if isVisible {
+            ghosttyView.processOutput(data)
+        }
     }
 
     public func appendSystemText(_ raw: String) {
@@ -453,6 +458,23 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func unfocus() {}
+
+    public func didBecomeVisible() {
+        guard !isVisible else { return }
+        isVisible = true
+        let snapshot = renderer.snapshot().string
+        if let data = snapshot.data(using: .utf8) {
+            ghosttyView.resetSurfaceOutput(data)
+        } else {
+            ghosttyView.forceRefresh()
+        }
+    }
+
+    public func didBecomeHidden() {
+        guard isVisible else { return }
+        isVisible = false
+        ghosttyView.closeSurface()
+    }
 
     public func close() {
         readSource?.cancel()

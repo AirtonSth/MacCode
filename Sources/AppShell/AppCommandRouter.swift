@@ -81,12 +81,37 @@ public final class AppCommandRouter: CommandRouting {
             copy.layout = remapIDs(in: copy.layout, idMap: idMap)
             ctx.state.workspaces[wid] = copy
         }
+        applySurfaceVisibility()
     }
 
     private func forEachSurface(in node: LayoutNode, _ visit: (SurfaceDescriptor) -> Void) {
         switch node {
         case .pane(let p): for s in p.surfaces { visit(s) }
         case .split(let s): for c in s.children { forEachSurface(in: c, visit) }
+        }
+    }
+
+    private func applySurfaceVisibility() {
+        guard let ctx = context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid] else {
+            SurfaceRegistry.shared.setVisibleSurfaceIDs([])
+            return
+        }
+        SurfaceRegistry.shared.setVisibleSurfaceIDs(selectedSurfaceIDs(in: ws.layout))
+    }
+
+    private func selectedSurfaceIDs(in node: LayoutNode) -> Set<SurfaceID> {
+        switch node {
+        case .pane(let pane):
+            if let selected = pane.selectedSurfaceID ?? pane.surfaces.first?.id {
+                return [selected]
+            }
+            return []
+        case .split(let split):
+            return split.children.reduce(into: Set<SurfaceID>()) { ids, child in
+                ids.formUnion(selectedSurfaceIDs(in: child))
+            }
         }
     }
 
@@ -173,6 +198,7 @@ public final class AppCommandRouter: CommandRouting {
     public func selectWorkspace(_ id: WorkspaceID) throws {
         try context?.apply(.selectWorkspace(id))
         windowController?.refreshFromState()
+        applySurfaceVisibility()
     }
 
     public func closeWorkspace(_ id: WorkspaceID) throws {
@@ -220,6 +246,7 @@ public final class AppCommandRouter: CommandRouting {
         let desc = makeSurface(type: type, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.addSurface(workspace, paneID: paneID, descriptor: desc))
         windowController?.refreshFromState()
+        applySurfaceVisibility()
         return desc
     }
 
@@ -228,12 +255,14 @@ public final class AppCommandRouter: CommandRouting {
         let desc = makeSurface(type: surfaceType, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.splitPane(workspace, paneID: paneID, direction: direction, newSurface: desc))
         windowController?.refreshFromState()
+        applySurfaceVisibility()
         return desc
     }
 
     public func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws {
         try context?.apply(.splitSurface(workspace, paneID: paneID, surface: surface, direction: direction))
         windowController?.refreshFromState()
+        applySurfaceVisibility()
     }
 
     public func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -243,6 +272,7 @@ public final class AppCommandRouter: CommandRouting {
             SurfaceRegistry.shared.unregister(surface)
         }
         windowController?.refreshFromState()
+        applySurfaceVisibility()
     }
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -251,6 +281,7 @@ public final class AppCommandRouter: CommandRouting {
         // becomes the visible content (the custom tab strip has no
         // built-in content switching like NSTabView did).
         windowController?.refreshFromState()
+        applySurfaceVisibility()
         windowController?.focusSurface(surface)
     }
 

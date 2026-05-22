@@ -11,6 +11,7 @@ public final class MarkdownSurface: NSObject, Surface {
     public let view: NSView
     private let webView: WKWebView
     public private(set) var filePath: String?
+    private var isVisible = true
 
     public init(workspaceID: WorkspaceID, filePath: String?, title: String = "markdown") {
         self.descriptor = SurfaceDescriptor(
@@ -49,6 +50,7 @@ public final class MarkdownSurface: NSObject, Surface {
     }
 
     private func loadAndRender() {
+        guard isVisible else { return }
         let body = Self.loadMarkdownBody(filePath: filePath)
         let html = Self.renderHTML(markdown: body)
         webView.loadHTMLString(html, baseURL: filePath.flatMap { URL(fileURLWithPath: $0).deletingLastPathComponent() })
@@ -179,6 +181,17 @@ public final class MarkdownSurface: NSObject, Surface {
 
     public func focus() { view.window?.makeFirstResponder(webView) }
     public func unfocus() {}
+    public func didBecomeVisible() {
+        guard !isVisible else { return }
+        isVisible = true
+        loadAndRender()
+    }
+    public func didBecomeHidden() {
+        guard isVisible else { return }
+        isVisible = false
+        webView.stopLoading()
+        webView.loadHTMLString("", baseURL: nil)
+    }
     public func close() {}
     public func sendText(_ text: String) {}
     public func readText() -> String { filePath ?? "" }

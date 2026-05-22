@@ -11,6 +11,7 @@ public final class FilePreviewSurface: NSObject, Surface {
     public let view: NSView
     public private(set) var filePath: String?
     private let containerStack: NSView
+    private var isVisible = true
 
     public init(workspaceID: WorkspaceID, filePath: String?, title: String = "preview") {
         self.descriptor = SurfaceDescriptor(
@@ -35,6 +36,7 @@ public final class FilePreviewSurface: NSObject, Surface {
     }
 
     private func renderForFile(_ path: String?) {
+        guard isVisible else { return }
         for sub in containerStack.subviews { sub.removeFromSuperview() }
         guard let p = path else {
             let label = NSTextField(labelWithString: "No file selected")
@@ -123,6 +125,16 @@ public final class FilePreviewSurface: NSObject, Surface {
 
     public func focus() { view.window?.makeFirstResponder(view) }
     public func unfocus() {}
+    public func didBecomeVisible() {
+        guard !isVisible else { return }
+        isVisible = true
+        renderForFile(filePath)
+    }
+    public func didBecomeHidden() {
+        guard isVisible else { return }
+        isVisible = false
+        for sub in containerStack.subviews { sub.removeFromSuperview() }
+    }
     public func close() {}
     public func sendText(_ text: String) {}
     public func readText() -> String { filePath ?? "" }

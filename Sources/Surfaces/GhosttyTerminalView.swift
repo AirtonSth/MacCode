@@ -171,6 +171,7 @@ private final class RemoteCodeGhosttyRuntime {
             macos-background-from-layer = true
             macos-titlebar-proxy-icon = hidden
             shell-integration = none
+            scrollback-limit = 2000000
             window-padding-x = 0
             window-padding-y = 0
             keybind = super+d=unbind
@@ -359,6 +360,12 @@ final class GhosttyTerminalView: NSView {
             ghostty_surface_free(surface)
             self.surface = nil
         }
+        pendingOutput.removeAll(keepingCapacity: false)
+    }
+
+    func resetSurfaceOutput(_ data: Data) {
+        closeSurface()
+        processOutput(data)
     }
 
     func processOutput(_ data: Data) {

@@ -44,6 +44,19 @@ final class EventBusTests: XCTestCase {
                        "terminal output is high-volume mirror data and must not occupy the replay backlog")
     }
 
+    func test_recentBacklogIsByteBounded() {
+        let bus = EventBus(recentLimit: 512, recentByteLimit: 900)
+        bus.publish(kind: "small.a", payload: .string(String(repeating: "a", count: 650)))
+        bus.publish(kind: "huge", payload: .string(String(repeating: "x", count: 2_000)))
+        bus.publish(kind: "small.b", payload: .string(String(repeating: "b", count: 650)))
+
+        var replayed: [String] = []
+        _ = bus.subscribe(since: 0) { replayed.append($0.kind) }
+
+        XCTAssertEqual(replayed, ["small.b"],
+                       "event replay must drop oversized/old payloads so one large RPC event cannot pin megabytes in memory")
+    }
+
     @MainActor
     func test_dispatcher_eventsRecent_returnsBus() async {
         // publish to shared bus then query
