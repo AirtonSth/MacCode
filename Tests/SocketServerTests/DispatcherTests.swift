@@ -62,6 +62,12 @@ final class FakeRouter: CommandRouting {
     var sentSurfaceText: [(SurfaceID, String)] = []
     func sendText(surface: SurfaceID, text: String) throws { sentSurfaceText.append((surface, text)) }
     func readText(surface: SurfaceID) throws -> String { "" }
+    var terminalHistory = TerminalOutputWindow(chunks: [], hasMoreOlder: false, nextBeforeChunkID: nil)
+    var lastHistoryRequest: (SurfaceID, Int64?, Int)?
+    func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow {
+        lastHistoryRequest = (surface, beforeChunkID, maxBytes)
+        return terminalHistory
+    }
     func surfaceHealth(surface: SurfaceID) -> Bool { true }
     func surfaceClearHistory(surface: SurfaceID) {}
     var sshHosts: [SSHHostProfile] = []
@@ -415,6 +421,32 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNil(resp.error)
         XCTAssertEqual(router.sentSurfaceText.first?.1, "\u{03}",
                        "iOS Ctrl-C must reach the macOS PTY as ETX so Claude cancels instead of receiving printable CSI-u text")
+    }
+
+    @MainActor
+    func test_surfaceReadHistoryReturnsBoundedDBWindowForInfiniteScroll() async throws {
+        let router = FakeRouter()
+        let sid = SurfaceID()
+        router.terminalHistory = TerminalOutputWindow(chunks: [
+            TerminalOutputChunk(id: 10, surfaceID: sid.value.uuidString, workspaceID: nil, chunkIndex: 3, data: Data("older".utf8), createdAt: Date())
+        ], hasMoreOlder: true, nextBeforeChunkID: 10)
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.read_history", params: [
+            "id": .string(sid.value.uuidString),
+            "before_chunk_id": .number(11),
+            "max_bytes": .number(1024)
+        ]))
+
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(router.lastHistoryRequest?.0, sid)
+        XCTAssertEqual(router.lastHistoryRequest?.1, 11)
+        XCTAssertEqual(router.lastHistoryRequest?.2, 1024)
+        guard case .object(let result)? = resp.result else { return XCTFail("history must return a paged result object") }
+        XCTAssertEqual(result["text"], .string("older"),
+                       "terminal infinite scroll must fetch text from local DB history, not from the visible renderer")
+        XCTAssertEqual(result["has_more_older"], .bool(true))
+        XCTAssertEqual(result["next_before_chunk_id"], .number(10))
     }
 
     @MainActor

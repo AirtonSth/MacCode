@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import Darwin
 import CoreModel
+import Persistence
 import CSystem
 import DesignSystemKit
 
@@ -219,12 +220,21 @@ public final class TerminalSurface: NSObject, Surface {
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
     private var isVisible = true
+    private let historyRepo: TerminalOutputRepository?
+    private let historyWorkspaceID: String
+    private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
+    private var pendingHistoryData = Data()
+    private var historyFlushScheduled = false
+    private var nextHistoryChunkIndex: Int64 = 1
+    private nonisolated static let maxHistoryChunkBytes = 64 * 1024
 
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
     }
 
-    public init(workspaceID: WorkspaceID, title: String, launch: Launch) throws {
+    public init(workspaceID: WorkspaceID, title: String, launch: Launch, historyRepo: TerminalOutputRepository? = nil) throws {
+        self.historyRepo = historyRepo
+        self.historyWorkspaceID = workspaceID.value.uuidString
         let cwd: String
         let type: SurfaceType
         var metadata: [String: String]
@@ -290,6 +300,9 @@ public final class TerminalSurface: NSObject, Surface {
         self.view = container
 
         super.init()
+        if let historyRepo {
+            nextHistoryChunkIndex = (try? historyRepo.nextChunkIndex(surfaceID: descriptor.id.value.uuidString)) ?? 1
+        }
 
         terminalView.onInputData = { [weak self] data in self?.writeToPTY(data) }
         terminalView.onTerminalSizeChange = { [weak self] size in
@@ -402,6 +415,7 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func appendDataAsync(_ data: Data) {
+        enqueueHistory(data)
         renderer.feed(data)
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         descriptor.hasUnreadActivity = true
@@ -414,6 +428,7 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
+        enqueueHistory(data)
         renderer.feed(data)
         SurfaceOutputBus.shared.emit(descriptor.id, data)
         if isVisible {
@@ -477,6 +492,7 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func close() {
+        flushHistory(wait: true)
         readSource?.cancel()
         readSource = nil
         if childPID > 0 {
@@ -493,6 +509,47 @@ public final class TerminalSurface: NSObject, Surface {
             masterFD = -1
         }
         ghosttyView.closeSurface()
+    }
+
+    public func flushPersistedHistory() {
+        flushHistory(wait: true)
+    }
+
+    private func enqueueHistory(_ data: Data) {
+        guard historyRepo != nil, !data.isEmpty else { return }
+        pendingHistoryData.append(data)
+        if pendingHistoryData.count >= Self.maxHistoryChunkBytes {
+            flushHistory(wait: false)
+        } else {
+            scheduleHistoryFlush()
+        }
+    }
+
+    private func scheduleHistoryFlush() {
+        guard !historyFlushScheduled else { return }
+        historyFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.historyFlushScheduled = false
+            self?.flushHistory(wait: false)
+        }
+    }
+
+    private func flushHistory(wait: Bool) {
+        guard let historyRepo, !pendingHistoryData.isEmpty else { return }
+        let data = pendingHistoryData
+        pendingHistoryData.removeAll(keepingCapacity: true)
+        let surfaceID = descriptor.id.value.uuidString
+        let workspaceID = historyWorkspaceID
+        let chunkIndex = nextHistoryChunkIndex
+        nextHistoryChunkIndex += 1
+        let write = DispatchWorkItem {
+            try? historyRepo.append(surfaceID: surfaceID, workspaceID: workspaceID, chunkIndex: chunkIndex, data: data)
+        }
+        if wait {
+            historyQueue.sync(execute: write)
+        } else {
+            historyQueue.async(execute: write)
+        }
     }
 
     public func snapshot() -> [String: String] {

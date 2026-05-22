@@ -33,10 +33,10 @@ public final class AppCommandRouter: CommandRouting {
                     let surface: Surface
                     switch desc.type {
                     case .terminal:
-                        surface = try TerminalSurface(workspaceID: wid, cwd: cwd, title: title)
+                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), historyRepo: ctx.terminalOutputRepo)
                     case .ssh:
                         if let profile = sshProfile(from: desc) {
-                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd))
+                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), historyRepo: ctx.terminalOutputRepo)
                         } else {
                             surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self)
                         }
@@ -293,6 +293,13 @@ public final class AppCommandRouter: CommandRouting {
     public func readText(surface: SurfaceID) throws -> String {
         guard let s = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
         return s.readText()
+    }
+
+    public func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow {
+        guard let surfaceObject = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
+        (surfaceObject as? TerminalSurface)?.flushPersistedHistory()
+        guard let repo = context?.terminalOutputRepo else { throw LayoutError.surfaceNotFound }
+        return try repo.readWindow(surfaceID: surface.value.uuidString, beforeChunkID: beforeChunkID, maxBytes: maxBytes)
     }
 
     public func surfaceHealth(surface: SurfaceID) -> Bool {
@@ -1035,7 +1042,7 @@ public final class AppCommandRouter: CommandRouting {
             let surface: Surface
             switch type {
             case .terminal:
-                surface = try TerminalSurface(workspaceID: workspace, cwd: cwd, title: baseTitle)
+                surface = try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo)
             case .ssh:
                 surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self)
             case .browser:

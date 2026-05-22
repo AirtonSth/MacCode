@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 6
+    public static let currentVersion: Int = 7
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -191,6 +191,19 @@ public enum Schema {
         SchemaStep(6, """
         ALTER TABLE agent_threads ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'supervised';
         ALTER TABLE agent_threads ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium';
+        """),
+        SchemaStep(7, """
+        CREATE TABLE IF NOT EXISTS terminal_output_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            surface_id TEXT NOT NULL,
+            workspace_id TEXT,
+            chunk_index INTEGER NOT NULL,
+            data BLOB NOT NULL,
+            byte_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_output_surface_index ON terminal_output_chunks(surface_id, chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_terminal_output_surface_id ON terminal_output_chunks(surface_id, id);
         """)
     ]
 

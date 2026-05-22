@@ -31,6 +31,7 @@ public protocol CommandRouting: AnyObject {
     func setSurfaceColor(_ wid: WorkspaceID, _ sid: SurfaceID, _ color: String) throws
     func sendText(surface: SurfaceID, text: String) throws
     func readText(surface: SurfaceID) throws -> String
+    func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow
     func surfaceHealth(surface: SurfaceID) -> Bool
     func surfaceClearHistory(surface: SurfaceID)
     // SSH
@@ -472,6 +473,23 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let text = try router.readText(surface: sid)
                 return .init(id: id, result: .string(text))
+            case "surface.read_history":
+                guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                let before = params["before_chunk_id"]?.intValue.map(Int64.init)
+                let maxBytes = params["max_bytes"]?.intValue ?? (256 * 1024)
+                let window = try router.readTerminalHistory(surface: sid, beforeChunkID: before, maxBytes: maxBytes)
+                return .init(id: id, result: .object([
+                    "text": .string(window.text),
+                    "chunks": .array(window.chunks.map { chunk in
+                        .object([
+                            "id": .number(Double(chunk.id)),
+                            "chunk_index": .number(Double(chunk.chunkIndex)),
+                            "byte_count": .number(Double(chunk.data.count))
+                        ])
+                    }),
+                    "has_more_older": .bool(window.hasMoreOlder),
+                    "next_before_chunk_id": window.nextBeforeChunkID.map { .number(Double($0)) } ?? .null
+                ]))
             case "agent.open":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let s = try router.openAgentApp(workspace: wid)

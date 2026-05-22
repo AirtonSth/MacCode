@@ -321,6 +321,136 @@ public final class AgentRunRepository {
     }
 }
 
+public struct TerminalOutputChunk: Equatable {
+    public let id: Int64
+    public let surfaceID: String
+    public let workspaceID: String?
+    public let chunkIndex: Int64
+    public let data: Data
+    public let createdAt: Date
+
+    public init(id: Int64, surfaceID: String, workspaceID: String?, chunkIndex: Int64, data: Data, createdAt: Date) {
+        self.id = id
+        self.surfaceID = surfaceID
+        self.workspaceID = workspaceID
+        self.chunkIndex = chunkIndex
+        self.data = data
+        self.createdAt = createdAt
+    }
+
+    public var text: String {
+        String(decoding: data, as: UTF8.self)
+    }
+}
+
+public struct TerminalOutputWindow: Equatable {
+    public let chunks: [TerminalOutputChunk]
+    public let hasMoreOlder: Bool
+    public let nextBeforeChunkID: Int64?
+
+    public init(chunks: [TerminalOutputChunk], hasMoreOlder: Bool, nextBeforeChunkID: Int64?) {
+        self.chunks = chunks
+        self.hasMoreOlder = hasMoreOlder
+        self.nextBeforeChunkID = nextBeforeChunkID
+    }
+
+    public var text: String {
+        chunks.map(\.text).joined()
+    }
+}
+
+public final class TerminalOutputRepository {
+    let db: SQLiteDB
+    public init(db: SQLiteDB) { self.db = db }
+
+    public func append(surfaceID: String, workspaceID: String?, chunkIndex: Int64, data: Data) throws {
+        guard !data.isEmpty else { return }
+        let st = try db.prepare("""
+            INSERT OR IGNORE INTO terminal_output_chunks(surface_id, workspace_id, chunk_index, data, byte_count, created_at)
+            VALUES(?, ?, ?, ?, ?, ?);
+        """)
+        try st.bind(1, surfaceID)
+        try st.bind(2, workspaceID)
+        try st.bind(3, chunkIndex)
+        try st.bind(4, data)
+        try st.bind(5, Int64(data.count))
+        try st.bind(6, iso.string(from: Date()))
+        _ = try st.step()
+    }
+
+    public func nextChunkIndex(surfaceID: String) throws -> Int64 {
+        let st = try db.prepare("SELECT COALESCE(MAX(chunk_index), 0) + 1 FROM terminal_output_chunks WHERE surface_id = ?;")
+        try st.bind(1, surfaceID)
+        return (try st.step()) ? st.columnInt64(0) : 1
+    }
+
+    public func readWindow(surfaceID: String, beforeChunkID: Int64? = nil, maxBytes: Int = 256 * 1024) throws -> TerminalOutputWindow {
+        let byteLimit = max(1, maxBytes)
+        let sql: String
+        if beforeChunkID == nil {
+            sql = """
+                SELECT id, surface_id, workspace_id, chunk_index, data, created_at
+                FROM terminal_output_chunks
+                WHERE surface_id = ?
+                ORDER BY id DESC;
+            """
+        } else {
+            sql = """
+                SELECT id, surface_id, workspace_id, chunk_index, data, created_at
+                FROM terminal_output_chunks
+                WHERE surface_id = ? AND id < ?
+                ORDER BY id DESC;
+            """
+        }
+        let st = try db.prepare(sql)
+        try st.bind(1, surfaceID)
+        if let beforeChunkID { try st.bind(2, beforeChunkID) }
+
+        var reversed: [TerminalOutputChunk] = []
+        var bytes = 0
+        var hasMoreOlder = false
+        while try st.step() {
+            guard let data = st.columnBlob(4) else { continue }
+            if !reversed.isEmpty && bytes + data.count > byteLimit {
+                hasMoreOlder = true
+                break
+            }
+            reversed.append(TerminalOutputChunk(
+                id: st.columnInt64(0),
+                surfaceID: st.columnText(1) ?? "",
+                workspaceID: st.columnText(2),
+                chunkIndex: st.columnInt64(3),
+                data: data,
+                createdAt: parseDate(st.columnText(5))
+            ))
+            bytes += data.count
+            if bytes >= byteLimit { break }
+        }
+        let chunks = Array(reversed.reversed())
+        return TerminalOutputWindow(
+            chunks: chunks,
+            hasMoreOlder: hasMoreOlder || hasOlder(surfaceID: surfaceID, before: chunks.first?.id),
+            nextBeforeChunkID: chunks.first?.id
+        )
+    }
+
+    public func delete(surfaceID: String) throws {
+        let st = try db.prepare("DELETE FROM terminal_output_chunks WHERE surface_id = ?;")
+        try st.bind(1, surfaceID)
+        _ = try st.step()
+    }
+
+    private func hasOlder(surfaceID: String, before id: Int64?) -> Bool {
+        guard let id else { return false }
+        guard let st = try? db.prepare("SELECT 1 FROM terminal_output_chunks WHERE surface_id = ? AND id < ? LIMIT 1;") else { return false }
+        try? st.bind(1, surfaceID)
+        try? st.bind(2, id)
+        return ((try? st.step()) ?? false)
+    }
+}
+
+extension TerminalOutputRepository: @unchecked Sendable {}
+
 public final class SessionSnapshotRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }

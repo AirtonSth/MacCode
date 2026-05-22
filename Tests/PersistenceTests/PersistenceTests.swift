@@ -114,4 +114,26 @@ final class PersistenceTests: XCTestCase {
             .turnStarted(turnId: "second")
         ], "reopening or following up must replay every persisted run event, not only the latest response")
     }
+
+    func test_terminalOutputHistoryReadsBoundedOlderWindows() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let repo = TerminalOutputRepository(db: db)
+        let surfaceID = UUID().uuidString
+
+        try repo.append(surfaceID: surfaceID, workspaceID: nil, chunkIndex: 1, data: Data("older-".utf8))
+        try repo.append(surfaceID: surfaceID, workspaceID: nil, chunkIndex: 2, data: Data("middle-".utf8))
+        try repo.append(surfaceID: surfaceID, workspaceID: nil, chunkIndex: 3, data: Data("newest".utf8))
+
+        let latest = try repo.readWindow(surfaceID: surfaceID, maxBytes: 14)
+
+        XCTAssertEqual(latest.text, "middle-newest",
+                       "terminal history fetch must return newest DB chunks without loading the whole scrollback into memory")
+        XCTAssertTrue(latest.hasMoreOlder, "bounded history windows must expose an older-page cursor for infinite scroll")
+        let older = try repo.readWindow(surfaceID: surfaceID, beforeChunkID: latest.nextBeforeChunkID, maxBytes: 64)
+        XCTAssertEqual(older.text, "older-",
+                       "fetching before the cursor must read the next older DB-backed terminal history page")
+        XCTAssertFalse(older.hasMoreOlder)
+    }
 }
