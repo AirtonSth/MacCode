@@ -15,13 +15,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var messages: [AgentMessage] = []
     @Published public var timeline = AssistantTimelineState()
     @Published public var timelineUpdateTick: Int = 0
+    @Published public var userInputSelections: [String: Set<String>] = [:]
+    @Published public var userInputDrafts: [String: String] = [:]
     @Published public var focusTick: Int = 0
     @Published public var prompt: String = ""
     @Published public var provider: AgentProvider = .codex
+    @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
     @Published public var model: String = "gpt-5.5"
     @Published public var availableModels: [AgentModelDescriptor] = []
+    @Published public var providerSnapshots: [AgentProviderSnapshot] = []
     @Published public var permissionMode: AgentPermissionMode = .supervised
     @Published public var reasoningEffort: AgentReasoningEffort = .medium
+    @Published public var serviceTier: AgentServiceTier = .auto
+    @Published public var executionMode: AgentExecutionMode = .local
+    @Published public var baseBranch: String = ""
+    @Published public var worktreePath: String?
+    private var customModelSelections = Set<String>()
     @Published public var status: AgentRunStatus = .pending
     @Published public var statusMessage: String = ""
     @Published public var currentRunId: AgentRunID?
@@ -40,6 +49,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Fired when a run completes so the workspace can move up in its
     /// pinned/unpinned group.
     public var onRunCompleted: (() -> Void)?
+    public var providerSnapshotLoader: (() async -> [AgentProviderSnapshot])?
+    public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
+    public var providerRecoveryAction: ((AgentProvider, String?) async throws -> String)?
+    public var pullRequestThreadPreparer: ((String, AgentProvider, String, AgentPermissionMode, AgentReasoningEffort, AgentServiceTier, AgentModelSelection?, String?) async throws -> AgentThread)?
+    @Published public var providerRecoveryActionRunning = false
+    @Published public var providerRecoveryStatusMessage: String?
+    @Published public var pullRequestURL: String = ""
+    @Published public var pullRequestPreparing = false
+    @Published public var pullRequestStatusMessage: String?
+    @Published public var checkpoints: [AgentTurnCheckpointSummary] = []
+    @Published public var selectedCheckpointTurnCount: Int?
+    @Published public var selectedCheckpointPath: String?
+    @Published public var checkpointDiffPreview: String = ""
+    @Published public var checkpointStatusMessage: String?
     /// B3: file paths attached to the next message (composer chips).
     @Published public var attachments: [String] = []
     /// When the active run started — drives the "Working for Xs" line.
@@ -50,9 +73,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let coordinator: AgentRunCoordinator
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
+    public let pendingCallbackRepo: ProviderPendingCallbackRepository?
+    public let proposedPlanRepo: AgentProposedPlanRepository?
+    public let checkpointRepo: AgentTurnCheckpointRepository?
     public let promptHistoryStore: PromptHistoryStore?
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
+    private var terminalRunIds = Set<AgentRunID>()
 
     public init(
         workspaceID: WorkspaceID,
@@ -60,6 +87,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         coordinator: AgentRunCoordinator,
         threadRepo: AgentThreadRepository,
         messageRepo: AgentMessageRepository,
+        pendingCallbackRepo: ProviderPendingCallbackRepository? = nil,
+        proposedPlanRepo: AgentProposedPlanRepository? = nil,
+        checkpointRepo: AgentTurnCheckpointRepository? = nil,
         promptHistoryStore: PromptHistoryStore? = nil
     ) {
         self.workspaceID = workspaceID
@@ -67,6 +97,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.coordinator = coordinator
         self.threadRepo = threadRepo
         self.messageRepo = messageRepo
+        self.pendingCallbackRepo = pendingCallbackRepo
+        self.proposedPlanRepo = proposedPlanRepo
+        self.checkpointRepo = checkpointRepo
         self.promptHistoryStore = promptHistoryStore
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
         self.coordinator.addObserver(self)
@@ -114,9 +147,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         selectedThreadId = id
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
+            providerInstanceId = t.providerInstanceId ?? t.provider.rawValue
             model = t.model
             permissionMode = t.permissionMode
             reasoningEffort = t.reasoningEffort
+            serviceTier = t.serviceTier
+            executionMode = t.executionMode
+            baseBranch = t.baseBranch ?? gitBranch ?? "main"
+            worktreePath = t.worktreePath
             status = t.status
             if t.status == .running {
                 if runStartedAt == nil { runStartedAt = Date() }
@@ -137,11 +175,123 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messageWindow = Self.baseMessageWindow
         loadWindow(id)
         timeline = AssistantTimelineState()
-        for event in coordinator.latestStreamEvents(threadId: id) {
+        let persistedEvents = coordinator.latestStreamEvents(threadId: id)
+        let replayEvents = providerThreadSnapshotEvents(threadId: id).map {
+            mergePersistedContextTelemetry(snapshot: $0, persisted: persistedEvents)
+        } ?? persistedEvents
+        for event in replayEvents {
             timeline.apply(event)
         }
+        rehydrateProposedPlans(threadId: id)
+        rehydratePendingCallbacks(threadId: id)
+        reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         timelineUpdateTick = 0
+    }
+
+    public func reloadCheckpoints() {
+        guard let selectedThreadId, let checkpointRepo else {
+            checkpoints = []
+            selectedCheckpointTurnCount = nil
+            selectedCheckpointPath = nil
+            checkpointDiffPreview = ""
+            return
+        }
+        let loaded = (try? checkpointRepo.list(threadId: selectedThreadId)) ?? []
+        checkpoints = loaded.reversed()
+        if let selected = selectedCheckpointTurnCount,
+           let checkpoint = checkpoints.first(where: { $0.checkpointTurnCount == selected }) {
+            selectCheckpoint(checkpoint, path: selectedCheckpointPath)
+        } else if let first = checkpoints.first {
+            selectCheckpoint(first, path: nil)
+        } else {
+            selectedCheckpointTurnCount = nil
+            selectedCheckpointPath = nil
+            checkpointDiffPreview = ""
+        }
+    }
+
+    public func selectCheckpoint(_ checkpoint: AgentTurnCheckpointSummary, path: String?) {
+        selectedCheckpointTurnCount = checkpoint.checkpointTurnCount
+        selectedCheckpointPath = path
+        checkpointStatusMessage = nil
+        if let path {
+            checkpointDiffPreview = checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? ""
+        } else {
+            checkpointDiffPreview = checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n\n")
+        }
+        if checkpointDiffPreview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            checkpointDiffPreview = checkpoint.errorMessage ?? "No diff captured for this checkpoint."
+        }
+    }
+
+    public func revertSelectedCheckpoint() {
+        guard let selectedThreadId, let turnCount = selectedCheckpointTurnCount else { return }
+        do {
+            _ = try coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
+            checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
+            messageWindow = Self.baseMessageWindow
+            loadWindow(selectedThreadId)
+            reloadCheckpoints()
+            reloadThreads()
+        } catch {
+            checkpointStatusMessage = "Revert failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func providerThreadSnapshotEvents(threadId: AgentThreadID) -> [AssistantEvent]? {
+        guard let events = try? coordinator.readThread(threadId: threadId), !events.isEmpty else {
+            return nil
+        }
+        return events
+    }
+
+    private func mergePersistedContextTelemetry(snapshot: [AssistantEvent], persisted: [AssistantEvent]) -> [AssistantEvent] {
+        var merged = snapshot
+        if !snapshot.contains(where: { if case .tokenUsage = $0 { return true }; return false }),
+           let usage = persisted.reversed().compactMap({ event -> AssistantTokenUsage? in
+               if case .tokenUsage(let usage) = event { return usage }
+               return nil
+           }).first {
+            merged.append(.tokenUsage(usage))
+        }
+        if !snapshot.contains(where: { if case .contextCompaction = $0 { return true }; return false }),
+           let summary = persisted.reversed().compactMap({ event -> String?? in
+               if case .contextCompaction(let summary) = event { return .some(summary) }
+               return nil
+           }).first {
+            merged.append(.contextCompaction(summary: summary))
+        }
+        return merged
+    }
+
+    private func rehydrateProposedPlans(threadId: AgentThreadID) {
+        guard let proposedPlanRepo,
+              let records = try? proposedPlanRepo.list(threadId: threadId) else { return }
+        for record in records {
+            timeline.apply(.proposedPlan(record.plan))
+        }
+    }
+
+    private func rehydratePendingCallbacks(threadId: AgentThreadID) {
+        guard let pendingCallbackRepo,
+              let callbacks = try? pendingCallbackRepo.listVisible(threadId: threadId) else { return }
+        let decoder = JSONDecoder()
+        for callback in callbacks {
+            guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
+            switch callback.kind {
+            case .approval:
+                guard var request = try? decoder.decode(AssistantPendingRequest.self, from: data) else { continue }
+                request.state = callback.state
+                request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                timeline.apply(.requestOpened(request))
+            case .userInput:
+                guard var request = try? decoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
+                request.state = callback.state
+                request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                timeline.apply(.userInputRequested(request))
+            }
+        }
     }
 
     // MARK: B4 — bounded message window
@@ -181,6 +331,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// C7: the most recent plan the agent proposed in this thread's
     /// timeline (t3code PlanSidebar — proposed-plan tracking).
     public var latestPlanText: String? {
+        if let plan = timeline.proposedPlans.last?.markdown.trimmingCharacters(in: .whitespacesAndNewlines),
+           !plan.isEmpty {
+            return plan
+        }
         for turn in timeline.turns.reversed() {
             if let plan = turn.items.last(where: { $0.type == .plan }) {
                 let t = plan.body.isEmpty ? (plan.summary ?? "") : plan.body
@@ -188,6 +342,83 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         return nil
+    }
+    public var latestProposedPlan: AssistantProposedPlan? {
+        timeline.proposedPlans.last { !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    @discardableResult
+    public func saveLatestProposedPlan(to url: URL) throws -> URL {
+        guard let plan = latestProposedPlan else {
+            throw NSError(domain: "RemoteCode.AgentApp", code: 404, userInfo: [
+                NSLocalizedDescriptionKey: "No proposed plan is available to save."
+            ])
+        }
+        try plan.markdown.data(using: .utf8)?.write(to: url, options: .atomic)
+        return url
+    }
+
+    public var activePlan: AssistantActivePlan? {
+        timeline.activePlan
+    }
+
+    public var openPendingRequests: [AssistantPendingRequest] {
+        timeline.pendingRequests.filter { $0.state == .pending || $0.state == .stale }
+    }
+
+    public var openPendingUserInputs: [AssistantUserInputRequest] {
+        timeline.pendingUserInputs.filter { $0.state == .pending || $0.state == .stale }
+    }
+
+    public func respondToPendingRequest(_ request: AssistantPendingRequest, response: AgentProviderRequestResponse) {
+        guard let threadId = selectedThreadId else { return }
+        let state: AssistantRequestState
+        switch response {
+        case .approve, .approveForSession: state = .approved
+        case .decline: state = .declined
+        case .cancel: state = .cancelled
+        }
+        do {
+            try coordinator.respondToRequest(threadId: threadId, requestId: request.id, response: response)
+            timeline.apply(.requestResolved(requestId: request.id, state: state))
+        } catch {
+            timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
+            timeline.apply(.requestResolved(requestId: request.id, state: .stale))
+        }
+        timelineUpdateTick += 1
+    }
+
+    public func answerPendingUserInput(_ request: AssistantUserInputRequest, answer: String) {
+        guard let threadId = selectedThreadId else { return }
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        userInputSelections[request.id] = nil
+        userInputDrafts[request.id] = nil
+        do {
+            try coordinator.respondToUserInput(threadId: threadId, requestId: request.id, text: trimmed)
+            timeline.apply(.userInputResolved(requestId: request.id, answer: trimmed))
+        } catch {
+            timeline.apply(.error(message: "Provider user-input response failed: \(error)", recoverable: true))
+            if let idx = timeline.pendingUserInputs.firstIndex(where: { $0.id == request.id }) {
+                timeline.pendingUserInputs[idx].state = .stale
+                timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+            }
+        }
+        timelineUpdateTick += 1
+    }
+
+    public func toggleUserInputOption(_ option: String, for request: AssistantUserInputRequest) {
+        var selection = userInputSelections[request.id] ?? []
+        if selection.contains(option) { selection.remove(option) }
+        else { selection.insert(option) }
+        userInputSelections[request.id] = selection
+    }
+
+    public func selectedUserInputAnswer(for request: AssistantUserInputRequest) -> String {
+        (userInputSelections[request.id] ?? [])
+            .filter { request.options.contains($0) }
+            .sorted()
+            .joined(separator: "\n")
     }
 
     public func loadModels() async {
@@ -197,31 +428,229 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.availableModels = m
             // B8: a provider switch must leave a model valid for that
             // provider — never a stale id from the other provider.
-            if !m.isEmpty, !m.contains(where: { $0.id == self.model }) {
+            if !self.modelSelectionIsValid(self.model, in: m) {
                 self.model = m.first?.id ?? self.model
             }
+            self.normalizeSelectedModelOptions()
         }
+    }
+
+    public func loadProviderSnapshots() async {
+        let snapshots: [AgentProviderSnapshot]
+        if let providerSnapshotLoader {
+            snapshots = await providerSnapshotLoader()
+        } else {
+            var local: [AgentProviderSnapshot] = []
+            for provider in AgentProvider.allCases {
+                let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
+                local.append(AgentProviderSnapshotFactory.snapshot(
+                    provider: provider,
+                    models: await runner.listModels(),
+                    binaryPath: ProcessLocator.resolve(provider.rawValue) ?? ""
+                ))
+            }
+            snapshots = local
+        }
+        await MainActor.run {
+            self.providerSnapshots = snapshots
+            if self.selectedProviderSnapshot == nil {
+                self.providerInstanceId = snapshots.first(where: { $0.provider == self.provider })?.id ?? self.provider.rawValue
+            }
+            if let current = self.selectedProviderSnapshot {
+                self.provider = current.provider
+                self.availableModels = current.models
+                if !self.modelSelectionIsValid(self.model, in: current.models) {
+                    self.model = current.models.first?.id ?? self.model
+                }
+                self.normalizeSelectedModelOptions()
+            }
+        }
+    }
+
+    public var selectedProviderSnapshot: AgentProviderSnapshot? {
+        providerSnapshots.first { $0.id == providerInstanceId }
+            ?? providerSnapshots.first { $0.provider == provider }
+    }
+
+    public var selectedModelDescriptor: AgentModelDescriptor? {
+        if let exact = availableModels.first(where: { $0.id == model && $0.provider == provider }) {
+            return exact
+        }
+        return model.isEmpty ? nil : availableModels.first { $0.provider == provider && $0.supportsCustomModel }
+    }
+
+    public var supportedReasoningEffortsForSelectedModel: [AgentReasoningEffort] {
+        selectedModelDescriptor?.supportedReasoningEfforts ?? AgentReasoningEffort.supportedCases
+    }
+
+    public var supportsReasoningForSelectedModel: Bool {
+        !supportedReasoningEffortsForSelectedModel.isEmpty
+    }
+
+    public var supportsServiceTierForSelectedModel: Bool {
+        selectedModelDescriptor?.supportsServiceTier == true
+    }
+
+    public var supportsCustomModelForSelectedProvider: Bool {
+        availableModels.contains { $0.provider == provider && $0.supportsCustomModel }
+    }
+
+    public var selectedModelContextWindowLabel: String? {
+        guard let tokens = selectedModelDescriptor?.contextWindowTokens, tokens > 0 else { return nil }
+        if tokens >= 1_000_000, tokens % 1_000_000 == 0 { return "\(tokens / 1_000_000)M ctx" }
+        if tokens >= 1_000, tokens % 1_000 == 0 { return "\(tokens / 1_000)k ctx" }
+        return "\(tokens) ctx"
+    }
+
+    private func modelSelectionIsValid(_ model: String, in models: [AgentModelDescriptor]) -> Bool {
+        guard !models.isEmpty else { return true }
+        if models.contains(where: { $0.id == model }) { return true }
+        return !model.isEmpty && customModelSelections.contains(model) && models.contains(where: \.supportsCustomModel)
+    }
+
+    public var currentModelSelection: AgentModelSelection {
+        let exactDescriptor = availableModels.first { $0.id == model && $0.provider == provider }
+        let descriptor = selectedModelDescriptor
+        let isCustom = exactDescriptor == nil && descriptor?.supportsCustomModel == true && !model.isEmpty
+        return AgentModelSelection(
+            provider: provider,
+            modelId: isCustom ? (descriptor?.id ?? "") : model,
+            customModelId: isCustom ? model : nil,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier
+        )
+    }
+
+    public func normalizeSelectedModelOptions() {
+        let efforts = supportedReasoningEffortsForSelectedModel
+        if efforts.isEmpty {
+            reasoningEffort = .medium
+        } else if !efforts.contains(reasoningEffort) {
+            reasoningEffort = efforts.first ?? .medium
+        }
+        if !supportsServiceTierForSelectedModel {
+            serviceTier = .auto
+        }
+    }
+
+    public var composerSuggestions: [AgentComposerSuggestion] {
+        AgentComposerSuggestions.suggestions(
+            for: prompt,
+            snapshot: selectedProviderSnapshot,
+            localSlashCommands: Self.localSlashCommands
+        )
+    }
+
+    public func applyComposerSuggestion(_ suggestion: AgentComposerSuggestion) {
+        prompt = AgentComposerSuggestions.replacingActiveToken(in: prompt, with: suggestion.insertText)
+        promptHistoryCursor = nil
+    }
+
+    public func providerDisplayName(_ provider: AgentProvider) -> String {
+        providerSnapshots.first { $0.provider == provider }?.displayName ?? provider.rawValue.capitalized
+    }
+
+    public func providerInstanceDisplayName(_ id: String) -> String {
+        providerSnapshots.first { $0.id == id }?.displayName ?? id
+    }
+
+    public var providerStatusMessage: String? {
+        guard let snapshot = selectedProviderSnapshot, snapshot.status != .available else { return nil }
+        return snapshot.statusDetail ?? "\(snapshot.displayName) is \(snapshot.status.rawValue)."
+    }
+
+    public var providerAccountStatusMessage: String? {
+        guard let snapshot = selectedProviderSnapshot,
+              let summary = snapshot.accountSummary else { return nil }
+        return "\(snapshot.displayName): \(summary)"
+    }
+
+    public var providerRecoveryActionTitle: String? {
+        guard let snapshot = selectedProviderSnapshot else { return nil }
+        return Self.providerRecoveryActionTitle(for: snapshot)
+    }
+
+    public static func providerRecoveryActionTitle(for snapshot: AgentProviderSnapshot) -> String? {
+        snapshot.recoveryActionTitle
+    }
+
+    public func performProviderRecoveryAction() async {
+        guard let snapshot = selectedProviderSnapshot,
+              let title = Self.providerRecoveryActionTitle(for: snapshot) else { return }
+        if title.hasPrefix("Update") {
+            guard let providerRecoveryAction else {
+                providerRecoveryStatusMessage = "Update unavailable: app router is not ready."
+                return
+            }
+            providerRecoveryActionRunning = true
+            defer { providerRecoveryActionRunning = false }
+            do {
+                let stdout = try await providerRecoveryAction(snapshot.provider, snapshot.id)
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                providerRecoveryStatusMessage = stdout.isEmpty ? "Update completed." : stdout
+                await loadProviderSnapshots()
+            } catch {
+                providerRecoveryStatusMessage = "Update failed: \(error)"
+            }
+            return
+        }
+        let command: String
+        if snapshot.authenticated == false {
+            command = "\(snapshot.provider.rawValue) login"
+        } else {
+            command = snapshot.provider == .codex ? "npm install -g @openai/codex" : "npm install -g @anthropic-ai/claude-code"
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        providerRecoveryStatusMessage = "Copied: \(command)"
+    }
+
+    public var contextHealthMessage: String? {
+        AgentContextStatusPresentation.message(
+            usage: timeline.tokenUsage,
+            compactionSummary: timeline.contextCompactionSummary
+        )
     }
 
     /// A1: the provider (source) is fixed once the thread has a
     /// conversation — only model/effort stay changeable after that.
     public var providerLocked: Bool { selectedThreadId != nil && !messages.isEmpty }
+    public var executionLocked: Bool { providerLocked || status == .running }
+
+    public func setProviderInstance(_ id: String) {
+        guard let snapshot = providerSnapshots.first(where: { $0.id == id }) else { return }
+        providerInstanceId = snapshot.id
+        provider = snapshot.provider
+        availableModels = snapshot.models
+        if !modelSelectionIsValid(model, in: snapshot.models) {
+            model = snapshot.models.first?.id ?? model
+        }
+        normalizeSelectedModelOptions()
+        persistThreadConfig()
+    }
 
     /// Persist the chosen run configuration onto the selected thread so a
     /// resumed run uses the right source, model, permission, and effort.
     public func persistThreadConfig() {
+        normalizeSelectedModelOptions()
         guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
         t.provider = provider
+        t.providerInstanceId = providerInstanceId
         t.model = model
         t.permissionMode = permissionMode
         t.reasoningEffort = reasoningEffort
+        t.serviceTier = serviceTier
+        t.modelSelection = currentModelSelection
         t.updatedAt = Date()
         try? threadRepo.upsert(t)
         if let i = threads.firstIndex(where: { $0.id == id }) {
             threads[i].provider = provider
+            threads[i].providerInstanceId = providerInstanceId
             threads[i].model = model
             threads[i].permissionMode = permissionMode
             threads[i].reasoningEffort = reasoningEffort
+            threads[i].serviceTier = serviceTier
+            threads[i].modelSelection = currentModelSelection
         }
     }
 
@@ -231,16 +660,105 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func setReasoningEffort(_ effort: AgentReasoningEffort) {
-        reasoningEffort = effort
+        let efforts = supportedReasoningEffortsForSelectedModel
+        reasoningEffort = efforts.isEmpty ? .medium : (efforts.contains(effort) ? effort : (efforts.first ?? .medium))
+        persistThreadConfig()
+    }
+
+    public func setServiceTier(_ tier: AgentServiceTier) {
+        serviceTier = supportsServiceTierForSelectedModel ? tier : .auto
+        persistThreadConfig()
+    }
+
+    public func setExecutionMode(_ mode: AgentExecutionMode) {
+        guard !executionLocked else { return }
+        executionMode = mode
+        if mode == .worktree, baseBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            baseBranch = gitBranch ?? "main"
+        }
+        persistThreadExecutionConfig()
+    }
+
+    public func setBaseBranch(_ branch: String) {
+        guard !executionLocked else { return }
+        baseBranch = branch.trimmingCharacters(in: .whitespacesAndNewlines)
+        if executionMode == .worktree {
+            persistThreadExecutionConfig()
+        }
+    }
+
+    public func persistThreadExecutionConfig() {
+        guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
+        let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        t.executionMode = executionMode
+        t.baseBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
+        if executionMode == .local { t.worktreePath = nil }
+        t.updatedAt = Date()
+        try? threadRepo.upsert(t)
+        if let i = threads.firstIndex(where: { $0.id == id }) {
+            threads[i].executionMode = t.executionMode
+            threads[i].baseBranch = t.baseBranch
+            threads[i].worktreePath = t.worktreePath
+        }
+    }
+
+    public func setModel(_ model: String) {
+        self.model = model
+        normalizeSelectedModelOptions()
+        persistThreadConfig()
+    }
+
+    public func setCustomModel(_ raw: String) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard supportsCustomModelForSelectedProvider else { return }
+        if !trimmed.isEmpty { customModelSelections.insert(trimmed) }
+        model = trimmed.isEmpty ? (availableModels.first { $0.provider == provider }?.id ?? "") : trimmed
+        normalizeSelectedModelOptions()
         persistThreadConfig()
     }
 
     public func createThread(title: String) {
-        let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider, model: model,
-                            permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        normalizeSelectedModelOptions()
+        let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider,
+                            providerInstanceId: providerInstanceId,
+                            model: model,
+                            permissionMode: permissionMode, reasoningEffort: reasoningEffort,
+                            executionMode: executionMode,
+                            baseBranch: executionMode == .worktree ? (baseBranch.isEmpty ? (gitBranch ?? "main") : baseBranch) : nil,
+                            serviceTier: serviceTier, modelSelection: currentModelSelection)
         try? threadRepo.upsert(t)
         reloadThreads()
         selectThread(t.id)
+    }
+
+    public func preparePullRequestThread() async {
+        let url = pullRequestURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !url.isEmpty else { return }
+        guard let pullRequestThreadPreparer else {
+            pullRequestStatusMessage = "PR preparation unavailable: app router is not ready."
+            return
+        }
+        normalizeSelectedModelOptions()
+        pullRequestPreparing = true
+        defer { pullRequestPreparing = false }
+        do {
+            let thread = try await pullRequestThreadPreparer(
+                url,
+                provider,
+                model,
+                permissionMode,
+                reasoningEffort,
+                serviceTier,
+                currentModelSelection,
+                providerInstanceId
+            )
+            pullRequestURL = ""
+            reloadThreads()
+            selectThread(thread.id)
+            pullRequestStatusMessage = "Opened \(thread.title)"
+        } catch {
+            pullRequestStatusMessage = "PR preparation failed: \(error)"
+        }
     }
 
     public func renameThread(_ id: AgentThreadID, to newTitle: String) {
@@ -321,7 +839,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
               let src = threads.first(where: { $0.id == tid }) else { return }
         let copy = AgentThread(workspaceId: workspaceID, title: "\(src.title) (fork)",
                                provider: src.provider, model: src.model,
-                               permissionMode: src.permissionMode, reasoningEffort: src.reasoningEffort)
+                               permissionMode: src.permissionMode, reasoningEffort: src.reasoningEffort,
+                               serviceTier: src.serviceTier)
         try? threadRepo.upsert(copy)
         for m in (try? messageRepo.list(threadId: tid)) ?? [] {
             try? messageRepo.append(AgentMessage(threadId: copy.id, role: m.role, content: m.content))
@@ -330,8 +849,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         selectThread(copy.id)
     }
 
-    /// Intercept `/clear /fork /model /plan /status` before they reach the
-    /// provider. Returns true if the input was a (handled) command.
+    /// Intercept only RemoteCode-owned slash commands before they reach the
+    /// provider. Provider commands such as `/goal` must pass through.
+    public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
+
     @discardableResult
     public func handleSlashCommand(_ raw: String) -> Bool {
         let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -356,14 +877,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 systemNote(names.isEmpty ? "No models loaded yet." : "Models: \(names)")
             }
         case "plan":
-            showPlanSidebar.toggle()
+            showPlanSidebar = true
             permissionMode = .supervised
             persistThreadConfig()
-            systemNote("Plan mode \(showPlanSidebar ? "on" : "off") · permission: supervised")
+            systemNote("Plan mode on · permission: supervised")
+        case "default":
+            showPlanSidebar = false
+            persistThreadConfig()
+            systemNote("Default mode on")
         case "status":
             systemNote(statusSummary())
         default:
-            systemNote("Unknown command: /\(cmd)")
+            return false
         }
         return true
     }
@@ -386,16 +911,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         recordPromptHistory(text)
-        // Slash commands never reach the provider.
-        if text.hasPrefix("/") {
+        if text.hasPrefix("/"), handleSlashCommand(text) {
             prompt = ""
-            _ = handleSlashCommand(text)
             return
         }
+        _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: showPlanSidebar ? .plan : .default)
+    }
+
+    @discardableResult
+    private func startProviderRun(text: String, attached: [String], recordHistory: Bool, interactionMode: AgentInteractionMode) async -> AgentRunID? {
+        if recordHistory { recordPromptHistory(text) }
         if selectedThreadId == nil {
             createThread(title: "New thread")
         }
-        guard let tid = selectedThreadId else { return }
+        guard let tid = selectedThreadId else { return nil }
         // B5: title a still-default thread from its first message.
         if let t = threads.first(where: { $0.id == tid }),
            AgentThreadTitle.isPlaceholder(t.title),
@@ -406,42 +935,81 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
         timelineUpdateTick = 0
-        // B3: fold attachment paths into the prompt so the agent (which
-        // has fs access per permission mode) can read them; show a friendly
-        // chip summary in the transcript.
-        let attached = attachments
+        let resolvedAttachments: [AgentAttachment]
+        do {
+            resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
+        } catch {
+            systemNote(String(describing: error))
+            return nil
+        }
         attachments = []
-        let composed = attached.isEmpty ? text
-            : text + "\n\n[Attached files]\n" + attached.map { "- \($0)" }.joined(separator: "\n")
-        let display = attached.isEmpty ? text
-            : text + "\n\n📎 " + attached.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+        let display = resolvedAttachments.isEmpty ? text
+            : text + "\n\n📎 " + resolvedAttachments.map(\.displayName).joined(separator: ", ")
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist).
         messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display)))
         persistThreadConfig()
+        let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
         let req = AgentRunRequest(
             threadId: tid,
             provider: provider,
+            providerInstanceId: providerInstanceId,
             model: model,
             cwd: cwd,
-            prompt: composed,
+            prompt: text,
+            userMessageContent: display,
+            attachments: resolvedAttachments,
             providerThreadId: threads.first(where: { $0.id == tid })?.providerThreadId,
             permissionMode: permissionMode,
-            reasoningEffort: reasoningEffort
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            interactionMode: interactionMode,
+            providerBinary: launchConfig?.binary,
+            environment: launchConfig?.environment ?? [:]
         )
         do {
             let runId = try await coordinator.startRun(req)
+            let runStatus = (try? coordinator.runStatus(runId)) ?? .running
             await MainActor.run {
-                self.currentRunId = runId
-                self.runThreads[runId] = tid
-                self.status = .running
-                self.runStartedAt = Date()
+                self.terminalRunIds.remove(runId)
+                if runStatus == .running || runStatus == .pending {
+                    self.currentRunId = runId
+                    self.runThreads[runId] = tid
+                    self.status = .running
+                    self.runStartedAt = Date()
+                } else {
+                    self.currentRunId = nil
+                    self.runThreads[runId] = nil
+                    self.status = runStatus
+                    self.runStartedAt = nil
+                }
                 self.reloadThreads()
                 self.onRunStateChange?()
             }
+            return runId
         } catch {
             await MainActor.run { self.statusMessage = "Failed to start: \(error)"; self.status = .failed }
+            return nil
         }
+    }
+
+    public func implementLatestPlan(newThread: Bool = false) async {
+        guard let sourceThreadId = selectedThreadId,
+              let plan = latestProposedPlan else { return }
+        let targetThreadId: AgentThreadID
+        if newThread {
+            createThread(title: "Implement plan")
+            guard let selectedThreadId else { return }
+            targetThreadId = selectedThreadId
+        } else {
+            targetThreadId = sourceThreadId
+        }
+        let prompt = AgentPlanImplementationPrompt.make(markdown: plan.markdown)
+        guard await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .default) != nil else { return }
+        try? proposedPlanRepo?.markImplemented(threadId: sourceThreadId, planId: plan.id, implementationThreadId: targetThreadId)
+        var implemented = plan
+        implemented.implementedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+        timeline.apply(.proposedPlan(implemented))
     }
 
     private func recordPromptHistory(_ text: String) {
@@ -497,9 +1065,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {
         Task { @MainActor in
             guard threadId == self.selectedThreadId else { return }
-            self.currentRunId = run
-            self.runThreads[run] = threadId
-            if self.status != .running { self.status = .running }
+            if !self.terminalRunIds.contains(run) {
+                self.currentRunId = run
+                self.runThreads[run] = threadId
+                if self.status != .running { self.status = .running }
+            }
             self.timeline.apply(event)
             self.timelineUpdateTick &+= 1
         }
@@ -508,6 +1078,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         Task { @MainActor in
             let finishedTid = threadId
+            self.terminalRunIds.insert(runId)
             self.runThreads[runId] = nil
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
                 // The coordinator is normally the persistence owner, but
@@ -546,10 +1117,214 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.reloadThreads()
             if threadId == self.selectedThreadId {
                 self.status = status
-                if status == .running { self.currentRunId = runId }
-                if status == .running, self.runStartedAt == nil { self.runStartedAt = Date() }
+                if status == .running {
+                    self.terminalRunIds.remove(runId)
+                    self.currentRunId = runId
+                    if self.runStartedAt == nil { self.runStartedAt = Date() }
+                } else if Self.isTerminalRunStatus(status) {
+                    self.terminalRunIds.insert(runId)
+                    self.currentRunId = nil
+                    self.runStartedAt = nil
+                    self.runThreads[runId] = nil
+                }
             }
             self.onRunStateChange?()
+        }
+    }
+
+    private static func isTerminalRunStatus(_ status: AgentRunStatus) -> Bool {
+        switch status {
+        case .completed, .failed, .cancelled, .interrupted:
+            return true
+        case .pending, .running:
+            return false
+        }
+    }
+}
+
+public struct AgentComposerSuggestion: Identifiable, Equatable, Sendable {
+    public enum Kind: Sendable {
+        case slashCommand
+        case skill
+    }
+
+    public let id: String
+    public let title: String
+    public let subtitle: String
+    public let insertText: String
+    public let kind: Kind
+
+    public init(title: String, subtitle: String, insertText: String, kind: Kind) {
+        self.id = "\(kind)-\(insertText)"
+        self.title = title
+        self.subtitle = subtitle
+        self.insertText = insertText
+        self.kind = kind
+    }
+}
+
+public enum AgentComposerSuggestions {
+    public static func suggestions(
+        for text: String,
+        snapshot: AgentProviderSnapshot?,
+        localSlashCommands: [String],
+        limit: Int = 8
+    ) -> [AgentComposerSuggestion] {
+        let token = activeToken(in: text)
+        guard token.hasPrefix("/") || token.hasPrefix("$") else { return [] }
+        let query = String(token.dropFirst()).lowercased()
+        if token.hasPrefix("$") {
+            return ranked(snapshot?.skills ?? [], query: query)
+                .prefix(limit)
+                .map {
+                    AgentComposerSuggestion(title: "$\($0)", subtitle: "Codex skill", insertText: "$\($0) ", kind: .skill)
+                }
+        }
+        let providerCommands = snapshot?.slashCommands ?? []
+        let allCommands = Array(Set(localSlashCommands + providerCommands)).sorted()
+        return ranked(allCommands, query: query)
+            .prefix(limit)
+            .map { command in
+                let source = localSlashCommands.contains(command) ? "RemoteCode command" : "\(snapshot?.displayName ?? "Provider") command"
+                return AgentComposerSuggestion(title: command, subtitle: source, insertText: "\(command) ", kind: .slashCommand)
+            }
+    }
+
+    public static func replacingActiveToken(in text: String, with replacement: String) -> String {
+        guard let range = activeTokenRange(in: text) else { return replacement }
+        var updated = text
+        updated.replaceSubrange(range, with: replacement)
+        return updated
+    }
+
+    private static func activeToken(in text: String) -> String {
+        guard let range = activeTokenRange(in: text) else { return "" }
+        return String(text[range])
+    }
+
+    private static func activeTokenRange(in text: String) -> Range<String.Index>? {
+        let end = text.endIndex
+        var start = end
+        while start > text.startIndex {
+            let previous = text.index(before: start)
+            if text[previous].isWhitespace { break }
+            start = previous
+        }
+        guard start < end else { return nil }
+        return start..<end
+    }
+
+    private static func ranked(_ values: [String], query: String) -> [String] {
+        let unique = Array(Set(values)).sorted()
+        guard !query.isEmpty else { return unique }
+        return unique
+            .filter { $0.lowercased().contains(query) }
+            .sorted { lhs, rhs in
+                let l = lhs.lowercased()
+                let r = rhs.lowercased()
+                let lp = l.hasPrefix(query) || l.hasPrefix("/\(query)")
+                let rp = r.hasPrefix(query) || r.hasPrefix("/\(query)")
+                if lp != rp { return lp }
+                return lhs < rhs
+            }
+    }
+}
+
+public enum AgentContextStatusPresentation {
+    public static func message(usage: AssistantTokenUsage?, compactionSummary: String?) -> String? {
+        let compacted = compactionSummary?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let usage else {
+            return compacted?.isEmpty == false ? "Context compacted: \(compacted!)" : nil
+        }
+        let tokenText: String
+        if let window = usage.contextWindow, window > 0 {
+            let pct = min(999, max(0, Int((Double(usage.totalTokens) / Double(window) * 100).rounded())))
+            tokenText = "Context \(pct)% · \(usage.totalTokens) / \(window) tokens"
+        } else {
+            tokenText = "Context \(usage.totalTokens) tokens"
+        }
+        var parts = [tokenText]
+        if usage.compactsAutomatically == true {
+            parts.append("auto-compacts")
+        }
+        if let compacted, !compacted.isEmpty {
+            parts.append("compacted")
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+public struct AgentTimelineItemPresentation: Equatable, Sendable {
+    public let icon: String
+    public let verb: String
+    public let label: String
+    public let detail: String?
+
+    public static func make(for item: AssistantItem) -> AgentTimelineItemPresentation {
+        let label = primaryText(for: item).replacingOccurrences(of: "\n", with: " ")
+        return AgentTimelineItemPresentation(
+            icon: icon(for: item),
+            verb: verb(for: item),
+            label: label,
+            detail: detailText(for: item)
+        )
+    }
+
+    private static func primaryText(for item: AssistantItem) -> String {
+        if let progress = item.progress {
+            let percent = Int((AssistantTimelineState.normalizedProgress(progress) * 100).rounded())
+            return "\(percent)% \(basePrimaryText(for: item))"
+        }
+        return basePrimaryText(for: item)
+    }
+
+    private static func basePrimaryText(for item: AssistantItem) -> String {
+        if let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty {
+            return summary
+        }
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? item.type.rawValue : body
+    }
+
+    private static func detailText(for item: AssistantItem) -> String? {
+        if item.type == .reasoning {
+            let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return summary?.isEmpty == false ? summary : nil
+        }
+        return item.output?.isEmpty == false ? item.output : nil
+    }
+
+    private static func verb(for item: AssistantItem) -> String {
+        switch item.state {
+        case .streaming: return "Running"
+        case .failed: return "Failed"
+        case .cancelled: return "Cancelled"
+        case .completed:
+            switch item.type {
+            case .fileChange: return "Changed"
+            case .webSearch: return "Searched"
+            case .imageView: return "Viewed"
+            case .review: return "Reviewed"
+            case .contextCompaction: return "Compacted"
+            case .error: return "Issue"
+            default: return "Ran"
+            }
+        }
+    }
+
+    private static func icon(for item: AssistantItem) -> String {
+        if item.state == .streaming { return "circle.dotted" }
+        if item.state == .failed { return "xmark.octagon" }
+        if item.state == .cancelled { return "nosign" }
+        switch item.type {
+        case .fileChange: return "doc.badge.gearshape"
+        case .mcpToolCall, .dynamicToolCall, .collabToolCall: return "puzzlepiece.extension"
+        case .webSearch: return "magnifyingglass"
+        case .imageView: return "photo"
+        case .review: return "checklist"
+        case .contextCompaction: return "rectangle.compress.vertical"
+        case .error: return "exclamationmark.triangle"
+        default: return "terminal"
         }
     }
 }
@@ -569,6 +1344,7 @@ public struct AgentAppView: View {
     @State private var pendingScrollDownReveal: Task<Void, Never>?
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @State private var showThreadRail = true
+    @State private var proposedPlanExpanded = false
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -615,7 +1391,7 @@ public struct AgentAppView: View {
             }
         }
         .background(DS.Palette.bg)
-        .task { await vm.loadModels() }
+        .task { await vm.loadProviderSnapshots() }
         .onDeleteCommand { deleteSelectedThreads() }
     }
 
@@ -795,6 +1571,13 @@ public struct AgentAppView: View {
             Text(vm.gitBranch ?? "no branch")
                 .font(DS.Font.caption2.monospaced())
                 .foregroundColor(DS.Palette.textSecondary)
+            if let context = vm.contextHealthMessage {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(context)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
             Text("·").foregroundColor(DS.Palette.textTertiary)
             Text(URL(fileURLWithPath: vm.cwd).lastPathComponent)
                 .font(DS.Font.caption2)
@@ -828,6 +1611,7 @@ public struct AgentAppView: View {
         }
     }
     private var effortLabel: String { vm.reasoningEffort.displayName }
+    private var serviceTierLabel: String { vm.serviceTier == .fast ? "Fast" : "Auto" }
 
     private func statusTone(_ s: AgentRunStatus) -> DSPill.Tone {
         switch s {
@@ -859,6 +1643,11 @@ public struct AgentAppView: View {
                                 case .turn(let turn): turnView(turn)
                                 }
                             }
+                            workLogRow
+                            if let plan = vm.activePlan {
+                                activePlanRow(plan)
+                            }
+                            pendingCallbackRows
                             if vm.status == .running { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
                             Color.clear
@@ -915,6 +1704,199 @@ public struct AgentAppView: View {
             .onChange(of: vm.timelineUpdateTick) { _ in scrollTimelineToBottom(proxy) }
             .onChange(of: vm.status) { _ in scrollTimelineToBottom(proxy) }
         }
+    }
+
+    @ViewBuilder
+    private var pendingCallbackRows: some View {
+        ForEach(vm.openPendingRequests) { request in
+            pendingRequestRow(request)
+        }
+        ForEach(vm.openPendingUserInputs) { request in
+            pendingUserInputRow(request)
+        }
+    }
+
+    @ViewBuilder
+    private var workLogRow: some View {
+        let activities = Array(vm.timeline.workActivities.suffix(8))
+        if !activities.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "list.bullet.rectangle")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text("Work log")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+                ForEach(activities) { activity in
+                    HStack(alignment: .top, spacing: DS.Space.sm) {
+                        Image(systemName: workActivityIcon(activity))
+                            .font(.system(size: 9))
+                            .foregroundColor(workActivityColor(activity))
+                            .frame(width: 13)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(activity.title)
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            if let detail = activity.detail, !detail.isEmpty {
+                                Text(detail)
+                                    .font(DS.Font.monoSmall)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .lineLimit(2)
+                                    .truncationMode(.tail)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .padding(.vertical, DS.Space.sm)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityIdentifier("agent.workLog")
+        }
+    }
+
+    private func workActivityIcon(_ activity: AssistantWorkActivity) -> String {
+        if activity.state == AssistantItemState.streaming.rawValue { return "circle.dotted" }
+        if activity.state == AssistantItemState.failed.rawValue || activity.kind == .error { return "xmark.octagon" }
+        switch activity.kind {
+        case .runtime: return "waveform.path.ecg"
+        case .tool: return "terminal"
+        case .request: return "checkmark.shield"
+        case .userInput: return "questionmark.circle"
+        case .error: return "exclamationmark.triangle"
+        }
+    }
+
+    private func workActivityColor(_ activity: AssistantWorkActivity) -> Color {
+        if activity.state == AssistantItemState.failed.rawValue || activity.kind == .error { return DS.Palette.danger }
+        if activity.state == AssistantItemState.streaming.rawValue { return DS.Palette.accent }
+        return DS.Palette.textTertiary
+    }
+
+    @ViewBuilder
+    private func pendingRequestRow(_ request: AssistantPendingRequest) -> some View {
+        let stale = request.state == .stale
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: stale ? "exclamationmark.triangle" : "checkmark.shield")
+                    .font(.system(size: 12))
+                    .foregroundColor(stale ? DS.Palette.warning : DS.Palette.accent)
+                Text(stale ? "Stale provider request" : "Provider approval")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                Spacer(minLength: 0)
+            }
+            Text(request.title)
+                .font(DS.Font.bodyDense.weight(.semibold))
+                .foregroundColor(DS.Palette.text)
+                .lineLimit(2)
+            if let detail = request.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+            if stale {
+                Text("Restart the turn to continue.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+            } else {
+                HStack(spacing: DS.Space.sm) {
+                    Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
+                    Button("Approve Session") { vm.respondToPendingRequest(request, response: .approveForSession) }
+                    Button("Decline") { vm.respondToPendingRequest(request, response: .decline(nil)) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .accessibilityIdentifier("agent.pendingRequest.\(request.id)")
+    }
+
+    @ViewBuilder
+    private func pendingUserInputRow(_ request: AssistantUserInputRequest) -> some View {
+        let stale = request.state == .stale
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: stale ? "exclamationmark.triangle" : "questionmark.circle")
+                    .font(.system(size: 12))
+                    .foregroundColor(stale ? DS.Palette.warning : DS.Palette.accent)
+                Text(stale ? "Stale provider question" : "Provider question")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                Spacer(minLength: 0)
+            }
+            Text(request.prompt)
+                .font(DS.Font.bodyDense.weight(.semibold))
+                .foregroundColor(DS.Palette.text)
+            if stale {
+                Text("Restart the turn to continue.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.warning)
+            } else if request.options.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    let draft = Binding(
+                        get: { vm.userInputDrafts[request.id] ?? request.answer ?? "" },
+                        set: { vm.userInputDrafts[request.id] = $0 }
+                    )
+                    Group {
+                        if request.isSecret {
+                            SecureField("Answer", text: draft)
+                        } else {
+                            TextField("Answer", text: draft)
+                        }
+                    }
+                    .textFieldStyle(.roundedBorder)
+                    Button("Answer") {
+                        vm.answerPendingUserInput(request, answer: vm.userInputDrafts[request.id] ?? request.answer ?? "")
+                    }
+                    .disabled((vm.userInputDrafts[request.id] ?? request.answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            } else if request.allowsMultipleSelection {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    HStack(spacing: DS.Space.sm) {
+                        ForEach(request.options, id: \.self) { option in
+                            let selected = vm.userInputSelections[request.id]?.contains(option) == true
+                            Button {
+                                vm.toggleUserInputOption(option, for: request)
+                            } label: {
+                                Label(option, systemImage: selected ? "checkmark.square.fill" : "square")
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button("Submit") {
+                        vm.answerPendingUserInput(request, answer: vm.selectedUserInputAnswer(for: request))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(vm.selectedUserInputAnswer(for: request).isEmpty)
+                }
+            } else {
+                HStack(spacing: DS.Space.sm) {
+                    ForEach(request.options, id: \.self) { option in
+                        Button(option) { vm.answerPendingUserInput(request, answer: option) }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .accessibilityIdentifier("agent.pendingUserInput.\(request.id)")
     }
 
     private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
@@ -979,6 +1961,16 @@ public struct AgentAppView: View {
     private func copyToPasteboard(_ s: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
+    }
+
+    private func saveLatestProposedPlan() {
+        guard let plan = vm.latestProposedPlan else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = plan.exportFileName
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        _ = try? vm.saveLatestProposedPlan(to: url)
     }
 
     @ViewBuilder
@@ -1087,8 +2079,9 @@ public struct AgentAppView: View {
                 Text(item.state == .streaming ? "Thinking…" : "Thought")
                     .font(DS.Font.caption2.weight(.semibold))
                     .foregroundColor(DS.Palette.textTertiary)
-                if !item.body.isEmpty {
-                    Text(item.body)
+                let text = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
+                if !text.isEmpty {
+                    Text(text)
                         .font(DS.Font.bodyDense)
                         .foregroundColor(DS.Palette.textTertiary)
                         .lineSpacing(3)
@@ -1102,17 +2095,15 @@ public struct AgentAppView: View {
                     .foregroundColor(DS.Palette.accent)
                 assistantProse(item.body)
             }
-        case .tool:
+        case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .review, .contextCompaction, .error:
             toolRow(item)
         }
     }
 
     @ViewBuilder
     private func toolRow(_ item: AssistantItem) -> some View {
-        let label = ((item.summary?.isEmpty == false ? item.summary! : item.body))
-            .replacingOccurrences(of: "\n", with: " ")
-        let running = item.state == .streaming
-        let hasOutput = (item.output?.isEmpty == false)
+        let presentation = AgentTimelineItemPresentation.make(for: item)
+        let hasOutput = (presentation.detail?.isEmpty == false)
         let expanded = expandedTools.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             Button {
@@ -1120,11 +2111,11 @@ public struct AgentAppView: View {
                 if expanded { expandedTools.remove(item.id) } else { expandedTools.insert(item.id) }
             } label: {
                 HStack(spacing: DS.Space.sm) {
-                    Image(systemName: running ? "circle.dotted" : "terminal")
+                    Image(systemName: presentation.icon)
                         .font(.system(size: 10)).foregroundColor(DS.Palette.textTertiary)
-                    (Text(running ? "Running " : "Ran ")
+                    (Text("\(presentation.verb) ")
                         .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
-                     + Text(label)
+                     + Text(presentation.label)
                         .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary))
                     .lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 0)
@@ -1137,7 +2128,7 @@ public struct AgentAppView: View {
             }
             .buttonStyle(.plain)
             .help(hasOutput ? (expanded ? "Hide tool output" : "Show tool output") : "Tool output unavailable")
-            if expanded, let o = item.output, !o.isEmpty {
+            if expanded, let o = presentation.detail, !o.isEmpty {
                 Text(o)
                     .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
                     .textSelection(.enabled)
@@ -1177,6 +2168,7 @@ public struct AgentAppView: View {
             .padding(.horizontal, DS.Space.lg)
             .padding(.top, DS.Space.sm)
             .padding(.bottom, DS.Space.xs)
+            composerSuggestions
             composerToolbar
         }
         .background(DS.Palette.surface)
@@ -1223,6 +2215,7 @@ public struct AgentAppView: View {
             .help("Attach files").accessibilityLabel("Attach files")
             .disabled(vm.status == .running)
             permissionMenu
+            executionMenu
             Spacer(minLength: DS.Space.sm)
             if vm.status == .running {
                 ProgressView().controlSize(.small).scaleEffect(0.55)
@@ -1231,6 +2224,38 @@ public struct AgentAppView: View {
             sendStopButton
         }
         .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+    }
+
+    @ViewBuilder
+    private var composerSuggestions: some View {
+        let suggestions = vm.composerSuggestions
+        if !suggestions.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: DS.Space.sm) {
+                    ForEach(suggestions) { suggestion in
+                        Button { vm.applyComposerSuggestion(suggestion) } label: {
+                            HStack(spacing: DS.Space.xs) {
+                                Image(systemName: suggestion.kind == .skill ? "puzzlepiece.extension" : "command")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text(suggestion.title)
+                                    .font(DS.Font.caption.weight(.medium))
+                                    .lineLimit(1)
+                            }
+                            .foregroundColor(DS.Palette.text)
+                            .padding(.horizontal, DS.Space.sm)
+                            .padding(.vertical, DS.Space.xs)
+                            .background(DS.Palette.surfaceRaised)
+                            .clipShape(Capsule())
+                            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                        }
+                        .buttonStyle(.plain)
+                        .help(suggestion.subtitle)
+                    }
+                }
+                .padding(.horizontal, DS.Space.lg)
+                .padding(.bottom, DS.Space.xs)
+            }
+        }
     }
 
     private var permissionMenu: some View {
@@ -1255,39 +2280,170 @@ public struct AgentAppView: View {
         .help("Permission mode")
     }
 
+    private var executionMenu: some View {
+        Menu {
+            TextField("PR URL", text: $vm.pullRequestURL)
+                .textFieldStyle(.roundedBorder)
+            Button(vm.pullRequestPreparing ? "Opening..." : "Open PR as thread") {
+                Task { await vm.preparePullRequestThread() }
+            }
+            .disabled(vm.pullRequestPreparing || vm.pullRequestURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.executionLocked)
+            if let message = vm.pullRequestStatusMessage {
+                Divider()
+                Text(message)
+                    .font(DS.Font.caption)
+                    .foregroundColor(message.hasPrefix("PR preparation failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+            }
+            Divider()
+            Picker("Execution", selection: $vm.executionMode) {
+                Text("Local").tag(AgentExecutionMode.local)
+                Text("Worktree").tag(AgentExecutionMode.worktree)
+            }
+            .onChange(of: vm.executionMode) { mode in vm.setExecutionMode(mode) }
+            if vm.executionMode == .worktree {
+                TextField("Base branch", text: Binding(
+                    get: { vm.baseBranch },
+                    set: { vm.setBaseBranch($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                if let path = vm.worktreePath, !path.isEmpty {
+                    Divider()
+                    Text(path)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+            }
+        } label: {
+            HStack(spacing: DS.Space.xs) {
+                Image(systemName: vm.executionMode == .worktree ? "arrow.triangle.branch" : "folder")
+                    .font(.system(size: 10))
+                Text(vm.executionMode == .worktree ? "Worktree" : "Local")
+                    .font(DS.Font.caption.weight(.medium))
+                    .lineLimit(1)
+                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+            }
+            .fixedSize()
+            .foregroundColor(DS.Palette.textSecondary)
+            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(Capsule())
+            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        }
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .disabled(vm.executionLocked)
+        .help(vm.executionLocked ? "Execution mode locks after the first message" : "Execution mode")
+    }
+
     private var modelMenu: some View {
         Menu {
             if !vm.providerLocked {
-                Picker("Source", selection: $vm.provider) {
-                    Text("Codex").tag(AgentProvider.codex)
-                    Text("Claude").tag(AgentProvider.claude)
-                }
-                .disabled(vm.status == .running)
-                .onChange(of: vm.provider) { _ in
-                    Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
+                if !vm.providerSnapshots.isEmpty {
+                    Picker("Source", selection: $vm.providerInstanceId) {
+                        ForEach(vm.providerSnapshots.filter(\.enabled), id: \.id) { snapshot in
+                            Text(snapshot.displayName).tag(snapshot.id)
+                        }
+                    }
+                    .disabled(vm.status == .running)
+                    .onChange(of: vm.providerInstanceId) { id in
+                        vm.setProviderInstance(id)
+                    }
+                } else {
+                    Picker("Source", selection: $vm.provider) {
+                        ForEach(AgentProvider.allCases, id: \.self) { provider in
+                            Text(vm.providerDisplayName(provider)).tag(provider)
+                        }
+                    }
+                    .disabled(vm.status == .running)
+                    .onChange(of: vm.provider) { _ in
+                        vm.providerInstanceId = vm.provider.rawValue
+                        Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
+                    }
                 }
             }
             if !vm.availableModels.isEmpty {
                 Picker("Model", selection: $vm.model) {
                     ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
+                    if vm.supportsCustomModelForSelectedProvider,
+                       !vm.model.isEmpty,
+                       !vm.availableModels.contains(where: { $0.id == vm.model && $0.provider == vm.provider }) {
+                        Text("Custom: \(vm.model)").tag(vm.model)
+                    }
                 }
-                .onChange(of: vm.model) { _ in vm.persistThreadConfig() }
+                .onChange(of: vm.model) { newValue in vm.setModel(newValue) }
                 .disabled(vm.status == .running)
             }
-            Divider()
-            Picker("Reasoning effort", selection: $vm.reasoningEffort) {
-                ForEach(AgentReasoningEffort.supportedCases, id: \.self) { e in
-                    Text(e.displayName).tag(e)
-                }
+            if vm.supportsCustomModelForSelectedProvider {
+                TextField("Custom model", text: Binding(
+                    get: { vm.model },
+                    set: { vm.setCustomModel($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .disabled(vm.status == .running)
             }
-            .onChange(of: vm.reasoningEffort) { newValue in vm.setReasoningEffort(newValue) }
+            if let contextWindow = vm.selectedModelContextWindowLabel {
+                Text(contextWindow)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            if vm.supportsReasoningForSelectedModel || vm.supportsServiceTierForSelectedModel {
+                Divider()
+            }
+            if vm.supportsReasoningForSelectedModel {
+                Picker("Reasoning effort", selection: $vm.reasoningEffort) {
+                    ForEach(vm.supportedReasoningEffortsForSelectedModel, id: \.self) { e in
+                        Text(e.displayName).tag(e)
+                    }
+                }
+                .onChange(of: vm.reasoningEffort) { newValue in vm.setReasoningEffort(newValue) }
+            }
+            if vm.supportsServiceTierForSelectedModel {
+                Picker("Service tier", selection: $vm.serviceTier) {
+                    Text("Auto").tag(AgentServiceTier.auto)
+                    Text("Fast").tag(AgentServiceTier.fast)
+                }
+                .onChange(of: vm.serviceTier) { newValue in vm.setServiceTier(newValue) }
+            }
+            if let providerStatus = vm.providerStatusMessage {
+                Divider()
+                Text(providerStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+            }
+            if let accountStatus = vm.providerAccountStatusMessage {
+                Text(accountStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            if let actionTitle = vm.providerRecoveryActionTitle {
+                Button(vm.providerRecoveryActionRunning ? "Working..." : actionTitle) {
+                    Task { await vm.performProviderRecoveryAction() }
+                }
+                .disabled(vm.providerRecoveryActionRunning)
+            }
+            if let actionStatus = vm.providerRecoveryStatusMessage {
+                Text(actionStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(actionStatus.hasPrefix("Update failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+            }
         } label: {
             HStack(spacing: DS.Space.xs) {
                 Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
                     .lineLimit(1)
-                Text("·").foregroundColor(DS.Palette.textTertiary)
-                Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
+                if vm.supportsReasoningForSelectedModel {
+                    Text("·").foregroundColor(DS.Palette.textTertiary)
+                    Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                }
+                if vm.serviceTier == .fast {
+                    Text("·").foregroundColor(DS.Palette.textTertiary)
+                    Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
+                        .lineLimit(1)
+                }
+                if let contextWindow = vm.selectedModelContextWindowLabel {
+                    Text("·").foregroundColor(DS.Palette.textTertiary)
+                    Text(contextWindow).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                }
                 Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
             }
@@ -1299,7 +2455,7 @@ public struct AgentAppView: View {
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .disabled(vm.status == .running)
-        .help(vm.providerLocked ? "Model · reasoning effort" : "Provider · model · reasoning effort")
+        .help(vm.providerLocked ? "Model · reasoning effort · service tier" : "Provider · model · reasoning effort · service tier")
     }
 
     private var sendStopButton: some View {
@@ -1399,11 +2555,54 @@ public struct AgentAppView: View {
                 DSIconButton("xmark", help: "Hide plan") { vm.showPlanSidebar = false }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            if let plan = vm.latestPlanText {
+            if let plan = vm.activePlan {
+                activePlanSidebarCard(plan)
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            }
+            if let proposedPlan = vm.latestProposedPlan {
+                let plan = proposedPlanExpanded ? proposedPlan.markdown : proposedPlan.collapsedPreview
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text("PROPOSED BY AGENT")
                         .font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
                         .foregroundColor(DS.Palette.accent)
+                    Text(proposedPlan.exportTitle)
+                        .font(DS.Font.body.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                    HStack(spacing: DS.Space.xs) {
+                        Button {
+                            Task { await vm.implementLatestPlan(newThread: false) }
+                        } label: {
+                            Label("Implement", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button {
+                            Task { await vm.implementLatestPlan(newThread: true) }
+                        } label: {
+                            Label("New thread", systemImage: "plus.message")
+                        }
+                        .buttonStyle(.bordered)
+                        Button {
+                            copyToPasteboard(plan)
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.bordered)
+                        Button {
+                            saveLatestProposedPlan()
+                        } label: {
+                            Label("Save", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.bordered)
+                        if proposedPlan.markdown != proposedPlan.collapsedPreview {
+                            Button {
+                                proposedPlanExpanded.toggle()
+                            } label: {
+                                Label(proposedPlanExpanded ? "Collapse" : "Show all",
+                                      systemImage: proposedPlanExpanded ? "chevron.up" : "chevron.down")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
                     ScrollView {
                         Text(plan)
                             .font(DS.Font.monoSmall)
@@ -1411,10 +2610,14 @@ public struct AgentAppView: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxHeight: 220)
+                    .frame(maxHeight: proposedPlanExpanded ? 420 : 220)
                 }
                 .padding(DS.Space.md)
                 .background(DS.Palette.bg)
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            }
+            checkpointBrowserCard
+            if !vm.checkpoints.isEmpty {
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             }
             Text("NOTES")
@@ -1430,6 +2633,194 @@ public struct AgentAppView: View {
         .background(DS.Palette.surface)
         .overlay(alignment: .leading) {
             Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+        }
+    }
+
+    @ViewBuilder
+    private var checkpointBrowserCard: some View {
+        if !vm.checkpoints.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                HStack {
+                    Text("CHECKPOINTS")
+                        .font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
+                        .foregroundColor(DS.Palette.accent)
+                    Spacer()
+                    Button {
+                        vm.reloadCheckpoints()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: DS.Space.xs) {
+                        ForEach(vm.checkpoints) { checkpoint in
+                            Button {
+                                vm.selectCheckpoint(checkpoint, path: nil)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("#\(checkpoint.checkpointTurnCount) \(checkpoint.status.rawValue.uppercased())")
+                                        .font(DS.Font.caption.weight(.semibold))
+                                    Text("\(checkpoint.files.count) files")
+                                        .font(DS.Font.caption2)
+                                        .foregroundColor(DS.Palette.textSecondary)
+                                }
+                                .frame(width: 116, alignment: .leading)
+                            }
+                            .buttonStyle(.bordered)
+                            .accessibilityIdentifier("agent.checkpoint.row.\(checkpoint.checkpointTurnCount)")
+                        }
+                    }
+                }
+                if let checkpoint = vm.checkpoints.first(where: { $0.checkpointTurnCount == vm.selectedCheckpointTurnCount }) {
+                    if !checkpoint.files.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: DS.Space.xs) {
+                                Button {
+                                    vm.selectCheckpoint(checkpoint, path: nil)
+                                } label: {
+                                    Label("All files", systemImage: "doc.text")
+                                }
+                                .buttonStyle(.bordered)
+                                ForEach(checkpoint.files, id: \.path) { file in
+                                    Button {
+                                        vm.selectCheckpoint(checkpoint, path: file.path)
+                                    } label: {
+                                        Label(URL(fileURLWithPath: file.path).lastPathComponent, systemImage: "doc")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .accessibilityIdentifier("agent.checkpoint.file.\(file.path)")
+                                }
+                            }
+                        }
+                    }
+                    ScrollView {
+                        Text(vm.checkpointDiffPreview)
+                            .font(DS.Font.monoSmall)
+                            .foregroundColor(DS.Palette.text)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 220)
+                    .background(DS.Palette.surface)
+                    .accessibilityIdentifier("agent.checkpoint.diff")
+                    HStack {
+                        if let message = vm.checkpointStatusMessage {
+                            Text(message)
+                                .font(DS.Font.caption)
+                                .foregroundColor(message.hasPrefix("Revert failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                        }
+                        Spacer()
+                        Button(role: .destructive) {
+                            vm.revertSelectedCheckpoint()
+                        } label: {
+                            Label("Revert", systemImage: "arrow.uturn.backward")
+                        }
+                        .disabled(checkpoint.status != .ready)
+                        .accessibilityIdentifier("agent.checkpoint.revert")
+                    }
+                }
+            }
+            .padding(DS.Space.md)
+            .background(DS.Palette.bg)
+            .accessibilityIdentifier("agent.checkpoints.card")
+        }
+    }
+
+    private func activePlanSidebarCard(_ plan: AssistantActivePlan) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Text("ACTIVE PLAN")
+                .font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
+                .foregroundColor(DS.Palette.accent)
+            if let explanation = plan.explanation, !explanation.isEmpty {
+                Text(explanation)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                ForEach(plan.steps) { step in
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.xs) {
+                        Image(systemName: step.status.iconName)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(step.status.tint)
+                            .frame(width: 14)
+                        Text(step.title)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.text)
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        }
+        .padding(DS.Space.md)
+        .background(DS.Palette.bg)
+    }
+
+    private func activePlanRow(_ plan: AssistantActivePlan) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "checklist")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.accent)
+                Text("Active plan")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                Spacer(minLength: 0)
+            }
+            if let explanation = plan.explanation, !explanation.isEmpty {
+                Text(explanation)
+                    .font(DS.Font.bodyDense)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                ForEach(plan.steps) { step in
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                        Image(systemName: step.status.iconName)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(step.status.tint)
+                            .frame(width: 16)
+                        Text(step.title)
+                            .font(DS.Font.bodyDense)
+                            .foregroundColor(DS.Palette.text)
+                        Spacer(minLength: DS.Space.sm)
+                        Text(step.status.label)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
+            }
+        }
+        .padding(DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .accessibilityIdentifier("agent.activePlan")
+    }
+}
+
+private extension AssistantPlanStepStatus {
+    var iconName: String {
+        switch self {
+        case .pending: return "circle"
+        case .inProgress: return "circle.dotted"
+        case .completed: return "checkmark.circle.fill"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .pending: return "Pending"
+        case .inProgress: return "In progress"
+        case .completed: return "Done"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .pending: return DS.Palette.textTertiary
+        case .inProgress: return DS.Palette.accent
+        case .completed: return DS.Palette.success
         }
     }
 }
@@ -1697,9 +3088,9 @@ public final class AgentAppSurface: NSObject, Surface {
     /// this already-open surface (wired by AppCommandRouter, like Feed).
     public var subscriptionToken: AnyHashable?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, promptHistoryStore: PromptHistoryStore? = nil, title: String = "Agent App") {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, promptHistoryStore: promptHistoryStore)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

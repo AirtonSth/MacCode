@@ -19,6 +19,22 @@ final class GitDiffTests: XCTestCase {
         p.waitUntilExit()
     }
 
+    private func shell(_ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args
+        let out = Pipe()
+        p.standardOutput = out
+        try? p.run()
+        p.waitUntilExit()
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }
+
+    private func writeExecutable(_ path: String, _ body: String) throws {
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+    }
+
     func test_summary_inNonGitDir_isNotRepo() {
         let dir = NSTemporaryDirectory() + UUID().uuidString
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -278,6 +294,140 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(GitDiff.suggestCommitMessage(clean), "", "a clean tree suggests no message")
     }
 
+    func test_deliveryPlanBuildsStructuredBranchCommitPRTextAndPhases() throws {
+        let dir = try mkTmpRepo()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "checkout", "-qb", "feature/delivery"])
+        run(["git", "-C", dir, "remote", "add", "origin", "git@github.com:acme/widget.git"])
+        try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+
+        let plan = GitDiff.deliveryPlan(in: dir)
+
+        XCTAssertEqual(plan.branchName, "agent/a-txt")
+        XCTAssertEqual(plan.commitMessage, "Update a.txt (+1 −1)")
+        XCTAssertEqual(plan.pullRequestTitle, plan.commitMessage)
+        XCTAssertTrue(plan.pullRequestBody.contains("- a.txt (modified)"))
+        XCTAssertEqual(plan.pullRequestURL, "https://github.com/acme/widget/compare/feature/delivery?expand=1")
+        XCTAssertEqual(plan.phases.map(\.name), ["branch", "commit", "push", "pull_request"],
+                       "agent git delivery must expose explicit phase status instead of opaque commit/push side effects")
+        XCTAssertEqual(plan.phases.map(\.status), [.ready, .ready, .ready, .ready])
+    }
+
+    func test_deliveryPlanUsesSafeProviderGeneratedCopyAndRejectsUnsafeBranch() throws {
+        let dir = try mkTmpRepo()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "checkout", "-qb", "feature/delivery"])
+        run(["git", "-C", dir, "remote", "add", "origin", "git@github.com:acme/widget.git"])
+        try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+
+        let plan = GitDiff.deliveryPlan(in: dir, copy: GitDeliveryCopy(
+            branchName: "../unsafe",
+            commitMessage: "Tighten agent lifecycle handling",
+            pullRequestTitle: "Agent lifecycle hardening",
+            pullRequestBody: "Provider-generated body with test notes."
+        ))
+
+        XCTAssertEqual(plan.branchName, "agent/a-txt",
+                       "unsafe provider-generated branch names must fall back to deterministic local branch text")
+        XCTAssertEqual(plan.commitMessage, "Tighten agent lifecycle handling",
+                       "safe provider-generated commit copy should replace deterministic fallback text")
+        XCTAssertEqual(plan.pullRequestTitle, "Agent lifecycle hardening")
+        XCTAssertEqual(plan.pullRequestBody, "Provider-generated body with test notes.")
+    }
+
+    func test_deliverRunsBranchCommitPushWithPhaseStatus() throws {
+        let remote = NSTemporaryDirectory() + "rc2-deliver-bare-" + UUID().uuidString
+        run(["git", "init", "-q", "--bare", remote])
+        let dir = try mkTmpRepo()
+        defer { try? FileManager.default.removeItem(atPath: dir); try? FileManager.default.removeItem(atPath: remote) }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "remote", "add", "origin", remote])
+        run(["git", "-C", dir, "push", "-q", "origin", "main"])
+        try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+
+        let result = GitDiff.deliver(in: dir)
+
+        XCTAssertTrue(result.ok, "one-shot delivery must run branch -> commit -> push without hiding per-phase failures: \(result.phases)")
+        XCTAssertEqual(result.phases.map(\.name), ["branch", "commit", "push", "pull_request"])
+        XCTAssertEqual(result.phases.prefix(3).map(\.status), [.completed, .completed, .completed])
+        XCTAssertEqual(GitDiff.branches(in: dir).current, "agent/a-txt")
+        XCTAssertEqual(GitDiff.log(in: dir, limit: 1).first?.subject, "Update a.txt (+1 −1)")
+    }
+
+    func test_deliverCreatesGitHubPullRequestWhenAuthenticatedCliIsAvailable() throws {
+        let remote = NSTemporaryDirectory() + "rc2-deliver-gh-bare-" + UUID().uuidString
+        run(["git", "init", "-q", "--bare", remote])
+        let dir = try mkTmpRepo()
+        let bin = NSTemporaryDirectory() + "rc2-deliver-gh-bin-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: bin, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: dir)
+            try? FileManager.default.removeItem(atPath: remote)
+            try? FileManager.default.removeItem(atPath: bin)
+        }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "remote", "add", "origin", "git@github.com:acme/widget.git"])
+        run(["git", "-C", dir, "remote", "set-url", "--push", "origin", remote])
+        run(["git", "-C", dir, "push", "-q", "origin", "main"])
+        try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+        let logPath = bin + "/gh.log"
+        try writeExecutable(bin + "/gh", """
+        #!/bin/sh
+        echo "$@" >> "\(logPath)"
+        if [ "$1" = "auth" ]; then exit 0; fi
+        echo "https://github.com/acme/widget/pull/77"
+        exit 0
+        """)
+
+        let result = GitDiff.deliver(in: dir, environment: ["PATH": "\(bin):\(ProcessInfo.processInfo.environment["PATH"] ?? "")"])
+
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.pullRequestURL, "https://github.com/acme/widget/pull/77")
+        XCTAssertEqual(result.phases.map(\.name), ["branch", "commit", "push", "pull_request"])
+        XCTAssertEqual(result.phases.map(\.status), [.completed, .completed, .completed, .completed],
+                       "authenticated GitHub CLI delivery must create the PR instead of returning only a compare URL")
+        let ghLog = try String(contentsOfFile: logPath)
+        XCTAssertTrue(ghLog.contains("auth status"))
+        XCTAssertTrue(ghLog.contains("pr create"))
+        XCTAssertTrue(ghLog.contains("--head agent/a-txt"))
+        XCTAssertTrue(ghLog.contains("--base main"))
+    }
+
+    func test_deliverLeavesPullRequestReadyWhenCliAuthIsUnavailable() throws {
+        let remote = NSTemporaryDirectory() + "rc2-deliver-noauth-bare-" + UUID().uuidString
+        run(["git", "init", "-q", "--bare", remote])
+        let dir = try mkTmpRepo()
+        let bin = NSTemporaryDirectory() + "rc2-deliver-noauth-bin-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: bin, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(atPath: dir)
+            try? FileManager.default.removeItem(atPath: remote)
+            try? FileManager.default.removeItem(atPath: bin)
+        }
+        try seedCommit(dir)
+        run(["git", "-C", dir, "remote", "add", "origin", "git@github.com:acme/widget.git"])
+        run(["git", "-C", dir, "remote", "set-url", "--push", "origin", remote])
+        run(["git", "-C", dir, "push", "-q", "origin", "main"])
+        try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+        let logPath = bin + "/gh.log"
+        try writeExecutable(bin + "/gh", """
+        #!/bin/sh
+        echo "$@" >> "\(logPath)"
+        if [ "$1" = "auth" ]; then exit 1; fi
+        exit 2
+        """)
+
+        let result = GitDiff.deliver(in: dir, environment: ["PATH": "\(bin):\(ProcessInfo.processInfo.environment["PATH"] ?? "")"])
+
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.pullRequestURL, "https://github.com/acme/widget/compare/agent/a-txt?expand=1")
+        XCTAssertEqual(result.phases.last?.status, .ready,
+                       "without authenticated gh/glab context, delivery must avoid a blind remote mutation and return the create-PR URL")
+        XCTAssertFalse((try String(contentsOfFile: logPath)).contains("pr create"))
+    }
+
     // MARK: D2 — push / pull-request URL
 
     func test_push_setsUpstreamThenPushesAgain() throws {
@@ -316,5 +466,91 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(GitDiff.pullRequestURL(in: dir),
                        "https://gitlab.com/acme/widget/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature/x",
                        "GitLab remotes must use the MR-new URL shape")
+    }
+
+    func test_pullRequestRef_parsesGitHubAndGitLabUrls() throws {
+        let github = try XCTUnwrap(GitDiff.pullRequestRef(from: "https://github.com/acme/widget/pull/42"))
+        XCTAssertEqual(github.host, "github.com")
+        XCTAssertEqual(github.repositoryPath, "acme/widget")
+        XCTAssertEqual(github.number, 42)
+        XCTAssertEqual(github.remoteRef, "refs/pull/42/head")
+
+        let gitlab = try XCTUnwrap(GitDiff.pullRequestRef(from: "https://gitlab.com/group/sub/widget/-/merge_requests/9"))
+        XCTAssertEqual(gitlab.host, "gitlab.com")
+        XCTAssertEqual(gitlab.repositoryPath, "group/sub/widget")
+        XCTAssertEqual(gitlab.number, 9)
+        XCTAssertEqual(gitlab.remoteRef, "refs/merge-requests/9/head")
+    }
+
+    func test_preparePullRequestWorktree_fetchesPullRefIntoIsolatedWorktree() throws {
+        let dir = try mkTmpRepo()
+        let bare = NSTemporaryDirectory() + "rc2-pr-origin-" + UUID().uuidString + ".git"
+        let worktreeRoot = dir + "-pr-worktrees"
+        defer {
+            try? FileManager.default.removeItem(atPath: dir)
+            try? FileManager.default.removeItem(atPath: bare)
+            try? FileManager.default.removeItem(atPath: worktreeRoot)
+        }
+        try seedCommit(dir)
+        run(["git", "init", "--bare", "-q", bare])
+        run(["git", "-C", dir, "remote", "add", "origin", bare])
+        run(["git", "-C", dir, "push", "-q", "origin", "main"])
+        run(["git", "-C", dir, "checkout", "-qb", "feature/pr-7"])
+        try "from pr\n".write(toFile: dir + "/pr.txt", atomically: true, encoding: .utf8)
+        run(["git", "-C", dir, "add", "pr.txt"])
+        run(["git", "-C", dir, "commit", "-q", "-m", "pr"])
+        run(["git", "-C", dir, "push", "-q", "origin", "HEAD:refs/pull/7/head"])
+        run(["git", "-C", dir, "checkout", "-q", "main"])
+
+        let prep = GitDiff.preparePullRequestWorktree(
+            in: dir,
+            urlString: "https://github.com/acme/widget/pull/7",
+            worktreePath: worktreeRoot + "/pr-7"
+        )
+
+        XCTAssertTrue(prep.result.ok, prep.result.message)
+        XCTAssertEqual(prep.branch, "rc-pr/github-com/acme-widget-7")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prep.worktreePath + "/pr.txt"),
+                      "PR preparation must checkout the PR head into an isolated worktree so Agent App work does not mutate the base checkout")
+        XCTAssertEqual(GitDiff.branches(in: prep.worktreePath).current, prep.branch)
+    }
+
+    func test_preparePullRequestWorktree_fallsBackToUpstreamRemoteAndTracksIt() throws {
+        let dir = try mkTmpRepo()
+        let forkBare = NSTemporaryDirectory() + "rc2-pr-fork-" + UUID().uuidString + ".git"
+        let upstreamBare = NSTemporaryDirectory() + "rc2-pr-upstream-" + UUID().uuidString + ".git"
+        let worktreeRoot = dir + "-pr-worktrees"
+        defer {
+            try? FileManager.default.removeItem(atPath: dir)
+            try? FileManager.default.removeItem(atPath: forkBare)
+            try? FileManager.default.removeItem(atPath: upstreamBare)
+            try? FileManager.default.removeItem(atPath: worktreeRoot)
+        }
+        try seedCommit(dir)
+        run(["git", "init", "--bare", "-q", forkBare])
+        run(["git", "init", "--bare", "-q", upstreamBare])
+        run(["git", "-C", dir, "remote", "add", "origin", forkBare])
+        run(["git", "-C", dir, "remote", "add", "upstream", upstreamBare])
+        run(["git", "-C", dir, "push", "-q", "origin", "main"])
+        run(["git", "-C", dir, "push", "-q", "upstream", "main"])
+        run(["git", "-C", dir, "checkout", "-qb", "feature/pr-8"])
+        try "from upstream pr\n".write(toFile: dir + "/upstream-pr.txt", atomically: true, encoding: .utf8)
+        run(["git", "-C", dir, "add", "upstream-pr.txt"])
+        run(["git", "-C", dir, "commit", "-q", "-m", "upstream pr"])
+        run(["git", "-C", dir, "push", "-q", "upstream", "HEAD:refs/pull/8/head"])
+        run(["git", "-C", dir, "checkout", "-q", "main"])
+
+        let prep = GitDiff.preparePullRequestWorktree(
+            in: dir,
+            urlString: "https://github.com/acme/widget/pull/8",
+            worktreePath: worktreeRoot + "/pr-8"
+        )
+
+        XCTAssertTrue(prep.result.ok, prep.result.message)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prep.worktreePath + "/upstream-pr.txt"),
+                      "when origin is a fork without the PR ref, PR preparation must try upstream instead of failing before the Agent can inspect the PR")
+        let upstream = shell(["git", "-C", prep.worktreePath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        XCTAssertEqual(upstream.trimmingCharacters(in: .whitespacesAndNewlines), "upstream/pr/8",
+                       "the isolated PR branch should track the remote PR ref it fetched from, preserving fork/upstream provenance")
     }
 }

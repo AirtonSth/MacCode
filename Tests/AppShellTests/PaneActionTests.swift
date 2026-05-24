@@ -698,6 +698,32 @@ final class PaneActionTests: XCTestCase {
                       "valid configured CLI paths must be reflected in diagnostics")
     }
 
+    func test_settingsViewModel_runsProviderUpdateFromConfiguredPath() async throws {
+        let (ctx, _) = try makeContext()
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fakeClaude = dir.appendingPathComponent("claude")
+        try """
+        #!/bin/sh
+        if [ "$1" = "update" ]; then
+          printf 'updated from settings\\n'
+          exit 0
+        fi
+        exit 7
+        """.write(to: fakeClaude, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeClaude.path)
+
+        let vm = SettingsViewModel(context: ctx)
+        vm.setClaudePath(fakeClaude.path)
+
+        await vm.updateProvider(.claude)
+
+        XCTAssertEqual(vm.providerUpdateMessages[.claude], "updated from settings",
+                       "Settings must run the provider-native update action through the configured Claude path instead of only surfacing stale update state")
+        XCTAssertFalse(vm.updatingProviders.contains(.claude),
+                       "Settings must clear provider update progress after completion so users can retry after a failure")
+    }
+
     func test_ratioSplit_laysOutSideBySideWithoutFreeSpace() {
         let split = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 901, height: 300))
         split.isVertical = true

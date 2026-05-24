@@ -6,12 +6,52 @@ import AgentRuntime
 import SocketServer
 import Surfaces
 
+private struct AgentProviderInstanceConfig: Decodable, Equatable {
+    var id: String
+    var provider: AgentProvider
+    var displayName: String?
+    var binaryPath: String?
+    var homePath: String?
+    var accentColor: String?
+    var enabled: Bool?
+    var env: [String: String]?
+}
+
+private struct ProviderProbeCacheKey: Hashable {
+    var provider: AgentProvider
+    var binaryPath: String
+    var environment: [String]
+
+    init(provider: AgentProvider, binaryPath: String, environment: [String: String]) {
+        self.provider = provider
+        self.binaryPath = binaryPath
+        self.environment = environment
+            .map { "\($0.key)=\($0.value)" }
+            .sorted()
+    }
+}
+
+private struct ProviderProbeCapabilities {
+    var version: String?
+    var authenticated: Bool?
+    var accountLabel: String?
+    var accountAuthMethod: String?
+    var updateState: String?
+    var advisory: String?
+    var slashCommands: [String]
+    var skills: [String]
+    var capturedAt: Date
+}
+
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
 public final class AppCommandRouter: CommandRouting {
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
+    private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
+    private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
+    private let providerProbeCacheTTL: TimeInterval = 30
 
     public init(context: AppContext) {
         self.context = context
@@ -43,12 +83,30 @@ public final class AppCommandRouter: CommandRouting {
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: title)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: title)
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") else { return }
                             DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
                         }
                         agent.subscriptionToken = AnyHashable(token)
+                        agent.viewModel.providerSnapshotLoader = { [weak self] in
+                            await self?.listAgentProviderSnapshots() ?? []
+                        }
+                        agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
+                            (
+                                self?.providerBinary(provider: provider, instanceId: instanceId),
+                                self?.providerEnvironment(provider: provider, instanceId: instanceId) ?? [:]
+                            )
+                        }
+                        agent.viewModel.providerRecoveryAction = { [weak self] provider, instanceId in
+                            guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+                            let result = try await self.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
+                            return result.objectValue?["stdout"]?.stringValue ?? ""
+                        }
+                        agent.viewModel.pullRequestThreadPreparer = { [weak self] url, provider, model, permission, reasoning, serviceTier, modelSelection, providerInstanceId in
+                            guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+                            return try self.prepareAgentThreadForPullRequest(workspace: wid, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+                        }
                         agent.viewModel.onReviewRequested = { [weak self] in
                             _ = try? self?.createSurface(workspace: wid, type: .rightSidebarTool, paneID: nil, title: "Git")
                         }
@@ -417,34 +475,52 @@ public final class AppCommandRouter: CommandRouting {
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort) throws -> AgentThread {
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let t = AgentThread(workspaceId: workspace, title: title, provider: provider, model: model,
-                            permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        let t = AgentThread(workspaceId: workspace, title: title, provider: provider,
+                            providerInstanceId: normalizedProviderInstanceId(provider: provider, requested: providerInstanceId),
+                            model: model,
+                            permissionMode: permissionMode, reasoningEffort: reasoningEffort,
+                            serviceTier: serviceTier,
+                            modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier))
         try ctx.threadRepo.upsert(t)
         try selectAgentThread(thread: t.id)
         return t
     }
 
-    public func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) throws -> AgentThread {
+    public func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
         if let provider, provider != t.provider {
             // A1 (iOS+macOS parity): the provider is fixed once the
             // thread has a conversation. Only model/effort stay
             // changeable after that. Enforced host-side so no client
             // can bypass the UI lock.
-            let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
             guard !started else {
                 throw JSONRPCError(code: -32010,
                     message: "Provider is locked once the thread has started; only model and effort can change.")
             }
             t.provider = provider
+            t.providerInstanceId = normalizedProviderInstanceId(provider: provider, requested: providerInstanceId)
             t.providerThreadId = nil
+        } else if let providerInstanceId {
+            let normalized = normalizedProviderInstanceId(provider: t.provider, requested: providerInstanceId)
+            if normalized != t.providerInstanceId {
+                guard !started else {
+                    throw JSONRPCError(code: -32013,
+                        message: "Provider instance is locked once the thread has started.")
+                }
+                t.providerInstanceId = normalized
+                t.providerThreadId = nil
+            }
         }
         if let model, model != t.model {
+            let canSwitchModelInSession = t.provider == .claude && t.providerThreadId?.isEmpty == false
             t.model = model
-            t.providerThreadId = nil
+            if !canSwitchModelInSession {
+                t.providerThreadId = nil
+            }
         }
         if let permissionMode {
             t.permissionMode = permissionMode
@@ -452,6 +528,17 @@ public final class AppCommandRouter: CommandRouting {
         if let reasoningEffort {
             t.reasoningEffort = reasoningEffort
         }
+        if let serviceTier {
+            t.serviceTier = serviceTier
+        }
+        let persistedCustomModel = t.modelSelection.customModelId == t.model ? t.modelSelection.customModelId : nil
+        t.modelSelection = modelSelection ?? AgentModelSelection(
+            provider: t.provider,
+            modelId: t.model,
+            customModelId: persistedCustomModel,
+            reasoningEffort: t.reasoningEffort,
+            serviceTier: t.serviceTier
+        )
         t.updatedAt = Date()
         try ctx.threadRepo.upsert(t)
         for s in SurfaceRegistry.shared.all() {
@@ -461,11 +548,67 @@ public final class AppCommandRouter: CommandRouting {
                 if let model { agent.viewModel.model = model }
                 if let permissionMode { agent.viewModel.permissionMode = permissionMode }
                 if let reasoningEffort { agent.viewModel.reasoningEffort = reasoningEffort }
+                if let serviceTier { agent.viewModel.serviceTier = serviceTier }
             }
             agent.viewModel.reloadThreads()
         }
         windowController?.refreshFromState()
         return t
+    }
+
+    public func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
+        guard !started else {
+            throw JSONRPCError(code: -32011, message: "Execution mode is locked once the thread has started.")
+        }
+        if executionMode == .worktree {
+            let branch = baseBranch?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !branch.isEmpty else {
+                throw JSONRPCError(code: -32012, message: "Worktree mode requires a base branch before the first agent prompt.")
+            }
+            t.baseBranch = branch
+        } else {
+            t.baseBranch = nil
+            t.worktreePath = nil
+        }
+        t.executionMode = executionMode
+        t.updatedAt = Date()
+        try ctx.threadRepo.upsert(t)
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            agent.viewModel.reloadThreads()
+        }
+        windowController?.refreshFromState()
+        return t
+    }
+
+    public func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let cwd = try workspaceCwd(workspace)
+        let prep = GitDiff.preparePullRequestWorktree(in: cwd, urlString: url)
+        guard prep.result.ok else {
+            throw JSONRPCError(code: -32050, message: prep.result.message.isEmpty ? "Failed to prepare pull request worktree." : prep.result.message)
+        }
+        var thread = AgentThread(
+            workspaceId: workspace,
+            title: "PR #\(prep.ref.number): \(prep.ref.repositoryPath)",
+            provider: provider,
+            providerInstanceId: normalizedProviderInstanceId(provider: provider, requested: providerInstanceId),
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            executionMode: .worktree,
+            baseBranch: prep.branch,
+            worktreePath: prep.worktreePath,
+            serviceTier: serviceTier,
+            modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier)
+        )
+        thread.updatedAt = Date()
+        try ctx.threadRepo.upsert(thread)
+        try selectAgentThread(thread: thread.id)
+        return thread
     }
 
     public func selectAgentThread(thread: AgentThreadID) throws {
@@ -484,9 +627,9 @@ public final class AppCommandRouter: CommandRouting {
         return try ctx.messageRepo.listRecent(threadId: thread, limit: max(0, min(limit, 500)))
     }
 
-    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
+    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentRunID {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
         if AgentThreadTitle.isPlaceholder(t.title),
            ((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty {
             t.title = AgentThreadTitle.titleFromFirstMessage(text)
@@ -504,16 +647,22 @@ public final class AppCommandRouter: CommandRouting {
         }
         let prov = t.provider
         let m = t.model
-        let cwd = ctx.state.workspaces.first { $0.value.id == t.workspaceId }?.value.cwd ?? FileManager.default.currentDirectoryPath
+        let cwd = try prepareAgentExecutionCwd(thread: &t)
         let req = AgentRunRequest(
             threadId: thread,
             provider: prov,
+            providerInstanceId: t.providerInstanceId,
             model: m,
             cwd: cwd,
             prompt: text,
+            attachments: attachments,
             providerThreadId: t.providerThreadId,
             permissionMode: t.permissionMode,
-            reasoningEffort: t.reasoningEffort
+            reasoningEffort: t.reasoningEffort,
+            serviceTier: t.serviceTier,
+            interactionMode: interactionMode ?? .default,
+            providerBinary: providerBinary(provider: prov, instanceId: t.providerInstanceId),
+            environment: providerEnvironment(provider: prov, instanceId: t.providerInstanceId)
         )
         let runId = try await ctx.coordinator.startRun(req)
         // HC-5 (R1): a message sent from the mobile mirror must be
@@ -530,6 +679,232 @@ public final class AppCommandRouter: CommandRouting {
             }
         }
         return runId
+    }
+
+    private func prepareAgentExecutionCwd(thread: inout AgentThread) throws -> String {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? FileManager.default.currentDirectoryPath
+        guard thread.executionMode == .worktree else { return workspaceCwd }
+        if let path = thread.worktreePath, FileManager.default.fileExists(atPath: path) {
+            return path
+        }
+        let base = thread.baseBranch?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !base.isEmpty else {
+            throw JSONRPCError(code: -32012, message: "Worktree mode requires a base branch before the first agent prompt.")
+        }
+        let root = URL(fileURLWithPath: workspaceCwd)
+        let parent = root.deletingLastPathComponent()
+        let name = root.lastPathComponent.isEmpty ? "workspace" : root.lastPathComponent
+        let shortId = String(thread.id.value.uuidString.prefix(8)).lowercased()
+        let path = parent.appendingPathComponent("\(name)-agent-worktrees").appendingPathComponent(shortId).path
+        let branch = "rc-agent/\(shortId)"
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        let result = GitDiff.createWorktree(in: workspaceCwd, path: path, branch: branch, baseBranch: base)
+        guard result.ok || FileManager.default.fileExists(atPath: path) else {
+            throw JSONRPCError(code: -32013, message: result.message.isEmpty ? "Failed to create agent worktree." : result.message)
+        }
+        thread.worktreePath = path
+        thread.updatedAt = Date()
+        try ctx.threadRepo.upsert(thread)
+        return path
+    }
+
+    public func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID) {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let source = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        let storedMarkdown: String?
+        if let planMarkdown {
+            storedMarkdown = planMarkdown
+        } else {
+            storedMarkdown = try ctx.proposedPlanRepo.list(threadId: thread).last(where: { $0.plan.id == planId })?.plan.markdown
+        }
+        let markdown = storedMarkdown
+        guard let markdown, !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw JSONRPCError(code: -32030, message: "Proposed plan not found.")
+        }
+        let implementationThread: AgentThread
+        if newThread {
+            implementationThread = try createAgentThread(
+                workspace: source.workspaceId,
+                title: "Implement plan",
+                provider: provider ?? source.provider,
+                model: model ?? source.model,
+                permissionMode: permissionMode ?? source.permissionMode,
+                reasoningEffort: reasoningEffort ?? source.reasoningEffort,
+                serviceTier: serviceTier ?? source.serviceTier,
+                modelSelection: modelSelection ?? source.modelSelection,
+                providerInstanceId: source.providerInstanceId
+            )
+        } else {
+            implementationThread = source
+        }
+        let runId = try await sendAgentMessage(
+            thread: implementationThread.id,
+            text: AgentPlanImplementationPrompt.make(markdown: markdown),
+            provider: provider,
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            interactionMode: .default,
+            modelSelection: modelSelection,
+            providerInstanceId: source.providerInstanceId,
+            attachments: []
+        )
+        try? ctx.proposedPlanRepo.markImplemented(threadId: thread, planId: planId, implementationThreadId: implementationThread.id)
+        return (runId, implementationThread.id)
+    }
+
+    public func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String) {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let source = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        let storedMarkdown = try ctx.proposedPlanRepo.list(threadId: thread).last(where: { $0.plan.id == planId })?.plan.markdown
+        guard let markdown = planMarkdown ?? storedMarkdown,
+              !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw JSONRPCError(code: -32030, message: "Proposed plan not found.")
+        }
+        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == source.workspaceId }?.value.cwd
+        guard let workspaceCwd, !workspaceCwd.isEmpty else { throw LayoutError.workspaceNotFound }
+        let rootURL = URL(fileURLWithPath: workspaceCwd).standardizedFileURL
+        let requestedRelative = relativePath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeRelative = requestedRelative?.isEmpty == false
+            ? requestedRelative!
+            : ".remotecode/plans/\(AssistantProposedPlan(id: planId, turnId: nil, markdown: markdown).exportFileName)"
+        guard !safeRelative.hasPrefix("/") && !safeRelative.split(separator: "/").contains("..") else {
+            throw JSONRPCError(code: -32031, message: "Plan save path must stay inside the workspace.")
+        }
+        let targetURL = rootURL.appendingPathComponent(safeRelative).standardizedFileURL
+        let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        guard targetURL.path == rootURL.path || targetURL.path.hasPrefix(rootPath) else {
+            throw JSONRPCError(code: -32031, message: "Plan save path must stay inside the workspace.")
+        }
+        try FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try markdown.write(to: targetURL, atomically: true, encoding: .utf8)
+        let resolvedRelative = String(targetURL.path.dropFirst(rootPath.count))
+        return (targetURL.path, resolvedRelative)
+    }
+
+    public func commandReceipt(method: String, clientRequestId: String) -> JSONValue? {
+        guard let ctx = context,
+              let json = try? ctx.commandReceiptRepo.get(method: method, clientRequestId: clientRequestId),
+              let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(JSONValue.self, from: data)
+    }
+
+    public func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue) {
+        guard let ctx = context,
+              let data = try? JSONEncoder().encode(result),
+              let json = String(data: data, encoding: .utf8) else { return }
+        try? ctx.commandReceiptRepo.record(method: method, clientRequestId: clientRequestId, resultJSON: json)
+    }
+
+    public func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let state: AssistantRequestState = {
+            switch response {
+            case .approve, .approveForSession: return .approved
+            case .decline: return .declined
+            case .cancel: return .cancelled
+            }
+        }()
+        do {
+            try ctx.coordinator.respondToRequest(threadId: thread, requestId: requestId, response: response)
+            try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .approval, state: state)
+        } catch {
+            let reason = "Provider approval response failed: \(error)"
+            try? ctx.providerPendingCallbackRepo.markStale(threadId: thread, requestId: requestId, kind: .approval, reason: reason)
+            EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
+                "thread_id": .string(thread.value.uuidString),
+                "request_id": .string(requestId),
+                "state": .string(AssistantRequestState.stale.rawValue),
+                "error": .string(reason)
+            ]))
+            throw error
+        }
+    }
+
+    public func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        do {
+            try ctx.coordinator.respondToUserInput(threadId: thread, requestId: requestId, text: text)
+            try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .userInput, state: .resolved)
+        } catch {
+            let reason = "Provider user-input response failed: \(error)"
+            try? ctx.providerPendingCallbackRepo.markStale(threadId: thread, requestId: requestId, kind: .userInput, reason: reason)
+            EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+                "thread_id": .string(thread.value.uuidString),
+                "request_id": .string(requestId),
+                "state": .string(AssistantRequestState.stale.rawValue),
+                "error": .string(reason)
+            ]))
+            throw error
+        }
+    }
+
+    public func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let decoder = JSONDecoder()
+        var requests: [AssistantPendingRequest] = []
+        var userInputs: [AssistantUserInputRequest] = []
+        for callback in try ctx.providerPendingCallbackRepo.listVisible(threadId: thread) {
+            guard let data = callback.payloadJSON.data(using: .utf8) else { continue }
+            switch callback.kind {
+            case .approval:
+                guard var request = try? decoder.decode(AssistantPendingRequest.self, from: data) else { continue }
+                request.state = callback.state
+                request.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                if callback.state == .stale, let reason = callback.staleReason {
+                    request.detail = [request.detail, reason].compactMap { $0 }.joined(separator: "\n")
+                }
+                requests.append(request)
+            case .userInput:
+                guard var input = try? decoder.decode(AssistantUserInputRequest.self, from: data) else { continue }
+                input.state = callback.state
+                input.resolvedAtMs = callback.resolvedAt.map { Int64($0.timeIntervalSince1970 * 1000) }
+                if callback.state == .stale, let reason = callback.staleReason, input.answer == nil {
+                    input.answer = reason
+                }
+                userInputs.append(input)
+            }
+        }
+        return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
+    }
+
+    public func readAgentThreadEvents(thread: AgentThreadID) throws -> [AssistantEvent] {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.coordinator.readThread(threadId: thread)
+    }
+
+    public func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try ctx.coordinator.rollbackThread(threadId: thread, toTurnId: toTurnId)
+    }
+
+    public func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.turnCheckpointRepo.list(threadId: thread)
+    }
+
+    public func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let checkpoint = try ctx.turnCheckpointRepo.get(threadId: thread, checkpointTurnCount: checkpointTurnCount) else {
+            throw LayoutError.workspaceNotFound
+        }
+        if let path {
+            return checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? ""
+        }
+        return checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n")
+    }
+
+    public func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let agentThread = try ctx.threadRepo.get(id: thread),
+              let workspaceId = agentThread.workspaceId else { throw LayoutError.workspaceNotFound }
+        return try ctx.coordinator.revertThreadToCheckpoint(
+            threadId: thread,
+            checkpointTurnCount: checkpointTurnCount,
+            cwd: try workspaceCwd(workspaceId)
+        )
     }
 
     public func stopAgentRun(thread: AgentThreadID) throws {
@@ -606,8 +981,244 @@ public final class AppCommandRouter: CommandRouting {
     }
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
-        let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
+        let binary = configuredProviderBinary(provider)
+        let runner: AgentProviderRunner = provider == .codex
+            ? CodexRunner(binaryNameOverride: binary)
+            : ClaudeRunner(binaryNameOverride: binary)
         return await runner.listModels()
+    }
+
+    public func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
+        var snapshots: [AgentProviderSnapshot] = []
+        let configuredInstances = providerInstanceConfigs()
+        if !configuredInstances.isEmpty {
+            for instance in configuredInstances {
+                let binary = providerBinary(instance: instance) ?? instance.provider.rawValue
+                let binaryPath = ProcessLocator.resolve(binary) ?? ""
+                let env = providerEnvironment(provider: instance.provider, instanceId: instance.id)
+                let capabilities = providerProbeCapabilities(provider: instance.provider, binaryPath: binaryPath, environment: env)
+                let models = await listAgentModels(
+                    provider: instance.provider,
+                    installedVersion: capabilities.version,
+                    binaryPath: binaryPath,
+                    environment: env
+                )
+                snapshots.append(AgentProviderSnapshotFactory.snapshot(
+                    provider: instance.provider,
+                    models: models,
+                    binaryPath: binaryPath,
+                    version: capabilities.version,
+                    authenticated: capabilities.authenticated,
+                    accountLabel: capabilities.accountLabel,
+                    accountAuthMethod: capabilities.accountAuthMethod,
+                    updateState: capabilities.updateState,
+                    advisory: capabilities.advisory,
+                    slashCommands: capabilities.slashCommands,
+                    skills: capabilities.skills,
+                    id: instance.id,
+                    displayName: instance.displayName,
+                    accentColor: instance.accentColor,
+                    enabled: instance.enabled ?? true,
+                    homePath: instance.homePath,
+                    environmentKeys: Array(env.keys).sorted()
+                ))
+            }
+            return snapshots
+        }
+        for provider in AgentProvider.allCases {
+            let binary = configuredProviderBinary(provider) ?? provider.rawValue
+            let binaryPath = ProcessLocator.resolve(binary) ?? ""
+            let capabilities = providerProbeCapabilities(provider: provider, binaryPath: binaryPath, environment: [:])
+            let models = await listAgentModels(
+                provider: provider,
+                installedVersion: capabilities.version,
+                binaryPath: binaryPath,
+                environment: [:]
+            )
+            snapshots.append(AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: models,
+                binaryPath: binaryPath,
+                version: capabilities.version,
+                authenticated: capabilities.authenticated,
+                accountLabel: capabilities.accountLabel,
+                accountAuthMethod: capabilities.accountAuthMethod,
+                updateState: capabilities.updateState,
+                advisory: capabilities.advisory,
+                slashCommands: capabilities.slashCommands,
+                skills: capabilities.skills
+            ))
+        }
+        return snapshots
+    }
+
+    private func listAgentModels(
+        provider: AgentProvider,
+        installedVersion: String?,
+        binaryPath: String,
+        environment: [String: String]
+    ) async -> [AgentModelDescriptor] {
+        switch provider {
+        case .codex:
+            if !binaryPath.isEmpty {
+                let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
+                let appServerModels = await CodexAppServerModelDiscovery.listModels(binary: binaryPath, cwd: cwd, environment: environment)
+                if !appServerModels.isEmpty {
+                    return appServerModels
+                }
+            }
+            return await listAgentModels(provider: provider)
+        case .claude:
+            return ClaudeRunner.listModels(installedVersion: installedVersion)
+        }
+    }
+
+    private func providerProbeCapabilities(provider: AgentProvider, binaryPath: String, environment: [String: String]) -> ProviderProbeCapabilities {
+        let key = ProviderProbeCacheKey(provider: provider, binaryPath: binaryPath, environment: environment)
+        let now = Date()
+        if let cached = providerProbeCache[key],
+           now.timeIntervalSince(cached.capturedAt) < providerProbeCacheTTL {
+            return cached
+        }
+        let auth = ProviderCLIProbe.authStatus(provider: provider, binaryPath: binaryPath, environment: environment)
+        let version = ProviderCLIProbe.versionStatus(binaryPath: binaryPath, environment: environment)
+        let capabilities = ProviderProbeCapabilities(
+            version: version.version,
+            authenticated: auth.authenticated,
+            accountLabel: auth.accountLabel,
+            accountAuthMethod: auth.accountAuthMethod,
+            updateState: version.updateState,
+            advisory: version.advisory,
+            slashCommands: ProviderCLIProbe.slashCommands(provider: provider, binaryPath: binaryPath, environment: environment),
+            skills: providerSkills(provider: provider, environment: environment),
+            capturedAt: now
+        )
+        providerProbeCache[key] = capabilities
+        return capabilities
+    }
+
+    private func providerSkills(provider: AgentProvider, environment: [String: String]) -> [String] {
+        let home: String
+        switch provider {
+        case .codex:
+            home = environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+        case .claude:
+            home = environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        }
+        let skillsRoot: URL
+        switch provider {
+        case .codex:
+            skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
+        case .claude:
+            skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude/skills", isDirectory: true)
+        }
+        return Self.discoverSkillNames(in: skillsRoot)
+    }
+
+    private static func discoverSkillNames(in root: URL) -> [String] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        let names = entries.compactMap { url -> String? in
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+            guard values?.isDirectory == true else { return nil }
+            let skillFile = url.appendingPathComponent("SKILL.md")
+            guard FileManager.default.fileExists(atPath: skillFile.path) else { return nil }
+            return url.lastPathComponent
+        }
+        return Array(Set(names)).sorted()
+    }
+
+    public func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue {
+        let binary = providerBinary(provider: provider, instanceId: providerInstanceId) ?? provider.rawValue
+        let binaryPath = ProcessLocator.resolve(binary) ?? ""
+        guard !binaryPath.isEmpty else {
+            throw JSONRPCError(code: -32040, message: "\(provider.rawValue) CLI binary is unavailable.")
+        }
+        let env = providerEnvironment(provider: provider, instanceId: providerInstanceId)
+        let key = ProviderProbeCacheKey(provider: provider, binaryPath: binaryPath, environment: env)
+        guard !providerUpdateLocks.contains(key) else {
+            throw JSONRPCError(code: -32041, message: "\(provider.rawValue) update is already running.")
+        }
+        providerUpdateLocks.insert(key)
+        defer { providerUpdateLocks.remove(key) }
+
+        let result = await Task.detached(priority: .utility) {
+            ProviderCLIProbe.update(provider: provider, binaryPath: binaryPath, environment: env)
+        }.value
+        providerProbeCache.removeValue(forKey: key)
+        return .object([
+            "provider": .string(provider.rawValue),
+            "provider_instance_id": providerInstanceId.map { .string($0) } ?? .null,
+            "binary_path": .string(binaryPath),
+            "ok": .bool(result.ok),
+            "status": .number(Double(result.status)),
+            "stdout": .string(result.stdout),
+            "stderr": .string(result.stderr)
+        ])
+    }
+
+    private func providerInstanceConfigs() -> [AgentProviderInstanceConfig] {
+        guard let raw = try? context?.settingsRepo.get("agent.provider.instances")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let data = raw.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([AgentProviderInstanceConfig].self, from: data) else {
+            return []
+        }
+        var seen = Set<String>()
+        return decoded.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && seen.insert($0.id).inserted }
+    }
+
+    private func providerInstanceConfig(id: String?, provider: AgentProvider) -> AgentProviderInstanceConfig? {
+        let instances = providerInstanceConfigs().filter { $0.provider == provider }
+        guard !instances.isEmpty else { return nil }
+        if let id, let exact = instances.first(where: { $0.id == id }) { return exact }
+        return instances.first { $0.enabled != false } ?? instances.first
+    }
+
+    private func normalizedProviderInstanceId(provider: AgentProvider, requested: String?) -> String {
+        providerInstanceConfig(id: requested, provider: provider)?.id ?? provider.rawValue
+    }
+
+    private func providerBinary(instance: AgentProviderInstanceConfig) -> String? {
+        let configured = instance.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let configured, !configured.isEmpty { return configured }
+        return configuredProviderBinary(instance.provider)
+    }
+
+    private func providerBinary(provider: AgentProvider, instanceId: String?) -> String? {
+        if let instance = providerInstanceConfig(id: instanceId, provider: provider) {
+            return providerBinary(instance: instance)
+        }
+        return configuredProviderBinary(provider)
+    }
+
+    private func providerEnvironment(provider: AgentProvider, instanceId: String?) -> [String: String] {
+        guard let instance = providerInstanceConfig(id: instanceId, provider: provider) else { return [:] }
+        var env = instance.env ?? [:]
+        let home = instance.homePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !home.isEmpty {
+            switch provider {
+            case .codex:
+                env["CODEX_HOME"] = env["CODEX_HOME"] ?? home
+            case .claude:
+                env["HOME"] = env["HOME"] ?? home
+            }
+        }
+        return env
+    }
+
+    private func configuredProviderBinary(_ provider: AgentProvider) -> String? {
+        let key: String
+        switch provider {
+        case .codex: key = "cli.codex.path"
+        case .claude: key = "cli.claude.path"
+        }
+        guard let value = try? context?.settingsRepo.get(key)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return nil }
+        return value
     }
 
     // MARK: git (socket/CLI parity — same engine the diff panel uses)
@@ -643,6 +1254,38 @@ public final class AppCommandRouter: CommandRouting {
     }
     public func gitPullRequestURL(workspace: WorkspaceID) throws -> String? {
         GitDiff.pullRequestURL(in: try workspaceCwd(workspace))
+    }
+    public func gitDeliveryPlan(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryPlan {
+        GitDiff.deliveryPlan(in: try workspaceCwd(workspace), copy: copy)
+    }
+    public func gitDeliver(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryResult {
+        GitDiff.deliver(in: try workspaceCwd(workspace), copy: copy, environment: nil)
+    }
+
+    public func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult {
+        guard let data = Data(base64Encoded: dataBase64), !data.isEmpty else {
+            throw JSONRPCError(code: -32602, message: "Invalid attachment data.")
+        }
+        let root = URL(fileURLWithPath: try workspaceCwd(workspace)).standardizedFileURL
+        let dir = root.appendingPathComponent(".remotecode", isDirectory: true)
+            .appendingPathComponent("attachments", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let safeName = Self.safeAttachmentFilename(filename)
+        let fileURL = dir.appendingPathComponent("\(UUID().uuidString)-\(safeName)", isDirectory: false)
+        try data.write(to: fileURL, options: [.atomic])
+        let ext = fileURL.pathExtension.lowercased()
+        let kind: AgentAttachmentKind = ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"].contains(ext) ? .image : .file
+        return AgentAttachmentUploadResult(path: fileURL.path, displayName: safeName, kind: kind, mimeType: mimeType, sizeBytes: data.count)
+    }
+
+    private static func safeAttachmentFilename(_ filename: String) -> String {
+        let raw = URL(fileURLWithPath: filename).lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = raw.isEmpty ? "attachment" : raw
+        let safe = fallback.map { char in
+            char.isLetter || char.isNumber || ".-_ ".contains(char) ? char : "-"
+        }
+        let result = String(safe).trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty ? "attachment" : String(result.prefix(120))
     }
 
     // MARK: project scripts / open-in-editor (RC2-069)
@@ -1049,7 +1692,7 @@ public final class AppCommandRouter: CommandRouting {
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: baseTitle)
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
@@ -1057,6 +1700,24 @@ public final class AppCommandRouter: CommandRouting {
                     DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
                 }
                 agent.subscriptionToken = AnyHashable(token)
+                agent.viewModel.providerSnapshotLoader = { [weak self] in
+                    await self?.listAgentProviderSnapshots() ?? []
+                }
+                agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
+                    (
+                        self?.providerBinary(provider: provider, instanceId: instanceId),
+                        self?.providerEnvironment(provider: provider, instanceId: instanceId) ?? [:]
+                    )
+                }
+                agent.viewModel.providerRecoveryAction = { [weak self] provider, instanceId in
+                    guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+                    let result = try await self.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
+                    return result.objectValue?["stdout"]?.stringValue ?? ""
+                }
+                agent.viewModel.pullRequestThreadPreparer = { [weak self] url, provider, model, permission, reasoning, serviceTier, modelSelection, providerInstanceId in
+                    guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+                    return try self.prepareAgentThreadForPullRequest(workspace: workspace, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+                }
                 agent.viewModel.onReviewRequested = { [weak self] in
                     _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
                 }

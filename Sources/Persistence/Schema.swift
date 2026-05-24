@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 7
+    public static let currentVersion: Int = 23
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -204,6 +204,136 @@ public enum Schema {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_output_surface_index ON terminal_output_chunks(surface_id, chunk_index);
         CREATE INDEX IF NOT EXISTS idx_terminal_output_surface_id ON terminal_output_chunks(surface_id, id);
+        """),
+        SchemaStep(8, """
+        CREATE TABLE IF NOT EXISTS provider_session_runtime (
+            thread_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            provider_instance_id TEXT,
+            status TEXT NOT NULL,
+            resume_cursor TEXT,
+            runtime_payload_json TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_session_runtime_provider ON provider_session_runtime(provider, status);
+        """),
+        SchemaStep(9, """
+        CREATE TABLE IF NOT EXISTS command_receipts (
+            method TEXT NOT NULL,
+            client_request_id TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(method, client_request_id)
+        );
+        """),
+        SchemaStep(10, """
+        ALTER TABLE provider_session_runtime ADD COLUMN cwd TEXT;
+        ALTER TABLE provider_session_runtime ADD COLUMN model TEXT;
+        ALTER TABLE provider_session_runtime ADD COLUMN last_event_kind TEXT;
+        ALTER TABLE provider_session_runtime ADD COLUMN last_error_message TEXT;
+        """),
+        SchemaStep(11, """
+        CREATE TABLE IF NOT EXISTS provider_pending_callbacks (
+            thread_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            callback_kind TEXT NOT NULL,
+            state TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            stale_reason TEXT,
+            PRIMARY KEY(thread_id, request_id, callback_kind),
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_pending_callbacks_open ON provider_pending_callbacks(state, thread_id);
+        """),
+        SchemaStep(12, """
+        CREATE TABLE IF NOT EXISTS agent_proposed_plans (
+            thread_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            turn_id TEXT,
+            markdown TEXT NOT NULL,
+            implemented_at TEXT,
+            implementation_thread_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, plan_id),
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_proposed_plans_thread ON agent_proposed_plans(thread_id, created_at);
+        """),
+        SchemaStep(13, """
+        CREATE TABLE IF NOT EXISTS agent_turn_checkpoints (
+            thread_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            checkpoint_turn_count INTEGER NOT NULL,
+            checkpoint_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            assistant_message_id TEXT,
+            error_message TEXT,
+            completed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, turn_id),
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_turn_checkpoints_thread ON agent_turn_checkpoints(thread_id, checkpoint_turn_count);
+        """),
+        SchemaStep(14, """
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN file_snapshots_json TEXT NOT NULL DEFAULT '[]';
+        """),
+        SchemaStep(15, """
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN diff_patch TEXT;
+        ALTER TABLE agent_turn_checkpoints ADD COLUMN file_diffs_json TEXT NOT NULL DEFAULT '[]';
+        """),
+        SchemaStep(16, """
+        ALTER TABLE agent_threads ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local';
+        ALTER TABLE agent_threads ADD COLUMN base_branch TEXT;
+        ALTER TABLE agent_threads ADD COLUMN worktree_path TEXT;
+        """),
+        SchemaStep(17, """
+        ALTER TABLE agent_threads ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'auto';
+        """),
+        SchemaStep(18, """
+        ALTER TABLE provider_session_runtime ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'auto';
+        """),
+        SchemaStep(19, """
+        ALTER TABLE provider_session_runtime ADD COLUMN runtime_mode TEXT NOT NULL DEFAULT 'supervised';
+        """),
+        SchemaStep(20, """
+        ALTER TABLE provider_session_runtime ADD COLUMN adapter_key TEXT;
+        ALTER TABLE provider_session_runtime ADD COLUMN binary_identity TEXT;
+        """),
+        SchemaStep(21, """
+        ALTER TABLE agent_threads ADD COLUMN model_selection_json TEXT;
+        """),
+        SchemaStep(22, """
+        ALTER TABLE agent_threads ADD COLUMN provider_instance_id TEXT;
+        ALTER TABLE agent_runs ADD COLUMN provider_instance_id TEXT;
+        """),
+        SchemaStep(23, """
+        CREATE TABLE IF NOT EXISTS agent_provider_event_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            run_id TEXT,
+            event_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            source TEXT NOT NULL,
+            method TEXT NOT NULL,
+            provider_turn_id TEXT,
+            provider_item_id TEXT,
+            provider_request_id TEXT,
+            payload_json TEXT NOT NULL,
+            received_at_ms INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE,
+            FOREIGN KEY(run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_event_logs_thread ON agent_provider_event_logs(thread_id, id);
+        CREATE INDEX IF NOT EXISTS idx_provider_event_logs_refs ON agent_provider_event_logs(provider_turn_id, provider_item_id, provider_request_id);
         """)
     ]
 

@@ -140,6 +140,47 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "display truncation must be separate from the stored full title")
     }
 
+    func testWorktreeExecutionCreatesIsolatedCwdBeforeFirstAgentPrompt() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2WorktreeExec-" + UUID().uuidString
+        let repo = NSTemporaryDirectory() + "RC2WorktreeRepo-" + UUID().uuidString
+        let worktreeRoot = repo + "-agent-worktrees"
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(atPath: repo)
+            try? FileManager.default.removeItem(atPath: worktreeRoot)
+        }
+        try FileManager.default.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        runShell(["git", "init", "-q", "-b", "main", repo])
+        runShell(["git", "-C", repo, "config", "user.email", "t@t.t"])
+        runShell(["git", "-C", repo, "config", "user.name", "test"])
+        try "base\n".write(toFile: repo + "/README.md", atomically: true, encoding: .utf8)
+        runShell(["git", "-C", repo, "add", "README.md"])
+        runShell(["git", "-C", repo, "commit", "-q", "-m", "init"])
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = CwdCaptureRunner()
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "repo", cwd: repo)
+        let thread = try router.createAgentThread(workspace: workspace.id, title: "worktree", provider: .codex, model: "fake-model", permissionMode: .supervised, reasoningEffort: .medium)
+        _ = try router.configureAgentThreadExecution(thread: thread.id, executionMode: .worktree, baseBranch: "main")
+
+        _ = try await router.sendAgentMessage(thread: thread.id, text: "run isolated", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        await waitAsync("fake provider receives worktree cwd") {
+            runner.lastCwd != nil
+        }
+
+        let cwd = try XCTUnwrap(runner.lastCwd)
+        let restoredThread = try XCTUnwrap(try ctx.threadRepo.get(id: thread.id))
+        XCTAssertNotEqual(cwd, repo)
+        XCTAssertEqual(restoredThread.executionMode, .worktree)
+        XCTAssertEqual(restoredThread.baseBranch, "main")
+        XCTAssertEqual(restoredThread.worktreePath, cwd)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cwd + "/README.md"),
+                      "the first provider prompt must run in a real isolated git worktree, not the original workspace")
+    }
+
     func testCodexWarningsAreNotUserVisibleErrors() {
         let warning = "[codex stderr] 2026-05-18T19:27:58Z WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt"
 
@@ -166,5 +207,39 @@ final class AppIdentityNotificationTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTFail("Timed out waiting for \(desc)")
+    }
+
+    private func runShell(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args
+        try? p.run()
+        p.waitUntilExit()
+    }
+}
+
+private final class CwdCaptureRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let queue = DispatchQueue(label: "CwdCaptureRunner")
+    private var _lastCwd: String?
+
+    var lastCwd: String? {
+        queue.sync { _lastCwd }
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        queue.sync {
+            _lastCwd = request.cwd
+        }
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: "turn-1")))
+            onEvent(.event(.turnCompleted(turnId: "turn-1", finalMessage: "ok")))
+            onEvent(.finished(.completed, finalMessage: "ok", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 }

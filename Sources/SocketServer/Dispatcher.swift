@@ -47,11 +47,26 @@ public protocol CommandRouting: AnyObject {
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort) throws -> AgentThread
-    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) throws -> AgentThread
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
+    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
+    func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread
+    func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
+    func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
     func selectAgentThread(thread: AgentThreadID) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
-    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID
+    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentRunID
+    func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
+    func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
+    func commandReceipt(method: String, clientRequestId: String) -> JSONValue?
+    func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue)
+    func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws
+    func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws
+    func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot
+    func readAgentThreadEvents(thread: AgentThreadID) throws -> [AssistantEvent]
+    func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) throws
+    func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
+    func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
+    func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
     func deleteAgentThread(thread: AgentThreadID) throws
     func deleteAgentThreads(_ threads: [AgentThreadID]) throws
@@ -61,6 +76,8 @@ public protocol CommandRouting: AnyObject {
     func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread]
     func markAgentThreadRead(thread: AgentThreadID) throws
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor]
+    func listAgentProviderSnapshots() async -> [AgentProviderSnapshot]
+    func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue
     // git
     func gitStatus(workspace: WorkspaceID) throws -> GitSummary
     func gitBranches(workspace: WorkspaceID) throws -> GitBranches
@@ -71,6 +88,8 @@ public protocol CommandRouting: AnyObject {
     func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String
     func gitPush(workspace: WorkspaceID) throws -> GitActionResult
     func gitPullRequestURL(workspace: WorkspaceID) throws -> String?
+    func gitDeliveryPlan(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryPlan
+    func gitDeliver(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryResult
     // project scripts / open-in-editor (RC2-069)
     func projectScripts(workspace: WorkspaceID) throws -> [ProjectScript]
     func projectRunScript(workspace: WorkspaceID, name: String) throws -> SurfaceDescriptor
@@ -117,7 +136,25 @@ public protocol CommandRouting: AnyObject {
 @MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
+    private var volatileCommandReceipts: [String: JSONValue] = [:]
     public init(router: CommandRouting) { self.router = router }
+
+    private func commandReceipt(method: String, params: [String: JSONValue]) -> (String, JSONValue)? {
+        guard let receiptKey = params["client_request_id"]?.stringValue else { return nil }
+        if let durable = router.commandReceipt(method: method, clientRequestId: receiptKey) {
+            return (receiptKey, durable)
+        }
+        if let cached = volatileCommandReceipts["\(method):\(receiptKey)"] {
+            return (receiptKey, cached)
+        }
+        return nil
+    }
+
+    private func recordCommandReceipt(method: String, clientRequestId: String?, result: JSONValue) {
+        guard let clientRequestId else { return }
+        volatileCommandReceipts["\(method):\(clientRequestId)"] = result
+        router.recordCommandReceipt(method: method, clientRequestId: clientRequestId, result: result)
+    }
 
     /// Translate symbolic key names (cmux v2 contract) into raw bytes
     /// the PTY-backed terminal understands. Anything we don't recognize
@@ -528,32 +565,74 @@ public final class JSONRPCDispatcher {
             case "agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
-                let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
-                let model = params["model"]?.stringValue ?? "fake-model"
+                let modelSelection = modelSelection(from: params["model_selection"])
+                let provider = modelSelection?.provider ?? (AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex)
+                let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue ?? "fake-model"
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
-                let reasoning = params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
-                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning)
+                let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
+                let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
+                let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
+                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                let provider = params["provider"]?.stringValue.flatMap(AgentProvider.init)
-                let model = params["model"]?.stringValue
+                let modelSelection = modelSelection(from: params["model_selection"])
+                let provider = modelSelection?.provider ?? params["provider"]?.stringValue.flatMap(AgentProvider.init)
+                let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init)
-                let reasoning = params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init)
-                let t = try router.configureAgentThread(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning)
+                let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init)
+                let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init)
+                let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
+                let t = try router.configureAgentThread(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "provider": .string(t.provider.rawValue),
                     "model": .string(t.model)
                 ]
+                payload["provider_instance_id"] = t.providerInstanceId.map { .string($0) } ?? .null
+                payload["providerInstanceId"] = t.providerInstanceId.map { .string($0) } ?? .null
                 payload["permission_mode"] = .string(t.permissionMode.rawValue)
                 payload["reasoning_effort"] = .string(t.reasoningEffort.rawValue)
+                payload["service_tier"] = .string(t.serviceTier.rawValue)
+                payload["model_selection"] = encode(t.modelSelection)
                 payload["provider_locked"] = .bool(providerLocked(t))
                 payload["providerLocked"] = .bool(providerLocked(t))
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
                 return .init(id: id, result: encodeThread(t))
+            case "agent.thread.execution.configure":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let modeValue = params["execution_mode"]?.stringValue,
+                      let mode = AgentExecutionMode(rawValue: modeValue) else { throw JSONRPCError.invalidParams }
+                let t = try router.configureAgentThreadExecution(thread: tid, executionMode: mode, baseBranch: params["base_branch"]?.stringValue)
+                EventBus.shared.publish(kind: "agent.thread.updated", payload: threadPayload(t))
+                return .init(id: id, result: encodeThread(t))
+            case "agent.thread.prepare_pr":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let url = params["url"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let modelSelection = modelSelection(from: params["model_selection"])
+                let provider = modelSelection?.provider ?? (AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex)
+                let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue ?? "fake-model"
+                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
+                let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
+                let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
+                let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
+                let t = try router.prepareAgentThreadForPullRequest(workspace: wid, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+                EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
+                return .init(id: id, result: encodeThread(t))
+            case "agent.attachment.upload":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let filename = params["filename"]?.stringValue,
+                      let dataBase64 = params["data_base64"]?.stringValue ?? params["dataBase64"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let uploaded = try router.uploadAgentAttachment(workspace: wid, filename: filename, mimeType: params["mime_type"]?.stringValue ?? params["mimeType"]?.stringValue, dataBase64: dataBase64)
+                EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "path": .string(uploaded.path),
+                    "display_name": .string(uploaded.displayName),
+                    "size_bytes": .number(Double(uploaded.sizeBytes))
+                ]))
+                return .init(id: id, result: encode(uploaded))
             case "agent.thread.select":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 try router.selectAgentThread(thread: tid)
@@ -562,43 +641,211 @@ public final class JSONRPCDispatcher {
             case "agent.message.send":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let text = params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
-                let provider = params["provider"]?.stringValue.flatMap(AgentProvider.init)
-                let model = params["model"]?.stringValue
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let modelSelection = modelSelection(from: params["model_selection"])
+                let provider = modelSelection?.provider ?? params["provider"]?.stringValue.flatMap(AgentProvider.init)
+                let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue
                 let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init)
-                let reasoning = params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init)
-                let runId = try await router.sendAgentMessage(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning)
-                return .init(id: id, result: .object(["run_id": .string(runId.value.uuidString)]))
+                let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init)
+                let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init)
+                let interactionMode = params["interaction_mode"]?.stringValue.flatMap(AgentInteractionMode.init)
+                let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
+                let attachments = agentAttachments(from: params["attachments"])
+                let runId = try await router.sendAgentMessage(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
+                let result: JSONValue = .object(["run_id": .string(runId.value.uuidString)])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.plan.implement":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let planId = params["plan_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let modelSelection = modelSelection(from: params["model_selection"])
+                let provider = modelSelection?.provider ?? params["provider"]?.stringValue.flatMap(AgentProvider.init)
+                let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue
+                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init)
+                let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init)
+                let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init)
+                let implemented = try await router.implementAgentPlan(
+                    thread: tid,
+                    planId: planId,
+                    planMarkdown: params["markdown"]?.stringValue,
+                    newThread: params["new_thread"]?.boolValue ?? false,
+                    provider: provider,
+                    model: model,
+                    permissionMode: permission,
+                    reasoningEffort: reasoning,
+                    serviceTier: serviceTier,
+                    modelSelection: modelSelection
+                )
+                EventBus.shared.publish(kind: "agent.plan.implemented", payload: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "plan_id": .string(planId),
+                    "implementation_thread_id": .string(implemented.implementationThreadId.value.uuidString),
+                    "run_id": .string(implemented.runId.value.uuidString)
+                ]))
+                let result: JSONValue = .object([
+                    "run_id": .string(implemented.runId.value.uuidString),
+                    "implementation_thread_id": .string(implemented.implementationThreadId.value.uuidString)
+                ])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.plan.save":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let planId = params["plan_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let saved = try router.saveAgentPlan(
+                    thread: tid,
+                    planId: planId,
+                    planMarkdown: params["markdown"]?.stringValue,
+                    relativePath: params["relative_path"]?.stringValue
+                )
+                let result: JSONValue = .object([
+                    "path": .string(saved.path),
+                    "relative_path": .string(saved.relativePath)
+                ])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.message.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let limit = params["limit"]?.intValue ?? 200
                 return .init(id: id, result: encode(try router.listAgentMessages(thread: tid, limit: limit)))
             case "agent.run.stop":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 try router.stopAgentRun(thread: tid)
-                return .init(id: id, result: .bool(true))
+                let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.request.respond":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let requestId = params["request_id"]?.stringValue,
+                      let decision = params["decision"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let response: AgentProviderRequestResponse
+                switch decision {
+                case "approve": response = .approve
+                case "approve_for_session", "approveForSession": response = .approveForSession
+                case "decline": response = .decline(params["message"]?.stringValue)
+                case "cancel": response = .cancel
+                default: throw JSONRPCError.invalidParams
+                }
+                try router.respondAgentRequest(thread: tid, requestId: requestId, response: response)
+                let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.user_input.respond":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let requestId = params["request_id"]?.stringValue,
+                      let text = params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                try router.respondAgentUserInput(thread: tid, requestId: requestId, text: text)
+                let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.pending_callbacks.list":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.listAgentPendingCallbacks(thread: tid)))
+            case "agent.thread.read":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.readAgentThreadEvents(thread: tid)))
+            case "agent.thread.rollback":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let turnId = params["turn_id"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                try router.rollbackAgentThread(thread: tid, toTurnId: turnId)
+                let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.checkpoint.list":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.listAgentThreadCheckpoints(thread: tid)))
+            case "agent.checkpoint.diff":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let turnCount = params["turn_count"]?.intValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: .string(try router.agentCheckpointDiff(thread: tid, checkpointTurnCount: turnCount, path: params["path"]?.stringValue)))
+            case "agent.checkpoint.revert":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let turnCount = params["turn_count"]?.intValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let checkpoint = try router.revertAgentThreadToCheckpoint(thread: tid, checkpointTurnCount: turnCount)
+                EventBus.shared.publish(kind: "agent.checkpoint.reverted", payload: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "turn_count": .number(Double(checkpoint.checkpointTurnCount)),
+                    "turn_id": .string(checkpoint.turnId),
+                    "checkpoint_ref": .string(checkpoint.checkpointRef)
+                ]))
+                let result = encode(checkpoint)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.delete":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 try router.deleteAgentThread(thread: tid)
                 EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object(["thread_id": .string(tid.value.uuidString)]))
-                return .init(id: id, result: .bool(true))
+                let result = JSONValue.bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.delete_many":
                 guard case .array(let values) = params["thread_ids"] ?? .null else { throw JSONRPCError.invalidParams }
                 let tids = values.compactMap { $0.stringValue.flatMap(UUID.init).map(AgentThreadID.init) }
                 guard !tids.isEmpty else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 try router.deleteAgentThreads(tids)
                 EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
                     "thread_ids": .array(tids.map { .string($0.value.uuidString) })
                 ]))
-                return .init(id: id, result: .bool(true))
+                let result = JSONValue.bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.rename":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let title = params["title"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let t = try router.renameAgentThread(thread: tid, title: title)
                 EventBus.shared.publish(kind: "agent.thread.renamed", payload: threadPayload(t))
-                return .init(id: id, result: encodeThread(t))
+                let result = encodeThread(t)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.set_pinned":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let pinned = params["pinned"]?.boolValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let t = try router.setAgentThreadPinned(thread: tid, pinned: pinned)
                 let order = try router.listAgentThreads(workspace: t.workspaceId).map { $0.id.value.uuidString }
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
@@ -614,10 +861,16 @@ public final class JSONRPCDispatcher {
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
                     "order": .array(order.map { .string($0) })
                 ]))
-                return .init(id: id, result: encodeThread(t))
+                let result = encodeThread(t)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.set_color":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let color = params["color"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let t = try router.setAgentThreadColor(thread: tid, color: color)
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
                     "thread_id": .string(t.id.value.uuidString),
@@ -626,10 +879,16 @@ public final class JSONRPCDispatcher {
                     "provider_locked": .bool(providerLocked(t)),
                     "providerLocked": .bool(providerLocked(t))
                 ]))
-                return .init(id: id, result: encodeThread(t))
+                let result = encodeThread(t)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.reorder":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let pos = params["position"]?.intValue ?? 0
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let list = try router.reorderAgentThread(thread: tid, position: pos)
                 let wid = list.first(where: { $0.id == tid })?.workspaceId
                 EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
@@ -638,12 +897,20 @@ public final class JSONRPCDispatcher {
                     "position": .number(Double(pos)),
                     "order": .array(list.map { .string($0.id.value.uuidString) })
                 ]))
-                return .init(id: id, result: .bool(true))
+                let result = JSONValue.bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.mark_read":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 try router.markAgentThreadRead(thread: tid)
                 EventBus.shared.publish(kind: "agent.thread.read", payload: .object(["thread_id": .string(tid.value.uuidString)]))
-                return .init(id: id, result: .bool(true))
+                let result = JSONValue.bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "git.status":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try router.gitStatus(workspace: wid)))
@@ -686,6 +953,14 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let url = try router.gitPullRequestURL(workspace: wid)
                 return .init(id: id, result: .object(["url": url.map { .string($0) } ?? .null]))
+            case "git.delivery_plan":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.gitDeliveryPlan(workspace: wid, copy: gitDeliveryCopy(from: params))))
+            case "git.deliver":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let r = try router.gitDeliver(workspace: wid, copy: gitDeliveryCopy(from: params))
+                EventBus.shared.publish(kind: "git.deliver", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                return .init(id: id, result: encode(r))
             case "project.scripts":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try router.projectScripts(workspace: wid)))
@@ -703,6 +978,14 @@ public final class JSONRPCDispatcher {
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
                 let models = await router.listAgentModels(provider: provider)
                 return .init(id: id, result: encode(models))
+            case "agent.providers.list":
+                return .init(id: id, result: encode(await router.listAgentProviderSnapshots()))
+            case "agent.provider.update":
+                let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
+                let instanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
+                let result = try await router.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
+                EventBus.shared.publish(kind: "agent.provider.updated", payload: result)
+                return .init(id: id, result: result)
             case "agent.state.current":
                 let w = try router.currentWindow()
                 return .init(id: id, result: .object([
@@ -992,10 +1275,62 @@ public final class JSONRPCDispatcher {
         let display = AgentThreadTitle.display(thread.title)
         object["displayTitle"] = .string(display)
         object["display_title"] = .string(display)
+        object["model_selection"] = encode(thread.modelSelection)
+        object["provider_instance_id"] = thread.providerInstanceId.map { .string($0) } ?? .null
+        object["execution_mode"] = .string(thread.executionMode.rawValue)
+        object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
+        object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
         let locked = providerLocked(thread)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
         return .object(object)
+    }
+
+    private func modelSelection(from value: JSONValue?) -> AgentModelSelection? {
+        guard case .object(let object) = value else { return nil }
+        guard let providerValue = object["provider"]?.stringValue,
+              let provider = AgentProvider(rawValue: providerValue) else { return nil }
+        let modelId = object["modelId"]?.stringValue ?? object["model_id"]?.stringValue ?? object["model"]?.stringValue ?? ""
+        let customModelId = object["customModelId"]?.stringValue ?? object["custom_model_id"]?.stringValue
+        let reasoning = (object["reasoningEffort"]?.stringValue ?? object["reasoning_effort"]?.stringValue)
+            .flatMap(AgentReasoningEffort.init) ?? .medium
+        let serviceTier = (object["serviceTier"]?.stringValue ?? object["service_tier"]?.stringValue)
+            .flatMap(AgentServiceTier.init) ?? .auto
+        return AgentModelSelection(
+            provider: provider,
+            modelId: modelId,
+            customModelId: customModelId,
+            reasoningEffort: reasoning,
+            serviceTier: serviceTier
+        )
+    }
+
+    private func agentAttachments(from value: JSONValue?) -> [AgentAttachment] {
+        guard case .array(let values) = value else { return [] }
+        return values.compactMap { value -> AgentAttachment? in
+            guard case .object(let object) = value,
+                  let path = object["path"]?.stringValue,
+                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            let kindRaw = object["kind"]?.stringValue ?? "file"
+            let kind = AgentAttachmentKind(rawValue: kindRaw) ?? .file
+            let displayName = object["displayName"]?.stringValue ?? object["display_name"]?.stringValue
+            let mimeType = object["mimeType"]?.stringValue ?? object["mime_type"]?.stringValue
+            return AgentAttachment(path: path, displayName: displayName, kind: kind, mimeType: mimeType)
+        }
+    }
+
+    private func gitDeliveryCopy(from params: [String: JSONValue]) -> GitDeliveryCopy? {
+        let object = params["copy"]?.objectValue ?? params["delivery_copy"]?.objectValue ?? params
+        let copy = GitDeliveryCopy(
+            branchName: object["branchName"]?.stringValue ?? object["branch_name"]?.stringValue,
+            commitMessage: object["commitMessage"]?.stringValue ?? object["commit_message"]?.stringValue,
+            pullRequestTitle: object["pullRequestTitle"]?.stringValue ?? object["pull_request_title"]?.stringValue,
+            pullRequestBody: object["pullRequestBody"]?.stringValue ?? object["pull_request_body"]?.stringValue
+        )
+        return copy.branchName == nil &&
+            copy.commitMessage == nil &&
+            copy.pullRequestTitle == nil &&
+            copy.pullRequestBody == nil ? nil : copy
     }
 
     private func threadPayload(_ thread: AgentThread) -> JSONValue {
@@ -1007,12 +1342,19 @@ public final class JSONRPCDispatcher {
             "display_title": .string(AgentThreadTitle.display(thread.title)),
             "displayTitle": .string(AgentThreadTitle.display(thread.title)),
             "provider": .string(thread.provider.rawValue),
+            "provider_instance_id": thread.providerInstanceId.map { .string($0) } ?? .null,
+            "providerInstanceId": thread.providerInstanceId.map { .string($0) } ?? .null,
             "model": .string(thread.model),
             "provider_locked": .bool(locked),
             "providerLocked": .bool(locked),
             "permission_mode": .string(thread.permissionMode.rawValue),
-            "reasoning_effort": .string(thread.reasoningEffort.rawValue)
+            "reasoning_effort": .string(thread.reasoningEffort.rawValue),
+            "service_tier": .string(thread.serviceTier.rawValue),
+            "model_selection": encode(thread.modelSelection),
+            "execution_mode": .string(thread.executionMode.rawValue)
         ]
+        payload["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
+        payload["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
         payload["color"] = thread.color.map { .string($0) } ?? .null
         payload["pinned"] = .bool(thread.pinned)
         payload["sort_order"] = .number(Double(thread.sortOrder))

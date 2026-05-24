@@ -1,5 +1,7 @@
 import XCTest
 import AppKit
+import MachO
+import SwiftUI
 @testable import Surfaces
 import CoreModel
 import Persistence
@@ -11,7 +13,7 @@ import AgentRuntime
 @MainActor
 final class AgentAppViewModelTests: XCTestCase {
 
-    private func makeVM() throws -> (AgentAppViewModel, AgentThreadRepository) {
+    private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -19,10 +21,27 @@ final class AgentAppViewModelTests: XCTestCase {
         let runRepo = AgentRunRepository(db: db)
         let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
                                         threadRepo: threadRepo,
-                                        providers: [.codex: FakeProviderRunner(provider: .codex),
+                                        providers: [.codex: provider ?? FakeProviderRunner(provider: .codex),
                                                     .claude: FakeProviderRunner(provider: .claude)])
         let workspaceID = WorkspaceID()
         let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                   coordinator: coord, threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        return (vm, threadRepo)
+    }
+
+    private func makeVM(adapter: AgentProviderAdapter) throws -> (AgentAppViewModel, AgentThreadRepository) {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(runRepo: runRepo,
+                                        messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providerAdapters: [.codex: adapter])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
                                    coordinator: coord, threadRepo: threadRepo,
                                    messageRepo: messageRepo,
                                    promptHistoryStore: PromptHistoryStore(db: db))
@@ -47,6 +66,632 @@ final class AgentAppViewModelTests: XCTestCase {
         let id = vm.selectedThreadId!
         vm.messages.append(AgentMessage(threadId: id, role: .user, content: "hi"))
         XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
+    }
+
+    func test_executionModeControlsPersistBeforeConversationAndLockAfterStart() throws {
+        let (vm, repo) = try makeVM()
+        vm.gitBranch = "main"
+        vm.createThread(title: "isolated")
+        vm.setExecutionMode(.worktree)
+        vm.setBaseBranch("feature-base")
+
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        var thread = try XCTUnwrap(try repo.get(id: id))
+        XCTAssertEqual(thread.executionMode, .worktree,
+                       "macOS Agent App must expose and persist worktree execution before the first provider turn")
+        XCTAssertEqual(thread.baseBranch, "feature-base")
+
+        vm.messages.append(AgentMessage(threadId: id, role: .user, content: "started"))
+        vm.setExecutionMode(.local)
+        thread = try XCTUnwrap(try repo.get(id: id))
+        XCTAssertEqual(thread.executionMode, .worktree,
+                       "execution mode must lock after conversation start so a long-running agent cannot silently move between local and worktree cwd")
+    }
+
+    func test_providerStatusMessageComesFromSnapshot() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex Work",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: false,
+                status: .unavailable,
+                statusDetail: "Codex binary missing.",
+                authenticated: true,
+                accountLabel: "work@example.com",
+                accountAuthMethod: "oauth",
+                models: [],
+                slashCommands: ["/goal"]
+            )
+        ]
+
+        XCTAssertEqual(vm.providerDisplayName(.codex), "Codex Work")
+        XCTAssertEqual(vm.providerStatusMessage, "Codex binary missing.",
+                       "macOS Agent App must surface provider status from the host/provider snapshot before the user sends")
+        XCTAssertEqual(vm.providerAccountStatusMessage, "Codex Work: work@example.com via oauth",
+                       "macOS Agent App provider cards must surface account label and auth method before a long run starts")
+        XCTAssertEqual(vm.providerRecoveryActionTitle, "Copy install command",
+                       "provider cards must expose an immediate recovery action when the selected CLI is unavailable")
+    }
+
+    func test_providerRecoveryActionRunsInstanceScopedUpdateAndRefreshesSnapshots() async throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .claude
+        vm.providerInstanceId = "claude-work"
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "claude-work",
+                provider: .claude,
+                driverKind: .claudeCLI,
+                displayName: "Claude Work",
+                accentColor: "#D97706",
+                continuationGroup: "anthropic-claude",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .warning,
+                statusDetail: "Update available: Claude Code 2.2.0",
+                authenticated: true,
+                models: [AgentModelDescriptor(id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5", provider: .claude)],
+                slashCommands: ["/status"],
+                advisory: "Update available: Claude Code 2.2.0",
+                updateState: "update_available"
+            )
+        ]
+        var updatedProvider: AgentProvider?
+        var updatedInstance: String?
+        vm.providerRecoveryAction = { provider, instanceId in
+            updatedProvider = provider
+            updatedInstance = instanceId
+            return "updated claude\n"
+        }
+        vm.providerSnapshotLoader = {
+            [AgentProviderSnapshot(
+                id: "claude-work",
+                provider: .claude,
+                driverKind: .claudeCLI,
+                displayName: "Claude Work",
+                accentColor: "#D97706",
+                continuationGroup: "anthropic-claude",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                statusDetail: nil,
+                authenticated: true,
+                models: [AgentModelDescriptor(id: "claude-sonnet-4-5", label: "Claude Sonnet 4.5", provider: .claude)],
+                slashCommands: ["/status"],
+                advisory: nil,
+                updateState: nil
+            )]
+        }
+
+        XCTAssertEqual(vm.providerRecoveryActionTitle, "Update Claude Work")
+
+        await vm.performProviderRecoveryAction()
+
+        XCTAssertEqual(updatedProvider, .claude)
+        XCTAssertEqual(updatedInstance, "claude-work",
+                       "provider recovery actions must stay instance-scoped so work/personal provider cards do not update the wrong account")
+        XCTAssertEqual(vm.providerRecoveryStatusMessage, "updated claude")
+        XCTAssertEqual(vm.selectedProviderSnapshot?.status, .available,
+                       "provider cards must refresh after recovery so stale warnings do not remain before long runs")
+    }
+
+    func test_preparePullRequestThreadUsesCurrentAgentConfigAndSelectsWorktreeThread() async throws {
+        let (vm, repo) = try makeVM()
+        vm.provider = .codex
+        vm.providerInstanceId = "codex-work"
+        vm.availableModels = [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true)]
+        vm.model = "gpt-5.5"
+        vm.permissionMode = .fullAccess
+        vm.reasoningEffort = .high
+        vm.serviceTier = .fast
+        vm.pullRequestURL = " https://github.com/acme/widget/pull/7 "
+        var captured: (String, AgentProvider, String, AgentPermissionMode, AgentReasoningEffort, AgentServiceTier, String?)?
+        vm.pullRequestThreadPreparer = { url, provider, model, permission, reasoning, serviceTier, _, providerInstanceId in
+            captured = (url, provider, model, permission, reasoning, serviceTier, providerInstanceId)
+            let thread = AgentThread(
+                workspaceId: vm.workspaceID,
+                title: "PR #7: acme/widget",
+                provider: provider,
+                providerInstanceId: providerInstanceId,
+                model: model,
+                permissionMode: permission,
+                reasoningEffort: reasoning,
+                executionMode: .worktree,
+                baseBranch: "rc-pr/github-com/acme-widget-7",
+                worktreePath: "/tmp/rc-pr-7",
+                serviceTier: serviceTier
+            )
+            try repo.upsert(thread)
+            return thread
+        }
+
+        await vm.preparePullRequestThread()
+
+        XCTAssertEqual(captured?.0, "https://github.com/acme/widget/pull/7")
+        XCTAssertEqual(captured?.1, .codex)
+        XCTAssertEqual(captured?.2, "gpt-5.5")
+        XCTAssertEqual(captured?.3, .fullAccess)
+        XCTAssertEqual(captured?.4, .high)
+        XCTAssertEqual(captured?.5, .fast)
+        XCTAssertEqual(captured?.6, "codex-work",
+                       "opening a PR as an Agent thread must preserve the selected provider instance so work/personal sessions do not collapse")
+        XCTAssertEqual(vm.selectedThreadId.flatMap { try? repo.get(id: $0) }?.worktreePath, "/tmp/rc-pr-7",
+                       "the macOS Agent App must select the isolated PR worktree thread after preparation")
+        XCTAssertEqual(vm.pullRequestURL, "")
+    }
+
+    func test_providerInstanceSelectionPersistsAndReachesProviderRun() async throws {
+        let capture = CapturingProviderRunner(provider: .codex)
+        let (vm, repo) = try makeVM(provider: capture)
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-personal",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex Personal",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                slashCommands: ["/goal"]
+            ),
+            AgentProviderSnapshot(
+                id: "codex-work",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex Work",
+                accentColor: "#125A9C",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex)],
+                slashCommands: ["/goal"]
+            )
+        ]
+        vm.providerLaunchConfig = { _, instanceId in
+            ("/usr/bin/env", instanceId == "codex-work" ? ["CODEX_HOME": "/tmp/codex-work"] : [:])
+        }
+
+        vm.setProviderInstance("codex-work")
+        vm.createThread(title: "instance")
+        vm.prompt = "check instance routing"
+        await vm.send()
+
+        let thread = try XCTUnwrap(vm.selectedThreadId.flatMap { try? repo.get(id: $0) })
+        XCTAssertEqual(thread.providerInstanceId, "codex-work",
+                       "the selected provider instance must persist on the thread before the first turn starts")
+        XCTAssertEqual(capture.providerInstanceIds.last, "codex-work",
+                       "macOS Agent App must route the actual run by selected provider instance, not just provider type")
+        XCTAssertEqual(capture.providerBinaries.last, "/usr/bin/env")
+        XCTAssertEqual(capture.environments.last?["CODEX_HOME"], "/tmp/codex-work")
+    }
+
+    func test_restartedAgentAppSendsFollowupWithPersistedProviderThreadId() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-restart-continuity-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let history = PromptHistoryStore(db: db)
+        let capture = CapturingProviderRunner(provider: .codex)
+        let firstCoordinator = AgentRunCoordinator(runRepo: runRepo,
+                                                   messageRepo: messageRepo,
+                                                   threadRepo: threadRepo,
+                                                   providers: [.codex: capture])
+        let firstVM = AgentAppViewModel(workspaceID: workspaceID,
+                                        cwd: tmp,
+                                        coordinator: firstCoordinator,
+                                        threadRepo: threadRepo,
+                                        messageRepo: messageRepo,
+                                        promptHistoryStore: history)
+
+        firstVM.createThread(title: "restart continuity")
+        let threadId = try XCTUnwrap(firstVM.selectedThreadId)
+        firstVM.prompt = "first turn"
+        await firstVM.send()
+        await waitAsync("first turn persists provider cursor") {
+            (try? threadRepo.get(id: threadId)?.providerThreadId)?.isEmpty == false
+        }
+        let persistedProviderThreadId = try XCTUnwrap(try threadRepo.get(id: threadId)?.providerThreadId)
+
+        let secondCoordinator = AgentRunCoordinator(runRepo: runRepo,
+                                                    messageRepo: messageRepo,
+                                                    threadRepo: threadRepo,
+                                                    providers: [.codex: capture])
+        let restartedVM = AgentAppViewModel(workspaceID: workspaceID,
+                                            cwd: tmp,
+                                            coordinator: secondCoordinator,
+                                            threadRepo: threadRepo,
+                                            messageRepo: messageRepo,
+                                            promptHistoryStore: history)
+
+        XCTAssertEqual(restartedVM.selectedThreadId, threadId,
+                       "after app restart, Agent App must reopen the persisted thread before follow-up sends")
+        restartedVM.prompt = "second turn after restart"
+        await restartedVM.send()
+        await waitAsync("follow-up request captured") { capture.prompts.count >= 2 }
+
+        XCTAssertEqual(capture.requestProviderThreadIds.first ?? nil, nil,
+                       "the first turn should start a fresh provider session")
+        XCTAssertEqual(capture.requestProviderThreadIds.dropFirst().first ?? nil, persistedProviderThreadId,
+                       "after app restart, Agent App must send follow-ups with the persisted provider thread id instead of forking a disconnected agent session")
+    }
+
+    func test_contextHealthMessageShowsTokenBudgetAndCompaction() throws {
+        let (vm, _) = try makeVM()
+        vm.timeline.apply(.tokenUsage(AssistantTokenUsage(inputTokens: 400, outputTokens: 100, totalTokens: 500, contextWindow: 1_000, compactsAutomatically: true)))
+
+        XCTAssertEqual(vm.contextHealthMessage, "Context 50% · 500 / 1000 tokens · auto-compacts",
+                       "macOS Agent App must expose context usage and automatic compaction capability so long agent runs do not silently approach the context limit")
+
+        vm.timeline.apply(.contextCompaction(summary: "older turns summarized"))
+        XCTAssertEqual(vm.contextHealthMessage, "Context 50% · 500 / 1000 tokens · auto-compacts · compacted",
+                       "macOS Agent App must surface compaction state so long-run behavior is visible")
+    }
+
+    func test_timelineItemPresentationKeepsProgressAndChannelsDistinct() {
+        let running = AgentTimelineItemPresentation.make(for: AssistantItem(
+            id: "cmd-1",
+            turnId: "turn-1",
+            type: .commandExecution,
+            state: .streaming,
+            summary: "swift test",
+            startedAtMs: 1
+        ))
+        XCTAssertEqual(running.icon, "circle.dotted")
+        XCTAssertEqual(running.verb, "Running")
+        XCTAssertEqual(running.label, "swift test")
+
+        let failed = AgentTimelineItemPresentation.make(for: AssistantItem(
+            id: "cmd-2",
+            turnId: "turn-1",
+            type: .commandExecution,
+            state: .failed,
+            body: "xcodebuild test",
+            startedAtMs: 2
+        ))
+        XCTAssertEqual(failed.icon, "xmark.octagon")
+        XCTAssertEqual(failed.verb, "Failed")
+
+        let changed = AgentTimelineItemPresentation.make(for: AssistantItem(
+            id: "file-1",
+            turnId: "turn-1",
+            type: .fileChange,
+            state: .completed,
+            summary: "Edited AgentThreadView.swift",
+            output: "1 file changed",
+            startedAtMs: 3
+        ))
+        XCTAssertEqual(changed.icon, "doc.badge.gearshape")
+        XCTAssertEqual(changed.verb, "Changed")
+        XCTAssertEqual(changed.detail, "1 file changed")
+
+        let reasoning = AgentTimelineItemPresentation.make(for: AssistantItem(
+            id: "think-1",
+            turnId: "turn-1",
+            type: .reasoning,
+            state: .completed,
+            summary: "Need provider parity",
+            startedAtMs: 4
+        ))
+        XCTAssertEqual(reasoning.detail, "Need provider parity",
+                       "reasoning summaries must stay visible even when providers send summary-only deltas")
+
+        let issue = AgentTimelineItemPresentation.make(for: AssistantItem(
+            id: "err-1",
+            turnId: "turn-1",
+            type: .error,
+            state: .completed,
+            body: "Unsupported realtime event",
+            startedAtMs: 5
+        ))
+        XCTAssertEqual(issue.icon, "exclamationmark.triangle")
+        XCTAssertEqual(issue.verb, "Issue")
+    }
+
+    func test_composerSuggestsProviderSlashCommandsAndSkills() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [],
+                slashCommands: ["/goal", "/review"],
+                skills: ["sam-fix-bug", "sam-review-code"]
+            )
+        ]
+
+        vm.prompt = "/go"
+        XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["/goal "],
+                       "provider-owned slash commands must be discoverable instead of requiring memorized syntax")
+
+        vm.prompt = "use $sam-f"
+        XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["$sam-fix-bug "],
+                       "Codex skills from the provider snapshot must be selectable from the composer")
+    }
+
+    func test_applyComposerSuggestionReplacesOnlyActiveToken() throws {
+        let (vm, _) = try makeVM()
+        vm.prompt = "before $sam-r"
+        vm.applyComposerSuggestion(AgentComposerSuggestion(
+            title: "$sam-review-code",
+            subtitle: "Codex skill",
+            insertText: "$sam-review-code ",
+            kind: .skill
+        ))
+
+        XCTAssertEqual(vm.prompt, "before $sam-review-code ",
+                       "selecting a composer suggestion must preserve surrounding prompt text")
+    }
+
+    func test_pendingProviderCallbacksExposeOnlyOpenOrStaleRows() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "callbacks")
+        vm.timeline.apply(.requestOpened(AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 1
+        )))
+        vm.timeline.apply(.requestOpened(AssistantPendingRequest(
+            id: "approval-2",
+            turnId: "turn-1",
+            kind: .fileChange,
+            title: "Edit file",
+            state: .stale,
+            createdAtMs: 2
+        )))
+        vm.timeline.apply(.userInputRequested(AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Pick mode",
+            options: ["Plan", "Run"],
+            createdAtMs: 3
+        )))
+        vm.timeline.apply(.requestResolved(requestId: "approval-1", state: .approved))
+
+        XCTAssertEqual(vm.openPendingRequests.map(\.id), ["approval-2"],
+                       "macOS Agent App must render stale provider callback state instead of leaving invisible dead requests")
+        XCTAssertEqual(vm.openPendingUserInputs.map(\.id), ["question-1"],
+                       "macOS Agent App must surface provider questions so the user can unblock Codex/Claude")
+    }
+
+    func test_selectThreadRehydratesPersistedStaleCallbacksIntoTimeline() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-callback-rehydrate-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let callbackRepo = ProviderPendingCallbackRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "callbacks", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try callbackRepo.record(threadId: thread.id, request: AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 1_000
+        ))
+        try callbackRepo.record(threadId: thread.id, userInput: AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Continue?",
+            options: ["Plan", "Run"],
+            createdAtMs: 2_000
+        ))
+        _ = try callbackRepo.markOpenStale(reason: "Provider callback state does not survive app restart.")
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   pendingCallbackRepo: callbackRepo)
+
+        vm.selectThread(thread.id)
+
+        XCTAssertEqual(vm.openPendingRequests.first?.id, "approval-1")
+        XCTAssertEqual(vm.openPendingRequests.first?.state, .stale,
+                       "persisted stale approvals must reappear in the Agent App after restart/reload")
+        XCTAssertEqual(vm.openPendingUserInputs.first?.id, "question-1")
+        XCTAssertEqual(vm.openPendingUserInputs.first?.state, .stale,
+                       "persisted stale provider questions must reappear in the Agent App after restart/reload")
+    }
+
+    func test_failedPendingCallbackResponsesBecomeStaleAndNonActionable() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-callback-fail-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FailingCallbackRunner()])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo)
+        vm.createThread(title: "callbacks")
+        vm.timeline.apply(.requestOpened(AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 1
+        )))
+        vm.timeline.apply(.userInputRequested(AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Continue?",
+            options: ["Plan", "Run"],
+            createdAtMs: 2
+        )))
+
+        vm.respondToPendingRequest(vm.openPendingRequests[0], response: .approve)
+        vm.answerPendingUserInput(vm.openPendingUserInputs[0], answer: "Run")
+
+        XCTAssertEqual(vm.openPendingRequests.first?.state, .stale,
+                       "failed provider approval responses must become non-actionable stale UI instead of leaving a dead approve button")
+        XCTAssertEqual(vm.openPendingUserInputs.first?.state, .stale,
+                       "failed provider question responses must become non-actionable stale UI instead of leaving a dead answer button")
+        XCTAssertTrue(vm.timeline.error?.contains("Provider user-input response failed") == true,
+                      "callback loss must leave visible activity explaining why the user needs to restart the turn")
+    }
+
+    func test_multiSelectUserInputBuildsOneFinalAnswer() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "multi input")
+        let request = AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Pick checks",
+            options: ["Unit", "UI", "Docs"],
+            allowsMultipleSelection: true,
+            createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        vm.toggleUserInputOption("UI", for: request)
+        vm.toggleUserInputOption("Unit", for: request)
+        let answer = vm.selectedUserInputAnswer(for: request)
+
+        XCTAssertEqual(answer, "UI\nUnit",
+                       "multi-select questions must submit one final answer atomically instead of resuming once per selected option")
+    }
+
+    func test_freeTextUserInputDraftCanAnswerProviderQuestion() throws {
+        let adapter = CapturingProviderAdapter(provider: .codex)
+        let (vm, _) = try makeVM(adapter: adapter)
+        vm.createThread(title: "free text input")
+        let request = AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Which branch should I inspect?",
+            options: [],
+            isSecret: true,
+            createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        vm.userInputDrafts[request.id] = "release/next"
+        vm.answerPendingUserInput(request, answer: vm.userInputDrafts[request.id] ?? "")
+
+        XCTAssertEqual(adapter.lastUserInputResponse?.requestId, "question-1")
+        XCTAssertEqual(adapter.lastUserInputResponse?.text, "release/next",
+                       "free-text provider questions must have an editable draft path so the user can unblock the waiting provider request")
+        XCTAssertNil(vm.userInputDrafts[request.id],
+                     "resolved provider questions must clear their local draft so stale text is not reused for a later request")
+        XCTAssertTrue(request.isSecret,
+                      "secret free-text questions use the same draft/submit path but must be distinguishable for masked rendering")
+    }
+
+    func test_selectThreadReplaysProviderReadThreadSnapshotWhenAvailable() throws {
+        let adapter = CapturingProviderAdapter(provider: .codex, readEvents: [
+            .threadStarted(threadId: "provider-thread-1", providerThreadId: "provider-thread-1"),
+            .turnStarted(turnId: "provider-turn-1"),
+            .itemStarted(item: AssistantItem(
+                id: "provider-message-1",
+                turnId: "provider-turn-1",
+                type: .assistantMessage,
+                state: .streaming,
+                summary: "Assistant message",
+                startedAtMs: 1
+            )),
+            .itemDelta(itemId: "provider-message-1", bodyAppend: "Recovered from provider snapshot", outputAppend: nil, summary: nil),
+            .turnCompleted(turnId: "provider-turn-1", finalMessage: "Recovered from provider snapshot")
+        ])
+        let (vm, _) = try makeVM(adapter: adapter)
+
+        vm.createThread(title: "recover")
+
+        XCTAssertEqual(vm.timeline.providerThreadId, "provider-thread-1")
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), ["provider-turn-1"])
+        XCTAssertEqual(vm.timeline.latestAssistantMessage, "Recovered from provider snapshot",
+                       "selecting a thread with a live provider session must reload the provider snapshot instead of relying only on stale local stream rows")
+    }
+
+    func test_restartedAgentAppRehydratesCodexThreadFromProviderSnapshotAfterLocalEventLoss() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-provider-snapshot-restart-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "recovered provider thread",
+            provider: .codex,
+            model: "gpt-5.5",
+            providerThreadId: "provider-thread-after-restart",
+            status: .completed
+        )
+        try threadRepo.upsert(thread)
+        try messageRepo.append(AgentMessage(threadId: thread.id, role: .assistant, content: "stale local final"))
+
+        let adapter = CapturingProviderAdapter(provider: .codex, readEvents: [
+            .threadStarted(threadId: "provider-thread-after-restart", providerThreadId: "provider-thread-after-restart"),
+            .turnStarted(turnId: "provider-turn-after-restart"),
+            .itemStarted(item: AssistantItem(
+                id: "provider-message-after-restart",
+                turnId: "provider-turn-after-restart",
+                type: .assistantMessage,
+                state: .streaming,
+                summary: "Assistant message",
+                startedAtMs: 1
+            )),
+            .itemDelta(itemId: "provider-message-after-restart", bodyAppend: "Recovered provider state after restart", outputAppend: nil, summary: nil),
+            .turnCompleted(turnId: "provider-turn-after-restart", finalMessage: "Recovered provider state after restart")
+        ])
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+
+        XCTAssertEqual(vm.selectedThreadId, thread.id,
+                       "after app restart, Agent App must reopen the persisted Codex thread")
+        XCTAssertEqual(vm.timeline.providerThreadId, "provider-thread-after-restart")
+        XCTAssertEqual(vm.timeline.turns.map(\.turnId), ["provider-turn-after-restart"])
+        XCTAssertEqual(vm.timeline.latestAssistantMessage, "Recovered provider state after restart",
+                       "app restart must prefer provider readThread state over stale local final-message rows when the provider session is recoverable")
     }
 
     func test_persistThreadConfig_writesProviderModelPermissionAndReasoningToThread() throws {
@@ -325,7 +970,7 @@ final class AgentAppViewModelTests: XCTestCase {
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
-            providers: [.codex: HoldOpenStreamRunner()]
+            providers: [.codex: ImmediateStreamRunner()]
         )
         let workspaceID = WorkspaceID()
         let firstSurface = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
@@ -419,6 +1064,67 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual(vm.prompt, "typed draft",
                        "history recall must not replace text the user is already typing")
+    }
+
+    func test_unknownSlashCommandPassesThroughToProviderForAgentOwnedCommands() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .codex)
+        vm.coordinator.replaceProvider(.codex, runner: runner)
+        vm.createThread(title: "goal")
+        vm.prompt = "/goal continue until the audit is implemented"
+
+        await vm.send()
+
+        await waitAsync("provider-owned slash command reaches runner") {
+            runner.prompts.contains("/goal continue until the audit is implemented")
+        }
+        XCTAssertFalse(vm.messages.contains { $0.role == .system && $0.content.contains("Unknown command") },
+                       "unknown slash commands must not be converted into local errors because providers own commands such as /goal")
+    }
+
+    func test_planCommandMakesNextProviderRunUsePlanInteractionMode() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .codex)
+        vm.coordinator.replaceProvider(.codex, runner: runner)
+        vm.createThread(title: "plan")
+        vm.prompt = "/plan"
+        await vm.send()
+        vm.prompt = "inspect before editing"
+
+        await vm.send()
+
+        await waitAsync("plan mode reaches runner") {
+            runner.interactionModes.contains(.plan)
+        }
+        XCTAssertEqual(runner.prompts.last, "inspect before editing",
+                       "plan mode must alter request metadata without corrupting the user-visible prompt")
+    }
+
+    func test_defaultCommandMakesNextProviderRunUseDefaultInteractionMode() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .claude)
+        vm.coordinator.replaceProvider(.claude, runner: runner)
+        vm.createThread(title: "default")
+        vm.provider = .claude
+        vm.model = "claude-sonnet-4-6"
+        vm.prompt = "/plan"
+        await vm.send()
+        vm.prompt = "inspect before editing"
+        await vm.send()
+        await waitAsync("plan mode reaches runner") {
+            runner.interactionModes.contains(.plan)
+        }
+
+        vm.prompt = "/default"
+        await vm.send()
+        vm.prompt = "now implement"
+        await vm.send()
+
+        await waitAsync("default mode reaches runner") {
+            runner.interactionModes.last == .default
+        }
+        XCTAssertEqual(runner.prompts.last, "now implement",
+                       "/default must restore provider runtime behavior without sending a local command as user prompt")
     }
 
     func test_typingAfterHistoryRecallTurnsRecalledPromptIntoEditableDraft() async throws {
@@ -542,12 +1248,12 @@ final class AgentAppViewModelTests: XCTestCase {
                       "/status must surface the run configuration")
     }
 
-    func test_slashUnknown_failsLoudAsSystemNote() throws {
+    func test_slashUnknown_returnsFalseSoProviderCanHandleIt() throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "t")
-        vm.handleSlashCommand("/wat")
-        XCTAssertTrue(vm.messages.last?.content.contains("Unknown command") ?? false,
-                      "an unknown slash command must report, not silently vanish")
+        XCTAssertFalse(vm.handleSlashCommand("/wat"),
+                       "unknown slash commands must be left for Codex or Claude instead of becoming local errors")
+        XCTAssertFalse(vm.messages.contains { $0.content.contains("Unknown command") })
     }
 
     // MARK: B4 — read/unread, active count, provider-model coherence
@@ -561,6 +1267,47 @@ final class AgentAppViewModelTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertTrue(cond(), "timed out waiting for: \(desc)")
+    }
+
+    private func runGit(_ args: [String], cwd: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = args
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        let stderr = Pipe()
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            let data = stderr.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8) ?? "git failed"
+            throw NSError(domain: "AgentAppViewModelTests.git", code: Int(process.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: message
+            ])
+        }
+    }
+
+    private func currentProcessFootprintKB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint / 1024)
+    }
+
+    private func renderedPNGData<V: View>(for rootView: V, size: NSSize = NSSize(width: 1000, height: 720)) -> Data? {
+        let host = NSHostingView(rootView: rootView)
+        host.frame = NSRect(origin: .zero, size: size)
+        host.setFrameSize(size)
+        host.layoutSubtreeIfNeeded()
+        host.displayIfNeeded()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return nil }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
     }
 
     func test_selectThread_marksItRead() throws {
@@ -602,6 +1349,62 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
+    func test_modelDescriptorControlsClampIllegalReasoningAndServiceTier() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .claude
+        vm.availableModels = [
+            AgentModelDescriptor(id: "haiku", label: "Haiku", provider: .claude, supportsReasoning: false, supportsCustomModel: true),
+            AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude, supportsReasoning: true, supportedReasoningEfforts: [.high], supportsCustomModel: true)
+        ]
+
+        vm.model = "haiku"
+        vm.reasoningEffort = .xhigh
+        vm.serviceTier = .fast
+        vm.normalizeSelectedModelOptions()
+
+        XCTAssertFalse(vm.supportsReasoningForSelectedModel,
+                       "models without thinking support must not render a reasoning picker")
+        XCTAssertEqual(vm.reasoningEffort, .medium,
+                       "unsupported reasoning selections must be clamped before persistence/send")
+        XCTAssertEqual(vm.serviceTier, .auto,
+                       "Claude/non-service-tier models must not preserve Codex fast mode")
+
+        vm.setModel("opus")
+        vm.setReasoningEffort(.xhigh)
+
+        XCTAssertEqual(vm.supportedReasoningEffortsForSelectedModel, [.high])
+        XCTAssertEqual(vm.reasoningEffort, .high,
+                       "reasoning controls must use the selected model descriptor, not a global effort list")
+    }
+
+    func test_modelDescriptorControlsPreserveCustomModelAndContextWindow() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.availableModels = [
+            AgentModelDescriptor(id: "", label: "Default", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true, contextWindowTokens: 400_000),
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true, contextWindowTokens: 1_000_000)
+        ]
+
+        vm.setCustomModel("gpt-experimental")
+
+        XCTAssertEqual(vm.model, "gpt-experimental",
+                       "custom-capable providers must not collapse a user-entered model back to the first known descriptor")
+        XCTAssertTrue(vm.supportsCustomModelForSelectedProvider)
+        XCTAssertEqual(vm.selectedModelContextWindowLabel, "400k ctx",
+                       "custom model selections should inherit the provider custom descriptor's context-window metadata for the UI")
+        XCTAssertTrue(vm.supportsServiceTierForSelectedModel,
+                      "custom Codex model selections should preserve descriptor-specific service-tier controls")
+
+        vm.availableModels = [
+            AgentModelDescriptor(id: "haiku", label: "Haiku", provider: .claude, supportsReasoning: false, supportsCustomModel: false)
+        ]
+        vm.provider = .claude
+        vm.setCustomModel("claude-custom")
+
+        XCTAssertEqual(vm.model, "gpt-experimental",
+                       "providers without custom-model support must ignore custom model entry instead of persisting an unsupported id")
+    }
+
     // MARK: B4 — bounded message window
 
     func test_messageWindow_capsThenLoadsEarlier() throws {
@@ -641,6 +1444,80 @@ final class AgentAppViewModelTests: XCTestCase {
                        "a huge persisted transcript must be clipped before SwiftUI renders it")
     }
 
+    func test_agentAppLongRunStressStaysBoundedAndReleasesRunState() async throws {
+        let runner = LongRunStreamRunner(turns: 90, runtimeEvents: 650)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "long stress")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let beforeKB = currentProcessFootprintKB()
+
+        vm.prompt = "exercise a long running agent stream"
+        await vm.send()
+
+        await waitAsync("long Agent App stream completes", timeout: 15) {
+            vm.status == .completed && vm.timeline.latestAssistantMessage == "LONG_ASSISTANT_89"
+        }
+        let afterKB = currentProcessFootprintKB()
+
+        XCTAssertEqual(vm.currentRunId, nil,
+                       "completed long runs must clear the selected Agent App run id instead of leaving Stop/Working state stuck")
+        XCTAssertEqual(vm.runStartedAt, nil,
+                       "completed long runs must clear the Working-for timer")
+        XCTAssertTrue(vm.coordinator.activeThreadIdsSnapshot().isEmpty,
+                      "the coordinator must release active thread handles after a long Agent App run")
+        XCTAssertLessThanOrEqual(vm.timeline.turns.count, AssistantTimelineState.liveTurnLimit,
+                                 "long streams must keep only the bounded live turn window")
+        XCTAssertEqual(vm.timeline.turns.last?.turnId, "long-turn-89",
+                       "bounded trimming must keep the newest long-run turn visible")
+        XCTAssertFalse(vm.timeline.turns.contains { $0.turnId == "long-turn-0" },
+                       "old long-run turns must be trimmed before SwiftUI renders unbounded history")
+        XCTAssertLessThanOrEqual(vm.timeline.providerRuntimeEvents.count, AssistantTimelineState.providerRuntimeEventLimit,
+                                 "raw provider runtime events must stay capped during long runs")
+        XCTAssertLessThanOrEqual(vm.timeline.workActivities.count, AssistantTimelineState.workActivityLimit,
+                                 "work-log rows must stay capped during long runs")
+        XCTAssertTrue(vm.contextHealthMessage?.contains("compacted") ?? false,
+                      "the Agent App must expose context compaction during long runs")
+
+        vm.selectThread(threadId)
+        XCTAssertLessThanOrEqual(vm.messages.count, AgentAppViewModel.baseMessageWindow,
+                                 "reopening a long thread must render only the bounded message window")
+
+        if beforeKB >= 0 && afterKB >= 0 {
+            XCTAssertLessThan(afterKB - beforeKB, 250_000,
+                              "macOS Agent App long-run stress must not grow process footprint by more than 250 MB")
+        }
+    }
+
+    func test_agentAppLongRunStressRendersMacSurfaceWithoutBlankingOrStuckRun() async throws {
+        let runner = LongRunStreamRunner(turns: 50, runtimeEvents: 300)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "visual long stress")
+
+        vm.prompt = "exercise a rendered long running agent stream"
+        await vm.send()
+
+        await waitAsync("rendered long Agent App stream completes", timeout: 15) {
+            vm.status == .completed && vm.timeline.latestAssistantMessage == "LONG_ASSISTANT_49"
+        }
+
+        let png = try XCTUnwrap(renderedPNGData(for: AgentAppView(vm: vm)),
+                                "the macOS Agent App SwiftUI surface must render to a non-empty bitmap after a long provider stream")
+        XCTAssertGreaterThan(png.count, 25_000,
+                             "long-run stress must leave a visible macOS Agent App surface instead of a blank or collapsed view")
+        XCTAssertEqual(vm.currentRunId, nil,
+                       "rendering after a long provider stream must not leave the macOS Agent App stuck in a selected run")
+        XCTAssertEqual(vm.runStartedAt, nil,
+                       "rendering after a long provider stream must not leave the Working timer active")
+        XCTAssertEqual(vm.timeline.turns.last?.turnId, "long-turn-49",
+                       "the rendered long-run surface must keep the newest assistant turn available")
+        XCTAssertLessThanOrEqual(vm.timeline.providerRuntimeEvents.count, AssistantTimelineState.providerRuntimeEventLimit,
+                                 "rendering must consume the bounded runtime-event window instead of retaining all provider events")
+        XCTAssertLessThanOrEqual(vm.timeline.workActivities.count, AssistantTimelineState.workActivityLimit,
+                                 "rendering must consume the bounded work-log window instead of retaining every long-run row")
+        XCTAssertTrue(vm.contextHealthMessage?.contains("compacted") ?? false,
+                      "rendering must keep long-run context/compaction telemetry visible")
+    }
+
     // MARK: B3 — composer attachments
 
     func test_attachments_addDedupesAndRemove() throws {
@@ -664,19 +1541,47 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_send_withAttachments_composesPromptAndClears() async throws {
-        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: runner)
         vm.createThread(title: "t")
         let tid = vm.selectedThreadId!
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-attachment-\(UUID().uuidString).swift")
+        try "let x = 1\n".write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+
         vm.prompt = "review these"
-        vm.addAttachments(["/tmp/x.swift"])
+        vm.addAttachments([file.path])
         await vm.send()
+
         XCTAssertTrue(vm.attachments.isEmpty, "attachments must clear after send")
-        let user = ((try? vm.messageRepo.list(threadId: tid)) ?? []).first { $0.role == .user }
-        XCTAssertTrue(user?.content.contains("[Attached files]") ?? false,
-                      "the persisted prompt must carry attachment paths for the agent")
-        XCTAssertTrue(user?.content.contains("/tmp/x.swift") ?? false)
+        XCTAssertEqual(runner.prompts.last, "review these",
+                       "attachment metadata must not be folded into provider prompt text")
+        XCTAssertEqual(runner.attachments.last?.map(\.path), [file.path],
+                       "provider runs must receive structured attachment metadata")
+        let persistedMessages: [AgentMessage] = (try? vm.messageRepo.list(threadId: tid)) ?? []
+        let user = persistedMessages.first { $0.role == .user }
+        XCTAssertFalse(user?.content.contains(file.path) ?? true,
+                       "persisted transcript must not leak raw attachment paths into prompt text")
+        XCTAssertTrue(user?.content.contains(file.lastPathComponent) ?? false,
+                      "the persisted transcript should keep a friendly attachment summary")
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content.contains("📎") },
                       "the transcript shows a friendly attachment summary, not raw paths")
+    }
+
+    func test_send_withMissingAttachmentFailsLoudAndDoesNotStartRun() async throws {
+        let runner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "t")
+        vm.prompt = "review"
+        vm.addAttachments(["/tmp/remote-code-missing-\(UUID().uuidString).png"])
+
+        await vm.send()
+
+        XCTAssertTrue(runner.prompts.isEmpty,
+                      "missing attachments must fail before provider spawn instead of sending a bad path")
+        XCTAssertTrue(vm.messages.contains { $0.role == .system && $0.content.contains("Attachment not found") },
+                      "attachment resolution errors must be visible to the user")
     }
 
     func test_send_persistsExactlyOneUserAndOneAssistantMessage() async throws {
@@ -770,6 +1675,19 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.prompt = "stream please"
         await vm.send()
         await waitAsync("run completes") { vm.status == .completed }
+        await waitAsync("stream timeline is persisted before reload") {
+            vm.timeline.turns.flatMap(\.items).contains {
+                $0.type == .assistantMessage && $0.body.contains("partial stream")
+            }
+        }
+        await waitAsync("stream event store contains assistant partial before reload") {
+            coordinator.latestStreamEvents(threadId: streamedThread).contains { event in
+                if case .itemDelta(let itemId, let bodyAppend, _, _) = event {
+                    return !itemId.isEmpty && (bodyAppend ?? "").contains("partial stream")
+                }
+                return false
+            }
+        }
 
         vm.createThread(title: "other")
         let reloadedVM = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
@@ -782,6 +1700,546 @@ final class AgentAppViewModelTests: XCTestCase {
         }, "reopening a thread must replay persisted stream items, not just show the final answer")
         XCTAssertEqual(reloadedVM.messages.filter { $0.role == .assistant && $0.content == "partial stream final" }.count, 0,
                        "the persisted final answer must not duplicate the replayed assistant stream")
+    }
+
+    func test_selectThreadReplaysPersistedContextTelemetryAfterRestart() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-replay-context-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: ContextTelemetryRunner()]
+        )
+        let workspaceID = WorkspaceID()
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                   coordinator: coordinator, threadRepo: threadRepo,
+                                   messageRepo: messageRepo)
+        vm.createThread(title: "telemetry")
+        let streamedThread = vm.selectedThreadId!
+        vm.prompt = "report context"
+        await vm.send()
+        await waitAsync("telemetry run completes") { vm.status == .completed }
+
+        let reloadedVM = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp,
+                                           coordinator: coordinator, threadRepo: threadRepo,
+                                           messageRepo: messageRepo)
+        reloadedVM.selectThread(streamedThread)
+
+        XCTAssertEqual(reloadedVM.contextHealthMessage, "Context 50% · 500 / 1000 tokens · auto-compacts · compacted",
+                       "reopening a thread after app restart must replay persisted token/compaction telemetry so long-run context pressure stays visible")
+    }
+
+    func test_realCodexAppServerAgentSurfaceSurvivesAppRestartAndRehydratesProviderHistory() async throws {
+        guard ProcessInfo.processInfo.environment["RC_REAL_CODEX_AGENT_APP_E2E"] == "1" else {
+            throw XCTSkip("Set RC_REAL_CODEX_AGENT_APP_E2E=1 to run the installed Codex app-server Agent App surface E2E.")
+        }
+        guard ProcessLocator.resolve("codex") != nil else {
+            throw XCTSkip("codex binary is not available on PATH")
+        }
+
+        let tmp = NSTemporaryDirectory() + "rc2-real-codex-agent-app-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let workspaceID = WorkspaceID()
+
+        let firstAdapter = CodexAppServerAdapter()
+        let firstCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            providerAdapters: [.codex: firstAdapter]
+        )
+        let firstSurface = AgentAppViewModel(workspaceID: workspaceID,
+                                             cwd: tmp,
+                                             coordinator: firstCoordinator,
+                                             threadRepo: threadRepo,
+                                             messageRepo: messageRepo)
+        firstSurface.createThread(title: "real codex")
+        firstSurface.provider = .codex
+        firstSurface.model = "gpt-5.5"
+        firstSurface.reasoningEffort = .minimal
+        firstSurface.permissionMode = .supervised
+        firstSurface.prompt = "Reply exactly RC_AGENT_APP_REAL_1 and nothing else."
+
+        await firstSurface.send()
+        await waitAsync("first real Codex app-server Agent App turn completes", timeout: 240) {
+            firstSurface.status == .completed
+        }
+
+        let threadId = try XCTUnwrap(firstSurface.selectedThreadId)
+        let providerThreadId = try XCTUnwrap(try threadRepo.get(id: threadId)?.providerThreadId)
+        XCTAssertTrue(firstSurface.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage && $0.body.contains("RC_AGENT_APP_REAL_1")
+        }, "the macOS Agent App surface must render the first real Codex app-server response")
+
+        firstAdapter.stopAll()
+
+        let secondAdapter = CodexAppServerAdapter()
+        let secondCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            providerAdapters: [.codex: secondAdapter]
+        )
+        let secondSurface = AgentAppViewModel(workspaceID: workspaceID,
+                                              cwd: tmp,
+                                              coordinator: secondCoordinator,
+                                              threadRepo: threadRepo,
+                                              messageRepo: messageRepo)
+        secondSurface.selectThread(threadId)
+        XCTAssertTrue(secondSurface.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage && $0.body.contains("RC_AGENT_APP_REAL_1")
+        }, "after app/coordinator restart, selecting the thread must recover provider history through Codex thread/read")
+
+        secondSurface.prompt = "Reply exactly RC_AGENT_APP_REAL_2 and nothing else."
+        await secondSurface.send()
+        await waitAsync("second real Codex app-server Agent App turn completes after restart", timeout: 240) {
+            secondSurface.status == .completed
+        }
+
+        let resumedThread = try XCTUnwrap(try threadRepo.get(id: threadId))
+        XCTAssertEqual(resumedThread.providerThreadId, providerThreadId,
+                       "the app restart follow-up must resume the same Codex app-server provider thread instead of forking a disconnected session")
+        XCTAssertTrue(secondSurface.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage && $0.body.contains("RC_AGENT_APP_REAL_2")
+        }, "the macOS Agent App surface must render the real Codex follow-up after restart")
+
+        secondAdapter.stopAll()
+
+        let readbackAdapter = CodexAppServerAdapter()
+        let readbackCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            providerAdapters: [.codex: readbackAdapter]
+        )
+        let readbackSurface = AgentAppViewModel(workspaceID: workspaceID,
+                                                cwd: tmp,
+                                                coordinator: readbackCoordinator,
+                                                threadRepo: threadRepo,
+                                                messageRepo: messageRepo)
+        readbackSurface.selectThread(threadId)
+        let renderedBodies = readbackSurface.timeline.turns.flatMap(\.items).map(\.body).joined(separator: "\n")
+        XCTAssertTrue(renderedBodies.contains("RC_AGENT_APP_REAL_1"))
+        XCTAssertTrue(renderedBodies.contains("RC_AGENT_APP_REAL_2"),
+                      "final app restart readback must prove both real Codex app-server turns remain visible in provider history")
+        readbackAdapter.stopAll()
+    }
+
+    func test_realCodexAppServerPlanModeSurfaceRendersAndImplementsProposedPlan() async throws {
+        guard ProcessInfo.processInfo.environment["RC_REAL_CODEX_AGENT_APP_E2E"] == "1" else {
+            throw XCTSkip("Set RC_REAL_CODEX_AGENT_APP_E2E=1 to run the installed Codex app-server Plan Mode surface E2E.")
+        }
+        guard ProcessLocator.resolve("codex") != nil else {
+            throw XCTSkip("codex binary is not available on PATH")
+        }
+
+        let tmp = NSTemporaryDirectory() + "rc2-real-codex-plan-surface-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        let sentinel = tmp + "/sentinel.txt"
+        try "RC_PLAN_SENTINEL_ORIGINAL\n".write(toFile: sentinel, atomically: true, encoding: .utf8)
+
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp + "-db").run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let workspaceID = WorkspaceID()
+
+        let adapter = CodexAppServerAdapter()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let surface = AgentAppViewModel(workspaceID: workspaceID,
+                                        cwd: tmp,
+                                        coordinator: coordinator,
+                                        threadRepo: threadRepo,
+                                        messageRepo: messageRepo)
+        surface.createThread(title: "real plan")
+        surface.provider = .codex
+        surface.model = "gpt-5.5"
+        surface.reasoningEffort = .minimal
+        surface.permissionMode = .supervised
+        surface.showPlanSidebar = true
+        surface.prompt = """
+        Create a proposed implementation plan only. Do not edit files.
+        The plan must include this exact marker: RC_AGENT_APP_PLAN_SURFACE.
+        The plan must include one implementation step that says to reply exactly RC_AGENT_APP_PLAN_IMPLEMENTED.
+        """
+
+        await surface.send()
+        await waitAsync("real Codex Plan Mode surface completes", timeout: 240) {
+            surface.status == .completed
+        }
+        let threadId = try XCTUnwrap(surface.selectedThreadId)
+        await waitAsync("real Codex Plan Mode proposed plan is rendered", timeout: 20) {
+            (surface.latestPlanText ?? "").contains("RC_AGENT_APP_PLAN_SURFACE")
+        }
+
+        XCTAssertEqual(try String(contentsOfFile: sentinel), "RC_PLAN_SENTINEL_ORIGINAL\n",
+                       "Plan Mode through the macOS Agent App surface must not mutate workspace files")
+        let providerThreadId = try XCTUnwrap(try threadRepo.get(id: threadId)?.providerThreadId)
+        let proposedPlan = try XCTUnwrap(surface.latestProposedPlan,
+                                         "the rendered plan card must be backed by a first-class proposed-plan artifact")
+        XCTAssertTrue(proposedPlan.markdown.contains("RC_AGENT_APP_PLAN_SURFACE"))
+
+        surface.showPlanSidebar = false
+        await surface.implementLatestPlan()
+        await waitAsync("real Codex proposed plan implementation completes", timeout: 240) {
+            surface.status == .completed
+        }
+
+        let resumedThread = try XCTUnwrap(try threadRepo.get(id: threadId))
+        XCTAssertEqual(resumedThread.providerThreadId, providerThreadId,
+                       "implementing a rendered proposed-plan card must continue the same provider thread")
+        let renderedText = surface.timeline.turns.flatMap(\.items).map(\.body).joined(separator: "\n")
+        XCTAssertTrue(renderedText.contains("RC_AGENT_APP_PLAN_IMPLEMENTED") ||
+                      (surface.messages.last?.content.contains("RC_AGENT_APP_PLAN_IMPLEMENTED") ?? false),
+                      "the rendered proposed-plan card action must run through the real Codex app-server surface end-to-end")
+        XCTAssertTrue(surface.timeline.proposedPlans.contains {
+            $0.id == proposedPlan.id && $0.implementedAtMs != nil
+        }, "acting on the proposed-plan card must mark the plan as implemented in the visible surface state")
+        adapter.stopAll()
+    }
+
+    func test_realCodexAppServerTokenUsageSurfaceSurvivesReload() async throws {
+        guard ProcessInfo.processInfo.environment["RC_REAL_CODEX_AGENT_APP_E2E"] == "1" else {
+            throw XCTSkip("Set RC_REAL_CODEX_AGENT_APP_E2E=1 to run the installed Codex app-server token telemetry E2E.")
+        }
+        guard ProcessLocator.resolve("codex") != nil else {
+            throw XCTSkip("codex binary is not available on PATH")
+        }
+
+        let tmp = NSTemporaryDirectory() + "rc2-real-codex-token-usage-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let workspaceID = WorkspaceID()
+
+        let adapter = CodexAppServerAdapter()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let surface = AgentAppViewModel(workspaceID: workspaceID,
+                                        cwd: tmp,
+                                        coordinator: coordinator,
+                                        threadRepo: threadRepo,
+                                        messageRepo: messageRepo)
+        surface.createThread(title: "real token usage")
+        surface.provider = .codex
+        surface.model = "gpt-5.5"
+        surface.reasoningEffort = .minimal
+        surface.permissionMode = .supervised
+        surface.prompt = "Reply exactly RC_AGENT_APP_TOKEN_USAGE and nothing else."
+
+        await surface.send()
+        await waitAsync("real Codex token-usage turn completes", timeout: 240) {
+            surface.status == .completed
+        }
+        let threadId = try XCTUnwrap(surface.selectedThreadId)
+        await waitAsync("real Codex token usage reaches Agent App surface", timeout: 20) {
+            surface.contextHealthMessage?.contains("Context ") == true &&
+            surface.contextHealthMessage?.contains("tokens") == true
+        }
+        let liveContext = try XCTUnwrap(surface.contextHealthMessage)
+        XCTAssertTrue(liveContext.contains("/"),
+                      "real Codex app-server token usage must include used/context-window counts, not just a generic activity flag")
+        XCTAssertTrue(liveContext.contains("auto-compacts"),
+                      "real Codex app-server token usage must surface automatic compaction capability so long-run context pressure is not mistaken for a hard stop")
+        adapter.stopAll()
+
+        let reloadedCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            providerAdapters: [.codex: CodexAppServerAdapter()]
+        )
+        let reloadedSurface = AgentAppViewModel(workspaceID: workspaceID,
+                                                cwd: tmp,
+                                                coordinator: reloadedCoordinator,
+                                                threadRepo: threadRepo,
+                                                messageRepo: messageRepo)
+        reloadedSurface.selectThread(threadId)
+
+        XCTAssertEqual(reloadedSurface.contextHealthMessage, liveContext,
+                       "reloading a real Codex app-server Agent App thread must replay persisted token usage so long-run context pressure stays visible")
+    }
+
+    func test_realCodexAppServerCheckpointRevertSurfaceRollsBackWorkspaceAndProviderAfterRestart() async throws {
+        guard ProcessInfo.processInfo.environment["RC_REAL_CODEX_AGENT_APP_E2E"] == "1" else {
+            throw XCTSkip("Set RC_REAL_CODEX_AGENT_APP_E2E=1 to run the installed Codex app-server checkpoint/revert E2E.")
+        }
+        guard ProcessLocator.resolve("codex") != nil else {
+            throw XCTSkip("codex binary is not available on PATH")
+        }
+
+        let repoDir = NSTemporaryDirectory() + "rc2-real-codex-checkpoint-repo-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: repoDir, withIntermediateDirectories: true)
+        try "BASE\n".write(toFile: repoDir + "/tracked.txt", atomically: true, encoding: .utf8)
+        try runGit(["init"], cwd: repoDir)
+        try runGit(["config", "user.email", "remotecode@example.test"], cwd: repoDir)
+        try runGit(["config", "user.name", "RemoteCode Test"], cwd: repoDir)
+        try runGit(["add", "tracked.txt"], cwd: repoDir)
+        try runGit(["commit", "-m", "base"], cwd: repoDir)
+
+        let appSupport = NSTemporaryDirectory() + "rc2-real-codex-checkpoint-db-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let workspaceID = WorkspaceID()
+
+        let adapter = CodexAppServerAdapter()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            checkpointRepo: checkpointRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let surface = AgentAppViewModel(workspaceID: workspaceID,
+                                        cwd: repoDir,
+                                        coordinator: coordinator,
+                                        threadRepo: threadRepo,
+                                        messageRepo: messageRepo)
+        surface.createThread(title: "real checkpoint")
+        surface.provider = .codex
+        surface.model = "gpt-5.5"
+        surface.reasoningEffort = .minimal
+        surface.permissionMode = .fullAccess
+
+        surface.prompt = """
+        Use shell to run:
+        python3 - <<'PY'
+        open('tracked.txt','w').write('RC_AGENT_APP_CHECKPOINT_ONE\\n')
+        PY
+        Then reply exactly RC_AGENT_APP_CHECKPOINT_ONE.
+        """
+        await surface.send()
+        await waitAsync("first real checkpoint mutation completes", timeout: 240) {
+            surface.status == .completed
+        }
+        let threadId = try XCTUnwrap(surface.selectedThreadId)
+        await waitAsync("first checkpoint is captured", timeout: 20) {
+            ((try? checkpointRepo.list(threadId: threadId)) ?? []).count >= 1
+        }
+
+        surface.prompt = """
+        Use shell to run:
+        python3 - <<'PY'
+        open('tracked.txt','w').write('RC_AGENT_APP_CHECKPOINT_TWO\\n')
+        open('new.txt','w').write('RC_AGENT_APP_CHECKPOINT_TWO\\n')
+        PY
+        Then reply exactly RC_AGENT_APP_CHECKPOINT_TWO.
+        """
+        await surface.send()
+        await waitAsync("second real checkpoint mutation completes", timeout: 240) {
+            surface.status == .completed
+        }
+        await waitAsync("second checkpoint is captured", timeout: 20) {
+            ((try? checkpointRepo.list(threadId: threadId)) ?? []).count >= 2
+        }
+        XCTAssertEqual(try String(contentsOfFile: repoDir + "/tracked.txt"), "RC_AGENT_APP_CHECKPOINT_TWO\n")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: repoDir + "/new.txt"))
+        adapter.stopAll()
+
+        let restartedAdapter = CodexAppServerAdapter()
+        let restartedCoordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: providerSessionRepo,
+            checkpointRepo: checkpointRepo,
+            providerAdapters: [.codex: restartedAdapter]
+        )
+        _ = try restartedCoordinator.revertThreadToCheckpoint(threadId: threadId, checkpointTurnCount: 1, cwd: repoDir)
+
+        XCTAssertEqual(try String(contentsOfFile: repoDir + "/tracked.txt"), "RC_AGENT_APP_CHECKPOINT_ONE\n",
+                       "checkpoint revert after app restart must restore the workspace to the selected real Codex turn")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repoDir + "/new.txt"),
+                       "checkpoint revert must remove files introduced after the selected real Codex turn")
+        let readback = try restartedCoordinator.readThread(threadId: threadId)
+        let readbackText = readback.map { String(describing: $0) }.joined(separator: "\n")
+        XCTAssertTrue(readbackText.contains("RC_AGENT_APP_CHECKPOINT_ONE"))
+        XCTAssertFalse(readbackText.contains("RC_AGENT_APP_CHECKPOINT_TWO"),
+                       "provider rollback after app restart must prune newer real Codex turns from provider history")
+        restartedAdapter.stopAll()
+    }
+
+    func test_selectThreadRehydratesPersistedProposedPlansIntoPlanSidebar() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-rehydrate-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "plan", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")
+        )
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   proposedPlanRepo: proposedPlanRepo)
+
+        vm.selectThread(thread.id)
+
+        XCTAssertEqual(vm.timeline.proposedPlans.map(\.id), ["plan-1"])
+        XCTAssertEqual(vm.latestPlanText, "1. Inspect\n2. Patch",
+                       "proposed plans must rehydrate into the Agent App plan sidebar after restart/reload")
+    }
+
+    func test_selectThreadRehydratesCheckpointsAndFileDiffPreview() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-checkpoint-browser-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "checkpoint", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let runId = AgentRunID()
+        try runRepo.upsert(AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed))
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: runId,
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:test:turn-1",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "Sources/App.swift", kind: "modified", additions: 2, deletions: 1)],
+            diffPatch: "diff --git a/Sources/App.swift b/Sources/App.swift\n+visible checkpoint",
+            fileDiffs: [AgentTurnCheckpointFileDiff(path: "Sources/App.swift", patch: "@@ file diff\n+visible file checkpoint")]
+        ))
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   checkpointRepo: checkpointRepo)
+
+        vm.selectThread(thread.id)
+
+        XCTAssertEqual(vm.checkpoints.map(\.checkpointTurnCount), [1])
+        XCTAssertTrue(vm.checkpointDiffPreview.contains("visible checkpoint"),
+                      "selecting a thread must hydrate the checkpoint browser with a readable all-files diff")
+        let checkpoint = try XCTUnwrap(vm.checkpoints.first)
+        vm.selectCheckpoint(checkpoint, path: "Sources/App.swift")
+        XCTAssertTrue(vm.checkpointDiffPreview.contains("visible file checkpoint"),
+                      "the checkpoint browser must let users inspect the file-level diff before choosing rollback")
+    }
+
+    func test_implementLatestPlanStartsRunAndMarksPlanTraceability() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-implement-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "plan", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")
+        )
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   proposedPlanRepo: proposedPlanRepo)
+        vm.selectThread(thread.id)
+
+        await vm.implementLatestPlan()
+
+        let messages = try messageRepo.list(threadId: thread.id)
+        XCTAssertTrue(messages.contains {
+            $0.role == .user && $0.content.contains("Implement this proposed plan now") && $0.content.contains("1. Inspect")
+        }, "implementing a plan must submit a concrete implementation prompt, not just toggle UI state")
+        let storedPlan = try XCTUnwrap(proposedPlanRepo.list(threadId: thread.id).first { $0.plan.id == "plan-1" })
+        XCTAssertEqual(storedPlan.implementationThreadId, thread.id,
+                       "the source plan must keep a link to the thread that implements it")
+        XCTAssertNotNil(storedPlan.plan.implementedAtMs,
+                        "implemented plans must be marked so repeat actions are traceable")
+    }
+
+    func test_saveLatestProposedPlanWritesMarkdownFile() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-save-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "plan", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let markdown = "# Fix Agent Freeze\n\n1. Inspect\n2. Patch"
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: markdown)
+        )
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID,
+                                   cwd: tmp,
+                                   coordinator: coordinator,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   proposedPlanRepo: proposedPlanRepo)
+        vm.selectThread(thread.id)
+
+        let url = URL(fileURLWithPath: tmp).appendingPathComponent(vm.latestProposedPlan!.exportFileName)
+        try vm.saveLatestProposedPlan(to: url)
+
+        XCTAssertEqual(try String(contentsOf: url), markdown,
+                       "saving a proposed plan must write the exact markdown artifact, not a truncated sidebar preview")
     }
 
     /// Regression: the VM defaulted to "gpt-5" — a dead id on codex
@@ -818,6 +2276,24 @@ private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {
     }
 }
 
+private final class FailingCallbackRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        throw AgentProviderAdapterError.unsupported("dead approval callback")
+    }
+
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        throw AgentProviderAdapterError.unsupported("dead user-input callback")
+    }
+}
+
 private final class HoldOpenStreamRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider = .codex
 
@@ -839,6 +2315,224 @@ private final class HoldOpenStreamRunner: AgentProviderRunner, @unchecked Sendab
             onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "partial stream final")))
             onEvent(.status(.completed))
             onEvent(.finished(.completed, finalMessage: "partial stream final", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class LongRunStreamRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    let turns: Int
+    let runtimeEvents: Int
+
+    init(turns: Int, runtimeEvents: Int) {
+        self.turns = turns
+        self.runtimeEvents = runtimeEvents
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        let turns = self.turns
+        let runtimeEvents = self.runtimeEvents
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let startedAt = Int64(Date().timeIntervalSince1970 * 1000)
+            onEvent(.status(.running))
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            for index in 0..<turns {
+                let turnId = "long-turn-\(index)"
+                let itemId = "long-item-\(index)"
+                onEvent(.event(.turnStarted(turnId: turnId)))
+                onEvent(.event(.itemStarted(item: AssistantItem(
+                    id: itemId,
+                    turnId: turnId,
+                    type: .commandExecution,
+                    summary: "stress command \(index)",
+                    startedAtMs: startedAt + Int64(index)
+                ))))
+                onEvent(.event(.itemProgress(itemId: itemId, progress: Double(index + 1) / Double(max(turns, 1)))))
+                onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: "ok \(index)\n", summary: nil)))
+                onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+                onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "LONG_ASSISTANT_\(index)")))
+            }
+            for index in 0..<runtimeEvents {
+                onEvent(.event(.providerRuntime(ProviderRuntimeEvent(
+                    id: "runtime-\(index)",
+                    provider: .codex,
+                    source: "long-run-test",
+                    method: "stress.event",
+                    providerTurnId: "long-turn-\(min(index, max(turns - 1, 0)))",
+                    payloadJSON: "{\"index\":\(index)}",
+                    receivedAtMs: startedAt + Int64(index)
+                ))))
+            }
+            onEvent(.event(.tokenUsage(AssistantTokenUsage(
+                inputTokens: 300_000,
+                outputTokens: 20_000,
+                totalTokens: 320_000,
+                contextWindow: 400_000
+            ))))
+            onEvent(.event(.contextCompaction(summary: "long-run history compacted")))
+            onEvent(.status(.completed))
+            onEvent(.finished(.completed, finalMessage: "LONG_ASSISTANT_\(max(turns - 1, 0))", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class ContextTelemetryRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let turnId = "context-turn"
+            onEvent(.status(.running))
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: turnId)))
+            onEvent(.event(.tokenUsage(AssistantTokenUsage(
+                inputTokens: 400,
+                outputTokens: 100,
+                totalTokens: 500,
+                contextWindow: 1_000,
+                compactsAutomatically: true
+            ))))
+            onEvent(.event(.contextCompaction(summary: "older turns summarized")))
+            onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "context ready")))
+            onEvent(.status(.completed))
+            onEvent(.finished(.completed, finalMessage: "context ready", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class ImmediateStreamRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        let turnId = UUID().uuidString
+        let itemId = UUID().uuidString
+        let providerThreadId = request.providerThreadId ?? UUID().uuidString
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        onEvent(.status(.running))
+        onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+        onEvent(.event(.turnStarted(turnId: turnId)))
+        onEvent(.event(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, startedAtMs: now))))
+        onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: "partial stream", outputAppend: nil, summary: nil)))
+        onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+        onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "partial stream final")))
+        onEvent(.status(.completed))
+        onEvent(.finished(.completed, finalMessage: "partial stream final", providerThreadId: providerThreadId))
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class CapturingProviderAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    let readEvents: [AssistantEvent]
+    private let lock = NSLock()
+    private var _lastUserInputResponse: (threadId: AgentThreadID, requestId: String, text: String)?
+
+    var lastUserInputResponse: (threadId: AgentThreadID, requestId: String, text: String)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastUserInputResponse
+    }
+
+    init(provider: AgentProvider, readEvents: [AssistantEvent] = []) {
+        self.provider = provider
+        self.readEvents = readEvents
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        lock.lock()
+        _lastUserInputResponse = (threadId, requestId, text)
+        lock.unlock()
+    }
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { true }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { readEvents }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class CapturingProviderRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var _prompts: [String] = []
+    private var _interactionModes: [AgentInteractionMode] = []
+    private var _attachments: [[AgentAttachment]] = []
+    private var _providerInstanceIds: [String?] = []
+    private var _providerBinaries: [String?] = []
+    private var _environments: [[String: String]] = []
+    private var _requestProviderThreadIds: [String?] = []
+
+    var prompts: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _prompts
+    }
+    var interactionModes: [AgentInteractionMode] {
+        lock.lock(); defer { lock.unlock() }
+        return _interactionModes
+    }
+    var attachments: [[AgentAttachment]] {
+        lock.lock(); defer { lock.unlock() }
+        return _attachments
+    }
+    var providerInstanceIds: [String?] {
+        lock.lock(); defer { lock.unlock() }
+        return _providerInstanceIds
+    }
+    var providerBinaries: [String?] {
+        lock.lock(); defer { lock.unlock() }
+        return _providerBinaries
+    }
+    var environments: [[String: String]] {
+        lock.lock(); defer { lock.unlock() }
+        return _environments
+    }
+    var requestProviderThreadIds: [String?] {
+        lock.lock(); defer { lock.unlock() }
+        return _requestProviderThreadIds
+    }
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    func listModels() async -> [AgentModelDescriptor] {
+        [AgentModelDescriptor(id: "capture-model", label: "Capture Model", provider: provider)]
+    }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        lock.lock()
+        _prompts.append(request.prompt)
+        _interactionModes.append(request.interactionMode)
+        _attachments.append(request.attachments)
+        _providerInstanceIds.append(request.providerInstanceId)
+        _providerBinaries.append(request.providerBinary)
+        _environments.append(request.environment)
+        _requestProviderThreadIds.append(request.providerThreadId)
+        lock.unlock()
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            onEvent(.status(.completed))
+            onEvent(.finished(.completed, finalMessage: nil, providerThreadId: providerThreadId))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }

@@ -10,6 +10,10 @@ final class PersistenceTests: XCTestCase {
         let (rep, db) = try bs.run()
         XCTAssertTrue(rep.firstRun)
         XCTAssertEqual(rep.schemaVersion, Schema.currentVersion)
+        let schemaStmt = try db.prepare("SELECT MAX(version) FROM schema_meta;")
+        XCTAssertTrue(try schemaStmt.step())
+        XCTAssertEqual(Int(schemaStmt.columnInt64(0)), Schema.currentVersion,
+                       "bootstrap must report the same schema version that migration actually records, otherwise restart diagnostics can lie about persistence shape")
         // touchedPaths only inside tmp
         for path in rep.touchedPaths {
             XCTAssertTrue(path.hasPrefix(tmp), "touched path \(path) escapes \(tmp)")
@@ -45,11 +49,35 @@ final class PersistenceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: tmp) }
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let tr = AgentThreadRepository(db: db)
-        let t = AgentThread(workspaceId: WorkspaceID(), title: "demo", provider: .codex, model: "gpt-5")
+        var t = AgentThread(workspaceId: WorkspaceID(), title: "demo", provider: .codex, model: "gpt-5")
+        t.providerInstanceId = "codex-personal"
+        t.executionMode = .worktree
+        t.baseBranch = "main"
+        t.worktreePath = "/tmp/rc-agent-worktree"
+        t.serviceTier = .fast
+        t.modelSelection = AgentModelSelection(provider: .codex,
+                                               modelId: "",
+                                               customModelId: "gpt-5.5-experimental",
+                                               reasoningEffort: .xhigh,
+                                               serviceTier: .fast)
         try tr.upsert(t)
         let list = try tr.list()
         XCTAssertEqual(list.count, 1)
         XCTAssertEqual(list[0].title, "demo")
+        XCTAssertEqual(list[0].providerInstanceId, "codex-personal",
+                       "provider instance id must persist on threads so future personal/work providers cannot mix continuation state")
+        XCTAssertEqual(list[0].executionMode, .worktree,
+                       "agent thread execution mode must persist so first-send worktree routing survives app restart")
+        XCTAssertEqual(list[0].baseBranch, "main")
+        XCTAssertEqual(list[0].worktreePath, "/tmp/rc-agent-worktree")
+        XCTAssertEqual(list[0].serviceTier, .fast,
+                       "agent service tier must persist so Codex fast mode survives app restart")
+        XCTAssertEqual(list[0].modelSelection.modelId, "")
+        XCTAssertEqual(list[0].modelSelection.customModelId, "gpt-5.5-experimental")
+        XCTAssertEqual(list[0].modelSelection.effectiveModel, "gpt-5.5-experimental",
+                       "custom model selection must persist as structured data so restart does not flatten it into a loose model string")
+        XCTAssertEqual(list[0].modelSelection.reasoningEffort, .xhigh)
+        XCTAssertEqual(list[0].modelSelection.serviceTier, .fast)
 
         let mr = AgentMessageRepository(db: db)
         try mr.append(AgentMessage(threadId: t.id, role: .user, content: "hi"))
@@ -57,6 +85,12 @@ final class PersistenceTests: XCTestCase {
         let msgs = try mr.list(threadId: t.id)
         XCTAssertEqual(msgs.count, 2)
         XCTAssertEqual(msgs[0].role, .user)
+
+        let runs = AgentRunRepository(db: db)
+        let run = AgentRun(threadId: t.id, provider: .codex, providerInstanceId: "codex-personal", model: "gpt-5", status: .running)
+        try runs.upsert(run)
+        XCTAssertEqual(try runs.get(id: run.id)?.providerInstanceId, "codex-personal",
+                       "provider instance id must persist on runs so recovery/debugging can identify the exact provider identity used")
     }
 
     func test_snapshot_roundtrip() throws {
@@ -89,6 +123,197 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+    func test_providerSessionRuntime_roundtripsRecoveryStateAcrossBootstrapRestart() throws {
+        let tmp = NSTemporaryDirectory() + "RC2ProviderSession-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let threadId: AgentThreadID
+        do {
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threads = AgentThreadRepository(db: db)
+            let thread = AgentThread(title: "resume", provider: .codex, model: "gpt-5.5")
+            threadId = thread.id
+            try threads.upsert(thread)
+            try ProviderSessionRuntimeRepository(db: db).upsert(ProviderSessionRuntime(
+                threadId: thread.id,
+                provider: .codex,
+                providerInstanceId: "default",
+                adapterKey: "CodexSessionRuntime",
+                binaryIdentity: "codex:/opt/homebrew/bin/codex",
+                status: .completed,
+                resumeCursor: "codex-thread-1",
+                cwd: "/tmp/remote-code",
+                model: "gpt-5.5",
+                serviceTier: .fast,
+                runtimeMode: .autoAcceptEdits,
+                lastEventKind: "turn.completed",
+                runtimePayloadJSON: #"{"turnCount":1}"#
+            ))
+        }
+
+        let (_, reopened) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let repo = ProviderSessionRuntimeRepository(db: reopened)
+        let session = try XCTUnwrap(try repo.get(threadId: threadId))
+        XCTAssertEqual(session.resumeCursor, "codex-thread-1",
+                       "provider resume cursor must survive app restart so long-running agent sessions can continue")
+        XCTAssertEqual(session.cwd, "/tmp/remote-code")
+        XCTAssertEqual(session.model, "gpt-5.5")
+        XCTAssertEqual(session.serviceTier, .fast)
+        XCTAssertEqual(session.runtimeMode, .autoAcceptEdits)
+        XCTAssertEqual(session.adapterKey, "CodexSessionRuntime")
+        XCTAssertEqual(session.binaryIdentity, "codex:/opt/homebrew/bin/codex")
+        XCTAssertEqual(session.lastEventKind, "turn.completed")
+        XCTAssertEqual(session.runtimePayloadJSON, #"{"turnCount":1}"#,
+                       "provider runtime payload must survive app restart so exact provider resume metadata is not reduced to diagnostics")
+        XCTAssertEqual(try repo.recoveryState(threadId: threadId), .recoverable(session),
+                       "completed sessions with a resume cursor must be classified as recoverable, not silently lost")
+    }
+
+    func test_proposedPlan_roundtripsIndependentlyFromMessagesAcrossBootstrapRestart() throws {
+        let tmp = NSTemporaryDirectory() + "RC2ProposedPlan-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let threadId: AgentThreadID
+        do {
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let thread = AgentThread(title: "plan", provider: .claude, model: "sonnet")
+            threadId = thread.id
+            try AgentThreadRepository(db: db).upsert(thread)
+            try AgentMessageRepository(db: db).append(AgentMessage(threadId: thread.id, role: .assistant, content: "normal assistant text"))
+            try AgentProposedPlanRepository(db: db).upsert(
+                threadId: thread.id,
+                plan: AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")
+            )
+        }
+
+        let (_, reopened) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let plans = try AgentProposedPlanRepository(db: reopened).list(threadId: threadId)
+        let messages = try AgentMessageRepository(db: reopened).list(threadId: threadId)
+
+        XCTAssertEqual(plans.map(\.plan.markdown), ["1. Inspect\n2. Patch"],
+                       "proposed plans must survive restart as structured artifacts, not only as assistant chat text")
+        XCTAssertEqual(messages.map(\.content), ["normal assistant text"],
+                       "plan artifacts must stay separate from normal assistant messages")
+    }
+
+    func test_turnCheckpoint_roundtripsFilesAndProviderTurnCountAcrossBootstrapRestart() throws {
+        let tmp = NSTemporaryDirectory() + "RC2TurnCheckpoint-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let threadId: AgentThreadID
+        do {
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let thread = AgentThread(title: "checkpoint", provider: .codex, model: "gpt-5.5")
+            threadId = thread.id
+            let runId = AgentRunID()
+            try AgentThreadRepository(db: db).upsert(thread)
+            try AgentRunRepository(db: db).upsert(AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed))
+            try AgentTurnCheckpointRepository(db: db).upsert(AgentTurnCheckpointSummary(
+                threadId: thread.id,
+                runId: runId,
+                turnId: "turn-1",
+                checkpointTurnCount: 1,
+                checkpointRef: "local-diff:\(runId.value.uuidString):turn-1",
+                status: .ready,
+                files: [AgentTurnCheckpointFile(path: "Sources/App.swift", kind: "modified", additions: 3, deletions: 1)]
+            ))
+        }
+
+        let (_, reopened) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let checkpoints = try AgentTurnCheckpointRepository(db: reopened).list(threadId: threadId)
+
+        XCTAssertEqual(checkpoints.count, 1)
+        XCTAssertEqual(checkpoints[0].turnId, "turn-1")
+        XCTAssertEqual(checkpoints[0].checkpointTurnCount, 1,
+                       "checkpoint turn count must survive restart so provider turns can be matched to workspace checkpoints")
+        XCTAssertEqual(checkpoints[0].status, .ready)
+        XCTAssertEqual(checkpoints[0].files, [AgentTurnCheckpointFile(path: "Sources/App.swift", kind: "modified", additions: 3, deletions: 1)],
+                       "checkpoint file summaries must survive as structured data, not only as display text")
+    }
+
+    func test_turnCheckpointCorruptionFailsLoudInsteadOfDroppingSnapshotData() throws {
+        let tmp = NSTemporaryDirectory() + "RC2TurnCheckpointCorrupt-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "checkpoint corrupt", provider: .codex, model: "gpt-5.5")
+        let runId = AgentRunID()
+        try AgentThreadRepository(db: db).upsert(thread)
+        try AgentRunRepository(db: db).upsert(AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed))
+        try AgentTurnCheckpointRepository(db: db).upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: runId,
+            turnId: "turn-corrupt",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:\(runId.value.uuidString):turn-corrupt",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "Sources/App.swift", kind: "modified", additions: 3, deletions: 1)]
+        ))
+        try db.execute("UPDATE agent_turn_checkpoints SET file_snapshots_json = '{broken json' WHERE turn_id = 'turn-corrupt';")
+
+        XCTAssertThrowsError(try AgentTurnCheckpointRepository(db: db).list(threadId: thread.id),
+                             "corrupt checkpoint snapshot JSON must fail loud instead of silently producing an empty restore set") { error in
+            XCTAssertTrue(String(describing: error).contains("Corrupt agent checkpoint"))
+        }
+    }
+
+    func test_commandReceipt_roundtripsAcrossBootstrapRestart() throws {
+        let tmp = NSTemporaryDirectory() + "RC2CommandReceipt-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        do {
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            try CommandReceiptRepository(db: db).record(
+                method: "agent.message.send",
+                clientRequestId: "mobile-send-1",
+                resultJSON: #"{"run_id":"run-1"}"#
+            )
+        }
+
+        let (_, reopened) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        XCTAssertEqual(
+            try CommandReceiptRepository(db: reopened).get(method: "agent.message.send", clientRequestId: "mobile-send-1"),
+            #"{"run_id":"run-1"}"#,
+            "agent command receipts must survive app restart so mobile retries cannot duplicate long-running provider turns"
+        )
+    }
+
+    func test_providerPendingCallbacks_roundtripResolveAndStaleAcrossRestart() throws {
+        let tmp = NSTemporaryDirectory() + "RC2PendingCallbacks-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let threadId: AgentThreadID
+        do {
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let thread = AgentThread(title: "callbacks", provider: .codex, model: "gpt-5.5")
+            threadId = thread.id
+            try AgentThreadRepository(db: db).upsert(thread)
+            let repo = ProviderPendingCallbackRepository(db: db)
+            try repo.record(threadId: thread.id, request: AssistantPendingRequest(
+                id: "approval-1",
+                turnId: "turn-1",
+                kind: .commandExecution,
+                title: "Run command",
+                detail: "swift test",
+                createdAtMs: 1_000
+            ))
+            try repo.record(threadId: thread.id, userInput: AssistantUserInputRequest(
+                id: "question-1",
+                turnId: "turn-1",
+                prompt: "Continue?",
+                options: ["Plan", "Run"],
+                createdAtMs: 2_000
+            ))
+            try repo.resolve(threadId: thread.id, requestId: "approval-1", kind: .approval, state: .approved)
+        }
+
+        let (_, reopened) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let repo = ProviderPendingCallbackRepository(db: reopened)
+        let approval = try XCTUnwrap(try repo.get(threadId: threadId, requestId: "approval-1", kind: .approval))
+        XCTAssertEqual(approval.state, .approved,
+                       "approval callback decisions must persist so retry/reload does not resurrect a resolved approval")
+        let staleCount = try repo.markOpenStale(reason: "Provider callback state does not survive app restart.")
+        let question = try XCTUnwrap(try repo.get(threadId: threadId, requestId: "question-1", kind: .userInput))
+        XCTAssertEqual(staleCount, 1)
+        XCTAssertEqual(question.state, .stale,
+                       "open provider questions must become explicitly stale after restart instead of leaving dead UI")
+        XCTAssertEqual(question.staleReason, "Provider callback state does not survive app restart.")
+    }
+
     func test_streamEventReplayIncludesEveryRunForThread() throws {
         let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }
@@ -113,6 +338,149 @@ final class PersistenceTests: XCTestCase {
             .error(message: "first update", recoverable: false),
             .turnStarted(turnId: "second")
         ], "reopening or following up must replay every persisted run event, not only the latest response")
+    }
+
+    func test_streamEventReplayLimitKeepsNewestEventsInChronologicalOrder() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threads = AgentThreadRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "bounded history", provider: .codex, model: "m")
+        try threads.upsert(thread)
+
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 1))
+        try runs.upsert(run)
+        for index in 0..<650 {
+            try runs.appendStreamEvent(
+                runId: run.id,
+                seq: index + 1,
+                kind: "turnStarted(turn-\(index))",
+                payloadJSON: #"{"turnStarted":{"turnId":"turn-\#(index)"}}"#
+            )
+        }
+
+        let replayed = try runs.listLatestStreamEvents(threadId: thread.id, limit: 500)
+
+        XCTAssertEqual(replayed.count, 500)
+        XCTAssertEqual(replayed.first, .turnStarted(turnId: "turn-150"),
+                       "long Agent App reload must drop the oldest persisted provider events, not the newest output")
+        XCTAssertEqual(replayed.last, .turnStarted(turnId: "turn-649"),
+                       "bounded replay must keep the newest provider event visible after restart")
+    }
+
+    func test_streamEventPruneKeepsNewestEventsAcrossRuns() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threads = AgentThreadRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "retention", provider: .codex, model: "m")
+        try threads.upsert(thread)
+
+        let firstRun = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 1))
+        let secondRun = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 2))
+        try runs.upsert(firstRun)
+        try runs.upsert(secondRun)
+        for index in 0..<8 {
+            try runs.appendStreamEvent(
+                runId: firstRun.id,
+                seq: index + 1,
+                kind: "turnStarted(first-\(index))",
+                payloadJSON: #"{"turnStarted":{"turnId":"first-\#(index)"}}"#
+            )
+        }
+        for index in 0..<8 {
+            try runs.appendStreamEvent(
+                runId: secondRun.id,
+                seq: index + 1,
+                kind: "turnStarted(second-\(index))",
+                payloadJSON: #"{"turnStarted":{"turnId":"second-\#(index)"}}"#
+            )
+        }
+
+        try runs.pruneStreamEvents(threadId: thread.id, keepLatest: 10)
+        let replayed = try runs.listLatestStreamEvents(threadId: thread.id, limit: 20)
+
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), 10,
+                       "long provider streams must not grow persisted event rows without a retention cap")
+        XCTAssertEqual(replayed.first, .turnStarted(turnId: "first-6"),
+                       "retention pruning must remove oldest events across runs, not only trim the latest run")
+        XCTAssertEqual(replayed.last, .turnStarted(turnId: "second-7"),
+                       "retention pruning must keep newest provider output for restart replay")
+    }
+
+    func test_providerEventLogSurvivesBoundedStreamEventPruning() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threads = AgentThreadRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "provider logs", provider: .codex, model: "m")
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 1))
+        try threads.upsert(thread)
+        try runs.upsert(run)
+
+        for index in 0..<20 {
+            let runtime = ProviderRuntimeEvent(
+                id: "runtime-\(index)",
+                provider: .codex,
+                source: "codex.app-server",
+                method: "item/completed",
+                providerTurnId: "turn-\(index)",
+                providerItemId: "item-\(index)",
+                providerRequestId: nil,
+                payloadJSON: #"{"type":"item/completed","index":\#(index)}"#,
+                receivedAtMs: Int64(index)
+            )
+            try runs.appendStreamEvent(
+                runId: run.id,
+                seq: index + 1,
+                kind: "providerRuntime(\(runtime.method))",
+                payloadJSON: String(data: try JSONEncoder().encode(AssistantEvent.providerRuntime(runtime)), encoding: .utf8)!
+            )
+            try runs.appendProviderEventLog(threadId: thread.id, runId: run.id, event: runtime)
+        }
+
+        try runs.pruneStreamEvents(threadId: thread.id, keepLatest: 5)
+
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), 5,
+                       "UI replay stream events should stay bounded for long Agent App sessions")
+        XCTAssertEqual(try runs.countProviderEventLogs(threadId: thread.id), 20,
+                       "native provider event logs must survive stream replay pruning so transport diagnostics are not lost")
+        let latest = try runs.listLatestProviderEventLogs(threadId: thread.id, limit: 3)
+        XCTAssertEqual(latest.map(\.id), ["runtime-17", "runtime-18", "runtime-19"])
+        XCTAssertEqual(latest.last?.providerItemId, "item-19",
+                       "provider log replay must retain native item/request refs for later debugging")
+    }
+
+    func test_providerEventLogCorruptionFailsLoudInsteadOfSkippingNativeEvidence() throws {
+        let tmp = NSTemporaryDirectory() + "RC2ProviderLogCorrupt-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threads = AgentThreadRepository(db: db)
+        let runs = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "provider logs corrupt", provider: .codex, model: "m")
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m", startedAt: Date(timeIntervalSince1970: 1))
+        try threads.upsert(thread)
+        try runs.upsert(run)
+        try runs.appendProviderEventLog(threadId: thread.id, runId: run.id, event: ProviderRuntimeEvent(
+            id: "runtime-corrupt",
+            provider: .codex,
+            source: "codex.app-server",
+            method: "item/completed",
+            providerTurnId: "turn-corrupt",
+            providerItemId: "item-corrupt",
+            providerRequestId: nil,
+            payloadJSON: #"{"type":"item/completed"}"#,
+            receivedAtMs: 1
+        ))
+        try db.execute("UPDATE agent_provider_event_logs SET provider = 'unknown-provider' WHERE event_id = 'runtime-corrupt';")
+
+        XCTAssertThrowsError(try runs.listLatestProviderEventLogs(threadId: thread.id),
+                             "corrupt provider event rows must fail loud instead of skipping native evidence during long-run diagnostics") { error in
+            XCTAssertTrue(String(describing: error).contains("Corrupt provider event log"))
+        }
     }
 
     func test_terminalOutputHistoryReadsBoundedOlderWindows() throws {

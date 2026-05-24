@@ -8,11 +8,12 @@ final class CodexRunnerArgsTests: XCTestCase {
 
     private func req(model: String = "", resume: String? = nil,
                      effort: AgentReasoningEffort? = .medium,
-                     mode: AgentPermissionMode = .supervised) -> AgentRunRequest {
+                     mode: AgentPermissionMode = .supervised,
+                     serviceTier: AgentServiceTier = .auto) -> AgentRunRequest {
         AgentRunRequest(threadId: AgentThreadID(), provider: .codex,
                         model: model, cwd: "/tmp", prompt: "do it",
                         providerThreadId: resume, permissionMode: mode,
-                        reasoningEffort: effort)
+                        reasoningEffort: effort, serviceTier: serviceTier)
     }
 
     func test_freshRun_usesExecNotResume_andOmitsModelWhenDefault() {
@@ -21,19 +22,53 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertFalse(a.contains("resume"), "a first run must not be a resume")
         XCTAssertFalse(a.contains("--model"), "empty model → account default (no -m)")
         XCTAssertTrue(a.contains("--json") && a.contains("--skip-git-repo-check"))
-        XCTAssertEqual(a.last, "do it", "prompt is the final positional arg")
+        XCTAssertTrue(a.last?.contains("You are in default mode inside the RemoteCode Agent App") == true,
+                      "Default Mode semantics must reach Codex, not only local UI state")
+        XCTAssertTrue(a.last?.contains("do it") == true, "prompt is the final positional arg payload")
     }
 
     func test_resume_passesSessionIdBeforePromptAndDropsSandboxModel() {
         let a = CodexRunner.buildArgs(req(model: "gpt-5-codex", resume: "sess-99", mode: .fullAccess))
         XCTAssertEqual(Array(a.prefix(2)), ["exec", "resume"])
-        XCTAssertEqual(Array(a.suffix(2)), ["sess-99", "do it"],
+        XCTAssertEqual(a[a.count - 2], "sess-99")
+        XCTAssertTrue(a.last?.contains("do it") == true,
                        "session id then prompt are the trailing positionals")
         XCTAssertFalse(a.contains("--sandbox"),
                        "`codex exec resume` rejects --sandbox (session keeps its own)")
         XCTAssertFalse(a.contains("--model"),
                        "`codex exec resume` rejects --model (session keeps its own)")
         XCTAssertTrue(a.contains("--json") && a.contains("--skip-git-repo-check"))
+    }
+
+    func test_imageAttachmentsUseNativeCodexImageFlagsBeforePrompt() {
+        let image = AgentAttachment(path: "/tmp/screen.png", kind: .image, mimeType: "image/png")
+        let text = AgentAttachment(path: "/tmp/notes.txt", kind: .file)
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .codex,
+                                      model: "", cwd: "/tmp", prompt: "inspect",
+                                      attachments: [image, text])
+
+        let args = CodexRunner.buildArgs(request)
+
+        let imageFlag = args.firstIndex(of: "--image")
+        XCTAssertNotNil(imageFlag, "Codex image attachments must use the native --image channel")
+        XCTAssertEqual(imageFlag.map { args[args.index(after: $0)] }, "/tmp/screen.png")
+        XCTAssertFalse(args.contains("/tmp/notes.txt"),
+                       "unsupported file attachments must not be smuggled into Codex argv as image inputs")
+        XCTAssertEqual(args.last, request.providerPrompt)
+    }
+
+    func test_resumeImageAttachmentsStayBeforeSessionIdAndPrompt() {
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .codex,
+                                      model: "", cwd: "/tmp", prompt: "inspect",
+                                      attachments: [AgentAttachment(path: "/tmp/screen.png", kind: .image)],
+                                      providerThreadId: "sess-99")
+
+        let args = CodexRunner.buildArgs(request)
+
+        XCTAssertLessThan(args.firstIndex(of: "--image")!, args.firstIndex(of: "sess-99")!,
+                          "`codex exec resume` expects image flags before the session id positional")
+        XCTAssertEqual(args[args.count - 2], "sess-99")
+        XCTAssertEqual(args.last, request.providerPrompt)
     }
 
     func test_modelPassedWhenChosen_andEffortMapped() {
@@ -48,6 +83,15 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertTrue(CodexRunner.buildArgs(req(mode: .fullAccess)).contains("danger-full-access"))
         XCTAssertTrue(CodexRunner.buildArgs(req(mode: .autoAcceptEdits)).contains("workspace-write"))
         XCTAssertTrue(CodexRunner.buildArgs(req(mode: .supervised)).contains("read-only"))
+    }
+
+    func test_approvalPolicyByPermission() {
+        XCTAssertTrue(CodexRunner.buildArgs(req(mode: .supervised)).contains(#"approval_policy="untrusted""#),
+                      "supervised mode must keep Codex in approval-required mode instead of auto-running untrusted commands")
+        XCTAssertTrue(CodexRunner.buildArgs(req(mode: .autoAcceptEdits)).contains(#"approval_policy="never""#),
+                      "auto-accept-edits mode must let Codex run workspace-write commands without approval deadlocks")
+        XCTAssertTrue(CodexRunner.buildArgs(req(mode: .fullAccess)).contains(#"approval_policy="never""#),
+                      "full-access mode must not prompt for approvals after the user selects danger-full-access")
     }
 
     /// Regression: the picker once listed gpt-5 / gpt-5-codex / o3, which
@@ -67,12 +111,29 @@ final class CodexRunnerArgsTests: XCTestCase {
         }
     }
 
+    func test_listModels_exposeCodexOptionDescriptors() async {
+        let model = await CodexRunner().listModels().first { $0.id == "gpt-5.5" }
+
+        XCTAssertEqual(model?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases,
+                       "Codex model metadata must tell clients exactly which reasoning efforts are legal")
+        XCTAssertTrue(model?.supportsServiceTier == true,
+                      "Codex model metadata must expose fast service-tier support instead of relying on provider-global UI guesses")
+        XCTAssertTrue(model?.supportsCustomModel == true,
+                      "Codex model metadata must allow custom account/model ids without losing the descriptor contract")
+    }
+
     /// Codex accepts `model_reasoning_effort="xhigh"` (it is the value in
     /// the user's ~/.codex/config.toml). The enum must forward it verbatim.
     func test_xhighEffort_forwardedToCodex() {
         let a = CodexRunner.buildArgs(req(effort: .xhigh))
         XCTAssertTrue(a.contains(#"model_reasoning_effort="xhigh""#),
                       "Extra High must map to the codex xhigh effort")
+    }
+
+    func test_fastServiceTier_forwardedToCodexConfig() {
+        let a = CodexRunner.buildArgs(req(serviceTier: .fast))
+        XCTAssertTrue(a.contains(#"model_service_tier="fast""#),
+                      "Fast mode must reach Codex as the service tier requested by t3code parity")
     }
 
     func test_supportedEfforts_omitMinimalRejectedByCodexCli() {
@@ -85,6 +146,18 @@ final class CodexRunnerArgsTests: XCTestCase {
                        "CLI path settings must be able to point at a concrete executable, not only a name in PATH")
         XCTAssertNil(ProcessLocator.resolve("/no/such/codex"),
                      "CLI path settings must fail loud when the configured executable does not exist")
+    }
+
+    func test_processEnvironmentMergesProviderInstanceHomeWithoutDroppingPath() {
+        let env = CodexRunner.processEnvironment(
+            overrides: ["CODEX_HOME": "/tmp/codex-work", "REMOTE_CODE_INSTANCE": "work"],
+            base: ["PATH": "/usr/bin", "CODEX_HOME": "/tmp/default"]
+        )
+
+        XCTAssertEqual(env["PATH"], "/usr/bin")
+        XCTAssertEqual(env["CODEX_HOME"], "/tmp/codex-work",
+                       "provider instances must isolate Codex auth/session state by overriding CODEX_HOME per run")
+        XCTAssertEqual(env["REMOTE_CODE_INSTANCE"], "work")
     }
 
     func test_processLocatorFallsBackToCommonUserCliDirectoriesWhenGuiPathIsLimited() throws {
@@ -104,5 +177,48 @@ final class CodexRunnerArgsTests: XCTestCase {
             cli.path,
             "macOS GUI launches often provide a limited PATH; agent CLIs installed in user bin dirs must still be discovered"
         )
+    }
+
+    func test_planModeWrapsPromptWithProviderInstructions() {
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .codex,
+                                      model: "", cwd: "/tmp", prompt: "inspect first",
+                                      interactionMode: .plan)
+        let args = CodexRunner.buildArgs(request)
+        XCTAssertTrue(args.last?.contains("You are in plan mode") == true,
+                      "plan mode must reach Codex as provider instructions, not only toggle local UI")
+        XCTAssertTrue(args.last?.contains("Do not edit files") == true)
+        XCTAssertTrue(args.last?.contains("inspect first") == true)
+    }
+
+    func test_defaultModeWrapsPromptWithProviderInstructions() {
+        let args = CodexRunner.buildArgs(req())
+        XCTAssertTrue(args.last?.contains("You are in default mode inside the RemoteCode Agent App") == true)
+        XCTAssertTrue(args.last?.contains("preserve unrelated local work") == true)
+        XCTAssertTrue(args.last?.contains("verify the result") == true)
+        XCTAssertTrue(args.last?.contains("do it") == true)
+    }
+
+    func test_stderrClassifierSuppressesBenignCodexNoiseButKeepsFatalTransportErrors() {
+        XCTAssertFalse(CodexRunner.shouldDisplayStderr("Warning: codex updated in background\n"),
+                       "benign Codex stderr warnings must not become visible run errors during long sessions")
+        XCTAssertFalse(CodexRunner.shouldDisplayStderr("Reading additional input from stdin...\n"),
+                       "stdin advisory noise must stay hidden because RemoteCode already passes the prompt as an arg")
+
+        let fatal = CodexRunner.displayableStderr("transport error: websocket closed unexpectedly\n")
+        XCTAssertEqual(fatal, "transport error: websocket closed unexpectedly",
+                       "fatal Codex transport stderr must remain visible with native evidence instead of leaving the Agent App stuck")
+    }
+
+    func test_fatalCodexStderrBuildsProviderRuntimeEvidence() {
+        let event = ProviderStderrClassifier.runtimeEvent(
+            message: "transport error: websocket closed unexpectedly",
+            provider: .codex,
+            source: "codex.exec.stderr"
+        )
+
+        XCTAssertEqual(event.method, "stderr.fatal")
+        XCTAssertEqual(event.source, "codex.exec.stderr")
+        XCTAssertTrue(event.payloadJSON.contains("websocket closed unexpectedly"),
+                      "fatal Codex stderr must be stored as raw provider runtime evidence for later debugging")
     }
 }

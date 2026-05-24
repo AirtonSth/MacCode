@@ -4,6 +4,7 @@ import SwiftUI
 import CoreModel
 import Persistence
 import AgentRuntime
+import SocketServer
 import DesignSystemKit
 
 extension Notification.Name {
@@ -23,6 +24,8 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var claudePath: String = ""
     @Published public var devices: [DeviceTrust] = []
     @Published public var newPairingCode: String?
+    @Published public var updatingProviders: Set<AgentProvider> = []
+    @Published public var providerUpdateMessages: [AgentProvider: String] = [:]
 
     public init(context: AppContext) {
         self.context = context
@@ -66,6 +69,33 @@ public final class SettingsViewModel: ObservableObject {
         saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
     }
 
+    public func updateProvider(_ provider: AgentProvider) async {
+        guard !updatingProviders.contains(provider) else { return }
+        guard let router = context.router else {
+            providerUpdateMessages[provider] = "Update unavailable: app router is not ready."
+            return
+        }
+        updatingProviders.insert(provider)
+        defer { updatingProviders.remove(provider) }
+
+        do {
+            let value = try await router.updateAgentProvider(provider: provider, providerInstanceId: nil)
+            let object = value.objectValue ?? [:]
+            let ok = object["ok"]?.boolValue ?? false
+            let status = object["status"]?.intValue ?? -1
+            let stdout = object["stdout"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let stderr = object["stderr"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if ok {
+                providerUpdateMessages[provider] = stdout.isEmpty ? "Update completed." : stdout
+            } else {
+                let detail = stderr.isEmpty ? stdout : stderr
+                providerUpdateMessages[provider] = detail.isEmpty ? "Update failed with status \(status)." : "Update failed with status \(status): \(detail)"
+            }
+        } catch {
+            providerUpdateMessages[provider] = "Update failed: \(error)"
+        }
+    }
+
     public func createPairingCode() {
         if let pc = try? trustRepo.createPairingCode(ttlSeconds: 600) {
             newPairingCode = pc.code
@@ -90,9 +120,13 @@ public final class SettingsViewModel: ObservableObject {
         try? settingsRepo.set(key, trimmed)
         switch provider {
         case .codex:
-            context.coordinator.replaceProvider(.codex, runner: CodexRunner(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+            context.coordinator.replaceProviderAdapter(.codex, adapter: CodexAppServerAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
         case .claude:
-            context.coordinator.replaceProvider(.claude, runner: ClaudeRunner(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+            if ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0" {
+                context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeStreamingCLIAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+            } else {
+                context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeAgentSDKBridgeAdapter())
+            }
         }
     }
 }
@@ -229,10 +263,12 @@ public struct SettingsView: View {
             DSSectionHeader("Diagnostics")
             cliPathRow(label: "Codex path",
                        value: Binding(get: { vm.codexPath }, set: { vm.setCodexPath($0) }),
-                       available: vm.codexAvailable)
+                       available: vm.codexAvailable,
+                       provider: .codex)
             cliPathRow(label: "Claude path",
                        value: Binding(get: { vm.claudePath }, set: { vm.setClaudePath($0) }),
-                       available: vm.claudeAvailable)
+                       available: vm.claudeAvailable,
+                       provider: .claude)
             Text("State directory")
                 .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
             Text(vm.context.bootstrapReport.path)
@@ -242,18 +278,30 @@ public struct SettingsView: View {
         .dsPanel(padding: DS.Space.lg)
     }
 
-    private func cliPathRow(label: String, value: Binding<String>, available: Bool) -> some View {
+    private func cliPathRow(label: String, value: Binding<String>, available: Bool, provider: AgentProvider) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             HStack(spacing: DS.Space.md) {
                 Text(label)
                     .font(DS.Font.caption2.weight(.semibold))
                     .foregroundColor(DS.Palette.textTertiary)
                 DSPill(available ? "found" : "missing", tone: available ? .success : .danger)
+                Spacer()
+                Button(vm.updatingProviders.contains(provider) ? "Updating..." : "Update") {
+                    Task { await vm.updateProvider(provider) }
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(!available || vm.updatingProviders.contains(provider))
             }
             TextField("", text: value)
                 .textFieldStyle(.roundedBorder)
                 .font(DS.Font.monoSmall)
                 .foregroundColor(DS.Palette.text)
+            if let message = vm.providerUpdateMessages[provider] {
+                Text(message)
+                    .font(DS.Font.caption)
+                    .foregroundColor(message.hasPrefix("Update failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                    .textSelection(.enabled)
+            }
         }
     }
 }

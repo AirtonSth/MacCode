@@ -50,6 +50,7 @@ public final class CodexParser {
                 summary: obj["summary"] as? String,
                 body: obj["body"] as? String ?? "",
                 output: obj["output"] as? String,
+                progress: Self.progressValue(obj),
                 startedAtMs: now
             )
             return [.itemStarted(item: it)]
@@ -59,7 +60,11 @@ public final class CodexParser {
             let output = obj["output_delta"] as? String
             let summary = obj["summary"] as? String
             if let b = body { assembled += b }
-            return [.itemDelta(itemId: id, bodyAppend: body, outputAppend: output, summary: summary)]
+            var out: [AssistantEvent] = [.itemDelta(itemId: id, bodyAppend: body, outputAppend: output, summary: summary)]
+            if let progress = Self.progressValue(obj) {
+                out.append(.itemProgress(itemId: id, progress: progress))
+            }
+            return out
         case "item.completed":
             // Real `codex exec --json`: the payload is a nested `item`
             // {id,type,text}. agent_message carries the assistant reply.
@@ -81,10 +86,10 @@ public final class CodexParser {
                     out.append(.itemCompleted(itemId: iid, finalState: .completed))
                 case .tool:
                     let summary = item["command"] as? String ?? item["name"] as? String ?? kind
-                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: .tool, state: .completed, summary: summary, body: "", output: text, startedAtMs: now)))
+                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: .tool, state: .completed, summary: summary, body: "", output: text, progress: Self.progressValue(item), startedAtMs: now)))
                     out.append(.itemCompleted(itemId: iid, finalState: .completed))
                 default: // reasoning / plan
-                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: tt, state: .streaming, summary: nil, body: text, startedAtMs: now)))
+                    out.append(.itemStarted(item: AssistantItem(id: iid, turnId: turnId, type: tt, state: .streaming, summary: nil, body: text, progress: Self.progressValue(item), startedAtMs: now)))
                     out.append(.itemCompleted(itemId: iid, finalState: .completed))
                 }
                 return out
@@ -103,6 +108,45 @@ public final class CodexParser {
                 ?? (assembled.isEmpty ? nil : assembled)
             currentTurnId = nil
             return [.turnCompleted(turnId: tid, finalMessage: final)]
+        case "request.opened":
+            let id = obj["request_id"] as? String ?? obj["id"] as? String ?? UUID().uuidString
+            let kind = mapRequestKind(obj["request_type"] as? String ?? obj["kind"] as? String ?? "")
+            let title = obj["title"] as? String ?? obj["summary"] as? String ?? kind.rawValue
+            let detail = obj["detail"] as? String ?? obj["command"] as? String ?? obj["path"] as? String
+            return [.requestOpened(AssistantPendingRequest(id: id, turnId: currentTurnId, kind: kind, title: title, detail: detail, createdAtMs: now))]
+        case "request.resolved":
+            let id = obj["request_id"] as? String ?? obj["id"] as? String ?? ""
+            let state = AssistantRequestState(rawValue: obj["state"] as? String ?? "") ?? .resolved
+            return [.requestResolved(requestId: id, state: state)]
+        case "user_input.requested":
+            let id = obj["request_id"] as? String ?? obj["id"] as? String ?? UUID().uuidString
+            let prompt = obj["prompt"] as? String ?? obj["question"] as? String ?? "Input required"
+            let options = obj["options"] as? [String] ?? []
+            let allowsMultiple = obj["allows_multiple_selection"] as? Bool
+                ?? obj["allows_multiple"] as? Bool
+                ?? obj["multi_select"] as? Bool
+                ?? ((obj["max_selections"] as? Int).map { $0 > 1 } ?? false)
+            return [.userInputRequested(AssistantUserInputRequest(id: id, turnId: currentTurnId, prompt: prompt, options: options, allowsMultipleSelection: allowsMultiple, createdAtMs: now))]
+        case "user_input.resolved":
+            let id = obj["request_id"] as? String ?? obj["id"] as? String ?? ""
+            let answer = obj["answer"] as? String
+            return [.userInputResolved(requestId: id, answer: answer)]
+        case "turn.proposed_plan", "proposed_plan":
+            let id = obj["plan_id"] as? String ?? obj["id"] as? String ?? UUID().uuidString
+            let markdown = obj["plan_markdown"] as? String ?? obj["markdown"] as? String ?? obj["text"] as? String ?? ""
+            return [.proposedPlan(AssistantProposedPlan(id: id, turnId: currentTurnId, markdown: markdown))]
+        case "plan_update", "update_plan", "turn.plan_update":
+            guard let plan = activePlan(from: obj, now: now) else { return [] }
+            return [.activePlanUpdated(plan)]
+        case "thread.token_usage", "token_usage":
+            let input = obj["input_tokens"] as? Int ?? 0
+            let output = obj["output_tokens"] as? Int ?? 0
+            let total = obj["total_tokens"] as? Int ?? (input + output)
+            let window = obj["context_window"] as? Int
+            let compactsAutomatically = obj["compacts_automatically"] as? Bool ?? obj["compactsAutomatically"] as? Bool
+            return [.tokenUsage(AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: total, contextWindow: window, compactsAutomatically: compactsAutomatically))]
+        case "context.compaction", "context_compaction":
+            return [.contextCompaction(summary: obj["summary"] as? String)]
         case "turn.failed":
             let msg = (obj["error"] as? [String: Any])?["message"] as? String
                 ?? obj["message"] as? String ?? "codex turn failed"
@@ -112,20 +156,108 @@ public final class CodexParser {
             let recoverable = obj["recoverable"] as? Bool ?? false
             return [.error(message: msg, recoverable: recoverable)]
         default:
+            if isExplicitlyUnsupportedRealtimeEvent(type) {
+                var out: [AssistantEvent] = []
+                ensureTurn(&out)
+                let turnId = currentTurnId ?? ""
+                let id = obj["id"] as? String ?? obj["event_id"] as? String ?? "unsupported-\(UUID().uuidString)"
+                let message = "Unsupported Codex realtime event: \(type)"
+                out.append(.itemStarted(item: AssistantItem(
+                    id: id,
+                    turnId: turnId,
+                    type: .error,
+                    state: .completed,
+                    summary: "Unsupported realtime event",
+                    body: message,
+                    startedAtMs: now,
+                    finishedAtMs: now
+                )))
+                out.append(.itemCompleted(itemId: id, finalState: .completed))
+                return out
+            }
             return []
         }
+    }
+
+    private func isExplicitlyUnsupportedRealtimeEvent(_ type: String) -> Bool {
+        let lowered = type.lowercased()
+        return lowered.hasPrefix("realtime.")
+            || lowered.hasPrefix("audio.")
+            || lowered.contains("audio_delta")
+            || lowered.contains("realtime")
     }
 
     private func mapItemType(_ s: String) -> AssistantItemType {
         switch s.lowercased() {
         case "reasoning": return .reasoning
         case "plan", "todo_list", "plan_update": return .plan
-        case "tool", "tool_call", "command", "command_execution",
-             "file_change", "patch", "mcp_tool_call", "web_search":
-            return .tool
+        case "command", "command_execution": return .commandExecution
+        case "file_change", "patch", "apply_patch": return .fileChange
+        case "mcp", "mcp_tool_call": return .mcpToolCall
+        case "dynamic", "dynamic_tool_call": return .dynamicToolCall
+        case "collab", "collab_tool_call": return .collabToolCall
+        case "web_search": return .webSearch
+        case "image_view": return .imageView
+        case "review": return .review
+        case "context_compaction": return .contextCompaction
+        case "error": return .error
+        case "tool", "tool_call": return .tool
         case "agent_message", "assistantmessage", "assistant", "message", "text":
             return .assistantMessage
         default: return .assistantMessage
         }
+    }
+
+    private func activePlan(from obj: [String: Any], now: Int64) -> AssistantActivePlan? {
+        let rawSteps = obj["plan"] as? [[String: Any]]
+            ?? obj["steps"] as? [[String: Any]]
+            ?? (obj["update"] as? [String: Any])?["plan"] as? [[String: Any]]
+        guard let rawSteps, !rawSteps.isEmpty else { return nil }
+        let steps = rawSteps.enumerated().compactMap { index, raw -> AssistantPlanStep? in
+            let title = raw["step"] as? String
+                ?? raw["title"] as? String
+                ?? raw["text"] as? String
+                ?? raw["content"] as? String
+                ?? ""
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let statusRaw = raw["status"] as? String ?? "pending"
+            let status = AssistantPlanStepStatus(rawValue: statusRaw)
+                ?? (statusRaw == "inProgress" ? .inProgress : .pending)
+            let id = raw["id"] as? String ?? "\(index)-\(trimmed)"
+            return AssistantPlanStep(id: id, title: trimmed, status: status)
+        }
+        guard !steps.isEmpty else { return nil }
+        return AssistantActivePlan(
+            explanation: obj["explanation"] as? String,
+            steps: steps,
+            updatedAtMs: now
+        )
+    }
+
+    private func mapRequestKind(_ s: String) -> AssistantRequestKind {
+        switch s.lowercased() {
+        case "command_execution": return .commandExecution
+        case "file_read": return .fileRead
+        case "file_change": return .fileChange
+        case "apply_patch": return .applyPatch
+        case "exec": return .exec
+        case "tool_user_input", "user_input": return .toolUserInput
+        case "dynamic": return .dynamic
+        case "auth_tokens_refresh": return .authTokensRefresh
+        default: return .dynamic
+        }
+    }
+
+    private static func progressValue(_ obj: [String: Any]) -> Double? {
+        for key in ["progress", "percentage", "percent"] {
+            if let value = obj[key] as? Double { return AssistantTimelineState.normalizedProgress(value) }
+            if let value = obj[key] as? Int { return AssistantTimelineState.normalizedProgress(Double(value)) }
+            if let value = obj[key] as? String,
+               let parsed = Double(value.trimmingCharacters(in: CharacterSet(charactersIn: "% "))) {
+                return AssistantTimelineState.normalizedProgress(parsed)
+            }
+        }
+        return nil
     }
 }

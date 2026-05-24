@@ -50,6 +50,30 @@ final class PersistenceRestoreTests: XCTestCase {
         XCTAssertTrue(ctx2.state.workspaces.values.contains { $0.name == "A" })
     }
 
+    func test_saveAgentPlanWritesExactMarkdownInsideWorkspace() throws {
+        let support = NSTemporaryDirectory() + "RC2PlanSave-" + UUID().uuidString
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2PlanWorkspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: support)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let ws = try router.createWorkspace(name: "PLAN", cwd: workspace.path)
+        let thread = try router.createAgentThread(workspace: ws.id, title: "plan", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium, serviceTier: .auto, modelSelection: nil)
+        let markdown = "\n# Keep exact markdown\n\n1. Inspect\n"
+        try ctx.proposedPlanRepo.upsert(threadId: thread.id, plan: AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: markdown))
+
+        let saved = try router.saveAgentPlan(thread: thread.id, planId: "plan-1", planMarkdown: nil, relativePath: nil)
+
+        XCTAssertEqual(saved.relativePath, ".remotecode/plans/keep-exact-markdown.md")
+        XCTAssertEqual(try String(contentsOfFile: saved.path), markdown,
+                       "mobile host-save must write the exact proposed-plan markdown, not a trimmed or rendered copy")
+        XCTAssertThrowsError(try router.saveAgentPlan(thread: thread.id, planId: "plan-1", planMarkdown: markdown, relativePath: "../plan.md"),
+                             "mobile clients must not be able to save plan markdown outside the workspace")
+    }
+
     func test_browserLastURL_persistsAcrossRestart() throws {
         let dir = NSTemporaryDirectory() + "RC2Persist-" + UUID().uuidString
         let target = "https://example.com/docs?tab=api"
@@ -76,5 +100,88 @@ final class PersistenceRestoreTests: XCTestCase {
                        "browser tabs must reopen on the last URL after RemoteCode restarts")
         XCTAssertEqual(browser.title, "API Docs",
                        "browser tab title must persist with the last visited page")
+    }
+
+    func test_providerCallbackState_persistsAndMarksOpenCallbacksStaleOnRestart() throws {
+        let dir = NSTemporaryDirectory() + "RC2Callbacks-" + UUID().uuidString
+        let threadId: AgentThreadID
+        do {
+            let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+            let thread = AgentThread(title: "callback", provider: .codex, model: "gpt-5.5")
+            threadId = thread.id
+            try ctx.threadRepo.upsert(thread)
+            let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-5.5")
+            try ctx.runRepo.upsert(run)
+
+            ctx.coordinator.onAssistantEvent?(.requestOpened(AssistantPendingRequest(
+                id: "approval-1",
+                turnId: "turn-1",
+                kind: .commandExecution,
+                title: "Run command",
+                detail: "swift test",
+                createdAtMs: 1_000
+            )), thread.id, run.id)
+            ctx.coordinator.onAssistantEvent?(.userInputRequested(AssistantUserInputRequest(
+                id: "question-1",
+                turnId: "turn-1",
+                prompt: "Continue?",
+                options: ["Plan", "Run"],
+                createdAtMs: 2_000
+            )), thread.id, run.id)
+            ctx.coordinator.onAssistantEvent?(.requestResolved(requestId: "approval-1", state: .approved), thread.id, run.id)
+        }
+
+        let ctx2 = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router2 = AppCommandRouter(context: ctx2)
+        let approval = try XCTUnwrap(try ctx2.providerPendingCallbackRepo.get(threadId: threadId, requestId: "approval-1", kind: .approval))
+        let question = try XCTUnwrap(try ctx2.providerPendingCallbackRepo.get(threadId: threadId, requestId: "question-1", kind: .userInput))
+        let visible = try router2.listAgentPendingCallbacks(thread: threadId)
+
+        XCTAssertEqual(approval.state, .approved,
+                       "resolved provider approvals must not be resurrected when the app restarts")
+        XCTAssertEqual(question.state, .stale,
+                       "unresolved provider questions must become explicitly stale after restart instead of trapping the Agent App in dead callback UI")
+        XCTAssertTrue(question.staleReason?.contains("Provider callback state does not survive app restarts") == true)
+        XCTAssertEqual(visible.requests.map(\.id), [],
+                       "host callback reload must hide resolved approvals after restart")
+        XCTAssertEqual(visible.userInputs.first?.id, "question-1",
+                       "host callback reload must expose stale unanswered provider questions for macOS/iOS recovery")
+        XCTAssertEqual(visible.userInputs.first?.state, .stale)
+    }
+
+    func test_failedProviderCallbackResponseMarksStoredCallbackStale() throws {
+        let dir = NSTemporaryDirectory() + "RC2CallbackFailure-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        let thread = AgentThread(title: "callback", provider: .codex, model: "gpt-5.5")
+        try ctx.threadRepo.upsert(thread)
+        try ctx.providerPendingCallbackRepo.record(threadId: thread.id, request: AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "swift test",
+            createdAtMs: 1
+        ))
+        try ctx.providerPendingCallbackRepo.record(threadId: thread.id, userInput: AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Continue?",
+            options: ["Plan", "Run"],
+            createdAtMs: 2
+        ))
+
+        XCTAssertThrowsError(try router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approve))
+        XCTAssertThrowsError(try router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run"))
+
+        let approval = try XCTUnwrap(try ctx.providerPendingCallbackRepo.get(threadId: thread.id, requestId: "approval-1", kind: .approval))
+        let question = try XCTUnwrap(try ctx.providerPendingCallbackRepo.get(threadId: thread.id, requestId: "question-1", kind: .userInput))
+        let visible = try router.listAgentPendingCallbacks(thread: thread.id)
+        XCTAssertEqual(approval.state, .stale,
+                       "a failed provider approval response must not remain pending forever after the provider session is gone")
+        XCTAssertEqual(question.state, .stale,
+                       "a failed provider question response must not remain pending forever after the provider session is gone")
+        XCTAssertTrue(visible.requests.first?.detail?.contains("Provider approval response failed") == true)
+        XCTAssertEqual(visible.userInputs.first?.state, .stale)
     }
 }

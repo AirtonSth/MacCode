@@ -25,6 +25,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
+    private var providerSessionReaperTimer: Timer?
 
     public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
         self.channel = channel
@@ -104,6 +105,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         palette = CommandPalette(router: router)
         settings = SettingsWindowController(context: context)
         SystemNotifier.shared.bootstrap()
+        reapIdleProviderSessions()
+        providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.reapIdleProviderSessions()
+            }
+        }
 
         installMainMenu()
         windowController.show()
@@ -114,7 +121,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         socketServer?.stop()
         httpServer?.stop()
         bonjour?.stop()
+        providerSessionReaperTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    private func reapIdleProviderSessions() {
+        do {
+            let result = try context.reapIdleProviderSessions()
+            if !result.stoppedThreadIds.isEmpty {
+                NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s).")
+            }
+        } catch {
+            NSLog("Failed to reap idle provider sessions: \(error)")
+        }
     }
 
     static func shouldPersistEvent(_ event: EventBus.Event) -> Bool {

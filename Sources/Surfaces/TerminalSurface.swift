@@ -220,6 +220,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
     private var isVisible = true
+    private var hiddenOutput = Data()
     private let historyRepo: TerminalOutputRepository?
     private let historyWorkspaceID: String
     private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
@@ -227,6 +228,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var historyFlushScheduled = false
     private var nextHistoryChunkIndex: Int64 = 1
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
+    private nonisolated static let maxHiddenOutputBytes = 1024 * 1024
 
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
@@ -423,6 +425,8 @@ public final class TerminalSurface: NSObject, Surface {
         SurfaceOutputBus.shared.emit(descriptor.id, data)
         if isVisible {
             ghosttyView.processOutput(data)
+        } else {
+            appendHiddenOutput(data)
         }
     }
 
@@ -433,6 +437,15 @@ public final class TerminalSurface: NSObject, Surface {
         SurfaceOutputBus.shared.emit(descriptor.id, data)
         if isVisible {
             ghosttyView.processOutput(data)
+        } else {
+            appendHiddenOutput(data)
+        }
+    }
+
+    private func appendHiddenOutput(_ data: Data) {
+        hiddenOutput.append(data)
+        if hiddenOutput.count > Self.maxHiddenOutputBytes {
+            hiddenOutput.removeFirst(hiddenOutput.count - Self.maxHiddenOutputBytes)
         }
     }
 
@@ -477,18 +490,22 @@ public final class TerminalSurface: NSObject, Surface {
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
-        let snapshot = renderer.snapshot().string
-        if let data = snapshot.data(using: .utf8) {
-            ghosttyView.resetSurfaceOutput(data)
-        } else {
+        if hiddenOutput.isEmpty {
             ghosttyView.forceRefresh()
+        } else {
+            let output = hiddenOutput
+            hiddenOutput.removeAll(keepingCapacity: true)
+            ghosttyView.processOutput(output)
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isVisible else { return }
+            self.ghosttyView.forceRefresh()
         }
     }
 
     public func didBecomeHidden() {
         guard isVisible else { return }
         isVisible = false
-        ghosttyView.closeSurface()
     }
 
     public func close() {

@@ -2,6 +2,62 @@ import XCTest
 @testable import CoreModel
 
 final class AssistantTimelineTests: XCTestCase {
+    func test_attachmentResolverKeepsStructuredMetadataAndClassifiesImages() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-attachments-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = root.appendingPathComponent("screen.png")
+        let text = root.appendingPathComponent("notes.txt")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: image)
+        try "notes".write(to: text, atomically: true, encoding: .utf8)
+
+        let attachments = try AgentAttachmentResolver.resolve(paths: [image.path, text.path, image.path])
+
+        XCTAssertEqual(attachments.map(\.path), [image.path, text.path],
+                       "attachment resolution must dedupe by canonical file path")
+        XCTAssertEqual(attachments.map(\.kind), [.image, .file],
+                       "image attachments need a provider-native channel while other files stay structured metadata")
+        XCTAssertEqual(attachments.first?.mimeType, "image/png")
+    }
+
+    func test_attachmentResolverFailsForMissingOrDirectoryPaths() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-code-attachments-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertThrowsError(try AgentAttachmentResolver.resolve(paths: [root.path]),
+                             "directory attachments must fail loud before provider spawn")
+        XCTAssertThrowsError(try AgentAttachmentResolver.resolve(paths: [root.appendingPathComponent("missing.png").path]),
+                             "missing attachment paths must fail loud before provider spawn")
+    }
+
+    func test_proposedPlanCollapsedPreviewKeepsFirstTenLines() {
+        let markdown = (1...12).map { "\($0). Step \($0)" }.joined(separator: "\n")
+        let plan = AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: markdown)
+
+        XCTAssertEqual(plan.collapsedPreview.split(separator: "\n", omittingEmptySubsequences: false).count, 10,
+                       "collapsed plan cards must keep the first ten lines for scanability")
+        XCTAssertTrue(plan.collapsedPreview.contains("10. Step 10"))
+        XCTAssertFalse(plan.collapsedPreview.contains("11. Step 11"),
+                       "collapsed previews must hide overflow until the user expands the plan")
+        XCTAssertEqual(AssistantProposedPlan.collapsedPreview(for: "1\n2", maxLines: 10), "1\n2")
+    }
+
+    func test_proposedPlanExportTitleAndFileNameAreStable() {
+        let plan = AssistantProposedPlan(
+            id: "plan-1",
+            turnId: "turn-1",
+            markdown: "# Fix Agent Freeze!\n\n1. Inspect sessions\n2. Patch lifecycle"
+        )
+
+        XCTAssertEqual(plan.exportTitle, "Fix Agent Freeze!",
+                       "exported plan cards need a human-readable title, not only raw markdown")
+        XCTAssertEqual(plan.exportFileName, "fix-agent-freeze.md",
+                       "saving a proposed plan must produce a stable markdown filename safe for desktop/mobile export")
+    }
+
     func test_timeline_appliesItemLifecycle() {
         var s = AssistantTimelineState()
         s.apply(.threadStarted(threadId: "t", providerThreadId: "pt"))
@@ -70,5 +126,166 @@ final class AssistantTimelineTests: XCTestCase {
         s.apply(.turnCompleted(turnId: "long", finalMessage: String(repeating: "z", count: 200_000)))
         XCTAssertLessThanOrEqual(s.turns[0].finalAssistantMessage?.count ?? 0, AssistantTimelineState.liveTextLimit,
                                  "terminal live text must also stay bounded before it is moved into persisted history")
+    }
+
+    func test_liveTimelineKeepsOnlyRecentTurnsForLongAgentSessions() {
+        var s = AssistantTimelineState()
+
+        for i in 0..<140 {
+            let turn = "turn-\(i)"
+            let item = "item-\(i)"
+            s.apply(.turnStarted(turnId: turn))
+            s.apply(.itemStarted(item: AssistantItem(id: item, turnId: turn, type: .assistantMessage, startedAtMs: Int64(i))))
+            s.apply(.itemDelta(itemId: item, bodyAppend: "answer \(i)", outputAppend: nil, summary: nil))
+            s.apply(.turnCompleted(turnId: turn, finalMessage: "answer \(i)"))
+        }
+
+        XCTAssertLessThanOrEqual(s.turns.count, AssistantTimelineState.liveTurnLimit,
+                                 "macOS Agent App must not retain every rendered turn forever during long-running sessions")
+        XCTAssertEqual(s.turns.first?.turnId, "turn-60",
+                       "bounded visible history must drop the oldest turns first while persisted DB history remains authoritative")
+        XCTAssertEqual(s.latestAssistantMessage, "answer 139",
+                       "bounded visible history must keep the newest agent output visible")
+    }
+
+    func test_timelineTracksApprovalsUserInputPlansAndTokenUsage() {
+        var s = AssistantTimelineState()
+        s.apply(.requestOpened(AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run tests",
+            detail: "swift test",
+            createdAtMs: 1
+        )))
+        s.apply(.userInputRequested(AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Pick mode",
+            options: ["Plan", "Run"],
+            createdAtMs: 2
+        )))
+        s.apply(.proposedPlan(AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")))
+        s.apply(.tokenUsage(AssistantTokenUsage(inputTokens: 10, outputTokens: 5, totalTokens: 15, contextWindow: 100, compactsAutomatically: true)))
+        s.apply(.contextCompaction(summary: "older messages compacted"))
+        s.apply(.requestResolved(requestId: "approval-1", state: .approved))
+        s.apply(.userInputResolved(requestId: "question-1", answer: "Run"))
+
+        XCTAssertEqual(s.pendingRequests.first?.state, .approved,
+                       "approval state must persist in the timeline so stale requests can be diagnosed after restart")
+        XCTAssertEqual(s.pendingUserInputs.first?.answer, "Run",
+                       "user-input answers must remain associated with their provider request id")
+        XCTAssertEqual(s.proposedPlans.first?.markdown, "1. Inspect\n2. Patch",
+                       "provider plan artifacts must be structured, not only assistant text")
+        XCTAssertEqual(s.tokenUsage?.totalTokens, 15,
+                       "token usage must be tracked for long-running context health")
+        XCTAssertEqual(s.tokenUsage?.compactsAutomatically, true,
+                       "automatic compaction capability must stay attached to token usage telemetry")
+        XCTAssertEqual(s.contextCompactionSummary, "older messages compacted")
+    }
+
+    func test_activePlanTracksStepStateSeparatelyFromProposedPlan() {
+        var s = AssistantTimelineState()
+        s.apply(.proposedPlan(AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")))
+        s.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "Executing plan",
+            steps: [
+                AssistantPlanStep(id: "step-1", title: "Inspect", status: .completed),
+                AssistantPlanStep(id: "step-2", title: "Patch", status: .inProgress),
+                AssistantPlanStep(id: "step-3", title: "Verify", status: .pending)
+            ],
+            updatedAtMs: 42
+        )))
+
+        XCTAssertEqual(s.proposedPlans.first?.id, "plan-1",
+                       "proposed plans must remain durable artifacts for implementation, not be overwritten by transient step progress")
+        XCTAssertEqual(s.activePlan?.steps.map(\.status), [.completed, .inProgress, .pending],
+                       "active plan updates must preserve step state so long-running /goal work exposes current progress")
+    }
+
+    func test_richItemTypesRemainDistinct() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "turn"))
+        for type in [AssistantItemType.commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .review, .contextCompaction, .error] {
+            s.apply(.itemStarted(item: AssistantItem(id: type.rawValue, turnId: "turn", type: type, startedAtMs: 1)))
+        }
+
+        XCTAssertEqual(s.turns[0].items.map(\.type), [.commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .review, .contextCompaction, .error],
+                       "provider runtime items must not collapse into one generic tool bucket because UI/mobile need distinct rendering and replay")
+    }
+
+    func test_providerRuntimeEventsPreserveRawProviderRefsAndPayload() {
+        let line = #"{"type":"item.completed","turn_id":"turn-native","item":{"id":"item-native","type":"agent_message","text":"hi"}}"#
+        guard let runtime = ProviderRuntimeEvent.fromJSONLine(line, provider: .codex, source: "codex.exec.json", receivedAtMs: 7) else {
+            return XCTFail("raw provider JSON lines must become canonical runtime events")
+        }
+
+        var s = AssistantTimelineState()
+        s.apply(.providerRuntime(runtime))
+
+        XCTAssertEqual(s.providerRuntimeEvents.first?.method, "item.completed")
+        XCTAssertEqual(s.providerRuntimeEvents.first?.providerTurnId, "turn-native",
+                       "native provider turn id must survive normalized conversion for read/rollback/debug parity")
+        XCTAssertEqual(s.providerRuntimeEvents.first?.providerItemId, "item-native",
+                       "native provider item id must survive normalized conversion for tool/content traceability")
+        XCTAssertTrue(s.providerRuntimeEvents.first?.payloadJSON.contains(#""agent_message""#) == true,
+                      "canonical runtime events must keep the raw payload so unknown Codex/Claude fields are not lost")
+    }
+
+    func test_workActivitiesSummarizeToolRequestAndRuntimeProgress() {
+        let runtime = ProviderRuntimeEvent(
+            id: "runtime-1",
+            provider: .codex,
+            source: "codex.exec.json",
+            method: "item.started",
+            providerTurnId: "turn-native",
+            providerItemId: "item-native",
+            payloadJSON: #"{"type":"item.started"}"#,
+            receivedAtMs: 3
+        )
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "turn-1"))
+        s.apply(.itemStarted(item: AssistantItem(
+            id: "tool-1",
+            turnId: "turn-1",
+            type: .commandExecution,
+            summary: "swift test",
+            startedAtMs: 1
+        )))
+        s.apply(.requestOpened(AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run tests",
+            detail: "swift test",
+            createdAtMs: 2
+        )))
+        s.apply(.providerRuntime(runtime))
+        s.apply(.itemCompleted(itemId: "tool-1", finalState: .completed))
+
+        XCTAssertTrue(s.workActivities.contains { $0.id == "item:tool-1" && $0.state == "completed" },
+                      "work log must expose tool progress without forcing users to inspect raw provider output")
+        XCTAssertTrue(s.workActivities.contains { $0.id == "request:approval-1" && $0.title.contains("Approval requested") },
+                      "work log must include approval/request progress because pending cards can move or become stale")
+        XCTAssertTrue(s.workActivities.contains { $0.id == "runtime:runtime-1" && $0.title.contains("item.started") },
+                      "work log must include raw provider runtime events so unknown Codex/Claude progress remains visible")
+    }
+
+    func test_workActivitiesTrackProviderPercentProgress() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "turn-1"))
+        s.apply(.itemStarted(item: AssistantItem(
+            id: "tool-1",
+            turnId: "turn-1",
+            type: .commandExecution,
+            summary: "swift test",
+            startedAtMs: 1
+        )))
+        s.apply(.itemProgress(itemId: "tool-1", progress: 42))
+
+        XCTAssertEqual(s.turns.first?.items.first?.progress, 0.42,
+                       "provider progress may arrive as 0-1 or 0-100 and must normalize before rendering")
+        XCTAssertTrue(s.workActivities.last?.title.contains("42% swift test") == true,
+                      "work log must expose current percent progress for long-running provider tools")
     }
 }

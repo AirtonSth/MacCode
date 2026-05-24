@@ -4,6 +4,26 @@ import CoreModel
 import Persistence
 
 final class FakeRunnerTests: XCTestCase {
+    private func runShell(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    private func mkTmpRepo(prefix: String = "rc2-coordinator-checkpoint-") throws -> String {
+        let dir = NSTemporaryDirectory() + prefix + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        runShell(["git", "init", "-q", "-b", "main", dir])
+        runShell(["git", "-C", dir, "config", "user.email", "t@t.t"])
+        runShell(["git", "-C", dir, "config", "user.name", "test"])
+        try "hello\n".write(toFile: dir + "/README.md", atomically: true, encoding: .utf8)
+        runShell(["git", "-C", dir, "add", "README.md"])
+        runShell(["git", "-C", dir, "commit", "-q", "-m", "init"])
+        return dir
+    }
+
     func test_fakeRunner_emitsCompleteTimeline() async throws {
         let runner = FakeProviderRunner(scenario: .simpleAssistant(reply: "OK"))
         let req = AgentRunRequest(threadId: AgentThreadID(), provider: .codex, model: "fake-model", cwd: "/tmp", prompt: "hi")
@@ -61,4 +81,1498 @@ final class FakeRunnerTests: XCTestCase {
         }
         XCTFail("assistant reply must persist from the turn completion event")
     }
+
+    func test_coordinator_preservesProviderAndModelWhenRunFinishes() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-provider-model-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "claude", provider: .claude, model: "claude-opus-4-7")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.claude: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "OK"))])
+        let req = AgentRunRequest(threadId: thread.id, provider: .claude, model: "claude-opus-4-7", cwd: tmp, prompt: "hi")
+        let runId = try await coordinator.startRun(req)
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let run = try? runRepo.get(id: runId), run.status == .completed {
+                XCTAssertEqual(run.provider, .claude,
+                               "finished runs must keep their provider so Claude sessions can be resumed and audited")
+                XCTAssertEqual(run.model, "claude-opus-4-7",
+                               "finished runs must keep the requested model instead of erasing resume metadata")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("run must complete and preserve provider/model metadata")
+    }
+
+    func test_coordinatorCapturesCheckpointSummaryForCompletedTurn() async throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-db-" + UUID().uuidString
+        let repoDir = try mkTmpRepo()
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(atPath: repoDir)
+        }
+        try "hello\nchanged\n".write(toFile: repoDir + "/README.md", atomically: true, encoding: .utf8)
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let thread = AgentThread(title: "checkpoint", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              checkpointRepo: checkpointRepo,
+                                              providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "OK"))])
+        let runId = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "fake-model", cwd: repoDir, prompt: "hi"))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let checkpoints = (try? checkpointRepo.list(threadId: thread.id)) ?? []
+            if let checkpoint = checkpoints.first {
+                XCTAssertEqual(checkpoint.runId, runId)
+                XCTAssertFalse(checkpoint.turnId.isEmpty)
+                XCTAssertEqual(checkpoint.checkpointTurnCount, 1)
+                XCTAssertEqual(checkpoint.status, .ready)
+                XCTAssertTrue(checkpoint.checkpointRef.contains(runId.value.uuidString))
+                XCTAssertTrue(checkpoint.files.contains { $0.path == "README.md" && $0.kind == "modified" },
+                              "completed mutation turns must retain a file-level checkpoint summary for recovery and audit")
+                XCTAssertTrue(checkpoint.diffPatch?.contains("README.md") == true)
+                XCTAssertTrue(checkpoint.fileDiffs.contains { $0.path == "README.md" && $0.patch.contains("changed") },
+                              "checkpoint rows must keep per-file diff patches so a later UI can inspect the exact agent turn")
+                XCTAssertNotNil(checkpoint.assistantMessageId,
+                                "checkpoint summaries must be coupled to the assistant turn output when the provider emitted one")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("completed run must capture a checkpoint summary")
+    }
+
+    func test_coordinatorRecordsMissingCheckpointWhenWorkspaceIsNotGit() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-checkpoint-missing-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let thread = AgentThread(title: "checkpoint", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              checkpointRepo: checkpointRepo,
+                                              providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "OK"))])
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "hi"))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let checkpoints = (try? checkpointRepo.list(threadId: thread.id)) ?? []
+            if let checkpoint = checkpoints.first {
+                XCTAssertEqual(checkpoint.status, .missing)
+                XCTAssertEqual(checkpoint.errorMessage, "Not a git repository.",
+                               "completed turns outside a git repo must leave an explicit missing checkpoint status instead of pretending recovery exists")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("non-git completed run must still record an explicit missing checkpoint")
+    }
+
+    func test_revertThreadToCheckpointRestoresWorkspaceAndRollsBackProvider() throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-revert-db-" + UUID().uuidString
+        let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-revert-repo-")
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(atPath: repoDir)
+        }
+        let turnOneBody = "hello\nturn one\n"
+        let turnTwoBody = "hello\nturn two\n"
+        try turnTwoBody.write(toFile: repoDir + "/README.md", atomically: true, encoding: .utf8)
+        try "later\n".write(toFile: repoDir + "/later.txt", atomically: true, encoding: .utf8)
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let thread = AgentThread(title: "revert", provider: .codex, model: "fake-model")
+        let runOne = AgentRunID()
+        let runTwo = AgentRunID()
+        let assistantOne = AgentMessage(threadId: thread.id, role: .assistant, content: "turn one")
+        let assistantTwo = AgentMessage(threadId: thread.id, role: .assistant, content: "turn two")
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(id: runOne, threadId: thread.id, provider: .codex, model: "fake-model", status: .completed))
+        try runRepo.upsert(AgentRun(id: runTwo, threadId: thread.id, provider: .codex, model: "fake-model", status: .completed))
+        try messageRepo.append(assistantOne)
+        try messageRepo.append(assistantTwo)
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: runOne,
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:\(runOne.value.uuidString):turn-1",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0)],
+            fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "README.md", kind: "modified", contentsBase64: Data(turnOneBody.utf8).base64EncodedString())],
+            assistantMessageId: assistantOne.id
+        ))
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: runTwo,
+            turnId: "turn-2",
+            checkpointTurnCount: 2,
+            checkpointRef: "local-diff:\(runTwo.value.uuidString):turn-2",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0),
+                    AgentTurnCheckpointFile(path: "later.txt", kind: "untracked", additions: 0, deletions: 0)],
+            fileSnapshots: [
+                AgentTurnCheckpointFileSnapshot(path: "README.md", kind: "modified", contentsBase64: Data(turnTwoBody.utf8).base64EncodedString()),
+                AgentTurnCheckpointFileSnapshot(path: "later.txt", kind: "untracked", contentsBase64: Data("later\n".utf8).base64EncodedString())
+            ],
+            assistantMessageId: assistantTwo.id
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              checkpointRepo: checkpointRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
+
+        XCTAssertEqual(try String(contentsOfFile: repoDir + "/README.md", encoding: .utf8), turnOneBody)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repoDir + "/later.txt"),
+                       "reverting to an earlier checkpoint must remove files introduced by newer provider turns")
+        XCTAssertEqual(adapter.lastRollback?.1, "turn-1",
+                       "workspace checkpoint revert must also roll back the provider conversation to the checkpoint turn")
+        XCTAssertEqual(try checkpointRepo.list(threadId: thread.id).map(\.checkpointTurnCount), [1])
+        XCTAssertEqual(try messageRepo.list(threadId: thread.id).map(\.content), ["turn one"],
+                       "local assistant messages after the target checkpoint must be pruned when their checkpoint trace is known")
+    }
+
+    func test_revertThreadToCheckpointRecoversPersistedProviderSessionBeforeRollback() throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-recover-revert-db-" + UUID().uuidString
+        let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-recover-revert-repo-")
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(atPath: repoDir)
+        }
+        let targetBody = "hello\nrecover target\n"
+        let newerBody = "hello\nrecover newer\n"
+        try newerBody.write(toFile: repoDir + "/README.md", atomically: true, encoding: .utf8)
+
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let providerSessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "recover revert", provider: .codex, model: "gpt-5.5", providerThreadId: "codex-thread-recovered")
+        let runOne = AgentRunID()
+        let runTwo = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(id: runOne, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed))
+        try runRepo.upsert(AgentRun(id: runTwo, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed))
+        try providerSessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "codex-thread-recovered",
+            cwd: repoDir,
+            model: "gpt-5.5"
+        ))
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: runOne,
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:\(runOne.value.uuidString):turn-1",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0)],
+            fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "README.md", kind: "modified", contentsBase64: Data(targetBody.utf8).base64EncodedString())]
+        ))
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: runTwo,
+            turnId: "turn-2",
+            checkpointTurnCount: 2,
+            checkpointRef: "local-diff:\(runTwo.value.uuidString):turn-2",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0)],
+            fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "README.md", kind: "modified", contentsBase64: Data(newerBody.utf8).base64EncodedString())]
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: providerSessionRepo,
+                                              checkpointRepo: checkpointRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
+
+        XCTAssertEqual(adapter.lastProviderThreadId, "codex-thread-recovered",
+                       "checkpoint revert after app restart must recover the persisted provider session before calling rollback")
+        XCTAssertEqual(adapter.lastRollback?.1, "turn-1")
+        XCTAssertEqual(try String(contentsOfFile: repoDir + "/README.md", encoding: .utf8), targetBody)
+    }
+
+    func test_revertThreadToCheckpointPreflightsSnapshotsBeforeProviderRollback() throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-corrupt-revert-db-" + UUID().uuidString
+        let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-corrupt-revert-repo-")
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(atPath: repoDir)
+        }
+
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let thread = AgentThread(title: "corrupt revert", provider: .codex, model: "gpt-5.5")
+        let run = AgentRunID()
+        try threadRepo.upsert(thread)
+        try runRepo.upsert(AgentRun(id: run, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed))
+        try checkpointRepo.upsert(AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: run,
+            turnId: "turn-corrupt",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:\(run.value.uuidString):turn-corrupt",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0)],
+            fileSnapshots: [AgentTurnCheckpointFileSnapshot(path: "README.md", kind: "modified", contentsBase64: "not-base64")]
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              checkpointRepo: checkpointRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        XCTAssertThrowsError(try coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir))
+        XCTAssertNil(adapter.lastRollback,
+                     "checkpoint revert must prove local snapshots are restorable before rolling back the provider conversation")
+    }
+
+    func test_coordinatorReleasesActiveRunStateAcrossManySequentialTurns() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-long-run-release-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "long", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: PromptEchoRunner()])
+
+        for index in 0..<30 {
+            let runId = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                                       provider: .codex,
+                                                                       model: "fake-model",
+                                                                       cwd: tmp,
+                                                                       prompt: "turn \(index)"))
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                if let run = try? runRepo.get(id: runId),
+                   run.status == .completed,
+                   coordinator.activeThreadIdsSnapshot().isEmpty {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertEqual(try runRepo.get(id: runId)?.status, .completed,
+                           "each long-run turn must finish instead of leaving the Agent App stuck running")
+            XCTAssertTrue(coordinator.activeThreadIdsSnapshot().isEmpty,
+                          "completed turns must be removed from active run tracking so long sessions do not pile up run handles")
+        }
+
+        let messages = try messageRepo.list(threadId: thread.id)
+        XCTAssertEqual(messages.filter { $0.role == .assistant && $0.content.hasPrefix("OK turn ") }.count, 30,
+                       "long sequential sessions must persist one assistant result per completed turn without losing output")
+    }
+
+    func test_coordinator_writesProviderSessionRuntimeForRecovery() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-session-runtime-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "resume", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providers: [.codex: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "OK"))])
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "hi", permissionMode: .autoAcceptEdits, serviceTier: .fast, interactionMode: .plan))
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if case .recoverable(let session)? = try? sessionRepo.recoveryState(threadId: thread.id) {
+                XCTAssertEqual(session.provider, .codex)
+                XCTAssertEqual(session.cwd, tmp)
+                XCTAssertEqual(session.model, "gpt-5.5")
+                XCTAssertEqual(session.serviceTier, .fast)
+                XCTAssertEqual(session.runtimeMode, .autoAcceptEdits)
+                XCTAssertEqual(session.adapterKey, "OneShotProviderAdapter:FakeProviderRunner",
+                               "provider runtime metadata must record the adapter shape for restart recovery diagnostics")
+                XCTAssertEqual(session.binaryIdentity?.hasPrefix("codex:"), true,
+                               "provider runtime metadata must record CLI identity for recovery diagnostics")
+                XCTAssertEqual(session.lastEventKind, "run.finished")
+                XCTAssertEqual(session.resumeCursor?.isEmpty, false,
+                               "finished provider sessions must persist a resume cursor so follow-up prompts do not start a disconnected thread")
+                let payloadData = try XCTUnwrap(session.runtimePayloadJSON?.data(using: .utf8))
+                let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: payloadData) as? [String: Any])
+                XCTAssertEqual(payload["providerThreadId"] as? String, session.resumeCursor,
+                               "runtime payload must carry the provider thread id used by restart recovery")
+                XCTAssertEqual(payload["turnCount"] as? Int, 1,
+                               "runtime payload must count completed turns so resumed CLI sessions do not lose turn history")
+                XCTAssertEqual((payload["lastCompletedTurnId"] as? String)?.isEmpty, false,
+                               "runtime payload must record the last completed provider turn for restart diagnostics")
+                XCTAssertEqual(payload["model"] as? String, "gpt-5.5")
+                XCTAssertEqual(payload["serviceTier"] as? String, "fast")
+                XCTAssertEqual(payload["runtimeMode"] as? String, "auto_accept_edits")
+                XCTAssertEqual(payload["interactionMode"] as? String, "plan",
+                               "runtime payload must persist interaction mode so provider sessions can recover plan/default behavior explicitly")
+                XCTAssertNotNil(payload["updatedAtMs"],
+                                "runtime payload must include a resume timestamp so stale recovery state is visible")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("coordinator must write a recoverable provider session runtime row")
+    }
+
+    func test_coordinatorTracksPendingUserInputIdsInProviderRuntimePayload() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-pending-runtime-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "pending", provider: .claude, model: "claude-haiku-4-5-20251001")
+        try threadRepo.upsert(thread)
+        let adapter = PendingUserInputAdapter()
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.claude: adapter])
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .claude, model: "claude-haiku-4-5-20251001", cwd: tmp, prompt: "ask"))
+
+        try await waitUntil("pending user-input id persisted in runtime payload") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON),
+                  let ids = payload["pendingUserInputRequestIds"] as? [String] else { return false }
+            return ids == ["ask-runtime-1"]
+        }
+
+        try coordinator.respondToUserInput(threadId: thread.id, requestId: "ask-runtime-1", text: "continue")
+
+        try await waitUntil("resolved user-input id removed from runtime payload") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON),
+                  let ids = payload["pendingUserInputRequestIds"] as? [String] else { return false }
+            return ids.isEmpty
+        }
+    }
+
+    func test_coordinatorTracksPendingApprovalIdsInProviderRuntimePayload() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-pending-approval-runtime-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "approval", provider: .claude, model: "claude-haiku-4-5-20251001")
+        try threadRepo.upsert(thread)
+        let adapter = PendingApprovalAdapter()
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.claude: adapter])
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .claude, model: "claude-haiku-4-5-20251001", cwd: tmp, prompt: "approve"))
+
+        try await waitUntil("pending approval id persisted in runtime payload") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON),
+                  let ids = payload["pendingApprovalRequestIds"] as? [String] else { return false }
+            return ids == ["approval-runtime-1"]
+        }
+
+        try coordinator.respondToRequest(threadId: thread.id, requestId: "approval-runtime-1", response: .approveForSession)
+
+        try await waitUntil("resolved approval id removed from runtime payload") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON),
+                  let ids = payload["pendingApprovalRequestIds"] as? [String] else { return false }
+            return ids.isEmpty
+        }
+    }
+
+    func test_coordinatorPersistsClaudeSessionSnapshotRuntimePayload() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-claude-snapshot-runtime-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "claude snapshot", provider: .claude, model: "claude-haiku-4-5-20251001")
+        try threadRepo.upsert(thread)
+        let adapter = ClaudeSessionSnapshotAdapter()
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .claude, model: "claude-haiku-4-5-20251001", cwd: tmp, prompt: "snapshot"))
+
+        try await waitUntil("Claude session snapshot persisted in runtime payload") {
+            guard let session = try? sessionRepo.get(threadId: thread.id),
+                  let payload = Self.runtimePayload(session.runtimePayloadJSON) else { return false }
+            return payload["providerThreadId"] as? String == "claude-sdk-session-1"
+                && payload["lastCompletedTurnId"] as? String == "turn-snapshot-1"
+                && payload["turnCount"] as? Int == 1
+                && payload["activeTurnId"] == nil
+                && payload["claudeResumeSessionAt"] as? String == "assistant-uuid-1"
+                && (payload["claudeInFlightToolIds"] as? [String]) == []
+                && (payload["pendingApprovalRequestIds"] as? [String]) == []
+                && (payload["pendingUserInputRequestIds"] as? [String]) == []
+        }
+    }
+
+    func test_coordinatorPreservesRuntimePayloadWhileStartingFollowupTurn() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-runtime-payload-preserve-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "resume", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-thread-7",
+            cwd: tmp,
+            model: "gpt-5.5",
+            serviceTier: .fast,
+            runtimeMode: .autoAcceptEdits,
+            lastEventKind: "run.finished",
+            runtimePayloadJSON: #"{"turnCount":7,"lastCompletedTurnId":"turn-7"}"#
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex, finishImmediately: false)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .codex,
+                                                           model: "gpt-5.5",
+                                                           cwd: tmp,
+                                                           prompt: "continue"))
+
+        let session = try XCTUnwrap(try sessionRepo.get(threadId: thread.id))
+        XCTAssertEqual(session.status, .running)
+        XCTAssertEqual(session.runtimePayloadJSON, #"{"turnCount":7,"lastCompletedTurnId":"turn-7"}"#,
+                       "starting a follow-up turn must not erase completed-turn recovery payload before the provider emits its next durable cursor")
+        XCTAssertEqual(adapter.lastProviderThreadId, "provider-thread-7")
+    }
+
+    func test_coordinatorUsesRecoverableSessionCursorForFollowupTurn() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-recovery-route-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "resume", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-thread-1",
+            cwd: tmp,
+            model: "gpt-5.5",
+            lastEventKind: "turn.completed"
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "continue"))
+
+        XCTAssertEqual(adapter.lastProviderThreadId, "provider-thread-1",
+                       "follow-up turns must use the persisted provider resume cursor when UI state omits providerThreadId")
+    }
+
+    func test_coordinatorAppliesRecoveredRuntimeModeToFollowupTurn() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-recovery-runtime-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "resume", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-thread-1",
+            cwd: tmp,
+            model: "gpt-5.5",
+            serviceTier: .fast,
+            runtimeMode: .fullAccess,
+            lastEventKind: "turn.completed",
+            runtimePayloadJSON: #"{"interactionMode":"plan","turnCount":2}"#
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .codex,
+                                                           model: "gpt-5.5",
+                                                           cwd: tmp,
+                                                           prompt: "continue"))
+
+        XCTAssertEqual(adapter.lastProviderThreadId, "provider-thread-1")
+        XCTAssertEqual(adapter.lastPermissionMode, .fullAccess,
+                       "restart recovery must apply the persisted runtime mode instead of silently downgrading resumed Codex turns to supervised")
+        XCTAssertEqual(adapter.lastServiceTier, .fast,
+                       "restart recovery must keep the persisted Codex service tier when the UI request omits it")
+        XCTAssertEqual(adapter.lastInteractionMode, .plan,
+                       "restart recovery must keep plan/default mode aligned with the persisted provider session")
+    }
+
+    func test_codexFollowupTurnReusesSameProviderThreadFromPersistedRecoveryState() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-codex-thread-continuity-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "codex continuity", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .codex,
+                                                           model: "gpt-5.5",
+                                                           cwd: tmp,
+                                                           prompt: "first"))
+        let firstProviderThreadId = try await waitForProviderThreadId(threadRepo: threadRepo,
+                                                                      threadId: thread.id)
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .codex,
+                                                           model: "gpt-5.5",
+                                                           cwd: tmp,
+                                                           prompt: "second"))
+
+        XCTAssertEqual(adapter.sendTurnCount, 2)
+        XCTAssertEqual(adapter.lastProviderThreadId, firstProviderThreadId,
+                       "Codex follow-up turns must reuse the persisted provider thread id so multi-turn tasks do not fork into disconnected sessions")
+    }
+
+    func test_coordinatorFailsLoudWhenExistingProviderThreadIsUnrecoverable() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-unrecoverable-route-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "broken", provider: .codex, model: "gpt-5.5", providerThreadId: "provider-thread-1")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: nil,
+            cwd: tmp,
+            model: "gpt-5.5",
+            lastEventKind: "turn.completed"
+        ))
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: SpyProviderAdapter(provider: .codex)])
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "continue"))
+            XCTFail("missing resume data for an existing provider thread must fail loudly instead of silently starting a disconnected session")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("no resume cursor"))
+        }
+    }
+
+    func test_coordinatorUsesLiveAdapterSessionWhenRuntimeCursorIsMissing() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-live-adapter-route-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "live", provider: .codex, model: "gpt-5.5", providerThreadId: "lost-persisted-cursor")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: nil,
+            cwd: tmp,
+            model: "gpt-5.5",
+            lastEventKind: "turn.completed"
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(threadId: thread.id, provider: .codex, status: .completed, providerThreadId: "live-session-1")
+        ]
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "continue live"))
+
+        XCTAssertEqual(adapter.lastProviderThreadId, "live-session-1",
+                       "live adapter sessions must be adopted before declaring missing durable resume data unrecoverable")
+    }
+
+    func test_coordinatorFailsLoudWhenActiveRuntimeSessionHasNoLiveSessionOrCursor() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-stale-active-route-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "stale active", provider: .codex, model: "gpt-5.5", providerThreadId: "provider-thread-1")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: nil,
+            cwd: tmp,
+            model: "gpt-5.5",
+            lastEventKind: "run.started"
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                               provider: .codex,
+                                                               model: "gpt-5.5",
+                                                               cwd: tmp,
+                                                               prompt: "continue stale active"))
+            XCTFail("stale active runtime state without a live adapter session must fail loudly instead of forking a disconnected provider session")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("marked active"),
+                          "error should explain that the active provider session cannot be recovered")
+            XCTAssertEqual(adapter.sendTurnCount, 0,
+                           "coordinator must not start a new provider process when existing thread recovery is unsafe")
+        }
+    }
+
+    func test_coordinatorStopsLiveAdapterSessionWithoutLocalRunHandle() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-stop-live-adapter-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "live stop", provider: .claude, model: "claude-opus-4-7")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .claude, finishImmediately: false)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(threadId: thread.id, provider: .claude, status: .running, providerThreadId: "claude-live-1")
+        ]
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        coordinator.stopRun(threadId: thread.id)
+
+        XCTAssertEqual(adapter.stopSessionCallCount, 1,
+                       "stop must close a live provider adapter session even after local active run state was lost")
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .claude,
+                                                           model: "claude-opus-4-7",
+                                                           cwd: tmp,
+                                                           prompt: "restart after live stop"))
+        XCTAssertEqual(adapter.cancelCount, 0,
+                       "stopping a recovered live provider session must not leave a pending cancellation for the next run")
+    }
+
+    func test_coordinatorRecoversPersistedActiveSessionBeforeInterruptingStop() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-stop-recovered-adapter-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "recovered stop", provider: .codex, model: "gpt-5.5", providerThreadId: "codex-thread-recovered")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: "codex-thread-recovered",
+            cwd: tmp,
+            model: "gpt-5.5",
+            lastEventKind: "turn.started",
+            runtimePayloadJSON: #"{"turnCount":0,"activeTurnId":"turn-active-recovered"}"#
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        coordinator.stopRun(threadId: thread.id)
+
+        XCTAssertEqual(adapter.lastProviderThreadId, "codex-thread-recovered",
+                       "stop after app restart must recover the persisted provider session before interrupting it")
+        XCTAssertEqual(adapter.lastRecoveredExtraArgs, ["remotecode.recovery.activeTurnId=turn-active-recovered"],
+                       "recovery must carry the active provider turn id so Codex app-server can interrupt the exact running turn")
+        XCTAssertEqual(adapter.interruptTurnCallCount, 1,
+                       "stop after app restart must call provider-native interrupt instead of only queuing a local cancellation")
+    }
+
+    func test_coordinator_emitsVisibleErrorWhenLifecyclePersistenceFails() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-persistence-fail-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "deleted", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: DelayedEventRunner()])
+        actor Issues {
+            var messages: [String] = []
+            func append(_ message: String) { messages.append(message) }
+            func containsPersistenceFailure() -> Bool {
+                messages.contains { $0.contains("Persistence failure") }
+            }
+        }
+        let issues = Issues()
+        coordinator.onPersistenceIssue = { message, _, _ in
+            Task { await issues.append(message) }
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "hi"))
+        try threadRepo.delete(id: thread.id)
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if await issues.containsPersistenceFailure() { return }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("lifecycle persistence failures must be surfaced instead of hidden behind try?")
+    }
+
+    func test_coordinatorRoutesTurnsThroughProviderAdapterBoundary() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-provider-adapter-boundary-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "adapter", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "hi"))
+
+        await waitForAdapterSend(adapter)
+        XCTAssertEqual(adapter.sendTurnCount, 1,
+                       "coordinator must route provider execution through the adapter boundary, not spawn a provider runner directly")
+        XCTAssertEqual(adapter.lastPrompt, "hi")
+    }
+
+    func test_coordinatorRoutesApprovalAndUserInputResponsesThroughProviderAdapter() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-provider-adapter-callbacks-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "adapter", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        try coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
+        try coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
+
+        XCTAssertEqual(adapter.lastRequestResponse?.0, thread.id)
+        XCTAssertEqual(adapter.lastRequestResponse?.1, "approval-1")
+        XCTAssertEqual(adapter.lastRequestResponse?.2, .approveForSession)
+        XCTAssertEqual(adapter.lastUserInputResponse?.0, thread.id)
+        XCTAssertEqual(adapter.lastUserInputResponse?.1, "question-1")
+        XCTAssertEqual(adapter.lastUserInputResponse?.2, "Run")
+    }
+
+    func test_coordinatorRoutesReadAndRollbackThroughProviderAdapter() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-provider-adapter-read-rollback-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "adapter", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex)
+        adapter.readEvents = [.turnStarted(turnId: "turn-1")]
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        XCTAssertEqual(try coordinator.readThread(threadId: thread.id), [.turnStarted(turnId: "turn-1")])
+        try coordinator.rollbackThread(threadId: thread.id, toTurnId: "turn-1")
+
+        XCTAssertEqual(adapter.lastRollback?.0, thread.id)
+        XCTAssertEqual(adapter.lastRollback?.1, "turn-1")
+    }
+
+    func test_claudeFirstTurnStartsThroughProviderAdapter() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-claude-first-turn-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "claude", provider: .claude, model: "claude-opus-4-7")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .claude)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .claude,
+                                                           model: "claude-opus-4-7",
+                                                           cwd: tmp,
+                                                           prompt: "start claude"))
+
+        await waitForAdapterSend(adapter)
+        XCTAssertEqual(adapter.sendTurnCount, 1,
+                       "Claude first turns must be routed through the provider adapter boundary so SDK-session integration has one ownership point")
+        XCTAssertEqual(adapter.lastPrompt, "start claude")
+        XCTAssertNil(adapter.lastProviderThreadId,
+                     "a new Claude session must start without accidentally borrowing a stale provider thread id")
+    }
+
+    func test_claudeRecoveryAfterStopAllUsesPersistedResumeState() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-claude-resume-after-stopall-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "claude", provider: .claude, model: "claude-opus-4-7")
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .claude,
+            status: .completed,
+            resumeCursor: "claude-session-1",
+            cwd: tmp,
+            model: "claude-opus-4-7",
+            lastEventKind: "turn.completed"
+        ))
+        let adapter = SpyProviderAdapter(provider: .claude)
+        adapter.stopAll()
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .claude,
+                                                           model: "claude-opus-4-7",
+                                                           cwd: tmp,
+                                                           prompt: "resume claude"))
+
+        await waitForAdapterSend(adapter)
+        XCTAssertTrue(adapter.stopAllCalled,
+                      "the test must simulate provider runtime loss before recovery")
+        XCTAssertEqual(adapter.lastProviderThreadId, "claude-session-1",
+                       "Claude recovery must use persisted resume state after provider stopAll instead of starting a disconnected thread")
+    }
+
+    func test_claudeCallbacksReadAndRollbackRouteThroughProviderAdapter() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-claude-callback-read-rollback-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "claude", provider: .claude, model: "claude-opus-4-7")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .claude)
+        adapter.readEvents = [.turnStarted(turnId: "claude-turn-1")]
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        try coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
+        try coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
+        XCTAssertEqual(try coordinator.readThread(threadId: thread.id), [.turnStarted(turnId: "claude-turn-1")])
+        try coordinator.rollbackThread(threadId: thread.id, toTurnId: "claude-turn-1")
+
+        XCTAssertEqual(adapter.lastRequestResponse?.2, .approveForSession,
+                       "Claude approval responses must route through the provider adapter")
+        XCTAssertEqual(adapter.lastUserInputResponse?.2, "Run",
+                       "Claude user input responses must route through the provider adapter")
+        XCTAssertEqual(adapter.lastRollback?.1, "claude-turn-1",
+                       "Claude rollback/revert must route through the provider adapter")
+    }
+
+    func test_claudeStopRunCancelsActiveProviderHandle() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-claude-interrupt-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "claude", provider: .claude, model: "claude-opus-4-7")
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .claude, finishImmediately: false)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .claude,
+                                                           model: "claude-opus-4-7",
+                                                           cwd: tmp,
+                                                           prompt: "stop claude"))
+        await waitForAdapterSend(adapter)
+        coordinator.stopRun(threadId: thread.id)
+
+        XCTAssertEqual(adapter.cancelCount, 1,
+                       "Claude interrupt/stop must cancel the active provider handle so long-running sessions do not keep working after user stop")
+    }
+
+    func test_claudeCliAdapterKeepsReadableThreadHistoryAndRollsBackLocalSnapshot() async throws {
+        let adapter = ClaudeCLIAdapter(runner: ScriptedClaudeRunner())
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(threadId: threadId,
+                                                       provider: .claude,
+                                                       model: "claude-opus-4-7",
+                                                       cwd: NSTemporaryDirectory(),
+                                                       prompt: "one")) { _ in }
+
+        let providerThreadId = try await waitForProviderThreadId(adapter: adapter, threadId: threadId)
+        _ = try await adapter.sendTurn(AgentRunRequest(threadId: threadId,
+                                                       provider: .claude,
+                                                       model: "claude-opus-4-7",
+                                                       cwd: NSTemporaryDirectory(),
+                                                       prompt: "two",
+                                                       providerThreadId: providerThreadId)) { _ in }
+        try await waitForReadableTurn(adapter: adapter, threadId: threadId, turnId: "turn-two")
+
+        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(\.completedTurnId), ["turn-one", "turn-two"],
+                       "Claude CLI sessions must expose readable turn history for Agent App reload instead of leaving readThread unsupported")
+
+        try adapter.rollbackThread(threadId: threadId, toTurnId: "turn-one")
+
+        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(\.completedTurnId), ["turn-one"],
+                       "Claude local rollback must trim the readable snapshot so checkpoint/revert UI does not show abandoned later turns")
+    }
+
+    func test_claudeCliAdapterKeepsReadableThreadHistoryBoundedForLongSessions() async throws {
+        let adapter = ClaudeCLIAdapter(runner: ScriptedClaudeRunner(), maxReadableEvents: 4)
+        let threadId = AgentThreadID()
+        var providerThreadId: String?
+
+        for prompt in ["one", "two", "three"] {
+            _ = try await adapter.sendTurn(AgentRunRequest(threadId: threadId,
+                                                           provider: .claude,
+                                                           model: "claude-opus-4-7",
+                                                           cwd: NSTemporaryDirectory(),
+                                                           prompt: prompt,
+                                                           providerThreadId: providerThreadId)) { _ in }
+            providerThreadId = try await waitForProviderThreadId(adapter: adapter, threadId: threadId)
+            try await waitForReadableTurn(adapter: adapter, threadId: threadId, turnId: "turn-\(prompt)")
+        }
+
+        let readable = try adapter.readThread(threadId: threadId)
+        XCTAssertLessThanOrEqual(readable.count, 4,
+                                 "Claude CLI readable snapshots must be bounded so long-running sessions do not retain every provider event in memory")
+        XCTAssertTrue(readable.contains { $0.completedTurnId == "turn-three" },
+                      "retention must keep the newest Claude turn visible after pruning older events")
+        XCTAssertFalse(readable.contains { $0.completedTurnId == "turn-one" },
+                       "retention should prune oldest Claude events once the readable window is full")
+    }
+
+    private func waitForAdapterSend(_ adapter: SpyProviderAdapter) async {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if adapter.sendTurnCount > 0 { return }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func waitForProviderThreadId(threadRepo: AgentThreadRepository, threadId: AgentThreadID) async throws -> String {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let providerThreadId = try threadRepo.get(id: threadId)?.providerThreadId,
+               !providerThreadId.isEmpty {
+                return providerThreadId
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("timed out waiting for persisted provider thread id")
+        return ""
+    }
+
+    private func waitForProviderThreadId(adapter: ClaudeCLIAdapter, threadId: AgentThreadID) async throws -> String {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let providerThreadId = adapter.listSessions().first(where: { $0.threadId == threadId })?.providerThreadId,
+               !providerThreadId.isEmpty {
+                return providerThreadId
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("timed out waiting for Claude CLI adapter provider thread id")
+        return ""
+    }
+
+    private func waitForReadableTurn(adapter: ClaudeCLIAdapter, threadId: AgentThreadID, turnId: String) async throws {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if ((try? adapter.readThread(threadId: threadId)) ?? []).contains(where: { $0.completedTurnId == turnId }) {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("timed out waiting for readable Claude turn \(turnId)")
+    }
+
+    private func waitUntil(_ message: String, condition: @escaping () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("timed out waiting for \(message)")
+    }
+
+    private static func runtimePayload(_ json: String?) -> [String: Any]? {
+        guard let json,
+              let data = json.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+}
+
+private extension AssistantEvent {
+    var completedTurnId: String? {
+        if case .turnCompleted(let turnId, _) = self { return turnId }
+        return nil
+    }
+}
+
+private final class DelayedEventRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        Task.detached {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let turnId = UUID().uuidString
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: turnId)))
+            onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "late")))
+            onEvent(.finished(.completed, finalMessage: "late", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class PromptEchoRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let turnId = UUID().uuidString
+            let answer = "OK \(request.prompt)"
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: turnId)))
+            onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: answer)))
+            onEvent(.finished(.completed, finalMessage: answer, providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class ScriptedClaudeRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .claude
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? "claude-session-test"
+            let turnId = "turn-\(request.prompt)"
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            onEvent(.event(.turnStarted(turnId: turnId)))
+            onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "OK \(request.prompt)")))
+            onEvent(.finished(.completed, finalMessage: "OK \(request.prompt)", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    let finishImmediately: Bool
+    private let lock = NSLock()
+    private var _sendTurnCount = 0
+    private var _cancelCount = 0
+    private var _stopAllCalled = false
+    private var _lastPrompt: String?
+    private var _lastProviderThreadId: String?
+    private var _lastPermissionMode: AgentPermissionMode?
+    private var _lastServiceTier: AgentServiceTier?
+    private var _lastInteractionMode: AgentInteractionMode?
+    private var _lastRequestResponse: (AgentThreadID, String, AgentProviderRequestResponse)?
+    private var _lastUserInputResponse: (AgentThreadID, String, String)?
+    private var _interruptTurnCallCount = 0
+    private var _lastRecoveredExtraArgs: [String] = []
+    var readEvents: [AssistantEvent] = []
+    var sessionSummaries: [AgentProviderSessionSummary] = []
+    private var _stopSessionCallCount = 0
+    private var _lastRollback: (AgentThreadID, String)?
+
+    var sendTurnCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _sendTurnCount
+    }
+    var cancelCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _cancelCount
+    }
+    var stopAllCalled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _stopAllCalled
+    }
+    var lastPrompt: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastPrompt
+    }
+    var lastProviderThreadId: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastProviderThreadId
+    }
+    var lastPermissionMode: AgentPermissionMode? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastPermissionMode
+    }
+    var lastServiceTier: AgentServiceTier? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastServiceTier
+    }
+    var lastInteractionMode: AgentInteractionMode? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastInteractionMode
+    }
+    var lastRequestResponse: (AgentThreadID, String, AgentProviderRequestResponse)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastRequestResponse
+    }
+    var lastUserInputResponse: (AgentThreadID, String, String)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastUserInputResponse
+    }
+    var lastRollback: (AgentThreadID, String)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastRollback
+    }
+    var stopSessionCallCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _stopSessionCallCount
+    }
+    var interruptTurnCallCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _interruptTurnCallCount
+    }
+    var lastRecoveredExtraArgs: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _lastRecoveredExtraArgs
+    }
+
+    init(provider: AgentProvider, finishImmediately: Bool = true) {
+        self.provider = provider
+        self.finishImmediately = finishImmediately
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        lock.lock()
+        _sendTurnCount += 1
+        _lastPrompt = request.prompt
+        _lastProviderThreadId = request.providerThreadId
+        _lastPermissionMode = request.permissionMode
+        _lastServiceTier = request.serviceTier
+        _lastInteractionMode = request.interactionMode
+        lock.unlock()
+        if finishImmediately {
+            Task.detached {
+                let providerThreadId = request.providerThreadId ?? UUID().uuidString
+                onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+                onEvent(.finished(.completed, finalMessage: nil, providerThreadId: providerThreadId))
+            }
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+            self?.lock.lock()
+            self?._cancelCount += 1
+            self?.lock.unlock()
+        }
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {
+        lock.lock()
+        _interruptTurnCallCount += 1
+        lock.unlock()
+    }
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        lock.lock()
+        _lastRequestResponse = (threadId, requestId, response)
+        lock.unlock()
+    }
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        lock.lock()
+        _lastUserInputResponse = (threadId, requestId, text)
+        lock.unlock()
+    }
+    func stopSession(threadId: AgentThreadID) throws {
+        lock.lock()
+        _stopSessionCallCount += 1
+        sessionSummaries.removeAll { $0.threadId == threadId }
+        lock.unlock()
+    }
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+        lock.lock()
+        _lastProviderThreadId = request.providerThreadId
+        _lastRecoveredExtraArgs = request.extraArgs
+        sessionSummaries.append(AgentProviderSessionSummary(threadId: request.threadId, provider: provider, status: .completed, providerThreadId: request.providerThreadId))
+        lock.unlock()
+    }
+    func listSessions() -> [AgentProviderSessionSummary] {
+        lock.lock(); defer { lock.unlock() }
+        return sessionSummaries
+    }
+    func hasSession(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessionSummaries.contains { $0.threadId == threadId }
+    }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { readEvents }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+        lock.lock()
+        _lastRollback = (threadId, toTurnId)
+        lock.unlock()
+    }
+    func stopAll() {
+        lock.lock()
+        _stopAllCalled = true
+        lock.unlock()
+    }
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class PendingUserInputAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider = .claude
+    private let lock = NSLock()
+    private var callbacks: [AgentThreadID: @Sendable (AgentRunEvent) -> Void] = [:]
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        lock.lock()
+        callbacks[request.threadId] = onEvent
+        lock.unlock()
+        Task.detached {
+            onEvent(.event(.threadStarted(threadId: "claude-runtime-session", providerThreadId: "claude-runtime-session")))
+            onEvent(.event(.turnStarted(turnId: "turn-runtime-1")))
+            onEvent(.event(.userInputRequested(AssistantUserInputRequest(
+                id: "ask-runtime-1",
+                turnId: "turn-runtime-1",
+                prompt: "Continue?",
+                options: ["yes", "no"],
+                createdAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            ))))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        lock.lock()
+        let callback = callbacks[threadId]
+        lock.unlock()
+        callback?(.event(.userInputResolved(requestId: requestId, answer: text)))
+    }
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { false }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class PendingApprovalAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider = .claude
+    private let lock = NSLock()
+    private var callbacks: [AgentThreadID: @Sendable (AgentRunEvent) -> Void] = [:]
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        lock.lock()
+        callbacks[request.threadId] = onEvent
+        lock.unlock()
+        Task.detached {
+            onEvent(.event(.threadStarted(threadId: "claude-approval-session", providerThreadId: "claude-approval-session")))
+            onEvent(.event(.turnStarted(turnId: "turn-approval-1")))
+            onEvent(.event(.requestOpened(AssistantPendingRequest(
+                id: "approval-runtime-1",
+                turnId: "turn-approval-1",
+                kind: .commandExecution,
+                title: "Run shell command?",
+                detail: "swift test",
+                createdAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            ))))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        lock.lock()
+        let callback = callbacks[threadId]
+        lock.unlock()
+        callback?(.event(.requestResolved(requestId: requestId, state: .approved)))
+    }
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { false }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class ClaudeSessionSnapshotAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider = .claude
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        Task.detached {
+            onEvent(.event(.threadStarted(threadId: "claude-sdk-session-1", providerThreadId: "claude-sdk-session-1")))
+            onEvent(.event(.turnStarted(turnId: "turn-snapshot-1")))
+            let startedPayload = """
+            {"activeTurnId":"turn-snapshot-1","providerThreadId":"claude-sdk-session-1","resume":"claude-sdk-session-1","resumeSessionAt":"assistant-uuid-1","turnCount":0,"inFlightToolIds":["tool-1"],"pendingApprovalRequestIds":["approval-1"],"pendingUserInputRequestIds":[],"model":"claude-haiku-4-5-20251001"}
+            """
+            onEvent(.event(.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json.session",
+                method: "claude.session.snapshot",
+                providerTurnId: "turn-snapshot-1",
+                payloadJSON: startedPayload,
+                receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            ))))
+            let completedPayload = """
+            {"providerThreadId":"claude-sdk-session-1","resume":"claude-sdk-session-1","resumeSessionAt":"assistant-uuid-1","lastCompletedTurnId":"turn-snapshot-1","turnCount":1,"inFlightToolIds":[],"pendingApprovalRequestIds":[],"pendingUserInputRequestIds":[],"model":"claude-haiku-4-5-20251001"}
+            """
+            onEvent(.event(.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json.session",
+                method: "claude.session.snapshot",
+                providerTurnId: "turn-snapshot-1",
+                payloadJSON: completedPayload,
+                receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            ))))
+            onEvent(.event(.turnCompleted(turnId: "turn-snapshot-1", finalMessage: "OK snapshot")))
+            onEvent(.finished(.completed, finalMessage: "OK snapshot", providerThreadId: "claude-sdk-session-1"))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { false }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }

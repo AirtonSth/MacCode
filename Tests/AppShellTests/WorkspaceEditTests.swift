@@ -29,6 +29,27 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertNil(ctx.state.workspaces[ws.id]?.metadata["description"])
     }
 
+    func test_agentAttachmentUploadWritesMobileImportIntoWorkspace() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RC2AttachmentUpload-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let (_, router) = try make()
+        let ws = try router.createWorkspace(name: "w", cwd: dir.path)
+
+        let uploaded = try router.uploadAgentAttachment(
+            workspace: ws.id,
+            filename: "../mobile note.txt",
+            mimeType: "text/plain",
+            dataBase64: Data("hello from ios".utf8).base64EncodedString()
+        )
+
+        XCTAssertTrue(uploaded.path.hasPrefix(dir.appendingPathComponent(".remotecode/attachments").path),
+                      "iOS imports must be copied into the host workspace before they are sent as provider attachments")
+        XCTAssertEqual(uploaded.displayName, "mobile note.txt")
+        XCTAssertEqual(uploaded.sizeBytes, 14)
+        XCTAssertEqual(try String(contentsOfFile: uploaded.path), "hello from ios")
+    }
+
     func test_workspacePinAndDragOrder_useSharedWindowOrder() throws {
         let (ctx, router) = try make()
         let first = try router.createWorkspace(name: "one", cwd: "/tmp")

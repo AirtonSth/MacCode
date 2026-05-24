@@ -67,13 +67,13 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         // earlier ids (gpt-5/gpt-5-codex/o3) are dead on this CLI and made
         // `codex --model …` fail with no output.
         [
-            AgentModelDescriptor(id: "", label: "Default (account)", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5.4-mini", label: "GPT-5.4-Mini", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5.3-codex", label: "GPT-5.3-Codex", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark", provider: .codex, supportsReasoning: true),
-            AgentModelDescriptor(id: "gpt-5.2", label: "GPT-5.2", provider: .codex, supportsReasoning: true)
+            AgentModelDescriptor(id: "", label: "Default (account)", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.4-mini", label: "GPT-5.4-Mini", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.3-codex", label: "GPT-5.3-Codex", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.3-codex-spark", label: "GPT-5.3-Codex-Spark", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.2", label: "GPT-5.2", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true)
         ]
     }
 
@@ -95,25 +95,34 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if let r = request.reasoningEffort?.rawValue {
             args += ["-c", "model_reasoning_effort=\"\(r)\""]
         }
+        if request.serviceTier == .fast {
+            args += ["-c", "model_service_tier=\"fast\""]
+        }
         if !resuming {
             let model = request.model.trimmingCharacters(in: .whitespaces)
             if !model.isEmpty, model.lowercased() != "default" {
                 args += ["--model", model]
             }
             switch request.permissionMode {
-            case .supervised:      args += ["--sandbox", "read-only"]
-            case .autoAcceptEdits: args += ["--sandbox", "workspace-write"]
-            case .fullAccess:      args += ["--sandbox", "danger-full-access"]
+            case .supervised:
+                args += ["-c", #"approval_policy="untrusted""#, "--sandbox", "read-only"]
+            case .autoAcceptEdits:
+                args += ["-c", #"approval_policy="never""#, "--sandbox", "workspace-write"]
+            case .fullAccess:
+                args += ["-c", #"approval_policy="never""#, "--sandbox", "danger-full-access"]
             }
+        }
+        for attachment in request.attachments where attachment.kind == .image {
+            args += ["--image", attachment.path]
         }
         args += request.extraArgs
         if resuming, let ptid { args.append(ptid) }   // SESSION_ID before PROMPT
-        args.append(request.prompt)
+        args.append(request.providerPrompt)
         return args
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        let binary = binaryNameOverride ?? "codex"
+        let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? request.providerBinary! : (binaryNameOverride ?? "codex")
         guard let path = ProcessLocator.resolve(binary) else {
             onEvent(.error("\(binary) not found in PATH"))
             onEvent(.finished(.failed, finalMessage: nil, providerThreadId: nil))
@@ -126,6 +135,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
         proc.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
+        proc.environment = Self.processEnvironment(overrides: request.environment)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
@@ -137,15 +147,23 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
         let cancelFlag = AgentCancelFlag()
+        let emitLine: (String) -> Void = { line in
+            if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .codex, source: "codex.exec.json") {
+                let ev = AssistantEvent.providerRuntime(runtimeEvent)
+                timeline.apply(ev)
+                onEvent(.event(ev))
+            }
+            for ev in parser.parseLine(line) {
+                timeline.apply(ev)
+                onEvent(.event(ev))
+            }
+        }
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty { return }
             for line in outBuf.take(data) {
-                for ev in parser.parseLine(line) {
-                    timeline.apply(ev)
-                    onEvent(.event(ev))
-                }
+                emitLine(line)
             }
         }
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -153,6 +171,11 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             if data.isEmpty { return }
             let s = String(data: data, encoding: .utf8) ?? ""
             if let visible = Self.displayableStderr(s) {
+                onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(
+                    message: visible,
+                    provider: .codex,
+                    source: "codex.exec.stderr"
+                ))))
                 onEvent(.error("[codex stderr] " + visible))
             }
         }
@@ -166,10 +189,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             // `turn.completed` (and the answer) is regularly lost.
             let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
             for line in outBuf.take(tail) + outBuf.flush() {
-                for ev in parser.parseLine(line) {
-                    timeline.apply(ev)
-                    onEvent(.event(ev))
-                }
+                emitLine(line)
             }
             let status: AgentRunStatus
             if cancelFlag.isCancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
@@ -200,13 +220,11 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public static func displayableStderr(_ raw: String) -> String? {
-        let kept = raw.split(whereSeparator: \.isNewline).map(String.init).filter { line in
-            let lower = line.lowercased()
-            return !(lower.contains(" warn ") && lower.contains("codex"))
-                && !lower.contains("reading additional input from stdin")
-        }
-        let text = kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
+        ProviderStderrClassifier.displayableStderr(raw, provider: .codex)
+    }
+
+    public static func processEnvironment(overrides: [String: String], base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        base.merging(overrides) { _, override in override }
     }
 }
 

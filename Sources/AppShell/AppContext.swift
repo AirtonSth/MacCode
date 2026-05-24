@@ -18,6 +18,11 @@ public final class AppContext {
     public let settingsRepo: SettingsRepository
     public let eventLog: EventLogRepository
     public let terminalOutputRepo: TerminalOutputRepository
+    public let providerSessionRuntimeRepo: ProviderSessionRuntimeRepository
+    public let commandReceiptRepo: CommandReceiptRepository
+    public let providerPendingCallbackRepo: ProviderPendingCallbackRepository
+    public let proposedPlanRepo: AgentProposedPlanRepository
+    public let turnCheckpointRepo: AgentTurnCheckpointRepository
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()
@@ -40,19 +45,46 @@ public final class AppContext {
         self.settingsRepo = SettingsRepository(db: db)
         self.eventLog = EventLogRepository(db: db)
         self.terminalOutputRepo = TerminalOutputRepository(db: db)
-        let codex = CodexRunner(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
-        let claude = ClaudeRunner(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
+        self.providerSessionRuntimeRepo = ProviderSessionRuntimeRepository(db: db)
+        self.commandReceiptRepo = CommandReceiptRepository(db: db)
+        self.providerPendingCallbackRepo = ProviderPendingCallbackRepository(db: db)
+        self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
+        let codex = CodexAppServerAdapter(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
+        let claude: AgentProviderAdapter = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0"
+            ? ClaudeStreamingCLIAdapter(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
+            : ClaudeAgentSDKBridgeAdapter()
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
-            providers: [.codex: codex, .claude: claude]
+            providerSessionRepo: providerSessionRuntimeRepo,
+            checkpointRepo: turnCheckpointRepo,
+            providerAdapters: [.codex: codex, .claude: claude]
         )
         try coordinator.reconcileOnLaunch()
+        _ = try providerPendingCallbackRepo.markOpenStale(
+            reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
+        )
 
         // GAP-7: stream agent run lifecycle + timeline to the network
         // event bus so the iOS mirror renders agent output in real time
         // (kinds/payloads match the iOS MirrorEventReducer contract).
         func itemJSON(_ item: AssistantItem) -> JSONValue {
             (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(item))) ?? .null
+        }
+        func runtimeEventPayload(_ event: ProviderRuntimeEvent, threadId: String) -> JSONValue {
+            var payload: [String: JSONValue] = [
+                "thread_id": .string(threadId),
+                "id": .string(event.id),
+                "provider": .string(event.provider.rawValue),
+                "source": .string(event.source),
+                "method": .string(event.method),
+                "payload_json": .string(event.payloadJSON),
+                "received_at_ms": .number(Double(event.receivedAtMs))
+            ]
+            if let turn = event.providerTurnId { payload["provider_turn_id"] = .string(turn) }
+            if let item = event.providerItemId { payload["provider_item_id"] = .string(item) }
+            if let request = event.providerRequestId { payload["provider_request_id"] = .string(request) }
+            return .object(payload)
         }
         func messageJSON(_ message: AgentMessage) -> JSONValue {
             (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(message))) ?? .null
@@ -93,13 +125,90 @@ public final class AppContext {
                     EventBus.shared.publish(kind: "agent.item.completed",
                                             payload: .object(["thread_id": .string(t), "item_id": .string(itemId)]))
                 }
-            case .itemCompleted(let itemId, _):
+            case .itemProgress(let itemId, let progress):
+                var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
+                if let progress { p["progress"] = .number(progress) }
+                EventBus.shared.publish(kind: "agent.item.progress", payload: .object(p))
+            case .itemCompleted(let itemId, let state):
                 EventBus.shared.publish(kind: "agent.item.completed",
-                                        payload: .object(["thread_id": .string(t), "item_id": .string(itemId)]))
+                                        payload: .object(["thread_id": .string(t), "item_id": .string(itemId), "state": .string(state.rawValue)]))
             case .turnCompleted(let turnId, let final):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "turn_id": .string(turnId)]
                 if let f = final { p["final"] = .string(f) }
                 EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
+            case .proposedPlan(let plan):
+                try? self.proposedPlanRepo.upsert(threadId: tid, plan: plan)
+                EventBus.shared.publish(kind: "agent.plan.proposed", payload: .object([
+                    "thread_id": .string(t),
+                    "plan_id": .string(plan.id),
+                    "markdown": .string(plan.markdown)
+                ]))
+            case .activePlanUpdated(let plan):
+                var payload: [String: JSONValue] = [
+                    "thread_id": .string(t),
+                    "steps": .array(plan.steps.map { step in
+                        .object([
+                            "id": .string(step.id),
+                            "title": .string(step.title),
+                            "status": .string(step.status.rawValue)
+                        ])
+                    }),
+                    "updated_at_ms": .number(Double(plan.updatedAtMs))
+                ]
+                if let explanation = plan.explanation { payload["explanation"] = .string(explanation) }
+                EventBus.shared.publish(kind: "agent.plan.active_updated", payload: .object(payload))
+            case .requestOpened(let request):
+                try? self.providerPendingCallbackRepo.record(threadId: tid, request: request)
+                EventBus.shared.publish(kind: "agent.request.opened", payload: .object([
+                    "thread_id": .string(t),
+                    "request_id": .string(request.id),
+                    "kind": .string(request.kind.rawValue),
+                    "title": .string(request.title),
+                    "detail": request.detail.map(JSONValue.string) ?? .null
+                ]))
+            case .requestResolved(let requestId, let state):
+                try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .approval, state: state)
+                EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
+                    "thread_id": .string(t),
+                    "request_id": .string(requestId),
+                    "state": .string(state.rawValue)
+                ]))
+            case .userInputRequested(let request):
+                try? self.providerPendingCallbackRepo.record(threadId: tid, userInput: request)
+                EventBus.shared.publish(kind: "agent.user_input.requested", payload: .object([
+                    "thread_id": .string(t),
+                    "request_id": .string(request.id),
+                    "prompt": .string(request.prompt),
+                    "options": .array(request.options.map(JSONValue.string)),
+                    "allows_multiple_selection": .bool(request.allowsMultipleSelection),
+                    "is_secret": .bool(request.isSecret)
+                ]))
+            case .userInputResolved(let requestId, let answer):
+                try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .userInput, state: .resolved)
+                EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+                    "thread_id": .string(t),
+                    "request_id": .string(requestId),
+                    "answer": answer.map(JSONValue.string) ?? .null
+                ]))
+            case .tokenUsage(let usage):
+                var p: [String: JSONValue] = [
+                    "thread_id": .string(t),
+                    "input_tokens": .number(Double(usage.inputTokens)),
+                    "output_tokens": .number(Double(usage.outputTokens)),
+                    "total_tokens": .number(Double(usage.totalTokens))
+                ]
+                if let window = usage.contextWindow { p["context_window"] = .number(Double(window)) }
+                if let compactsAutomatically = usage.compactsAutomatically {
+                    p["compacts_automatically"] = .bool(compactsAutomatically)
+                }
+                EventBus.shared.publish(kind: "agent.thread.token_usage", payload: .object(p))
+            case .contextCompaction(let summary):
+                EventBus.shared.publish(kind: "agent.context.compaction", payload: .object([
+                    "thread_id": .string(t),
+                    "summary": summary.map(JSONValue.string) ?? .null
+                ]))
+            case .providerRuntime(let event):
+                EventBus.shared.publish(kind: "agent.provider_runtime.event", payload: runtimeEventPayload(event, threadId: t))
             case .error:
                 EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid))
             }
@@ -164,5 +273,22 @@ public final class AppContext {
         pendingSave = nil
         let snap = SessionSnapshot(layout: state)
         _ = try? snapshotRepo.save(snap)
+    }
+
+    @discardableResult
+    public func reapIdleProviderSessions(now: Date = Date(), idleAge: TimeInterval = 6 * 60 * 60) throws -> ProviderSessionReaperResult {
+        let cutoff = now.addingTimeInterval(-idleAge)
+        let activeThreadIds = Set(
+            try threadRepo.list().filter { thread in
+                thread.status == .running
+            }.map(\.id)
+        )
+        let reaper = ProviderSessionReaper(
+            sessionRepo: providerSessionRuntimeRepo,
+            pendingCallbackRepo: providerPendingCallbackRepo
+        ) {
+            activeThreadIds
+        }
+        return try reaper.reapIdleSessions(olderThan: cutoff)
     }
 }

@@ -102,28 +102,86 @@ final class FakeRouter: CommandRouting {
             return $0.updatedAt > $1.updatedAt
         }
     }
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort) throws -> AgentThread {
-        let thread = AgentThread(workspaceId: workspace, title: title, provider: provider, model: model,
-                                 permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
+        let thread = AgentThread(workspaceId: workspace, title: title, provider: provider,
+                                 providerInstanceId: providerInstanceId,
+                                 model: model,
+                                 permissionMode: permissionMode, reasoningEffort: reasoningEffort,
+                                 serviceTier: serviceTier, modelSelection: modelSelection)
         threadStore.append(thread)
         return thread
     }
     var lastSendPermission: AgentPermissionMode?
     var lastSendReasoning: AgentReasoningEffort?
+    var lastSendServiceTier: AgentServiceTier?
+    var lastSendInteractionMode: AgentInteractionMode?
+    var lastSendText: String?
+    var lastSendAttachments: [AgentAttachment] = []
+    var lastImplementedPlan: (AgentThreadID, String, AgentThreadID)?
+    var lastSavedPlan: (AgentThreadID, String, String?, String?)?
+    var sendAgentMessageCallCount = 0
+    var commandReceipts: [String: JSONValue] = [:]
+    var lastAgentRequestResponse: (AgentThreadID, String, AgentProviderRequestResponse)?
+    var respondAgentRequestCallCount = 0
+    var lastAgentUserInputResponse: (AgentThreadID, String, String)?
+    var respondAgentUserInputCallCount = 0
+    var readAgentEvents: [AssistantEvent] = []
+    var pendingCallbackSnapshot = AssistantPendingCallbacksSnapshot()
+    var lastRollback: (AgentThreadID, String)?
+    var rollbackCallCount = 0
+    var lastCheckpointRevert: (AgentThreadID, Int)?
+    var checkpointRevertCallCount = 0
+    var stopAgentRunCallCount = 0
+    var checkpointStore: [AgentTurnCheckpointSummary] = []
     var messageStore: [AgentMessage] = []
-    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) throws -> AgentThread {
+    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         if let provider, provider != threadStore[idx].provider {
             threadStore[idx].provider = provider
+            threadStore[idx].providerInstanceId = provider.rawValue
             threadStore[idx].providerThreadId = nil
         }
+        if let providerInstanceId { threadStore[idx].providerInstanceId = providerInstanceId }
         if let model, model != threadStore[idx].model {
+            let canSwitchModelInSession = threadStore[idx].provider == .claude && threadStore[idx].providerThreadId?.isEmpty == false
             threadStore[idx].model = model
-            threadStore[idx].providerThreadId = nil
+            if !canSwitchModelInSession {
+                threadStore[idx].providerThreadId = nil
+            }
         }
         if let permissionMode { threadStore[idx].permissionMode = permissionMode }
         if let reasoningEffort { threadStore[idx].reasoningEffort = reasoningEffort }
+        if let serviceTier { threadStore[idx].serviceTier = serviceTier }
+        if let modelSelection { threadStore[idx].modelSelection = modelSelection }
         return threadStore[idx]
+    }
+    func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread {
+        guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+        threadStore[idx].executionMode = executionMode
+        threadStore[idx].baseBranch = baseBranch
+        if executionMode == .local { threadStore[idx].worktreePath = nil }
+        return threadStore[idx]
+    }
+    var lastPreparedPullRequest: (WorkspaceID, String)?
+    func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
+        lastPreparedPullRequest = (workspace, url)
+        let thread = AgentThread(workspaceId: workspace, title: "PR #7: acme/widget", provider: provider,
+                                 providerInstanceId: providerInstanceId,
+                                 model: model,
+                                 permissionMode: permissionMode,
+                                 reasoningEffort: reasoningEffort,
+                                 executionMode: .worktree,
+                                 baseBranch: "rc-pr/github-com/acme-widget-7",
+                                 worktreePath: "/tmp/rc-pr-7",
+                                 serviceTier: serviceTier,
+                                 modelSelection: modelSelection)
+        threadStore.append(thread)
+        return thread
+    }
+    func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult {
+        guard let data = Data(base64Encoded: dataBase64) else { throw JSONRPCError.invalidParams }
+        let path = "/tmp/remotecode-attachments/\(filename)"
+        return AgentAttachmentUploadResult(path: path, displayName: filename, kind: filename.hasSuffix(".png") ? .image : .file, mimeType: mimeType, sizeBytes: data.count)
     }
     var selectedThread: AgentThreadID?
     func selectAgentThread(thread: AgentThreadID) throws {
@@ -133,30 +191,132 @@ final class FakeRouter: CommandRouting {
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
     }
-    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?) async throws -> AgentRunID {
-        _ = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort)
+    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentRunID {
+        sendAgentMessageCallCount += 1
+        lastSendText = text
+        lastSendInteractionMode = interactionMode
+        lastSendAttachments = attachments
+        _ = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
         lastSendPermission = threadStore.first(where: { $0.id == thread })?.permissionMode
         lastSendReasoning = threadStore.first(where: { $0.id == thread })?.reasoningEffort
+        lastSendServiceTier = threadStore.first(where: { $0.id == thread })?.serviceTier
         return AgentRunID()
     }
-    func stopAgentRun(thread: AgentThreadID) throws {}
+    func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID) {
+        let target: AgentThread
+        if newThread {
+            target = try createAgentThread(workspace: threadStore.first(where: { $0.id == thread })?.workspaceId,
+                                           title: "Implement plan",
+                                           provider: provider ?? .codex,
+                                           model: model ?? "fake-model",
+                                           permissionMode: permissionMode ?? .supervised,
+                                           reasoningEffort: reasoningEffort ?? .medium,
+                                           serviceTier: serviceTier ?? .auto,
+                                           modelSelection: modelSelection,
+                                           providerInstanceId: nil)
+        } else {
+            guard let existing = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
+            target = existing
+        }
+        let runId = try await sendAgentMessage(thread: target.id,
+                                               text: AgentPlanImplementationPrompt.make(markdown: planMarkdown ?? ""),
+                                               provider: provider,
+                                               model: model,
+                                               permissionMode: permissionMode,
+                                               reasoningEffort: reasoningEffort,
+                                               serviceTier: serviceTier,
+                                               interactionMode: .default,
+                                               modelSelection: modelSelection,
+                                               providerInstanceId: nil,
+                                               attachments: [])
+        lastImplementedPlan = (thread, planId, target.id)
+        return (runId, target.id)
+    }
+    func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String) {
+        lastSavedPlan = (thread, planId, planMarkdown, relativePath)
+        return ("/tmp/\(relativePath ?? "plan.md")", relativePath ?? ".remotecode/plans/plan.md")
+    }
+    func commandReceipt(method: String, clientRequestId: String) -> JSONValue? {
+        commandReceipts["\(method):\(clientRequestId)"]
+    }
+    func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue) {
+        commandReceipts["\(method):\(clientRequestId)"] = result
+    }
+    func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        respondAgentRequestCallCount += 1
+        lastAgentRequestResponse = (thread, requestId, response)
+    }
+    func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws {
+        respondAgentUserInputCallCount += 1
+        lastAgentUserInputResponse = (thread, requestId, text)
+    }
+    func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
+        pendingCallbackSnapshot
+    }
+    func readAgentThreadEvents(thread: AgentThreadID) throws -> [AssistantEvent] {
+        readAgentEvents
+    }
+    func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) throws {
+        rollbackCallCount += 1
+        lastRollback = (thread, toTurnId)
+    }
+    func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
+        checkpointStore.filter { $0.threadId == thread }
+    }
+    func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
+        guard let checkpoint = checkpointStore.first(where: { $0.threadId == thread && $0.checkpointTurnCount == checkpointTurnCount }) else {
+            return ""
+        }
+        if let path { return checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? "" }
+        return checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n")
+    }
+    func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary {
+        checkpointRevertCallCount += 1
+        lastCheckpointRevert = (thread, checkpointTurnCount)
+        return AgentTurnCheckpointSummary(
+            threadId: thread,
+            runId: AgentRunID(),
+            turnId: "turn-\(checkpointTurnCount)",
+            checkpointTurnCount: checkpointTurnCount,
+            checkpointRef: "local-diff:test:turn-\(checkpointTurnCount)",
+            status: .ready,
+            files: []
+        )
+    }
+    func stopAgentRun(thread: AgentThreadID) throws {
+        stopAgentRunCallCount += 1
+    }
     var threadStore: [AgentThread] = []
-    func deleteAgentThread(thread: AgentThreadID) throws { threadStore.removeAll { $0.id == thread } }
+    var deleteAgentThreadCallCount = 0
+    var deleteAgentThreadsCallCount = 0
+    var setAgentThreadPinnedCallCount = 0
+    var setAgentThreadColorCallCount = 0
+    var reorderAgentThreadCallCount = 0
+    var renameAgentThreadCallCount = 0
+    var markAgentThreadReadCallCount = 0
+    func deleteAgentThread(thread: AgentThreadID) throws {
+        deleteAgentThreadCallCount += 1
+        threadStore.removeAll { $0.id == thread }
+    }
     func deleteAgentThreads(_ threads: [AgentThreadID]) throws {
+        deleteAgentThreadsCallCount += 1
         threadStore.removeAll { threads.contains($0.id) }
     }
     func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread {
+        setAgentThreadPinnedCallCount += 1
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].pinned = pinned
         try normalizeThreadOrder(workspaceId: threadStore[idx].workspaceId)
         return threadStore[idx]
     }
     func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread {
+        setAgentThreadColorCallCount += 1
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].color = color.isEmpty ? nil : color
         return threadStore[idx]
     }
     func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread] {
+        reorderAgentThreadCallCount += 1
         guard let current = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         let wid = current.workspaceId
         var ordered = try listAgentThreads(workspace: wid)
@@ -170,11 +330,13 @@ final class FakeRouter: CommandRouting {
         return try listAgentThreads(workspace: wid)
     }
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
+        renameAgentThreadCallCount += 1
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].title = title
         return threadStore[idx]
     }
     func markAgentThreadRead(thread: AgentThreadID) throws {
+        markAgentThreadReadCallCount += 1
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         threadStore[idx].hasUnread = false
         selectedThread = thread
@@ -189,6 +351,44 @@ final class FakeRouter: CommandRouting {
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         [AgentModelDescriptor(id: "x", label: "X", provider: provider)]
     }
+    func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
+        [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "gpt-5.1-codex", label: "GPT-5.1 Codex", provider: .codex)],
+                slashCommands: ["/status", "/goal"]
+            ),
+            AgentProviderSnapshot(
+                id: "claude-cli",
+                provider: .claude,
+                driverKind: .claudeCLI,
+                displayName: "Claude",
+                accentColor: "#D97706",
+                continuationGroup: "anthropic-claude",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "sonnet", label: "Sonnet", provider: .claude)],
+                slashCommands: ["/status"]
+            )
+        ]
+    }
+    var providerUpdateResult: JSONValue = .object(["ok": .bool(true)])
+    var providerUpdateCall: (AgentProvider, String?)?
+    func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue {
+        providerUpdateCall = (provider, providerInstanceId)
+        return providerUpdateResult
+    }
     var gitCwd = "/tmp"
     func gitStatus(workspace: WorkspaceID) throws -> GitSummary { GitDiff.summary(in: gitCwd) }
     func gitBranches(workspace: WorkspaceID) throws -> GitBranches { GitDiff.branches(in: gitCwd) }
@@ -199,6 +399,8 @@ final class FakeRouter: CommandRouting {
     func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String { GitDiff.diff(in: gitCwd, path: path, ignoreWhitespace: ignoreWhitespace) }
     func gitPush(workspace: WorkspaceID) throws -> GitActionResult { GitDiff.push(in: gitCwd) }
     func gitPullRequestURL(workspace: WorkspaceID) throws -> String? { GitDiff.pullRequestURL(in: gitCwd) }
+    func gitDeliveryPlan(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryPlan { GitDiff.deliveryPlan(in: gitCwd, copy: copy) }
+    func gitDeliver(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryResult { GitDiff.deliver(in: gitCwd, copy: copy, environment: nil) }
     var projectCwd = "/tmp"
     func projectScripts(workspace: WorkspaceID) throws -> [ProjectScript] { ProjectScripts.discover(in: projectCwd) }
     func projectRunScript(workspace: WorkspaceID, name: String) throws -> SurfaceDescriptor {
@@ -292,6 +494,45 @@ final class DispatcherTests: XCTestCase {
         }
         XCTAssertTrue(surfaceTypes.contains(.string("files")),
                       "Files must be advertised by the host; otherwise iOS cannot discover or create the mirrored Files tab")
+    }
+
+    @MainActor
+    func test_agentProvidersListReturnsSnapshotsForProviderDrivenUI() async {
+        let d = JSONRPCDispatcher(router: FakeRouter())
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.providers.list", params: nil))
+
+        guard case .array(let snapshots)? = resp.result,
+              let codex = snapshots.compactMap(\.objectValue).first(where: { $0["provider"] == .string("codex") }) else {
+            return XCTFail("agent.providers.list must expose provider snapshots so Agent App does not hardcode provider state")
+        }
+        XCTAssertEqual(codex["displayName"], .string("Codex"))
+        XCTAssertEqual(codex["status"], .string("available"))
+        XCTAssertEqual(codex["driverKind"], .string("codex_cli"))
+        XCTAssertEqual(codex["slashCommands"]?.arrayValue?.contains(.string("/goal")), true)
+        XCTAssertEqual(codex["models"]?.arrayValue?.isEmpty, false)
+    }
+
+    @MainActor
+    func test_agentProviderUpdateRoutesThroughDispatcherWithInstanceId() async {
+        let router = FakeRouter()
+        router.providerUpdateResult = .object(["ok": .bool(true), "stdout": .string("updated\n")])
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.provider.update",
+            params: [
+                "provider": .string("claude"),
+                "provider_instance_id": .string("claude-work")
+            ]
+        ))
+
+        XCTAssertEqual(router.providerUpdateCall?.0, .claude)
+        XCTAssertEqual(router.providerUpdateCall?.1, "claude-work")
+        XCTAssertEqual(resp.result, JSONValue.object(["ok": .bool(true), "stdout": .string("updated\n")]),
+                       "provider update must be a host RPC action so macOS and iOS can invoke the same serialized provider-native update path")
     }
 
     @MainActor
@@ -566,9 +807,14 @@ final class DispatcherTests: XCTestCase {
         sh(["git", "init", "-q", "-b", "main", dir])
         sh(["git", "-C", dir, "config", "user.email", "t@t.t"])
         sh(["git", "-C", dir, "config", "user.name", "t"])
+        let remote = NSTemporaryDirectory() + "rc2-disp-git-remote-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: remote) }
+        sh(["git", "init", "-q", "--bare", remote])
         try "hi\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
         sh(["git", "-C", dir, "add", "a.txt"])
         sh(["git", "-C", dir, "commit", "-q", "-m", "init"])
+        sh(["git", "-C", dir, "remote", "add", "origin", remote])
+        sh(["git", "-C", dir, "push", "-q", "origin", "main"])
         let router = FakeRouter(); router.gitCwd = dir
         let d = JSONRPCDispatcher(router: router)
         let wid = JSONValue.string(UUID().uuidString)
@@ -585,6 +831,53 @@ final class DispatcherTests: XCTestCase {
         guard case .object(let bo)? = br.result else { return XCTFail("git.create_branch must return a result") }
         XCTAssertEqual(bo["ok"], .bool(true), "create_branch must report success over the wire")
         XCTAssertEqual(GitDiff.branches(in: dir).current, "feat", "the socket call must actually move HEAD")
+
+        try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
+        let delivery = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "git.delivery_plan", params: [
+            "workspace_id": wid,
+            "copy": .object([
+                "branchName": .string("agent/provider-copy"),
+                "commitMessage": .string("Use provider generated commit copy"),
+                "pullRequestTitle": .string("Provider generated PR title"),
+                "pullRequestBody": .string("Provider generated PR body")
+            ])
+        ]))
+        guard case .object(let plan)? = delivery.result else { return XCTFail("git.delivery_plan must return structured delivery text and phases") }
+        XCTAssertEqual(plan["commitMessage"], .string("Use provider generated commit copy"))
+        XCTAssertEqual(plan["branchName"], .string("agent/provider-copy"))
+        XCTAssertEqual(plan["pullRequestTitle"], .string("Provider generated PR title"))
+        guard case .array(let phases)? = plan["phases"], phases.count == 4 else {
+            return XCTFail("git.delivery_plan must expose branch/commit/push/pull_request phase status for safe agent delivery")
+        }
+
+        let delivered = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "git.deliver", params: ["workspace_id": wid]))
+        guard case .object(let result)? = delivered.result else { return XCTFail("git.deliver must return one-shot delivery phase status") }
+        XCTAssertEqual(result["ok"], .bool(true), "git.deliver must execute branch, commit, and push through the socket")
+        guard case .array(let deliveredPhases)? = result["phases"], deliveredPhases.count == 4 else {
+            return XCTFail("git.deliver must return each stacked phase")
+        }
+        XCTAssertEqual(GitDiff.branches(in: dir).current, "agent/a-txt")
+    }
+
+    @MainActor
+    func test_agentAttachmentUploadRoutesImportedMobileFileToHostPath() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let wid = JSONValue.string(UUID().uuidString)
+
+        let uploaded = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.attachment.upload", params: [
+            "workspace_id": wid,
+            "filename": .string("screen.png"),
+            "mime_type": .string("image/png"),
+            "data_base64": .string(Data("image-bytes".utf8).base64EncodedString())
+        ]))
+
+        guard case .object(let obj)? = uploaded.result else { return XCTFail("agent.attachment.upload must return a host attachment path") }
+        XCTAssertEqual(obj["path"], .string("/tmp/remotecode-attachments/screen.png"))
+        XCTAssertEqual(obj["displayName"], .string("screen.png"))
+        XCTAssertEqual(obj["kind"], .string("image"),
+                       "iOS local imports must become host-readable structured attachments before agent.message.send")
+        XCTAssertEqual(obj["sizeBytes"], .number(11))
     }
 
     @MainActor
@@ -699,26 +992,452 @@ final class DispatcherTests: XCTestCase {
             "provider": .string("claude"),
             "model": .string("claude-sonnet-4-6"),
             "permission_mode": .string("full_access"),
-            "reasoning_effort": .string("high")
+            "reasoning_effort": .string("high"),
+            "service_tier": .string("fast"),
+            "model_selection": .object([
+                "provider": .string("claude"),
+                "model_id": .string("claude-sonnet-4-6"),
+                "reasoning_effort": .string("high"),
+                "service_tier": .string("fast")
+            ])
         ]))
         guard case .object(let cfgObj)? = cfg.result else { return XCTFail("configure must echo the updated host thread") }
         XCTAssertEqual(cfgObj["provider"], .string("claude"))
+        XCTAssertEqual(cfgObj["providerInstanceId"], .string("claude"),
+                       "provider instance identity must round-trip with thread metadata so clients can keep personal/work sessions separate")
         XCTAssertEqual(cfgObj["model"], .string("claude-sonnet-4-6"))
         XCTAssertEqual(cfgObj["permissionMode"], .string("full_access"))
         XCTAssertEqual(cfgObj["reasoningEffort"], .string("high"))
+        XCTAssertEqual(cfgObj["serviceTier"], .string("fast"))
+        guard case .object(let cfgSelection)? = cfgObj["model_selection"] else { return XCTFail("configure must echo structured model selection") }
+        XCTAssertEqual(cfgSelection["modelId"], .string("claude-sonnet-4-6"))
+        XCTAssertEqual(cfgSelection["reasoningEffort"], .string("high"),
+                       "iOS must be able to round-trip model options as one structured selection, not loose fields that can drift")
 
         let send = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.send", params: [
             "thread_id": tid,
-            "text": .string("run on host")
+            "text": .string("run on host"),
+            "model_selection": .object([
+                "provider": .string("codex"),
+                "model_id": .string(""),
+                "custom_model_id": .string("gpt-5.5-experimental"),
+                "reasoning_effort": .string("xhigh"),
+                "service_tier": .string("fast")
+            ]),
+            "interaction_mode": .string("plan"),
+            "attachments": .array([
+                .object([
+                    "path": .string("/tmp/screen.png"),
+                    "display_name": .string("screen.png"),
+                    "kind": .string("image"),
+                    "mime_type": .string("image/png")
+                ]),
+                .object([
+                    "path": .string("/tmp/notes.txt"),
+                    "displayName": .string("notes.txt"),
+                    "kind": .string("file")
+                ])
+            ])
         ]))
         guard case .object(let sendObj)? = send.result else { return XCTFail("send must return host run object") }
         XCTAssertNotNil(sendObj["run_id"]?.stringValue, "send must return host run id")
-        XCTAssertEqual(router.threadStore.first?.provider, .claude)
-        XCTAssertEqual(router.threadStore.first?.model, "claude-sonnet-4-6")
+        XCTAssertEqual(router.threadStore.first?.provider, .codex)
+        XCTAssertEqual(router.threadStore.first?.model, "gpt-5.5-experimental")
+        XCTAssertEqual(router.threadStore.first?.modelSelection.customModelId, "gpt-5.5-experimental")
         XCTAssertEqual(router.lastSendPermission, .fullAccess,
                        "send must use the thread's persisted permission mode when no override is sent")
-        XCTAssertEqual(router.lastSendReasoning, .high,
-                       "send must use the thread's persisted reasoning effort when no override is sent")
+        XCTAssertEqual(router.lastSendReasoning, .xhigh,
+                       "send must use structured model-selection reasoning when iOS sends a custom model")
+        XCTAssertEqual(router.lastSendServiceTier, .fast,
+                       "send must use the thread's persisted service tier when no override is sent")
+        XCTAssertEqual(router.lastSendInteractionMode, .plan,
+                       "mobile /plan must reach the provider runtime as interaction_mode, not only local UI text")
+        XCTAssertEqual(router.lastSendAttachments.map(\.path), ["/tmp/screen.png", "/tmp/notes.txt"],
+                       "mobile attachments must reach the host as structured metadata instead of being folded into prompt text")
+        XCTAssertEqual(router.lastSendAttachments.first?.kind, .image)
+        XCTAssertEqual(router.lastSendAttachments.first?.mimeType, "image/png")
+    }
+
+    @MainActor
+    func test_agentThreadExecutionConfigureRoutesWorktreeMode() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "exec", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.execution.configure", params: [
+            "thread_id": .string(thread.id.value.uuidString),
+            "execution_mode": .string("worktree"),
+            "base_branch": .string("main")
+        ]))
+
+        XCTAssertNotNil(response.result)
+        XCTAssertEqual(router.threadStore[0].executionMode, .worktree)
+        XCTAssertEqual(router.threadStore[0].baseBranch, "main",
+                       "worktree execution must require and persist a base branch before the first provider turn")
+    }
+
+    @MainActor
+    func test_agentThreadPreparePRCreatesWorktreeThread() async throws {
+        let router = FakeRouter()
+        let workspace = WorkspaceID()
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.prepare_pr", params: [
+            "workspace_id": .string(workspace.value.uuidString),
+            "url": .string("https://github.com/acme/widget/pull/7"),
+            "provider": .string("codex"),
+            "provider_instance_id": .string("codex-work"),
+            "model": .string("gpt-5.5")
+        ]))
+
+        guard case .object(let obj)? = response.result else { return XCTFail("prepare_pr must return the created agent thread") }
+        XCTAssertEqual(router.lastPreparedPullRequest?.0, workspace)
+        XCTAssertEqual(router.lastPreparedPullRequest?.1, "https://github.com/acme/widget/pull/7")
+        XCTAssertEqual(obj["execution_mode"], .string("worktree"))
+        XCTAssertEqual(obj["worktree_path"], .string("/tmp/rc-pr-7"),
+                       "PR preparation must expose the isolated checkout path so mobile can show where the Agent thread will run")
+        XCTAssertEqual(obj["provider_instance_id"], .string("codex-work"))
+    }
+
+    @MainActor
+    func test_agentPlanImplementBuildsPromptAndReturnsTraceability() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "plan", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.plan.implement", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "plan_id": .string("plan-1"),
+            "markdown": .string("1. Inspect\n2. Patch")
+        ]))
+
+        guard case .object(let obj)? = response.result else { return XCTFail("implement plan must return run and implementation thread ids") }
+        XCTAssertNotNil(obj["run_id"]?.stringValue)
+        XCTAssertEqual(obj["implementation_thread_id"]?.stringValue, t.id.value.uuidString)
+        XCTAssertEqual(router.lastImplementedPlan?.1, "plan-1")
+        XCTAssertTrue(router.lastSendText?.contains("Implement this proposed plan now") == true)
+        XCTAssertTrue(router.lastSendText?.contains("1. Inspect") == true,
+                      "implement plan must send the selected plan content to the provider")
+    }
+
+    @MainActor
+    func test_agentPlanSaveReturnsWorkspacePathForMobileClients() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "plan", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.plan.save", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "plan_id": .string("plan-1"),
+            "markdown": .string("1. Inspect\n2. Patch"),
+            "relative_path": .string(".remotecode/plans/fix.md")
+        ]))
+
+        guard case .object(let obj)? = response.result else { return XCTFail("save plan must return host path metadata") }
+        XCTAssertEqual(obj["relative_path"]?.stringValue, ".remotecode/plans/fix.md")
+        XCTAssertEqual(router.lastSavedPlan?.1, "plan-1")
+        XCTAssertEqual(router.lastSavedPlan?.2, "1. Inspect\n2. Patch",
+                       "mobile plan save must persist exact proposed-plan markdown through the host")
+    }
+
+    @MainActor
+    func test_agentMessageSendClientRequestIdIsIdempotent() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "idempotent", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+        let params: [String: JSONValue] = [
+            "thread_id": .string(t.id.value.uuidString),
+            "text": .string("run once"),
+            "client_request_id": .string("send-1")
+        ]
+
+        let first = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.send", params: params))
+        let second = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.send", params: params))
+
+        XCTAssertEqual(first.result, second.result,
+                       "a retried agent send with the same client_request_id must return the original run id")
+        XCTAssertEqual(router.sendAgentMessageCallCount, 1,
+                       "retrying the same send command must not duplicate user messages or provider turns")
+    }
+
+    @MainActor
+    func test_agentMessageSendClientRequestIdSurvivesDispatcherRecreation() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "idempotent", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let params: [String: JSONValue] = [
+            "thread_id": .string(t.id.value.uuidString),
+            "text": .string("run once"),
+            "client_request_id": .string("send-restart-1")
+        ]
+
+        let first = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.send", params: params))
+        let second = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.send", params: params))
+
+        XCTAssertEqual(first.result, second.result,
+                       "durable command receipts must let a recreated dispatcher return the original run id")
+        XCTAssertEqual(router.sendAgentMessageCallCount, 1,
+                       "a client retry after socket/dispatcher recreation must not duplicate provider turns")
+    }
+
+    @MainActor
+    func test_agentPlanImplementClientRequestIdIsIdempotent() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "plan", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let params: [String: JSONValue] = [
+            "thread_id": .string(t.id.value.uuidString),
+            "plan_id": .string("plan-1"),
+            "markdown": .string("1. Inspect"),
+            "client_request_id": .string("implement-1")
+        ]
+
+        let first = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.plan.implement", params: params))
+        let second = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.plan.implement", params: params))
+
+        XCTAssertEqual(first.result, second.result,
+                       "retrying plan implementation must return the original run and implementation thread ids")
+        XCTAssertEqual(router.sendAgentMessageCallCount, 1,
+                       "a retried implement-plan command must not send the implementation prompt twice")
+    }
+
+    @MainActor
+    func test_agentCallbackAndRollbackClientRequestIdsAreIdempotent() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "callbacks", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let threadId = JSONValue.string(t.id.value.uuidString)
+        let approvalParams: [String: JSONValue] = [
+            "thread_id": threadId,
+            "request_id": .string("approval-1"),
+            "decision": .string("approve"),
+            "client_request_id": .string("approval-retry-1")
+        ]
+        let inputParams: [String: JSONValue] = [
+            "thread_id": threadId,
+            "request_id": .string("question-1"),
+            "text": .string("Run"),
+            "client_request_id": .string("input-retry-1")
+        ]
+        let rollbackParams: [String: JSONValue] = [
+            "thread_id": threadId,
+            "turn_id": .string("turn-1"),
+            "client_request_id": .string("rollback-retry-1")
+        ]
+
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.request.respond", params: approvalParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.request.respond", params: approvalParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.user_input.respond", params: inputParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "agent.user_input.respond", params: inputParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "agent.thread.rollback", params: rollbackParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(6), method: "agent.thread.rollback", params: rollbackParams))
+
+        XCTAssertEqual(router.respondAgentRequestCallCount, 1,
+                       "approval retries must not submit duplicate provider approvals")
+        XCTAssertEqual(router.respondAgentUserInputCallCount, 1,
+                       "question retries must not submit duplicate provider input")
+        XCTAssertEqual(router.rollbackCallCount, 1,
+                       "rollback retries must not rollback the provider session twice")
+    }
+
+    @MainActor
+    func test_agentStopAndCheckpointRevertClientRequestIdsAreIdempotent() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "revert", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let stopParams: [String: JSONValue] = [
+            "thread_id": .string(t.id.value.uuidString),
+            "client_request_id": .string("stop-retry-1")
+        ]
+        let revertParams: [String: JSONValue] = [
+            "thread_id": .string(t.id.value.uuidString),
+            "turn_count": .number(1),
+            "client_request_id": .string("checkpoint-retry-1")
+        ]
+
+        let firstRevert = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.revert", params: revertParams))
+        let secondRevert = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.revert", params: revertParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.run.stop", params: stopParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "agent.run.stop", params: stopParams))
+
+        XCTAssertEqual(firstRevert.result, secondRevert.result,
+                       "checkpoint revert retries must return the first checkpoint result")
+        XCTAssertEqual(router.checkpointRevertCallCount, 1,
+                       "checkpoint revert retries must not apply the rollback twice")
+        XCTAssertEqual(router.stopAgentRunCallCount, 1,
+                       "stop retries must not repeat the stop side effect")
+    }
+
+    @MainActor
+    func test_agentThreadMetadataClientRequestIdsAreIdempotent() async throws {
+        let router = FakeRouter()
+        let workspace = WorkspaceID()
+        let first = AgentThread(workspaceId: workspace, title: "first", provider: .codex, model: "gpt-5.5", sortOrder: 0)
+        let second = AgentThread(workspaceId: workspace, title: "second", provider: .codex, model: "gpt-5.5", hasUnread: true, sortOrder: 1)
+        let third = AgentThread(workspaceId: workspace, title: "third", provider: .codex, model: "gpt-5.5", sortOrder: 2)
+        router.threadStore = [first, second, third]
+        let threadId = JSONValue.string(second.id.value.uuidString)
+        let thirdId = JSONValue.string(third.id.value.uuidString)
+        let calls: [(method: String, params: [String: JSONValue])] = [
+            ("agent.thread.rename", ["thread_id": threadId, "title": .string("renamed"), "client_request_id": .string("rename-1")]),
+            ("agent.thread.set_pinned", ["thread_id": threadId, "pinned": .bool(true), "client_request_id": .string("pin-1")]),
+            ("agent.thread.set_color", ["thread_id": threadId, "color": .string("#ff0000"), "client_request_id": .string("color-1")]),
+            ("agent.thread.reorder", ["thread_id": threadId, "position": .number(0), "client_request_id": .string("reorder-1")]),
+            ("agent.thread.mark_read", ["thread_id": threadId, "client_request_id": .string("read-1")]),
+            ("agent.thread.delete", ["thread_id": thirdId, "client_request_id": .string("delete-1")])
+        ]
+
+        for call in calls {
+            let firstResponse = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: call.method, params: call.params))
+            let secondResponse = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: call.method, params: call.params))
+            XCTAssertEqual(firstResponse.result, secondResponse.result,
+                           "\(call.method) retries must return the original result")
+        }
+
+        let deleteManyParams: [String: JSONValue] = [
+            "thread_ids": .array([.string(first.id.value.uuidString)]),
+            "client_request_id": .string("delete-many-1")
+        ]
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.thread.delete_many", params: deleteManyParams))
+        _ = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "agent.thread.delete_many", params: deleteManyParams))
+
+        XCTAssertEqual(router.renameAgentThreadCallCount, 1, "rename retry must not rename twice")
+        XCTAssertEqual(router.setAgentThreadPinnedCallCount, 1, "pin retry must not reorder twice")
+        XCTAssertEqual(router.setAgentThreadColorCallCount, 1, "color retry must not update twice")
+        XCTAssertEqual(router.reorderAgentThreadCallCount, 1, "reorder retry must not reorder twice")
+        XCTAssertEqual(router.markAgentThreadReadCallCount, 1, "mark-read retry must not emit duplicate read side effects")
+        XCTAssertEqual(router.deleteAgentThreadCallCount, 1, "delete retry must not delete twice")
+        XCTAssertEqual(router.deleteAgentThreadsCallCount, 1, "bulk delete retry must not delete twice")
+    }
+
+    @MainActor
+    func test_agentApprovalAndUserInputResponsesRouteThroughDispatcher() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "callbacks", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let d = JSONRPCDispatcher(router: router)
+        let threadId = JSONValue.string(thread.id.value.uuidString)
+
+        let approval = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.request.respond", params: [
+            "thread_id": threadId,
+            "request_id": .string("approval-1"),
+            "decision": .string("approve_for_session")
+        ]))
+        let input = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.user_input.respond", params: [
+            "thread_id": threadId,
+            "request_id": .string("question-1"),
+            "text": .string("Run")
+        ]))
+
+        XCTAssertEqual(approval.result, .bool(true))
+        XCTAssertEqual(input.result, .bool(true))
+        XCTAssertEqual(router.lastAgentRequestResponse?.0, thread.id)
+        XCTAssertEqual(router.lastAgentRequestResponse?.1, "approval-1")
+        XCTAssertEqual(router.lastAgentRequestResponse?.2, .approveForSession)
+        XCTAssertEqual(router.lastAgentUserInputResponse?.0, thread.id)
+        XCTAssertEqual(router.lastAgentUserInputResponse?.1, "question-1")
+        XCTAssertEqual(router.lastAgentUserInputResponse?.2, "Run")
+    }
+
+    @MainActor
+    func test_agentPendingCallbacksListRoutesThroughDispatcher() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "callbacks", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.pendingCallbackSnapshot = AssistantPendingCallbacksSnapshot(
+            requests: [AssistantPendingRequest(id: "approval-1", turnId: "turn-1", kind: .commandExecution, title: "Run tests", detail: "swift test", state: .stale, createdAtMs: 1, resolvedAtMs: 2)],
+            userInputs: [AssistantUserInputRequest(id: "question-1", turnId: "turn-1", prompt: "Pick mode", options: ["Plan", "Run"], state: .pending, createdAtMs: 3)]
+        )
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.pending_callbacks.list", params: [
+            "thread_id": .string(thread.id.value.uuidString)
+        ]))
+
+        let data = try JSONEncoder().encode(try XCTUnwrap(response.result))
+        let snapshot = try JSONDecoder().decode(AssistantPendingCallbacksSnapshot.self, from: data)
+        XCTAssertEqual(snapshot.requests.first?.state, .stale,
+                       "iOS reconnects must be able to reload stale provider approvals from the host instead of waiting for live events")
+        XCTAssertEqual(snapshot.userInputs.first?.options, ["Plan", "Run"],
+                       "iOS reconnects must reload pending provider questions with answer options intact")
+    }
+
+    @MainActor
+    func test_agentThreadReadAndRollbackRouteThroughDispatcher() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "read", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.readAgentEvents = [.turnStarted(turnId: "turn-1")]
+        let d = JSONRPCDispatcher(router: router)
+        let threadId = JSONValue.string(thread.id.value.uuidString)
+
+        let read = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.read", params: [
+            "thread_id": threadId
+        ]))
+        let rollback = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.thread.rollback", params: [
+            "thread_id": threadId,
+            "turn_id": .string("turn-1")
+        ]))
+
+        XCTAssertNotNil(read.result,
+                        "readThread must be exposed over RPC so mobile/macOS can recover provider state")
+        XCTAssertEqual(rollback.result, .bool(true))
+        XCTAssertEqual(router.lastRollback?.0, thread.id)
+        XCTAssertEqual(router.lastRollback?.1, "turn-1")
+    }
+
+    @MainActor
+    func test_agentCheckpointRevertRoutesThroughDispatcher() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "revert", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.revert", params: [
+            "thread_id": .string(thread.id.value.uuidString),
+            "turn_count": .number(1)
+        ]))
+
+        XCTAssertNotNil(response.result)
+        XCTAssertEqual(router.lastCheckpointRevert?.0, thread.id)
+        XCTAssertEqual(router.lastCheckpointRevert?.1, 1,
+                       "checkpoint revert must route as a combined workspace/provider rollback command, not only provider readThread rollback")
+    }
+
+    @MainActor
+    func test_agentCheckpointListAndDiffRoutesThroughDispatcher() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "diff", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        router.checkpointStore = [AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: AgentRunID(),
+            turnId: "turn-1",
+            checkpointTurnCount: 1,
+            checkpointRef: "local-diff:test:turn-1",
+            status: .ready,
+            files: [AgentTurnCheckpointFile(path: "README.md", kind: "modified", additions: 1, deletions: 0)],
+            diffPatch: "diff --git a/README.md b/README.md\n",
+            fileDiffs: [AgentTurnCheckpointFileDiff(path: "README.md", patch: "@@ README\n+changed\n")]
+        )]
+        let d = JSONRPCDispatcher(router: router)
+
+        let list = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.list", params: [
+            "thread_id": .string(thread.id.value.uuidString)
+        ]))
+        let diff = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.diff", params: [
+            "thread_id": .string(thread.id.value.uuidString),
+            "turn_count": .number(1),
+            "path": .string("README.md")
+        ]))
+
+        XCTAssertNotNil(list.result)
+        XCTAssertEqual(diff.result, .string("@@ README\n+changed\n"),
+                       "per-turn file diffs must be reachable over RPC so clients can inspect a specific agent turn without relying on current git state")
     }
 
     @MainActor
@@ -785,7 +1504,7 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_agentThreadConfigureClearsProviderSessionWhenProviderOrModelChanges() async throws {
+    func test_agentThreadConfigureClearsProviderSessionWhenProviderChanges() async throws {
         let router = FakeRouter()
         var t = AgentThread(workspaceId: nil, title: "switch provider", provider: .claude, model: "claude-sonnet-4-6")
         t.providerThreadId = "claude-session"
@@ -799,6 +1518,26 @@ final class DispatcherTests: XCTestCase {
         ]))
 
         XCTAssertNil(resp.error)
-        XCTAssertNil(router.threadStore.first?.providerThreadId, "changing provider/model must not resume an incompatible provider session")
+        XCTAssertNil(router.threadStore.first?.providerThreadId, "changing provider must not resume an incompatible provider session")
+    }
+
+    @MainActor
+    func test_agentThreadConfigurePreservesClaudeProviderSessionWhenOnlyModelChanges() async throws {
+        let router = FakeRouter()
+        var t = AgentThread(workspaceId: nil, title: "switch model", provider: .claude, model: "claude-sonnet-4-6")
+        t.providerThreadId = "claude-session"
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.configure", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "provider": .string("claude"),
+            "model": .string("claude-opus-4-7")
+        ]))
+
+        XCTAssertNil(resp.error)
+        XCTAssertEqual(router.threadStore.first?.model, "claude-opus-4-7")
+        XCTAssertEqual(router.threadStore.first?.providerThreadId, "claude-session",
+                       "Claude model switching must keep the provider session cursor so the next turn can resume the same conversation")
     }
 }
