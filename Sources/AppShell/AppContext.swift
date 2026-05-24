@@ -243,6 +243,23 @@ public final class AppContext {
                 "base64": .string(chunk.base64EncodedString())
             ]))
         }
+        SurfaceRuntimeBus.shared.sink = { sid, health in
+            EventBus.shared.publish(kind: "surface.health", payload: .object([
+                "surface_id": .string(sid.value.uuidString),
+                "alive": .bool(health.alive),
+                "process_alive": .bool(health.processAlive),
+                "child_pid": health.childPID.map { .number(Double($0)) } ?? .null,
+                "exit_status": health.exitStatus.map { .number(Double($0)) } ?? .null,
+                "termination_signal": health.terminationSignal.map { .number(Double($0)) } ?? .null,
+                "pty_open": .bool(health.ptyOpen),
+                "input_accepting": .bool(health.inputAccepting),
+                "terminal_dead_reason": health.terminalDeadReason.map { .string($0) } ?? .null,
+                "last_output_at": health.lastOutputAt.map { .number($0.timeIntervalSince1970) } ?? .null,
+                "output_partial": .bool(health.outputPartial),
+                "output_pending_bytes": .number(Double(health.outputPendingBytes)),
+                "history_write_failures": .number(Double(health.historyWriteFailures))
+            ]))
+        }
 
         // restore last snapshot if any
         if let snap = try snapshotRepo.latest() {

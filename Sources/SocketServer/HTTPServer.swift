@@ -35,8 +35,9 @@ public extension DirectAuthProvider {
 
 public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
-    static let maxRequestBodyBytes = 1024 * 1024
+    static let maxRequestBodyBytes = 2 * 1024 * 1024
     static let maxClientFramePayloadBytes = 1024 * 1024
+    static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
 
     public let port: UInt16
     public let bindLoopbackOnly: Bool
@@ -188,15 +189,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                 .contains(PayloadCodec.lzfse.wireName) == true
             let wsFilter = EventStreamFilter.parse(headers["x-rc2-ws-filter"])
-            // GAP-6: EventBus.publish fans out to subscribers from many
-            // threads (RPC dispatch, agent runner, …). Writing frames to
-            // one socket from concurrent threads interleaves bytes and
-            // permanently desyncs the client's WS stream (observed: the
-            // stream dies the moment an agent run emits rapid events).
-            // Serialize every write for this connection onto one queue.
-            let wsQueue = DispatchQueue(label: "rc2.ws.write")
-            let id = EventBus.shared.subscribe(since: 0, filter: wsFilter) { [weak self] ev in
-                guard let self else { return }
+            let subIDBox = LockedSubscriberID()
+            let outbound = WebSocketOutboundQueue(
+                maxQueuedBytes: Self.maxWebSocketOutboundQueuedBytes,
+                writer: { [weak self] data in
+                    guard let self else { return false }
+                    return self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
+                },
+                onClose: { reason in
+                    if let id = subIDBox.value { EventBus.shared.unsubscribe(id) }
+                    EventBus.shared.publish(kind: "diagnostic.ws_slow_client", payload: .object([
+                        "reason": .string(reason),
+                        "baseline_required": .bool(true)
+                    ]))
+                    shutdown(fd, SHUT_RDWR)
+                }
+            )
+            let id = EventBus.shared.subscribe(since: 0, filter: wsFilter) { ev in
                 let obj: [String: Any] = [
                     "seq": ev.seq,
                     "kind": ev.kind,
@@ -204,14 +213,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     "payload": Self.jsonValueToAny(ev.payload)
                 ]
                 guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
-                wsQueue.async {
-                    self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
-                }
+                _ = outbound.enqueue(data)
             }
+            subIDBox.value = id
             subID = id
             // keep connection open; read incoming frames (ping/pong/close)
-            wsServeLoop(fd: fd, writeQueue: wsQueue)
-            wsQueue.sync {}
+            wsServeLoop(fd: fd, outbound: outbound)
+            outbound.drain()
             return
         }
 
@@ -443,21 +451,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         _ = writeAll(fd: fd, data: data)
     }
 
-    private func sendWSEvent(fd: Int32, data: Data, compressed: Bool) {
+    private func sendWSEvent(fd: Int32, data: Data, compressed: Bool) -> Bool {
         if compressed,
            let envelope = try? PayloadCodec.encodeWebSocketEnvelope(data),
            envelope.count < data.count {
-            sendWSFrame(fd: fd, opcode: 0x2, data: envelope)
-            return
+            return sendWSFrame(fd: fd, opcode: 0x2, data: envelope)
         }
-        sendWSFrame(fd: fd, opcode: 0x1, data: data)
+        return sendWSFrame(fd: fd, opcode: 0x1, data: data)
     }
 
     private func sendWSText(fd: Int32, data: Data) {
-        sendWSFrame(fd: fd, opcode: 0x1, data: data)
+        _ = sendWSFrame(fd: fd, opcode: 0x1, data: data)
     }
 
-    private func sendWSFrame(fd: Int32, opcode: UInt8, data: Data) {
+    private func sendWSFrame(fd: Int32, opcode: UInt8, data: Data) -> Bool {
         // server frames are unmasked
         var frame = Data()
         frame.append(0x80 | opcode)
@@ -474,10 +481,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
         }
         frame.append(data)
-        _ = writeAll(fd: fd, data: frame)
+        return writeAll(fd: fd, data: frame)
     }
 
-    private func wsServeLoop(fd: Int32, writeQueue: DispatchQueue) {
+    private func wsServeLoop(fd: Int32, outbound: WebSocketOutboundQueue) {
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while running {
@@ -488,13 +495,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 buf.removeFirst(consumed)
                 switch frame.opcode {
                 case 0x8: // close
-                    writeQueue.sync { sendCloseFrame(fd: fd) }; return
+                    sendCloseFrame(fd: fd); return
                 case 0x9: // ping -> pong
                     guard frame.payload.count <= 125 else {
-                        writeQueue.sync { sendCloseFrame(fd: fd) }
+                        sendCloseFrame(fd: fd)
                         return
                     }
-                    writeQueue.async { self.sendPongFrame(fd: fd, payload: frame.payload) }
+                    sendPongFrame(fd: fd, payload: frame.payload)
                 case 0xA: // pong
                     continue
                 case 0x1, 0x2:
@@ -571,7 +578,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {
-        data.withUnsafeBytes { raw in
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        return data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return true }
             var written = 0
             while written < data.count {

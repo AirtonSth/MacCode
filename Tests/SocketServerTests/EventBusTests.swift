@@ -57,6 +57,33 @@ final class EventBusTests: XCTestCase {
                        "event replay must drop oversized/old payloads so one large RPC event cannot pin megabytes in memory")
     }
 
+    func test_recentEventsReportsBaselineRequiredWhenReplayByteCapIsExceeded() {
+        let bus = EventBus(recentLimit: 512, recentByteLimit: 20_000)
+        bus.publish(kind: "surface.output", payload: .string(String(repeating: "x", count: 2_000)))
+        bus.publish(kind: "surface.output", payload: .string(String(repeating: "y", count: 2_000)))
+
+        let recent = bus.recentEvents(since: 0, maxBytes: 800)
+
+        XCTAssertTrue(recent.requiresBaseline,
+                      "when replay cannot prove complete terminal output, iOS must be told to fetch a snapshot or show partial state")
+    }
+
+    func test_webSocketOutboundQueueClosesSlowClientBeforeMemoryCanGrowUnbounded() {
+        let closed = LockedStrings()
+        let queue = WebSocketOutboundQueue(maxQueuedBytes: 8, writer: { _ in
+            Thread.sleep(forTimeInterval: 0.03)
+            return true
+        }, onClose: { reason in
+            closed.append(reason)
+        })
+
+        XCTAssertEqual(queue.enqueue(Data("12345678".utf8)), .accepted)
+        XCTAssertEqual(queue.enqueue(Data("9".utf8)), .queueFull,
+                       "a stalled iOS socket must be disconnected/downgraded instead of letting host terminal output queue forever")
+        queue.drain()
+        XCTAssertEqual(closed.values(), ["queue_full"])
+    }
+
     @MainActor
     func test_dispatcher_eventsRecent_returnsBus() async {
         // publish to shared bus then query
@@ -66,5 +93,19 @@ final class EventBusTests: XCTestCase {
         guard case .object(let o) = resp.result! else { return XCTFail() }
         guard case .array(let evs) = o["events"]! else { return XCTFail() }
         XCTAssertFalse(evs.isEmpty)
+    }
+}
+
+private final class LockedStrings {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    func append(_ value: String) {
+        lock.lock(); storage.append(value); lock.unlock()
+    }
+
+    func values() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
     }
 }

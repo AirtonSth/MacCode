@@ -134,6 +134,13 @@ public protocol CommandRouting: AnyObject {
 }
 
 @MainActor
+public protocol TerminalCommandRouting: AnyObject {
+    func sendTextResult(surface: SurfaceID, text: String) throws -> JSONValue
+    func surfaceHealthDetails(surface: SurfaceID) -> JSONValue
+    func readTextSnapshot(surface: SurfaceID) throws -> JSONValue
+}
+
+@MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
     private var volatileCommandReceipts: [String: JSONValue] = [:]
@@ -517,16 +524,25 @@ public final class JSONRPCDispatcher {
             case "surface.send_text":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let text = params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
+                if let terminalRouter = router as? TerminalCommandRouting {
+                    return .init(id: id, result: try terminalRouter.sendTextResult(surface: sid, text: text))
+                }
                 try router.sendText(surface: sid, text: text)
-                return .init(id: id, result: .bool(true))
+                return .init(id: id, result: .object(["status": .string("accepted"), "accepted": .bool(true)]))
             case "surface.send_key":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let key = params["key"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let sequence = encodeKey(key)
+                if let terminalRouter = router as? TerminalCommandRouting {
+                    return .init(id: id, result: try terminalRouter.sendTextResult(surface: sid, text: sequence))
+                }
                 try router.sendText(surface: sid, text: sequence)
-                return .init(id: id, result: .bool(true))
+                return .init(id: id, result: .object(["status": .string("accepted"), "accepted": .bool(true)]))
             case "surface.health":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                if let terminalRouter = router as? TerminalCommandRouting {
+                    return .init(id: id, result: terminalRouter.surfaceHealthDetails(surface: sid))
+                }
                 let alive = router.surfaceHealth(surface: sid)
                 return .init(id: id, result: .object(["alive": .bool(alive)]))
             case "surface.clear_history":
@@ -535,6 +551,10 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .bool(true))
             case "surface.read_text":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
+                if params["include_metadata"]?.boolValue == true,
+                   let terminalRouter = router as? TerminalCommandRouting {
+                    return .init(id: id, result: try terminalRouter.readTextSnapshot(surface: sid))
+                }
                 let text = try router.readText(surface: sid)
                 return .init(id: id, result: .string(text))
             case "surface.read_history":

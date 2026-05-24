@@ -211,6 +211,12 @@ public final class TerminalSurface: NSObject, Surface {
     private let ghosttyView: GhosttyTerminalView
     private var masterFD: Int32 = -1
     private var childPID: pid_t = -1
+    private var processAlive = false
+    private var exitStatus: Int32?
+    private var terminationSignal: Int32?
+    private var terminalDeadReason: String?
+    private var lastOutputAt: Date?
+    private var inputPump: TerminalInputPump?
     private var readSource: DispatchSourceRead?
     private let renderer = ANSIRenderer(
         rows: TerminalViewportGeometry.fallbackSize.rows,
@@ -227,6 +233,9 @@ public final class TerminalSurface: NSObject, Surface {
     private var pendingHistoryData = Data()
     private var historyFlushScheduled = false
     private var nextHistoryChunkIndex: Int64 = 1
+    private var historyWriteFailures = 0
+    private var outputPartial = false
+    private var outputPendingBytes = 0
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
     private nonisolated static let maxHiddenOutputBytes = 1024 * 1024
 
@@ -306,14 +315,14 @@ public final class TerminalSurface: NSObject, Surface {
             nextHistoryChunkIndex = (try? historyRepo.nextChunkIndex(surfaceID: descriptor.id.value.uuidString)) ?? 1
         }
 
-        terminalView.onInputData = { [weak self] data in self?.writeToPTY(data) }
+        terminalView.onInputData = { [weak self] data in _ = self?.writeToPTY(data) }
         terminalView.onTerminalSizeChange = { [weak self] size in
             guard let self else { return }
             self.applyTerminalSize(size, sendToPTY: self.masterFD >= 0)
         }
         container.onFileDrop = { [weak self] paths in
             guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return }
-            self?.writeToPTY(data)
+            _ = self?.writeToPTY(data)
         }
         container.onLayout = { [weak self] in
             self?.ghosttyView.forceRefresh()
@@ -322,6 +331,8 @@ public final class TerminalSurface: NSObject, Surface {
 
         if case .sshPlaceholder = launch {
             appendString("[ssh disconnected]\nSelect a saved SSH host or add a new one to connect.\n")
+            terminalDeadReason = "ssh_disconnected"
+            publishRuntimeHealth()
             return
         }
 
@@ -329,23 +340,16 @@ public final class TerminalSurface: NSObject, Surface {
         let pid = rc2_forkpty(&amaster)
         if pid < 0 {
             appendString("[forkpty failed: \(String(cString: strerror(errno)))]\n")
+            terminalDeadReason = "fork_failed"
+            publishRuntimeHealth()
             return
         }
         if pid == 0 {
             _ = chdir(cwd)
-            setenv("TERM", "xterm-256color", 1)
-            setenv("COLORTERM", "truecolor", 1)
-            setenv("CLICOLOR", "1", 1)
-            unsetenv("NO_COLOR")
-            setenv("TERM_PROGRAM", "ghostty", 1)
-            setenv("RC2_WORKSPACE_ID", workspaceID.value.uuidString, 1)
-            setenv("RC2_SURFACE_ID", descriptor.id.value.uuidString, 1)
-            if getenv("LANG") == nil {
-                setenv("LANG", "en_US.UTF-8", 1)
-            }
+            TerminalStartupEnvironment(workspaceID: workspaceID, surfaceID: descriptor.id).applyToCurrentProcess()
             switch launch {
             case .shell:
-                let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+                let shell = TerminalStartupEnvironment.shellPath()
                 let shellName = (shell as NSString).lastPathComponent
                 shell.withCString { sPath in
                     ("-" + shellName).withCString { argv0 in
@@ -368,8 +372,15 @@ public final class TerminalSurface: NSObject, Surface {
         }
         self.masterFD = amaster
         self.childPID = pid
+        self.processAlive = true
+        self.exitStatus = nil
+        self.terminationSignal = nil
+        self.terminalDeadReason = nil
+        self.lastOutputAt = Date()
+        configureInputPump(fd: amaster)
         applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
+        publishRuntimeHealth()
     }
 
     private func applyTerminalSize(_ size: TerminalViewportSize, sendToPTY: Bool, force: Bool = false) {
@@ -405,21 +416,25 @@ public final class TerminalSurface: NSObject, Surface {
             Darwin.close(masterFD)
             masterFD = -1
         }
-        reapChildIfExited()
+        let status = reapChildIfExited()
+        markTerminalDead(reason: "process_exited", exitStatus: status)
     }
 
-    private func reapChildIfExited() {
-        guard childPID > 0 else { return }
+    private func reapChildIfExited() -> Int32? {
+        guard childPID > 0 else { return exitStatus }
         var status: Int32 = 0
         if waitpid(childPID, &status, WNOHANG) == childPID {
             childPID = -1
+            return status
         }
+        return nil
     }
 
     private func appendDataAsync(_ data: Data) {
         enqueueHistory(data)
         renderer.feed(data)
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
+        lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
         // HC-1: stream raw PTY output to the mirror in real time.
         SurfaceOutputBus.shared.emit(descriptor.id, data)
@@ -434,6 +449,7 @@ public final class TerminalSurface: NSObject, Surface {
         guard let data = raw.data(using: .utf8) else { return }
         enqueueHistory(data)
         renderer.feed(data)
+        lastOutputAt = Date()
         SurfaceOutputBus.shared.emit(descriptor.id, data)
         if isVisible {
             ghosttyView.processOutput(data)
@@ -445,7 +461,11 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendHiddenOutput(_ data: Data) {
         hiddenOutput.append(data)
         if hiddenOutput.count > Self.maxHiddenOutputBytes {
-            hiddenOutput.removeFirst(hiddenOutput.count - Self.maxHiddenOutputBytes)
+            let dropped = hiddenOutput.count - Self.maxHiddenOutputBytes
+            hiddenOutput.removeFirst(dropped)
+            outputPartial = true
+            outputPendingBytes += dropped
+            publishRuntimeHealth()
         }
     }
 
@@ -460,23 +480,111 @@ public final class TerminalSurface: NSObject, Surface {
               let raw = String(data: data, encoding: .utf8)?.lowercased(),
               raw.contains("password:") || raw.contains("passphrase") else { return }
         didSendSavedSSHPassword = true
-        sendText(savedSSHPassword + "\n")
+        _ = sendTextStatus(savedSSHPassword + "\n")
     }
 
-    private func writeToPTY(_ data: Data) {
-        guard masterFD >= 0, !data.isEmpty else { return }
-        data.withUnsafeBytes { ptr in
-            _ = Darwin.write(masterFD, ptr.baseAddress, data.count)
+    @discardableResult
+    private func writeToPTY(_ data: Data) -> TerminalInputStatus {
+        guard !data.isEmpty else { return .accepted }
+        guard processAlive, masterFD >= 0, terminalDeadReason == nil else { return .processExited }
+        guard let inputPump else { return .writeFailed }
+        let status = inputPump.enqueue(data)
+        if status != .accepted {
+            publishRuntimeHealth()
         }
+        return status
+    }
+
+    private func configureInputPump(fd: Int32) {
+        let pump = TerminalInputPump(writer: { data, offset in
+            data.withUnsafeBytes { ptr in
+                guard let base = ptr.baseAddress else { return .wrote(0) }
+                let n = Darwin.write(fd, base.advanced(by: offset), data.count - offset)
+                if n > 0 { return .wrote(n) }
+                if n < 0, errno == EINTR { return .interrupted }
+                if n < 0, errno == EAGAIN || errno == EWOULDBLOCK { return .wouldBlock }
+                return .failed(errno)
+            }
+        })
+        pump.onTerminalFailure = { [weak self] status in
+            DispatchQueue.main.async {
+                self?.markTerminalDead(reason: status.rawValue, exitStatus: nil)
+            }
+        }
+        inputPump = pump
+    }
+
+    public func sendTextStatus(_ text: String) -> TerminalInputStatus {
+        guard let data = text.data(using: .utf8) else { return .writeFailed }
+        return writeToPTY(data)
     }
 
     public func sendText(_ text: String) {
-        guard let data = text.data(using: .utf8) else { return }
-        writeToPTY(data)
+        _ = sendTextStatus(text)
+    }
+
+    public func runtimeHealth() -> TerminalRuntimeHealth {
+        TerminalRuntimeHealth(
+            processAlive: processAlive,
+            childPID: childPID > 0 ? childPID : nil,
+            exitStatus: exitStatus,
+            terminationSignal: terminationSignal,
+            ptyOpen: masterFD >= 0,
+            inputAccepting: processAlive && terminalDeadReason == nil && (inputPump?.inputAccepting ?? false),
+            terminalDeadReason: terminalDeadReason,
+            lastOutputAt: lastOutputAt,
+            outputPartial: outputPartial,
+            outputPendingBytes: outputPendingBytes + hiddenOutput.count,
+            historyWriteFailures: historyWriteFailures
+        )
+    }
+
+    public func readTextSnapshot() -> TerminalTextSnapshot {
+        if !isVisible && !hiddenOutput.isEmpty {
+            return TerminalTextSnapshot(
+                text: renderer.snapshot().string,
+                complete: false,
+                source: "ansi_fallback",
+                timestamp: Date(),
+                partialReason: outputPartial ? "hidden_output_cap" : "hidden_output_pending",
+                pendingBytes: outputPendingBytes + hiddenOutput.count
+            )
+        }
+        if let text = ghosttyView.readViewportText() {
+            return TerminalTextSnapshot(
+                text: text,
+                complete: !outputPartial && historyWriteFailures == 0,
+                source: "ghostty_viewport",
+                timestamp: Date(),
+                partialReason: outputPartial ? "hidden_output_cap" : (historyWriteFailures > 0 ? "history_persistence_failed" : nil),
+                pendingBytes: outputPendingBytes
+            )
+        }
+        return TerminalTextSnapshot(
+            text: renderer.snapshot().string,
+            complete: false,
+            source: "ansi_fallback",
+            timestamp: Date(),
+            partialReason: "ghostty_unavailable",
+            pendingBytes: outputPendingBytes + hiddenOutput.count
+        )
+    }
+
+    private func publishRuntimeHealth() {
+        SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
+    }
+
+    private func markTerminalDead(reason: String, exitStatus: Int32?) {
+        guard processAlive || terminalDeadReason == nil else { return }
+        processAlive = false
+        self.exitStatus = exitStatus ?? self.exitStatus
+        terminalDeadReason = reason
+        inputPump?.stop(reason: .processExited)
+        publishRuntimeHealth()
     }
 
     public func readText() -> String {
-        ghosttyView.readViewportText() ?? renderer.snapshot().string
+        readTextSnapshot().text
     }
 
     public func focus() {
@@ -495,6 +603,7 @@ public final class TerminalSurface: NSObject, Surface {
         } else {
             let output = hiddenOutput
             hiddenOutput.removeAll(keepingCapacity: true)
+            outputPendingBytes = 0
             ghosttyView.processOutput(output)
         }
         DispatchQueue.main.async { [weak self] in
@@ -512,9 +621,12 @@ public final class TerminalSurface: NSObject, Surface {
         flushHistory(wait: true)
         readSource?.cancel()
         readSource = nil
+        inputPump?.stop(reason: .processExited)
         if childPID > 0 {
             let pid = childPID
             childPID = -1
+            processAlive = false
+            terminalDeadReason = terminalDeadReason ?? "closed"
             kill(pid, SIGHUP)
             DispatchQueue.global(qos: .utility).async {
                 var status: Int32 = 0
@@ -526,6 +638,7 @@ public final class TerminalSurface: NSObject, Surface {
             masterFD = -1
         }
         ghosttyView.closeSurface()
+        publishRuntimeHealth()
     }
 
     public func flushPersistedHistory() {
@@ -560,7 +673,16 @@ public final class TerminalSurface: NSObject, Surface {
         let chunkIndex = nextHistoryChunkIndex
         nextHistoryChunkIndex += 1
         let write = DispatchWorkItem {
-            try? historyRepo.append(surfaceID: surfaceID, workspaceID: workspaceID, chunkIndex: chunkIndex, data: data)
+            do {
+                try historyRepo.append(surfaceID: surfaceID, workspaceID: workspaceID, chunkIndex: chunkIndex, data: data)
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.historyWriteFailures += 1
+                    self?.outputPartial = true
+                    self?.publishRuntimeHealth()
+                }
+                NSLog("RemoteCode terminal history write failed surface=%@ chunk=%lld error=%@", surfaceID, chunkIndex, String(describing: error))
+            }
         }
         if wait {
             historyQueue.sync(execute: write)

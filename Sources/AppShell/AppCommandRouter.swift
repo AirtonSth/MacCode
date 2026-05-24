@@ -46,7 +46,7 @@ private struct ProviderProbeCapabilities {
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: CommandRouting {
+public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
@@ -348,9 +348,35 @@ public final class AppCommandRouter: CommandRouting {
         s.sendText(text)
     }
 
+    public func sendTextResult(surface: SurfaceID, text: String) throws -> JSONValue {
+        guard let s = SurfaceRegistry.shared.surface(surface) else {
+            return terminalInputStatusJSON(.surfaceNotFound)
+        }
+        if let terminal = s as? TerminalSurface {
+            return terminalInputStatusJSON(terminal.sendTextStatus(text))
+        }
+        s.sendText(text)
+        return terminalInputStatusJSON(.accepted)
+    }
+
     public func readText(surface: SurfaceID) throws -> String {
         guard let s = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
         return s.readText()
+    }
+
+    public func readTextSnapshot(surface: SurfaceID) throws -> JSONValue {
+        guard let s = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
+        if let terminal = s as? TerminalSurface {
+            return terminalSnapshotJSON(terminal.readTextSnapshot())
+        }
+        return .object([
+            "text": .string(s.readText()),
+            "complete": .bool(true),
+            "partial": .bool(false),
+            "source": .string("surface_read_text"),
+            "timestamp": .number(Date().timeIntervalSince1970),
+            "pending_bytes": .number(0)
+        ])
     }
 
     public func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow {
@@ -362,6 +388,25 @@ public final class AppCommandRouter: CommandRouting {
 
     public func surfaceHealth(surface: SurfaceID) -> Bool {
         SurfaceRegistry.shared.surface(surface) != nil
+    }
+
+    public func surfaceHealthDetails(surface: SurfaceID) -> JSONValue {
+        guard let s = SurfaceRegistry.shared.surface(surface) else {
+            return .object([
+                "alive": .bool(false),
+                "process_alive": .bool(false),
+                "pty_open": .bool(false),
+                "input_accepting": .bool(false),
+                "terminal_dead_reason": .string(TerminalInputStatus.surfaceNotFound.rawValue)
+            ])
+        }
+        guard let terminal = s as? TerminalSurface else {
+            return .object([
+                "alive": .bool(true),
+                "surface_type": .string(s.descriptor.type.rawValue)
+            ])
+        }
+        return terminalHealthJSON(terminal.runtimeHealth())
     }
 
     public func surfaceClearHistory(surface: SurfaceID) {
@@ -2141,4 +2186,40 @@ private extension Optional {
         guard let value = self else { throw error }
         return value
     }
+}
+
+private func terminalInputStatusJSON(_ status: TerminalInputStatus) -> JSONValue {
+    .object([
+        "status": .string(status.rawValue),
+        "accepted": .bool(status == .accepted)
+    ])
+}
+
+private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
+    .object([
+        "alive": .bool(health.alive),
+        "process_alive": .bool(health.processAlive),
+        "child_pid": health.childPID.map { .number(Double($0)) } ?? .null,
+        "exit_status": health.exitStatus.map { .number(Double($0)) } ?? .null,
+        "termination_signal": health.terminationSignal.map { .number(Double($0)) } ?? .null,
+        "pty_open": .bool(health.ptyOpen),
+        "input_accepting": .bool(health.inputAccepting),
+        "terminal_dead_reason": health.terminalDeadReason.map { .string($0) } ?? .null,
+        "last_output_at": health.lastOutputAt.map { .number($0.timeIntervalSince1970) } ?? .null,
+        "output_partial": .bool(health.outputPartial),
+        "output_pending_bytes": .number(Double(health.outputPendingBytes)),
+        "history_write_failures": .number(Double(health.historyWriteFailures))
+    ])
+}
+
+private func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue {
+    .object([
+        "text": .string(snapshot.text),
+        "complete": .bool(snapshot.complete),
+        "partial": .bool(!snapshot.complete),
+        "source": .string(snapshot.source),
+        "timestamp": .number(snapshot.timestamp.timeIntervalSince1970),
+        "partial_reason": snapshot.partialReason.map { .string($0) } ?? .null,
+        "pending_bytes": .number(Double(snapshot.pendingBytes))
+    ])
 }

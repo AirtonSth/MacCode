@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import CoreModel
 @testable import Surfaces
 
 @MainActor
@@ -103,5 +104,144 @@ final class TerminalEncodeTests: XCTestCase {
 
         XCTAssertEqual(DroppedFilePaths.paths(from: pasteboard), ["/tmp/plain.txt"],
                        "Finder file-url string drops must resolve to absolute path text")
+    }
+
+    func test_inputPumpRetriesPartialWritesUntilExactOrderedBytesArrive() {
+        let chunks = LockedTerminalChunks()
+        let pump = TerminalInputPump { data, offset in
+            let remaining = data.count - offset
+            let count = min(3, remaining)
+            chunks.append(data.subdata(in: offset..<(offset + count)))
+            return .wrote(count)
+        }
+
+        XCTAssertEqual(pump.enqueue(Data("abcdef".utf8)), .accepted)
+        XCTAssertEqual(pump.enqueue(Data("ghij".utf8)), .accepted)
+        pump.drain()
+
+        XCTAssertEqual(String(data: chunks.joined(), encoding: .utf8), "abcdefghij",
+                       "large terminal input must be written in order even when the PTY accepts only partial chunks")
+    }
+
+    func test_inputPumpRetriesInterruptedAndWouldBlockWritesWithoutDroppingBytes() {
+        let chunks = LockedTerminalChunks()
+        let attempts = LockedCounter()
+        let pump = TerminalInputPump(retryDelay: 0) { data, offset in
+            let attempt = attempts.increment()
+            if attempt == 1 { return .interrupted }
+            if attempt == 2 { return .wouldBlock }
+            chunks.append(data.subdata(in: offset..<data.count))
+            return .wrote(data.count - offset)
+        }
+
+        XCTAssertEqual(pump.enqueue(Data("retry-me".utf8)), .accepted)
+        pump.drain()
+
+        XCTAssertEqual(String(data: chunks.joined(), encoding: .utf8), "retry-me",
+                       "EINTR/EAGAIN are normal PTY pressure signals and must not make remote input disappear")
+    }
+
+    func test_inputPumpRejectsQueueOverflowBeforeReportingSuccess() {
+        let pump = TerminalInputPump(maxQueuedBytes: 4) { _, _ in .wrote(1) }
+
+        XCTAssertEqual(pump.enqueue(Data("12345".utf8)), .queueFull,
+                       "remote paste must fail loudly when the bounded input queue cannot accept the payload")
+    }
+
+    func test_inputPumpDeadStateRejectsFutureInputAsProcessExited() {
+        let pump = TerminalInputPump { _, _ in .wrote(1) }
+        pump.stop()
+
+        XCTAssertEqual(pump.enqueue(Data("x".utf8)), .processExited,
+                       "after terminal death, iOS/macOS input must receive process_exited instead of silent success")
+    }
+
+    func test_ghosttySurfaceSlotRemovesPointerBeforeCloseSoStaleRefreshesCannotReuseIt() {
+        let slot = GhosttySurfaceSlot()
+        let generation = slot.beginCreate()!
+        let fakeSurface = UnsafeMutableRawPointer(bitPattern: 0x1)!
+
+        XCTAssertTrue(slot.install(fakeSurface, generation: generation))
+        XCTAssertEqual(slot.liveSurface(), fakeSurface)
+
+        XCTAssertEqual(slot.removeForClose(), fakeSurface)
+        XCTAssertNil(slot.liveSurface(),
+                     "closing must clear the live pointer before free so delayed refresh/input paths cannot use stale Ghostty memory")
+        slot.markClosed()
+        XCTAssertNil(slot.removeForClose(),
+                     "double close must be idempotent because app/window teardown can race terminal surface teardown")
+    }
+
+    func test_terminalStartupEnvironmentProtectsTerminalIdentityAndPreservesUserShellConfig() {
+        let workspaceID = WorkspaceID(UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
+        let surfaceID = SurfaceID(UUID(uuidString: "00000000-0000-0000-0000-000000000002")!)
+        let environment = TerminalStartupEnvironment(
+            parent: [
+                "TERM": "dumb",
+                "COLORTERM": "none",
+                "TERM_PROGRAM": "Apple_Terminal",
+                "ZDOTDIR": "/tmp/custom-zdotdir",
+                "SHELL": "/bin/bash",
+                "LANG": "pt_BR.UTF-8"
+            ],
+            workspaceID: workspaceID,
+            surfaceID: surfaceID
+        )
+
+        XCTAssertEqual(environment.assignments["TERM"], "xterm-256color",
+                       "terminal identity must be owned by the managed terminal renderer, not inherited from the launching app")
+        XCTAssertEqual(environment.assignments["COLORTERM"], "truecolor")
+        XCTAssertEqual(environment.assignments["TERM_PROGRAM"], "ghostty")
+        XCTAssertNil(environment.assignments["ZDOTDIR"],
+                     "custom ZDOTDIR must stay inherited so zsh user config is preserved")
+        XCTAssertNil(environment.assignments["LANG"],
+                     "an existing locale must not be overwritten by the terminal helper")
+        XCTAssertEqual(TerminalStartupEnvironment.shellPath(from: ["SHELL": "/bin/bash"]), "/bin/bash")
+    }
+
+    func test_terminalStartupEnvironmentBlanksOnlyKnownInheritedAgentSelectionKeys() {
+        let workspaceID = WorkspaceID(UUID(uuidString: "00000000-0000-0000-0000-000000000003")!)
+        let surfaceID = SurfaceID(UUID(uuidString: "00000000-0000-0000-0000-000000000004")!)
+        let environment = TerminalStartupEnvironment(
+            parent: [
+                "ANTHROPIC_API_KEY": "secret",
+                "ANTHROPIC_MODEL": "stale-model",
+                "OPENAI_API_KEY": "user-terminal-secret"
+            ],
+            workspaceID: workspaceID,
+            surfaceID: surfaceID
+        )
+
+        XCTAssertEqual(environment.assignments["ANTHROPIC_API_KEY"], "",
+                       "known inherited Claude selection/auth env is blanked to avoid leaking stale app agent state into long-running terminals")
+        XCTAssertEqual(environment.assignments["ANTHROPIC_MODEL"], "")
+        XCTAssertNil(environment.assignments["OPENAI_API_KEY"],
+                     "unmanaged user shell secrets must remain inherited instead of being logged, copied, or selectively erased")
+        XCTAssertTrue(environment.removals.contains("NO_COLOR"))
+    }
+}
+
+private final class LockedTerminalChunks {
+    private let lock = NSLock()
+    private var chunks: [Data] = []
+
+    func append(_ data: Data) {
+        lock.lock(); chunks.append(data); lock.unlock()
+    }
+
+    func joined() -> Data {
+        lock.lock(); defer { lock.unlock() }
+        return chunks.reduce(into: Data()) { $0.append($1) }
+    }
+}
+
+private final class LockedCounter {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        value += 1
+        return value
     }
 }

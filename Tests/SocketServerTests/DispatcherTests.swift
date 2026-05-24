@@ -5,7 +5,7 @@ import Persistence
 import AgentRuntime
 
 @MainActor
-final class FakeRouter: CommandRouting {
+final class FakeRouter: CommandRouting, TerminalCommandRouting {
     var workspaces: [Workspace] = []
     var window = AppWindow()
 
@@ -61,7 +61,19 @@ final class FakeRouter: CommandRouting {
     func setSurfaceColor(_ wid: WorkspaceID, _ sid: SurfaceID, _ color: String) throws {}
     var sentSurfaceText: [(SurfaceID, String)] = []
     func sendText(surface: SurfaceID, text: String) throws { sentSurfaceText.append((surface, text)) }
+    var terminalSendResult: JSONValue = .object(["status": .string("accepted"), "accepted": .bool(true)])
+    func sendTextResult(surface: SurfaceID, text: String) throws -> JSONValue {
+        sentSurfaceText.append((surface, text))
+        return terminalSendResult
+    }
     func readText(surface: SurfaceID) throws -> String { "" }
+    var terminalSnapshot: JSONValue = .object([
+        "text": .string(""),
+        "complete": .bool(true),
+        "partial": .bool(false),
+        "source": .string("test")
+    ])
+    func readTextSnapshot(surface: SurfaceID) throws -> JSONValue { terminalSnapshot }
     var terminalHistory = TerminalOutputWindow(chunks: [], hasMoreOlder: false, nextBeforeChunkID: nil)
     var lastHistoryRequest: (SurfaceID, Int64?, Int)?
     func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow {
@@ -69,6 +81,8 @@ final class FakeRouter: CommandRouting {
         return terminalHistory
     }
     func surfaceHealth(surface: SurfaceID) -> Bool { true }
+    var terminalHealth: JSONValue = .object(["alive": .bool(true), "process_alive": .bool(true), "input_accepting": .bool(true)])
+    func surfaceHealthDetails(surface: SurfaceID) -> JSONValue { terminalHealth }
     func surfaceClearHistory(surface: SurfaceID) {}
     var sshHosts: [SSHHostProfile] = []
     func sshHostList() throws -> [SSHHostProfile] { sshHosts }
@@ -1539,5 +1553,70 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(router.threadStore.first?.model, "claude-opus-4-7")
         XCTAssertEqual(router.threadStore.first?.providerThreadId, "claude-session",
                        "Claude model switching must keep the provider session cursor so the next turn can resume the same conversation")
+    }
+
+    @MainActor
+    func test_surfaceSendTextReturnsExplicitTerminalFailureStatus() async throws {
+        let router = FakeRouter()
+        let surface = SurfaceID()
+        router.terminalSendResult = .object(["status": .string("process_exited"), "accepted": .bool(false)])
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.send_text", params: [
+            "id": .string(surface.value.uuidString),
+            "text": .string("pwd")
+        ]))
+
+        let result = try XCTUnwrap(resp.result?.objectValue)
+        XCTAssertEqual(result["status"], .string("process_exited"),
+                       "remote terminal input must fail loudly after child exit instead of returning opaque success")
+        XCTAssertEqual(result["accepted"], .bool(false))
+    }
+
+    @MainActor
+    func test_surfaceHealthIncludesTerminalProcessState() async throws {
+        let router = FakeRouter()
+        let surface = SurfaceID()
+        router.terminalHealth = .object([
+            "alive": .bool(false),
+            "process_alive": .bool(false),
+            "pty_open": .bool(false),
+            "input_accepting": .bool(false),
+            "terminal_dead_reason": .string("process_exited")
+        ])
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.health", params: [
+            "id": .string(surface.value.uuidString)
+        ]))
+
+        let result = try XCTUnwrap(resp.result?.objectValue)
+        XCTAssertEqual(result["alive"], .bool(false))
+        XCTAssertEqual(result["terminal_dead_reason"], .string("process_exited"),
+                       "iOS ALIVE/DEAD must reflect terminal process state, not just surface object existence")
+    }
+
+    @MainActor
+    func test_surfaceReadTextCanReturnSnapshotReliabilityMetadata() async throws {
+        let router = FakeRouter()
+        let surface = SurfaceID()
+        router.terminalSnapshot = .object([
+            "text": .string("partial"),
+            "complete": .bool(false),
+            "partial": .bool(true),
+            "source": .string("ansi_fallback"),
+            "partial_reason": .string("ghostty_unavailable")
+        ])
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.read_text", params: [
+            "id": .string(surface.value.uuidString),
+            "include_metadata": .bool(true)
+        ]))
+
+        let result = try XCTUnwrap(resp.result?.objectValue)
+        XCTAssertEqual(result["complete"], .bool(false))
+        XCTAssertEqual(result["partial_reason"], .string("ghostty_unavailable"),
+                       "snapshot reads must say when terminal text is degraded so iOS does not show fake complete output")
     }
 }

@@ -9,6 +9,70 @@ private final class RemoteCodeGhosttyIOContext {
     weak var view: GhosttyTerminalView?
 }
 
+final class GhosttySurfaceSlot {
+    enum State: Equatable {
+        case empty
+        case creating(UInt64)
+        case live(UInt64)
+        case closing(UInt64)
+        case closed(UInt64)
+    }
+
+    private(set) var state: State = .empty
+    private(set) var generation: UInt64 = 0
+    private var surface: ghostty_surface_t?
+
+    var isLive: Bool {
+        guard case .live = state else { return false }
+        return surface != nil
+    }
+
+    func beginCreate() -> UInt64? {
+        guard surface == nil else { return nil }
+        switch state {
+        case .creating, .closing:
+            return nil
+        case .empty, .live, .closed:
+            generation &+= 1
+            state = .creating(generation)
+            return generation
+        }
+    }
+
+    func install(_ newSurface: ghostty_surface_t, generation expectedGeneration: UInt64) -> Bool {
+        guard case .creating(let activeGeneration) = state,
+              activeGeneration == expectedGeneration else { return false }
+        surface = newSurface
+        state = .live(expectedGeneration)
+        return true
+    }
+
+    func cancelCreate(generation expectedGeneration: UInt64) {
+        guard case .creating(let activeGeneration) = state,
+              activeGeneration == expectedGeneration else { return }
+        state = .closed(expectedGeneration)
+    }
+
+    func liveSurface() -> ghostty_surface_t? {
+        guard case .live = state else { return nil }
+        return surface
+    }
+
+    func removeForClose() -> ghostty_surface_t? {
+        guard let current = surface else {
+            state = .closed(generation)
+            return nil
+        }
+        surface = nil
+        state = .closing(generation)
+        return current
+    }
+
+    func markClosed() {
+        state = .closed(generation)
+    }
+}
+
 private func ghosttyTerminalIOWriteCallback(
     _ userdata: UnsafeMutableRawPointer?,
     _ bytes: UnsafePointer<CChar>?,
@@ -293,7 +357,7 @@ final class GhosttyTerminalView: NSView {
     var onInputData: ((Data) -> Void)?
     var onTerminalSizeChange: ((TerminalViewportSize) -> Void)?
 
-    private var surface: ghostty_surface_t?
+    private let surfaceSlot = GhosttySurfaceSlot()
     private let ioContext = RemoteCodeGhosttyIOContext()
     private var pendingOutput = Data()
     private var outputFlushScheduled = false
@@ -315,9 +379,10 @@ final class GhosttyTerminalView: NSView {
     }
 
     deinit {
-        if let surface {
+        if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
         }
+        surfaceSlot.markClosed()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -356,10 +421,10 @@ final class GhosttyTerminalView: NSView {
     }
 
     func closeSurface() {
-        if let surface {
+        if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
-            self.surface = nil
         }
+        surfaceSlot.markClosed()
         pendingOutput.removeAll(keepingCapacity: false)
     }
 
@@ -371,7 +436,7 @@ final class GhosttyTerminalView: NSView {
     func processOutput(_ data: Data) {
         guard !data.isEmpty else { return }
         appendPendingOutput(data)
-        guard let surface else {
+        guard let surface = surfaceSlot.liveSurface() else {
             return
         }
         if pendingOutput.count >= Self.immediateOutputFlushBytes {
@@ -399,7 +464,7 @@ final class GhosttyTerminalView: NSView {
     private func flushPendingOutput() {
         outputFlushScheduled = false
         ensureSurface()
-        guard let surface else { return }
+        guard let surface = surfaceSlot.liveSurface() else { return }
         flushPendingOutput(to: surface)
     }
 
@@ -427,7 +492,7 @@ final class GhosttyTerminalView: NSView {
         ensureSurface()
         updateGhosttySize(force: true)
         flushPendingOutput()
-        if let surface {
+        if let surface = surfaceSlot.liveSurface() {
             ghostty_surface_render_now(surface)
             ghostty_surface_refresh(surface)
         }
@@ -439,7 +504,7 @@ final class GhosttyTerminalView: NSView {
 
     private func readText(pointTag: ghostty_point_tag_e) -> String? {
         ensureSurface()
-        guard let surface else { return nil }
+        guard let surface = surfaceSlot.liveSurface() else { return nil }
         flushPendingOutput(to: surface)
         ghostty_surface_render_now(surface)
 
@@ -469,13 +534,14 @@ final class GhosttyTerminalView: NSView {
     }
 
     private func ensureSurface() {
-        guard surface == nil else { return }
+        guard surfaceSlot.liveSurface() == nil else { return }
         guard window != nil else { return }
         guard bounds.width > 0, bounds.height > 0 else { return }
         guard let app = RemoteCodeGhosttyRuntime.shared.app else { return }
         guard Self.hasActiveDisplay() else { return }
         guard let displayID = window?.screen?.displayID ?? NSScreen.main?.displayID,
               displayID != 0 else { return }
+        guard let generation = surfaceSlot.beginCreate() else { return }
 
         var config = ghostty_surface_config_new()
         config.platform_tag = GHOSTTY_PLATFORM_MACOS
@@ -491,6 +557,7 @@ final class GhosttyTerminalView: NSView {
         config.io_write_userdata = Unmanaged.passUnretained(ioContext).toOpaque()
 
         guard let created = ghostty_surface_new(app, &config) else {
+            surfaceSlot.cancelCreate(generation: generation)
             #if DEBUG
             NSLog(
                 "RemoteCode Ghostty surface allocation failed bounds=%@ window=%d layer=%d %@",
@@ -503,7 +570,10 @@ final class GhosttyTerminalView: NSView {
             return
         }
 
-        surface = created
+        guard surfaceSlot.install(created, generation: generation) else {
+            ghostty_surface_free(created)
+            return
+        }
         ghostty_surface_set_display_id(created, displayID)
         updateGhosttySize(force: true)
         updateFocus()
@@ -517,14 +587,14 @@ final class GhosttyTerminalView: NSView {
     }
 
     private func updateFocus() {
-        guard let surface else { return }
+        guard let surface = surfaceSlot.liveSurface() else { return }
         ghostty_surface_set_focus(surface, window?.firstResponder === self)
     }
 
     @discardableResult
     private func updateGhosttySize(force: Bool) -> Bool {
         ensureSurface()
-        guard let surface else { return false }
+        guard let surface = surfaceSlot.liveSurface() else { return false }
         guard bounds.width > 0, bounds.height > 0 else { return false }
 
         let backing = convertToBacking(NSRect(origin: .zero, size: bounds.size)).size
@@ -681,7 +751,7 @@ final class GhosttyTerminalView: NSView {
 
     private func surfaceForInput() -> ghostty_surface_t? {
         ensureSurface()
-        return surface
+        return surfaceSlot.liveSurface()
     }
 
     private func sendText(_ text: String, to surface: ghostty_surface_t) {
