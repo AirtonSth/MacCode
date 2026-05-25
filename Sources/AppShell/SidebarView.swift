@@ -15,13 +15,28 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var workspaces: [Workspace] = []
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
+    @Published public var privateAccountUser: PrivateAccountUser?
     public var draggingWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
+    private var privateAccountObserver: NSObjectProtocol?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
         self.router = router
+        self.privateAccountObserver = NotificationCenter.default.addObserver(
+            forName: .rc2PrivateAccountChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.reloadPrivateAccount() }
+        }
         reload()
+    }
+
+    deinit {
+        if let privateAccountObserver {
+            NotificationCenter.default.removeObserver(privateAccountObserver)
+        }
     }
 
     public func reload() {
@@ -29,6 +44,12 @@ public final class SidebarViewModel: ObservableObject {
         workspaces = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+        reloadPrivateAccount()
+    }
+
+    private func reloadPrivateAccount() {
+        guard let ctx = context else { return }
+        privateAccountUser = PrivateAccountSessionStore(repo: ctx.settingsRepo).load()?.user
     }
 
     public func select(_ wid: WorkspaceID) {
@@ -183,29 +204,47 @@ public final class SidebarViewModel: ObservableObject {
 
 public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
+    private let onOpenSettings: () -> Void
+    private let onOpenAccount: () -> Void
 
-    public init(vm: SidebarViewModel) { self.vm = vm }
+    public init(
+        vm: SidebarViewModel,
+        onOpenSettings: @escaping () -> Void = {},
+        onOpenAccount: @escaping () -> Void = {}
+    ) {
+        self.vm = vm
+        self.onOpenSettings = onOpenSettings
+        self.onOpenAccount = onOpenAccount
+    }
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Color.clear.frame(height: 44)
 
-            HStack(spacing: DS.Space.xs) {
-                Button { vm.newWorkspace() } label: {
-                    sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
-                }
-                .buttonStyle(.plain)
-                .help("Create new workspace")
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                HStack(spacing: DS.Space.xs) {
+                    Button { vm.newWorkspace() } label: {
+                        sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Create new workspace")
 
-                Button { vm.toggleSidebar() } label: {
-                    Image(systemName: "sidebar.left")
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 32, height: 32)
-                        .contentShape(Rectangle())
+                    Button { vm.toggleSidebar() } label: {
+                        Image(systemName: "sidebar.left")
+                            .font(.system(size: 15, weight: .regular))
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .frame(width: 32, height: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Toggle sidebar")
+                }
+
+                Button(action: onOpenSettings) {
+                    sidebarActionRow(symbol: "gearshape", title: "Settings")
                 }
                 .buttonStyle(.plain)
-                .help("Toggle sidebar")
+                .help("Settings")
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
@@ -242,7 +281,8 @@ public struct SidebarRootView: View {
                 .padding(.horizontal, DS.Space.sm)
             }
             .frame(maxHeight: .infinity)
-            .padding(.bottom, 76)
+
+            accountFooter
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // Subtle liquid-glass: a near-transparent tint over the
@@ -272,6 +312,82 @@ public struct SidebarRootView: View {
             RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                 .fill(Color.white.opacity(0.001))
         )
+    }
+
+    private var accountFooter: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Rectangle()
+                .fill(DS.Palette.line.opacity(0.55))
+                .frame(height: DS.Border.hairline)
+
+            Button(action: onOpenAccount) {
+                HStack(spacing: DS.Space.md) {
+                    accountAvatar
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(accountDisplayName)
+                            .font(DS.Font.bodyStrong)
+                            .foregroundColor(DS.Palette.text)
+                            .lineLimit(1)
+                        Text(accountSubtitle)
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .frame(height: 48)
+                .contentShape(Rectangle())
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .fill(Color.white.opacity(0.001))
+                )
+            }
+            .buttonStyle(.plain)
+            .help(vm.privateAccountUser == nil ? "Sign in" : "Account")
+            .padding(.horizontal, DS.Space.md)
+            .padding(.top, DS.Space.md)
+            .padding(.bottom, DS.Space.lg)
+        }
+        .background(DS.Palette.surface.opacity(0.42))
+    }
+
+    private var accountAvatar: some View {
+        ZStack {
+            Circle()
+                .fill(vm.privateAccountUser == nil ? DS.Palette.surfaceRaised : DS.Palette.accent.opacity(0.22))
+                .overlay(
+                    Circle()
+                        .stroke(DS.Palette.lineStrong.opacity(0.7), lineWidth: DS.Border.hairline)
+                )
+            Text(accountInitials)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(vm.privateAccountUser == nil ? DS.Palette.textSecondary : DS.Palette.accent)
+        }
+        .frame(width: 28, height: 28)
+    }
+
+    private var accountDisplayName: String {
+        guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first, !local.isEmpty else {
+            return "Sign in"
+        }
+        return String(local)
+    }
+
+    private var accountSubtitle: String {
+        vm.privateAccountUser?.email ?? "RemoteCode Account"
+    }
+
+    private var accountInitials: String {
+        guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first else {
+            return "RC"
+        }
+        let letters = local.filter(\.isLetter)
+        let prefix = letters.prefix(2)
+        return prefix.isEmpty ? "RC" : String(prefix).uppercased()
     }
 
     @ViewBuilder
@@ -403,6 +519,7 @@ public final class SidebarView: NSObject {
     private let viewModel: SidebarViewModel
     private let host: NSHostingView<SidebarRootView>
     private var settingsController: SettingsWindowController?
+    private var accountController: AccountWindowController?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -431,28 +548,15 @@ public final class SidebarView: NSObject {
         ])
         self.view = container
         super.init()
-        configureSettingsFooter(in: container)
+        h.rootView = SidebarRootView(
+            vm: viewModel,
+            onOpenSettings: { [weak self] in self?.showSettings() },
+            onOpenAccount: { [weak self] in self?.showAccount() }
+        )
     }
 
     public func refresh() {
         viewModel.reload()
-    }
-
-    private func configureSettingsFooter(in container: NSView) {
-        let footer = NSHostingView(rootView: SidebarFooterSettingsButton { [weak self] in
-            self?.showSettings()
-        })
-        footer.translatesAutoresizingMaskIntoConstraints = false
-        footer.wantsLayer = true
-        footer.layer?.backgroundColor = NSColor.clear.cgColor
-        container.addSubview(footer)
-
-        NSLayoutConstraint.activate([
-            footer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            footer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            footer.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            footer.heightAnchor.constraint(equalToConstant: 72)
-        ])
     }
 
     @objc private func showSettings() {
@@ -465,44 +569,15 @@ public final class SidebarView: NSObject {
             controller.show()
         }
     }
-}
 
-private struct SidebarFooterSettingsButton: View {
-    let action: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Rectangle()
-                .fill(DS.Palette.line.opacity(0.55))
-                .frame(height: DS.Border.hairline)
-            Button(action: action) {
-                HStack(spacing: DS.Space.md) {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 16, weight: .regular))
-                        .frame(width: 20, height: 20)
-                        .foregroundColor(DS.Palette.text)
-                    Text("Settings")
-                        .font(DS.Font.bodyStrong)
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, DS.Space.sm)
-                .frame(height: 42)
-                .contentShape(Rectangle())
-                .background(
-                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .fill(Color.white.opacity(0.001))
-                )
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
-            .padding(.horizontal, DS.Space.md)
-            .padding(.top, DS.Space.md)
-            .padding(.bottom, DS.Space.lg)
-            Spacer(minLength: 0)
+    @objc private func showAccount() {
+        guard let context else { return }
+        let controller = accountController ?? AccountWindowController(context: context)
+        accountController = controller
+        if let window = view.window {
+            controller.show(attachedTo: window)
+        } else {
+            controller.show()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color.clear)
     }
 }

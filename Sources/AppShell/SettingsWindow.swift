@@ -9,6 +9,7 @@ import DesignSystemKit
 
 extension Notification.Name {
     static let rc2RemoteAccessSettingChanged = Notification.Name("rc2RemoteAccessSettingChanged")
+    static let rc2PrivateAccountChanged = Notification.Name("rc2PrivateAccountChanged")
 }
 
 @MainActor
@@ -147,6 +148,7 @@ public final class SettingsViewModel: ObservableObject {
             privateAccountUser = verified.user
             privateAccountStatus = verified.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
             privateBillingPortalURL = nil
+            NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
         } catch {
             privateAccountStatus = "Sign in failed"
         }
@@ -167,6 +169,7 @@ public final class SettingsViewModel: ObservableObject {
             privateAccountUser = user
             privateAccountEmail = user.email
             privateAccountStatus = user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+            NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
         } catch {
             do {
                 let refreshed = try await privateAccountAPI.refresh(refreshToken: stored.refreshToken)
@@ -174,11 +177,13 @@ public final class SettingsViewModel: ObservableObject {
                 privateAccountUser = refreshed.user
                 privateAccountEmail = refreshed.user.email
                 privateAccountStatus = refreshed.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+                NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
             } catch {
                 privateAccountStore.clear()
                 privateAccountUser = nil
                 privateBillingPortalURL = nil
                 privateAccountStatus = "Session expired"
+                NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
             }
         }
     }
@@ -211,6 +216,7 @@ public final class SettingsViewModel: ObservableObject {
         privateAccountUser = nil
         privateAccountStatus = "Optional"
         privateBillingPortalURL = nil
+        NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
     }
 
     public var codexAvailable: Bool { ProcessLocator.resolve(codexPath).map { !$0.isEmpty } ?? false }
@@ -261,7 +267,6 @@ public struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     remoteAccessSection
-                    privateAccountSection
                     diffDefaultsSection
                     trustedDevicesSection
                     diagnosticsSection
@@ -318,41 +323,6 @@ public struct SettingsView: View {
                 .labelsHidden()
             }
             Text("These defaults seed new Git diff surfaces and match the toolbar toggles in the diff panel.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-        }
-        .dsPanel(padding: DS.Space.lg)
-    }
-
-    private var privateAccountSection: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Private Account")
-            settingRow("Status") {
-                DSPill(vm.privateAccountStatus, tone: vm.privateAccountUser?.subscribed == true ? .success : .warning)
-            }
-            TextField("Email", text: Binding(get: { vm.privateAccountEmail }, set: { vm.privateAccountEmail = $0 }))
-                .textFieldStyle(.roundedBorder)
-                .font(DS.Font.body)
-            SecureField("Password", text: Binding(get: { vm.privateAccountPassword }, set: { vm.privateAccountPassword = $0 }))
-                .textFieldStyle(.roundedBorder)
-                .font(DS.Font.body)
-            HStack(spacing: DS.Space.md) {
-                Button(vm.privateAccountBusy ? "Connecting..." : "Connect") {
-                    Task { await vm.connectPrivateAccount() }
-                }
-                .buttonStyle(DSSecondaryButtonStyle())
-                .disabled(vm.privateAccountBusy)
-                Button("Refresh") { Task { await vm.refreshPrivateAccount() } }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(vm.privateAccountUser == nil || vm.privateAccountBusy)
-                Button("Billing") { Task { await vm.openPrivateBillingPortal() } }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(vm.privateAccountUser == nil || vm.privateAccountBusy)
-                Button("Disconnect") { Task { await vm.disconnectPrivateAccount() } }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(vm.privateAccountUser == nil || vm.privateAccountBusy)
-            }
-            Text("Optional on macOS. When connected, host notifications can use the private backend for the paired iOS device.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }
@@ -448,6 +418,165 @@ public struct SettingsView: View {
     }
 }
 
+public struct AccountView: View {
+    @ObservedObject var vm: SettingsViewModel
+    private let onClose: (() -> Void)?
+
+    public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
+        self.vm = vm
+        self.onClose = onClose
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xl) {
+            HStack(alignment: .top, spacing: DS.Space.md) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                        .fill(DS.Palette.accent.opacity(0.16))
+                    Image(systemName: vm.privateAccountUser == nil ? "person.crop.circle.badge.plus" : "person.crop.circle.badge.checkmark")
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundColor(DS.Palette.accent)
+                }
+                .frame(width: 42, height: 42)
+
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text(vm.privateAccountUser == nil ? "Sign in to RemoteCode" : "RemoteCode Account")
+                        .font(DS.Font.title3)
+                        .foregroundColor(DS.Palette.text)
+                    Text(vm.privateAccountUser == nil ? "Connect your private account for backend push notifications to paired devices." : "Manage the private account connected to this Mac.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Button("Done") { onClose?() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+            }
+
+            if vm.privateAccountUser == nil {
+                signedOutForm
+            } else {
+                signedInPanel
+            }
+        }
+        .padding(DS.Space.xxl)
+        .frame(width: 460)
+        .background(DS.Palette.bg)
+    }
+
+    private var signedOutForm: some View {
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            HStack {
+                Text("Status")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                Spacer()
+                DSPill(vm.privateAccountStatus, tone: .warning)
+            }
+
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text("Email")
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.textSecondary)
+                TextField("you@example.com", text: Binding(get: { vm.privateAccountEmail }, set: { vm.privateAccountEmail = $0 }))
+                    .textFieldStyle(.roundedBorder)
+                    .font(DS.Font.body)
+            }
+
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text("Password")
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.textSecondary)
+                SecureField("Password", text: Binding(get: { vm.privateAccountPassword }, set: { vm.privateAccountPassword = $0 }))
+                    .textFieldStyle(.roundedBorder)
+                    .font(DS.Font.body)
+            }
+
+            Button {
+                Task { await vm.connectPrivateAccount() }
+            } label: {
+                HStack(spacing: DS.Space.sm) {
+                    if vm.privateAccountBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.65)
+                    }
+                    Text(vm.privateAccountBusy ? "Signing in..." : "Sign in")
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(DSPrimaryButtonStyle())
+            .disabled(vm.privateAccountBusy)
+
+            if vm.privateAccountStatus == "Sign in failed" {
+                Text("Check the email and password, then try again.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+            }
+        }
+        .dsPanel(padding: DS.Space.xl, raised: true)
+    }
+
+    private var signedInPanel: some View {
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                ZStack {
+                    Circle()
+                        .fill(DS.Palette.accent.opacity(0.20))
+                        .overlay(Circle().stroke(DS.Palette.lineStrong, lineWidth: DS.Border.hairline))
+                    Text(accountInitials)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(DS.Palette.accent)
+                }
+                .frame(width: 44, height: 44)
+
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text(accountName)
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(DS.Palette.text)
+                    Text(vm.privateAccountUser?.email ?? "")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                DSPill(vm.privateAccountStatus, tone: vm.privateAccountUser?.subscribed == true ? .success : .warning)
+            }
+
+            HStack(spacing: DS.Space.md) {
+                Button("Refresh") { Task { await vm.refreshPrivateAccount() } }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.privateAccountBusy)
+                Button("Billing") { Task { await vm.openPrivateBillingPortal() } }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.privateAccountBusy)
+                Spacer()
+                Button("Disconnect") { Task { await vm.disconnectPrivateAccount() } }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.privateAccountBusy)
+            }
+        }
+        .dsPanel(padding: DS.Space.xl, raised: true)
+    }
+
+    private var accountName: String {
+        guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first, !local.isEmpty else {
+            return "RemoteCode Account"
+        }
+        return String(local)
+    }
+
+    private var accountInitials: String {
+        guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first else {
+            return "RC"
+        }
+        let letters = local.filter(\.isLetter)
+        let prefix = letters.prefix(2)
+        return prefix.isEmpty ? "RC" : String(prefix).uppercased()
+    }
+}
+
 @MainActor
 public final class SettingsWindowController: NSObject {
     public let window: NSWindow
@@ -463,6 +592,55 @@ public final class SettingsWindowController: NSObject {
         win.center()
         self.window = win
         host.rootView = SettingsView(vm: viewModel) { [weak win] in
+            guard let win else { return }
+            if let parent = win.sheetParent {
+                parent.endSheet(win)
+            } else {
+                win.close()
+            }
+        }
+    }
+
+    public func show() {
+        viewModel.reload()
+        if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
+            show(attachedTo: parent)
+        } else {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    public func show(attachedTo parent: NSWindow) {
+        viewModel.reload()
+        if parent.attachedSheet === window { return }
+        if window.sheetParent != nil { window.sheetParent?.endSheet(window) }
+        parent.beginSheet(window)
+    }
+
+    public func close() {
+        if let parent = window.sheetParent {
+            parent.endSheet(window)
+        } else {
+            window.close()
+        }
+    }
+}
+
+@MainActor
+public final class AccountWindowController: NSObject {
+    public let window: NSWindow
+    public let viewModel: SettingsViewModel
+
+    public init(context: AppContext) {
+        self.viewModel = SettingsViewModel(context: context)
+        let host = NSHostingController(rootView: AccountView(vm: viewModel))
+        let win = NSWindow(contentViewController: host)
+        win.title = "RemoteCode Account"
+        win.styleMask = [.titled, .closable]
+        win.setContentSize(NSSize(width: 460, height: 360))
+        win.center()
+        self.window = win
+        host.rootView = AccountView(vm: viewModel) { [weak win] in
             guard let win else { return }
             if let parent = win.sheetParent {
                 parent.endSheet(win)
