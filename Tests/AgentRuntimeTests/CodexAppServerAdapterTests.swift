@@ -66,23 +66,40 @@ final class CodexAppServerAdapterTests: XCTestCase {
             return client
         }
         let threadId = AgentThreadID()
+        actor Sink {
+            var finished: AgentRunStatus?
+            func record(_ event: AgentRunEvent) {
+                if case .finished(let status, _, _) = event {
+                    finished = status
+                }
+            }
+            func status() -> AgentRunStatus? { finished }
+        }
+        let sink = Sink()
         let handle = try await adapter.sendTurn(AgentRunRequest(
             threadId: threadId,
             provider: .codex,
             model: "gpt-5.5",
             cwd: "/tmp/remotecode-app-server-adapter",
             prompt: "wait"
-        )) { _ in }
+        )) { event in
+            Task { await sink.record(event) }
+        }
 
         handle.cancel()
 
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
-            if !client.interruptedTurns.isEmpty { break }
+            if !client.interruptedTurns.isEmpty, await sink.status() == .cancelled { break }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(client.interruptedTurns.first?.providerThreadId, "codex-thread-1")
         XCTAssertEqual(client.interruptedTurns.first?.turnId, "turn-app-server-1")
+        let finishedStatus = await sink.status()
+        XCTAssertEqual(finishedStatus, .cancelled,
+                       "Codex app-server cancellation must finish the local run so macOS and iOS do not stay running forever")
+        XCTAssertTrue(client.didStop,
+                      "Codex app-server cancellation must stop the provider process tree after interrupting the active turn")
     }
 
     func test_adapterRollbackUsesCompletedTurnHistoryInsteadOfParsingTurnIdDigits() async throws {
@@ -877,6 +894,84 @@ final class CodexAppServerAdapterTests: XCTestCase {
                       "some Codex app-server Plan Mode builds emit the plan as final assistant text; the Agent App still needs a first-class proposed-plan card")
     }
 
+    func test_adapterStartsStreamingAssistantItemOnlyOnceAcrossDeltas() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "count"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-stream-1",
+            "item": [
+                "id": "agent-message-1",
+                "type": "agentMessage"
+            ]
+        ])
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-stream-1",
+            "itemId": "agent-message-1",
+            "delta": "1"
+        ])
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-stream-1",
+            "itemId": "agent-message-1",
+            "delta": " 2 3"
+        ])
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-stream-1",
+            "item": [
+                "id": "agent-message-1",
+                "type": "agentMessage",
+                "text": "1 2 3"
+            ]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-stream-1"
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        let starts = events.filter {
+            if case .itemStarted(let item) = $0 {
+                return item.id == "agent-message-1" && item.type == .assistantMessage
+            }
+            return false
+        }
+        let body = events.compactMap { event -> String? in
+            if case .turnCompleted(_, let final) = event { return final }
+            return nil
+        }.first
+        let streamedBody = events.compactMap { event -> String? in
+            if case .itemDelta(_, let body, _, _) = event { return body }
+            return nil
+        }.joined()
+
+        XCTAssertEqual(starts.count, 1,
+                       "Codex app-server deltas for one assistant item must not create duplicate empty transcript rows")
+        XCTAssertEqual(body, "1 2 3",
+                       "Codex app-server streamed deltas must be returned as final assistant text")
+        XCTAssertEqual(streamedBody, "1 2 3",
+                       "item/completed must not replay the full assistant text after deltas already streamed it")
+    }
+
     func test_adapterMapsAppServerTurnPlanUpdatedToActivePlanState() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -1204,12 +1299,14 @@ final class CodexAppServerAdapterTests: XCTestCase {
                       "generated app-server goal updates must be readable in the Agent App, not only preserved as raw runtime JSON")
         XCTAssertTrue(events.contains { if case .itemDelta(_, _, let output, let summary) = $0 { return summary == "Turn diff updated" && output == "diff --git a/file b/file" } else { return false } },
                       "turn/diff/updated should surface the aggregated provider diff as file-change activity")
-        XCTAssertTrue(events.contains { if case .error(let message, let recoverable) = $0 { return recoverable && message == "Codex warning: config warning" } else { return false } })
-        XCTAssertTrue(events.contains { if case .error(let message, let recoverable) = $0 { return recoverable && message == "Codex guardian warning: risky command" } else { return false } })
-        XCTAssertTrue(events.contains { if case .error(let message, let recoverable) = $0 { return recoverable && message.contains("bad config") && message.contains("fix config") } else { return false } })
-        XCTAssertTrue(events.contains { if case .error(let message, let recoverable) = $0 { return recoverable && message.contains("old flag") && message.contains("use new flag") } else { return false } })
-        XCTAssertTrue(events.contains { if case .error(let message, let recoverable) = $0 { return recoverable && message.contains("hard") && message.contains("primary") } else { return false } },
-                      "rate-limit notifications should become visible recoverable diagnostics before a long run appears frozen")
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Codex warning" && item.output == "config warning" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Codex guardian warning" && item.output == "risky command" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "bad config" && item.output == "fix config" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "old flag" && item.output == "use new flag" } else { return false } })
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Codex rate limit" && item.output?.contains("hard") == true && item.output?.contains("primary") == true } else { return false } },
+                      "rate-limit notifications should become visible diagnostics before a long run appears frozen without marking a successful turn as failed")
+        XCTAssertFalse(events.contains { if case .error(let message, _) = $0 { return message.contains("config warning") || message.contains("risky command") || message.contains("bad config") || message.contains("old flag") || message.contains("primary") } else { return false } },
+                       "recoverable Codex warnings must not publish agent.run.error when the turn can still succeed")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Thread status changed" && item.output?.contains("waitingOnApproval") == true } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Hook completed" && item.output?.contains("hook ok") == true } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Auto approval review" && item.output?.contains("safe command") == true } else { return false } })

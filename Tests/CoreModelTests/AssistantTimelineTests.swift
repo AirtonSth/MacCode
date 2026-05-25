@@ -77,6 +77,20 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(s.turns[0].finalAssistantMessage, "Hello")
     }
 
+    func test_timelineDuplicateItemStartDoesNotEraseStreamedAssistantText() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "turn1"))
+        s.apply(.itemStarted(item: AssistantItem(id: "answer", turnId: "turn1", type: .assistantMessage, startedAtMs: 1)))
+        s.apply(.itemDelta(itemId: "answer", bodyAppend: "1", outputAppend: nil, summary: nil))
+        s.apply(.itemStarted(item: AssistantItem(id: "answer", turnId: "turn1", type: .assistantMessage, startedAtMs: 2)))
+        s.apply(.itemDelta(itemId: "answer", bodyAppend: " 2 3", outputAppend: nil, summary: nil))
+
+        XCTAssertEqual(s.turns[0].items.count, 1,
+                       "duplicate provider item-start events must update the existing item instead of creating empty answer rows")
+        XCTAssertEqual(s.turns[0].items[0].body, "1 2 3",
+                       "a repeated item-start must not erase streamed assistant text before the final answer is rendered")
+    }
+
     func test_timeline_handlesError() {
         var s = AssistantTimelineState()
         s.apply(.error(message: "boom", recoverable: false))

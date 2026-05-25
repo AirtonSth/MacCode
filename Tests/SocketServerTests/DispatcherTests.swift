@@ -443,6 +443,9 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] { [] }
     func notificationMarkRead(id: String) throws {}
     func notificationDismiss(id: String) throws {}
+    func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
+        .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
+    }
     var settings: [String: String] = [:]
     func settingsGet(keys: [String]) throws -> [String: String] {
         Dictionary(uniqueKeysWithValues: keys.map { ($0, settings[$0] ?? "") })

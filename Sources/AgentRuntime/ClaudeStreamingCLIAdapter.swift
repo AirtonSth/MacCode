@@ -340,7 +340,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         for event in parsed {
             record(event, session: session)
             emit(.event(event), session: session)
-            if case .error = event {
+            if case .error(_, let recoverable) = event, !recoverable {
                 session.sawError = true
             }
             if case .threadStarted(_, let providerThreadId) = event {

@@ -371,9 +371,13 @@ public final class ClaudeParser {
             ?? [stringValue(obj["limit_type"]) ?? stringValue(obj["limitType"]) ?? "rate limit", reset.map { "reset \($0)" }]
                 .compactMap { $0 }
                 .joined(separator: " ")
-        return [
-            .error(message: "Claude \(message)", recoverable: true)
-        ] + completedRuntimeItem(id: stringValue(obj["id"]) ?? "claude-rate-limit-\(now)", type: .error, summary: "Claude rate limit", body: message, now: now)
+        return completedRuntimeItem(
+            id: stringValue(obj["id"]) ?? "claude-rate-limit-\(now)",
+            type: .tool,
+            summary: "Claude rate limit",
+            body: message,
+            now: now
+        )
     }
 
     private func tokenUsage(from obj: [String: Any]) -> AssistantTokenUsage? {

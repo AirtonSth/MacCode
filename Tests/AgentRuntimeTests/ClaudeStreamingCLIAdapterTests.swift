@@ -66,6 +66,57 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    func test_recoverableRateLimitTelemetryDoesNotFailSuccessfulStreamingTurn() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-streaming-rate-limit-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys
+        print(json.dumps({"type":"system","subtype":"init","session_id":"rate-limit-session"}), flush=True)
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            print(json.dumps({"type":"rate_limit_event","limit_type":"requests","reset_at":"2026-05-24T22:00:00Z"}), flush=True)
+            print(json.dumps({"type":"result","subtype":"success","is_error":False,"result":"1 2 3 4 5 6 7 8 9 10","session_id":"rate-limit-session"}), flush=True)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "count to 10"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "1 2 3 4 5 6 7 8 9 10")
+
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .event(.itemStarted(let item)) = $0 {
+                return item.type == .tool && item.summary == "Claude rate limit" && item.body.contains("requests")
+            }
+            return false
+        }, "Claude rate-limit telemetry must stay visible without becoming an agent error")
+        XCTAssertFalse(events.contains {
+            if case .event(.error(let message, _)) = $0 {
+                return message.contains("requests")
+            }
+            return false
+        }, "Claude rate-limit telemetry must not publish agent.run.error when the turn succeeds")
+        XCTAssertFalse(events.contains {
+            if case .finished(.failed, _, _) = $0 { return true }
+            return false
+        }, "a successful Claude result must not be marked failed only because recoverable rate-limit telemetry arrived first")
+        try adapter.stopSession(threadId: threadId)
+    }
+
     func test_rollbackThreadPrunesStreamingReadableHistoryAndSessionSnapshot() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-rollback-\(UUID().uuidString)", isDirectory: true)
@@ -757,6 +808,63 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "Claude SDK bridge must send structured attachment metadata to the SDK bridge instead of flattening attachments into the prompt")
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "sdk-session-1")
         XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId).count, 2)
+        try adapter.stopSession(threadId: threadId)
+    }
+
+    func test_agentSDKBridgeRecoverableRateLimitTelemetryDoesNotFailSuccessfulTurn() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-rate-limit-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try """
+        import readline from 'node:readline';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          if (cmd.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: 'sdk-rate-limit-session' });
+          } else if (cmd.type === 'rc_turn') {
+            write({ type: 'rate_limit_event', limit_type: 'requests', reset_at: '2026-05-24T22:00:00Z' });
+            write({ type: 'result', subtype: 'success', is_error: false, result: 'SDK_RATE_LIMIT_OK', session_id: 'sdk-rate-limit-session' });
+          } else if (cmd.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "rate limit"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "SDK_RATE_LIMIT_OK")
+
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .event(.itemStarted(let item)) = $0 {
+                return item.type == .tool && item.summary == "Claude rate limit" && item.body.contains("requests")
+            }
+            return false
+        }, "Claude SDK rate-limit telemetry must stay visible without becoming an agent error")
+        XCTAssertFalse(events.contains {
+            if case .event(.error(let message, _)) = $0 {
+                return message.contains("requests")
+            }
+            return false
+        }, "Claude SDK rate-limit telemetry must not publish agent.run.error when the turn succeeds")
+        XCTAssertFalse(events.contains {
+            if case .finished(.failed, _, _) = $0 { return true }
+            return false
+        }, "a successful Claude SDK result must not be marked failed only because recoverable rate-limit telemetry arrived first")
         try adapter.stopSession(threadId: threadId)
     }
 

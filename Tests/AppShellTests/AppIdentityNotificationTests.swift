@@ -50,6 +50,126 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "push presentation is reserved for background or closed app states")
     }
 
+    func testPrivateAccountLoginIsOptionalAndPersistsSessionForBackendPush() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateAccount-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let api = RecordingPrivateAccountAPI()
+        let vm = SettingsViewModel(context: ctx, privateAccountAPI: api)
+
+        XCTAssertEqual(vm.privateAccountStatus, "Optional",
+                       "macOS private login must be optional; the host remains usable before an account is connected")
+
+        vm.privateAccountEmail = "desktop@example.com"
+        vm.privateAccountPassword = "password123"
+        await vm.connectPrivateAccount()
+
+        let stored = try XCTUnwrap(PrivateAccountSessionStore(repo: ctx.settingsRepo).load())
+        XCTAssertEqual(api.loginRequests, [["email": "desktop@example.com", "password": "password123"]])
+        XCTAssertEqual(stored.accessToken, "access-token")
+        XCTAssertEqual(stored.user.email, "desktop@example.com")
+        XCTAssertEqual(vm.privateAccountStatus, "Subscription active",
+                       "a subscribed private account is what unlocks authenticated backend push delivery")
+    }
+
+    func testPrivateAccountRefreshUsesRefreshTokenBeforeDroppingOptionalSession() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateRefresh-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let api = RecordingPrivateAccountAPI()
+        api.currentUserShouldFail = true
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(api.session)
+        let vm = SettingsViewModel(context: ctx, privateAccountAPI: api)
+
+        await vm.refreshPrivateAccount()
+
+        let stored = try XCTUnwrap(PrivateAccountSessionStore(repo: ctx.settingsRepo).load())
+        XCTAssertEqual(api.refreshRequests, ["refresh-token"])
+        XCTAssertEqual(stored.accessToken, "refreshed-access-token")
+        XCTAssertEqual(vm.privateAccountStatus, "Subscription active",
+                       "macOS optional private login must recover expired access tokens before discarding the account")
+    }
+
+    func testPrivateBillingPortalUsesBackendPortalAndInjectedOpener() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivatePortal-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let api = RecordingPrivateAccountAPI()
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(api.session)
+        var openedURL: URL?
+        let vm = SettingsViewModel(context: ctx, privateAccountAPI: api, openURL: { openedURL = $0 })
+
+        await vm.openPrivateBillingPortal()
+
+        XCTAssertEqual(api.billingOverviewRequests, ["access-token"])
+        XCTAssertEqual(api.portalRequests, ["access-token"])
+        XCTAssertEqual(openedURL?.absoluteString, "https://apps.apple.com/account/subscriptions")
+        XCTAssertEqual(vm.privateBillingPortalURL?.absoluteString, "https://apps.apple.com/account/subscriptions",
+                       "macOS billing management must use the private backend portal contract instead of hardcoding a provider URL")
+    }
+
+    func testDisconnectPrivateAccountLogsOutWithoutRevokingLocalPairing() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateLogout-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let trustRepo = DeviceTrustRepository(db: ctx.db)
+        let request = try trustRepo.createPairingRequest(deviceName: "iPhone", ttlSeconds: 600)
+        let paired = try trustRepo.approvePairingRequest(id: request.id)
+        let api = RecordingPrivateAccountAPI()
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(api.session)
+        let vm = SettingsViewModel(context: ctx, privateAccountAPI: api)
+
+        await vm.disconnectPrivateAccount()
+
+        XCTAssertEqual(api.logoutRequests, ["refresh-token"])
+        XCTAssertNil(PrivateAccountSessionStore(repo: ctx.settingsRepo).load())
+        XCTAssertNotNil(try trustRepo.verify(token: paired?.token ?? ""),
+                        "macOS private logout must not revoke paired iOS trusted-device credentials")
+    }
+
+    func testPrivatePushTokenUpdateStoresPairedIosTokenForBackendDelivery() throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivatePushToken-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+
+        let result = try router.privatePushTokenUpdate(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: "activity-token",
+            deviceID: "device-1"
+        )
+        let stored = try XCTUnwrap(PrivatePushTargetStore(repo: ctx.settingsRepo).load())
+
+        XCTAssertEqual(result, .object(["ok": .bool(true), "push_token_type": .string("apns")]))
+        XCTAssertEqual(stored.pushToken, "apns-token")
+        XCTAssertEqual(stored.liveActivityToken, "activity-token")
+        XCTAssertEqual(stored.deviceId, "device-1",
+                       "the Mac must retain the paired iOS APNS target before it can ask private.remotecode.io to deliver alerts")
+    }
+
+    func testPrivateNotificationBridgeSendsThreadOutcomeThroughBackendPush() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivateBridge-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+
+        let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-1",
+            title: "Build fix",
+            phase: .completed
+        ))
+        await bridge.deliver(content)
+
+        XCTAssertEqual(api.alertRequests.count, 1)
+        XCTAssertEqual(api.alertRequests.first?.accessToken, "access-token")
+        XCTAssertEqual(api.alertRequests.first?.pushToken, "apns-token")
+        XCTAssertEqual(api.alertRequests.first?.idempotencyKey, "thread.thread-1.completed")
+        XCTAssertEqual(api.alertRequests.first?.title, "Thread finished")
+        XCTAssertEqual(api.alertRequests.first?.body, "Build fix response is ready.",
+                       "terminal outcome notifications must be sent to the private backend with the paired iOS push target")
+    }
+
     func testStreamingErrorsDoNotEmitTerminalRunNotificationsBeforeFinish() async throws {
         let dir = NSTemporaryDirectory() + "RC2Notify-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -241,5 +361,84 @@ private final class CwdCaptureRunner: AgentProviderRunner, @unchecked Sendable {
             onEvent(.finished(.completed, finalMessage: "ok", providerThreadId: providerThreadId))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
+    let session = PrivateAccountSession(
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        user: PrivateAccountUser(
+            daysRemaing: 30,
+            daysRemaining: 30,
+            email: "desktop@example.com",
+            id: "user-1",
+            subscribed: true
+        )
+    )
+    var loginRequests: [[String: String]] = []
+    var alertRequests: [(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
+    var billingOverviewRequests: [String] = []
+    var portalRequests: [String] = []
+    var refreshRequests: [String] = []
+    var logoutRequests: [String] = []
+    var currentUserShouldFail = false
+
+    func login(email: String, password: String) async throws -> PrivateAccountSession {
+        loginRequests.append(["email": email, "password": password])
+        return session
+    }
+
+    func currentUser(accessToken: String) async throws -> PrivateAccountUser {
+        if currentUserShouldFail {
+            throw PrivateAccountAPIError.http(401)
+        }
+        return session.user
+    }
+
+    func refresh(refreshToken: String) async throws -> PrivateAccountSession {
+        refreshRequests.append(refreshToken)
+        return PrivateAccountSession(
+            accessToken: "refreshed-access-token",
+            refreshToken: "refreshed-refresh-token",
+            user: session.user
+        )
+    }
+
+    func logout(refreshToken: String) async throws {
+        logoutRequests.append(refreshToken)
+    }
+
+    func billingOverview(accessToken: String) async throws -> PrivateBillingOverview {
+        billingOverviewRequests.append(accessToken)
+        return PrivateBillingOverview(
+            plan: PrivateBillingOverview.Plan(
+                billingPeriod: "monthly",
+                priceUsd: 4.99,
+                provider: "lemon_squeezy",
+                trialDays: 7
+            ),
+            subscription: PrivateSubscriptionSnapshot(
+                daysRemaing: 30,
+                daysRemaining: 30,
+                email: "desktop@example.com",
+                endsAt: nil,
+                portalUrl: "https://apps.apple.com/account/subscriptions",
+                renewsAt: "2026-06-24T00:00:00.000Z",
+                status: "active",
+                subscribed: true,
+                trialEndsAt: nil
+            )
+        )
+    }
+
+    func createPortal(accessToken: String) async throws -> URL {
+        portalRequests.append(accessToken)
+        return URL(string: "https://apps.apple.com/account/subscriptions")!
+    }
+
+    func deliverAlert(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+        alertRequests.append((accessToken, title, body, pushToken, pushTokenType, idempotencyKey))
+        return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
 }

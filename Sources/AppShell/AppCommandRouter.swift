@@ -953,9 +953,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     }
 
     public func stopAgentRun(thread: AgentThreadID) throws {
-        // We don't track thread->run map; cancel any active run for that thread by scanning observer state.
-        // V1 simplification: rely on UI-tracked currentRunId; CLI stop targets thread id.
-        // Best effort: nothing here; the AgentAppViewModel keeps live runs.
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        ctx.coordinator.stopRun(threadId: thread)
     }
 
     public func deleteAgentThread(thread: AgentThreadID) throws {
@@ -1607,6 +1606,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public func notificationDismiss(id: String) throws {
         guard let ctx = context else { return }
         try NotificationRepository(db: ctx.db).dismiss(id: id)
+    }
+
+    public func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        PrivatePushTargetStore(repo: ctx.settingsRepo).save(
+            pushToken: pushToken,
+            pushTokenType: pushTokenType,
+            liveActivityToken: liveActivityToken,
+            deviceId: deviceID
+        )
+        return .object([
+            "ok": .bool(true),
+            "push_token_type": .string(pushTokenType)
+        ])
     }
 
     public func settingsGet(keys: [String]) throws -> [String: String] {

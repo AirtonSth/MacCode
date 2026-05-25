@@ -1345,6 +1345,7 @@ public struct AgentAppView: View {
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @State private var showThreadRail = true
     @State private var proposedPlanExpanded = false
+    @State private var showWorkLog = false
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -1721,36 +1722,60 @@ public struct AgentAppView: View {
         let activities = Array(vm.timeline.workActivities.suffix(8))
         if !activities.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "list.bullet.rectangle")
-                        .font(.system(size: 11))
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text("Work log")
-                        .font(DS.Font.caption.weight(.semibold))
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
-                ForEach(activities) { activity in
-                    HStack(alignment: .top, spacing: DS.Space.sm) {
-                        Image(systemName: workActivityIcon(activity))
-                            .font(.system(size: 9))
-                            .foregroundColor(workActivityColor(activity))
-                            .frame(width: 13)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(activity.title)
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.textSecondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            if let detail = activity.detail, !detail.isEmpty {
-                                Text(detail)
-                                    .font(DS.Font.monoSmall)
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .lineLimit(2)
-                                    .truncationMode(.tail)
-                            }
-                        }
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        showWorkLog.toggle()
+                    }
+                } label: {
+                    HStack(spacing: DS.Space.sm) {
+                        Image(systemName: showWorkLog ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .frame(width: 10)
+                        Image(systemName: "list.bullet.rectangle")
+                            .font(.system(size: 11))
+                            .foregroundColor(DS.Palette.textTertiary)
+                        Text("Work log")
+                            .font(DS.Font.caption.weight(.semibold))
+                            .foregroundColor(DS.Palette.textSecondary)
+                        Text("\(activities.count)")
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
                         Spacer(minLength: 0)
                     }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("agent.workLog.toggle")
+                .accessibilityLabel(showWorkLog ? "Hide work log" : "Show work log")
+                .help(showWorkLog ? "Hide work log" : "Show work log")
+                if showWorkLog {
+                    VStack(alignment: .leading, spacing: DS.Space.sm) {
+                        ForEach(activities) { activity in
+                            HStack(alignment: .top, spacing: DS.Space.sm) {
+                                Image(systemName: workActivityIcon(activity))
+                                    .font(.system(size: 9))
+                                    .foregroundColor(workActivityColor(activity))
+                                    .frame(width: 13)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(activity.title)
+                                        .font(DS.Font.caption)
+                                        .foregroundColor(DS.Palette.textSecondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                    if let detail = activity.detail, !detail.isEmpty {
+                                        Text(detail)
+                                            .font(DS.Font.monoSmall)
+                                            .foregroundColor(DS.Palette.textTertiary)
+                                            .lineLimit(2)
+                                            .truncationMode(.tail)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                            }
+                        }
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
             .padding(.vertical, DS.Space.sm)

@@ -17,6 +17,9 @@ public final class SettingsViewModel: ObservableObject {
     public let trustRepo: DeviceTrustRepository
     public let settingsStore: SettingsStore
     public let context: AppContext
+    private let privateAccountAPI: PrivateAccountAPI
+    private let privateAccountStore: PrivateAccountSessionStore
+    private let openURL: @MainActor (URL) -> Void
 
     @Published public var remoteAccessEnabled: Bool = false
     @Published public var appSettings: AppSettings = AppSettings()
@@ -26,12 +29,25 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var newPairingCode: String?
     @Published public var updatingProviders: Set<AgentProvider> = []
     @Published public var providerUpdateMessages: [AgentProvider: String] = [:]
+    @Published public var privateAccountEmail: String = ""
+    @Published public var privateAccountPassword: String = ""
+    @Published public var privateAccountUser: PrivateAccountUser?
+    @Published public var privateAccountStatus: String = "Optional"
+    @Published public var privateAccountBusy: Bool = false
+    @Published public var privateBillingPortalURL: URL?
 
-    public init(context: AppContext) {
+    public init(
+        context: AppContext,
+        privateAccountAPI: PrivateAccountAPI = URLSessionPrivateAccountAPI(),
+        openURL: @escaping @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) }
+    ) {
         self.context = context
+        self.privateAccountAPI = privateAccountAPI
+        self.openURL = openURL
         self.settingsRepo = context.settingsRepo
         self.trustRepo = DeviceTrustRepository(db: context.db)
         self.settingsStore = SettingsStore(db: context.db)
+        self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
         reload()
     }
 
@@ -41,6 +57,16 @@ public final class SettingsViewModel: ObservableObject {
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
         devices = (try? trustRepo.list()) ?? []
+        if let session = privateAccountStore.load() {
+            privateAccountUser = session.user
+            privateAccountEmail = session.user.email
+            privateAccountStatus = session.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+            privateBillingPortalURL = nil
+        } else {
+            privateAccountUser = nil
+            privateAccountStatus = "Optional"
+            privateBillingPortalURL = nil
+        }
     }
 
     public func setRemoteAccess(_ on: Bool) {
@@ -107,6 +133,86 @@ public final class SettingsViewModel: ObservableObject {
         reload()
     }
 
+    public func connectPrivateAccount() async {
+        let email = privateAccountEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty, !privateAccountPassword.isEmpty, !privateAccountBusy else { return }
+        privateAccountBusy = true
+        defer { privateAccountBusy = false }
+        do {
+            let session = try await privateAccountAPI.login(email: email, password: privateAccountPassword)
+            let user = try await privateAccountAPI.currentUser(accessToken: session.accessToken)
+            let verified = PrivateAccountSession(accessToken: session.accessToken, refreshToken: session.refreshToken, user: user)
+            privateAccountStore.save(verified)
+            privateAccountPassword = ""
+            privateAccountUser = verified.user
+            privateAccountStatus = verified.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+            privateBillingPortalURL = nil
+        } catch {
+            privateAccountStatus = "Sign in failed"
+        }
+    }
+
+    public func refreshPrivateAccount() async {
+        guard !privateAccountBusy else { return }
+        guard let stored = privateAccountStore.load() else {
+            privateAccountStatus = "Optional"
+            return
+        }
+        privateAccountBusy = true
+        defer { privateAccountBusy = false }
+        do {
+            let user = try await privateAccountAPI.currentUser(accessToken: stored.accessToken)
+            let verified = PrivateAccountSession(accessToken: stored.accessToken, refreshToken: stored.refreshToken, user: user)
+            privateAccountStore.save(verified)
+            privateAccountUser = user
+            privateAccountEmail = user.email
+            privateAccountStatus = user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+        } catch {
+            do {
+                let refreshed = try await privateAccountAPI.refresh(refreshToken: stored.refreshToken)
+                privateAccountStore.save(refreshed)
+                privateAccountUser = refreshed.user
+                privateAccountEmail = refreshed.user.email
+                privateAccountStatus = refreshed.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+            } catch {
+                privateAccountStore.clear()
+                privateAccountUser = nil
+                privateBillingPortalURL = nil
+                privateAccountStatus = "Session expired"
+            }
+        }
+    }
+
+    public func openPrivateBillingPortal() async {
+        guard !privateAccountBusy else { return }
+        guard let stored = privateAccountStore.load() else {
+            privateAccountStatus = "Sign in required"
+            return
+        }
+        privateAccountBusy = true
+        defer { privateAccountBusy = false }
+        do {
+            _ = try await privateAccountAPI.billingOverview(accessToken: stored.accessToken)
+            let url = try await privateAccountAPI.createPortal(accessToken: stored.accessToken)
+            privateBillingPortalURL = url
+            openURL(url)
+        } catch {
+            privateAccountStatus = "Billing portal unavailable"
+        }
+    }
+
+    public func disconnectPrivateAccount() async {
+        let refreshToken = privateAccountStore.load()?.refreshToken
+        if let refreshToken {
+            try? await privateAccountAPI.logout(refreshToken: refreshToken)
+        }
+        privateAccountStore.clear()
+        privateAccountPassword = ""
+        privateAccountUser = nil
+        privateAccountStatus = "Optional"
+        privateBillingPortalURL = nil
+    }
+
     public var codexAvailable: Bool { ProcessLocator.resolve(codexPath).map { !$0.isEmpty } ?? false }
     public var claudeAvailable: Bool { ProcessLocator.resolve(claudePath).map { !$0.isEmpty } ?? false }
 
@@ -155,6 +261,7 @@ public struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     remoteAccessSection
+                    privateAccountSection
                     diffDefaultsSection
                     trustedDevicesSection
                     diagnosticsSection
@@ -211,6 +318,41 @@ public struct SettingsView: View {
                 .labelsHidden()
             }
             Text("These defaults seed new Git diff surfaces and match the toolbar toggles in the diff panel.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var privateAccountSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Private Account")
+            settingRow("Status") {
+                DSPill(vm.privateAccountStatus, tone: vm.privateAccountUser?.subscribed == true ? .success : .warning)
+            }
+            TextField("Email", text: Binding(get: { vm.privateAccountEmail }, set: { vm.privateAccountEmail = $0 }))
+                .textFieldStyle(.roundedBorder)
+                .font(DS.Font.body)
+            SecureField("Password", text: Binding(get: { vm.privateAccountPassword }, set: { vm.privateAccountPassword = $0 }))
+                .textFieldStyle(.roundedBorder)
+                .font(DS.Font.body)
+            HStack(spacing: DS.Space.md) {
+                Button(vm.privateAccountBusy ? "Connecting..." : "Connect") {
+                    Task { await vm.connectPrivateAccount() }
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(vm.privateAccountBusy)
+                Button("Refresh") { Task { await vm.refreshPrivateAccount() } }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.privateAccountUser == nil || vm.privateAccountBusy)
+                Button("Billing") { Task { await vm.openPrivateBillingPortal() } }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.privateAccountUser == nil || vm.privateAccountBusy)
+                Button("Disconnect") { Task { await vm.disconnectPrivateAccount() } }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.privateAccountUser == nil || vm.privateAccountBusy)
+            }
+            Text("Optional on macOS. When connected, host notifications can use the private backend for the paired iOS device.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }

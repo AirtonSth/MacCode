@@ -465,9 +465,23 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .itemStarted(let item):
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
-                turns[idx].items.append(item)
+                if let itemIndex = turns[idx].items.firstIndex(where: { $0.id == item.id }) {
+                    let existing = turns[idx].items[itemIndex]
+                    var merged = item
+                    if merged.body.isEmpty { merged.body = existing.body }
+                    if merged.output == nil { merged.output = existing.output }
+                    if merged.progress == nil { merged.progress = existing.progress }
+                    if merged.summary == nil { merged.summary = existing.summary }
+                    if merged.finishedAtMs == nil { merged.finishedAtMs = existing.finishedAtMs }
+                    if merged.state == .streaming, existing.state != .streaming { merged.state = existing.state }
+                    turns[idx].items[itemIndex] = merged
+                } else {
+                    turns[idx].items.append(item)
+                }
             }
-            recordActivity(for: item, state: item.state)
+            if let recorded = self.item(withId: item.id) {
+                recordActivity(for: recorded, state: recorded.state)
+            }
         case .itemDelta(let iid, let bodyAppend, let outputAppend, let summary):
             mutateItem(iid) { item in
                 if let b = bodyAppend {

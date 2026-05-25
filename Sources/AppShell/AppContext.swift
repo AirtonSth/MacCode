@@ -23,6 +23,7 @@ public final class AppContext {
     public let providerPendingCallbackRepo: ProviderPendingCallbackRepository
     public let proposedPlanRepo: AgentProposedPlanRepository
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
+    public let privateNotificationBridge: PrivateNotificationBridge
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()
@@ -50,6 +51,10 @@ public final class AppContext {
         self.providerPendingCallbackRepo = ProviderPendingCallbackRepository(db: db)
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
+        self.privateNotificationBridge = PrivateNotificationBridge(
+            accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
+            pushTargetStore: PrivatePushTargetStore(repo: self.settingsRepo)
+        )
         let codex = CodexAppServerAdapter(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
         let claude: AgentProviderAdapter = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0"
             ? ClaudeStreamingCLIAdapter(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
@@ -89,10 +94,13 @@ public final class AppContext {
         func messageJSON(_ message: AgentMessage) -> JSONValue {
             (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(message))) ?? .null
         }
-        func agentRunPayload(threadId: AgentThreadID) -> JSONValue {
+        func agentRunPayload(threadId: AgentThreadID, status: AgentRunStatus? = nil) -> JSONValue {
             var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
             if let wid = try? threadRepo.get(id: threadId)?.workspaceId {
                 payload["workspace_id"] = .string(wid.value.uuidString)
+            }
+            if let status {
+                payload["status"] = .string(status.rawValue)
             }
             return .object(payload)
         }
@@ -215,14 +223,17 @@ public final class AppContext {
         }
         coordinator.onRunFinished = { tid, _, status in
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
-            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid))
-            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid))
+            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, status: status))
+            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, status: status))
             if let content = RemoteCodeNotificationContent.threadOutcome(
                 threadId: tid.value.uuidString,
                 title: try? self.threadRepo.get(id: tid)?.title,
                 phase: status
             ) {
                 SystemNotifier.shared.post(content)
+                Task {
+                    await self.privateNotificationBridge.deliver(content)
+                }
             }
         }
 

@@ -35,6 +35,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var pendingUserInputs: [String: PendingUserInput]
         var proposedPlanBuffers: [String: String]
         var emittedProposedPlanIds: Set<String>
+        var startedItemIds: Set<String>
+        var streamedItemIds: Set<String>
     }
 
     private struct PendingApproval {
@@ -396,6 +398,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var events: [AssistantEvent] = [runtimeEvent(method: method, payload: payload)]
         var finished: AgentRunEvent?
         let now = Int64(Date().timeIntervalSince1970 * 1000)
+        func appendCompletedTool(summary: String, output: String?) {
+            let turnId = activeTurnId(threadId: threadId) ?? ""
+            let itemId = "\(summary.lowercased().replacingOccurrences(of: " ", with: "-"))-\(UUID().uuidString)"
+            events.append(.itemStarted(item: AssistantItem(
+                id: itemId,
+                turnId: turnId,
+                type: .tool,
+                state: .completed,
+                summary: summary,
+                output: output?.nilIfEmpty,
+                startedAtMs: now,
+                finishedAtMs: now
+            )))
+        }
         switch method {
         case "thread/started":
             if let providerThreadId = string(payload, "threadId") ?? (payload["thread"] as? [String: Any]).flatMap({ string($0, "id") }) {
@@ -445,14 +461,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
-            events.append(.itemStarted(item: AssistantItem(
-                id: itemId,
-                turnId: turnId,
-                type: Self.assistantItemType(for: rawType),
-                state: .streaming,
-                summary: Self.summary(for: item, type: rawType),
-                startedAtMs: now
-            )))
+            if markStartedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
+                events.append(.itemStarted(item: AssistantItem(
+                    id: itemId,
+                    turnId: turnId,
+                    type: Self.assistantItemType(for: rawType),
+                    state: .streaming,
+                    summary: Self.summary(for: item, type: rawType),
+                    startedAtMs: now
+                )))
+            }
         case "item/autoApprovalReview/started", "item.autoApprovalReview.started", "item/autoApprovalReview/completed", "item.autoApprovalReview.completed":
             let review = payload["review"] as? [String: Any] ?? payload["autoApprovalReview"] as? [String: Any] ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
@@ -503,7 +521,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     finishedAtMs: now
                 )))
             }
-            if let body = Self.body(for: item, type: rawType), !body.isEmpty {
+            if let body = Self.body(for: item, type: rawType), !body.isEmpty,
+               itemType != .assistantMessage || !hasStreamedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
                 events.append(.itemDelta(
                     itemId: itemId,
                     bodyAppend: itemType == .assistantMessage ? body : nil,
@@ -518,6 +537,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             ensureAssistantItem(threadId: threadId, turnId: turnId, itemId: itemId, now: now, events: &events)
             let delta = string(payload, "delta") ?? string(payload, "text") ?? ""
             appendFinalMessage(threadId: threadId, delta: delta)
+            markStreamedItem(threadId: threadId, turnId: turnId, itemId: itemId)
             events.append(.itemDelta(itemId: itemId, bodyAppend: delta, outputAppend: nil, summary: nil))
         case "command/exec/outputDelta", "command.exec.outputDelta":
             let itemId = string(payload, "itemId") ?? string(payload, "item_id") ?? string(payload, "commandId") ?? string(payload, "command_id") ?? "command-exec-\(UUID().uuidString)"
@@ -645,11 +665,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
         case "warning", "guardianWarning":
             let message = string(payload, "message") ?? string(payload, "summary") ?? Self.jsonString(payload) ?? "Codex warning"
-            events.append(.error(message: method == "guardianWarning" ? "Codex guardian warning: \(message)" : "Codex warning: \(message)", recoverable: true))
+            appendCompletedTool(summary: method == "guardianWarning" ? "Codex guardian warning" : "Codex warning", output: message)
         case "configWarning", "deprecationNotice":
             let summary = string(payload, "summary") ?? (method == "configWarning" ? "Codex config warning" : "Codex deprecation notice")
             let details = string(payload, "details") ?? string(payload, "path")
-            events.append(.error(message: [summary, details].compactMap { $0?.nilIfEmpty }.joined(separator: "\n"), recoverable: true))
+            appendCompletedTool(summary: summary, output: details)
         case "account/updated", "account.updated":
             let turnId = activeTurnId(threadId: threadId) ?? ""
             let itemId = "account-updated-\(UUID().uuidString)"
@@ -660,7 +680,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .completed, summary: "Account updated", output: detail.nilIfEmpty, startedAtMs: now, finishedAtMs: now)))
         case "account/rateLimits/updated", "account.rateLimits.updated":
             if let warning = Self.rateLimitWarning(from: payload) {
-                events.append(.error(message: warning, recoverable: true))
+                appendCompletedTool(summary: "Codex rate limit", output: warning)
             }
         case "mcpServer/oauthLogin/completed", "mcpServer.startupStatus.updated", "mcpServer/startupStatus/updated":
             let turnId = activeTurnId(threadId: threadId) ?? ""
@@ -810,7 +830,32 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private func ensureAssistantItem(threadId: AgentThreadID, turnId: String, itemId: String, now: Int64, events: inout [AssistantEvent]) {
+        guard markStartedItem(threadId: threadId, turnId: turnId, itemId: itemId) else { return }
         events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, state: .streaming, startedAtMs: now)))
+    }
+
+    private func markStartedItem(threadId: AgentThreadID, turnId: String, itemId: String) -> Bool {
+        let key = "\(turnId):\(itemId)"
+        lock.lock()
+        let alreadyStarted = sessions[threadId]?.startedItemIds.contains(key) ?? false
+        if !alreadyStarted {
+            sessions[threadId]?.startedItemIds.insert(key)
+        }
+        lock.unlock()
+        return !alreadyStarted
+    }
+
+    private func markStreamedItem(threadId: AgentThreadID, turnId: String, itemId: String) {
+        let key = "\(turnId):\(itemId)"
+        lock.lock()
+        sessions[threadId]?.streamedItemIds.insert(key)
+        lock.unlock()
+    }
+
+    private func hasStreamedItem(threadId: AgentThreadID, turnId: String, itemId: String) -> Bool {
+        let key = "\(turnId):\(itemId)"
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.streamedItemIds.contains(key) ?? false
     }
 
     private func emit(_ events: [AssistantEvent], threadId: AgentThreadID) {
@@ -837,7 +882,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private func cancel(threadId: AgentThreadID) {
-        try? interruptTurn(threadId: threadId)
+        guard let session = removeSession(threadId: threadId) else { return }
+        let turnId = session.activeTurnId
+        settlePendingCallbacks(session: session)
+        if let turnId {
+            Task {
+                try? await session.client.interruptTurn(providerThreadId: session.providerThreadId, turnId: turnId)
+                session.client.stop()
+            }
+        } else {
+            session.client.stop()
+        }
+        session.onEvent?(.status(.cancelled))
+        session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
     }
 
     private func recordSession(threadId: AgentThreadID, client: CodexAppServerControlling, providerThreadId: String, interactionMode: AgentInteractionMode, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) {
@@ -854,7 +911,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             pendingApprovals: [:],
             pendingUserInputs: [:],
             proposedPlanBuffers: [:],
-            emittedProposedPlanIds: []
+            emittedProposedPlanIds: [],
+            startedItemIds: [],
+            streamedItemIds: []
         )
         lock.unlock()
     }

@@ -117,6 +117,7 @@ public protocol CommandRouting: AnyObject {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]]
     func notificationMarkRead(id: String) throws
     func notificationDismiss(id: String) throws
+    func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -1094,6 +1095,17 @@ public final class JSONRPCDispatcher {
                 try router.notificationDismiss(id: nid)
                 EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(nid)]))
                 return .init(id: id, result: .bool(true))
+            case "private.push_token.update":
+                guard let pushToken = params["push_token"]?.stringValue,
+                      let pushTokenType = params["push_token_type"]?.stringValue,
+                      pushTokenType == "apns" || pushTokenType == "fcm" else { throw JSONRPCError.invalidParams }
+                let result = try router.privatePushTokenUpdate(
+                    pushToken: pushToken,
+                    pushTokenType: pushTokenType,
+                    liveActivityToken: params["live_activity_token"]?.stringValue,
+                    deviceID: params["device_id"]?.stringValue
+                )
+                return .init(id: id, result: result)
             case "pane.list":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let panes = try router.paneList(workspace: wid)

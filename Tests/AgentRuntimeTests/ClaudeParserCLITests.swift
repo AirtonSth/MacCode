@@ -217,11 +217,17 @@ final class ClaudeParserCLITests: XCTestCase {
             return false
         }, "Claude auth_status failures must fail loud and recoverable")
         XCTAssertTrue(evs.contains {
-            if case .error(let message, let recoverable) = $0 {
-                return recoverable && message.contains("requests")
+            if case .itemStarted(let item) = $0 {
+                return item.type == .tool && item.summary == "Claude rate limit" && item.body.contains("requests")
             }
             return false
         }, "Claude rate_limit_event must be visible before the user assumes the app hung")
+        XCTAssertFalse(evs.contains {
+            if case .error(let message, _) = $0 {
+                return message.contains("requests")
+            }
+            return false
+        }, "Claude rate_limit_event must not render as an agent error when the turn later succeeds")
     }
 
     func test_claudeSdkPermissionLifecycleBecomesApprovalRequest() {

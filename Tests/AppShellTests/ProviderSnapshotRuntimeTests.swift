@@ -513,6 +513,48 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                      "Claude provider isolation should follow Claude Code's HOME-based state model")
         XCTAssertEqual(request.environment["REMOTE_CODE_INSTANCE"], "personal")
     }
+
+    func test_stopAgentRunCancelsCoordinatorThreadRun() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = BlockingCancelRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "stop", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "stop",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        _ = try await router.sendAgentMessage(thread: thread.id,
+                                              text: "wait",
+                                              provider: nil,
+                                              model: nil,
+                                              permissionMode: nil,
+                                              reasoningEffort: nil)
+        try router.stopAgentRun(thread: thread.id)
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if runner.cancelled, try ctx.threadRepo.get(id: thread.id)?.status == .cancelled {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(runner.cancelled,
+                      "agent.run.stop must reach the active provider handle instead of returning a no-op success")
+        XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.status, .cancelled,
+                       "stopped runs must update persisted thread status so macOS and iOS leave running state")
+    }
 }
 
 private final class RequestCaptureRunner: AgentProviderRunner, @unchecked Sendable {
@@ -540,5 +582,33 @@ private final class RequestCaptureRunner: AgentProviderRunner, @unchecked Sendab
             onEvent(.finished(.completed, finalMessage: "ok", providerThreadId: providerThreadId))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class BlockingCancelRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var _cancelled = false
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    var cancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _cancelled
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        onEvent(.event(.turnStarted(turnId: "turn-blocking")))
+        return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+            self?.lock.lock()
+            self?._cancelled = true
+            self?.lock.unlock()
+            onEvent(.status(.cancelled))
+            onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+        }
     }
 }

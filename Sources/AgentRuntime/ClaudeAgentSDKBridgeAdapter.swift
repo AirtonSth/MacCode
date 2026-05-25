@@ -466,7 +466,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         for event in parsed {
             record(event, session: session)
             emit(.event(event), session: session)
-            if case .error = event { session.sawError = true }
+            if case .error(_, let recoverable) = event, !recoverable { session.sawError = true }
             if case .threadStarted(_, let providerThreadId) = event {
                 lock.lock(); session.providerThreadId = providerThreadId; lock.unlock()
                 emitSessionSnapshot(session: session, reason: "thread_started")
