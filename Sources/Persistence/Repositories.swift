@@ -378,6 +378,14 @@ public final class AgentRunRepository {
         return countBefore
     }
 
+    public func markStopped(id: AgentRunID, status: AgentRunStatus = .cancelled, at date: Date = Date()) throws {
+        let st = try db.prepare("UPDATE agent_runs SET status=?, finished_at=? WHERE id=? AND status IN ('pending', 'running');")
+        try st.bind(1, status.rawValue)
+        try st.bind(2, iso.string(from: date))
+        try st.bind(3, id.value.uuidString)
+        _ = try st.step()
+    }
+
     private func countRunning() throws -> Int {
         let st = try db.prepare("SELECT COUNT(*) FROM agent_runs WHERE status='running';")
         if try st.step() { return Int(st.columnInt64(0)) }

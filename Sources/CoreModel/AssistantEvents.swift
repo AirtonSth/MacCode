@@ -180,6 +180,14 @@ public struct AssistantProposedPlan: Codable, Sendable, Equatable, Identifiable 
         Self.collapsedPreview(for: markdown)
     }
 
+    public var isImplemented: Bool {
+        implementedAtMs != nil
+    }
+
+    public var showsImplementationActions: Bool {
+        !isImplemented
+    }
+
     public static func exportTitle(for markdown: String) -> String {
         let fallback = "Proposed Plan"
         for rawLine in markdown.split(whereSeparator: \.isNewline) {

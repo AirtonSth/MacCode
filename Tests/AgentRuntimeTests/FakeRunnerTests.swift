@@ -1090,6 +1090,38 @@ final class FakeRunnerTests: XCTestCase {
                        "Claude interrupt/stop must cancel the active provider handle so long-running sessions do not keep working after user stop")
     }
 
+    func test_stopRunInterruptsActiveProviderAdapterForCodexAndClaude() async throws {
+        for provider in [AgentProvider.codex, .claude] {
+            let tmp = NSTemporaryDirectory() + "rc2-active-stop-\(provider.rawValue)-" + UUID().uuidString
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let thread = AgentThread(title: "stop \(provider.rawValue)",
+                                     provider: provider,
+                                     model: provider == .codex ? "gpt-5.5" : "claude-opus-4-7")
+            try threadRepo.upsert(thread)
+            let adapter = SpyProviderAdapter(provider: provider, finishImmediately: false)
+            let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                                  messageRepo: messageRepo,
+                                                  threadRepo: threadRepo,
+                                                  providerAdapters: [provider: adapter])
+
+            _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                               provider: provider,
+                                                               model: thread.model,
+                                                               cwd: tmp,
+                                                               prompt: "long stop"))
+            await waitForAdapterSend(adapter)
+            coordinator.stopRun(threadId: thread.id)
+
+            XCTAssertEqual(adapter.cancelCount, 1,
+                           "Stop Chat must cancel the active \(provider.rawValue) run handle")
+            XCTAssertEqual(adapter.interruptTurnCallCount, 1,
+                           "Stop Chat must also call the \(provider.rawValue) adapter interrupt path so provider-native work aborts even when the handle is incomplete")
+        }
+    }
+
     func test_claudeCliAdapterKeepsReadableThreadHistoryAndRollsBackLocalSnapshot() async throws {
         let adapter = ClaudeCLIAdapter(runner: ScriptedClaudeRunner())
         let threadId = AgentThreadID()

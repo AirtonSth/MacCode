@@ -1089,6 +1089,8 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.createThread(title: "plan")
         vm.prompt = "/plan"
         await vm.send()
+        XCTAssertFalse(vm.showPlanSidebar,
+                       "plan mode must not open the side panel; proposed plans render in the main timeline")
         vm.prompt = "inspect before editing"
 
         await vm.send()
@@ -1098,6 +1100,44 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertEqual(runner.prompts.last, "inspect before editing",
                        "plan mode must alter request metadata without corrupting the user-visible prompt")
+    }
+
+    func test_inlinePlanCommandSendsRemainingPromptInPlanMode() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .codex)
+        vm.coordinator.replaceProvider(.codex, runner: runner)
+        vm.createThread(title: "inline plan")
+
+        vm.prompt = "/plan What's the best way to create the snake game?"
+        await vm.send()
+        XCTAssertFalse(vm.showPlanSidebar,
+                       "inline /plan must keep the plan response in the main window instead of opening the side panel")
+
+        await waitAsync("inline plan prompt reaches runner") {
+            runner.interactionModes.contains(.plan)
+        }
+        XCTAssertEqual(runner.prompts.last, "What's the best way to create the snake game?",
+                       "mobile and desktop users must be able to type /plan plus the actual question in one send without dropping the user prompt")
+    }
+
+    func test_inlinePlanCommandWorksForClaudeProvider() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .claude)
+        vm.coordinator.replaceProvider(.claude, runner: runner)
+        vm.createThread(title: "inline plan claude")
+        vm.provider = .claude
+        vm.model = "claude-sonnet-4-6"
+
+        vm.prompt = "/plan What's the best way to create the snake game?"
+        await vm.send()
+        XCTAssertFalse(vm.showPlanSidebar,
+                       "Claude inline /plan must keep the plan response in the main window instead of opening the side panel")
+
+        await waitAsync("inline plan prompt reaches Claude runner") {
+            runner.interactionModes.contains(.plan)
+        }
+        XCTAssertEqual(runner.prompts.last, "What's the best way to create the snake game?",
+                       "Claude plan mode must receive the prompt text when /plan and the question are sent together")
     }
 
     func test_defaultCommandMakesNextProviderRunUseDefaultInteractionMode() async throws {
@@ -1347,6 +1387,77 @@ final class AgentAppViewModelTests: XCTestCase {
             XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
                           "a provider switch must leave a model valid for that provider")
         }
+    }
+
+    func test_providerSwitchClearsStaleModelBeforeAsyncLoad() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)
+        ]
+        vm.model = "gpt-5.5"
+
+        vm.setProvider(.claude)
+
+        XCTAssertEqual(vm.provider, .claude)
+        XCTAssertEqual(vm.availableModels, [],
+                       "macOS Source changes must clear stale Codex model rows immediately while Claude models load")
+        XCTAssertEqual(vm.model, "",
+                       "macOS must not keep sending the old Codex model after the user switches Source to Claude")
+    }
+
+    func test_providerInstancePickerCannotShowClaudeSourceWithCodexModels() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.providerInstanceId = "codex-cli"
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)
+        ]
+        vm.model = "gpt-5.5"
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                authenticated: true,
+                accountLabel: "codex@example.com",
+                accountAuthMethod: "codex",
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                slashCommands: []
+            ),
+            AgentProviderSnapshot(
+                id: "claude-cli",
+                provider: .claude,
+                driverKind: .claudeCLI,
+                displayName: "Claude",
+                accentColor: "#D97706",
+                continuationGroup: "anthropic-claude",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                authenticated: true,
+                accountLabel: "claude@example.com",
+                accountAuthMethod: "claude.ai",
+                models: [AgentModelDescriptor(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: .claude)],
+                slashCommands: []
+            )
+        ]
+
+        vm.providerInstanceId = "claude-cli"
+
+        XCTAssertEqual(vm.selectedProviderSnapshot?.provider, .claude)
+        XCTAssertEqual(vm.modelOptionsForSelectedProvider.map(\.provider), [.claude],
+                       "the model menu must follow the selected Source snapshot immediately; otherwise the user sees Claude with Codex GPT models until changing Source twice")
+        XCTAssertFalse(vm.modelOptionsForSelectedProvider.contains { $0.id.hasPrefix("gpt-") },
+                       "the model menu must not keep Codex GPT rows after the selected Source snapshot is Claude")
     }
 
     func test_modelDescriptorControlsClampIllegalReasoningAndServiceTier() throws {
@@ -2090,7 +2201,7 @@ final class AgentAppViewModelTests: XCTestCase {
         restartedAdapter.stopAll()
     }
 
-    func test_selectThreadRehydratesPersistedProposedPlansIntoPlanSidebar() throws {
+    func test_selectThreadRehydratesPersistedProposedPlansForMainTimeline() throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-rehydrate-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -2119,7 +2230,7 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual(vm.timeline.proposedPlans.map(\.id), ["plan-1"])
         XCTAssertEqual(vm.latestPlanText, "1. Inspect\n2. Patch",
-                       "proposed plans must rehydrate into the Agent App plan sidebar after restart/reload")
+                       "proposed plans must rehydrate into the Agent App main timeline after restart/reload")
     }
 
     func test_selectThreadRehydratesCheckpointsAndFileDiffPreview() throws {
@@ -2204,6 +2315,10 @@ final class AgentAppViewModelTests: XCTestCase {
                        "the source plan must keep a link to the thread that implements it")
         XCTAssertNotNil(storedPlan.plan.implementedAtMs,
                         "implemented plans must be marked so repeat actions are traceable")
+        XCTAssertFalse(storedPlan.plan.showsImplementationActions,
+                       "implemented plan cards must hide Implement and New thread instead of leaving disabled repeat actions visible")
+        XCTAssertTrue(AssistantProposedPlan(id: "draft", turnId: "turn-1", markdown: "1. Inspect").showsImplementationActions,
+                      "unimplemented plan cards must keep their implementation actions available")
     }
 
     func test_saveLatestProposedPlanWritesMarkdownFile() throws {

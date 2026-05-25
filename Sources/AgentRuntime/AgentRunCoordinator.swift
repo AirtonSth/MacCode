@@ -204,11 +204,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
         if let handle {
             handle.cancel()
+            if let adapter = try? adapterForThread(threadId) {
+                try? adapter.interruptTurn(threadId: threadId)
+            }
+            markStopRequested(threadId: threadId, runId: runId)
             return
         }
         if let adapter = try? adapterForThread(threadId), adapter.hasSession(threadId: threadId) {
             do {
                 try adapter.stopSession(threadId: threadId)
+                markStopRequested(threadId: threadId, runId: nil)
                 return
             } catch {
                 // One-shot runners can expose a session before the local run handle exists.
@@ -220,6 +225,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 try recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
                 if adapter.hasSession(threadId: threadId) {
                     try adapter.interruptTurn(threadId: threadId)
+                    markStopRequested(threadId: threadId, runId: nil)
                     return
                 }
             } catch {
@@ -230,6 +236,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         pendingThreadStops.insert(threadId)
         lock.unlock()
+        markStopRequested(threadId: threadId, runId: nil)
+    }
+
+    private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
+        let stoppedRunId = runId ?? AgentRunID()
+        if let runId {
+            try? runRepo.markStopped(id: runId, status: .cancelled)
+        }
+        if var thread = try? threadRepo.get(id: threadId), thread.status == .running || thread.status == .pending {
+            thread.status = .cancelled
+            thread.updatedAt = Date()
+            try? threadRepo.upsert(thread)
+        }
+        try? providerSessionRepo?.markStopped(threadId: threadId)
+        lock.lock()
+        if let runId {
+            active.removeValue(forKey: runId)
+            activeThreads.removeValue(forKey: threadId)
+            activeRunMetadata.removeValue(forKey: runId)
+            activeTurnIds.removeValue(forKey: runId)
+            activeAssistantMessageIds.removeValue(forKey: runId)
+            seq.removeValue(forKey: runId)
+        }
+        pendingThreadStops.remove(threadId)
+        lock.unlock()
+        for observer in observersSnapshot() {
+            observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)
+        }
+        onRunFinished?(threadId, stoppedRunId, .cancelled)
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {

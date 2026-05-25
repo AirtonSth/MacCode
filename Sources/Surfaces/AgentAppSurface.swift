@@ -36,6 +36,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false
+    @Published public var interactionMode: AgentInteractionMode = .default
     @Published public var planNotes: String = ""
     /// C1: git branch + working-tree summary of the agent's dir, for the
     /// composer context strip ("N files changed +A −B").
@@ -473,10 +474,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var selectedModelDescriptor: AgentModelDescriptor? {
-        if let exact = availableModels.first(where: { $0.id == model && $0.provider == provider }) {
+        if let exact = modelOptionsForSelectedProvider.first(where: { $0.id == model }) {
             return exact
         }
-        return model.isEmpty ? nil : availableModels.first { $0.provider == provider && $0.supportsCustomModel }
+        return model.isEmpty ? nil : modelOptionsForSelectedProvider.first { $0.supportsCustomModel }
+    }
+
+    public var modelOptionsForSelectedProvider: [AgentModelDescriptor] {
+        let snapshot = selectedProviderSnapshot
+        let optionProvider = snapshot?.provider ?? provider
+        let snapshotModels = snapshot?.models.filter { $0.provider == optionProvider } ?? []
+        if !snapshotModels.isEmpty { return snapshotModels }
+        return availableModels.filter { $0.provider == optionProvider }
     }
 
     public var supportedReasoningEffortsForSelectedModel: [AgentReasoningEffort] {
@@ -492,7 +501,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var supportsCustomModelForSelectedProvider: Bool {
-        availableModels.contains { $0.provider == provider && $0.supportsCustomModel }
+        modelOptionsForSelectedProvider.contains { $0.supportsCustomModel }
     }
 
     public var selectedModelContextWindowLabel: String? {
@@ -504,12 +513,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func modelSelectionIsValid(_ model: String, in models: [AgentModelDescriptor]) -> Bool {
         guard !models.isEmpty else { return true }
-        if models.contains(where: { $0.id == model }) { return true }
-        return !model.isEmpty && customModelSelections.contains(model) && models.contains(where: \.supportsCustomModel)
+        if models.contains(where: { $0.id == model && $0.provider == provider }) { return true }
+        return !model.isEmpty
+            && customModelSelections.contains(model)
+            && models.contains { $0.provider == provider && $0.supportsCustomModel }
     }
 
     public var currentModelSelection: AgentModelSelection {
-        let exactDescriptor = availableModels.first { $0.id == model && $0.provider == provider }
+        let exactDescriptor = modelOptionsForSelectedProvider.first { $0.id == model }
         let descriptor = selectedModelDescriptor
         let isCustom = exactDescriptor == nil && descriptor?.supportsCustomModel == true && !model.isEmpty
         return AgentModelSelection(
@@ -629,6 +640,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         persistThreadConfig()
     }
 
+    public func setProvider(_ newProvider: AgentProvider) {
+        provider = newProvider
+        providerInstanceId = newProvider.rawValue
+        availableModels = []
+        model = ""
+        normalizeSelectedModelOptions()
+        persistThreadConfig()
+    }
+
     /// Persist the chosen run configuration onto the selected thread so a
     /// resumed run uses the right source, model, permission, and effort.
     public func persistThreadConfig() {
@@ -712,7 +732,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard supportsCustomModelForSelectedProvider else { return }
         if !trimmed.isEmpty { customModelSelections.insert(trimmed) }
-        model = trimmed.isEmpty ? (availableModels.first { $0.provider == provider }?.id ?? "") : trimmed
+        model = trimmed.isEmpty ? (modelOptionsForSelectedProvider.first?.id ?? "") : trimmed
         normalizeSelectedModelOptions()
         persistThreadConfig()
     }
@@ -853,13 +873,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// provider. Provider commands such as `/goal` must pass through.
     public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
 
+    private static func localSlashCommandParts(_ raw: String) -> (command: String, argument: String)? {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.hasPrefix("/") else { return nil }
+        let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
+        return (
+            parts.first?.lowercased() ?? "",
+            parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        )
+    }
+
     @discardableResult
     public func handleSlashCommand(_ raw: String) -> Bool {
-        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard line.hasPrefix("/") else { return false }
-        let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
-        let cmd = parts.first?.lowercased() ?? ""
-        let arg = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        guard let parts = Self.localSlashCommandParts(raw) else { return false }
+        let cmd = parts.command
+        let arg = parts.argument
         switch cmd {
         case "clear":
             createThread(title: "New thread")
@@ -877,12 +905,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 systemNote(names.isEmpty ? "No models loaded yet." : "Models: \(names)")
             }
         case "plan":
-            showPlanSidebar = true
+            interactionMode = .plan
             permissionMode = .supervised
             persistThreadConfig()
             systemNote("Plan mode on · permission: supervised")
         case "default":
-            showPlanSidebar = false
+            interactionMode = .default
             persistThreadConfig()
             systemNote("Default mode on")
         case "status":
@@ -911,11 +939,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         recordPromptHistory(text)
+        if let slash = Self.localSlashCommandParts(text),
+           (slash.command == "plan" || slash.command == "default"),
+           !slash.argument.isEmpty {
+            _ = handleSlashCommand("/\(slash.command)")
+            _ = await startProviderRun(
+                text: slash.argument,
+                attached: attachments,
+                recordHistory: false,
+                interactionMode: interactionMode
+            )
+            return
+        }
         if text.hasPrefix("/"), handleSlashCommand(text) {
             prompt = ""
             return
         }
-        _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: showPlanSidebar ? .plan : .default)
+        _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
     }
 
     @discardableResult
@@ -1595,7 +1635,7 @@ public struct AgentAppView: View {
     }
 
     private var modelLabel: String {
-        vm.availableModels.first(where: { $0.id == vm.model })?.label ?? vm.model
+        vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
     }
     private var permissionLabel: String {
         switch vm.permissionMode {
@@ -2082,8 +2122,12 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
+        let turnPlans = proposedPlans(for: turn)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            ForEach(turn.items, id: \.id) { item in itemRow(item) }
+            ForEach(turn.items.filter { !($0.type == .plan && !turnPlans.isEmpty) }, id: \.id) { item in itemRow(item) }
+            ForEach(turnPlans) { plan in
+                proposedPlanRow(plan)
+            }
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage, !final.isEmpty,
@@ -2092,6 +2136,12 @@ public struct AgentAppView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func proposedPlans(for turn: AssistantTurnSnapshot) -> [AssistantProposedPlan] {
+        vm.timeline.proposedPlans.filter {
+            $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     @ViewBuilder
@@ -2363,34 +2413,37 @@ public struct AgentAppView: View {
         Menu {
             if !vm.providerLocked {
                 if !vm.providerSnapshots.isEmpty {
-                    Picker("Source", selection: $vm.providerInstanceId) {
+                    Picker("Source", selection: Binding(
+                        get: { vm.providerInstanceId },
+                        set: { vm.setProviderInstance($0) }
+                    )) {
                         ForEach(vm.providerSnapshots.filter(\.enabled), id: \.id) { snapshot in
                             Text(snapshot.displayName).tag(snapshot.id)
                         }
                     }
                     .disabled(vm.status == .running)
-                    .onChange(of: vm.providerInstanceId) { id in
-                        vm.setProviderInstance(id)
-                    }
                 } else {
-                    Picker("Source", selection: $vm.provider) {
+                    Picker("Source", selection: Binding(
+                        get: { vm.provider },
+                        set: { provider in
+                            vm.setProvider(provider)
+                            Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
+                        }
+                    )) {
                         ForEach(AgentProvider.allCases, id: \.self) { provider in
                             Text(vm.providerDisplayName(provider)).tag(provider)
                         }
                     }
                     .disabled(vm.status == .running)
-                    .onChange(of: vm.provider) { _ in
-                        vm.providerInstanceId = vm.provider.rawValue
-                        Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
-                    }
                 }
             }
-            if !vm.availableModels.isEmpty {
+            let modelOptions = vm.modelOptionsForSelectedProvider
+            if !modelOptions.isEmpty {
                 Picker("Model", selection: $vm.model) {
-                    ForEach(vm.availableModels, id: \.id) { m in Text(m.label).tag(m.id) }
+                    ForEach(modelOptions, id: \.id) { m in Text(m.label).tag(m.id) }
                     if vm.supportsCustomModelForSelectedProvider,
                        !vm.model.isEmpty,
-                       !vm.availableModels.contains(where: { $0.id == vm.model && $0.provider == vm.provider }) {
+                       !modelOptions.contains(where: { $0.id == vm.model }) {
                         Text("Custom: \(vm.model)").tag(vm.model)
                     }
                 }
@@ -2594,18 +2647,20 @@ public struct AgentAppView: View {
                         .font(DS.Font.body.weight(.semibold))
                         .foregroundColor(DS.Palette.text)
                     HStack(spacing: DS.Space.xs) {
-                        Button {
-                            Task { await vm.implementLatestPlan(newThread: false) }
-                        } label: {
-                            Label("Implement", systemImage: "play.fill")
+                        if proposedPlan.showsImplementationActions {
+                            Button {
+                                Task { await vm.implementLatestPlan(newThread: false) }
+                            } label: {
+                                Label("Implement", systemImage: "play.fill")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            Button {
+                                Task { await vm.implementLatestPlan(newThread: true) }
+                            } label: {
+                                Label("New thread", systemImage: "plus.message")
+                            }
+                            .buttonStyle(.bordered)
                         }
-                        .buttonStyle(.borderedProminent)
-                        Button {
-                            Task { await vm.implementLatestPlan(newThread: true) }
-                        } label: {
-                            Label("New thread", systemImage: "plus.message")
-                        }
-                        .buttonStyle(.bordered)
                         Button {
                             copyToPasteboard(plan)
                         } label: {
@@ -2821,6 +2876,71 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
         .accessibilityIdentifier("agent.activePlan")
+    }
+
+    private func proposedPlanRow(_ plan: AssistantProposedPlan) -> some View {
+        let markdown = proposedPlanExpanded ? plan.markdown : plan.collapsedPreview
+        return VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                Image(systemName: plan.implementedAtMs == nil ? "list.bullet.clipboard" : "checkmark.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(plan.implementedAtMs == nil ? "Proposed plan" : "Implementation started")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                    Text(plan.exportTitle)
+                        .font(DS.Font.bodyDense.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                }
+                Spacer(minLength: 0)
+            }
+            AgentMessageMarkdownView(text: markdown)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: DS.Space.xs) {
+                if plan.showsImplementationActions {
+                    Button {
+                        Task { await vm.implementLatestPlan(newThread: false) }
+                    } label: {
+                        Label("Implement", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button {
+                        Task { await vm.implementLatestPlan(newThread: true) }
+                    } label: {
+                        Label("New thread", systemImage: "plus.message")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Button {
+                    copyToPasteboard(markdown)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    saveLatestProposedPlan()
+                } label: {
+                    Label("Save", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.bordered)
+                if plan.markdown != plan.collapsedPreview {
+                    Button {
+                        proposedPlanExpanded.toggle()
+                    } label: {
+                        Label(proposedPlanExpanded ? "Collapse" : "Show all",
+                              systemImage: proposedPlanExpanded ? "chevron.up" : "chevron.down")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .accessibilityIdentifier("agent.proposedPlan.\(plan.id)")
     }
 }
 
