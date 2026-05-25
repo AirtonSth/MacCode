@@ -77,6 +77,15 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "sidebar action labels must use the same base font size as normal workspace rows")
     }
 
+    func testSidebarLiquidGlassAvoidsOpaqueBottomBand() throws {
+        let source = try String(contentsOf: sidebarViewURL())
+
+        XCTAssertTrue(source.contains("container.material = .sidebar"),
+                      "the main sidebar should use the macOS sidebar vibrancy material for a stronger glass surface")
+        XCTAssertFalse(source.contains(".background(DS.Palette.surface.opacity(0.42))"),
+                       "the account footer must not repaint the bottom as a dark block after hide/show restores the sidebar")
+    }
+
     func testThreadOutcomeNotificationContentMatchesLegacyActionablePhases() {
         XCTAssertNil(RemoteCodeNotificationContent.threadOutcome(
             threadId: "t1",

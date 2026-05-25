@@ -217,6 +217,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18
             ctx.allowsImplicitAnimation = true
+            ctx.completionHandler = { [weak self] in
+                guard let self else { return }
+                self.split.adjustSubviews()
+                self.window.contentView?.layoutSubtreeIfNeeded()
+            }
             sidebar.view.isHidden = sidebarCollapsed
             collapsedWorkspaceHeader.isHidden = !sidebarCollapsed
             visibleWorkspaceHeader.isHidden = sidebarCollapsed

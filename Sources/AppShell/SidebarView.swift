@@ -331,7 +331,12 @@ public struct SidebarRootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         // Subtle liquid-glass: a near-transparent tint over the
         // NSVisualEffectView the host sits in (see SidebarView).
-        .background(DS.Palette.surface.opacity(0.55))
+        .background(DS.Palette.surface.opacity(0.28))
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(0.045))
+                .frame(width: DS.Border.hairline)
+        }
         // The sidebar material reaches the top edge; only its controls
         // start below the traffic-light band.
         .ignoresSafeArea(.container, edges: .top)
@@ -411,7 +416,7 @@ public struct SidebarRootView: View {
             .padding(.top, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
         }
-        .background(DS.Palette.surface.opacity(0.42))
+        .background(Color.white.opacity(0.025))
     }
 
     private var accountAvatar: some View {
@@ -594,7 +599,7 @@ public final class SidebarView: NSObject {
         // the translucent SwiftUI sidebar. Chrome only — per design rules
         // glass never goes on main content.
         let container = NSVisualEffectView()
-        container.material = .underWindowBackground
+        container.material = .sidebar
         container.blendingMode = .behindWindow
         container.state = .active
         container.translatesAutoresizingMaskIntoConstraints = false

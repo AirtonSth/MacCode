@@ -613,6 +613,35 @@ final class PaneActionTests: XCTestCase {
                        "collapsed mode still needs a full-width header so the user can restore the sidebar")
     }
 
+    func test_sidebarHideShowRestoresFullHeightSidebarWithoutBottomGap() throws {
+        let (ctx, router) = try makeContext()
+        _ = try router.createWorkspace(name: "glass-gap", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        controller.window.setFrame(NSRect(x: 0, y: 0, width: 1200, height: 720), display: false)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+
+        let content = try XCTUnwrap(controller.window.contentView)
+        let split = try XCTUnwrap(allSubviews(of: content).first { $0 is NSSplitView } as? NSSplitView)
+        let sidebar = try XCTUnwrap(split.subviews.first,
+                                    "restoring the sidebar must keep the sidebar arranged inside the split view")
+        let splitFrame = split.convert(split.bounds, to: content)
+        let sidebarFrame = sidebar.convert(sidebar.bounds, to: content)
+
+        XCTAssertFalse(sidebar.isHidden,
+                       "showing the sidebar again must unhide the glass sidebar view")
+        XCTAssertEqual(splitFrame.minY, content.bounds.minY, accuracy: 0.5,
+                       "the split view must remain pinned to the window bottom after hide/show")
+        XCTAssertEqual(sidebarFrame.minY, content.bounds.minY, accuracy: 0.5,
+                       "the restored sidebar glass must reach the bottom instead of leaving a black strip")
+        XCTAssertEqual(sidebarFrame.height, splitFrame.height, accuracy: 0.5,
+                       "the restored sidebar material must cover the split height")
+    }
+
     func test_openWorkspaceInNewWindow_usesSidebarlessHeaderWithBackButton() throws {
         let (ctx, router) = try makeContext()
         let detached = try router.createWorkspace(name: "detached", cwd: NSTemporaryDirectory())
