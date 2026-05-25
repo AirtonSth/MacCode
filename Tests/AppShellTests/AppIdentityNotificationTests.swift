@@ -63,6 +63,20 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "the appcast must keep referencing the notarized release DMG asset")
     }
 
+    func testSidebarActionsKeepRequestedOrderAndWorkspaceFontSize() throws {
+        let source = try String(contentsOf: sidebarViewURL())
+        let newWorkspace = try XCTUnwrap(source.range(of: "title: \"New Workspace\""))
+        let settings = try XCTUnwrap(source.range(of: "title: \"Settings\""))
+        let updates = try XCTUnwrap(source.range(of: "title: vm.updateActionTitle"))
+
+        XCTAssertLessThan(newWorkspace.lowerBound, settings.lowerBound,
+                          "sidebar actions must keep New Workspace above Settings")
+        XCTAssertLessThan(settings.lowerBound, updates.lowerBound,
+                          "the update/check action belongs below Settings, not above New Workspace")
+        XCTAssertTrue(source.contains("Text(title)\n                .font(DS.Font.body)"),
+                      "sidebar action labels must use the same base font size as normal workspace rows")
+    }
+
     func testThreadOutcomeNotificationContentMatchesLegacyActionablePhases() {
         XCTAssertNil(RemoteCodeNotificationContent.threadOutcome(
             threadId: "t1",
@@ -365,6 +379,14 @@ final class AppIdentityNotificationTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent(".github/workflows/release-macos.yml")
+    }
+
+    private func sidebarViewURL() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/AppShell/SidebarView.swift")
     }
 
     private func waitAsync(_ desc: String, timeout: TimeInterval = 6, _ cond: @escaping () -> Bool) async {

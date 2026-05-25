@@ -257,15 +257,6 @@ public struct SidebarRootView: View {
             Color.clear.frame(height: 44)
 
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                if vm.showsUpdateControl {
-                    Button { vm.checkForUpdates() } label: {
-                        sidebarActionRow(symbol: "arrow.down.circle", title: vm.updateActionTitle)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!vm.updateActionEnabled)
-                    .help(updateHelpText)
-                }
-
                 HStack(spacing: DS.Space.xs) {
                     Button { vm.newWorkspace() } label: {
                         sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
@@ -289,6 +280,15 @@ public struct SidebarRootView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Settings")
+
+                if vm.showsUpdateControl {
+                    Button { vm.checkForUpdates() } label: {
+                        sidebarActionRow(symbol: "arrow.down.circle", title: vm.updateActionTitle)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!vm.updateActionEnabled)
+                    .help(updateHelpText)
+                }
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
@@ -344,7 +344,7 @@ public struct SidebarRootView: View {
                 .frame(width: 20, height: 20)
                 .foregroundColor(DS.Palette.text)
             Text(title)
-                .font(DS.Font.bodyStrong)
+                .font(DS.Font.body)
                 .foregroundColor(DS.Palette.text)
                 .lineLimit(1)
             Spacer(minLength: 0)
