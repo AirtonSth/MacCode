@@ -62,14 +62,16 @@ public final class SparkleAppUpdater: AppUpdateChecking {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.availability = .available }
+            guard let updater = self else { return }
+            Task { @MainActor in updater.availability = .available }
         })
         observers.append(center.addObserver(
             forName: .SUUpdaterDidNotFindUpdate,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.availability = .upToDate }
+            guard let updater = self else { return }
+            Task { @MainActor in updater.availability = .upToDate }
         })
     }
 }

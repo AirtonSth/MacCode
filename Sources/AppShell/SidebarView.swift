@@ -32,7 +32,8 @@ public final class SidebarViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.reloadPrivateAccount() }
+            guard let viewModel = self else { return }
+            Task { @MainActor in viewModel.reloadPrivateAccount() }
         }
         self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
             self?.updateAvailability = availability

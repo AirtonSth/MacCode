@@ -109,8 +109,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         SystemNotifier.shared.bootstrap()
         reapIdleProviderSessions()
         providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
+            guard let delegate = self else { return }
             Task { @MainActor in
-                self?.reapIdleProviderSessions()
+                delegate.reapIdleProviderSessions()
             }
         }
 
