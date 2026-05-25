@@ -117,6 +117,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         installMainMenu()
         windowController.show()
+        checkForUpdatesAfterOpeningApp()
+    }
+
+    public func checkForUpdatesAfterOpeningApp() {
+        updater?.checkForUpdates()
     }
 
     public func applicationWillTerminate(_ notification: Notification) {

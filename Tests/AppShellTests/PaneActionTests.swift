@@ -708,6 +708,8 @@ final class PaneActionTests: XCTestCase {
                       "the sidebar must expose the Sparkle update/check row above New Workspace when auto-update is configured")
         XCTAssertEqual(vm.updateActionTitle, "Update Available",
                        "a found Sparkle update must be presented as an installable update, not as a manual DMG download")
+        XCTAssertTrue(vm.updateActionHighlighted,
+                      "an installable update must be visually highlighted so it is not just another sidebar row")
 
         vm.checkForUpdates()
 
@@ -719,6 +721,21 @@ final class PaneActionTests: XCTestCase {
         updater.availability = .upToDate
         XCTAssertEqual(vm.updateActionTitle, "Up to Date",
                        "Sparkle no-update feedback must stay visible instead of silently hiding the control")
+        XCTAssertFalse(vm.updateActionHighlighted,
+                       "the update highlight must clear once Sparkle reports there is no installable update")
+    }
+
+    func test_appDelegateChecksForUpdatesAfterOpeningApp() throws {
+        let delegate = AppDelegate()
+        let updater = RecordingAppUpdateChecker(availability: .unknown)
+        delegate.updater = updater
+
+        delegate.checkForUpdatesAfterOpeningApp()
+
+        XCTAssertEqual(updater.checks, 1,
+                       "opening the macOS app must run the same Sparkle update check as the sidebar control")
+        XCTAssertEqual(updater.availability, .checking,
+                       "startup update checks must drive the visible checking state instead of staying idle")
     }
 
     func test_settingsController_presentsSettingsAsModalSheet() throws {

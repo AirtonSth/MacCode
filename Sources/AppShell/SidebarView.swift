@@ -121,6 +121,10 @@ public final class SidebarViewModel: ObservableObject {
         updateChecker != nil && updateAvailability != .checking
     }
 
+    public var updateActionHighlighted: Bool {
+        updateAvailability == .available
+    }
+
     public func checkForUpdates() {
         updateChecker?.checkForUpdates()
     }
@@ -283,7 +287,11 @@ public struct SidebarRootView: View {
 
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
-                        sidebarActionRow(symbol: "arrow.down.circle", title: vm.updateActionTitle)
+                        sidebarActionRow(
+                            symbol: "arrow.down.circle",
+                            title: vm.updateActionTitle,
+                            isEmphasized: vm.updateActionHighlighted
+                        )
                     }
                     .buttonStyle(.plain)
                     .disabled(!vm.updateActionEnabled)
@@ -342,15 +350,15 @@ public struct SidebarRootView: View {
         .ignoresSafeArea(.container, edges: .top)
     }
 
-    private func sidebarActionRow(symbol: String, title: String) -> some View {
+    private func sidebarActionRow(symbol: String, title: String, isEmphasized: Bool = false) -> some View {
         HStack(spacing: DS.Space.md) {
             Image(systemName: symbol)
-                .font(.system(size: 16, weight: .regular))
+                .font(.system(size: 16, weight: isEmphasized ? .semibold : .regular))
                 .frame(width: 20, height: 20)
-                .foregroundColor(DS.Palette.text)
+                .foregroundColor(isEmphasized ? DS.Palette.warning : DS.Palette.text)
             Text(title)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
+                .font(isEmphasized ? DS.Font.bodyStrong : DS.Font.body)
+                .foregroundColor(isEmphasized ? DS.Palette.warning : DS.Palette.text)
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
@@ -359,7 +367,12 @@ public struct SidebarRootView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(Color.white.opacity(0.001))
+                .fill(isEmphasized ? DS.Palette.warning.opacity(0.16) : Color.white.opacity(0.001))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(isEmphasized ? DS.Palette.warning.opacity(0.55) : Color.clear,
+                              lineWidth: DS.Border.hairline)
         )
     }
 
