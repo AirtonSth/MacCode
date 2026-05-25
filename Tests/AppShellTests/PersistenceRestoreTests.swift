@@ -6,6 +6,12 @@ import Persistence
 
 @MainActor
 final class PersistenceRestoreTests: XCTestCase {
+    private func closeAndUnregisterAllSurfaces() {
+        let surfaces = SurfaceRegistry.shared.all()
+        surfaces.forEach { $0.close() }
+        surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
     /// Workspaces and tabs must survive a process restart even without a
     /// clean quit — i.e. the snapshot is written on mutation, not only on
     /// applicationWillTerminate.
@@ -21,6 +27,7 @@ final class PersistenceRestoreTests: XCTestCase {
             _ = try router.createSurface(workspace: ws.id, type: .terminal, paneID: nil, title: "t")
             _ = try router.createSurface(workspace: ws.id, type: .browser, paneID: nil, title: "b")
             ctx.saveSnapshot() // immediate flush (debounced timer would also fire)
+            defer { closeAndUnregisterAllSurfaces() }
         }
 
         // ── Session 2: fresh AppContext on the SAME app-support dir.

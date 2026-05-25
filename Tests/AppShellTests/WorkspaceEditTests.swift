@@ -1,10 +1,22 @@
 import XCTest
 @testable import AppShell
 @testable import CoreModel
+@testable import Surfaces
 import Persistence
 
 @MainActor
 final class WorkspaceEditTests: XCTestCase {
+    private func closeAndUnregisterAllSurfaces() {
+        let surfaces = SurfaceRegistry.shared.all()
+        surfaces.forEach { $0.close() }
+        surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
+    override func tearDown() {
+        closeAndUnregisterAllSurfaces()
+        super.tearDown()
+    }
+
     private func make() throws -> (AppContext, AppCommandRouter) {
         let dir = NSTemporaryDirectory() + "RC2WSEdit-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

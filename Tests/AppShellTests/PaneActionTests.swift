@@ -6,6 +6,17 @@ import Persistence
 
 @MainActor
 final class PaneActionTests: XCTestCase {
+    private func closeAndUnregisterAllSurfaces() {
+        let surfaces = SurfaceRegistry.shared.all()
+        surfaces.forEach { $0.close() }
+        surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
+    override func tearDown() {
+        closeAndUnregisterAllSurfaces()
+        super.tearDown()
+    }
+
     private func makeContext() throws -> (AppContext, AppCommandRouter) {
         let tmp = NSTemporaryDirectory() + "RC2PaneTest-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)

@@ -232,6 +232,7 @@ public final class TerminalSurface: NSObject, Surface {
     private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
     private var pendingHistoryData = Data()
     private var historyFlushScheduled = false
+    private var isClosing = false
     private var nextHistoryChunkIndex: Int64 = 1
     private var historyWriteFailures = 0
     private var outputPartial = false
@@ -431,6 +432,7 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func appendDataAsync(_ data: Data) {
+        guard !isClosing else { return }
         enqueueHistory(data)
         renderer.feed(data)
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
@@ -551,6 +553,17 @@ public final class TerminalSurface: NSObject, Surface {
             )
         }
         if let text = ghosttyView.readViewportText() {
+            let rendererText = renderer.snapshot().string
+            if Self.shouldPreferRendererSnapshotForReadText(viewportText: text, rendererText: rendererText) {
+                return TerminalTextSnapshot(
+                    text: rendererText,
+                    complete: !outputPartial && historyWriteFailures == 0,
+                    source: "ansi_renderer",
+                    timestamp: Date(),
+                    partialReason: outputPartial ? "hidden_output_cap" : (historyWriteFailures > 0 ? "history_persistence_failed" : nil),
+                    pendingBytes: outputPendingBytes
+                )
+            }
             return TerminalTextSnapshot(
                 text: text,
                 complete: !outputPartial && historyWriteFailures == 0,
@@ -587,6 +600,20 @@ public final class TerminalSurface: NSObject, Surface {
         readTextSnapshot().text
     }
 
+    static func shouldPreferRendererSnapshotForReadText(viewportText: String, rendererText: String) -> Bool {
+        guard rendererText.contains(where: { $0.isNewline }),
+              rendererText.count > viewportText.count else { return false }
+        return visibleLineCount(viewportText) <= 1
+    }
+
+    private static func visibleLineCount(_ text: String) -> Int {
+        text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .count
+    }
+
     public func focus() {
         view.window?.makeFirstResponder(ghosttyView)
         ghosttyView.forceRefresh()
@@ -618,6 +645,8 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func close() {
+        guard !isClosing else { return }
+        isClosing = true
         flushHistory(wait: true)
         readSource?.cancel()
         readSource = nil
@@ -646,7 +675,7 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func enqueueHistory(_ data: Data) {
-        guard historyRepo != nil, !data.isEmpty else { return }
+        guard !isClosing, historyRepo != nil, !data.isEmpty else { return }
         pendingHistoryData.append(data)
         if pendingHistoryData.count >= Self.maxHistoryChunkBytes {
             flushHistory(wait: false)
@@ -665,7 +694,12 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func flushHistory(wait: Bool) {
-        guard let historyRepo, !pendingHistoryData.isEmpty else { return }
+        guard let historyRepo, !pendingHistoryData.isEmpty else {
+            if wait {
+                historyQueue.sync {}
+            }
+            return
+        }
         let data = pendingHistoryData
         pendingHistoryData.removeAll(keepingCapacity: true)
         let surfaceID = descriptor.id.value.uuidString

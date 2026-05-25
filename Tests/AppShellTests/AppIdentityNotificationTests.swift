@@ -4,11 +4,18 @@ import XCTest
 @testable import CoreModel
 @testable import SocketServer
 @testable import Persistence
+@testable import Surfaces
 
 /// Intent: v2 must be packaged as RemoteCode, with the legacy desktop
 /// bundle identifier and icon, so users can install it as an update.
 @MainActor
 final class AppIdentityNotificationTests: XCTestCase {
+    private func closeAndUnregisterAllSurfaces() {
+        let surfaces = SurfaceRegistry.shared.all()
+        surfaces.forEach { $0.close() }
+        surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
     func testReleaseChannelUsesLegacyRemoteCodeDesktopIdentity() {
         XCTAssertEqual(ReleaseChannel.stable.bundleID, "io.remotecode.desktop")
         XCTAssertEqual(ReleaseChannel.stable.displayName, "RemoteCode")
@@ -265,6 +272,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let repo = NSTemporaryDirectory() + "RC2WorktreeRepo-" + UUID().uuidString
         let worktreeRoot = repo + "-agent-worktrees"
         defer {
+            closeAndUnregisterAllSurfaces()
             try? FileManager.default.removeItem(atPath: appSupport)
             try? FileManager.default.removeItem(atPath: repo)
             try? FileManager.default.removeItem(atPath: worktreeRoot)

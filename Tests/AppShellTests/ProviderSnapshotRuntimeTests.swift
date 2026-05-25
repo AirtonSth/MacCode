@@ -3,9 +3,16 @@ import XCTest
 @testable import CoreModel
 @testable import AgentRuntime
 @testable import SocketServer
+@testable import Surfaces
 
 @MainActor
 final class ProviderSnapshotRuntimeTests: XCTestCase {
+    private func closeAndUnregisterAllSurfaces() {
+        let surfaces = SurfaceRegistry.shared.all()
+        surfaces.forEach { $0.close() }
+        surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
     func test_providerSnapshotsUseConfiguredBinaryAndExposeVersion() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -395,6 +402,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
 
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
@@ -459,6 +467,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: claudeHome, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
 
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
@@ -519,6 +528,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
 
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)

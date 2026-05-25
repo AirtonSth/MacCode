@@ -2,10 +2,17 @@ import XCTest
 import AppKit
 @testable import AppShell
 @testable import CoreModel
+@testable import Surfaces
 import Persistence
 
 @MainActor
 final class SplitLayoutRuntimeTests: XCTestCase {
+    private func closeAndUnregisterAllSurfaces() {
+        let surfaces = SurfaceRegistry.shared.all()
+        surfaces.forEach { $0.close() }
+        surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
     private func findSplit(_ v: NSView) -> RatioSplitView? {
         if let s = v as? RatioSplitView { return s }
         for sub in v.subviews { if let f = findSplit(sub) { return f } }
@@ -35,6 +42,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
     func test_horizontalSplit_panesAreEqualWidthAtRuntime() throws {
         let (ctx, router, wc) = try makeWindowController()
         _ = ctx // keep AppContext alive (router.context is weak)
+        defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
 
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
@@ -55,6 +63,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
     func test_verticalSplit_panesAreEqualHeightAtRuntime() throws {
         let (ctx, router, wc) = try makeWindowController()
         _ = ctx // keep AppContext alive (router.context is weak)
+        defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
 
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
@@ -75,6 +84,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
     func test_sidebarDividerCanResizeWorkspaceList() throws {
         let (ctx, _, wc) = try makeWindowController()
         _ = ctx
+        defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         wc.window.contentView?.layoutSubtreeIfNeeded()
@@ -90,6 +100,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
     func test_sidebarDefaultWidthMatchesDesignUntilUserResizes() throws {
         let (ctx, _, wc) = try makeWindowController()
         _ = ctx
+        defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         wc.window.contentView?.layoutSubtreeIfNeeded()
@@ -104,6 +115,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
+        defer { closeAndUnregisterAllSurfaces() }
         let first = MainWindowController(context: ctx, router: router)
         first.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()

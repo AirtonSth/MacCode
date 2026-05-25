@@ -136,8 +136,10 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     var sendAgentMessageCallCount = 0
     var commandReceipts: [String: JSONValue] = [:]
     var lastAgentRequestResponse: (AgentThreadID, String, AgentProviderRequestResponse)?
+    var agentRequestResponses: [(AgentThreadID, String, AgentProviderRequestResponse)] = []
     var respondAgentRequestCallCount = 0
     var lastAgentUserInputResponse: (AgentThreadID, String, String)?
+    var agentUserInputResponses: [(AgentThreadID, String, String)] = []
     var respondAgentUserInputCallCount = 0
     var readAgentEvents: [AssistantEvent] = []
     var pendingCallbackSnapshot = AssistantPendingCallbacksSnapshot()
@@ -146,6 +148,7 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     var lastCheckpointRevert: (AgentThreadID, Int)?
     var checkpointRevertCallCount = 0
     var stopAgentRunCallCount = 0
+    var stoppedAgentThreads: [AgentThreadID] = []
     var checkpointStore: [AgentTurnCheckpointSummary] = []
     var messageStore: [AgentMessage] = []
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
@@ -259,10 +262,12 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
         respondAgentRequestCallCount += 1
         lastAgentRequestResponse = (thread, requestId, response)
+        agentRequestResponses.append((thread, requestId, response))
     }
     func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws {
         respondAgentUserInputCallCount += 1
         lastAgentUserInputResponse = (thread, requestId, text)
+        agentUserInputResponses.append((thread, requestId, text))
     }
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
         pendingCallbackSnapshot
@@ -299,6 +304,7 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     }
     func stopAgentRun(thread: AgentThreadID) throws {
         stopAgentRunCallCount += 1
+        stoppedAgentThreads.append(thread)
     }
     var threadStore: [AgentThread] = []
     var deleteAgentThreadCallCount = 0
@@ -1262,6 +1268,71 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentCallbackResponsesRouteByThreadForEveryProviderAndStartSurface() async throws {
+        let router = FakeRouter()
+        let cases: [(title: String, provider: AgentProvider)] = [
+            ("codex macOS-started", .codex),
+            ("codex iOS-started", .codex),
+            ("claude macOS-started", .claude),
+            ("claude iOS-started", .claude)
+        ]
+        router.threadStore = cases.map {
+            var thread = AgentThread(title: $0.title, provider: $0.provider, model: "test-model")
+            thread.status = .running
+            return thread
+        }
+
+        for thread in router.threadStore {
+            let threadId = JSONValue.string(thread.id.value.uuidString)
+            let approve = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.request.respond",
+                params: [
+                    "thread_id": threadId,
+                    "request_id": .string("approval-\(thread.id.value.uuidString)"),
+                    "decision": .string("approve")
+                ]
+            ))
+            let decline = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(2),
+                method: "agent.request.respond",
+                params: [
+                    "thread_id": threadId,
+                    "request_id": .string("decline-\(thread.id.value.uuidString)"),
+                    "decision": .string("decline"),
+                    "message": .string("No")
+                ]
+            ))
+            let input = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(3),
+                method: "agent.user_input.respond",
+                params: [
+                    "thread_id": threadId,
+                    "request_id": .string("input-\(thread.id.value.uuidString)"),
+                    "text": .string("Run")
+                ]
+            ))
+
+            XCTAssertEqual(approve.result, .bool(true), "approval response must route for \(thread.title)")
+            XCTAssertEqual(decline.result, .bool(true), "decline response must route for \(thread.title)")
+            XCTAssertEqual(input.result, .bool(true), "user-input response must route for \(thread.title)")
+        }
+
+        XCTAssertEqual(router.agentRequestResponses.map(\.0), router.threadStore.flatMap { [$0.id, $0.id] },
+                       "approval and decline responses must stay thread-scoped for Codex/Claude and either start surface")
+        XCTAssertEqual(router.agentUserInputResponses.map(\.0), router.threadStore.map(\.id),
+                       "user-input answers must stay thread-scoped for Codex/Claude and either start surface")
+        XCTAssertEqual(router.agentRequestResponses.compactMap { record -> String? in
+            if case .decline(let message) = record.2 { return message }
+            return nil
+        }, Array(repeating: "No", count: cases.count),
+                       "decline approvals from macOS or iOS must reach the provider as explicit declines, not as silent cancellations")
+    }
+
+    @MainActor
     func test_agentStopAndCheckpointRevertClientRequestIdsAreIdempotent() async throws {
         let router = FakeRouter()
         let t = AgentThread(workspaceId: nil, title: "revert", provider: .codex, model: "gpt-5.5")
@@ -1287,6 +1358,39 @@ final class DispatcherTests: XCTestCase {
                        "checkpoint revert retries must not apply the rollback twice")
         XCTAssertEqual(router.stopAgentRunCallCount, 1,
                        "stop retries must not repeat the stop side effect")
+    }
+
+    @MainActor
+    func test_agentRunStopRoutesByThreadForEveryProviderAndStartSurface() async throws {
+        let router = FakeRouter()
+        let cases: [(title: String, provider: AgentProvider)] = [
+            ("codex macOS-started", .codex),
+            ("codex iOS-started", .codex),
+            ("claude macOS-started", .claude),
+            ("claude iOS-started", .claude)
+        ]
+        router.threadStore = cases.map {
+            var thread = AgentThread(title: $0.title, provider: $0.provider, model: "test-model")
+            thread.status = .running
+            return thread
+        }
+
+        for thread in router.threadStore {
+            let response = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.run.stop",
+                params: [
+                    "thread_id": .string(thread.id.value.uuidString),
+                    "client_request_id": .string("stop-\(thread.id.value.uuidString)")
+                ]
+            ))
+            XCTAssertEqual(response.result, .bool(true),
+                           "Stop Chat must return success for \(thread.title) instead of depending on provider or origin surface")
+        }
+
+        XCTAssertEqual(router.stoppedAgentThreads, router.threadStore.map(\.id),
+                       "agent.run.stop must be thread-scoped so macOS and iOS Stop Chat can stop Codex or Claude runs regardless of where the run started")
     }
 
     @MainActor
