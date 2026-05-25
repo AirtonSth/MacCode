@@ -30,6 +30,37 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(script.contains("<key>CFBundleDisplayName</key><string>RemoteCode</string>"))
         XCTAssertTrue(script.contains("<key>CFBundleIconFile</key><string>AppIcon</string>"))
         XCTAssertTrue(script.contains("AppIcon.icns"))
+        XCTAssertTrue(script.contains("<key>SUFeedURL</key><string>${SPARKLE_FEED_URL}</string>"),
+                      "release bundles must point Sparkle at the stable appcast feed")
+        XCTAssertTrue(script.contains("<key>SUPublicEDKey</key><string>${SPARKLE_PUBLIC_ED_KEY}</string>"),
+                      "release bundles must embed the Sparkle EdDSA public key used to verify update archives")
+        XCTAssertTrue(script.contains("<key>SUEnableAutomaticChecks</key><true/>"),
+                      "auto-update must enable Sparkle background update checks")
+        XCTAssertTrue(script.contains("<key>SUAutomaticallyUpdate</key><true/>"),
+                      "auto-update must let Sparkle download/install eligible updates instead of only linking a DMG")
+        XCTAssertTrue(script.contains("Contents/Frameworks/Sparkle.framework"),
+                      "the SwiftPM-built app bundle must embed Sparkle.framework for the updater to load")
+        XCTAssertTrue(script.contains("install_name_tool -add_rpath \"@executable_path/../Frameworks\""),
+                      "the packaged executable must be able to find embedded Sparkle.framework")
+        XCTAssertTrue(script.contains("codesign --force --deep --sign - \"$DIST/$BUNDLE\""),
+                      "local packaging must ad-hoc sign after rpath changes so the app can launch for smoke tests")
+    }
+
+    func testReleaseWorkflowPublishesSignedSparkleAppcastToPages() throws {
+        let workflow = try String(contentsOf: releaseWorkflowURL())
+
+        XCTAssertTrue(workflow.contains("RC2_SPARKLE_PUBLIC_ED_KEY"),
+                      "release packaging must receive the Sparkle public key from secrets")
+        XCTAssertTrue(workflow.contains("SPARKLE_PRIVATE_KEY"),
+                      "the appcast must be signed with the private EdDSA key in CI")
+        XCTAssertTrue(workflow.contains("sign_update"),
+                      "the release workflow must use Sparkle tooling to sign the DMG enclosure")
+        XCTAssertTrue(workflow.contains("dist/pages/appcast.xml"),
+                      "the release workflow must generate the appcast that Sparkle polls")
+        XCTAssertTrue(workflow.contains("actions/deploy-pages"),
+                      "the appcast must be published to GitHub Pages at the stable feed URL")
+        XCTAssertTrue(workflow.contains("stable-macos-arm64-RemoteCode.dmg"),
+                      "the appcast must keep referencing the notarized release DMG asset")
     }
 
     func testThreadOutcomeNotificationContentMatchesLegacyActionablePhases() {
@@ -326,6 +357,14 @@ final class AppIdentityNotificationTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("scripts/package-app.sh")
+    }
+
+    private func releaseWorkflowURL() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent(".github/workflows/release-macos.yml")
     }
 
     private func waitAsync(_ desc: String, timeout: TimeInterval = 6, _ cond: @escaping () -> Bool) async {

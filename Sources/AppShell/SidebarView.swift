@@ -16,19 +16,26 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
     @Published public var privateAccountUser: PrivateAccountUser?
+    @Published public var updateAvailability: AppUpdateAvailability = .unknown
     public var draggingWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
     private var privateAccountObserver: NSObjectProtocol?
+    private let updateChecker: AppUpdateChecking?
 
-    public init(context: AppContext, router: AppCommandRouter) {
+    public init(context: AppContext, router: AppCommandRouter, updateChecker: AppUpdateChecking? = nil) {
         self.context = context
         self.router = router
+        self.updateChecker = updateChecker
+        self.updateAvailability = updateChecker?.availability ?? .unknown
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in self?.reloadPrivateAccount() }
+        }
+        self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
+            self?.updateAvailability = availability
         }
         reload()
     }
@@ -88,6 +95,33 @@ public final class SidebarViewModel: ObservableObject {
 
     public func toggleSidebar() {
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
+    }
+
+    public var showsUpdateControl: Bool {
+        updateChecker != nil
+    }
+
+    public var updateActionTitle: String {
+        switch updateAvailability {
+        case .available:
+            return "Update Available"
+        case .checking:
+            return "Checking for Updates"
+        case .upToDate:
+            return "Up to Date"
+        case .failed:
+            return "Update Check Failed"
+        case .unknown:
+            return "Check for Updates"
+        }
+    }
+
+    public var updateActionEnabled: Bool {
+        updateChecker != nil && updateAvailability != .checking
+    }
+
+    public func checkForUpdates() {
+        updateChecker?.checkForUpdates()
     }
 
     public func openWorkspaceInNewWindow(_ ws: Workspace) {
@@ -222,6 +256,15 @@ public struct SidebarRootView: View {
             Color.clear.frame(height: 44)
 
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                if vm.showsUpdateControl {
+                    Button { vm.checkForUpdates() } label: {
+                        sidebarActionRow(symbol: "arrow.down.circle", title: vm.updateActionTitle)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!vm.updateActionEnabled)
+                    .help(updateHelpText)
+                }
+
                 HStack(spacing: DS.Space.xs) {
                     Button { vm.newWorkspace() } label: {
                         sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
@@ -312,6 +355,21 @@ public struct SidebarRootView: View {
             RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                 .fill(Color.white.opacity(0.001))
         )
+    }
+
+    private var updateHelpText: String {
+        switch vm.updateAvailability {
+        case .available:
+            return "Install the available RemoteCode update"
+        case .checking:
+            return "Checking for RemoteCode updates"
+        case .upToDate:
+            return "Check again for RemoteCode updates"
+        case .failed(let message):
+            return message
+        case .unknown:
+            return "Check for RemoteCode updates"
+        }
     }
 
     private var accountFooter: some View {
@@ -521,10 +579,10 @@ public final class SidebarView: NSObject {
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
 
-    public init(context: AppContext, router: AppCommandRouter) {
+    public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
         self.router = router
-        self.viewModel = SidebarViewModel(context: context, router: router)
+        self.viewModel = SidebarViewModel(context: context, router: router, updateChecker: updater)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
         // NSHostingView is opaque by default; let the vibrancy show.

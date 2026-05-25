@@ -16,7 +16,9 @@ let package = Package(
         .library(name: "Surfaces", targets: ["Surfaces"]),
         .library(name: "DesignSystemKit", targets: ["DesignSystemKit"])
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0")
+    ],
     targets: [
         .binaryTarget(
             name: "GhosttyKit",
@@ -72,7 +74,15 @@ let package = Package(
         ),
         .executableTarget(
             name: "AppShell",
-            dependencies: ["CoreModel", "Persistence", "AgentRuntime", "SocketServer", "Surfaces", "DesignSystemKit"],
+            dependencies: [
+                "CoreModel",
+                "Persistence",
+                "AgentRuntime",
+                "SocketServer",
+                "Surfaces",
+                "DesignSystemKit",
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             path: "Sources/AppShell"
         ),
         .executableTarget(

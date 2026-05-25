@@ -670,6 +670,28 @@ final class PaneActionTests: XCTestCase {
         wait(for: [exp], timeout: 0.2)
     }
 
+    func test_sidebarUpdateControlReflectsSparkleStateAndRunsUpdaterAction() throws {
+        let (ctx, router) = try makeContext()
+        let updater = RecordingAppUpdateChecker(availability: .available)
+        let vm = SidebarViewModel(context: ctx, router: router, updateChecker: updater)
+
+        XCTAssertTrue(vm.showsUpdateControl,
+                      "the sidebar must expose the Sparkle update/check row above New Workspace when auto-update is configured")
+        XCTAssertEqual(vm.updateActionTitle, "Update Available",
+                       "a found Sparkle update must be presented as an installable update, not as a manual DMG download")
+
+        vm.checkForUpdates()
+
+        XCTAssertEqual(updater.checks, 1,
+                       "clicking the sidebar update row must route to Sparkle's updater action")
+        XCTAssertEqual(vm.updateActionTitle, "Checking for Updates",
+                       "the sidebar must reflect Sparkle progress so repeated clicks do not stack checks")
+
+        updater.availability = .upToDate
+        XCTAssertEqual(vm.updateActionTitle, "Up to Date",
+                       "Sparkle no-update feedback must stay visible instead of silently hiding the control")
+    }
+
     func test_settingsController_presentsSettingsAsModalSheet() throws {
         let (ctx, router) = try makeContext()
         _ = try router.createWorkspace(name: "settings", cwd: NSTemporaryDirectory())
@@ -786,5 +808,23 @@ final class PaneActionTests: XCTestCase {
             current = candidate.superview
         }
         return true
+    }
+}
+
+@MainActor
+private final class RecordingAppUpdateChecker: AppUpdateChecking {
+    var availability: AppUpdateAvailability {
+        didSet { onAvailabilityChanged?(availability) }
+    }
+    var onAvailabilityChanged: ((AppUpdateAvailability) -> Void)?
+    private(set) var checks = 0
+
+    init(availability: AppUpdateAvailability) {
+        self.availability = availability
+    }
+
+    func checkForUpdates() {
+        checks += 1
+        availability = .checking
     }
 }

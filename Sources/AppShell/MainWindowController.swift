@@ -174,10 +174,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var workspaceWindows: [WorkspaceID: WorkspaceWindowController] = [:]
     private var detachedWorkspaceIDs: Set<WorkspaceID> = []
 
-    public init(context: AppContext, router: AppCommandRouter) {
+    public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
         self.router = router
-        self.sidebar = SidebarView(context: context, router: router)
+        self.sidebar = SidebarView(context: context, router: router, updater: updater)
         self.sidebarWidth = Self.storedSidebarWidth(context: context)
 
         let style: NSWindow.StyleMask = [.titled, .resizable, .closable, .miniaturizable]

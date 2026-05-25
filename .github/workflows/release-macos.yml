@@ -11,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   stable-macos-arm64-dmg:
@@ -87,6 +89,9 @@ jobs:
         env:
           RC2_VERSION: ${{ steps.release.outputs.version }}
           RC2_DMG_NAME: ${{ env.ASSET_NAME }}
+          RC2_REQUIRE_SPARKLE_KEY: "1"
+          RC2_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+          RC2_SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
         run: |
           test "$(uname -m)" = "arm64"
           scripts/package-dmg.sh
@@ -117,3 +122,61 @@ jobs:
           gh release upload "${{ steps.release.outputs.tag }}" "dist/$ASSET_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+
+      - name: Generate Sparkle appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SPARKLE_PRIVATE_KEY" ]; then
+            echo "Missing Sparkle private key secret"
+            exit 1
+          fi
+          SPARKLE_TOOLS=".build/artifacts/sparkle/Sparkle/bin"
+          SIGN_UPDATE="$SPARKLE_TOOLS/sign_update"
+          if [ ! -x "$SIGN_UPDATE" ]; then
+            echo "Sparkle sign_update tool not found at $SIGN_UPDATE"
+            exit 1
+          fi
+          KEY_FILE="$RUNNER_TEMP/sparkle_ed_private_key"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
+          SIGNATURE="$("$SIGN_UPDATE" --ed-key-file "$KEY_FILE" "dist/$ASSET_NAME")"
+          DMG_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.release.outputs.tag }}/$ASSET_NAME"
+          mkdir -p dist/pages
+          cat > dist/pages/appcast.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>RemoteCode Updates</title>
+              <link>https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml</link>
+              <description>RemoteCode macOS updates</description>
+              <item>
+                <title>RemoteCode ${{ steps.release.outputs.version }}</title>
+                <sparkle:version>${{ steps.release.outputs.version }}</sparkle:version>
+                <sparkle:shortVersionString>${{ steps.release.outputs.version }}</sparkle:shortVersionString>
+                <pubDate>$(date -Ru)</pubDate>
+                <enclosure url="$DMG_URL" type="application/x-apple-diskimage" $SIGNATURE />
+              </item>
+            </channel>
+          </rss>
+          EOF
+          grep -F "sparkle:edSignature" dist/pages/appcast.xml
+          grep -F "$ASSET_NAME" dist/pages/appcast.xml
+
+      - name: Upload Sparkle appcast to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.release.outputs.tag }}" "dist/pages/appcast.xml" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Sparkle appcast pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/pages
+
+      - name: Deploy Sparkle appcast to GitHub Pages
+        uses: actions/deploy-pages@v4

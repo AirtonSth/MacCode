@@ -22,6 +22,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let bonjourDelegate = BonjourDelegate()
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
+    public var updater: AppUpdateChecking?
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
@@ -68,7 +69,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
         }
-        windowController = MainWindowController(context: context, router: router)
+        updater = SparkleAppUpdater.defaultIfConfigured()
+        windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
         // Rebuild Surface objects from restored layout descriptors, then
         // refresh so the restored workspaces + tabs actually render
