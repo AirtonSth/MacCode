@@ -253,11 +253,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         let numTurns = snapshot.completedTurnIds.distance(from: targetIndex, to: snapshot.completedTurnIds.endIndex) - 1
         guard numTurns > 0 else { return }
+        let client = snapshot.client
+        let providerThreadId = snapshot.providerThreadId
         let semaphore = DispatchSemaphore(value: 0)
         let box = LockedResult<CodexAppServerClient.JSONObject>()
         Task {
             do {
-                let response = try await snapshot.client.rollbackThread(providerThreadId: snapshot.providerThreadId, numTurns: numTurns)
+                let response = try await client.rollbackThread(providerThreadId: providerThreadId, numTurns: numTurns)
                 box.set(.success(response))
             } catch {
                 box.set(.failure(error))
