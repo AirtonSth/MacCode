@@ -173,4 +173,44 @@ final class CellularDataOptimizationTests: XCTestCase {
         XCTAssertEqual(payload?["rows"], .number(34))
         XCTAssertEqual(payload?["cols"], .number(120))
     }
+
+    func testCellularWebSocketBatcherCoalescesTerminalSummariesPerSurface() {
+        let sent = LockedStrings()
+        let batcher = WebSocketEventBatcher(enabled: true, filter: .cellularSafe, delay: 10) { data in
+            sent.append(String(decoding: data, as: UTF8.self))
+        }
+
+        batcher.enqueue(event: EventBus.Event(seq: 1, kind: "surface.output.summary", payload: .object([
+            "surface_id": .string("terminal-1"),
+            "seq": .number(1)
+        ]), ts: 0), data: Data("old-terminal-1".utf8))
+        batcher.enqueue(event: EventBus.Event(seq: 2, kind: "surface.output.summary", payload: .object([
+            "surface_id": .string("terminal-1"),
+            "seq": .number(2)
+        ]), ts: 0), data: Data("new-terminal-1".utf8))
+        batcher.enqueue(event: EventBus.Event(seq: 3, kind: "agent.run.completed", payload: .object([
+            "thread_id": .string("thread-1")
+        ]), ts: 0), data: Data("critical".utf8))
+        batcher.flush()
+
+        XCTAssertEqual(sent.values, ["new-terminal-1", "critical"],
+                       "on cellular WS, repeated terminal summaries for the same surface should collapse to the newest frame before critical events are sent")
+    }
+}
+
+private final class LockedStrings: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ value: String) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
+    }
 }

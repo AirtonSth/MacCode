@@ -209,6 +209,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     shutdown(fd, SHUT_RDWR)
                 }
             )
+            let batcher = WebSocketEventBatcher(enabled: wsFilter == .cellularSafe,
+                                                filter: wsFilter) { data in
+                _ = outbound.enqueue(data)
+            }
             let id = EventBus.shared.subscribe(since: 0, filter: wsFilter) { ev in
                 let obj: [String: Any] = [
                     "seq": ev.seq,
@@ -217,7 +221,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     "payload": Self.jsonValueToAny(ev.payload)
                 ]
                 guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
-                _ = outbound.enqueue(data)
+                batcher.enqueue(event: ev, data: data)
             }
             subIDBox.value = id
             subID = id

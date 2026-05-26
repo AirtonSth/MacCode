@@ -176,6 +176,14 @@ public enum EventStreamFilter: Sendable, Equatable {
         map(event) != nil
     }
 
+    public func coalescingKey(for event: EventBus.Event) -> String? {
+        guard self == .cellularSafe else { return nil }
+        guard case .object(let payload) = event.payload else { return nil }
+        guard event.kind == "surface.output.summary",
+              let surfaceID = payload["surface_id"]?.stringValue else { return nil }
+        return "\(event.kind):\(surfaceID)"
+    }
+
     public func map(_ event: EventBus.Event) -> EventBus.Event? {
         switch self {
         case .full:
