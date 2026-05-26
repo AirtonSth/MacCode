@@ -240,19 +240,18 @@ public final class AppContext {
         // HC-1: stream terminal/surface PTY output to the mirror so iOS
         // renders a live terminal (not a poll). Raw bytes, base64 +
         // monotonic seq per surface for ordered incremental rendering.
-        let surfaceSeqLock = NSLock()
-        var surfaceSeq: [String: Int] = [:]
-        SurfaceOutputBus.shared.sink = { sid, chunk in
+        SurfaceOutputBus.shared.sink = { sid, seq, chunk in
             let key = sid.value.uuidString
-            surfaceSeqLock.lock()
-            let s = (surfaceSeq[key] ?? 0) + 1
-            surfaceSeq[key] = s
-            surfaceSeqLock.unlock()
-            EventBus.shared.publish(kind: "surface.output", payload: .object([
+            var payload: [String: JSONValue] = [
                 "surface_id": .string(key),
-                "seq": .number(Double(s)),
+                "seq": .number(Double(seq)),
                 "base64": .string(chunk.base64EncodedString())
-            ]))
+            ]
+            if let terminal = SurfaceRegistry.shared.surface(sid) as? TerminalSurface {
+                payload["rows"] = .number(Double(terminal.viewportSize.rows))
+                payload["cols"] = .number(Double(terminal.viewportSize.cols))
+            }
+            EventBus.shared.publish(kind: "surface.output", payload: .object(payload))
         }
         SurfaceRuntimeBus.shared.sink = { sid, health in
             EventBus.shared.publish(kind: "surface.health", payload: .object([
@@ -268,7 +267,9 @@ public final class AppContext {
                 "last_output_at": health.lastOutputAt.map { .number($0.timeIntervalSince1970) } ?? .null,
                 "output_partial": .bool(health.outputPartial),
                 "output_pending_bytes": .number(Double(health.outputPendingBytes)),
-                "history_write_failures": .number(Double(health.historyWriteFailures))
+                "history_write_failures": .number(Double(health.historyWriteFailures)),
+                "rows": .number(Double(health.rows)),
+                "cols": .number(Double(health.cols))
             ]))
         }
 

@@ -21,6 +21,8 @@ public struct TerminalRuntimeHealth: Sendable, Equatable {
     public var outputPartial: Bool
     public var outputPendingBytes: Int
     public var historyWriteFailures: Int
+    public var rows: Int
+    public var cols: Int
 
     public var alive: Bool {
         processAlive && ptyOpen && terminalDeadReason == nil
@@ -34,6 +36,8 @@ public struct TerminalTextSnapshot: Sendable, Equatable {
     public var timestamp: Date
     public var partialReason: String?
     public var pendingBytes: Int
+    public var rows: Int
+    public var cols: Int
 }
 
 struct TerminalStartupEnvironment: Equatable {

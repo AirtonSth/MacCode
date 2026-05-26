@@ -8,6 +8,7 @@ final class HTTPPairingTests: XCTestCase {
     final class FakeAuth: DirectAuthProvider {
         var devices: [(String, String)] = []
         var autoApprove = true
+        var lastPrivateAccountAccessToken: String?
         private var requests: [String: (code: String, status: String, token: String?, deviceId: String?)] = [:]
 
         func verify(token: String) -> Bool { token == "valid-token" }
@@ -18,6 +19,10 @@ final class HTTPPairingTests: XCTestCase {
             return ("dev-1", "valid-token")
         }
         func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? {
+            createPairingRequest(deviceName: deviceName, privateAccountAccessToken: nil)
+        }
+        func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
+            lastPrivateAccountAccessToken = privateAccountAccessToken
             let id = "req-1", code = "424242"
             requests[id] = (code, "pending", nil, nil)
             return (id, code)
@@ -115,6 +120,7 @@ final class HTTPPairingTests: XCTestCase {
         let pair = post("\(base)/v1/pair", ["device_name": "phone"])
         let rid = try XCTUnwrap(pair?["request_id"] as? String)
         XCTAssertEqual(pair?["code"] as? String, "424242")
+        XCTAssertNil(auth.lastPrivateAccountAccessToken)
 
         let s1 = post("\(base)/v1/pair/status", ["request_id": rid])
         XCTAssertEqual(s1?["status"] as? String, "approved")
@@ -124,6 +130,26 @@ final class HTTPPairingTests: XCTestCase {
         let s2 = post("\(base)/v1/pair/status", ["request_id": rid])
         XCTAssertEqual(s2?["status"] as? String, "approved")
         XCTAssertNil(s2?["token"])
+    }
+
+    @MainActor
+    func test_pairRequestPassesPrivateAccountTokenToAuthProvider() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth()
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)
+
+        let pair = post("\(base)/v1/pair", [
+            "device_name": "phone",
+            "private_account_access_token": "ios-private-token"
+        ])
+
+        XCTAssertEqual(pair?["code"] as? String, "424242")
+        XCTAssertEqual(auth.lastPrivateAccountAccessToken, "ios-private-token",
+                       "the Mac HTTP pairing endpoint must pass the iOS private account proof into the auth provider before deciding whether to prompt")
     }
 
     @MainActor

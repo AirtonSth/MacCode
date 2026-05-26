@@ -117,7 +117,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "CoreModel", "Persistence", "Surfaces"],
+            dependencies: ["AppShell", "CoreModel", "Persistence", "SocketServer", "Surfaces"],
             path: "Tests/AppShellTests"
         )
     ],

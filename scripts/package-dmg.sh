@@ -8,6 +8,8 @@ ASSET_NAME="${RC2_DMG_NAME:-stable-macos-arm64-RemoteCode.dmg}"
 DIST="dist"
 APP_NAME="RemoteCode.app"
 DMG_ROOT="$DIST/dmg-root"
+DMG_BUILD_ROOT="$DIST/dmg-build"
+DMG_BUILD_APP="$DMG_BUILD_ROOT/$APP_NAME"
 OUTPUT="$DIST/$ASSET_NAME"
 SIGN_IDENTITY="${RC2_CODESIGN_IDENTITY:-}"
 BACKGROUND_DIR="$DMG_ROOT/background"
@@ -19,13 +21,14 @@ if [[ "$SIGN_IDENTITY" != Developer\ ID\ Application:* ]]; then
   exit 1
 fi
 
-"$(dirname "$0")/package-app.sh"
+rm -rf "$DMG_BUILD_ROOT"
+RC2_PACKAGE_APP_OUTPUT="$DMG_BUILD_APP" "$(dirname "$0")/package-app.sh"
 
 rm -rf "$DMG_ROOT" "$OUTPUT"
 mkdir -p "$DMG_ROOT"
 mkdir -p "$BACKGROUND_DIR"
 
-cp -R "$DIST/$APP_NAME" "$DMG_ROOT/$APP_NAME"
+cp -R "$DMG_BUILD_APP" "$DMG_ROOT/$APP_NAME"
 ln -s /Applications "$DMG_ROOT/Applications"
 "$(dirname "$0")/generate-dmg-background.swift" "$BACKGROUND_IMAGE"
 chflags hidden "$BACKGROUND_DIR" 2>/dev/null || true
@@ -91,6 +94,6 @@ hdiutil convert "$RW_DMG" \
 codesign --force --sign "$SIGN_IDENTITY" "$OUTPUT"
 codesign --verify --verbose=4 "$OUTPUT"
 
-rm -rf "$DMG_ROOT" "$RW_DMG"
+rm -rf "$DMG_ROOT" "$DMG_BUILD_ROOT" "$RW_DMG"
 
 echo "[package] dmg ready at $OUTPUT"

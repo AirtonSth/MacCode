@@ -7,9 +7,11 @@ final class SurfaceOutputBusTests: XCTestCase {
         let surfaceID = SurfaceID()
         let delivered = expectation(description: "batched terminal output delivered")
         var chunks: [String] = []
+        var seqs: [Int] = []
 
-        bus.sink = { id, data in
+        bus.sink = { id, seq, data in
             guard id == surfaceID else { return }
+            seqs.append(seq)
             chunks.append(String(decoding: data, as: UTF8.self))
             delivered.fulfill()
         }
@@ -24,5 +26,7 @@ final class SurfaceOutputBusTests: XCTestCase {
         )
         wait(for: [delivered], timeout: 1.0)
         XCTAssertEqual(chunks, ["long command output"])
+        XCTAssertEqual(seqs, [1],
+                       "batched terminal output must publish one monotonic per-surface seq per delivered mirror chunk")
     }
 }

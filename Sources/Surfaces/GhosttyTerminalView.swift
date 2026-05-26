@@ -363,6 +363,8 @@ final class GhosttyTerminalView: NSView {
     private var outputFlushScheduled = false
     private var lastPixelSize = NSSize(width: 0, height: 0)
     private var lastScale = NSSize(width: 0, height: 0)
+    private var renderGeneration = 0
+    private var visibleInUI = true
 
     private static let immediateOutputFlushBytes = 64 * 1024
     private static let maxPendingOutputBytes = 1024 * 1024
@@ -405,6 +407,9 @@ final class GhosttyTerminalView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if window == nil {
+            renderGeneration &+= 1
+        }
         ensureSurface()
         updateGhosttySize(force: true)
         updateFocus()
@@ -421,6 +426,7 @@ final class GhosttyTerminalView: NSView {
     }
 
     func closeSurface() {
+        renderGeneration &+= 1
         if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
         }
@@ -433,14 +439,21 @@ final class GhosttyTerminalView: NSView {
         processOutput(data)
     }
 
-    func processOutput(_ data: Data) {
+    func processOutput(_ data: Data, render: Bool = true) {
         guard !data.isEmpty else { return }
+        if !render {
+            if let surface = surfaceSlot.liveSurface() {
+                processOutputImmediately(data, to: surface, render: false)
+            }
+            return
+        }
+        guard isRenderable else { return }
         appendPendingOutput(data)
         guard let surface = surfaceSlot.liveSurface() else {
             return
         }
         if pendingOutput.count >= Self.immediateOutputFlushBytes {
-            flushPendingOutput(to: surface)
+            flushPendingOutput(to: surface, render: true)
         } else {
             scheduleOutputFlush()
         }
@@ -456,22 +469,29 @@ final class GhosttyTerminalView: NSView {
     private func scheduleOutputFlush() {
         guard !outputFlushScheduled else { return }
         outputFlushScheduled = true
+        let generation = renderGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.outputFlushDelay) { [weak self] in
-            self?.flushPendingOutput()
+            guard let self, generation == self.renderGeneration else { return }
+            self.flushPendingOutput()
         }
     }
 
     private func flushPendingOutput() {
         outputFlushScheduled = false
+        guard isRenderable else { return }
         ensureSurface()
         guard let surface = surfaceSlot.liveSurface() else { return }
-        flushPendingOutput(to: surface)
+        flushPendingOutput(to: surface, render: true)
     }
 
-    private func flushPendingOutput(to surface: ghostty_surface_t) {
+    private func flushPendingOutput(to surface: ghostty_surface_t, render: Bool) {
         guard !pendingOutput.isEmpty else { return }
         let output = pendingOutput
         pendingOutput.removeAll(keepingCapacity: true)
+        processOutputImmediately(output, to: surface, render: render)
+    }
+
+    private func processOutputImmediately(_ output: Data, to surface: ghostty_surface_t, render: Bool) {
         output.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             ghostty_surface_process_output(
@@ -480,6 +500,7 @@ final class GhosttyTerminalView: NSView {
                 UInt(raw.count)
             )
         }
+        guard render, isRenderable else { return }
         ghostty_surface_render_now(surface)
         ghostty_surface_refresh(surface)
     }
@@ -489,6 +510,7 @@ final class GhosttyTerminalView: NSView {
     }
 
     func forceRefresh() {
+        guard isRenderable else { return }
         ensureSurface()
         updateGhosttySize(force: true)
         flushPendingOutput()
@@ -498,6 +520,26 @@ final class GhosttyTerminalView: NSView {
         }
     }
 
+    func refreshSurfaceOnly() {
+        guard isRenderable else { return }
+        ensureSurface()
+        let refreshedByResize = updateGhosttySize(force: true)
+        guard !refreshedByResize else { return }
+        if let surface = surfaceSlot.liveSurface() {
+            ghostty_surface_refresh(surface)
+        }
+    }
+
+    func setOcclusion(visible: Bool) {
+        visibleInUI = visible
+        if !visible {
+            renderGeneration &+= 1
+            pendingOutput.removeAll(keepingCapacity: false)
+        }
+        guard let surface = surfaceSlot.liveSurface() else { return }
+        ghostty_surface_set_occlusion(surface, visible)
+    }
+
     func readViewportText() -> String? {
         readText(pointTag: GHOSTTY_POINT_VIEWPORT)
     }
@@ -505,8 +547,10 @@ final class GhosttyTerminalView: NSView {
     private func readText(pointTag: ghostty_point_tag_e) -> String? {
         ensureSurface()
         guard let surface = surfaceSlot.liveSurface() else { return nil }
-        flushPendingOutput(to: surface)
-        ghostty_surface_render_now(surface)
+        flushPendingOutput(to: surface, render: isRenderable)
+        if isRenderable {
+            ghostty_surface_render_now(surface)
+        }
 
         let topLeft = ghostty_point_s(
             tag: pointTag,
@@ -577,8 +621,14 @@ final class GhosttyTerminalView: NSView {
         ghostty_surface_set_display_id(created, displayID)
         updateGhosttySize(force: true)
         updateFocus()
-        flushPendingOutput(to: created)
-        ghostty_surface_refresh(created)
+        flushPendingOutput(to: created, render: isRenderable)
+        if visibleInUI {
+            ghostty_surface_refresh(created)
+        }
+    }
+
+    private var isRenderable: Bool {
+        visibleInUI && window != nil && bounds.width > 0 && bounds.height > 0 && !isHidden
     }
 
     private static func hasActiveDisplay() -> Bool {
@@ -625,7 +675,9 @@ final class GhosttyTerminalView: NSView {
         let rows = max(1, Int(size.rows))
         let cols = max(1, Int(size.columns))
         onTerminalSizeChange?(TerminalViewportSize(rows: rows, cols: cols))
-        ghostty_surface_refresh(surface)
+        if visibleInUI {
+            ghostty_surface_refresh(surface)
+        }
         return true
     }
 

@@ -232,9 +232,7 @@ public final class SidebarViewModel: ObservableObject {
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        for id in ids {
-            try? router?.closeWorkspace(id)
-        }
+        try? router?.closeWorkspaces(Array(ids))
         selectedWorkspaceIDs.removeAll()
         selectionAnchorID = nil
         reload()

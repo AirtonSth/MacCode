@@ -195,6 +195,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         win.titlebarAppearsTransparent = true
         win.titleVisibility = .hidden
         win.isMovableByWindowBackground = false
+        win.collectionBehavior.insert(.moveToActiveSpace)
         win.minSize = NSSize(width: 900, height: 600)
         self.window = win
 
@@ -305,6 +306,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     public func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
         window.makeKeyAndOrderFront(nil)
     }
 

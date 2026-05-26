@@ -135,9 +135,11 @@ public struct LayoutReducer {
         case .closeWorkspace(let wid):
             guard next.workspaces[wid] != nil else { throw LayoutError.workspaceNotFound }
             next.workspaces.removeValue(forKey: wid)
-            next.window.workspaces.removeAll { $0 == wid }
-            if next.window.selectedWorkspaceID == wid {
-                next.window.selectedWorkspaceID = next.window.workspaces.first
+            for index in next.windows.indices {
+                next.windows[index].workspaces.removeAll { $0 == wid }
+                if next.windows[index].selectedWorkspaceID == wid {
+                    next.windows[index].selectedWorkspaceID = next.windows[index].workspaces.first
+                }
             }
             return next
         case .selectWorkspace(let wid):

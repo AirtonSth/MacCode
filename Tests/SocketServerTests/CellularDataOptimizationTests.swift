@@ -139,7 +139,13 @@ final class CellularDataOptimizationTests: XCTestCase {
         _ = bus.subscribe(since: nil, filter: .cellularSafe) { filtered.append($0.kind) }
 
         bus.publish(kind: "diagnostic.tick", payload: .object(["sample": .string(String(repeating: "x", count: 200))]))
-        bus.publish(kind: "surface.output", payload: .object(["surface_id": .string("s1"), "base64": .string(Data(String(repeating: "log ", count: 200).utf8).base64EncodedString())]))
+        bus.publish(kind: "surface.output", payload: .object([
+            "surface_id": .string("s1"),
+            "seq": .number(7),
+            "rows": .number(33),
+            "cols": .number(101),
+            "base64": .string(Data(String(repeating: "log ", count: 200).utf8).base64EncodedString())
+        ]))
         bus.publish(kind: "surface.browser", payload: .object(["surface_id": .string("s1"), "url": .string("https://example.test")]))
         bus.publish(kind: "agent.run.completed", payload: .object(["thread_id": .string("t1")]))
 
@@ -147,5 +153,24 @@ final class CellularDataOptimizationTests: XCTestCase {
                        "old/unfiltered clients must keep receiving the full stream")
         XCTAssertEqual(filtered, ["surface.output.summary", "surface.browser", "agent.run.completed"],
                        "cellular-safe WS filtering may summarize passive terminal output and drop diagnostics while visible state and critical events pass")
+    }
+
+    func testCellularSafeOutputSummaryKeepsSeqAndGeometry() {
+        let source = EventBus.Event(seq: 1, kind: "surface.output", payload: .object([
+            "surface_id": .string("s1"),
+            "seq": .number(42),
+            "rows": .number(34),
+            "cols": .number(120),
+            "base64": .string(Data("abc".utf8).base64EncodedString())
+        ]), ts: 0)
+
+        let mapped = EventStreamFilter.cellularSafe.map(source)
+        let payload = mapped?.payload.objectValue
+
+        XCTAssertEqual(mapped?.kind, "surface.output.summary")
+        XCTAssertEqual(payload?["seq"], .number(42),
+                       "summarized terminal output must keep per-surface seq so iOS knows whether read_history caught up")
+        XCTAssertEqual(payload?["rows"], .number(34))
+        XCTAssertEqual(payload?["cols"], .number(120))
     }
 }

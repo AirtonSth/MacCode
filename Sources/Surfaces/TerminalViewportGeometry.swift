@@ -1,9 +1,14 @@
 import AppKit
 import Foundation
 
-struct TerminalViewportSize: Equatable {
-    let rows: Int
-    let cols: Int
+public struct TerminalViewportSize: Equatable, Sendable {
+    public let rows: Int
+    public let cols: Int
+
+    public init(rows: Int, cols: Int) {
+        self.rows = rows
+        self.cols = cols
+    }
 }
 
 enum TerminalViewportGeometry {

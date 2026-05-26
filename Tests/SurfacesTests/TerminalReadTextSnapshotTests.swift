@@ -18,4 +18,12 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
         XCTAssertFalse(TerminalSurface.shouldPreferRendererSnapshotForReadText(viewportText: viewport, rendererText: renderer),
                        "TUI-like multiline viewport text must stay host-owned instead of being replaced by older renderer scrollback")
     }
+
+    func test_readTextSnapshotStaysPartialWhenHiddenOutputIsPending() {
+        XCTAssertFalse(TerminalSurface.readTextComplete(outputPartial: false, outputPendingBytes: 42, historyWriteFailures: 0),
+                       "surface.read_text must stay incomplete while hidden terminal bytes have not completed their visible drain")
+        XCTAssertEqual(TerminalSurface.readTextPartialReason(outputPartial: false, outputPendingBytes: 42, historyWriteFailures: 0),
+                       "hidden_output_pending")
+    }
+
 }

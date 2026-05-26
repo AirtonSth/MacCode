@@ -16,6 +16,8 @@ struct RemoteCodeMain {
         let delegate = AppDelegate(channel: channel, appSupportOverride: appSupportOverride, dbOverride: dbOverride)
         app.delegate = delegate
         app.activate(ignoringOtherApps: true)
-        app.run()
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
     }
 }

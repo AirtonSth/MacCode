@@ -68,6 +68,55 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
     }
 
+    func test_modelChangeIsBlockedAfterConversationStarts() throws {
+        let (vm, repo) = try makeVM()
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex),
+            AgentModelDescriptor(id: "gpt-5.6", label: "GPT-5.6", provider: .codex)
+        ]
+        vm.createThread(title: "locked model")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        vm.setModel("gpt-5.5")
+        vm.messages.append(AgentMessage(threadId: id, role: .user, content: "first turn"))
+
+        vm.setModel("gpt-5.6")
+
+        XCTAssertEqual(vm.model, "gpt-5.5",
+                       "model changes after the first message must be blocked so resumed provider threads do not fork model state silently")
+        XCTAssertEqual(try repo.get(id: id)?.model, "gpt-5.5",
+                       "a locked model change must not persist to the thread configuration")
+    }
+
+    func test_modelListLoadingAndRetryStateIsVisible() async throws {
+        let (vm, _) = try makeVM()
+        vm.modelListLoader = { _ in
+            try await Task.sleep(nanoseconds: 20_000_000)
+            return []
+        }
+
+        let load = Task { await vm.loadModels() }
+        await waitAsync("model list loading state becomes visible") {
+            vm.modelListLoading == true && vm.modelListStatusMessage == "Loading models..."
+        }
+        await load.value
+
+        XCTAssertEqual(vm.modelListStatusMessage, "No models returned for Codex. Retry from the model menu.",
+                       "an empty model list must leave visible retry guidance instead of a silent Default-only picker")
+        XCTAssertFalse(vm.modelListLoading)
+    }
+
+    func test_modelSnapshotFailureFailsLoud() async throws {
+        let (vm, _) = try makeVM()
+        struct SnapshotFailure: Error {}
+        vm.providerSnapshotLoader = { throw SnapshotFailure() }
+
+        await vm.loadProviderSnapshots()
+
+        XCTAssertEqual(vm.providerSnapshotStatusMessage, "Provider snapshot failed. Retry from the model menu.",
+                       "provider/model snapshot fetch failures must be visible so the user can distinguish stale local models from a loaded provider list")
+        XCTAssertTrue(vm.providerSnapshots.isEmpty)
+    }
+
     func test_executionModeControlsPersistBeforeConversationAndLockAfterStart() throws {
         let (vm, repo) = try makeVM()
         vm.gitBranch = "main"

@@ -194,13 +194,23 @@ public enum EventStreamFilter: Sendable, Equatable {
         guard case .object(let payload) = event.payload,
               let surfaceID = payload["surface_id"] else { return nil }
         let base64Bytes = payload["base64"]?.stringValue?.utf8.count ?? 0
+        var summary: [String: JSONValue] = [
+            "surface_id": surfaceID,
+            "partial": .bool(true),
+            "encoded_bytes": .number(Double(base64Bytes))
+        ]
+        if let seq = payload["seq"] {
+            summary["seq"] = seq
+        }
+        if let rows = payload["rows"] {
+            summary["rows"] = rows
+        }
+        if let cols = payload["cols"] {
+            summary["cols"] = cols
+        }
         return EventBus.Event(seq: event.seq,
                               kind: "surface.output.summary",
-                              payload: .object([
-                                  "surface_id": surfaceID,
-                                  "partial": .bool(true),
-                                  "encoded_bytes": .number(Double(base64Bytes))
-                              ]),
+                              payload: .object(summary),
                               ts: event.ts)
     }
 }

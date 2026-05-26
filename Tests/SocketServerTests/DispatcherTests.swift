@@ -23,7 +23,7 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
         return ws
     }
     func selectWorkspace(_ id: WorkspaceID) throws { window.selectedWorkspaceID = id }
-    func closeWorkspace(_ id: WorkspaceID) throws { workspaces.removeAll { $0.id == id } }
+    func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws { workspaces.removeAll { $0.id == id } }
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {}
     func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws {}
     func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {}

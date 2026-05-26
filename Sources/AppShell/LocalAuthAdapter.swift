@@ -11,7 +11,16 @@ public struct PairingPrompt: Sendable {
 
 public final class LocalAuthAdapter: DirectAuthProvider {
     let repo: DeviceTrustRepository
-    public init(repo: DeviceTrustRepository) { self.repo = repo }
+    private let privateAccountStore: PrivateAccountSessionStore?
+    private let privateAccountAPI: PrivateAccountAPI
+
+    public init(repo: DeviceTrustRepository,
+                privateAccountStore: PrivateAccountSessionStore? = nil,
+                privateAccountAPI: PrivateAccountAPI = URLSessionPrivateAccountAPI()) {
+        self.repo = repo
+        self.privateAccountStore = privateAccountStore
+        self.privateAccountAPI = privateAccountAPI
+    }
 
     /// Set by AppDelegate. Invoked (off the main thread) when a device
     /// asks to pair; the closure hops to main and shows the modal.
@@ -28,10 +37,38 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     }
 
     public func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? {
+        createPairingRequest(deviceName: deviceName, privateAccountAccessToken: nil)
+    }
+
+    public func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
         guard let req = try? repo.createPairingRequest(deviceName: deviceName) else { return nil }
         try? repo.audit(actor: "device", action: "pairing.request", detail: deviceName)
+        if canAutoApprovePairing(privateAccountAccessToken: privateAccountAccessToken) {
+            approvePairingRequest(req.id)
+            try? repo.audit(actor: "account", action: "pairing.auto_approve", detail: deviceName)
+            return (req.id, req.code)
+        }
         onPairingRequest?(PairingPrompt(requestId: req.id, code: req.code, deviceName: deviceName))
         return (req.id, req.code)
+    }
+
+    private func canAutoApprovePairing(privateAccountAccessToken: String?) -> Bool {
+        guard let privateAccountAccessToken,
+              let localSession = privateAccountStore?.load(),
+              localSession.user.subscribed else { return false }
+
+        let sema = DispatchSemaphore(value: 0)
+        let box = LockedAccountVerificationBox()
+        let api = privateAccountAPI
+        Task.detached {
+            let remoteUser = try? await api.currentUser(accessToken: privateAccountAccessToken)
+            box.value = remoteUser?.subscribed == true
+                && remoteUser?.id == localSession.user.id
+                && remoteUser?.email.lowercased() == localSession.user.email.lowercased()
+            sema.signal()
+        }
+        if sema.wait(timeout: .now() + 8) == .timedOut { return false }
+        return box.value
     }
 
     /// Called from the Mac modal's Approve button.
@@ -92,5 +129,15 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     public func revokeDevice(_ id: String) {
         try? repo.revoke(id: id)
         try? repo.audit(actor: "system", action: "device.revoke", detail: id)
+    }
+}
+
+private final class LockedAccountVerificationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return storage }
+        set { lock.lock(); storage = newValue; lock.unlock() }
     }
 }

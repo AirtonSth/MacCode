@@ -254,14 +254,33 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     }
 
     public func selectWorkspace(_ id: WorkspaceID) throws {
+        if context?.state.window.selectedWorkspaceID == id {
+            return
+        }
         try context?.apply(.selectWorkspace(id))
         windowController?.refreshFromState()
         applySurfaceVisibility()
     }
 
-    public func closeWorkspace(_ id: WorkspaceID) throws {
+    public func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
         try context?.apply(.closeWorkspace(id))
         windowController?.refreshFromState()
+        if publishEvent {
+            publishWorkspaceClosed(id)
+        }
+    }
+
+    public func closeWorkspaces(_ ids: [WorkspaceID]) throws {
+        guard let ctx = context else { throw NSError(domain: "rc2", code: 0) }
+        var seen: Set<WorkspaceID> = []
+        let uniqueIds = ids.filter { seen.insert($0).inserted }
+        guard !uniqueIds.isEmpty else { return }
+        guard uniqueIds.allSatisfy({ ctx.state.workspaces[$0] != nil }) else { throw LayoutError.workspaceNotFound }
+        for id in uniqueIds {
+            try ctx.apply(.closeWorkspace(id))
+        }
+        windowController?.refreshFromState()
+        uniqueIds.forEach(publishWorkspaceClosed)
     }
 
     public func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {
@@ -277,6 +296,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {
         try context?.apply(.setWorkspaceColor(id, color))
         windowController?.refreshFromState()
+    }
+
+    private func publishWorkspaceClosed(_ id: WorkspaceID) {
+        EventBus.shared.publish(kind: "workspace.closed", payload: .object([
+            "workspace_id": .string(id.value.uuidString)
+        ]))
     }
 
     public func setWorkspacePinned(_ id: WorkspaceID, _ pinned: Bool) throws {
@@ -334,6 +359,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     }
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
+        if let ws = context?.state.workspaces[workspace],
+           let paneID = ws.layout.paneIDs().first(where: { paneID in
+               ws.layout.find(paneID: paneID)?.surfaces.contains(where: { $0.id == surface }) == true
+           }),
+           ws.focusedPaneID == paneID,
+           ws.layout.find(paneID: paneID)?.selectedSurfaceID == surface {
+            windowController?.focusSurface(surface)
+            return
+        }
         try context?.apply(.focusSurface(workspace, surface))
         // Rebuild the pane so the newly selected tab's surface actually
         // becomes the visible content (the custom tab strip has no
@@ -2221,7 +2255,9 @@ private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
         "last_output_at": health.lastOutputAt.map { .number($0.timeIntervalSince1970) } ?? .null,
         "output_partial": .bool(health.outputPartial),
         "output_pending_bytes": .number(Double(health.outputPendingBytes)),
-        "history_write_failures": .number(Double(health.historyWriteFailures))
+        "history_write_failures": .number(Double(health.historyWriteFailures)),
+        "rows": .number(Double(health.rows)),
+        "cols": .number(Double(health.cols))
     ])
 }
 
@@ -2233,6 +2269,8 @@ private func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue
         "source": .string(snapshot.source),
         "timestamp": .number(snapshot.timestamp.timeIntervalSince1970),
         "partial_reason": snapshot.partialReason.map { .string($0) } ?? .null,
-        "pending_bytes": .number(Double(snapshot.pendingBytes))
+        "pending_bytes": .number(Double(snapshot.pendingBytes)),
+        "rows": .number(Double(snapshot.rows)),
+        "cols": .number(Double(snapshot.cols))
     ])
 }

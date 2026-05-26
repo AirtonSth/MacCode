@@ -833,6 +833,33 @@ final class FakeRunnerTests: XCTestCase {
                        "stopping a recovered live provider session must not leave a pending cancellation for the next run")
     }
 
+    func test_coordinatorIgnoresStopForAlreadyStoppedThreadWithoutLiveSession() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-stop-stale-no-session-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "stale stop", provider: .claude, model: "claude-opus-4-7", status: .cancelled)
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .claude, finishImmediately: false)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerAdapters: [.claude: adapter])
+
+        coordinator.stopRun(threadId: thread.id)
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
+                                                           provider: .claude,
+                                                           model: "claude-opus-4-7",
+                                                           cwd: tmp,
+                                                           prompt: "restart after stale stop"))
+
+        XCTAssertEqual(adapter.sendTurnCount, 1,
+                       "the next run must still start on an already-stopped thread")
+        XCTAssertEqual(adapter.cancelCount, 0,
+                       "stop on an already-stopped thread must not leave a pending cancellation that auto-cancels the next run")
+    }
+
     func test_coordinatorRecoversPersistedActiveSessionBeforeInterruptingStop() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-stop-recovered-adapter-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

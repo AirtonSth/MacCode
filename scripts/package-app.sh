@@ -13,6 +13,29 @@ VERSION="${RC2_VERSION:-0.1.0}"
 SPARKLE_FEED_URL="${RC2_SPARKLE_FEED_URL:-https://github.com/samuelfaj/remotecode.io/releases/latest/download/appcast.xml}"
 SPARKLE_PUBLIC_ED_KEY="${RC2_SPARKLE_PUBLIC_ED_KEY:-}"
 
+running_bundle_pids() {
+  local exec_path="$1"
+  [ -e "$exec_path" ] || return 0
+  local abs_exec
+  abs_exec="$(cd "$(dirname "$exec_path")" && pwd -P)/$(basename "$exec_path")"
+  ps -axo pid=,command= | awk -v exec="$abs_exec" '{
+    pid = $1
+    sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0)
+    if (index($0, exec) == 1) { print pid }
+  }'
+}
+
+wait_for_bundle_exit() {
+  local exec_path="$1"
+  local pids
+  for _ in {1..20}; do
+    pids="$(running_bundle_pids "$exec_path")"
+    [ -z "$pids" ] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
 if [ -z "${DEVELOPER_DIR:-}" ] && [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
   export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
 fi
@@ -30,30 +53,64 @@ CLI="$BIN_DIR/rc2"
 SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 
-rm -rf "$DIST/$BUNDLE"
-mkdir -p "$DIST/$BUNDLE/Contents/MacOS"
-mkdir -p "$DIST/$BUNDLE/Contents/Resources"
-mkdir -p "$DIST/$BUNDLE/Contents/Frameworks"
-
-cp "$BIN" "$DIST/$BUNDLE/Contents/MacOS/RemoteCode"
-if [ -x "$CLI" ]; then
-  cp "$CLI" "$DIST/$BUNDLE/Contents/MacOS/rc2"
-fi
-if [ -d "$SURFACES_RESOURCES" ]; then
-  cp -R "$SURFACES_RESOURCES" "$DIST/$BUNDLE/Contents/Resources/RemoteCode_Surfaces.bundle"
-fi
-if [ -f "Resources/AppIcon.icns" ]; then
-  cp "Resources/AppIcon.icns" "$DIST/$BUNDLE/Contents/Resources/AppIcon.icns"
-fi
-SPARKLE_FRAMEWORK="$(find "$BIN_DIR" -maxdepth 2 -name Sparkle.framework -type d | head -n 1 || true)"
-if [ -n "$SPARKLE_FRAMEWORK" ]; then
-  cp -R "$SPARKLE_FRAMEWORK" "$DIST/$BUNDLE/Contents/Frameworks/Sparkle.framework"
-  if ! otool -l "$DIST/$BUNDLE/Contents/MacOS/RemoteCode" | grep -F "@executable_path/../Frameworks" >/dev/null; then
-    install_name_tool -add_rpath "@executable_path/../Frameworks" "$DIST/$BUNDLE/Contents/MacOS/RemoteCode"
+APP_PATH="${RC2_PACKAGE_APP_OUTPUT:-$DIST/$BUNDLE}"
+APP_EXECUTABLE="$APP_PATH/Contents/MacOS/RemoteCode"
+RUNNING_PIDS="$(running_bundle_pids "$APP_EXECUTABLE")"
+if [ -n "$RUNNING_PIDS" ]; then
+  if [ "${RC2_REPLACE_RUNNING_APP:-0}" != "1" ]; then
+    echo "[package] refusing to replace running $APP_PATH" >&2
+    echo "[package] running pid(s): $(echo "$RUNNING_PIDS" | tr '\n' ' ')" >&2
+    echo "[package] set RC2_REPLACE_RUNNING_APP=1 only when the caller intentionally relaunches the dev app" >&2
+    exit 1
+  fi
+  echo "[package] stopping running $APP_PATH before replacing it"
+  /usr/bin/osascript -e "tell application id \"${BUNDLE_ID}\" to quit" >/dev/null 2>&1 || true
+  if ! wait_for_bundle_exit "$APP_EXECUTABLE"; then
+    RUNNING_PIDS="$(running_bundle_pids "$APP_EXECUTABLE")"
+    for pid in $RUNNING_PIDS; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
+  if ! wait_for_bundle_exit "$APP_EXECUTABLE"; then
+    RUNNING_PIDS="$(running_bundle_pids "$APP_EXECUTABLE")"
+    echo "[package] running pid(s) did not exit: $(echo "$RUNNING_PIDS" | tr '\n' ' ')" >&2
+    exit 1
   fi
 fi
 
-cat > "$DIST/$BUNDLE/Contents/Info.plist" <<EOF
+APP_PARENT="$(dirname "$APP_PATH")"
+APP_BASENAME="$(basename "$APP_PATH" .app)"
+STAGING_ROOT="$APP_PARENT/.staging"
+STAGING_APP="$STAGING_ROOT/${APP_BASENAME}-$$.app"
+cleanup_staging() {
+  rm -rf "$STAGING_APP"
+}
+trap cleanup_staging EXIT
+
+rm -rf "$STAGING_APP"
+mkdir -p "$STAGING_APP/Contents/MacOS"
+mkdir -p "$STAGING_APP/Contents/Resources"
+mkdir -p "$STAGING_APP/Contents/Frameworks"
+
+cp "$BIN" "$STAGING_APP/Contents/MacOS/RemoteCode"
+if [ -x "$CLI" ]; then
+  cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
+fi
+if [ -d "$SURFACES_RESOURCES" ]; then
+  cp -R "$SURFACES_RESOURCES" "$STAGING_APP/Contents/Resources/RemoteCode_Surfaces.bundle"
+fi
+if [ -f "Resources/AppIcon.icns" ]; then
+  cp "Resources/AppIcon.icns" "$STAGING_APP/Contents/Resources/AppIcon.icns"
+fi
+SPARKLE_FRAMEWORK="$(find "$BIN_DIR" -maxdepth 2 -name Sparkle.framework -type d | head -n 1 || true)"
+if [ -n "$SPARKLE_FRAMEWORK" ]; then
+  cp -R "$SPARKLE_FRAMEWORK" "$STAGING_APP/Contents/Frameworks/Sparkle.framework"
+  if ! otool -l "$STAGING_APP/Contents/MacOS/RemoteCode" | grep -F "@executable_path/../Frameworks" >/dev/null; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$STAGING_APP/Contents/MacOS/RemoteCode"
+  fi
+fi
+
+cat > "$STAGING_APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -80,12 +137,21 @@ cat > "$DIST/$BUNDLE/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-cat > "$DIST/$BUNDLE/Contents/PkgInfo" <<EOF
+cat > "$STAGING_APP/Contents/PkgInfo" <<EOF
 APPL????
 EOF
 
-codesign --force --deep --sign - "$DIST/$BUNDLE"
+if command -v xattr >/dev/null 2>&1; then
+  xattr -cr "$STAGING_APP" || true
+fi
+codesign --force --deep --sign - --timestamp=none "$STAGING_APP"
+codesign --verify --deep --strict --verbose=2 "$STAGING_APP"
 
-echo "[package] bundle ready at $DIST/$BUNDLE"
-echo "[package] launch: open '$DIST/$BUNDLE'  or  $DIST/$BUNDLE/Contents/MacOS/RemoteCode"
+rm -rf "$APP_PATH"
+mkdir -p "$APP_PARENT"
+mv "$STAGING_APP" "$APP_PATH"
+trap - EXIT
+
+echo "[package] bundle ready at $APP_PATH"
+echo "[package] launch: open '$APP_PATH'  or  $APP_PATH/Contents/MacOS/RemoteCode"
 echo "[package] release DMGs require Developer ID signing and notarization"

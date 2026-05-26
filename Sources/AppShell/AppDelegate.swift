@@ -90,7 +90,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let trustRepo = DeviceTrustRepository(db: context.db)
-        let auth = LocalAuthAdapter(repo: trustRepo)
+        let auth = LocalAuthAdapter(
+            repo: trustRepo,
+            privateAccountStore: PrivateAccountSessionStore(repo: context.settingsRepo)
+        )
         authProvider = auth   // GAP-5: retain for process lifetime
         localAuth = auth
         // A device-initiated pair request pops an approve/deny modal on
@@ -131,6 +134,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            windowController?.show()
+        }
+        return true
     }
 
     private func reapIdleProviderSessions() {

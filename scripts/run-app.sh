@@ -6,7 +6,7 @@ APP_NAME="RemoteCode"
 APP_BUNDLE="dist/${APP_NAME}.app"
 
 pkill -x "$APP_NAME" 2>/dev/null || true
-RC2_CONFIG=debug ./scripts/package-app.sh
+RC2_REPLACE_RUNNING_APP=1 RC2_CONFIG=debug ./scripts/package-app.sh
 /usr/bin/open -n "$APP_BUNDLE"
 
 if [[ "${1:-}" == "--verify" ]]; then

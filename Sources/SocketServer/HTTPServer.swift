@@ -19,6 +19,7 @@ public protocol DirectAuthProvider: AnyObject {
     /// Device-initiated: create a request and surface a Mac-side
     /// approve/deny modal. Returns the request id + the code to display.
     func createPairingRequest(deviceName: String) -> (requestId: String, code: String)?
+    func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)?
     /// Poll a request. `token` is non-nil exactly once, on the first
     /// poll after approval, and is never persisted server-side.
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)?
@@ -30,6 +31,9 @@ public protocol DirectAuthProvider: AnyObject {
 /// until they opt into the request/approve flow.
 public extension DirectAuthProvider {
     func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? { nil }
+    func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
+        createPairingRequest(deviceName: deviceName)
+    }
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? { nil }
 }
 
@@ -282,7 +286,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any]
             let deviceName = (obj?["device_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Unnamed device"
-            guard let r = auth.createPairingRequest(deviceName: deviceName) else {
+            let privateAccountAccessToken = (obj?["private_account_access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            guard let r = auth.createPairingRequest(deviceName: deviceName, privateAccountAccessToken: privateAccountAccessToken) else {
                 send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
             }
             sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300], acceptEncoding: headers["accept-encoding"])

@@ -176,6 +176,7 @@ def main():
         "slow_ws_disconnect_seen": False,
         "baseline_required_seen": False,
         "hidden_partial_seen": False,
+        "workspace_tui_return_input_seen": False,
         "large_input_bytes": LARGE_INPUT_BYTES,
         "tui_seconds": TUI_SECONDS,
         "child_exit_dead_seen": False,
@@ -184,7 +185,9 @@ def main():
     slow_sock = None
     try:
         pkill_app()
-        run(["./scripts/package-app.sh"], cwd=ROOT, stdout=subprocess.DEVNULL)
+        package_env = os.environ.copy()
+        package_env["RC2_REPLACE_RUNNING_APP"] = "1"
+        run(["./scripts/package-app.sh"], cwd=ROOT, env=package_env, stdout=subprocess.DEVNULL)
         env = os.environ.copy()
         env["RC2_APP_SUPPORT"] = str(app_support)
         env["RC2_DB_PATH"] = str(app_support / "RemoteCode.sqlite")
@@ -238,6 +241,45 @@ def main():
         rpc("workspace.select", {"id": hidden_wid})
         wait_snapshot_contains(hidden_sid, "RC2_E2E_HIDDEN_", timeout=15)
         rpc("workspace.select", {"id": primary_wid})
+
+        send_text(primary_sid, (
+            "stty -echo\n"
+            "cat >/tmp/rc2_workspace_tui.py <<'PY'\n"
+            "import select, sys, time\n"
+            "sys.stdout.write('\\x1b[?1049h')\n"
+            "sys.stdout.write('RC2_' + 'TUI_RUNTIME_READY\\n')\n"
+            "sys.stdout.flush()\n"
+            "tty=open('/dev/tty')\n"
+            "end=time.time()+60\n"
+            "i=0\n"
+            "while time.time()<end:\n"
+            "    sys.stdout.write('\\x1b[HRC2_WORKSPACE_TUI_%06d\\nwaiting for progress prompt\\n' % i)\n"
+            "    sys.stdout.flush()\n"
+            "    ready, _, _ = select.select([tty], [], [], 0.05)\n"
+            "    if ready:\n"
+            "        line=tty.readline().strip()\n"
+            "        if not line:\n"
+            "            continue\n"
+            "        sys.stdout.write('\\x1b[HRC2_TUI_PROGRESS_INPUT:%s\\n' % line)\n"
+            "        sys.stdout.flush()\n"
+            "        break\n"
+            "    i+=1\n"
+            "sys.stdout.write('\\x1b[?1049lRC2_TUI_WORKSPACE_RETURN_DONE\\n')\n"
+            "sys.stdout.flush()\n"
+            "PY\n"
+            "stty echo\n"
+            "python3 /tmp/rc2_workspace_tui.py\n"
+        ))
+        wait_snapshot_contains(primary_sid, "RC2_TUI_RUNTIME_READY", timeout=10)
+        rpc("workspace.select", {"id": hidden_wid})
+        send_text(hidden_sid, "ls; printf 'RC2_OTHER_WORKSPACE_LS_OK\\n'\n")
+        time.sleep(5)
+        wait_snapshot_contains(hidden_sid, "RC2_OTHER_WORKSPACE_LS_OK", timeout=10)
+        rpc("workspace.select", {"id": primary_wid})
+        send_text(primary_sid, "how is the progress?\n")
+        wait_snapshot_contains(primary_sid, "RC2_TUI_PROGRESS_INPUT:how is the progress?", timeout=10)
+        wait_snapshot_contains(primary_sid, "RC2_TUI_WORKSPACE_RETURN_DONE", timeout=10)
+        stats["workspace_tui_return_input_seen"] = True
 
         chunk = "A" * 79 + "\n"
         payload = (chunk * ((LARGE_INPUT_BYTES // len(chunk)) + 1))[:LARGE_INPUT_BYTES]

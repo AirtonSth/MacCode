@@ -42,8 +42,22 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "the SwiftPM-built app bundle must embed Sparkle.framework for the updater to load")
         XCTAssertTrue(script.contains("install_name_tool -add_rpath \"@executable_path/../Frameworks\""),
                       "the packaged executable must be able to find embedded Sparkle.framework")
-        XCTAssertTrue(script.contains("codesign --force --deep --sign - \"$DIST/$BUNDLE\""),
+        XCTAssertTrue(script.contains("RC2_PACKAGE_APP_OUTPUT"),
+                      "DMG and test packaging must be able to build into a staging app without touching the live dev bundle")
+        XCTAssertTrue(script.contains("STAGING_APP"),
+                      "local packaging must assemble and sign a staging bundle before swapping the final app path")
+        XCTAssertTrue(script.contains("codesign --force --deep --sign - --timestamp=none \"$STAGING_APP\""),
                       "local packaging must ad-hoc sign after rpath changes so the app can launch for smoke tests")
+        XCTAssertTrue(script.contains("codesign --verify --deep --strict --verbose=2 \"$STAGING_APP\""),
+                      "local packaging must verify the staged signature before replacing the final app")
+        XCTAssertTrue(script.contains("refusing to replace running $APP_PATH"),
+                      "local packaging must fail loud instead of overwriting a live bundle and letting macOS kill the mapped executable with Code Signature Invalid")
+        XCTAssertTrue(script.contains("RC2_REPLACE_RUNNING_APP"),
+                      "only explicit relaunch callers may stop and replace a running local dev app")
+        let refusal = try XCTUnwrap(script.range(of: "refusing to replace running $APP_PATH"))
+        let replace = try XCTUnwrap(script.range(of: "rm -rf \"$APP_PATH\""))
+        XCTAssertLessThan(refusal.lowerBound, replace.lowerBound,
+                          "the live-bundle refusal must run before the destructive final app replacement")
     }
 
     func testReleaseWorkflowPublishesSignedSparkleAppcastToPages() throws {
@@ -130,6 +144,33 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(stored.user.email, "desktop@example.com")
         XCTAssertEqual(vm.privateAccountStatus, "Subscription active",
                        "a subscribed private account is what unlocks authenticated backend push delivery")
+    }
+
+    func testSamePrivateAccountPairingAutoApprovesWithoutMacPrompt() throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivatePairing-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let api = RecordingPrivateAccountAPI()
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        accountStore.save(api.session)
+        let auth = LocalAuthAdapter(
+            repo: DeviceTrustRepository(db: ctx.db),
+            privateAccountStore: accountStore,
+            privateAccountAPI: api
+        )
+        let prompted = PromptFlag()
+        auth.onPairingRequest = { _ in prompted.value = true }
+
+        let request = try XCTUnwrap(auth.createPairingRequest(
+            deviceName: "iPhone",
+            privateAccountAccessToken: "ios-access-token"
+        ))
+        let status = try XCTUnwrap(auth.pairingRequestStatus(requestId: request.requestId))
+
+        XCTAssertFalse(prompted.value,
+                       "when iOS and macOS prove the same subscribed private account, pairing must not ask the Mac user for approval")
+        XCTAssertEqual(status.status, "approved")
+        XCTAssertNotNil(status.token,
+                        "same-account auto-approval must still mint a normal trusted-device token for later direct RPC auth")
     }
 
     func testPrivateAccountRefreshUsesRefreshTokenBeforeDroppingOptionalSession() async throws {
@@ -439,6 +480,16 @@ private final class CwdCaptureRunner: AgentProviderRunner, @unchecked Sendable {
             onEvent(.finished(.completed, finalMessage: "ok", providerThreadId: providerThreadId))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+}
+
+private final class PromptFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return storage }
+        set { lock.lock(); storage = newValue; lock.unlock() }
     }
 }
 

@@ -36,9 +36,11 @@ public final class SurfaceRegistry {
     }
     public func surface(_ id: SurfaceID) -> Surface? { surfaces[id] }
     public func all() -> [Surface] { Array(surfaces.values) }
+    public func isVisible(_ id: SurfaceID) -> Bool { visibleSurfaceIDs.contains(id) }
 
     public func setVisibleSurfaceIDs(_ ids: Set<SurfaceID>) {
-        let hidden = Set(surfaces.keys).subtracting(ids)
+        guard ids != visibleSurfaceIDs else { return }
+        let hidden = visibleSurfaceIDs.subtracting(ids)
         let shown = ids.subtracting(visibleSurfaceIDs)
         visibleSurfaceIDs = ids
         for id in hidden { surfaces[id]?.didBecomeHidden() }

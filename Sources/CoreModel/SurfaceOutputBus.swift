@@ -10,8 +10,9 @@ public final class SurfaceOutputBus: @unchecked Sendable {
     private let queue: DispatchQueue
     private let flushDelay: TimeInterval
     private let maxBatchBytes: Int
-    private var sinkStorage: ((_ surfaceId: SurfaceID, _ chunk: Data) -> Void)?
+    private var sinkStorage: ((_ surfaceId: SurfaceID, _ seq: Int, _ chunk: Data) -> Void)?
     private var pending: [SurfaceID: Data] = [:]
+    private var surfaceSeq: [SurfaceID: Int] = [:]
     private var flushScheduled = false
 
     init(
@@ -25,13 +26,17 @@ public final class SurfaceOutputBus: @unchecked Sendable {
     }
 
     /// Set by AppShell to forward to the network event bus.
-    public var sink: ((_ surfaceId: SurfaceID, _ chunk: Data) -> Void)? {
+    public var sink: ((_ surfaceId: SurfaceID, _ seq: Int, _ chunk: Data) -> Void)? {
         get { queue.sync { sinkStorage } }
         set {
             queue.async {
                 self.sinkStorage = newValue
             }
         }
+    }
+
+    public func currentSequence(_ surfaceId: SurfaceID) -> Int {
+        queue.sync { surfaceSeq[surfaceId] ?? 0 }
     }
 
     public func emit(_ surfaceId: SurfaceID, _ chunk: Data) {
@@ -66,6 +71,8 @@ public final class SurfaceOutputBus: @unchecked Sendable {
 
     private func flush(_ surfaceId: SurfaceID) {
         guard let chunk = pending.removeValue(forKey: surfaceId), !chunk.isEmpty else { return }
-        sinkStorage?(surfaceId, chunk)
+        let seq = (surfaceSeq[surfaceId] ?? 0) + 1
+        surfaceSeq[surfaceId] = seq
+        sinkStorage?(surfaceId, seq, chunk)
     }
 }

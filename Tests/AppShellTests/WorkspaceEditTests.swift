@@ -1,6 +1,7 @@
 import XCTest
 @testable import AppShell
 @testable import CoreModel
+@testable import SocketServer
 @testable import Surfaces
 import Persistence
 
@@ -85,6 +86,35 @@ final class WorkspaceEditTests: XCTestCase {
         try router.closeWorkspace(ws.id)
         XCTAssertNil(ctx.state.workspaces[ws.id])
         XCTAssertFalse(ctx.state.window.workspaces.contains(ws.id))
+    }
+
+    func test_batchRemoveDropsSelectedWorkspacesAndPublishesMirrorEvents() throws {
+        let (ctx, router) = try make()
+        let first = try router.createWorkspace(name: "one", cwd: "/tmp")
+        let second = try router.createWorkspace(name: "two", cwd: "/tmp")
+        let third = try router.createWorkspace(name: "three", cwd: "/tmp")
+        let startSeq = EventBus.shared.snapshot().lastSeq
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: startSeq) { event in
+            if event.kind == "workspace.closed" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        try router.closeWorkspaces([first.id, second.id])
+
+        XCTAssertNil(ctx.state.workspaces[first.id],
+                     "bulk workspace deletion must remove every selected workspace from host state")
+        XCTAssertNil(ctx.state.workspaces[second.id],
+                     "bulk workspace deletion must not stop after the first selected workspace")
+        XCTAssertEqual(ctx.state.window.workspaces, [third.id],
+                       "bulk workspace deletion must leave the sidebar with only non-selected workspaces")
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, third.id,
+                       "after deleting selected workspaces, the app must select a remaining workspace instead of hanging on a deleted id")
+        XCTAssertEqual(events.map(\.kind), ["workspace.closed", "workspace.closed"],
+                       "bulk workspace deletion must publish one host event per removed workspace so paired iOS mirrors do not keep stale rows")
+        XCTAssertEqual(events.compactMap { $0.payload.objectValue?["workspace_id"]?.stringValue },
+                       [first.id.value.uuidString, second.id.value.uuidString],
+                       "workspace.closed events must carry the exact payload key consumed by the iOS mirror reducer")
     }
 
     func test_finderURL_requiresExistingWorkspaceDirectory() throws {

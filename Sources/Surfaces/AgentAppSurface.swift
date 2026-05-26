@@ -50,12 +50,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Fired when a run completes so the workspace can move up in its
     /// pinned/unpinned group.
     public var onRunCompleted: (() -> Void)?
-    public var providerSnapshotLoader: (() async -> [AgentProviderSnapshot])?
+    public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
+    public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
     public var providerRecoveryAction: ((AgentProvider, String?) async throws -> String)?
     public var pullRequestThreadPreparer: ((String, AgentProvider, String, AgentPermissionMode, AgentReasoningEffort, AgentServiceTier, AgentModelSelection?, String?) async throws -> AgentThread)?
     @Published public var providerRecoveryActionRunning = false
     @Published public var providerRecoveryStatusMessage: String?
+    @Published public var modelListLoading = false
+    @Published public var modelListStatusMessage: String?
+    @Published public var providerSnapshotStatusMessage: String?
     @Published public var pullRequestURL: String = ""
     @Published public var pullRequestPreparing = false
     @Published public var pullRequestStatusMessage: String?
@@ -423,47 +427,69 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func loadModels() async {
-        let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
-        let m = await runner.listModels()
-        await MainActor.run {
-            self.availableModels = m
-            // B8: a provider switch must leave a model valid for that
-            // provider — never a stale id from the other provider.
-            if !self.modelSelectionIsValid(self.model, in: m) {
-                self.model = m.first?.id ?? self.model
+        modelListLoading = true
+        modelListStatusMessage = "Loading models..."
+        defer { modelListLoading = false }
+        do {
+            let m: [AgentModelDescriptor]
+            if let modelListLoader {
+                m = try await modelListLoader(provider)
+            } else {
+                let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
+                m = await runner.listModels()
             }
-            self.normalizeSelectedModelOptions()
+            await MainActor.run {
+                self.availableModels = m
+                self.modelListStatusMessage = m.isEmpty ? "No models returned for \(self.providerDisplayName(self.provider)). Retry from the model menu." : nil
+                // B8: a provider switch must leave a model valid for that
+                // provider — never a stale id from the other provider.
+                if !self.modelSelectionIsValid(self.model, in: m) {
+                    self.model = m.first?.id ?? self.model
+                }
+                self.normalizeSelectedModelOptions()
+            }
+        } catch {
+            await MainActor.run {
+                self.modelListStatusMessage = "Model list failed. Retry from the model menu."
+            }
         }
     }
 
     public func loadProviderSnapshots() async {
-        let snapshots: [AgentProviderSnapshot]
-        if let providerSnapshotLoader {
-            snapshots = await providerSnapshotLoader()
-        } else {
-            var local: [AgentProviderSnapshot] = []
-            for provider in AgentProvider.allCases {
-                let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
-                local.append(AgentProviderSnapshotFactory.snapshot(
-                    provider: provider,
-                    models: await runner.listModels(),
-                    binaryPath: ProcessLocator.resolve(provider.rawValue) ?? ""
-                ))
-            }
-            snapshots = local
-        }
-        await MainActor.run {
-            self.providerSnapshots = snapshots
-            if self.selectedProviderSnapshot == nil {
-                self.providerInstanceId = snapshots.first(where: { $0.provider == self.provider })?.id ?? self.provider.rawValue
-            }
-            if let current = self.selectedProviderSnapshot {
-                self.provider = current.provider
-                self.availableModels = current.models
-                if !self.modelSelectionIsValid(self.model, in: current.models) {
-                    self.model = current.models.first?.id ?? self.model
+        do {
+            let snapshots: [AgentProviderSnapshot]
+            if let providerSnapshotLoader {
+                snapshots = try await providerSnapshotLoader()
+            } else {
+                var local: [AgentProviderSnapshot] = []
+                for provider in AgentProvider.allCases {
+                    let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
+                    local.append(AgentProviderSnapshotFactory.snapshot(
+                        provider: provider,
+                        models: await runner.listModels(),
+                        binaryPath: ProcessLocator.resolve(provider.rawValue) ?? ""
+                    ))
                 }
-                self.normalizeSelectedModelOptions()
+                snapshots = local
+            }
+            await MainActor.run {
+                self.providerSnapshotStatusMessage = nil
+                self.providerSnapshots = snapshots
+                if self.selectedProviderSnapshot == nil {
+                    self.providerInstanceId = snapshots.first(where: { $0.provider == self.provider })?.id ?? self.provider.rawValue
+                }
+                if let current = self.selectedProviderSnapshot {
+                    self.provider = current.provider
+                    self.availableModels = current.models
+                    if !self.modelSelectionIsValid(self.model, in: current.models) {
+                        self.model = current.models.first?.id ?? self.model
+                    }
+                    self.normalizeSelectedModelOptions()
+                }
+            }
+        } catch {
+            await MainActor.run {
+                self.providerSnapshotStatusMessage = "Provider snapshot failed. Retry from the model menu."
             }
         }
     }
@@ -723,12 +749,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func setModel(_ model: String) {
+        guard !providerLocked else { return }
         self.model = model
         normalizeSelectedModelOptions()
         persistThreadConfig()
     }
 
     public func setCustomModel(_ raw: String) {
+        guard !providerLocked else { return }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard supportsCustomModelForSelectedProvider else { return }
         if !trimmed.isEmpty { customModelSelections.insert(trimmed) }
@@ -2438,6 +2466,30 @@ public struct AgentAppView: View {
                 }
             }
             let modelOptions = vm.modelOptionsForSelectedProvider
+            if vm.modelListLoading {
+                Text("Loading models...")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            if vm.modelListStatusMessage != nil || vm.providerSnapshotStatusMessage != nil {
+                Button("Retry loading models") {
+                    Task {
+                        await vm.loadProviderSnapshots()
+                        await vm.loadModels()
+                    }
+                }
+                .disabled(vm.modelListLoading)
+            }
+            if let modelListStatus = vm.modelListStatusMessage {
+                Text(modelListStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+            }
+            if let providerSnapshotStatus = vm.providerSnapshotStatusMessage {
+                Text(providerSnapshotStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+            }
             if !modelOptions.isEmpty {
                 Picker("Model", selection: $vm.model) {
                     ForEach(modelOptions, id: \.id) { m in Text(m.label).tag(m.id) }
@@ -2448,7 +2500,7 @@ public struct AgentAppView: View {
                     }
                 }
                 .onChange(of: vm.model) { newValue in vm.setModel(newValue) }
-                .disabled(vm.status == .running)
+                .disabled(vm.status == .running || vm.providerLocked)
             }
             if vm.supportsCustomModelForSelectedProvider {
                 TextField("Custom model", text: Binding(
@@ -2456,7 +2508,7 @@ public struct AgentAppView: View {
                     set: { vm.setCustomModel($0) }
                 ))
                 .textFieldStyle(.roundedBorder)
-                .disabled(vm.status == .running)
+                .disabled(vm.status == .running || vm.providerLocked)
             }
             if let contextWindow = vm.selectedModelContextWindowLabel {
                 Text(contextWindow)

@@ -158,6 +158,7 @@ final class TerminalTextView: NSTextView {
 private final class TerminalDropContainerView: NSView {
     var onFileDrop: (([String]) -> Void)?
     var onLayout: (() -> Void)?
+    var onWindowChanged: ((NSWindow?) -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -192,6 +193,7 @@ private final class TerminalDropContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         onLayout?()
+        onWindowChanged?(window)
     }
 }
 
@@ -226,7 +228,6 @@ public final class TerminalSurface: NSObject, Surface {
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
     private var isVisible = true
-    private var hiddenOutput = Data()
     private let historyRepo: TerminalOutputRepository?
     private let historyWorkspaceID: String
     private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
@@ -237,8 +238,17 @@ public final class TerminalSurface: NSObject, Surface {
     private var historyWriteFailures = 0
     private var outputPartial = false
     private var outputPendingBytes = 0
+    private var readerAllowsRender = true
+    private var isDrainingHiddenBacklog = false
+    private var hiddenBacklogDrainGeneration = 0
+    private var parkingWindow: NSWindow?
+    private var parkingConstraints: [NSLayoutConstraint] = []
+    private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
-    private nonisolated static let maxHiddenOutputBytes = 1024 * 1024
+
+    public var viewportSize: TerminalViewportSize {
+        terminalSize
+    }
 
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
@@ -325,8 +335,15 @@ public final class TerminalSurface: NSObject, Surface {
             guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return }
             _ = self?.writeToPTY(data)
         }
-        container.onLayout = { [weak self] in
-            self?.ghosttyView.forceRefresh()
+        container.onLayout = { [weak self, weak container] in
+            guard let self,
+                  !self.isClosing,
+                  self.isVisible,
+                  container?.window != nil else { return }
+            self.ghosttyView.refreshSurfaceOnly()
+        }
+        container.onWindowChanged = { [weak self] window in
+            self?.handleContainerWindowChanged(window)
         }
         applyTerminalSize(TerminalViewportGeometry.fallbackSize, sendToPTY: false, force: true)
 
@@ -405,7 +422,8 @@ public final class TerminalSurface: NSObject, Surface {
                 return
             }
             let data = Data(buf[0..<Int(n)])
-            DispatchQueue.main.async { self.appendDataAsync(data) }
+            let renderAllowedAtRead = self.readerAllowsRender
+            DispatchQueue.main.async { self.appendDataAsync(data, renderAllowedAtRead: renderAllowedAtRead) }
         }
         src.resume()
     }
@@ -431,19 +449,23 @@ public final class TerminalSurface: NSObject, Surface {
         return nil
     }
 
-    private func appendDataAsync(_ data: Data) {
+    private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
         enqueueHistory(data)
-        renderer.feed(data)
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
         // HC-1: stream raw PTY output to the mirror in real time.
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        if isVisible {
+        if renderAllowedAtRead {
+            renderer.feed(data)
+        }
+        if renderAllowedAtRead, canRenderTerminalOutput {
             ghosttyView.processOutput(data)
         } else {
-            appendHiddenOutput(data)
+            outputPendingBytes += data.count
+            continueHiddenBacklogDrainIfNeeded()
+            ghosttyView.processOutput(data, render: false)
         }
     }
 
@@ -453,22 +475,37 @@ public final class TerminalSurface: NSObject, Surface {
         renderer.feed(data)
         lastOutputAt = Date()
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        if isVisible {
+        if canRenderTerminalOutput {
             ghosttyView.processOutput(data)
         } else {
-            appendHiddenOutput(data)
+            outputPendingBytes += data.count
+            ghosttyView.processOutput(data, render: false)
         }
     }
 
-    private func appendHiddenOutput(_ data: Data) {
-        hiddenOutput.append(data)
-        if hiddenOutput.count > Self.maxHiddenOutputBytes {
-            let dropped = hiddenOutput.count - Self.maxHiddenOutputBytes
-            hiddenOutput.removeFirst(dropped)
-            outputPartial = true
-            outputPendingBytes += dropped
-            publishRuntimeHealth()
+    private var canRenderTerminalOutput: Bool {
+        guard isVisible,
+              !isDrainingHiddenBacklog,
+              SurfaceRegistry.shared.isVisible(descriptor.id),
+              let window = view.window,
+              window !== parkingWindow,
+              view.bounds.width > 1,
+              view.bounds.height > 1,
+              !Self.isHiddenOrHasHiddenAncestor(view) else { return false }
+        return true
+    }
+
+    private func handleContainerWindowChanged(_ window: NSWindow?) {
+        guard !isClosing else { return }
+        if let window, window !== parkingWindow {
+            closeParkingWindowIfNeeded()
+            if isVisible {
+                ghosttyView.refreshSurfaceOnly()
+            }
+            return
         }
+        guard window == nil else { return }
+        scheduleParkingIfDetached()
     }
 
     public func appendSystemText(_ raw: String) {
@@ -536,41 +573,59 @@ public final class TerminalSurface: NSObject, Surface {
             terminalDeadReason: terminalDeadReason,
             lastOutputAt: lastOutputAt,
             outputPartial: outputPartial,
-            outputPendingBytes: outputPendingBytes + hiddenOutput.count,
-            historyWriteFailures: historyWriteFailures
+            outputPendingBytes: outputPendingBytes,
+            historyWriteFailures: historyWriteFailures,
+            rows: terminalSize.rows,
+            cols: terminalSize.cols
         )
     }
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
-        if !isVisible && !hiddenOutput.isEmpty {
+        if !isVisible && outputPendingBytes > 0 {
             return TerminalTextSnapshot(
                 text: renderer.snapshot().string,
                 complete: false,
                 source: "ansi_fallback",
                 timestamp: Date(),
                 partialReason: outputPartial ? "hidden_output_cap" : "hidden_output_pending",
-                pendingBytes: outputPendingBytes + hiddenOutput.count
+                pendingBytes: outputPendingBytes,
+                rows: terminalSize.rows,
+                cols: terminalSize.cols
             )
         }
         if let text = ghosttyView.readViewportText() {
             let rendererText = renderer.snapshot().string
+            let complete = Self.readTextComplete(
+                outputPartial: outputPartial,
+                outputPendingBytes: outputPendingBytes,
+                historyWriteFailures: historyWriteFailures
+            )
+            let partialReason = Self.readTextPartialReason(
+                outputPartial: outputPartial,
+                outputPendingBytes: outputPendingBytes,
+                historyWriteFailures: historyWriteFailures
+            )
             if Self.shouldPreferRendererSnapshotForReadText(viewportText: text, rendererText: rendererText) {
                 return TerminalTextSnapshot(
                     text: rendererText,
-                    complete: !outputPartial && historyWriteFailures == 0,
+                    complete: complete,
                     source: "ansi_renderer",
                     timestamp: Date(),
-                    partialReason: outputPartial ? "hidden_output_cap" : (historyWriteFailures > 0 ? "history_persistence_failed" : nil),
-                    pendingBytes: outputPendingBytes
+                    partialReason: partialReason,
+                    pendingBytes: outputPendingBytes,
+                    rows: terminalSize.rows,
+                    cols: terminalSize.cols
                 )
             }
             return TerminalTextSnapshot(
                 text: text,
-                complete: !outputPartial && historyWriteFailures == 0,
+                complete: complete,
                 source: "ghostty_viewport",
                 timestamp: Date(),
-                partialReason: outputPartial ? "hidden_output_cap" : (historyWriteFailures > 0 ? "history_persistence_failed" : nil),
-                pendingBytes: outputPendingBytes
+                partialReason: partialReason,
+                pendingBytes: outputPendingBytes,
+                rows: terminalSize.rows,
+                cols: terminalSize.cols
             )
         }
         return TerminalTextSnapshot(
@@ -579,8 +634,21 @@ public final class TerminalSurface: NSObject, Surface {
             source: "ansi_fallback",
             timestamp: Date(),
             partialReason: "ghostty_unavailable",
-            pendingBytes: outputPendingBytes + hiddenOutput.count
+            pendingBytes: outputPendingBytes,
+            rows: terminalSize.rows,
+            cols: terminalSize.cols
         )
+    }
+
+    static func readTextComplete(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int) -> Bool {
+        !outputPartial && outputPendingBytes == 0 && historyWriteFailures == 0
+    }
+
+    static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int) -> String? {
+        if outputPartial { return "hidden_output_cap" }
+        if outputPendingBytes > 0 { return "hidden_output_pending" }
+        if historyWriteFailures > 0 { return "history_persistence_failed" }
+        return nil
     }
 
     private func publishRuntimeHealth() {
@@ -615,9 +683,41 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func focus() {
-        view.window?.makeFirstResponder(ghosttyView)
-        ghosttyView.forceRefresh()
+        guard applyFocusIfReady() else {
+            scheduleFocusRetry()
+            return
+        }
+    }
+
+    @discardableResult
+    private func applyFocusIfReady() -> Bool {
+        guard isVisible,
+              !isClosing,
+              let window = view.window,
+              window !== parkingWindow,
+              view.bounds.width > 1,
+              view.bounds.height > 1,
+              !Self.isHiddenOrHasHiddenAncestor(view) else { return false }
+        window.makeFirstResponder(ghosttyView)
+        ghosttyView.refreshSurfaceOnly()
         descriptor.hasUnreadActivity = false
+        return true
+    }
+
+    private static func isHiddenOrHasHiddenAncestor(_ view: NSView) -> Bool {
+        var current: NSView? = view
+        while let node = current {
+            if node.isHidden { return true }
+            current = node.superview
+        }
+        return false
+    }
+
+    private func scheduleFocusRetry() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            _ = self.applyFocusIfReady()
+        }
     }
 
     public func unfocus() {}
@@ -625,28 +725,61 @@ public final class TerminalSurface: NSObject, Surface {
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
-        if hiddenOutput.isEmpty {
-            ghosttyView.forceRefresh()
-        } else {
-            let output = hiddenOutput
-            hiddenOutput.removeAll(keepingCapacity: true)
-            outputPendingBytes = 0
-            ghosttyView.processOutput(output)
+        readerAllowsRender = true
+        ghosttyView.setOcclusion(visible: true)
+        let hadHiddenOutput = outputPendingBytes > 0
+        outputPendingBytes = 0
+        if hadHiddenOutput {
+            beginHiddenBacklogDrain()
         }
+        ghosttyView.refreshSurfaceOnly()
+        scheduleVisibleRefresh()
+    }
+
+    private func scheduleVisibleRefresh() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.isVisible else { return }
-            self.ghosttyView.forceRefresh()
+            guard let self, self.isVisible, !self.isClosing else { return }
+            self.ghosttyView.refreshSurfaceOnly()
         }
     }
 
     public func didBecomeHidden() {
         guard isVisible else { return }
         isVisible = false
+        readerAllowsRender = false
+        isDrainingHiddenBacklog = false
+        ghosttyView.setOcclusion(visible: false)
+        scheduleParkingIfDetached()
+    }
+
+    private func beginHiddenBacklogDrain() {
+        isDrainingHiddenBacklog = true
+        hiddenBacklogDrainGeneration &+= 1
+        scheduleHiddenBacklogDrainCompletion(generation: hiddenBacklogDrainGeneration)
+    }
+
+    private func continueHiddenBacklogDrainIfNeeded() {
+        guard isDrainingHiddenBacklog else { return }
+        hiddenBacklogDrainGeneration &+= 1
+        scheduleHiddenBacklogDrainCompletion(generation: hiddenBacklogDrainGeneration)
+    }
+
+    private func scheduleHiddenBacklogDrainCompletion(generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.hiddenBacklogQuietDelay) { [weak self] in
+            guard let self,
+                  self.hiddenBacklogDrainGeneration == generation,
+                  self.isVisible,
+                  !self.isClosing else { return }
+            self.isDrainingHiddenBacklog = false
+            self.outputPendingBytes = 0
+            self.ghosttyView.refreshSurfaceOnly()
+        }
     }
 
     public func close() {
         guard !isClosing else { return }
         isClosing = true
+        closeParkingWindowIfNeeded()
         flushHistory(wait: true)
         readSource?.cancel()
         readSource = nil
@@ -668,6 +801,56 @@ public final class TerminalSurface: NSObject, Surface {
         }
         ghosttyView.closeSurface()
         publishRuntimeHealth()
+    }
+
+    private func scheduleParkingIfDetached() {
+        guard parkingWindow == nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.parkInHiddenWindowIfNeeded()
+        }
+    }
+
+    private func parkInHiddenWindowIfNeeded() {
+        guard !isClosing,
+              !isVisible,
+              view.window == nil else { return }
+
+        let frame = NSRect(x: 0, y: 0, width: max(view.bounds.width, 800), height: max(view.bounds.height, 600))
+        let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.hasShadow = false
+        window.alphaValue = 0
+        window.ignoresMouseEvents = true
+        window.collectionBehavior = [.transient, .ignoresCycle, .stationary]
+        window.isExcludedFromWindowsMenu = true
+
+        let content = NSView(frame: frame)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView = content
+
+        view.removeFromSuperview()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(view)
+        parkingConstraints = [
+            view.topAnchor.constraint(equalTo: content.topAnchor),
+            view.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+        ]
+        NSLayoutConstraint.activate(parkingConstraints)
+        parkingWindow = window
+    }
+
+    private func closeParkingWindowIfNeeded() {
+        guard let window = parkingWindow else { return }
+        NSLayoutConstraint.deactivate(parkingConstraints)
+        parkingConstraints.removeAll()
+        parkingWindow = nil
+        if view.window === window {
+            view.removeFromSuperview()
+        }
+        window.contentView = nil
+        window.close()
     }
 
     public func flushPersistedHistory() {

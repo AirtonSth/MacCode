@@ -173,6 +173,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let terminalStatus = (try? runRepo.get(id: runId)?.status).flatMap { status -> AgentRunStatus? in
             status == .running || status == .pending ? nil : status
         }
+        if terminalStatus == .cancelled {
+            handle.cancel()
+            return runId
+        }
         lock.lock()
         let shouldCancel: Bool
         if terminalStatus == nil {
@@ -233,6 +237,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // if the recovered state is not sufficient to continue.
             }
         }
+        guard let thread = try? threadRepo.get(id: threadId),
+              thread.status == .running || thread.status == .pending else {
+            lock.lock()
+            pendingThreadStops.remove(threadId)
+            lock.unlock()
+            return
+        }
         lock.lock()
         pendingThreadStops.insert(threadId)
         lock.unlock()
@@ -258,8 +269,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
             seq.removeValue(forKey: runId)
+            pendingThreadStops.remove(threadId)
         }
-        pendingThreadStops.remove(threadId)
         lock.unlock()
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)

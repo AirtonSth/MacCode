@@ -16,7 +16,7 @@ public protocol CommandRouting: AnyObject {
     func paneSwap(workspace: WorkspaceID, a: PaneID, b: PaneID) throws
     func createWorkspace(name: String, cwd: String) throws -> Workspace
     func selectWorkspace(_ id: WorkspaceID) throws
-    func closeWorkspace(_ id: WorkspaceID) throws
+    func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool) throws
     func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws
     func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws
     func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws
@@ -132,6 +132,12 @@ public protocol CommandRouting: AnyObject {
     func filesEditSave(sessionID: String) throws -> JSONValue
     func filesEditDiscard(sessionID: String) throws -> JSONValue
     func filesEditClose(sessionID: String) throws -> JSONValue
+}
+
+public extension CommandRouting {
+    func closeWorkspace(_ id: WorkspaceID) throws {
+        try closeWorkspace(id, publishEvent: true)
+    }
 }
 
 @MainActor
@@ -405,7 +411,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .bool(true))
             case "workspace.close":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
-                try router.closeWorkspace(wid)
+                try router.closeWorkspace(wid, publishEvent: false)
                 EventBus.shared.publish(kind: "workspace.closed", payload: .object(["workspace_id": .string(wid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "workspace.rename":
@@ -563,7 +569,7 @@ public final class JSONRPCDispatcher {
                 let before = params["before_chunk_id"]?.intValue.map(Int64.init)
                 let maxBytes = params["max_bytes"]?.intValue ?? (256 * 1024)
                 let window = try router.readTerminalHistory(surface: sid, beforeChunkID: before, maxBytes: maxBytes)
-                return .init(id: id, result: .object([
+                var result: [String: JSONValue] = [
                     "text": .string(window.text),
                     "chunks": .array(window.chunks.map { chunk in
                         .object([
@@ -574,7 +580,9 @@ public final class JSONRPCDispatcher {
                     }),
                     "has_more_older": .bool(window.hasMoreOlder),
                     "next_before_chunk_id": window.nextBeforeChunkID.map { .number(Double($0)) } ?? .null
-                ]))
+                ]
+                result["surface_seq"] = .number(Double(SurfaceOutputBus.shared.currentSequence(sid)))
+                return .init(id: id, result: .object(result))
             case "agent.open":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let s = try router.openAgentApp(workspace: wid)
