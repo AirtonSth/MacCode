@@ -237,6 +237,28 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual((rolledBack["lastParams"] as? [String: Any])?["numTurns"] as? Int, 2)
     }
 
+    func test_updateThreadSettingsSendsFullAccessRuntimePolicy() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let response = try await client.requestJSONObject(method: "thread/read", params: ["threadId": "thread-app-server-1"])
+        XCTAssertEqual(response["lastMethod"] as? String, "thread/read")
+
+        try await client.updateThreadSettings(providerThreadId: "thread-app-server-1", permissionMode: .fullAccess)
+        let update = try await client.requestJSONObject(method: "test/lastThreadSettingsUpdate")
+        XCTAssertEqual(update["lastMethod"] as? String, "thread/settings/update")
+        let params = try XCTUnwrap(update["lastParams"] as? [String: Any])
+        XCTAssertEqual(params["threadId"] as? String, "thread-app-server-1")
+        XCTAssertEqual(params["approvalPolicy"] as? String, "never")
+        XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "dangerFullAccess")
+    }
+
     private func makeFakeAppServerPeer() throws -> String {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)
@@ -247,6 +269,7 @@ final class CodexAppServerClientTests: XCTestCase {
         import json
         import sys
 
+        last_thread_settings_update = {}
         for line in sys.stdin:
             msg = json.loads(line)
             method = msg.get("method")
@@ -388,6 +411,20 @@ final class CodexAppServerClientTests: XCTestCase {
                             "status": {"state": "idle", "activeFlags": []}
                         }
                     }
+                }), flush=True)
+            elif method == "thread/settings/update":
+                last_thread_settings_update = {
+                    "lastMethod": method,
+                    "lastParams": msg.get("params", {})
+                }
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": last_thread_settings_update
+                }), flush=True)
+            elif method == "test/lastThreadSettingsUpdate":
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": last_thread_settings_update
                 }), flush=True)
             elif method == "turn/interrupt":
                 print(json.dumps({

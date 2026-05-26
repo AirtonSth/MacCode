@@ -250,8 +250,26 @@ final class CodexAppServerAdapterTests: XCTestCase {
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "acceptForSession")
+        let update = try XCTUnwrap(client.updatedThreadSettings.first,
+                                   "Approve Session must update the live Codex thread settings so later approvals in the same turn are auto-approved")
+        XCTAssertEqual(update.providerThreadId, "codex-thread-1")
+        XCTAssertEqual(update.permissionMode, .fullAccess)
+        let autoResponse = try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "itemId": "cmd-2",
+            "command": "npm install"
+        ])
+        let autoDecision = try XCTUnwrap(autoResponse as? [String: Any])
+        XCTAssertEqual(autoDecision["decision"] as? String, "acceptForSession",
+                       "After Approve Session, later approval requests in the same loaded session must be auto-approved instead of surfacing another pending card")
         let events = await sink.snapshot()
         XCTAssertTrue(events.contains { if case .requestResolved(let id, let state) = $0 { return id == request.id && state == .approved } else { return false } })
+        let openedRequests = events.compactMap {
+            if case .requestOpened(let request) = $0 { return request }
+            return nil
+        }
+        XCTAssertEqual(openedRequests.map(\.id), [request.id])
     }
 
     func test_adapterMapsNestedApprovalPayloadIntoReadableRequestDetail() async throws {
@@ -802,9 +820,10 @@ final class CodexAppServerAdapterTests: XCTestCase {
                       "Codex thread/read should render common string output aliases for known item types instead of falling back to missing or opaque JSON content")
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, let body, _, _) = $0 { return itemId == "agent-content-1" && body == "Assistant content array text" } else { return false } },
                       "agentMessage snapshots should render app-server content arrays as assistant text instead of raw JSON")
-        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "user-content-1" && item.summary == "User message" } else { return false } })
-        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "user-content-1" && output == "User content array text" } else { return false } },
-                      "userMessage snapshots should render app-server content arrays instead of raw JSON")
+        XCTAssertFalse(events.contains { if case .itemStarted(let item) = $0 { return item.id == "user-content-1" } else { return false } },
+                       "userMessage snapshots must not render as tool rows because the Agent App already shows the prompt as a user bubble")
+        XCTAssertTrue(events.contains { if case .providerRuntime(let runtime) = $0 { return runtime.providerItemId == "user-content-1" && runtime.payloadJSON.contains("User content array text") } else { return false } },
+                      "userMessage snapshots must stay available in raw runtime history even when hidden from the visible assistant timeline")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "hook-1" && item.summary == "Hook prompt" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "hook-1" && output == "Hook prompt fragment" } else { return false } },
                       "hookPrompt snapshots should render fragment text instead of raw JSON")
@@ -1138,6 +1157,43 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Context compaction" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.type == .contextCompaction && item.summary == "Context compacted" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "native-context-compaction" && item.type == .contextCompaction && item.summary == "Context compaction" } else { return false } })
+    }
+
+    func test_adapterRendersTurnCompletedFinalPayloadWhenOnlyRuntimeItemsStreamed() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "count to 10"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("mcpServer.startupStatus.updated", [
+            "serverName": "status",
+            "status": "completed"
+        ])
+        client.notificationHandler?("turn.completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-count-1",
+            "finalMessage": "1 2 3 4 5 6 7 8 9 10"
+        ])
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "MCP server status" } else { return false } },
+                      "runtime-only app-server activity must still stay available in the Work log")
+        XCTAssertTrue(events.contains { if case .turnCompleted(let turnId, let final) = $0 { return turnId == "turn-count-1" && final == "1 2 3 4 5 6 7 8 9 10" } else { return false } },
+                      "a simple completed Codex turn must render the human answer even when the app-server only streamed runtime/tool notifications")
     }
 
     func test_adapterMapsGeneratedAppServerOperationalNotificationsIntoVisibleEvents() async throws {
@@ -1616,6 +1672,10 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         let providerThreadId: String
         let includeTurns: Bool
     }
+    struct UpdatedThreadSettings {
+        let providerThreadId: String
+        let permissionMode: AgentPermissionMode
+    }
 
     var notificationHandler: CodexAppServerClient.NotificationHandler?
     var serverRequestHandler: CodexAppServerClient.ServerRequestHandler?
@@ -1628,6 +1688,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     private var _interruptedTurns: [InterruptedTurn] = []
     private var _rolledBackTurns: [RolledBackTurn] = []
     private var _readCalls: [ReadCall] = []
+    private var _updatedThreadSettings: [UpdatedThreadSettings] = []
 
     init(autoComplete: Bool = true) {
         self.autoComplete = autoComplete
@@ -1656,6 +1717,11 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     var readCalls: [ReadCall] {
         lock.lock(); defer { lock.unlock() }
         return _readCalls
+    }
+
+    var updatedThreadSettings: [UpdatedThreadSettings] {
+        lock.lock(); defer { lock.unlock() }
+        return _updatedThreadSettings
     }
 
     var didStop: Bool {
@@ -1704,6 +1770,16 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject {
         recordRolledBack(RolledBackTurn(providerThreadId: providerThreadId, numTurns: numTurns))
         return ["thread": ["id": providerThreadId, "turns": []]]
+    }
+
+    func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws {
+        recordUpdatedThreadSettings(UpdatedThreadSettings(providerThreadId: providerThreadId, permissionMode: permissionMode))
+    }
+
+    private func recordUpdatedThreadSettings(_ update: UpdatedThreadSettings) {
+        lock.lock()
+        _updatedThreadSettings.append(update)
+        lock.unlock()
     }
 
     func stop() {

@@ -8,6 +8,7 @@ public protocol CodexAppServerControlling: AnyObject, Sendable {
     func interruptTurn(providerThreadId: String, turnId: String) async throws
     func readThread(providerThreadId: String, includeTurns: Bool) async throws -> CodexAppServerClient.JSONObject
     func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject
+    func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws
     func stop()
 }
 
@@ -37,6 +38,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var emittedProposedPlanIds: Set<String>
         var startedItemIds: Set<String>
         var streamedItemIds: Set<String>
+        var permissionMode: AgentPermissionMode
     }
 
     private struct PendingApproval {
@@ -88,7 +90,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let client = try clientFor(request: request, onEvent: onEvent)
         _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
         let opened = try await client.openThread(for: request)
-        recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent)
+        recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
         onEvent(.status(.running))
         onEvent(.event(.threadStarted(threadId: opened.providerThreadId, providerThreadId: opened.providerThreadId)))
 
@@ -136,6 +138,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             runtimeEvent(method: "item/requestApproval/decision", payload: payload),
             .requestResolved(requestId: requestId, state: state)
         ], threadId: threadId)
+        if response == .approveForSession {
+            setSessionPermissionMode(threadId: threadId, permissionMode: .fullAccess)
+            try promoteSessionPermission(threadId: threadId, to: .fullAccess)
+        }
         pending.continuation.resume(returning: ["decision": Self.codexDecision(response)])
     }
 
@@ -192,7 +198,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         do {
             let opened = try box.get().get()
-            recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent)
+            recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
             if let activeTurnId = Self.recoveryActiveTurnId(from: request.extraArgs) {
                 setActiveTurn(threadId: request.threadId, turnId: activeTurnId)
             }
@@ -326,6 +332,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private func awaitApproval(method: String, payload: [String: Any], threadId: AgentThreadID, kind: AssistantRequestKind) async throws -> Any? {
+        if sessionPermissionMode(threadId: threadId) == .fullAccess {
+            emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
+            return ["decision": "acceptForSession"]
+        }
         let requestId = UUID().uuidString
         let turnId = string(payload, "turnId")
             ?? string(payload, "turn_id")
@@ -354,6 +364,27 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ))
             ], threadId: threadId)
         }
+    }
+
+    private func promoteSessionPermission(threadId: AgentThreadID, to mode: AgentPermissionMode) throws {
+        guard let snapshot = sessionSnapshot(threadId: threadId) else {
+            throw AgentProviderAdapterError.sessionNotFound(threadId)
+        }
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = LockedResult<Void>()
+        Task {
+            do {
+                try await snapshot.client.updateThreadSettings(providerThreadId: snapshot.providerThreadId, permissionMode: mode)
+                box.set(.success(()))
+            } catch {
+                box.set(.failure(error))
+            }
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 10) == .success else {
+            throw AgentProviderAdapterError.unsupported("Codex app-server thread/settings/update timed out")
+        }
+        try box.get().get()
     }
 
     private func awaitUserInput(method: String, payload: [String: Any], threadId: AgentThreadID) async throws -> Any? {
@@ -458,11 +489,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 startedAtMs: now,
                 finishedAtMs: completed ? now : nil
             )))
-        case "item/started":
+        case "item/started", "item.started":
             let item = (payload["item"] as? [String: Any]) ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
+            if rawType == "userMessage" { break }
             if markStartedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
                 events.append(.itemStarted(item: AssistantItem(
                     id: itemId,
@@ -488,11 +520,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 startedAtMs: now,
                 finishedAtMs: completed ? now : nil
             )))
-        case "item/completed":
+        case "item/completed", "item.completed":
             let item = (payload["item"] as? [String: Any]) ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
+            if rawType == "userMessage" { break }
             let itemType = Self.assistantItemType(for: rawType)
             let summary = Self.summary(for: item, type: rawType)
             if rawType == "plan",
@@ -533,7 +566,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ))
             }
             events.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(for: string(item, "status"))))
-        case "item/agentMessage/delta":
+        case "item/agentMessage/delta", "item.agentMessage.delta":
             let itemId = string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             ensureAssistantItem(threadId: threadId, turnId: turnId, itemId: itemId, now: now, events: &events)
@@ -792,9 +825,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 startedAtMs: now,
                 finishedAtMs: now
             )))
-        case "turn/completed":
+        case "turn/completed", "turn.completed":
             let turnId = string(payload, "turnId") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) ?? activeTurnId(threadId: threadId) ?? ""
-            let final = finalMessage(threadId: threadId)
+            let final = Self.turnCompletedFinalMessage(from: payload) ?? finalMessage(threadId: threadId)
             if let markdown = Self.proposedPlanMarkdown(in: final) ?? planModeFinalMarkdown(threadId: threadId, final: final) {
                 let planId = "plan-\(turnId)"
                 if markProposedPlanEmitted(threadId: threadId, planId: planId) {
@@ -899,7 +932,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
     }
 
-    private func recordSession(threadId: AgentThreadID, client: CodexAppServerControlling, providerThreadId: String, interactionMode: AgentInteractionMode, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) {
+    private func recordSession(threadId: AgentThreadID, client: CodexAppServerControlling, providerThreadId: String, interactionMode: AgentInteractionMode, onEvent: @escaping @Sendable (AgentRunEvent) -> Void, permissionMode: AgentPermissionMode) {
         lock.lock()
         sessions[threadId] = Session(
             client: client,
@@ -915,7 +948,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             proposedPlanBuffers: [:],
             emittedProposedPlanIds: [],
             startedItemIds: [],
-            streamedItemIds: []
+            streamedItemIds: [],
+            permissionMode: permissionMode
         )
         lock.unlock()
     }
@@ -952,6 +986,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func providerThreadId(threadId: AgentThreadID) -> String? {
         lock.lock(); defer { lock.unlock() }
         return sessions[threadId]?.providerThreadId
+    }
+
+    private func sessionPermissionMode(threadId: AgentThreadID) -> AgentPermissionMode? {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.permissionMode
+    }
+
+    private func setSessionPermissionMode(threadId: AgentThreadID, permissionMode: AgentPermissionMode) {
+        lock.lock()
+        sessions[threadId]?.permissionMode = permissionMode
+        lock.unlock()
     }
 
     private func appendFinalMessage(threadId: AgentThreadID, delta: String) {
@@ -1330,9 +1375,40 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return turns.compactMap { string($0, "id") }
     }
 
+    private static func turnCompletedFinalMessage(from payload: [String: Any]) -> String? {
+        for candidate in turnCompletedPayloadCandidates(from: payload) {
+            if let text = stringBodyFallback(for: candidate)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty {
+                return text
+            }
+            if let items = candidate["items"] as? [[String: Any]] {
+                for item in items.reversed() {
+                    let type = string(item, "type") ?? ""
+                    if assistantItemType(for: type) == .assistantMessage,
+                       let text = body(for: item, type: type)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !text.isEmpty {
+                        return text
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func turnCompletedPayloadCandidates(from payload: [String: Any]) -> [[String: Any]] {
+        var candidates = [payload]
+        for key in ["turn", "message", "response", "result"] {
+            if let nested = payload[key] as? [String: Any] {
+                candidates.append(nested)
+            }
+        }
+        return candidates
+    }
+
     private static func events(fromThreadItem item: [String: Any], turnId: String, startedAtMs: Int64) -> [AssistantEvent] {
         let id = string(item, "id") ?? UUID().uuidString
         let type = string(item, "type") ?? "unknown"
+        if type == "userMessage" { return [] }
         let itemType = assistantItemType(for: type)
         let state = itemState(for: string(item, "status"))
         let summary = summary(for: item, type: type)
@@ -1483,7 +1559,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private static func stringBodyFallback(for item: [String: Any]) -> String? {
-        for key in ["text", "message", "output", "content", "result", "summary", "details", "detail", "path", "url", "query"] {
+        for key in ["finalMessage", "final_message", "final", "answer", "text", "message", "output", "content", "result", "summary", "details", "detail", "path", "url", "query"] {
             if let value = joinedStrings(item[key])?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
                 return value
             }

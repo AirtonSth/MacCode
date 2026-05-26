@@ -50,6 +50,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Fired when a run completes so the workspace can move up in its
     /// pinned/unpinned group.
     public var onRunCompleted: (() -> Void)?
+    /// Fired when local Agent App controls persist thread run config so
+    /// remote mirrors can receive the same thread metadata.
+    public var onThreadConfigPersisted: ((AgentThread) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
@@ -368,11 +371,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var openPendingRequests: [AssistantPendingRequest] {
-        timeline.pendingRequests.filter { $0.state == .pending || $0.state == .stale }
+        timeline.pendingRequests.filter { $0.state == .pending }
     }
 
     public var openPendingUserInputs: [AssistantUserInputRequest] {
-        timeline.pendingUserInputs.filter { $0.state == .pending || $0.state == .stale }
+        timeline.pendingUserInputs.filter { $0.state == .pending }
     }
 
     public func respondToPendingRequest(_ request: AssistantPendingRequest, response: AgentProviderRequestResponse) {
@@ -386,6 +389,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         do {
             try coordinator.respondToRequest(threadId: threadId, requestId: request.id, response: response)
             timeline.apply(.requestResolved(requestId: request.id, state: state))
+            if response == .approveForSession {
+                setPermissionMode(.fullAccess)
+            }
         } catch {
             timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
             timeline.apply(.requestResolved(requestId: request.id, state: .stale))
@@ -698,6 +704,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             threads[i].serviceTier = serviceTier
             threads[i].modelSelection = currentModelSelection
         }
+        onThreadConfigPersisted?(t)
     }
 
     public func setPermissionMode(_ mode: AgentPermissionMode) {

@@ -237,6 +237,17 @@ public final class CodexAppServerClient: @unchecked Sendable {
         )
     }
 
+    public func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws {
+        _ = try await requestJSONObject(
+            method: "thread/settings/update",
+            params: [
+                "threadId": providerThreadId,
+                "approvalPolicy": Self.approvalPolicy(for: permissionMode),
+                "sandboxPolicy": Self.sandboxPolicy(for: permissionMode)
+            ]
+        )
+    }
+
     public func notify(method: String, params: Any? = nil) throws {
         var payload: JSONObject = ["method": method]
         if let params { payload["params"] = params }

@@ -498,7 +498,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "selecting a composer suggestion must preserve surrounding prompt text")
     }
 
-    func test_pendingProviderCallbacksExposeOnlyOpenOrStaleRows() throws {
+    func test_pendingProviderCallbacksExposeOnlyActionableRows() throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "callbacks")
         vm.timeline.apply(.requestOpened(AssistantPendingRequest(
@@ -526,8 +526,8 @@ final class AgentAppViewModelTests: XCTestCase {
         )))
         vm.timeline.apply(.requestResolved(requestId: "approval-1", state: .approved))
 
-        XCTAssertEqual(vm.openPendingRequests.map(\.id), ["approval-2"],
-                       "macOS Agent App must render stale provider callback state instead of leaving invisible dead requests")
+        XCTAssertEqual(vm.openPendingRequests.map(\.id), [],
+                       "macOS Agent App must not render stale provider callbacks as actionable rows after the turn can no longer answer them")
         XCTAssertEqual(vm.openPendingUserInputs.map(\.id), ["question-1"],
                        "macOS Agent App must surface provider questions so the user can unblock Codex/Claude")
     }
@@ -569,12 +569,14 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.selectThread(thread.id)
 
-        XCTAssertEqual(vm.openPendingRequests.first?.id, "approval-1")
-        XCTAssertEqual(vm.openPendingRequests.first?.state, .stale,
-                       "persisted stale approvals must reappear in the Agent App after restart/reload")
-        XCTAssertEqual(vm.openPendingUserInputs.first?.id, "question-1")
-        XCTAssertEqual(vm.openPendingUserInputs.first?.state, .stale,
-                       "persisted stale provider questions must reappear in the Agent App after restart/reload")
+        XCTAssertEqual(vm.timeline.pendingRequests.first?.state, .stale,
+                       "persisted stale approvals must remain in timeline state for diagnostics after restart/reload")
+        XCTAssertEqual(vm.timeline.pendingUserInputs.first?.state, .stale,
+                       "persisted stale provider questions must remain in timeline state for diagnostics after restart/reload")
+        XCTAssertEqual(vm.openPendingRequests, [],
+                       "stale approvals must not reappear as actionable Agent App cards after restart/reload")
+        XCTAssertEqual(vm.openPendingUserInputs, [],
+                       "stale provider questions must not reappear as actionable Agent App cards after restart/reload")
     }
 
     func test_failedPendingCallbackResponsesBecomeStaleAndNonActionable() throws {
@@ -611,10 +613,14 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.respondToPendingRequest(vm.openPendingRequests[0], response: .approve)
         vm.answerPendingUserInput(vm.openPendingUserInputs[0], answer: "Run")
 
-        XCTAssertEqual(vm.openPendingRequests.first?.state, .stale,
-                       "failed provider approval responses must become non-actionable stale UI instead of leaving a dead approve button")
-        XCTAssertEqual(vm.openPendingUserInputs.first?.state, .stale,
-                       "failed provider question responses must become non-actionable stale UI instead of leaving a dead answer button")
+        XCTAssertEqual(vm.timeline.pendingRequests.first?.state, .stale,
+                       "failed provider approval responses must be retained as stale diagnostics")
+        XCTAssertEqual(vm.timeline.pendingUserInputs.first?.state, .stale,
+                       "failed provider question responses must be retained as stale diagnostics")
+        XCTAssertEqual(vm.openPendingRequests, [],
+                       "failed provider approval responses must not leave a dead approve button")
+        XCTAssertEqual(vm.openPendingUserInputs, [],
+                       "failed provider question responses must not leave a dead answer card")
         XCTAssertTrue(vm.timeline.error?.contains("Provider user-input response failed") == true,
                       "callback loss must leave visible activity explaining why the user needs to restart the turn")
     }
@@ -664,6 +670,31 @@ final class AgentAppViewModelTests: XCTestCase {
                      "resolved provider questions must clear their local draft so stale text is not reused for a later request")
         XCTAssertTrue(request.isSecret,
                       "secret free-text questions use the same draft/submit path but must be distinguishable for masked rendering")
+    }
+
+    func test_approveForSessionPromotesThreadPermissionToFullAccess() throws {
+        let adapter = CapturingProviderAdapter(provider: .codex)
+        let (vm, repo) = try makeVM(adapter: adapter)
+        vm.createThread(title: "approval")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        let request = AssistantPendingRequest(
+            id: "approval-1",
+            turnId: "turn-1",
+            kind: .commandExecution,
+            title: "Run command",
+            detail: "npm create vite",
+            createdAtMs: 1
+        )
+        vm.timeline.apply(.requestOpened(request))
+
+        vm.respondToPendingRequest(request, response: .approveForSession)
+
+        XCTAssertEqual(adapter.lastRequestResponse?.response, .approveForSession,
+                       "Approve Session must still send the provider session-scoped decision so the current run stops asking")
+        XCTAssertEqual(vm.permissionMode, .fullAccess,
+                       "Approve Session must visibly move the macOS thread from Supervised to Full Access")
+        XCTAssertEqual(try repo.get(id: threadId)?.permissionMode, .fullAccess,
+                       "Approve Session must persist Full Access so later messages in the same thread auto-approve")
     }
 
     func test_selectThreadReplaysProviderReadThreadSnapshotWhenAvailable() throws {
@@ -2600,7 +2631,13 @@ private final class CapturingProviderAdapter: AgentProviderAdapter, @unchecked S
     let provider: AgentProvider
     let readEvents: [AssistantEvent]
     private let lock = NSLock()
+    private var _lastRequestResponse: (threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse)?
     private var _lastUserInputResponse: (threadId: AgentThreadID, requestId: String, text: String)?
+
+    var lastRequestResponse: (threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastRequestResponse
+    }
 
     var lastUserInputResponse: (threadId: AgentThreadID, requestId: String, text: String)? {
         lock.lock(); defer { lock.unlock() }
@@ -2620,7 +2657,11 @@ private final class CapturingProviderAdapter: AgentProviderAdapter, @unchecked S
         AgentRunHandle(runId: request.runId, process: nil) {}
     }
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        lock.lock()
+        _lastRequestResponse = (threadId, requestId, response)
+        lock.unlock()
+    }
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
         lock.lock()
         _lastUserInputResponse = (threadId, requestId, text)

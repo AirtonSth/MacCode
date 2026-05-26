@@ -57,6 +57,33 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         self.context = context
     }
 
+    private func publishAgentThreadUpdated(_ thread: AgentThread) {
+        let locked = !((try? listAgentMessages(thread: thread.id, limit: 1)) ?? []).isEmpty
+        var payload: [String: JSONValue] = [
+            "thread_id": .string(thread.id.value.uuidString),
+            "workspace_id": thread.workspaceId.map { .string($0.value.uuidString) } ?? .null,
+            "title": .string(thread.title),
+            "display_title": .string(AgentThreadTitle.display(thread.title)),
+            "displayTitle": .string(AgentThreadTitle.display(thread.title)),
+            "provider": .string(thread.provider.rawValue),
+            "model": .string(thread.model),
+            "provider_locked": .bool(locked),
+            "providerLocked": .bool(locked),
+            "permission_mode": .string(thread.permissionMode.rawValue),
+            "reasoning_effort": .string(thread.reasoningEffort.rawValue),
+            "service_tier": .string(thread.serviceTier.rawValue),
+            "execution_mode": .string(thread.executionMode.rawValue),
+            "pinned": .bool(thread.pinned),
+            "sort_order": .number(Double(thread.sortOrder))
+        ]
+        payload["provider_instance_id"] = thread.providerInstanceId.map { .string($0) } ?? .null
+        payload["providerInstanceId"] = thread.providerInstanceId.map { .string($0) } ?? .null
+        payload["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
+        payload["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
+        payload["color"] = thread.color.map { .string($0) } ?? .null
+        EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
+    }
+
     /// Walk the restored layout state and instantiate fresh Surface
     /// views for every descriptor. Surfaces are rebuilt with new IDs
     /// (their old IDs were owned by surfaces that no longer exist), so
@@ -115,6 +142,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                         }
                         agent.viewModel.onRunCompleted = { [weak self] in
                             self?.promoteWorkspaceAfterCompletedRun(wid)
+                        }
+                        agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
+                            self?.publishAgentThreadUpdated(thread)
                         }
                         surface = agent
                     case .files:
@@ -890,6 +920,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         do {
             try ctx.coordinator.respondToRequest(threadId: thread, requestId: requestId, response: response)
             try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .approval, state: state)
+            EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
+                "thread_id": .string(thread.value.uuidString),
+                "request_id": .string(requestId),
+                "state": .string(state.rawValue)
+            ]))
+            if response == .approveForSession {
+                let updated = try configureAgentThread(
+                    thread: thread,
+                    provider: nil,
+                    model: nil,
+                    permissionMode: .fullAccess,
+                    reasoningEffort: nil,
+                    serviceTier: nil,
+                    modelSelection: nil,
+                    providerInstanceId: nil
+                )
+                publishAgentThreadUpdated(updated)
+            }
         } catch {
             let reason = "Provider approval response failed: \(error)"
             try? ctx.providerPendingCallbackRepo.markStale(threadId: thread, requestId: requestId, kind: .approval, reason: reason)
@@ -908,6 +956,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         do {
             try ctx.coordinator.respondToUserInput(threadId: thread, requestId: requestId, text: text)
             try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .userInput, state: .resolved)
+            EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
+                "thread_id": .string(thread.value.uuidString),
+                "request_id": .string(requestId),
+                "answer": .string(text)
+            ]))
         } catch {
             let reason = "Provider user-input response failed: \(error)"
             try? ctx.providerPendingCallbackRepo.markStale(threadId: thread, requestId: requestId, kind: .userInput, reason: reason)
@@ -1819,6 +1872,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 }
                 agent.viewModel.onRunCompleted = { [weak self] in
                     self?.promoteWorkspaceAfterCompletedRun(workspace)
+                }
+                agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
+                    self?.publishAgentThreadUpdated(thread)
                 }
                 surface = agent
             case .files:

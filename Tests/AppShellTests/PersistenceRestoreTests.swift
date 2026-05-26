@@ -1,6 +1,8 @@
 import XCTest
 @testable import AppShell
+@testable import AgentRuntime
 @testable import CoreModel
+@testable import SocketServer
 @testable import Surfaces
 import Persistence
 
@@ -191,4 +193,120 @@ final class PersistenceRestoreTests: XCTestCase {
         XCTAssertTrue(visible.requests.first?.detail?.contains("Provider approval response failed") == true)
         XCTAssertEqual(visible.userInputs.first?.state, .stale)
     }
+
+    func test_approveForSessionFromRemoteClientPromotesThreadToFullAccessAndMirrorsEvent() throws {
+        let dir = NSTemporaryDirectory() + "RC2Persist-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let adapter = ApprovalCaptureAdapter(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        var thread = AgentThread(workspaceId: nil, title: "approval", provider: .codex, model: "gpt-5.5")
+        thread.permissionMode = .supervised
+        try ctx.threadRepo.upsert(thread)
+        var mirroredEvents: [EventBus.Event] = []
+        let lastSeq = EventBus.shared.snapshot().lastSeq
+        let token = EventBus.shared.subscribe(since: lastSeq) { event in
+            if event.kind == "agent.thread.updated" { mirroredEvents.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        try router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approveForSession)
+
+        XCTAssertEqual(adapter.lastRequestResponse?.response, .approveForSession,
+                       "the iOS RPC path must still send the session-scoped approval to the live provider adapter")
+        XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.permissionMode, .fullAccess,
+                       "Approve Session from iOS must persist Full Access on the host thread")
+        XCTAssertTrue(mirroredEvents.contains {
+            $0.payload.objectValue?["thread_id"] == .string(thread.id.value.uuidString) &&
+            $0.payload.objectValue?["permission_mode"] == .string("full_access")
+        }, "Approve Session from iOS must emit a thread update so connected devices render Full Access")
+    }
+
+    func test_remoteUserInputResponseResolvesStoredCallbackAndMirrorsEvent() throws {
+        let dir = NSTemporaryDirectory() + "RC2UserInput-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let adapter = ApprovalCaptureAdapter(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        let thread = AgentThread(title: "callback", provider: .codex, model: "gpt-5.5")
+        try ctx.threadRepo.upsert(thread)
+        try ctx.providerPendingCallbackRepo.record(threadId: thread.id, userInput: AssistantUserInputRequest(
+            id: "question-1",
+            turnId: "turn-1",
+            prompt: "Continue?",
+            options: ["Plan", "Run"],
+            createdAtMs: 2
+        ))
+
+        var mirroredEvents: [EventBus.Event] = []
+        let lastSeq = EventBus.shared.snapshot().lastSeq
+        let token = EventBus.shared.subscribe(since: lastSeq) { event in
+            if event.kind == "agent.user_input.resolved" { mirroredEvents.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        try router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run")
+
+        XCTAssertEqual(adapter.lastUserInputResponse?.text, "Run",
+                       "the iOS RPC path must still send the answer to the live provider adapter")
+        XCTAssertEqual(try ctx.providerPendingCallbackRepo.get(threadId: thread.id, requestId: "question-1", kind: .userInput)?.state, .resolved,
+                       "answering from a remote client must resolve the stored callback so reloads do not resurrect the card")
+        XCTAssertEqual(try router.listAgentPendingCallbacks(thread: thread.id).userInputs, [],
+                       "resolved provider questions must disappear from macOS and iOS callback reloads")
+        XCTAssertTrue(mirroredEvents.contains {
+            $0.payload.objectValue?["thread_id"] == .string(thread.id.value.uuidString) &&
+            $0.payload.objectValue?["request_id"] == .string("question-1") &&
+            $0.payload.objectValue?["answer"] == .string("Run")
+        }, "answering from iOS must emit a resolved event so all open Agent App mirrors clear the card")
+    }
+}
+
+private final class ApprovalCaptureAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var _lastRequestResponse: (threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse)?
+    private var _lastUserInputResponse: (threadId: AgentThreadID, requestId: String, text: String)?
+
+    var lastRequestResponse: (threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastRequestResponse
+    }
+
+    var lastUserInputResponse: (threadId: AgentThreadID, requestId: String, text: String)? {
+        lock.lock(); defer { lock.unlock() }
+        return _lastUserInputResponse
+    }
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+        lock.lock()
+        _lastRequestResponse = (threadId, requestId, response)
+        lock.unlock()
+    }
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        lock.lock()
+        _lastUserInputResponse = (threadId, requestId, text)
+        lock.unlock()
+    }
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { true }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }
