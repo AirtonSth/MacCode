@@ -2,6 +2,27 @@ import XCTest
 @testable import CoreModel
 
 final class SurfaceOutputBusTests: XCTestCase {
+    func testFlushNowDeliversPendingTerminalOutputSynchronouslyForHistoryRead() {
+        let bus = SurfaceOutputBus()
+        let surfaceID = SurfaceID()
+        var chunks: [String] = []
+        var seqs: [Int] = []
+
+        bus.sink = { id, seq, data in
+            guard id == surfaceID else { return }
+            seqs.append(seq)
+            chunks.append(String(decoding: data, as: UTF8.self))
+        }
+
+        bus.emit(surfaceID, Data("complete ".utf8))
+        bus.emit(surfaceID, Data("history".utf8))
+        bus.flushNow(surfaceID)
+
+        XCTAssertEqual(chunks, ["complete history"],
+                       "surface.read_history must be able to flush the current terminal batch before returning an authoritative snapshot")
+        XCTAssertEqual(seqs, [1])
+    }
+
     func testBurstTerminalOutputIsBatchedBeforeMirrorDelivery() {
         let bus = SurfaceOutputBus()
         let surfaceID = SurfaceID()

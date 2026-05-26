@@ -31,6 +31,7 @@ public struct TerminalRuntimeHealth: Sendable, Equatable {
 
 public struct TerminalTextSnapshot: Sendable, Equatable {
     public var text: String
+    public var ansiText: String? = nil
     public var complete: Bool
     public var source: String
     public var timestamp: Date

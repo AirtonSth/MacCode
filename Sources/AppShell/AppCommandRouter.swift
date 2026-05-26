@@ -416,6 +416,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow {
         guard let surfaceObject = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
         (surfaceObject as? TerminalSurface)?.flushPersistedHistory()
+        SurfaceOutputBus.shared.flushNow(surface)
         guard let repo = context?.terminalOutputRepo else { throw LayoutError.surfaceNotFound }
         return try repo.readWindow(surfaceID: surface.value.uuidString, beforeChunkID: beforeChunkID, maxBytes: maxBytes)
     }
@@ -2264,6 +2265,7 @@ private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
 private func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue {
     .object([
         "text": .string(snapshot.text),
+        "ansi_text": snapshot.ansiText.map { .string($0) } ?? .null,
         "complete": .bool(snapshot.complete),
         "partial": .bool(!snapshot.complete),
         "source": .string(snapshot.source),

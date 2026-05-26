@@ -584,6 +584,7 @@ public final class TerminalSurface: NSObject, Surface {
         if !isVisible && outputPendingBytes > 0 {
             return TerminalTextSnapshot(
                 text: renderer.snapshot().string,
+                ansiText: renderer.ansiSnapshot(includeScrollback: true),
                 complete: false,
                 source: "ansi_fallback",
                 timestamp: Date(),
@@ -608,6 +609,7 @@ public final class TerminalSurface: NSObject, Surface {
             if Self.shouldPreferRendererSnapshotForReadText(viewportText: text, rendererText: rendererText) {
                 return TerminalTextSnapshot(
                     text: rendererText,
+                    ansiText: renderer.ansiSnapshot(includeScrollback: true),
                     complete: complete,
                     source: "ansi_renderer",
                     timestamp: Date(),
@@ -619,6 +621,7 @@ public final class TerminalSurface: NSObject, Surface {
             }
             return TerminalTextSnapshot(
                 text: text,
+                ansiText: renderer.ansiSnapshot(matchingVisibleText: text),
                 complete: complete,
                 source: "ghostty_viewport",
                 timestamp: Date(),
@@ -630,6 +633,7 @@ public final class TerminalSurface: NSObject, Surface {
         }
         return TerminalTextSnapshot(
             text: renderer.snapshot().string,
+            ansiText: renderer.ansiSnapshot(includeScrollback: true),
             complete: false,
             source: "ansi_fallback",
             timestamp: Date(),

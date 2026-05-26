@@ -511,6 +511,150 @@ public final class ANSIRenderer {
         return out
     }
 
+    public func ansiSnapshot(includeScrollback: Bool = false) -> String {
+        let allRows = usesAlternateScreen || !includeScrollback ? grid : scrollback + grid
+        var out = ""
+        var currentStyle: ANSIStyle?
+        for (i, row) in allRows.enumerated() {
+            var endCol = row.count - 1
+            while endCol >= 0, row[endCol].ch == " " && row[endCol].bg == NSColor.clear { endCol -= 1 }
+            if endCol >= 0 {
+                for c in 0...endCol {
+                    let cell = row[c]
+                    let style = ANSIStyle(cell: cell, isCursor: false)
+                    if style != currentStyle {
+                        out += style.sequence
+                        currentStyle = style
+                    }
+                    out.append(cell.ch)
+                }
+            }
+            if i < allRows.count - 1 {
+                out.append("\n")
+            }
+        }
+        if currentStyle != nil {
+            out += "\u{001B}[0m"
+        }
+        return out
+    }
+
+    public func ansiSnapshot(matchingVisibleText visibleText: String) -> String {
+        let full = ansiSnapshot(includeScrollback: true)
+        let ansiLines = full.components(separatedBy: "\n")
+        let plainLines = ansiLines.map(Self.strippingANSIControls)
+        var latestStyledLineByText: [String: String] = [:]
+        for (plain, ansi) in zip(plainLines, ansiLines) {
+            let key = Self.normalizeVisibleLine(plain)
+            guard !key.isEmpty else { continue }
+            latestStyledLineByText[key] = ansi
+        }
+
+        let matched = visibleText
+            .components(separatedBy: "\n")
+            .map { line -> String in
+                let key = Self.normalizeVisibleLine(line)
+                guard !key.isEmpty else { return "" }
+                return latestStyledLineByText[key] ?? ANSIStyle.defaultSequence + line
+            }
+            .joined(separator: "\n")
+        return matched.contains("\u{001B}") ? matched + "\u{001B}[0m" : matched
+    }
+
+    private static func normalizeVisibleLine(_ line: String) -> String {
+        var normalized = line
+        while normalized.last == " " {
+            normalized.removeLast()
+        }
+        return normalized
+    }
+
+    private static func strippingANSIControls(_ line: String) -> String {
+        var output = ""
+        var index = line.startIndex
+        while index < line.endIndex {
+            if line[index] == "\u{001B}" {
+                let next = line.index(after: index)
+                guard next < line.endIndex, line[next] == "[" else {
+                    index = next
+                    continue
+                }
+                var scan = line.index(after: next)
+                while scan < line.endIndex {
+                    let scalar = line[scan].unicodeScalars.first?.value ?? 0
+                    let after = line.index(after: scan)
+                    if scalar >= 0x40 && scalar <= 0x7E {
+                        index = after
+                        break
+                    }
+                    scan = after
+                    if scan == line.endIndex {
+                        index = scan
+                    }
+                }
+            } else {
+                output.append(line[index])
+                index = line.index(after: index)
+            }
+        }
+        return output
+    }
+
+    private struct ANSIStyle: Equatable {
+        var foreground: RGB?
+        var background: RGB?
+        var bold: Bool
+        var italic: Bool
+        var underline: Bool
+
+        init(cell: Cell, isCursor: Bool) {
+            var fg = cell.fg
+            var bg = cell.bg
+            if isCursor {
+                bg = ANSIRenderer.Cell.defaultFG
+                fg = ANSIRenderer.Cell.defaultBG == NSColor.clear ? DS.NS.terminalBG : ANSIRenderer.Cell.defaultBG
+            }
+            foreground = RGB(fg)
+            background = bg == NSColor.clear ? nil : RGB(bg)
+            bold = cell.bold
+            italic = cell.italic
+            underline = cell.underline
+        }
+
+        var sequence: String {
+            var codes = ["0"]
+            if bold { codes.append("1") }
+            if italic { codes.append("3") }
+            if underline { codes.append("4") }
+            if let foreground {
+                codes.append("38;2;\(foreground.red);\(foreground.green);\(foreground.blue)")
+            }
+            if let background {
+                codes.append("48;2;\(background.red);\(background.green);\(background.blue)")
+            }
+            return "\u{001B}[\(codes.joined(separator: ";"))m"
+        }
+
+        static var defaultSequence: String { "\u{001B}[0;38;2;242;242;242m" }
+    }
+
+    private struct RGB: Equatable {
+        var red: Int
+        var green: Int
+        var blue: Int
+
+        init?(_ color: NSColor) {
+            guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
+            red = Self.byte(srgb.redComponent)
+            green = Self.byte(srgb.greenComponent)
+            blue = Self.byte(srgb.blueComponent)
+        }
+
+        private static func byte(_ value: CGFloat) -> Int {
+            min(255, max(0, Int((value * 255).rounded())))
+        }
+    }
+
     public func cursorOffset(in rendered: String) -> Int {
         let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard !lines.isEmpty else { return 0 }

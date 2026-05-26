@@ -72,6 +72,69 @@ final class ANSIRendererTests: XCTestCase {
         assertColor(bg, red: 32, green: 36, blue: 48)
     }
 
+    func test_ansiSnapshotPreservesEnhancedTerminalStylesForIOSMirror() {
+        let r = ANSIRenderer(rows: 2, cols: 20)
+        r.showCursor = false
+
+        r.feed("\u{1B}[38;2;255;128;64;48;2;32;36;48;1mTUI\u{1B}[0m".data(using: .utf8)!)
+
+        let ansi = r.ansiSnapshot(includeScrollback: false)
+        XCTAssertTrue(ansi.contains("\u{1B}[0;1;38;2;255;128;64;48;2;32;36;48mT"),
+                      "iOS synchronized terminal snapshots must carry ANSI foreground, background, and bold state instead of plain text only")
+        XCTAssertTrue(ansi.hasSuffix("\u{1B}[0m"),
+                      "exported ANSI snapshots must reset style so later chunks do not inherit stale terminal colors")
+    }
+
+    func test_ansiSnapshotCanExportVisibleViewportWithoutOldScrollback() {
+        let r = ANSIRenderer(rows: 2, cols: 20)
+        r.showCursor = false
+
+        r.feed("old\ncurrent\nprompt".data(using: .utf8)!)
+
+        let visible = r.ansiSnapshot(includeScrollback: false)
+        XCTAssertFalse(visible.contains("old"),
+                       "callers that need only the current terminal frame can export ANSI without old scrollback")
+        XCTAssertTrue(visible.contains("current"))
+        XCTAssertTrue(visible.contains("prompt"))
+    }
+
+    func test_ansiSnapshotDoesNotExportSyntheticCursorCell() {
+        let r = ANSIRenderer(rows: 1, cols: 10)
+
+        r.feed("ab".data(using: .utf8)!)
+
+        let ansi = r.ansiSnapshot(includeScrollback: false)
+        XCTAssertFalse(ansi.hasSuffix(" \u{1B}[0m"),
+                       "synchronized mobile snapshots must not encode the host renderer cursor as a stray glyph")
+    }
+
+    func test_ansiSnapshotMatchingVisibleTextKeepsViewportShapeAndStyles() {
+        let r = ANSIRenderer(rows: 4, cols: 44)
+        r.showCursor = false
+
+        r.feed("""
+        old line
+        \u{1B}[38;2;242;242;242;48;2;87;31;24m76 - h1 {                                \u{1B}[0m
+        \u{1B}[38;2;242;242;242;48;2;87;31;24m77 -   font-size: 56px;                   \u{1B}[0m
+        \u{1B}[38;2;242;242;242m• Working (4m 27s • esc to interrupt)\u{1B}[0m
+        """.data(using: .utf8)!)
+
+        let visible = """
+        76 - h1 {
+        77 -   font-size: 56px;
+        • Working (4m 27s • esc to interrupt)
+        """
+        let ansi = r.ansiSnapshot(matchingVisibleText: visible)
+
+        XCTAssertEqual(ansi.components(separatedBy: "\n").count,
+                       visible.components(separatedBy: "\n").count,
+                       "iOS enhanced snapshots must match the macOS viewport line count instead of shipping the whole renderer scrollback")
+        XCTAssertTrue(ansi.contains("48;2;87;31;24"),
+                      "visible Ghostty lines should reuse the renderer's latest ANSI background when the same line exists in scrollback")
+        XCTAssertTrue(ansi.contains("• Working"),
+                      "the live status line must remain in the synchronized iOS snapshot")
+    }
+
     func test_carriageReturn_overwrites() {
         let r = ANSIRenderer(rows: 1, cols: 10)
         r.feed("abc\rXY".data(using: .utf8)!)

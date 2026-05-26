@@ -14,6 +14,7 @@ public final class SurfaceOutputBus: @unchecked Sendable {
     private var pending: [SurfaceID: Data] = [:]
     private var surfaceSeq: [SurfaceID: Int] = [:]
     private var flushScheduled = false
+    private let queueKey = DispatchSpecificKey<Void>()
 
     init(
         queue: DispatchQueue = DispatchQueue(label: "RemoteCode.SurfaceOutputBus"),
@@ -23,6 +24,7 @@ public final class SurfaceOutputBus: @unchecked Sendable {
         self.queue = queue
         self.flushDelay = max(0, flushDelay)
         self.maxBatchBytes = max(1, maxBatchBytes)
+        self.queue.setSpecific(key: queueKey, value: ())
     }
 
     /// Set by AppShell to forward to the network event bus.
@@ -50,6 +52,16 @@ public final class SurfaceOutputBus: @unchecked Sendable {
                 self.flush(surfaceId)
             } else {
                 self.scheduleFlush()
+            }
+        }
+    }
+
+    public func flushNow(_ surfaceId: SurfaceID) {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            flush(surfaceId)
+        } else {
+            queue.sync {
+                flush(surfaceId)
             }
         }
     }
