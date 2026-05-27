@@ -951,6 +951,108 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertEqual(adapter.lastPrompt, "hi")
     }
 
+    func test_reconcileOnLaunchClearsThreadAndProviderSessionStateForInterruptedRuns() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-launch-reconcile-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        var thread = AgentThread(title: "stale codex", provider: .codex, model: "gpt-5.5")
+        thread.status = .running
+        try threadRepo.upsert(thread)
+        let run = AgentRun(id: AgentRunID(), threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .running)
+        try runRepo.upsert(run)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .running,
+            resumeCursor: nil,
+            updatedAt: Date(timeIntervalSince1970: 1)
+        ))
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: SpyProviderAdapter(provider: .codex)])
+
+        try coordinator.reconcileOnLaunch()
+
+        XCTAssertEqual(try runRepo.get(id: run.id)?.status, .interrupted,
+                       "launch recovery must not leave a persisted Codex run marked running when no provider process survived restart")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .interrupted,
+                       "Agent App must not show an endless running spinner after launch reconciles a dead Codex run")
+        XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .interrupted,
+                       "provider recovery state must not keep a dead Codex app-server session active after launch")
+    }
+
+    func test_startRunFailureMarksThreadAndSessionFailedInsteadOfLeavingRunningSpinner() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-start-failure-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "auth failure", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: FailingProviderAdapter(provider: .codex)])
+        let runId = AgentRunID()
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(runId: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "count"))
+            XCTFail("Codex app-server startup failures must be surfaced to the caller")
+        } catch {
+            // Expected: the important assertion is persisted state below.
+        }
+
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .failed,
+                       "provider startup failure must close the persisted run instead of leaving it running")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .failed,
+                       "Agent App must show a failed run state when Codex exits during startup, not an endless spinner")
+        XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .failed,
+                       "provider session runtime must record that Codex startup failed so recovery does not try to resume a dead process")
+        XCTAssertTrue((try sessionRepo.get(threadId: thread.id)?.lastErrorMessage ?? "").contains("simulated provider startup failure"))
+    }
+
+    func test_interruptedProviderSessionWithoutResumeCursorStartsFreshTurn() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-interrupted-fresh-start-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        var thread = AgentThread(title: "retry", provider: .codex, model: "gpt-5.5")
+        thread.status = .interrupted
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .interrupted,
+            resumeCursor: nil,
+            cwd: tmp,
+            model: "gpt-5.5",
+            lastEventKind: "run.started"
+        ))
+        let adapter = SpyProviderAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo,
+                                              messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providerSessionRepo: sessionRepo,
+                                              providerAdapters: [.codex: adapter])
+
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "gpt-5.5", cwd: tmp, prompt: "retry"))
+
+        await waitForAdapterSend(adapter)
+        XCTAssertEqual(adapter.lastProviderThreadId, nil,
+                       "an interrupted Codex thread with no persisted provider cursor must start a clean app-server session instead of blocking retry")
+        XCTAssertEqual(try messageRepo.list(threadId: thread.id).last?.content, "retry",
+                       "retry after interrupted startup must persist the user's new prompt")
+    }
+
     func test_coordinatorRoutesApprovalAndUserInputResponsesThroughProviderAdapter() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-provider-adapter-callbacks-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -1484,6 +1586,33 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         _stopAllCalled = true
         lock.unlock()
     }
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
+private final class FailingProviderAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        throw AgentProviderAdapterError.unsupported("simulated provider startup failure")
+    }
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { false }
+    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }
 

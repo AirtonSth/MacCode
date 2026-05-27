@@ -322,9 +322,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func suppressPersistedFinalDuplicatedByTimeline() {
-        let timelineTexts = Set(timeline.assistantTexts)
-        guard !timelineTexts.isEmpty else { return }
-        messages.removeAll { $0.role == .assistant && timelineTexts.contains($0.content) }
+        // Persisted assistant rows are the durable completed answer. The view
+        // suppresses matching live timeline text instead so partial replay
+        // cannot hide the final response.
     }
 
     public func loadEarlierMessages() {
@@ -1160,6 +1160,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // live provider completions can arrive after stream drain on
                 // a background handler. Keep the restart contract here too.
                 self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
+                if finishedTid == self.selectedThreadId {
+                    self.loadWindow(finishedTid)
+                    self.suppressPersistedFinalDuplicatedByTimeline()
+                }
             }
             if status == .completed, var t = try? self.threadRepo.get(id: finishedTid) {
                 // Completed work leaves an unread marker until the user
@@ -1424,6 +1428,47 @@ public struct AgentAppView: View {
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
+    static func shouldRenderFinalAssistantMessage(_ turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> Bool {
+        guard let final = turn.finalAssistantMessage, !final.isEmpty else { return false }
+        if assistantText(final, matchesAny: persistedAssistantTexts) { return false }
+        return !turn.items.contains {
+            guard $0.type == .assistantMessage else { return false }
+            return assistantText($0.body, matches: final)
+        }
+    }
+
+    static func shouldRenderAssistantItemBody(_ body: String, persistedAssistantTexts: [String] = []) -> Bool {
+        !body.isEmpty && !assistantText(body, matchesAny: persistedAssistantTexts)
+    }
+
+    private static func assistantText(_ text: String, matchesAny candidates: [String]) -> Bool {
+        candidates.contains { assistantText(text, matches: $0) }
+    }
+
+    private static func assistantText(_ lhs: String, matches rhs: String) -> Bool {
+        let normalizedLHS = normalizedAssistantText(lhs)
+        let normalizedRHS = normalizedAssistantText(rhs)
+        guard !normalizedLHS.isEmpty, !normalizedRHS.isEmpty else { return false }
+        let compactLHS = compactAssistantText(lhs)
+        let compactRHS = compactAssistantText(rhs)
+        return normalizedLHS == normalizedRHS ||
+            normalizedLHS.contains(normalizedRHS) ||
+            compactLHS == compactRHS ||
+            compactLHS.contains(compactRHS)
+    }
+
+    private static func normalizedAssistantText(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func compactAssistantText(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private enum TranscriptEntry: Identifiable {
         case message(AgentMessage)
         case turn(AssistantTurnSnapshot)
@@ -1452,6 +1497,10 @@ public struct AgentAppView: View {
                 if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
                 return lhs.sortTime < rhs.sortTime
             }
+    }
+
+    private var persistedAssistantTexts: [String] {
+        vm.messages.compactMap { $0.role == .assistant ? $0.content : nil }
     }
 
     public var body: some View {
@@ -2165,8 +2214,8 @@ public struct AgentAppView: View {
             }
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
-            if let final = turn.finalAssistantMessage, !final.isEmpty,
-               !turn.items.contains(where: { $0.type == .assistantMessage }) {
+            if let final = turn.finalAssistantMessage,
+               Self.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
                 assistantProse(final)
             }
         }
@@ -2183,7 +2232,9 @@ public struct AgentAppView: View {
     private func itemRow(_ item: AssistantItem) -> some View {
         switch item.type {
         case .assistantMessage:
-            if !item.body.isEmpty { assistantProse(item.body) }
+            if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
+                assistantProse(item.body)
+            }
         case .reasoning:
             VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text(item.state == .streaming ? "Thinking…" : "Thought")

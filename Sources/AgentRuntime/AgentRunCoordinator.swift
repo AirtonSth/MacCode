@@ -100,6 +100,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func reconcileOnLaunch() throws {
         _ = try runRepo.reconcileRunningOnLaunch()
+        let now = Date()
+        for thread in try threadRepo.list() where thread.status == .running {
+            var copy = thread
+            copy.status = .interrupted
+            copy.updatedAt = now
+            try threadRepo.upsert(copy)
+        }
+        if let providerSessionRepo {
+            let future = Date.distantFuture
+            for session in try providerSessionRepo.list(status: .running, updatedBefore: future) {
+                try providerSessionRepo.markStopped(threadId: session.threadId, at: now)
+            }
+        }
     }
 
     public func runStatus(_ runId: AgentRunID) throws -> AgentRunStatus? {
@@ -167,8 +180,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         let runId = effectiveRequest.runId
         let coordinator = self
-        let handle = try await runner.sendTurn(effectiveRequest) { ev in
-            coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
+        let handle: AgentRunHandle
+        do {
+            handle = try await runner.sendTurn(effectiveRequest) { ev in
+                coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
+            }
+        } catch {
+            markStartFailure(
+                error,
+                request: effectiveRequest,
+                runId: runId,
+                adapterKey: adapterKey,
+                binaryIdentity: binaryIdentity
+            )
+            throw error
         }
         let terminalStatus = (try? runRepo.get(id: runId)?.status).flatMap { status -> AgentRunStatus? in
             status == .running || status == .pending ? nil : status
@@ -278,6 +303,48 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         onRunFinished?(threadId, stoppedRunId, .cancelled)
     }
 
+    private func markStartFailure(_ error: Error, request: AgentRunRequest, runId: AgentRunID, adapterKey: String, binaryIdentity: String?) {
+        let message = String(describing: error)
+        var run = AgentRun(
+            id: runId,
+            threadId: request.threadId,
+            provider: request.provider,
+            providerInstanceId: request.providerInstanceId,
+            model: request.model,
+            status: .failed,
+            finishedAt: Date(),
+            errorMessage: message
+        )
+        run.startedAt = Date()
+        try? runRepo.upsert(run)
+        if var thread = try? threadRepo.get(id: request.threadId) {
+            thread.status = .failed
+            thread.updatedAt = Date()
+            try? threadRepo.upsert(thread)
+        }
+        try? providerSessionRepo?.upsert(ProviderSessionRuntime(
+            threadId: request.threadId,
+            provider: request.provider,
+            providerInstanceId: request.providerInstanceId,
+            adapterKey: adapterKey,
+            binaryIdentity: binaryIdentity,
+            status: .failed,
+            resumeCursor: request.providerThreadId,
+            cwd: request.cwd,
+            model: request.model,
+            serviceTier: request.serviceTier,
+            runtimeMode: request.permissionMode,
+            lastEventKind: "run.start_failed",
+            lastErrorMessage: message
+        ))
+        for observer in observersSnapshot() {
+            observer.runCoordinator(self, didChangeStatus: .failed, runId: runId, threadId: request.threadId)
+            observer.runCoordinator(self, didReceive: .error(message: message, recoverable: false), run: runId, threadId: request.threadId)
+        }
+        onAssistantEvent?(.error(message: message, recoverable: false), request.threadId, runId)
+        onRunFinished?(request.threadId, runId, .failed)
+    }
+
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
         let adapter = try adapterForThread(threadId)
         try adapter.respondToRequest(threadId: threadId, requestId: requestId, response: response)
@@ -366,6 +433,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             return nil
         case .stopped(let session) where session.provider == request.provider:
+            if session.resumeCursor?.isEmpty != false,
+               let thread = try threadRepo.get(id: request.threadId),
+               thread.providerThreadId?.isEmpty != false {
+                return nil
+            }
             throw AgentProviderAdapterError.unsupported("Provider session for this thread is stopped; start a new thread or rerun from a valid checkpoint.")
         case .unrecoverable(let reason):
             if let thread = try threadRepo.get(id: request.threadId), thread.providerThreadId?.isEmpty == false {

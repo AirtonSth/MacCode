@@ -936,6 +936,114 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
+    func test_finishCallbackReloadsSelectedMessagesWhenLiveTimelineMissedFinal() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        let id = vm.selectedThreadId!
+        try vm.messageRepo.append(AgentMessage(threadId: id, role: .user, content: "count"))
+        vm.messages = (try? vm.messageRepo.list(threadId: id)) ?? []
+
+        vm.runCoordinator(vm.coordinator, didFinish: AgentRunID(), threadId: id, status: .completed,
+                          finalMessage: "O: 1 2 3", providerThreadId: nil)
+
+        await waitAsync("selected messages include final assistant reply") {
+            vm.messages.contains { $0.role == .assistant && $0.content == "O: 1 2 3" }
+        }
+    }
+
+    func test_turnViewRendersFinalWhenAssistantItemHasNoBody() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage, body: "", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "O: I counted integers from 1 to 15.",
+            finished: true
+        )
+
+        XCTAssertTrue(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                      "an empty assistant item must not hide the completed final answer")
+    }
+
+    func test_turnViewRendersFinalWhenAssistantItemBodyIsOnlyPartial() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S count: 1 2 3 4 5 6 7 8 9 10 now count to 15",
+                              startedAtMs: 1)
+            ],
+            finalAssistantMessage: "S count: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15",
+            finished: true
+        )
+
+        XCTAssertTrue(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                      "a partial live assistant body must not hide the completed final answer")
+    }
+
+    func test_turnViewDoesNotDuplicateFinalWhenAssistantItemAlreadyRenderedBody() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage, body: "final answer", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "final answer",
+            finished: true
+        )
+
+        XCTAssertFalse(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                       "a non-empty assistant item already renders the final answer")
+    }
+
+    func test_turnViewDoesNotDuplicateFinalWhenOnlyWhitespaceDiffers() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "D count only.\n\n1 2 3 4 5 6 7 8 9 10",
+                              startedAtMs: 1)
+            ],
+            finalAssistantMessage: "D count only. 1 2 3 4 5 6 7 8 9 10",
+            finished: true
+        )
+
+        XCTAssertFalse(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                       "formatting-only differences between live and final assistant text must not duplicate the visible answer")
+    }
+
+    func test_turnViewDoesNotDuplicateFinalWhenWhitespaceBeforeNumberDiffers() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "D count only.\n\n1 2 3 4 5 6 7 8 9 10",
+                              startedAtMs: 1)
+            ],
+            finalAssistantMessage: "D count only.1 2 3 4 5 6 7 8 9 10",
+            finished: true
+        )
+
+        XCTAssertFalse(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                       "streamed and final assistant text can differ only by a missing space before the first token; that must stay one visible answer")
+    }
+
+    func test_turnViewUsesPersistedAssistantMessageAsCompletedAnswer() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "tool-1", turnId: "turn-1", type: .mcpToolCall,
+                              summary: "MCP server status", startedAtMs: 1)
+            ],
+            finalAssistantMessage: "1 2 3 4 5 6 7 8 9 10",
+            finished: true
+        )
+
+        XCTAssertFalse(AgentAppView.shouldRenderFinalAssistantMessage(
+            turn,
+            persistedAssistantTexts: ["1 2 3 4 5 6 7 8 9 10"]
+        ), "when the final answer is already persisted as a normal assistant row, timeline fallback must not duplicate it")
+    }
+
     func test_finishCallback_marksCompletedThreadUnreadUntilOpened() async throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "done")
@@ -1077,6 +1185,22 @@ final class AgentAppViewModelTests: XCTestCase {
                 $0.type == .assistantMessage && $0.body.contains("partial stream")
             }
         }
+    }
+
+    func test_timelineBuffersAssistantDeltaUntilItemStartedArrives() {
+        var timeline = AssistantTimelineState()
+
+        timeline.apply(.turnStarted(turnId: "turn-1"))
+        timeline.apply(.itemDelta(itemId: "assistant-1", bodyAppend: "O: 1 2 3", outputAppend: nil, summary: nil))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "assistant-1",
+            turnId: "turn-1",
+            type: .assistantMessage,
+            startedAtMs: 1
+        )))
+
+        XCTAssertEqual(timeline.turns.first?.items.first?.body, "O: 1 2 3",
+                       "provider notifications can reach the SwiftUI surface out of order; the first assistant delta must not be dropped or the user sees only tool/status rows")
     }
 
     func test_promptComposerEnterSendsAndShiftEnterInsertsNewline() {
@@ -1841,8 +1965,14 @@ final class AgentAppViewModelTests: XCTestCase {
         }, "sending a follow-up must not clear prior agent timeline history such as tool calls and outputs")
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "first prompt" })
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "second prompt" })
-        XCTAssertFalse(vm.messages.contains { $0.role == .assistant && $0.content == "first answer" },
-                       "the final assistant bubble must not duplicate the replayed assistant timeline")
+        let persistedAssistantTexts = vm.messages.compactMap { $0.role == .assistant ? $0.content : nil }
+        XCTAssertTrue(persistedAssistantTexts.contains("first answer"),
+                      "the persisted assistant answer must remain available as the durable completed response")
+        XCTAssertFalse(vm.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage &&
+            $0.body == "first answer" &&
+            AgentAppView.shouldRenderAssistantItemBody($0.body, persistedAssistantTexts: persistedAssistantTexts)
+        }, "the replayed assistant timeline must not render a duplicate of the persisted final answer")
     }
 
     func test_selectThreadReplaysPersistedStreamHistoryWithoutDuplicatingFinalAnswer() async throws {
@@ -1889,8 +2019,14 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(reloadedVM.timeline.turns.flatMap(\.items).contains {
             $0.type == .assistantMessage && $0.body.contains("partial stream")
         }, "reopening a thread must replay persisted stream items, not just show the final answer")
-        XCTAssertEqual(reloadedVM.messages.filter { $0.role == .assistant && $0.content == "partial stream final" }.count, 0,
-                       "the persisted final answer must not duplicate the replayed assistant stream")
+        let persistedAssistantTexts = reloadedVM.messages.compactMap { $0.role == .assistant ? $0.content : nil }
+        XCTAssertEqual(persistedAssistantTexts.filter { $0 == "partial stream final" }.count, 1,
+                       "the persisted final answer must remain available as the durable completed response")
+        XCTAssertFalse(reloadedVM.timeline.turns.flatMap(\.items).contains {
+            $0.type == .assistantMessage &&
+            $0.body == "partial stream final" &&
+            AgentAppView.shouldRenderAssistantItemBody($0.body, persistedAssistantTexts: persistedAssistantTexts)
+        }, "the replayed assistant stream must not render a duplicate of the persisted final answer")
     }
 
     func test_selectThreadReplaysPersistedContextTelemetryAfterRestart() async throws {

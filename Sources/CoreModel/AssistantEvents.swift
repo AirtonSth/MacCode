@@ -429,6 +429,13 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public var tokenUsage: AssistantTokenUsage?
     public var contextCompactionSummary: String?
     public var providerRuntimeEvents: [ProviderRuntimeEvent]
+    private var pendingItemDeltas: [String: PendingItemDelta]
+
+    private struct PendingItemDelta: Codable, Sendable, Equatable {
+        var body: String = ""
+        var output: String = ""
+        var summary: String?
+    }
 
     public init() {
         self.turns = []
@@ -437,6 +444,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         self.pendingUserInputs = []
         self.proposedPlans = []
         self.providerRuntimeEvents = []
+        self.pendingItemDeltas = [:]
     }
 
     public var latestAssistantMessage: String? {
@@ -473,6 +481,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .itemStarted(let item):
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
+                let pending = pendingItemDeltas.removeValue(forKey: item.id)
                 if let itemIndex = turns[idx].items.firstIndex(where: { $0.id == item.id }) {
                     let existing = turns[idx].items[itemIndex]
                     var merged = item
@@ -482,16 +491,19 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     if merged.summary == nil { merged.summary = existing.summary }
                     if merged.finishedAtMs == nil { merged.finishedAtMs = existing.finishedAtMs }
                     if merged.state == .streaming, existing.state != .streaming { merged.state = existing.state }
+                    applyPendingDelta(pending, to: &merged)
                     turns[idx].items[itemIndex] = merged
                 } else {
-                    turns[idx].items.append(item)
+                    var started = item
+                    applyPendingDelta(pending, to: &started)
+                    turns[idx].items.append(started)
                 }
             }
             if let recorded = self.item(withId: item.id) {
                 recordActivity(for: recorded, state: recorded.state)
             }
         case .itemDelta(let iid, let bodyAppend, let outputAppend, let summary):
-            mutateItem(iid) { item in
+            let applied = mutateItem(iid) { item in
                 if let b = bodyAppend {
                     item.body = Self.cappedText(item.body + b, limit: Self.liveTextLimit)
                 }
@@ -499,6 +511,17 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     item.output = Self.cappedText((item.output ?? "") + o, limit: Self.liveOutputLimit)
                 }
                 if let s = summary { item.summary = s }
+            }
+            if !applied {
+                var pending = pendingItemDeltas[iid] ?? PendingItemDelta()
+                if let b = bodyAppend {
+                    pending.body = Self.cappedText(pending.body + b, limit: Self.liveTextLimit)
+                }
+                if let o = outputAppend {
+                    pending.output = Self.cappedText(pending.output + o, limit: Self.liveOutputLimit)
+                }
+                if let s = summary { pending.summary = s }
+                pendingItemDeltas[iid] = pending
             }
         case .itemState(let iid, let state):
             mutateItem(iid) { $0.state = state }
@@ -618,12 +641,27 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         turns = Array(turns.suffix(Self.liveTurnLimit))
     }
 
-    private mutating func mutateItem(_ iid: String, _ mut: (inout AssistantItem) -> Void) {
+    @discardableResult
+    private mutating func mutateItem(_ iid: String, _ mut: (inout AssistantItem) -> Void) -> Bool {
         for ti in turns.indices {
             for ii in turns[ti].items.indices where turns[ti].items[ii].id == iid {
                 mut(&turns[ti].items[ii])
-                return
+                return true
             }
+        }
+        return false
+    }
+
+    private func applyPendingDelta(_ pending: PendingItemDelta?, to item: inout AssistantItem) {
+        guard let pending else { return }
+        if !pending.body.isEmpty {
+            item.body = Self.cappedText(item.body + pending.body, limit: Self.liveTextLimit)
+        }
+        if !pending.output.isEmpty {
+            item.output = Self.cappedText((item.output ?? "") + pending.output, limit: Self.liveOutputLimit)
+        }
+        if let summary = pending.summary {
+            item.summary = summary
         }
     }
 

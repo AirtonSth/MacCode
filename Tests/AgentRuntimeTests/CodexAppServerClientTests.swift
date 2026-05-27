@@ -56,6 +56,34 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(thread["origin"] as? String, "codex-app-server")
     }
 
+    func test_appServerClientRespondsToStringIdServerRequests() async throws {
+        let script = try makeFakeAppServerPeer()
+        let requests = LockedPairs()
+
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            serverRequestHandler: { method, params in
+                let itemId = (params as? [String: Any])?["itemId"] as? String ?? ""
+                requests.append((method, itemId))
+                return ["answers": ["question-1": ["answers": ["continue"]]]]
+            }
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let result: [String: Any] = try await client.requestJSONObject(
+            method: "test/stringIdRequest",
+            params: [:]
+        )
+
+        let recordedRequests = requests.values()
+        XCTAssertTrue(recordedRequests.contains { $0.0 == "item/tool/requestUserInput" && $0.1 == "item-string-request-1" },
+                       "Codex app-server may use JSON-RPC string ids for provider questions; RemoteCode must answer them or the turn can wait forever without a final response")
+        XCTAssertEqual(result["answered"] as? Bool, true)
+    }
+
     func test_openThreadResumesAndFallsBackToStartOnlyForRecoverableStaleThread() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
@@ -426,6 +454,31 @@ final class CodexAppServerClientTests: XCTestCase {
                     "id": msg["id"],
                     "result": last_thread_settings_update
                 }), flush=True)
+            elif method == "test/stringIdRequest":
+                print(json.dumps({
+                    "id": "request-string-1",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "itemId": "item-string-request-1",
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "questions": [
+                            {
+                                "id": "question-1",
+                                "header": "Continue",
+                                "question": "Continue?"
+                            }
+                        ]
+                    }
+                }), flush=True)
+                for response_line in sys.stdin:
+                    response = json.loads(response_line)
+                    if response.get("id") == "request-string-1":
+                        print(json.dumps({
+                            "id": msg["id"],
+                            "result": {"answered": True, "response": response}
+                        }), flush=True)
+                        break
             elif method == "turn/interrupt":
                 print(json.dumps({
                     "id": msg["id"],

@@ -55,6 +55,28 @@ public final class CodexAppServerClient: @unchecked Sendable {
         let resume: @Sendable (Result<Any?, Error>) -> Void
     }
 
+    private enum ServerRequestID {
+        case int(Int)
+        case string(String)
+
+        init?(_ value: Any?) {
+            if let int = value as? Int {
+                self = .int(int)
+            } else if let string = value as? String, !string.isEmpty {
+                self = .string(string)
+            } else {
+                return nil
+            }
+        }
+
+        var jsonValue: Any {
+            switch self {
+            case .int(let value): return value
+            case .string(let value): return value
+            }
+        }
+    }
+
     private let process: Process
     private let stdinPipe: Pipe
     private let stdoutPipe: Pipe
@@ -68,6 +90,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private var notificationHandler: NotificationHandler?
     private var serverRequestHandler: ServerRequestHandler?
     private var stderrBuffer = Data()
+    public var terminationHandler: (@Sendable (Error) -> Void)?
 
     public init(
         binary: String = "codex",
@@ -117,6 +140,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
         process.terminationHandler = { [weak self] _ in
             self?.failPending(CodexAppServerError.processExited)
+            self?.terminationHandler?(CodexAppServerError.processExited)
         }
 
         do {
@@ -318,7 +342,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
 
         guard let method = object["method"] as? String else { return }
         let params = object["params"]
-        if let id = object["id"] as? Int {
+        if let id = ServerRequestID(object["id"]) {
             Task { [weak self] in
                 await self?.handleServerRequest(id: id, method: method, params: params)
             }
@@ -327,13 +351,13 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    private func handleServerRequest(id: Int, method: String, params: Any?) async {
+    private func handleServerRequest(id: ServerRequestID, method: String, params: Any?) async {
         do {
             let result = try await serverRequestHandler?(method, params)
-            try write(["id": id, "result": result ?? NSNull()])
+            try write(["id": id.jsonValue, "result": result ?? NSNull()])
         } catch {
             try? write([
-                "id": id,
+                "id": id.jsonValue,
                 "error": [
                     "code": -32603,
                     "message": String(describing: error)

@@ -102,6 +102,41 @@ final class CodexAppServerAdapterTests: XCTestCase {
                       "Codex app-server cancellation must stop the provider process tree after interrupting the active turn")
     }
 
+    func test_adapterFailsRunWhenAppServerProcessExitsBeforeTurnCompleted() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "count"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.simulateTermination()
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let finish = await sink.finish {
+                XCTAssertEqual(finish.0, .failed)
+                XCTAssertEqual(finish.2, "codex-thread-1")
+                XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                               "dead Codex app-server sessions must be removed so the next turn starts cleanly")
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("Codex app-server process exit must finish the local run instead of leaving Agent App running forever")
+    }
+
     func test_adapterRollbackUsesCompletedTurnHistoryInsteadOfParsingTurnIdDigits() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -270,6 +305,47 @@ final class CodexAppServerAdapterTests: XCTestCase {
             return nil
         }
         XCTAssertEqual(openedRequests.map(\.id), [request.id])
+    }
+
+    func test_adapterHandlesDottedAppServerRequestAliases() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "ask me"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("item.tool.requestUserInput", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "question-1",
+                "questions": [[
+                    "id": "choice-1",
+                    "header": "Continue",
+                    "question": "Continue?"
+                ]]
+            ])
+        }
+        let request = try await waitForUserInput(in: sink)
+
+        try adapter.respondToUserInput(threadId: threadId, requestId: request.id, text: "continue")
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertNotNil(response["answers"],
+                        "dotted app-server request aliases must still route through pending UI callbacks; otherwise the provider turn can freeze waiting for input")
     }
 
     func test_adapterMapsNestedApprovalPayloadIntoReadableRequestDetail() async throws {
@@ -991,6 +1067,50 @@ final class CodexAppServerAdapterTests: XCTestCase {
                        "item/completed must not replay the full assistant text after deltas already streamed it")
     }
 
+    func test_adapterTreatsSnakeCaseAgentMessageCompletionAsFinalAssistantResponse() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "count to 10"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-snake-agent-message-1",
+            "item": [
+                "id": "agent-message-snake-1",
+                "type": "agent_message",
+                "text": "1 2 3 4 5 6 7 8 9 10",
+                "status": "completed"
+            ]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-snake-agent-message-1"
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "agent-message-snake-1" && item.type == .assistantMessage } else { return false } },
+                      "Codex app-server may emit no assistant delta and only complete an agent_message item; users still need a normal assistant bubble, not a tool row")
+        XCTAssertTrue(events.contains { if case .itemDelta(let itemId, let body, _, _) = $0 { return itemId == "agent-message-snake-1" && body == "1 2 3 4 5 6 7 8 9 10" } else { return false } },
+                      "the completed agent_message text must render as assistant text when the provider skips streaming deltas")
+        XCTAssertTrue(events.contains { if case .turnCompleted(let turnId, let final) = $0 { return turnId == "turn-snake-agent-message-1" && final == "1 2 3 4 5 6 7 8 9 10" } else { return false } },
+                      "turn.completed without finalMessage must return the completed agent_message text as the final user-visible answer")
+    }
+
     func test_adapterMapsAppServerTurnPlanUpdatedToActivePlanState() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -1679,6 +1799,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
 
     var notificationHandler: CodexAppServerClient.NotificationHandler?
     var serverRequestHandler: CodexAppServerClient.ServerRequestHandler?
+    var terminationHandler: (@Sendable (Error) -> Void)?
     var readResponse: CodexAppServerClient.JSONObject = ["thread": ["id": "codex-thread-1", "turns": []]]
     let autoComplete: Bool
     private let lock = NSLock()
@@ -1727,6 +1848,10 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     var didStop: Bool {
         lock.lock(); defer { lock.unlock() }
         return _didStop
+    }
+
+    func simulateTermination() {
+        terminationHandler?(CodexAppServerError.processExited)
     }
 
     func initialize(clientName: String, clientTitle: String, clientVersion: String) async throws -> CodexAppServerInitializeResult {

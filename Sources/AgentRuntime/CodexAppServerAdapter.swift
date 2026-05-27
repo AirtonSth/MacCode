@@ -2,6 +2,7 @@ import Foundation
 import CoreModel
 
 public protocol CodexAppServerControlling: AnyObject, Sendable {
+    var terminationHandler: (@Sendable (Error) -> Void)? { get set }
     func initialize(clientName: String, clientTitle: String, clientVersion: String) async throws -> CodexAppServerInitializeResult
     func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject
@@ -88,6 +89,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
         let client = try clientFor(request: request, onEvent: onEvent)
+        client.terminationHandler = { [weak self] error in
+            self?.handleClientTermination(threadId: request.threadId, error: error)
+        }
         _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
         let opened = try await client.openThread(for: request)
         recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
@@ -317,13 +321,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func handleServerRequest(method: String, params: Any?, threadId: AgentThreadID) async throws -> Any? {
         let payload = params as? [String: Any] ?? [:]
         switch method {
-        case "item/commandExecution/requestApproval":
+        case "item/commandExecution/requestApproval", "item.commandExecution.requestApproval":
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .commandExecution)
-        case "item/fileRead/requestApproval":
+        case "item/fileRead/requestApproval", "item.fileRead.requestApproval":
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .fileRead)
-        case "item/fileChange/requestApproval":
+        case "item/fileChange/requestApproval", "item.fileChange.requestApproval":
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .fileChange)
-        case "item/tool/requestUserInput":
+        case "item/tool/requestUserInput", "item.tool.requestUserInput":
             return try await awaitUserInput(method: method, payload: payload, threadId: threadId)
         default:
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
@@ -546,18 +550,24 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 )))
                 events.append(.contextCompaction(summary: summary))
             } else if Self.isRawResponseItemType(rawType) {
-                events.append(.itemStarted(item: AssistantItem(
-                    id: itemId,
-                    turnId: turnId,
-                    type: itemType,
-                    state: .completed,
-                    summary: summary,
-                    startedAtMs: now,
-                    finishedAtMs: now
-                )))
+                if markStartedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
+                    events.append(.itemStarted(item: AssistantItem(
+                        id: itemId,
+                        turnId: turnId,
+                        type: itemType,
+                        state: .completed,
+                        summary: summary,
+                        startedAtMs: now,
+                        finishedAtMs: now
+                    )))
+                }
             }
+            let alreadyStreamed = hasStreamedItem(threadId: threadId, turnId: turnId, itemId: itemId)
             if let body = Self.body(for: item, type: rawType), !body.isEmpty,
-               itemType != .assistantMessage || !hasStreamedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
+               itemType != .assistantMessage || !alreadyStreamed {
+                if itemType == .assistantMessage {
+                    appendFinalMessage(threadId: threadId, delta: body)
+                }
                 events.append(.itemDelta(
                     itemId: itemId,
                     bodyAppend: itemType == .assistantMessage ? body : nil,
@@ -930,6 +940,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         session.onEvent?(.status(.cancelled))
         session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
+    }
+
+    private func handleClientTermination(threadId: AgentThreadID, error: Error) {
+        guard let session = removeSession(threadId: threadId) else { return }
+        guard session.status == .running else { return }
+        settlePendingCallbacks(session: session)
+        let message = "Codex app-server process exited before completing the turn: \(error)"
+        session.onEvent?(.event(runtimeEvent(method: "process/exited", payload: [
+            "threadId": session.providerThreadId,
+            "message": message
+        ])))
+        session.onEvent?(.error(message))
+        session.onEvent?(.status(.failed))
+        session.onEvent?(.finished(.failed, finalMessage: nil, providerThreadId: session.providerThreadId))
     }
 
     private func recordSession(threadId: AgentThreadID, client: CodexAppServerControlling, providerThreadId: String, interactionMode: AgentInteractionMode, onEvent: @escaping @Sendable (AgentRunEvent) -> Void, permissionMode: AgentPermissionMode) {
@@ -1355,8 +1379,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     let planId = string(item, "id") ?? "plan-\(turnId)"
                     events.append(.proposedPlan(AssistantProposedPlan(id: planId, turnId: turnId, markdown: markdown)))
                 }
-                if string(item, "type") == "agentMessage",
-                   let text = body(for: item, type: "agentMessage"),
+                let type = string(item, "type") ?? ""
+                if assistantItemType(for: type) == .assistantMessage,
+                   let text = body(for: item, type: type),
                    !text.isEmpty {
                     finalMessage = text
                 }
@@ -1438,7 +1463,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private static func assistantItemType(for type: String) -> AssistantItemType {
         switch type {
-        case "agentMessage", "message": return .assistantMessage
+        case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message": return .assistantMessage
         case "plan": return .plan
         case "reasoning", "reasoning_text", "summary_text": return .reasoning
         case "commandExecution", "local_shell_call", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output": return .commandExecution
@@ -1456,6 +1481,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private static func isRawResponseItemType(_ type: String) -> Bool {
         [
+            "agentMessage", "assistantMessage", "agent_message", "assistant_message",
             "message", "reasoning", "reasoning_text", "summary_text",
             "local_shell_call", "function_call", "function_call_output",
             "custom_tool_call", "custom_tool_call_output", "mcp_call",
@@ -1481,7 +1507,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return "User message"
         case "hookPrompt":
             return "Hook prompt"
-        case "agentMessage", "message":
+        case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message":
             return "Assistant message"
         case "plan":
             return "Plan"
@@ -1523,7 +1549,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return joinedStrings(item["content"]) ?? stringBodyFallback(for: item)
         case "hookPrompt":
             return joinedStrings(item["fragments"]) ?? stringBodyFallback(for: item)
-        case "agentMessage", "message", "plan":
+        case "agentMessage", "assistantMessage", "agent_message", "assistant_message", "message", "plan":
             return string(item, "text")
                 ?? joinedStrings(item["content"])
                 ?? string(item, "planMarkdown")
