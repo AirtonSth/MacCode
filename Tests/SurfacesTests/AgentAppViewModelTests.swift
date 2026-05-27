@@ -1027,6 +1027,28 @@ final class AgentAppViewModelTests: XCTestCase {
                        "streamed and final assistant text can differ only by a missing space before the first token; that must stay one visible answer")
     }
 
+    func test_turnViewDoesNotDuplicateFinalWhenMultipleAssistantItemsAlreadyRenderedIt() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S e2e-fullaccess-start. D run pwd.",
+                              startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "S e2e-fullaccess-after-pwd. D run git status.",
+                              startedAtMs: 2),
+                AssistantItem(id: "msg-3", turnId: "turn-1", type: .assistantMessage,
+                              body: "O e2e-fullaccess-done.",
+                              startedAtMs: 3)
+            ],
+            finalAssistantMessage: "S e2e-fullaccess-start. D run pwd.S e2e-fullaccess-after-pwd. D run git status.O e2e-fullaccess-done.",
+            finished: true
+        )
+
+        XCTAssertFalse(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                       "when a turn streams several assistant updates, the persisted final can equal their combined text and must not be rendered as a duplicate block")
+    }
+
     func test_turnViewUsesPersistedAssistantMessageAsCompletedAnswer() {
         let turn = AssistantTurnSnapshot(
             turnId: "turn-1",
@@ -1042,6 +1064,65 @@ final class AgentAppViewModelTests: XCTestCase {
             turn,
             persistedAssistantTexts: ["1 2 3 4 5 6 7 8 9 10"]
         ), "when the final answer is already persisted as a normal assistant row, timeline fallback must not duplicate it")
+    }
+
+    func test_turnViewKeepsAssistantPartialVisibleWhenPersistedAnswerContainsIt() {
+        let persisted = """
+        Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
+        S wrapper not git repo.
+        C memory confirms wrapper workspace; git lives nested.
+        D locate nested repos, then stage/commit/push each dirty repo.
+        """
+
+        XCTAssertTrue(AgentAppView.shouldRenderAssistantItemBody(
+            """
+            Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
+            S wrapper not git repo.
+            """,
+            persistedAssistantTexts: [persisted]
+        ), "live partial updates must stay visible even when an older persisted answer contains the same prefix")
+    }
+
+    func test_persistedAssistantMessageHidesWhenLiveItemsAlreadyRenderCombinedText() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S e2e-fullaccess2-start. D run pwd.",
+                              startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "S e2e-fullaccess2-after-pwd. D run git status in macos-app.",
+                              startedAtMs: 2),
+                AssistantItem(id: "msg-3", turnId: "turn-1", type: .assistantMessage,
+                              body: "O e2e-fullaccess2-done.",
+                              startedAtMs: 3)
+            ],
+            finalAssistantMessage: "S e2e-fullaccess2-start. D run pwd.S e2e-fullaccess2-after-pwd. D run git status in macos-app.O e2e-fullaccess2-done.",
+            finished: true
+        )
+
+        XCTAssertFalse(AgentAppView.shouldRenderPersistedAssistantMessage(
+            "S e2e-fullaccess2-start. D run pwd.S e2e-fullaccess2-after-pwd. D run git status in macos-app.O e2e-fullaccess2-done.",
+            timelineTurns: [turn]
+        ), "the persisted assistant row must not duplicate the live macOS timeline when all partial updates already render")
+    }
+
+    func test_persistedAssistantMessageRendersWhenLiveItemsAreOnlyPartial() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S count: 1 2 3 4 5",
+                              startedAtMs: 1)
+            ],
+            finalAssistantMessage: "S count: 1 2 3 4 5 6 7 8 9 10",
+            finished: true
+        )
+
+        XCTAssertTrue(AgentAppView.shouldRenderPersistedAssistantMessage(
+            "S count: 1 2 3 4 5 6 7 8 9 10",
+            timelineTurns: [turn]
+        ), "if the live timeline has only a partial response, the persisted assistant answer must still render")
     }
 
     func test_finishCallback_marksCompletedThreadUnreadUntilOpened() async throws {
@@ -1201,6 +1282,25 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual(timeline.turns.first?.items.first?.body, "O: 1 2 3",
                        "provider notifications can reach the SwiftUI surface out of order; the first assistant delta must not be dropped or the user sees only tool/status rows")
+    }
+
+    func test_timelineIgnoresDuplicateTurnStartedForSameTurn() {
+        var timeline = AssistantTimelineState()
+
+        timeline.apply(.turnStarted(turnId: "turn-1"))
+        timeline.apply(.itemStarted(item: AssistantItem(
+            id: "assistant-1",
+            turnId: "turn-1",
+            type: .assistantMessage,
+            startedAtMs: 1
+        )))
+        timeline.apply(.itemDelta(itemId: "assistant-1", bodyAppend: "partial stream", outputAppend: nil, summary: nil))
+        timeline.apply(.turnStarted(turnId: "turn-1"))
+
+        XCTAssertEqual(timeline.turns.map(\.turnId), ["turn-1"],
+                       "duplicate provider turn-start notifications must not duplicate the visible macOS transcript")
+        XCTAssertEqual(timeline.turns.first?.items.first?.body, "partial stream",
+                       "deduping the turn must preserve already streamed assistant text")
     }
 
     func test_promptComposerEnterSendsAndShiftEnterInsertsNewline() {

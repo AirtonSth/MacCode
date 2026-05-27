@@ -476,8 +476,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .threadStarted(let tid, let ptid):
             self.threadId = tid; self.providerThreadId = ptid
         case .turnStarted(let tid):
-            turns.append(AssistantTurnSnapshot(turnId: tid))
-            trimTurns()
+            ensureTurn(tid)
         case .itemStarted(let item):
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {

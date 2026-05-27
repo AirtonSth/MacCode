@@ -1431,6 +1431,7 @@ public struct AgentAppView: View {
     static func shouldRenderFinalAssistantMessage(_ turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> Bool {
         guard let final = turn.finalAssistantMessage, !final.isEmpty else { return false }
         if assistantText(final, matchesAny: persistedAssistantTexts) { return false }
+        if assistantText(combinedAssistantItemText(in: turn), equals: final) { return false }
         return !turn.items.contains {
             guard $0.type == .assistantMessage else { return false }
             return assistantText($0.body, matches: final)
@@ -1438,11 +1439,34 @@ public struct AgentAppView: View {
     }
 
     static func shouldRenderAssistantItemBody(_ body: String, persistedAssistantTexts: [String] = []) -> Bool {
-        !body.isEmpty && !assistantText(body, matchesAny: persistedAssistantTexts)
+        !body.isEmpty && !assistantText(body, equalsAny: persistedAssistantTexts)
+    }
+
+    static func shouldRenderPersistedAssistantMessage(_ text: String, timelineTurns: [AssistantTurnSnapshot]) -> Bool {
+        guard !text.isEmpty else { return false }
+        return !timelineTurns.contains { turn in
+            if assistantText(combinedAssistantItemText(in: turn), equals: text) { return true }
+            return turn.items.contains {
+                guard $0.type == .assistantMessage else { return false }
+                return assistantText($0.body, equals: text)
+            }
+        }
     }
 
     private static func assistantText(_ text: String, matchesAny candidates: [String]) -> Bool {
         candidates.contains { assistantText(text, matches: $0) }
+    }
+
+    private static func assistantText(_ text: String, equalsAny candidates: [String]) -> Bool {
+        candidates.contains { assistantText(text, equals: $0) }
+    }
+
+    private static func combinedAssistantItemText(in turn: AssistantTurnSnapshot) -> String {
+        turn.items
+            .filter { $0.type == .assistantMessage }
+            .map(\.body)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
     }
 
     private static func assistantText(_ lhs: String, matches rhs: String) -> Bool {
@@ -1455,6 +1479,14 @@ public struct AgentAppView: View {
             normalizedLHS.contains(normalizedRHS) ||
             compactLHS == compactRHS ||
             compactLHS.contains(compactRHS)
+    }
+
+    private static func assistantText(_ lhs: String, equals rhs: String) -> Bool {
+        let normalizedLHS = normalizedAssistantText(lhs)
+        let normalizedRHS = normalizedAssistantText(rhs)
+        guard !normalizedLHS.isEmpty, !normalizedRHS.isEmpty else { return false }
+        return normalizedLHS == normalizedRHS ||
+            compactAssistantText(lhs) == compactAssistantText(rhs)
     }
 
     private static func normalizedAssistantText(_ text: String) -> String {
@@ -2186,7 +2218,9 @@ public struct AgentAppView: View {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
-            assistantProse(msg.content)
+            if Self.shouldRenderPersistedAssistantMessage(msg.content, timelineTurns: vm.timeline.turns) {
+                assistantProse(msg.content)
+            }
         case .system:
             Text(msg.content)
                 .font(DS.Font.caption)
