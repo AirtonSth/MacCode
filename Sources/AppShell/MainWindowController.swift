@@ -462,10 +462,23 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         restoreProtectedFocus(focusedInput)
     }
 
+    public func detachedVisibleWorkspaceIDsForSurfaceReconciliation() -> Set<WorkspaceID> {
+        Set(workspaceWindows.compactMap { workspaceID, controller in
+            guard controller.window.isVisible,
+                  context?.state.workspaces[workspaceID] != nil else { return nil }
+            return workspaceID
+        })
+    }
+
     public func focusSurface(_ id: SurfaceID) {
         if let s = SurfaceRegistry.shared.surface(id) {
             s.focus()
         }
+    }
+
+    public func repairSelectedTerminalFocus(reason: String) {
+        guard protectedFocusedView() == nil else { return }
+        router?.repairSelectedTerminalFocus(reason: reason)
     }
 
     public var hasProtectedInputFocus: Bool {
@@ -536,6 +549,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         workspaceWindows[workspaceID] = controller
         updateCollapsedWorkspaceHeader()
         controller.show()
+        router.reconcileSurfaceVisibility()
+        controller.repairSelectedTerminalFocus(reason: "detached_workspace_open")
     }
 
     public func workspaceWindow(for workspaceID: WorkspaceID) -> NSWindow? {
@@ -556,6 +571,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         refreshFromState()
         window.makeKeyAndOrderFront(nil)
         controller?.closeFromOwner()
+        router?.reconcileSurfaceVisibility()
+        repairSelectedTerminalFocus(reason: "detached_workspace_return")
     }
 
     private func workspaceWindowClosed(_ workspaceID: WorkspaceID) {
@@ -566,6 +583,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
         refreshFromState()
         window.makeKeyAndOrderFront(nil)
+        router?.reconcileSurfaceVisibility()
+        repairSelectedTerminalFocus(reason: "detached_workspace_close")
     }
 
     private func rebuildWorkspaceContainer() {
@@ -705,6 +724,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         context?.saveSnapshot()
     }
 
+    public func windowDidBecomeKey(_ notification: Notification) {
+        repairSelectedTerminalFocus(reason: "main_window_key")
+    }
+
     // MARK: NSSplitViewDelegate
     public func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
         guard splitView === split, dividerIndex == 0 else { return proposedMinimumPosition }
@@ -782,6 +805,7 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         window.makeKeyAndOrderFront(nil)
+        repairSelectedTerminalFocus(reason: "workspace_window_show")
     }
 
     func closeFromOwner() {
@@ -807,6 +831,18 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
         if let split = layout as? RatioSplitView {
             split.relayoutNow()
         }
+    }
+
+    func repairSelectedTerminalFocus(reason: String) {
+        guard protectedFocusedView() == nil else { return }
+        router?.repairSelectedTerminalFocus(workspace: workspaceID, reason: reason)
+    }
+
+    private func protectedFocusedView() -> NSView? {
+        guard let responder = window.firstResponder as? NSView,
+              responder is NSTextView,
+              responder.isDescendant(of: workspaceContent) else { return nil }
+        return responder
     }
 
     private func setupLayout() {
@@ -923,6 +959,10 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
         if !closingFromOwner {
             onClose()
         }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        repairSelectedTerminalFocus(reason: "workspace_window_key")
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {

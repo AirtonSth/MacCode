@@ -23,6 +23,7 @@ public struct TerminalRuntimeHealth: Sendable, Equatable {
     public var historyWriteFailures: Int
     public var rows: Int
     public var cols: Int
+    public var renderDiagnostics: TerminalRenderDiagnostics? = nil
 
     public var alive: Bool {
         processAlive && ptyOpen && terminalDeadReason == nil
@@ -39,6 +40,74 @@ public struct TerminalTextSnapshot: Sendable, Equatable {
     public var pendingBytes: Int
     public var rows: Int
     public var cols: Int
+    public var renderDiagnostics: TerminalRenderDiagnostics? = nil
+}
+
+public struct TerminalRenderDiagnostics: Sendable, Equatable {
+    public var logicalVisible: Bool
+    public var registryVisible: Bool
+    public var drainingHiddenBacklog: Bool
+    public var windowAttached: Bool
+    public var parked: Bool
+    public var hasUsableBounds: Bool
+    public var hiddenAncestor: Bool
+    public var blockedReason: String?
+
+    public var canRender: Bool {
+        logicalVisible &&
+        registryVisible &&
+        !drainingHiddenBacklog &&
+        windowAttached &&
+        !parked &&
+        hasUsableBounds &&
+        !hiddenAncestor
+    }
+
+    public init(
+        logicalVisible: Bool,
+        registryVisible: Bool,
+        drainingHiddenBacklog: Bool,
+        windowAttached: Bool,
+        parked: Bool,
+        hasUsableBounds: Bool,
+        hiddenAncestor: Bool
+    ) {
+        self.logicalVisible = logicalVisible
+        self.registryVisible = registryVisible
+        self.drainingHiddenBacklog = drainingHiddenBacklog
+        self.windowAttached = windowAttached
+        self.parked = parked
+        self.hasUsableBounds = hasUsableBounds
+        self.hiddenAncestor = hiddenAncestor
+        self.blockedReason = Self.firstBlockedReason(
+            logicalVisible: logicalVisible,
+            registryVisible: registryVisible,
+            drainingHiddenBacklog: drainingHiddenBacklog,
+            windowAttached: windowAttached,
+            parked: parked,
+            hasUsableBounds: hasUsableBounds,
+            hiddenAncestor: hiddenAncestor
+        )
+    }
+
+    static func firstBlockedReason(
+        logicalVisible: Bool,
+        registryVisible: Bool,
+        drainingHiddenBacklog: Bool,
+        windowAttached: Bool,
+        parked: Bool,
+        hasUsableBounds: Bool,
+        hiddenAncestor: Bool
+    ) -> String? {
+        if !logicalVisible { return "logical_hidden" }
+        if !registryVisible { return "registry_hidden" }
+        if drainingHiddenBacklog { return "hidden_backlog_draining" }
+        if !windowAttached { return "window_detached" }
+        if parked { return "parking_window" }
+        if !hasUsableBounds { return "invalid_bounds" }
+        if hiddenAncestor { return "hidden_ancestor" }
+        return nil
+    }
 }
 
 struct TerminalStartupEnvironment: Equatable {

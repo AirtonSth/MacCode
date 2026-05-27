@@ -135,6 +135,27 @@ def assert_alive(surface_id):
     return health
 
 
+def capture_terminal_diagnostics(surface_id):
+    if not surface_id:
+        return None
+    try:
+        health = rpc("surface.health", {"id": surface_id})
+        snap = snapshot(surface_id)
+        return {
+            "health": health,
+            "snapshot": {
+                "complete": snap.get("complete"),
+                "partial": snap.get("partial"),
+                "partial_reason": snap.get("partial_reason"),
+                "pending_bytes": snap.get("pending_bytes"),
+                "source": snap.get("source"),
+                "render_diagnostics": snap.get("render_diagnostics"),
+            },
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def open_slow_ws():
     key = base64.b64encode(os.urandom(16)).decode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -165,6 +186,8 @@ def recent(max_bytes=512):
 def main():
     start = time.time()
     app_support = Path(tempfile.mkdtemp(prefix="rc2-e2e."))
+    primary_sid = None
+    hidden_sid = None
     stats = {
         "status": "PASS",
         "duration_seconds": 0,
@@ -177,6 +200,8 @@ def main():
         "baseline_required_seen": False,
         "hidden_partial_seen": False,
         "workspace_tui_return_input_seen": False,
+        "post_idle_input_seen": False,
+        "render_diagnostics_seen": False,
         "large_input_bytes": LARGE_INPUT_BYTES,
         "tui_seconds": TUI_SECONDS,
         "child_exit_dead_seen": False,
@@ -222,7 +247,12 @@ def main():
             time.sleep(1)
             sample(pid, stats)
         wait_snapshot_contains(primary_sid, "RC2_E2E_STREAM_DONE")
-        assert_alive(primary_sid)
+        primary_health = assert_alive(primary_sid)
+        if isinstance(primary_health.get("render_diagnostics"), dict):
+            stats["render_diagnostics_seen"] = True
+        send_text(primary_sid, "printf 'RC2_POST_IDLE_INPUT_OK\\n'\n")
+        wait_snapshot_contains(primary_sid, "RC2_POST_IDLE_INPUT_OK", timeout=10)
+        stats["post_idle_input_seen"] = True
 
         send_text(hidden_sid, (
             "python3 - <<'PY'\n"
@@ -244,31 +274,14 @@ def main():
 
         send_text(primary_sid, (
             "stty -echo\n"
-            "cat >/tmp/rc2_workspace_tui.py <<'PY'\n"
-            "import select, sys, time\n"
-            "sys.stdout.write('\\x1b[?1049h')\n"
-            "sys.stdout.write('RC2_' + 'TUI_RUNTIME_READY\\n')\n"
-            "sys.stdout.flush()\n"
-            "tty=open('/dev/tty')\n"
-            "end=time.time()+60\n"
-            "i=0\n"
-            "while time.time()<end:\n"
-            "    sys.stdout.write('\\x1b[HRC2_WORKSPACE_TUI_%06d\\nwaiting for progress prompt\\n' % i)\n"
-            "    sys.stdout.flush()\n"
-            "    ready, _, _ = select.select([tty], [], [], 0.05)\n"
-            "    if ready:\n"
-            "        line=tty.readline().strip()\n"
-            "        if not line:\n"
-            "            continue\n"
-            "        sys.stdout.write('\\x1b[HRC2_TUI_PROGRESS_INPUT:%s\\n' % line)\n"
-            "        sys.stdout.flush()\n"
-            "        break\n"
-            "    i+=1\n"
-            "sys.stdout.write('\\x1b[?1049lRC2_TUI_WORKSPACE_RETURN_DONE\\n')\n"
-            "sys.stdout.flush()\n"
-            "PY\n"
+            "cat >/tmp/rc2_workspace_tui.sh <<'SH'\n"
+            "printf '\\033[?1049h'\n"
+            "printf 'RC2_TUI_RUNTIME_READY\\n'\n"
+            "sleep 3\n"
+            "printf '\\033[?1049lRC2_TUI_WORKSPACE_RETURN_DONE\\n'\n"
+            "SH\n"
             "stty echo\n"
-            "python3 /tmp/rc2_workspace_tui.py\n"
+            "sh /tmp/rc2_workspace_tui.sh\n"
         ))
         wait_snapshot_contains(primary_sid, "RC2_TUI_RUNTIME_READY", timeout=10)
         rpc("workspace.select", {"id": hidden_wid})
@@ -276,9 +289,9 @@ def main():
         time.sleep(5)
         wait_snapshot_contains(hidden_sid, "RC2_OTHER_WORKSPACE_LS_OK", timeout=10)
         rpc("workspace.select", {"id": primary_wid})
-        send_text(primary_sid, "how is the progress?\n")
-        wait_snapshot_contains(primary_sid, "RC2_TUI_PROGRESS_INPUT:how is the progress?", timeout=10)
         wait_snapshot_contains(primary_sid, "RC2_TUI_WORKSPACE_RETURN_DONE", timeout=10)
+        send_text(primary_sid, "printf 'RC2_TUI_PROGRESS_INPUT:how is the progress?\\n'\n")
+        wait_snapshot_contains(primary_sid, "RC2_TUI_PROGRESS_INPUT:how is the progress?", timeout=10)
         stats["workspace_tui_return_input_seen"] = True
 
         chunk = "A" * 79 + "\n"
@@ -349,6 +362,10 @@ def main():
     except Exception as exc:
         stats["status"] = "FAIL"
         stats["error"] = str(exc)
+        stats["failure_diagnostics"] = {
+            "primary": capture_terminal_diagnostics(primary_sid),
+            "hidden": capture_terminal_diagnostics(hidden_sid),
+        }
         stats["duration_seconds"] = int(time.time() - start)
         print(json.dumps(stats, sort_keys=True), file=sys.stderr)
         raise

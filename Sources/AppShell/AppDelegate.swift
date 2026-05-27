@@ -140,7 +140,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         if !flag {
             windowController?.show()
         }
+        router?.reconcileSurfaceVisibility()
+        windowController?.repairSelectedTerminalFocus(reason: "app_reopen")
         return true
+    }
+
+    public func applicationDidBecomeActive(_ notification: Notification) {
+        router?.reconcileSurfaceVisibility()
+        windowController?.repairSelectedTerminalFocus(reason: "app_active")
     }
 
     private func reapIdleProviderSessions() {

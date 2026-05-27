@@ -241,6 +241,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var readerAllowsRender = true
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
+    private var focusRepairGeneration = 0
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
@@ -248,6 +249,10 @@ public final class TerminalSurface: NSObject, Surface {
 
     public var viewportSize: TerminalViewportSize {
         terminalSize
+    }
+
+    var ownsTerminalFocusForTesting: Bool {
+        view.window?.firstResponder === ghosttyView
     }
 
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
@@ -460,7 +465,7 @@ public final class TerminalSurface: NSObject, Surface {
         if renderAllowedAtRead {
             renderer.feed(data)
         }
-        if renderAllowedAtRead, canRenderTerminalOutput {
+        if renderAllowedAtRead, renderDiagnostics().canRender {
             ghosttyView.processOutput(data)
         } else {
             outputPendingBytes += data.count
@@ -475,7 +480,7 @@ public final class TerminalSurface: NSObject, Surface {
         renderer.feed(data)
         lastOutputAt = Date()
         SurfaceOutputBus.shared.emit(descriptor.id, data)
-        if canRenderTerminalOutput {
+        if renderDiagnostics().canRender {
             ghosttyView.processOutput(data)
         } else {
             outputPendingBytes += data.count
@@ -483,16 +488,17 @@ public final class TerminalSurface: NSObject, Surface {
         }
     }
 
-    private var canRenderTerminalOutput: Bool {
-        guard isVisible,
-              !isDrainingHiddenBacklog,
-              SurfaceRegistry.shared.isVisible(descriptor.id),
-              let window = view.window,
-              window !== parkingWindow,
-              view.bounds.width > 1,
-              view.bounds.height > 1,
-              !Self.isHiddenOrHasHiddenAncestor(view) else { return false }
-        return true
+    private func renderDiagnostics() -> TerminalRenderDiagnostics {
+        let window = view.window
+        return TerminalRenderDiagnostics(
+            logicalVisible: isVisible,
+            registryVisible: SurfaceRegistry.shared.isVisible(descriptor.id),
+            drainingHiddenBacklog: isDrainingHiddenBacklog,
+            windowAttached: window != nil,
+            parked: window != nil && window === parkingWindow,
+            hasUsableBounds: view.bounds.width > 1 && view.bounds.height > 1,
+            hiddenAncestor: Self.isHiddenOrHasHiddenAncestor(view)
+        )
     }
 
     private func handleContainerWindowChanged(_ window: NSWindow?) {
@@ -576,7 +582,8 @@ public final class TerminalSurface: NSObject, Surface {
             outputPendingBytes: outputPendingBytes,
             historyWriteFailures: historyWriteFailures,
             rows: terminalSize.rows,
-            cols: terminalSize.cols
+            cols: terminalSize.cols,
+            renderDiagnostics: renderDiagnostics()
         )
     }
 
@@ -591,12 +598,14 @@ public final class TerminalSurface: NSObject, Surface {
                 partialReason: outputPartial ? "hidden_output_cap" : "hidden_output_pending",
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
-                cols: terminalSize.cols
+                cols: terminalSize.cols,
+                renderDiagnostics: renderDiagnostics()
             )
         }
+        let diagnostics = renderDiagnostics()
         if let text = ghosttyView.readViewportText() {
             let rendererText = renderer.snapshot().string
-            let complete = Self.readTextComplete(
+            let complete = diagnostics.canRender && Self.readTextComplete(
                 outputPartial: outputPartial,
                 outputPendingBytes: outputPendingBytes,
                 historyWriteFailures: historyWriteFailures
@@ -604,7 +613,8 @@ public final class TerminalSurface: NSObject, Surface {
             let partialReason = Self.readTextPartialReason(
                 outputPartial: outputPartial,
                 outputPendingBytes: outputPendingBytes,
-                historyWriteFailures: historyWriteFailures
+                historyWriteFailures: historyWriteFailures,
+                renderBlockedReason: diagnostics.blockedReason
             )
             if Self.shouldPreferRendererSnapshotForReadText(viewportText: text, rendererText: rendererText) {
                 return TerminalTextSnapshot(
@@ -616,7 +626,8 @@ public final class TerminalSurface: NSObject, Surface {
                     partialReason: partialReason,
                     pendingBytes: outputPendingBytes,
                     rows: terminalSize.rows,
-                    cols: terminalSize.cols
+                    cols: terminalSize.cols,
+                    renderDiagnostics: diagnostics
                 )
             }
             return TerminalTextSnapshot(
@@ -628,7 +639,8 @@ public final class TerminalSurface: NSObject, Surface {
                 partialReason: partialReason,
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
-                cols: terminalSize.cols
+                cols: terminalSize.cols,
+                renderDiagnostics: diagnostics
             )
         }
         return TerminalTextSnapshot(
@@ -640,7 +652,8 @@ public final class TerminalSurface: NSObject, Surface {
             partialReason: "ghostty_unavailable",
             pendingBytes: outputPendingBytes,
             rows: terminalSize.rows,
-            cols: terminalSize.cols
+            cols: terminalSize.cols,
+            renderDiagnostics: diagnostics
         )
     }
 
@@ -648,10 +661,11 @@ public final class TerminalSurface: NSObject, Surface {
         !outputPartial && outputPendingBytes == 0 && historyWriteFailures == 0
     }
 
-    static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int) -> String? {
+    static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int, renderBlockedReason: String? = nil) -> String? {
         if outputPartial { return "hidden_output_cap" }
         if outputPendingBytes > 0 { return "hidden_output_pending" }
         if historyWriteFailures > 0 { return "history_persistence_failed" }
+        if let renderBlockedReason { return renderBlockedReason }
         return nil
     }
 
@@ -687,10 +701,15 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func focus() {
-        guard applyFocusIfReady() else {
-            scheduleFocusRetry()
-            return
-        }
+        repairTerminalFocus(reason: "surface_focus")
+    }
+
+    public func repairTerminalFocus(reason: String) {
+        focusRepairGeneration &+= 1
+        let generation = focusRepairGeneration
+        guard !applyFocusIfReady() else { return }
+        scheduleFocusRetry(generation: generation, delay: nil)
+        scheduleFocusRetry(generation: generation, delay: 0.05)
     }
 
     @discardableResult
@@ -701,7 +720,8 @@ public final class TerminalSurface: NSObject, Surface {
               window !== parkingWindow,
               view.bounds.width > 1,
               view.bounds.height > 1,
-              !Self.isHiddenOrHasHiddenAncestor(view) else { return false }
+              !Self.isHiddenOrHasHiddenAncestor(view),
+              window.attachedSheet == nil else { return false }
         window.makeFirstResponder(ghosttyView)
         ghosttyView.refreshSurfaceOnly()
         descriptor.hasUnreadActivity = false
@@ -717,10 +737,16 @@ public final class TerminalSurface: NSObject, Surface {
         return false
     }
 
-    private func scheduleFocusRetry() {
-        DispatchQueue.main.async { [weak self] in
+    private func scheduleFocusRetry(generation: Int, delay: TimeInterval?) {
+        let attempt = { [weak self] in
             guard let self else { return }
+            guard self.focusRepairGeneration == generation else { return }
             _ = self.applyFocusIfReady()
+        }
+        if let delay {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: attempt)
+        } else {
+            DispatchQueue.main.async(execute: attempt)
         }
     }
 

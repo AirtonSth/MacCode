@@ -169,7 +169,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
             copy.layout = remapIDs(in: copy.layout, idMap: idMap)
             ctx.state.workspaces[wid] = copy
         }
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
     }
 
     private func forEachSurface(in node: LayoutNode, _ visit: (SurfaceDescriptor) -> Void) {
@@ -179,14 +179,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         }
     }
 
-    private func applySurfaceVisibility() {
-        guard let ctx = context,
-              let wid = ctx.state.window.selectedWorkspaceID,
-              let ws = ctx.state.workspaces[wid] else {
+    public func reconcileSurfaceVisibility() {
+        guard let ctx = context else {
             SurfaceRegistry.shared.setVisibleSurfaceIDs([])
             return
         }
-        SurfaceRegistry.shared.setVisibleSurfaceIDs(selectedSurfaceIDs(in: ws.layout))
+        var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
+        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
+            workspaceIDs.formUnion(detached)
+        }
+        let visibleIDs = workspaceIDs.reduce(into: Set<SurfaceID>()) { ids, workspaceID in
+            guard let ws = ctx.state.workspaces[workspaceID] else { return }
+            ids.formUnion(selectedSurfaceIDs(in: ws.layout))
+        }
+        SurfaceRegistry.shared.setVisibleSurfaceIDs(visibleIDs)
     }
 
     private func selectedSurfaceIDs(in node: LayoutNode) -> Set<SurfaceID> {
@@ -201,6 +207,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 ids.formUnion(selectedSurfaceIDs(in: child))
             }
         }
+    }
+
+    private func focusedSelectedSurfaceID(in workspace: Workspace) -> SurfaceID? {
+        if let focusedPaneID = workspace.focusedPaneID,
+           let pane = workspace.layout.find(paneID: focusedPaneID) {
+            return pane.selectedSurfaceID ?? pane.surfaces.first?.id
+        }
+        return selectedSurfaceIDs(in: workspace.layout).first
     }
 
     private func remapIDs(in node: LayoutNode, idMap: [SurfaceID: SurfaceID]) -> LayoutNode {
@@ -248,27 +262,33 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try context?.apply(.createWindow(title: title))
         let w = try currentWindow()
         windowController?.openAdditionalWindow(for: w)
+        reconcileSurfaceVisibility()
         return w
     }
 
     public func focusWindow(_ id: WindowID) throws {
         try context?.apply(.focusWindow(id))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        windowController?.repairSelectedTerminalFocus(reason: "window_focus")
     }
 
     public func closeWindow(_ id: WindowID) throws {
         try context?.apply(.closeWindow(id))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
     }
 
     public func moveWorkspaceToWindow(workspace: WorkspaceID, target: WindowID) throws {
         try context?.apply(.moveWorkspaceToWindow(workspace, target))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
     }
 
     public func paneSwap(workspace: WorkspaceID, a: PaneID, b: PaneID) throws {
         try context?.apply(.swapPanes(workspace, a, b))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
     }
 
     public func createWorkspace(name: String, cwd: String) throws -> Workspace {
@@ -280,6 +300,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try ctx.apply(.addSurface(id, paneID: nil, descriptor: term))
         guard let ws = ctx.state.workspaces[id] else { throw LayoutError.workspaceNotFound }
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
         return ws
     }
 
@@ -289,12 +310,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         }
         try context?.apply(.selectWorkspace(id))
         windowController?.refreshFromState()
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
+        windowController?.repairSelectedTerminalFocus(reason: "workspace_select")
     }
 
     public func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
         try context?.apply(.closeWorkspace(id))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
         if publishEvent {
             publishWorkspaceClosed(id)
         }
@@ -310,6 +333,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
             try ctx.apply(.closeWorkspace(id))
         }
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
         uniqueIds.forEach(publishWorkspaceClosed)
     }
 
@@ -359,7 +383,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         let desc = makeSurface(type: type, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.addSurface(workspace, paneID: paneID, descriptor: desc))
         windowController?.refreshFromState()
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
         return desc
     }
 
@@ -368,14 +392,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         let desc = makeSurface(type: surfaceType, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.splitPane(workspace, paneID: paneID, direction: direction, newSurface: desc))
         windowController?.refreshFromState()
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
         return desc
     }
 
     public func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws {
         try context?.apply(.splitSurface(workspace, paneID: paneID, surface: surface, direction: direction))
         windowController?.refreshFromState()
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
     }
 
     public func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -385,7 +409,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
             SurfaceRegistry.shared.unregister(surface)
         }
         windowController?.refreshFromState()
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
     }
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -403,8 +427,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         // becomes the visible content (the custom tab strip has no
         // built-in content switching like NSTabView did).
         windowController?.refreshFromState()
-        applySurfaceVisibility()
+        reconcileSurfaceVisibility()
         windowController?.focusSurface(surface)
+    }
+
+    public func repairSelectedTerminalFocus(reason: String) {
+        guard let ctx = context else { return }
+        var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
+        if let detached = windowController?.detachedVisibleWorkspaceIDsForSurfaceReconciliation() {
+            workspaceIDs.formUnion(detached)
+        }
+        for workspaceID in workspaceIDs {
+            repairSelectedTerminalFocus(workspace: workspaceID, reason: reason)
+        }
+    }
+
+    public func repairSelectedTerminalFocus(workspace workspaceID: WorkspaceID, reason: String) {
+        guard let ws = context?.state.workspaces[workspaceID],
+              let surfaceID = focusedSelectedSurfaceID(in: ws),
+              SurfaceRegistry.shared.isVisible(surfaceID),
+              let terminal = SurfaceRegistry.shared.surface(surfaceID) as? TerminalSurface else { return }
+        terminal.repairTerminalFocus(reason: reason)
     }
 
     public func sendText(surface: SurfaceID, text: String) throws {
@@ -1639,11 +1682,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws {
         try context?.apply(.moveSurfaceToPane(workspace, surface: surface, targetPane: targetPane))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
     }
 
     public func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws {
         try context?.apply(.reorderSurface(workspace, surface: surface, toPane: toPane, position: position))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
     }
 
     public func openWorkspaceInNewWindow(_ workspace: WorkspaceID) {
@@ -2314,7 +2359,8 @@ private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
         "output_pending_bytes": .number(Double(health.outputPendingBytes)),
         "history_write_failures": .number(Double(health.historyWriteFailures)),
         "rows": .number(Double(health.rows)),
-        "cols": .number(Double(health.cols))
+        "cols": .number(Double(health.cols)),
+        "render_diagnostics": health.renderDiagnostics.map(terminalRenderDiagnosticsJSON) ?? .null
     ])
 }
 
@@ -2329,6 +2375,21 @@ private func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue
         "partial_reason": snapshot.partialReason.map { .string($0) } ?? .null,
         "pending_bytes": .number(Double(snapshot.pendingBytes)),
         "rows": .number(Double(snapshot.rows)),
-        "cols": .number(Double(snapshot.cols))
+        "cols": .number(Double(snapshot.cols)),
+        "render_diagnostics": snapshot.renderDiagnostics.map(terminalRenderDiagnosticsJSON) ?? .null
+    ])
+}
+
+private func terminalRenderDiagnosticsJSON(_ diagnostics: TerminalRenderDiagnostics) -> JSONValue {
+    .object([
+        "logical_visible": .bool(diagnostics.logicalVisible),
+        "registry_visible": .bool(diagnostics.registryVisible),
+        "draining_hidden_backlog": .bool(diagnostics.drainingHiddenBacklog),
+        "window_attached": .bool(diagnostics.windowAttached),
+        "parked": .bool(diagnostics.parked),
+        "has_usable_bounds": .bool(diagnostics.hasUsableBounds),
+        "hidden_ancestor": .bool(diagnostics.hiddenAncestor),
+        "can_render": .bool(diagnostics.canRender),
+        "blocked_reason": diagnostics.blockedReason.map { .string($0) } ?? .null
     ])
 }
