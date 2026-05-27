@@ -95,6 +95,23 @@ Within the SKILL 150–300ms window; ease-out for entrances.
 - `DSSectionHeader` — uppercased tracked tertiary label + trailing slot.
 - `DSEmptyState` — icon + title + subtitle, centered on `bg`.
 
+## macOS sidebar header controls
+
+- Sidebar header utility icons stay in the 44pt top header band, right aligned
+  with the content header.
+- Logged-in account, Settings, and sidebar toggle appear as a compact icon
+  group in this order: account initials, cog, sidebar toggle.
+- Use 28pt-wide by 32pt-tall button frames with 2pt spacing between buttons:
+  tight enough to read as one utility cluster, but large enough for reliable
+  macOS pointer targeting.
+- The account icon uses the same initials avatar visual as the footer account
+  row, scaled down to fit the icon cluster.
+- Logged out keeps the account row in the footer unchanged; logged in moves
+  the account affordance to the header and removes the account/Insomnia
+  separator from the footer.
+- Every icon-only header control must have `.help(...)` plus an
+  `.accessibilityLabel(...)`; do not rely on the SF Symbol name as the label.
+
 ## Where each screen uses it
 
 | Screen / surface | File | Treatment |

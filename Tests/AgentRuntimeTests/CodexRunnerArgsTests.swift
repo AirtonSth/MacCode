@@ -151,10 +151,15 @@ final class CodexRunnerArgsTests: XCTestCase {
     func test_processEnvironmentMergesProviderInstanceHomeWithoutDroppingPath() {
         let env = CodexRunner.processEnvironment(
             overrides: ["CODEX_HOME": "/tmp/codex-work", "REMOTE_CODE_INSTANCE": "work"],
-            base: ["PATH": "/usr/bin", "CODEX_HOME": "/tmp/default"]
+            base: ["PATH": "/usr/bin", "HOME": "/tmp/remote-code-home", "CODEX_HOME": "/tmp/default"]
         )
 
-        XCTAssertEqual(env["PATH"], "/usr/bin")
+        let path = env["PATH"]?.split(separator: ":").map(String.init) ?? []
+        XCTAssertEqual(path.first, "/usr/bin")
+        XCTAssertTrue(path.contains("/opt/homebrew/bin"),
+                      "Finder-launched macOS apps receive a minimal PATH; provider wrappers using /usr/bin/env node must still find Homebrew node")
+        XCTAssertTrue(path.contains("/tmp/remote-code-home/.local/bin"),
+                      "provider subprocesses must keep common user CLI install directories reachable when the app is launched from Finder")
         XCTAssertEqual(env["CODEX_HOME"], "/tmp/codex-work",
                        "provider instances must isolate Codex auth/session state by overriding CODEX_HOME per run")
         XCTAssertEqual(env["REMOTE_CODE_INSTANCE"], "work")

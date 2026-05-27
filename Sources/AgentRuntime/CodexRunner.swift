@@ -35,6 +35,10 @@ public enum ProcessLocator {
         return nil
     }
 
+    public static func expandedPath(environmentPath: String?, homeDirectory: String) -> String {
+        searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory).joined(separator: ":")
+    }
+
     private static func searchPath(environmentPath: String?, homeDirectory: String) -> [String] {
         var paths = (environmentPath ?? "")
             .split(separator: ":")
@@ -224,7 +228,10 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public static func processEnvironment(overrides: [String: String], base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
-        base.merging(overrides) { _, override in override }
+        var env = base.merging(overrides) { _, override in override }
+        let home = env["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        env["PATH"] = ProcessLocator.expandedPath(environmentPath: env["PATH"], homeDirectory: home)
+        return env
     }
 }
 

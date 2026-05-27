@@ -17,14 +17,30 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(d, AppSettings(), "absent settings must be the documented defaults")
         XCTAssertFalse(d.diffWordWrap)
         XCTAssertEqual(d.sidebarSort, "updated")
+        XCTAssertFalse(d.insomniaEnabled)
+        XCTAssertTrue(d.insomniaAllowDisplaySleep)
+        XCTAssertFalse(d.insomniaAllowSystemSleepWhenDisplayClosed)
+        XCTAssertTrue(d.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
     }
 
     func test_saveThenLoadRoundTrips() throws {
         let (s, _) = try store()
-        s.save(AppSettings(diffWordWrap: true, diffIgnoreWhitespace: true, sidebarSort: "manual"))
+        s.save(AppSettings(
+            diffWordWrap: true,
+            diffIgnoreWhitespace: true,
+            sidebarSort: "manual",
+            insomniaEnabled: true,
+            insomniaAllowDisplaySleep: false,
+            insomniaAllowSystemSleepWhenDisplayClosed: true,
+            insomniaAllowScreenSaverAfter45MinutesOfInactivity: false
+        ))
         let r = s.load()
         XCTAssertTrue(r.diffWordWrap && r.diffIgnoreWhitespace)
         XCTAssertEqual(r.sidebarSort, "manual")
+        XCTAssertTrue(r.insomniaEnabled)
+        XCTAssertFalse(r.insomniaAllowDisplaySleep)
+        XCTAssertTrue(r.insomniaAllowSystemSleepWhenDisplayClosed)
+        XCTAssertFalse(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
     }
 
     func test_updatePreservesOtherFields() throws {
@@ -35,6 +51,18 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(r.diffIgnoreWhitespace, "the updated field changes")
         XCTAssertTrue(r.diffWordWrap, "siblings must survive a partial update")
         XCTAssertEqual(r.sidebarSort, "created")
+    }
+
+    func test_olderBlobWithoutInsomniaFieldsKeepsExistingSettings() throws {
+        let (s, db) = try store()
+        try SettingsRepository(db: db).set("app_settings", #"{"diffWordWrap":true,"diffIgnoreWhitespace":false,"sidebarSort":"manual"}"#)
+        let r = s.load()
+        XCTAssertTrue(r.diffWordWrap, "older settings blobs must not be discarded when new Insomnia fields are absent")
+        XCTAssertEqual(r.sidebarSort, "manual")
+        XCTAssertFalse(r.insomniaEnabled)
+        XCTAssertTrue(r.insomniaAllowDisplaySleep)
+        XCTAssertFalse(r.insomniaAllowSystemSleepWhenDisplayClosed)
+        XCTAssertTrue(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
     }
 
     func test_corruptBlobDegradesToDefaults() throws {

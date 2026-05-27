@@ -327,6 +327,147 @@ public final class AgentMessageRepository {
     }
 }
 
+public final class AgentQueuedMessageRepository {
+    let db: SQLiteDB
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    public init(db: SQLiteDB) { self.db = db }
+
+    public func enqueue(
+        threadId: AgentThreadID,
+        text: String,
+        attachments: [AgentAttachment],
+        interactionMode: AgentInteractionMode
+    ) throws -> AgentQueuedMessage {
+        let position = try nextPosition(threadId: threadId)
+        let queued = AgentQueuedMessage(
+            threadId: threadId,
+            text: text,
+            attachments: attachments,
+            interactionMode: interactionMode,
+            position: position
+        )
+        try upsert(queued)
+        return queued
+    }
+
+    public func upsert(_ message: AgentQueuedMessage) throws {
+        let st = try db.prepare("""
+            INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, updated_at=excluded.updated_at;
+        """)
+        try st.bind(1, message.id.value.uuidString)
+        try st.bind(2, message.threadId.value.uuidString)
+        try st.bind(3, message.text)
+        try st.bind(4, attachmentsJSON(message.attachments))
+        try st.bind(5, message.interactionMode.rawValue)
+        try st.bind(6, Int64(message.position))
+        try st.bind(7, iso.string(from: message.createdAt))
+        try st.bind(8, iso.string(from: message.updatedAt))
+        _ = try st.step()
+    }
+
+    public func list(threadId: AgentThreadID) throws -> [AgentQueuedMessage] {
+        let st = try db.prepare("""
+            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            FROM agent_queued_messages
+            WHERE thread_id = ?
+            ORDER BY position ASC, created_at ASC;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        var out: [AgentQueuedMessage] = []
+        while try st.step() {
+            out.append(decodeRow(st))
+        }
+        return out
+    }
+
+    public func first(threadId: AgentThreadID) throws -> AgentQueuedMessage? {
+        let st = try db.prepare("""
+            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            FROM agent_queued_messages
+            WHERE thread_id = ?
+            ORDER BY position ASC, created_at ASC
+            LIMIT 1;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        return try st.step() ? decodeRow(st) : nil
+    }
+
+    public func get(id: AgentQueuedMessageID) throws -> AgentQueuedMessage? {
+        let st = try db.prepare("""
+            SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            FROM agent_queued_messages
+            WHERE id = ?;
+        """)
+        try st.bind(1, id.value.uuidString)
+        return try st.step() ? decodeRow(st) : nil
+    }
+
+    public func update(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage? {
+        guard var queued = try get(id: id) else { return nil }
+        queued.text = text
+        queued.attachments = attachments
+        queued.updatedAt = Date()
+        try upsert(queued)
+        return queued
+    }
+
+    public func delete(id: AgentQueuedMessageID) throws -> AgentQueuedMessage? {
+        guard let queued = try get(id: id) else { return nil }
+        let st = try db.prepare("DELETE FROM agent_queued_messages WHERE id = ?;")
+        try st.bind(1, id.value.uuidString)
+        _ = try st.step()
+        try normalizePositions(threadId: queued.threadId)
+        return queued
+    }
+
+    private func nextPosition(threadId: AgentThreadID) throws -> Int {
+        let st = try db.prepare("SELECT COALESCE(MAX(position), 0) + 1 FROM agent_queued_messages WHERE thread_id = ?;")
+        try st.bind(1, threadId.value.uuidString)
+        return (try st.step()) ? Int(st.columnInt64(0)) : 1
+    }
+
+    private func normalizePositions(threadId: AgentThreadID) throws {
+        let queued = try list(threadId: threadId)
+        for (index, message) in queued.enumerated() where message.position != index + 1 {
+            let st = try db.prepare("UPDATE agent_queued_messages SET position = ?, updated_at = ? WHERE id = ?;")
+            try st.bind(1, Int64(index + 1))
+            try st.bind(2, iso.string(from: Date()))
+            try st.bind(3, message.id.value.uuidString)
+            _ = try st.step()
+        }
+    }
+
+    private func attachmentsJSON(_ attachments: [AgentAttachment]) -> String {
+        guard let data = try? encoder.encode(attachments),
+              let json = String(data: data, encoding: .utf8) else { return "[]" }
+        return json
+    }
+
+    private func decodeAttachments(_ json: String?) -> [AgentAttachment] {
+        guard let json,
+              let data = json.data(using: .utf8),
+              let attachments = try? decoder.decode([AgentAttachment].self, from: data) else { return [] }
+        return attachments
+    }
+
+    private func decodeRow(_ st: SQLiteStatement) -> AgentQueuedMessage {
+        AgentQueuedMessage(
+            id: AgentQueuedMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
+            threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
+            text: st.columnText(2) ?? "",
+            attachments: decodeAttachments(st.columnText(3)),
+            interactionMode: AgentInteractionMode(rawValue: st.columnText(4) ?? "") ?? .default,
+            position: Int(st.columnInt64(5)),
+            createdAt: parseDate(st.columnText(6)),
+            updatedAt: parseDate(st.columnText(7))
+        )
+    }
+}
+
 public final class AgentRunRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }

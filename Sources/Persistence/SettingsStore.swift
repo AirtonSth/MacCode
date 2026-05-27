@@ -9,13 +9,46 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var diffIgnoreWhitespace: Bool
     /// "updated" | "created" | "manual" — sidebar workspace ordering.
     public var sidebarSort: String
+    public var insomniaEnabled: Bool
+    public var insomniaAllowDisplaySleep: Bool
+    public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
+    public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
 
     public init(diffWordWrap: Bool = false,
                 diffIgnoreWhitespace: Bool = false,
-                sidebarSort: String = "updated") {
+                sidebarSort: String = "updated",
+                insomniaEnabled: Bool = false,
+                insomniaAllowDisplaySleep: Bool = true,
+                insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
+                insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true) {
         self.diffWordWrap = diffWordWrap
         self.diffIgnoreWhitespace = diffIgnoreWhitespace
         self.sidebarSort = sidebarSort
+        self.insomniaEnabled = insomniaEnabled
+        self.insomniaAllowDisplaySleep = insomniaAllowDisplaySleep
+        self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
+        self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case diffWordWrap
+        case diffIgnoreWhitespace
+        case sidebarSort
+        case insomniaEnabled
+        case insomniaAllowDisplaySleep
+        case insomniaAllowSystemSleepWhenDisplayClosed
+        case insomniaAllowScreenSaverAfter45MinutesOfInactivity
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        diffWordWrap = try c.decodeIfPresent(Bool.self, forKey: .diffWordWrap) ?? false
+        diffIgnoreWhitespace = try c.decodeIfPresent(Bool.self, forKey: .diffIgnoreWhitespace) ?? false
+        sidebarSort = try c.decodeIfPresent(String.self, forKey: .sidebarSort) ?? "updated"
+        insomniaEnabled = try c.decodeIfPresent(Bool.self, forKey: .insomniaEnabled) ?? false
+        insomniaAllowDisplaySleep = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowDisplaySleep) ?? true
+        insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
+        insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
     }
 }
 

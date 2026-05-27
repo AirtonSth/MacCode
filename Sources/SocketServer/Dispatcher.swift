@@ -54,7 +54,10 @@ public protocol CommandRouting: AnyObject {
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
     func selectAgentThread(thread: AgentThreadID) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
-    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentRunID
+    func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
+    func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage
+    func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
+    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     func commandReceipt(method: String, clientRequestId: String) -> JSONValue?
@@ -683,8 +686,34 @@ public final class JSONRPCDispatcher {
                 let interactionMode = params["interaction_mode"]?.stringValue.flatMap(AgentInteractionMode.init)
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let attachments = agentAttachments(from: params["attachments"])
-                let runId = try await router.sendAgentMessage(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
-                let result: JSONValue = .object(["run_id": .string(runId.value.uuidString)])
+                let sendResult = try await router.sendAgentMessage(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
+                let result = messageSendResultPayload(sendResult)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.message.queue.list":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(try router.listAgentQueuedMessages(thread: tid)))
+            case "agent.message.queue.update":
+                guard let qid = params["queued_message_id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init)
+                        ?? params["id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init),
+                      let text = params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let updated = try router.updateAgentQueuedMessage(id: qid, text: text, attachments: agentAttachments(from: params["attachments"]))
+                let result = queuedMessagePayload(updated)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.message.queue.cancel":
+                guard let qid = params["queued_message_id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init)
+                        ?? params["id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init) else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let cancelled = try router.cancelAgentQueuedMessage(id: qid)
+                let result = queuedMessagePayload(cancelled)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
             case "agent.plan.implement":
@@ -1324,6 +1353,37 @@ public final class JSONRPCDispatcher {
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
         return .object(object)
+    }
+
+    private func messageSendResultPayload(_ result: AgentMessageSendResult) -> JSONValue {
+        var payload: [String: JSONValue] = ["status": .string(result.status.rawValue)]
+        if let runId = result.runId {
+            payload["run_id"] = .string(runId.value.uuidString)
+        }
+        if let queued = result.queuedMessage {
+            payload["queued_message_id"] = .string(queued.id.value.uuidString)
+            payload["position"] = .number(Double(queued.position))
+            payload["queued_message"] = queuedMessagePayload(queued)
+        }
+        return .object(payload)
+    }
+
+    private func queuedMessagePayload(_ message: AgentQueuedMessage) -> JSONValue {
+        guard case .object(var object) = encode(message) else { return .null }
+        object["id"] = .string(message.id.value.uuidString)
+        object["thread_id"] = .string(message.threadId.value.uuidString)
+        object["threadId"] = .string(message.threadId.value.uuidString)
+        object["interaction_mode"] = .string(message.interactionMode.rawValue)
+        object["interactionMode"] = .string(message.interactionMode.rawValue)
+        object["attachments"] = encode(message.attachments)
+        object["position"] = .number(Double(message.position))
+        object["created_at"] = .string(iso8601(message.createdAt))
+        object["updated_at"] = .string(iso8601(message.updatedAt))
+        return .object(object)
+    }
+
+    private func iso8601(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
     }
 
     private func modelSelection(from value: JSONValue?) -> AgentModelSelection? {

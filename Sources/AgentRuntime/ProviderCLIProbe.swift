@@ -98,7 +98,7 @@ public enum ProviderCLIProbe {
            lower.contains("logged in") || lower.contains("authenticated") {
             return AuthStatus(authenticated: true, accountLabel: accountLabel, accountAuthMethod: accountAuthMethod)
         }
-        return AuthStatus(authenticated: result.status == 0 ? nil : false, accountLabel: accountLabel, accountAuthMethod: accountAuthMethod)
+        return AuthStatus(authenticated: nil, accountLabel: accountLabel, accountAuthMethod: accountAuthMethod)
     }
 
     public static func slashCommands(provider: AgentProvider, binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 2.0) -> [String] {
@@ -127,7 +127,7 @@ public enum ProviderCLIProbe {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: trimmed)
         proc.arguments = arguments
-        proc.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        proc.environment = CodexRunner.processEnvironment(overrides: environment)
         proc.standardInput = FileHandle.nullDevice
         let out = Pipe()
         let err = Pipe()

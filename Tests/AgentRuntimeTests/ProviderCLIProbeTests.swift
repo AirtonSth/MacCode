@@ -88,6 +88,23 @@ final class ProviderCLIProbeTests: XCTestCase {
                        "text auth probes must retain auth method details instead of collapsing every account to a boolean")
     }
 
+    func test_authProbeDoesNotReportUnauthenticatedWhenProviderWrapperCannotFindRuntime() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let binary = dir.appendingPathComponent("codex")
+        try """
+        #!/bin/sh
+        printf 'env: node: No such file or directory\\n' >&2
+        exit 127
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let status = ProviderCLIProbe.authStatus(provider: .codex, binaryPath: binary.path)
+
+        XCTAssertNil(status.authenticated,
+                     "a missing provider runtime from a minimal macOS GUI PATH is an environment failure, not lost Codex authentication")
+    }
+
     func test_slashCommandProbeReadsProviderHelpCommandsAndEnvironment() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -83,7 +83,10 @@ let package = Package(
                 "DesignSystemKit",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
-            path: "Sources/AppShell"
+            path: "Sources/AppShell",
+            linkerSettings: [
+                .linkedFramework("IOKit")
+            ]
         ),
         .executableTarget(
             name: "RC2CLI",

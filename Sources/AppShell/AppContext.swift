@@ -13,6 +13,7 @@ public final class AppContext {
     public let projectRepo: ProjectRepository
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
+    public let queuedMessageRepo: AgentQueuedMessageRepository
     public let runRepo: AgentRunRepository
     public let snapshotRepo: SessionSnapshotRepository
     public let settingsRepo: SettingsRepository
@@ -41,6 +42,7 @@ public final class AppContext {
         self.projectRepo = ProjectRepository(db: db)
         self.threadRepo = AgentThreadRepository(db: db)
         self.messageRepo = AgentMessageRepository(db: db)
+        self.queuedMessageRepo = AgentQueuedMessageRepository(db: db)
         self.runRepo = AgentRunRepository(db: db)
         self.snapshotRepo = SessionSnapshotRepository(db: db)
         self.settingsRepo = SettingsRepository(db: db)
@@ -225,6 +227,11 @@ public final class AppContext {
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
             EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, status: status))
             EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, status: status))
+            if status == .completed || status == .cancelled {
+                Task { @MainActor in
+                    try? await self.router?.drainNextQueuedAgentMessage(thread: tid)
+                }
+            }
             if let content = RemoteCodeNotificationContent.threadOutcome(
                 threadId: tid.value.uuidString,
                 title: try? self.threadRepo.get(id: tid)?.title,

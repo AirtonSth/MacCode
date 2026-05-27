@@ -764,6 +764,54 @@ public struct AgentMessage: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
+    public let id: AgentQueuedMessageID
+    public let threadId: AgentThreadID
+    public var text: String
+    public var attachments: [AgentAttachment]
+    public var interactionMode: AgentInteractionMode
+    public var position: Int
+    public let createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        id: AgentQueuedMessageID = AgentQueuedMessageID(),
+        threadId: AgentThreadID,
+        text: String,
+        attachments: [AgentAttachment] = [],
+        interactionMode: AgentInteractionMode = .default,
+        position: Int = 0,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.threadId = threadId
+        self.text = text
+        self.attachments = attachments
+        self.interactionMode = interactionMode
+        self.position = position
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
+
+public enum AgentMessageSendStatus: String, Codable, Sendable, Equatable {
+    case started
+    case queued
+}
+
+public struct AgentMessageSendResult: Codable, Sendable, Equatable {
+    public let status: AgentMessageSendStatus
+    public let runId: AgentRunID?
+    public let queuedMessage: AgentQueuedMessage?
+
+    public init(status: AgentMessageSendStatus, runId: AgentRunID? = nil, queuedMessage: AgentQueuedMessage? = nil) {
+        self.status = status
+        self.runId = runId
+        self.queuedMessage = queuedMessage
+    }
+}
+
 public struct AgentRun: Codable, Sendable, Equatable, Identifiable {
     public let id: AgentRunID
     public let threadId: AgentThreadID

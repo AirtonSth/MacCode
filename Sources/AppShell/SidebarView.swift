@@ -17,16 +17,29 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
     @Published public var privateAccountUser: PrivateAccountUser?
     @Published public var updateAvailability: AppUpdateAvailability = .unknown
+    @Published public private(set) var insomniaEnabled: Bool = false
+    @Published public private(set) var insomniaAllowDisplaySleep: Bool = true
+    @Published public private(set) var insomniaAllowSystemSleepWhenDisplayClosed: Bool = false
+    @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     public var draggingWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
     private var privateAccountObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
+    private let settingsStore: SettingsStore
+    private let insomniaPower: InsomniaPowerManaging
 
-    public init(context: AppContext, router: AppCommandRouter, updateChecker: AppUpdateChecking? = nil) {
+    public init(
+        context: AppContext,
+        router: AppCommandRouter,
+        updateChecker: AppUpdateChecking? = nil,
+        insomniaPower: InsomniaPowerManaging = MacOSInsomniaPowerManager()
+    ) {
         self.context = context
         self.router = router
         self.updateChecker = updateChecker
         self.updateAvailability = updateChecker?.availability ?? .unknown
+        self.settingsStore = SettingsStore(db: context.db)
+        self.insomniaPower = insomniaPower
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
             object: nil,
@@ -39,12 +52,14 @@ public final class SidebarViewModel: ObservableObject {
             self?.updateAvailability = availability
         }
         reload()
+        reloadInsomnia()
     }
 
     deinit {
         if let privateAccountObserver {
             NotificationCenter.default.removeObserver(privateAccountObserver)
         }
+        insomniaPower.releaseProcessAssertions()
     }
 
     public func reload() {
@@ -58,6 +73,70 @@ public final class SidebarViewModel: ObservableObject {
     private func reloadPrivateAccount() {
         guard let ctx = context else { return }
         privateAccountUser = PrivateAccountSessionStore(repo: ctx.settingsRepo).load()?.user
+    }
+
+    private func reloadInsomnia() {
+        let settings = settingsStore.load()
+        insomniaEnabled = settings.insomniaEnabled
+        insomniaAllowDisplaySleep = settings.insomniaAllowDisplaySleep
+        insomniaAllowSystemSleepWhenDisplayClosed = settings.insomniaAllowSystemSleepWhenDisplayClosed
+        insomniaAllowScreenSaverAfter45MinutesOfInactivity = settings.insomniaAllowScreenSaverAfter45MinutesOfInactivity
+        applyInsomniaPower()
+    }
+
+    public func setInsomniaEnabled(_ enabled: Bool) {
+        insomniaEnabled = enabled
+        settingsStore.update {
+            $0.insomniaEnabled = enabled
+        }
+        applyInsomniaPower()
+    }
+
+    public func setInsomniaAllowDisplaySleep(_ enabled: Bool) {
+        insomniaAllowDisplaySleep = enabled
+        settingsStore.update { $0.insomniaAllowDisplaySleep = enabled }
+        applyInsomniaPower()
+    }
+
+    public func setInsomniaAllowSystemSleepWhenDisplayClosed(_ enabled: Bool) {
+        insomniaAllowSystemSleepWhenDisplayClosed = enabled
+        settingsStore.update { $0.insomniaAllowSystemSleepWhenDisplayClosed = enabled }
+        applyInsomniaPower()
+    }
+
+    public func setInsomniaAllowScreenSaverAfter45MinutesOfInactivity(_ enabled: Bool) {
+        insomniaAllowScreenSaverAfter45MinutesOfInactivity = enabled
+        settingsStore.update { $0.insomniaAllowScreenSaverAfter45MinutesOfInactivity = enabled }
+        applyInsomniaPower()
+    }
+
+    private func applyInsomniaPower() {
+        guard insomniaEnabled else {
+            insomniaPower.deactivate()
+            return
+        }
+
+        guard insomniaPower.activate(reason: "RemoteCode Insomnia", options: insomniaPowerOptions) else {
+            NSLog("RemoteCode Insomnia failed to activate macOS power assertions.")
+            finishInsomniaSession()
+            return
+        }
+    }
+
+    private func finishInsomniaSession() {
+        insomniaEnabled = false
+        insomniaPower.deactivate()
+        settingsStore.update {
+            $0.insomniaEnabled = false
+        }
+    }
+
+    private var insomniaPowerOptions: InsomniaPowerOptions {
+        InsomniaPowerOptions(
+            allowDisplaySleep: insomniaAllowDisplaySleep,
+            allowSystemSleepWhenDisplayClosed: insomniaAllowSystemSleepWhenDisplayClosed,
+            allowScreenSaverAfter45MinutesOfInactivity: insomniaAllowScreenSaverAfter45MinutesOfInactivity
+        )
     }
 
     public func select(_ wid: WorkspaceID) {
@@ -241,6 +320,7 @@ public final class SidebarViewModel: ObservableObject {
 
 public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
+    @State private var showsInsomniaOptions = false
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
 
@@ -256,32 +336,51 @@ public struct SidebarRootView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Color.clear.frame(height: 44)
-
-            VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                HStack(spacing: DS.Space.xs) {
-                    Button { vm.newWorkspace() } label: {
-                        sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Create new workspace")
-
-                    Button { vm.toggleSidebar() } label: {
-                        Image(systemName: "sidebar.left")
-                            .font(.system(size: 15, weight: .regular))
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .frame(width: 32, height: 32)
+            HStack(spacing: 2) {
+                Spacer(minLength: 0)
+                if vm.privateAccountUser != nil {
+                    Button(action: onOpenAccount) {
+                        headerAccountAvatar
+                            .frame(width: 28, height: 32)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("Toggle sidebar")
+                    .help(accountSubtitle)
+                    .accessibilityLabel("Account")
+                    .accessibilityValue(accountSubtitle)
                 }
 
                 Button(action: onOpenSettings) {
-                    sidebarActionRow(symbol: "gearshape", title: "Settings")
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 28, height: 32)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help("Settings")
+                .accessibilityLabel("Settings")
+
+                Button { vm.toggleSidebar() } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 15, weight: .regular))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 28, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Toggle sidebar")
+                .accessibilityLabel("Toggle sidebar")
+            }
+            .padding(.horizontal, DS.Space.md)
+            .frame(height: 44)
+
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Button { vm.newWorkspace() } label: {
+                    sidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+                }
+                .buttonStyle(.plain)
+                .help("Create new workspace")
 
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
@@ -396,42 +495,152 @@ public struct SidebarRootView: View {
                 .fill(DS.Palette.line.opacity(0.55))
                 .frame(height: DS.Border.hairline)
 
-            Button(action: onOpenAccount) {
-                HStack(spacing: DS.Space.md) {
-                    accountAvatar
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(accountDisplayName)
-                            .font(DS.Font.bodyStrong)
-                            .foregroundColor(DS.Palette.text)
-                            .lineLimit(1)
-                        Text(accountSubtitle)
-                            .font(DS.Font.caption2)
+            if vm.privateAccountUser == nil {
+                Button(action: onOpenAccount) {
+                    HStack(spacing: DS.Space.md) {
+                        accountAvatar
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(accountDisplayName)
+                                .font(DS.Font.bodyStrong)
+                                .foregroundColor(DS.Palette.text)
+                                .lineLimit(1)
+                            Text(accountSubtitle)
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
                             .foregroundColor(DS.Palette.textTertiary)
-                            .lineLimit(1)
+                            .frame(width: 24, height: 24)
                     }
-                    Spacer(minLength: 0)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
+                    .padding(.horizontal, DS.Space.sm)
+                    .frame(height: 48)
+                    .contentShape(Rectangle())
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .fill(Color.white.opacity(0.001))
+                    )
                 }
-                .padding(.horizontal, DS.Space.sm)
-                .frame(height: 48)
-                .contentShape(Rectangle())
-                .background(
-                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .fill(Color.white.opacity(0.001))
-                )
+                .buttonStyle(.plain)
+                .help("Sign in")
+                .padding(.horizontal, DS.Space.md)
+                .padding(.top, DS.Space.md)
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.09))
+                    .frame(height: DS.Border.hairline)
+                    .padding(.horizontal, DS.Space.md)
+                    .padding(.vertical, DS.Space.sm)
             }
-            .buttonStyle(.plain)
-            .help(vm.privateAccountUser == nil ? "Sign in" : "Account")
-            .padding(.horizontal, DS.Space.md)
-            .padding(.top, DS.Space.md)
-            .padding(.bottom, DS.Space.lg)
+
+            insomniaControl
+                .padding(.horizontal, DS.Space.md)
+                .padding(.top, vm.privateAccountUser == nil ? 0 : DS.Space.md)
+                .padding(.bottom, DS.Space.lg)
         }
         .background(Color.white.opacity(0.025))
     }
 
+    private var insomniaHelpText: String {
+        "Insomnia keeps this Mac awake while the toggle is on. Settings can allow display sleep, closed-display sleep, or the screen saver without ending the session."
+    }
+
+    private var insomniaControl: some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            insomniaToggle
+            Text("Insomnia")
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .lineLimit(1)
+                .frame(height: 24, alignment: .center)
+            Spacer(minLength: 0)
+            insomniaOptionsMenu
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .frame(height: 36)
+        .help(insomniaHelpText)
+    }
+
+    private var insomniaToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) {
+                vm.setInsomniaEnabled(!vm.insomniaEnabled)
+            }
+        } label: {
+            ZStack(alignment: vm.insomniaEnabled ? .trailing : .leading) {
+                Capsule()
+                    .fill(vm.insomniaEnabled ? DS.Palette.danger : DS.Palette.surfaceRaised)
+                    .overlay(
+                        Capsule()
+                            .stroke(vm.insomniaEnabled ? Color.clear : DS.Palette.lineStrong.opacity(0.7),
+                                    lineWidth: DS.Border.hairline)
+                    )
+                Circle()
+                    .fill(Color.white)
+                    .shadow(color: Color.black.opacity(0.18), radius: 1, x: 0, y: 1)
+                    .padding(2)
+            }
+            .frame(width: 32, height: 18)
+        }
+        .buttonStyle(.plain)
+        .frame(width: 36, height: 24)
+        .contentShape(Rectangle())
+        .help(insomniaHelpText)
+        .accessibilityLabel("Insomnia")
+        .accessibilityValue(vm.insomniaEnabled ? "on" : "off")
+        .accessibilityHint(insomniaHelpText)
+    }
+
+    private var insomniaOptionsMenu: some View {
+        Button {
+            showsInsomniaOptions.toggle()
+        } label: {
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Palette.textTertiary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showsInsomniaOptions, arrowEdge: .trailing) {
+            insomniaOptionsPopover
+        }
+        .help(insomniaHelpText)
+        .accessibilityLabel("Insomnia settings")
+    }
+
+    private var insomniaOptionsPopover: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Toggle("Allow display sleep", isOn: Binding(
+                get: { vm.insomniaAllowDisplaySleep },
+                set: { vm.setInsomniaAllowDisplaySleep($0) }
+            ))
+            Toggle("Allow system sleep when display is closed", isOn: Binding(
+                get: { vm.insomniaAllowSystemSleepWhenDisplayClosed },
+                set: { vm.setInsomniaAllowSystemSleepWhenDisplayClosed($0) }
+            ))
+            Toggle("Allow screen saver after 45m of inactivity", isOn: Binding(
+                get: { vm.insomniaAllowScreenSaverAfter45MinutesOfInactivity },
+                set: { vm.setInsomniaAllowScreenSaverAfter45MinutesOfInactivity($0) }
+            ))
+        }
+        .toggleStyle(.checkbox)
+        .font(DS.Font.body)
+        .foregroundColor(DS.Palette.text)
+        .padding(DS.Space.md)
+    }
+
     private var accountAvatar: some View {
+        accountAvatar(size: 28, textSize: 11)
+    }
+
+    private var headerAccountAvatar: some View {
+        accountAvatar(size: 18, textSize: 7.5)
+    }
+
+    private func accountAvatar(size: CGFloat, textSize: CGFloat) -> some View {
         ZStack {
             Circle()
                 .fill(vm.privateAccountUser == nil ? DS.Palette.surfaceRaised : DS.Palette.accent.opacity(0.22))
@@ -440,10 +649,10 @@ public struct SidebarRootView: View {
                         .stroke(DS.Palette.lineStrong.opacity(0.7), lineWidth: DS.Border.hairline)
                 )
             Text(accountInitials)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: textSize, weight: .semibold))
                 .foregroundColor(vm.privateAccountUser == nil ? DS.Palette.textSecondary : DS.Palette.accent)
         }
-        .frame(width: 28, height: 28)
+        .frame(width: size, height: size)
     }
 
     private var accountDisplayName: String {

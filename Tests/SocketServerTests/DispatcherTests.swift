@@ -151,6 +151,7 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     var stoppedAgentThreads: [AgentThreadID] = []
     var checkpointStore: [AgentTurnCheckpointSummary] = []
     var messageStore: [AgentMessage] = []
+    var queuedMessageStore: [AgentQueuedMessage] = []
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         if let provider, provider != threadStore[idx].provider {
@@ -208,7 +209,21 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
     }
-    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentRunID {
+    func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
+        queuedMessageStore.filter { $0.threadId == thread }.sorted { $0.position < $1.position }
+    }
+    func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage {
+        guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
+        queuedMessageStore[idx].text = text
+        queuedMessageStore[idx].attachments = attachments
+        queuedMessageStore[idx].updatedAt = Date()
+        return queuedMessageStore[idx]
+    }
+    func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage {
+        guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
+        return queuedMessageStore.remove(at: idx)
+    }
+    func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult {
         sendAgentMessageCallCount += 1
         lastSendText = text
         lastSendInteractionMode = interactionMode
@@ -217,7 +232,12 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
         lastSendPermission = threadStore.first(where: { $0.id == thread })?.permissionMode
         lastSendReasoning = threadStore.first(where: { $0.id == thread })?.reasoningEffort
         lastSendServiceTier = threadStore.first(where: { $0.id == thread })?.serviceTier
-        return AgentRunID()
+        if threadStore.first(where: { $0.id == thread })?.status == .running {
+            let queued = AgentQueuedMessage(threadId: thread, text: text, attachments: attachments, interactionMode: interactionMode ?? .default, position: queuedMessageStore.count + 1)
+            queuedMessageStore.append(queued)
+            return AgentMessageSendResult(status: .queued, queuedMessage: queued)
+        }
+        return AgentMessageSendResult(status: .started, runId: AgentRunID())
     }
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID) {
         let target: AgentThread
@@ -235,17 +255,18 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
             guard let existing = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
             target = existing
         }
-        let runId = try await sendAgentMessage(thread: target.id,
-                                               text: AgentPlanImplementationPrompt.make(markdown: planMarkdown ?? ""),
-                                               provider: provider,
-                                               model: model,
-                                               permissionMode: permissionMode,
-                                               reasoningEffort: reasoningEffort,
-                                               serviceTier: serviceTier,
-                                               interactionMode: .default,
-                                               modelSelection: modelSelection,
-                                               providerInstanceId: nil,
-                                               attachments: [])
+        let sendResult = try await sendAgentMessage(thread: target.id,
+                                                    text: AgentPlanImplementationPrompt.make(markdown: planMarkdown ?? ""),
+                                                    provider: provider,
+                                                    model: model,
+                                                    permissionMode: permissionMode,
+                                                    reasoningEffort: reasoningEffort,
+                                                    serviceTier: serviceTier,
+                                                    interactionMode: .default,
+                                                    modelSelection: modelSelection,
+                                                    providerInstanceId: nil,
+                                                    attachments: [])
+        let runId = try XCTUnwrap(sendResult.runId)
         lastImplementedPlan = (thread, planId, target.id)
         return (runId, target.id)
     }
@@ -1205,6 +1226,62 @@ final class DispatcherTests: XCTestCase {
                        "durable command receipts must let a recreated dispatcher return the original run id")
         XCTAssertEqual(router.sendAgentMessageCallCount, 1,
                        "a client retry after socket/dispatcher recreation must not duplicate provider turns")
+    }
+
+    @MainActor
+    func test_agentMessageSendQueuesWhenThreadIsRunning() async throws {
+        let router = FakeRouter()
+        var t = AgentThread(workspaceId: nil, title: "running", provider: .codex, model: "gpt-5.5")
+        t.status = .running
+        router.threadStore = [t]
+        let d = JSONRPCDispatcher(router: router)
+
+        let response = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.send", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "text": .string("run after current turn")
+        ]))
+
+        guard case .object(let obj)? = response.result else { return XCTFail("running sends must return a queued result") }
+        XCTAssertEqual(obj["status"], .string("queued"))
+        XCTAssertNotNil(obj["queued_message_id"]?.stringValue)
+        XCTAssertEqual(obj["position"], .number(1))
+        XCTAssertNil(obj["run_id"],
+                     "queued sends must not expose a run id before they actually start")
+        XCTAssertEqual(router.queuedMessageStore.first?.text, "run after current turn",
+                       "a send during an active run must persist as an editable queued message instead of being dropped")
+    }
+
+    @MainActor
+    func test_agentMessageQueueUpdateAndCancelAreIdempotentWithClientRequestId() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "queue", provider: .codex, model: "gpt-5.5")
+        let q = AgentQueuedMessage(threadId: t.id, text: "draft", attachments: [], interactionMode: .default, position: 1)
+        router.threadStore = [t]
+        router.queuedMessageStore = [q]
+
+        let updateParams: [String: JSONValue] = [
+            "queued_message_id": .string(q.id.value.uuidString),
+            "text": .string("edited draft"),
+            "client_request_id": .string("queue-update-1")
+        ]
+        let firstUpdate = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.queue.update", params: updateParams))
+        let secondUpdate = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.queue.update", params: updateParams))
+
+        XCTAssertEqual(firstUpdate.result, secondUpdate.result,
+                       "retries for queued-message edits must return the same host result and not mutate twice")
+        XCTAssertEqual(router.queuedMessageStore.first?.text, "edited draft")
+
+        let cancelParams: [String: JSONValue] = [
+            "queued_message_id": .string(q.id.value.uuidString),
+            "client_request_id": .string("queue-cancel-1")
+        ]
+        let firstCancel = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.message.queue.cancel", params: cancelParams))
+        let secondCancel = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "agent.message.queue.cancel", params: cancelParams))
+
+        XCTAssertEqual(firstCancel.result, secondCancel.result,
+                       "retries for queued-message cancellation must not fail after the first removal")
+        XCTAssertTrue(router.queuedMessageStore.isEmpty,
+                      "cancelling a queued item must remove only that queued item")
     }
 
     @MainActor

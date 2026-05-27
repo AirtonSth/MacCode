@@ -53,6 +53,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Fired when local Agent App controls persist thread run config so
     /// remote mirrors can receive the same thread metadata.
     public var onThreadConfigPersisted: ((AgentThread) -> Void)?
+    public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
@@ -73,6 +74,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var checkpointStatusMessage: String?
     /// B3: file paths attached to the next message (composer chips).
     @Published public var attachments: [String] = []
+    @Published public var queuedMessages: [AgentQueuedMessage] = []
+    @Published public var queueStatusMessage: String?
+    @Published public var editingQueuedMessage: AgentQueuedMessage?
+    @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
     @Published public var runStartedAt: Date?
 
@@ -81,6 +86,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let coordinator: AgentRunCoordinator
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
+    public let queuedMessageRepo: AgentQueuedMessageRepository?
     public let pendingCallbackRepo: ProviderPendingCallbackRepository?
     public let proposedPlanRepo: AgentProposedPlanRepository?
     public let checkpointRepo: AgentTurnCheckpointRepository?
@@ -95,6 +101,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         coordinator: AgentRunCoordinator,
         threadRepo: AgentThreadRepository,
         messageRepo: AgentMessageRepository,
+        queuedMessageRepo: AgentQueuedMessageRepository? = nil,
         pendingCallbackRepo: ProviderPendingCallbackRepository? = nil,
         proposedPlanRepo: AgentProposedPlanRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
@@ -105,6 +112,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.coordinator = coordinator
         self.threadRepo = threadRepo
         self.messageRepo = messageRepo
+        self.queuedMessageRepo = queuedMessageRepo
         self.pendingCallbackRepo = pendingCallbackRepo
         self.proposedPlanRepo = proposedPlanRepo
         self.checkpointRepo = checkpointRepo
@@ -153,6 +161,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func selectThread(_ id: AgentThreadID) {
         selectedThreadId = id
+        reloadQueuedMessages()
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
             providerInstanceId = t.providerInstanceId ?? t.provider.rawValue
@@ -196,6 +205,62 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressPersistedFinalDuplicatedByTimeline()
         timelineUpdateTick = 0
     }
+
+    public func reloadQueuedMessages() {
+        guard let selectedThreadId, let queuedMessageRepo else {
+            queuedMessages = []
+            return
+        }
+        queuedMessages = (try? queuedMessageRepo.list(threadId: selectedThreadId)) ?? []
+    }
+
+    public func editQueuedMessage(_ message: AgentQueuedMessage) {
+        editingQueuedMessage = message
+        queuedMessageDraft = message.text
+        queueStatusMessage = nil
+    }
+
+    public func saveQueuedMessageEdit() {
+        guard let editingQueuedMessage, let queuedMessageRepo else { return }
+        let text = queuedMessageDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty || !editingQueuedMessage.attachments.isEmpty else { return }
+        do {
+            if let updated = try queuedMessageRepo.update(id: editingQueuedMessage.id, text: text, attachments: editingQueuedMessage.attachments) {
+                queueStatusMessage = nil
+                self.editingQueuedMessage = nil
+                queuedMessageDraft = ""
+                reloadQueuedMessages()
+                onQueuedMessageEvent?("agent.message.queue.updated", updated)
+            } else {
+                queueStatusMessage = "Already processing."
+                self.editingQueuedMessage = nil
+                queuedMessageDraft = ""
+                reloadQueuedMessages()
+            }
+        } catch {
+            queueStatusMessage = "Queue edit failed: \(error)"
+        }
+    }
+
+    public func cancelQueuedMessage(_ message: AgentQueuedMessage) {
+        guard let queuedMessageRepo else { return }
+        do {
+            if let cancelled = try queuedMessageRepo.delete(id: message.id) {
+                if editingQueuedMessage?.id == message.id {
+                    editingQueuedMessage = nil
+                    queuedMessageDraft = ""
+                }
+                reloadQueuedMessages()
+                onQueuedMessageEvent?("agent.message.queue.cancelled", cancelled)
+            } else {
+                queueStatusMessage = "Already processing."
+                reloadQueuedMessages()
+            }
+        } catch {
+            queueStatusMessage = "Queue cancel failed: \(error)"
+        }
+    }
+
 
     public func reloadCheckpoints() {
         guard let selectedThreadId, let checkpointRepo else {
@@ -974,6 +1039,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         recordPromptHistory(text)
+        if status == .running || status == .pending {
+            await enqueuePromptWhileRunning(text: text, attached: attachments)
+            return
+        }
         if let slash = Self.localSlashCommandParts(text),
            (slash.command == "plan" || slash.command == "default"),
            !slash.argument.isEmpty {
@@ -991,6 +1060,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
+    }
+
+    private func enqueuePromptWhileRunning(text: String, attached: [String]) async {
+        guard let selectedThreadId, let queuedMessageRepo else { return }
+        let resolvedAttachments: [AgentAttachment]
+        do {
+            resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
+        } catch {
+            systemNote(String(describing: error))
+            return
+        }
+        do {
+            let queued = try queuedMessageRepo.enqueue(
+                threadId: selectedThreadId,
+                text: text,
+                attachments: resolvedAttachments,
+                interactionMode: interactionMode
+            )
+            prompt = ""
+            attachments = []
+            queueStatusMessage = nil
+            reloadQueuedMessages()
+            onQueuedMessageEvent?("agent.message.queued", queued)
+        } catch {
+            queueStatusMessage = "Queue send failed: \(error)"
+        }
     }
 
     @discardableResult
@@ -1425,6 +1520,7 @@ public struct AgentAppView: View {
     @State private var showThreadRail = true
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
+    @State private var queuedMessagePendingCancel: AgentQueuedMessage?
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -1715,6 +1811,7 @@ public struct AgentAppView: View {
                     .background(DS.Palette.bg)
             }
             timeline
+            queuedMessagesSection
             composer
         }
         .background(DS.Palette.bg)
@@ -2332,6 +2429,124 @@ public struct AgentAppView: View {
 
     // MARK: Composer
 
+    @ViewBuilder
+    private var queuedMessagesSection: some View {
+        if !vm.queuedMessages.isEmpty || vm.queueStatusMessage != nil {
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "text.line.first.and.arrowtriangle.forward")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                    Text("Queued")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                    Text("\(vm.queuedMessages.count)")
+                        .font(DS.Font.caption.monospacedDigit())
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Spacer(minLength: 0)
+                }
+                if let message = vm.queueStatusMessage {
+                    Text(message)
+                        .font(DS.Font.caption)
+                        .foregroundColor(message.contains("failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                }
+                ForEach(vm.queuedMessages) { message in
+                    queuedMessageRow(message)
+                }
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.vertical, DS.Space.md)
+            .background(DS.Palette.bg)
+            .confirmationDialog(
+                "Cancel queued message?",
+                isPresented: Binding(
+                    get: { queuedMessagePendingCancel != nil },
+                    set: { if !$0 { queuedMessagePendingCancel = nil } }
+                )
+            ) {
+                Button("Cancel queued message", role: .destructive) {
+                    if let queuedMessagePendingCancel {
+                        vm.cancelQueuedMessage(queuedMessagePendingCancel)
+                    }
+                    queuedMessagePendingCancel = nil
+                }
+                Button("Keep message", role: .cancel) {
+                    queuedMessagePendingCancel = nil
+                }
+            }
+        }
+    }
+
+    private func queuedMessageRow(_ message: AgentQueuedMessage) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Text("#\(message.position)")
+                    .font(DS.Font.caption.monospacedDigit().weight(.semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .frame(width: 28, alignment: .leading)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    if vm.editingQueuedMessage?.id == message.id {
+                        TextEditor(text: $vm.queuedMessageDraft)
+                            .font(DS.Font.body)
+                            .frame(minHeight: 64, maxHeight: 120)
+                            .scrollContentBackground(.hidden)
+                            .background(DS.Palette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            .accessibilityLabel("Edit queued message \(message.position)")
+                    } else {
+                        Text(message.text.isEmpty ? attachmentSummary(message) : message.text)
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.text)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !message.attachments.isEmpty {
+                        Label("\(message.attachments.count) attachment\(message.attachments.count == 1 ? "" : "s")", systemImage: "paperclip")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                }
+                Spacer(minLength: DS.Space.sm)
+                if vm.editingQueuedMessage?.id == message.id {
+                    Button("Save") { vm.saveQueuedMessageEdit() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    Button("Cancel") {
+                        vm.editingQueuedMessage = nil
+                        vm.queuedMessageDraft = ""
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else {
+                    Button("Edit") { vm.editQueuedMessage(message) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityLabel("Queued message \(message.position), edit")
+                    Button("Cancel") {
+                        if message.attachments.isEmpty && message.text.count < 120 {
+                            vm.cancelQueuedMessage(message)
+                        } else {
+                            queuedMessagePendingCancel = message
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityLabel("Cancel queued message \(message.position)")
+                }
+            }
+        }
+        .padding(DS.Space.md)
+        .background(DS.Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+    }
+
+    private func attachmentSummary(_ message: AgentQueuedMessage) -> String {
+        message.attachments.map(\.displayName).joined(separator: ", ")
+    }
+
     // Unified Codex-style composer card: changed-files strip → editor →
     // toolbar (attach · permission · model·effort · send/stop).
     private var composer: some View {
@@ -2346,7 +2561,7 @@ public struct AgentAppView: View {
                 text: $vm.prompt,
                 height: $composerEditorHeight,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
-                isEnabled: vm.status != .running,
+                isEnabled: true,
                 onSend: { Task { await vm.send() } },
                 onPreviousHistory: { vm.recallPreviousPrompt() },
                 onNextHistory: { vm.recallNextPrompt() },
@@ -2402,12 +2617,14 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textSecondary)
             .help("Attach files").accessibilityLabel("Attach files")
-            .disabled(vm.status == .running)
             permissionMenu
             executionMenu
             Spacer(minLength: DS.Space.sm)
             if vm.status == .running {
                 ProgressView().controlSize(.small).scaleEffect(0.55)
+            }
+            if vm.status == .running {
+                stopButton
             }
             modelMenu
             sendStopButton
@@ -2676,24 +2893,38 @@ public struct AgentAppView: View {
 
     private var sendStopButton: some View {
         Button {
-            if vm.status == .running { vm.stop() } else { Task { await vm.send() } }
+            Task { await vm.send() }
         } label: {
             ZStack {
                 Circle()
-                    .fill(vm.status == .running ? DS.Palette.text
-                          : (sendIdleDisabled ? DS.Palette.surfaceRaised : DS.Palette.accent))
+                    .fill(sendIdleDisabled ? DS.Palette.surfaceRaised : DS.Palette.accent)
                     .frame(width: 28, height: 28)
-                Image(systemName: vm.status == .running ? "stop.fill" : "arrow.up")
+                Image(systemName: vm.status == .running ? "text.line.first.and.arrowtriangle.forward" : "arrow.up")
                     .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(vm.status == .running ? DS.Palette.bg
-                                     : (sendIdleDisabled ? DS.Palette.textTertiary : DS.Palette.onAccent))
+                    .foregroundColor(sendIdleDisabled ? DS.Palette.textTertiary : DS.Palette.onAccent)
             }
         }
         .buttonStyle(.plain)
-        .disabled(vm.status != .running && sendIdleDisabled)
+        .disabled(sendIdleDisabled)
         .keyboardShortcut(.return, modifiers: [.command])
-        .accessibilityLabel(vm.status == .running ? "Stop" : "Send")
-        .help(vm.status == .running ? "Stop running agent" : "Send prompt")
+        .accessibilityLabel(vm.status == .running ? "Queue message" : "Send")
+        .help(vm.status == .running ? "Queue message for this thread" : "Send prompt")
+    }
+
+    private var stopButton: some View {
+        Button { vm.stop() } label: {
+            ZStack {
+                Circle()
+                    .fill(DS.Palette.danger)
+                    .frame(width: 28, height: 28)
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(DS.Palette.bg)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Stop running agent")
+        .help("Stop running agent")
     }
 
     private var attachmentChips: some View {
@@ -3371,9 +3602,9 @@ public final class AgentAppSurface: NSObject, Surface {
     /// this already-open surface (wired by AppCommandRouter, like Feed).
     public var subscriptionToken: AnyHashable?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, title: String = "Agent App") {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

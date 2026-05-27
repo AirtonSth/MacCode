@@ -84,6 +84,50 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
     }
 
+    private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
+        var payload: [String: JSONValue] = [
+            "id": .string(message.id.value.uuidString),
+            "queued_message_id": .string(message.id.value.uuidString),
+            "thread_id": .string(message.threadId.value.uuidString),
+            "text": .string(message.text),
+            "attachments": jsonValue(message.attachments),
+            "interaction_mode": .string(message.interactionMode.rawValue),
+            "position": .number(Double(message.position)),
+            "created_at": .string(ISO8601DateFormatter().string(from: message.createdAt)),
+            "updated_at": .string(ISO8601DateFormatter().string(from: message.updatedAt))
+        ]
+        if let thread = try? context?.threadRepo.get(id: message.threadId),
+           let workspaceId = thread.workspaceId {
+            payload["workspace_id"] = .string(workspaceId.value.uuidString)
+        }
+        EventBus.shared.publish(kind: kind, payload: .object(payload))
+    }
+
+    private func jsonValue<T: Encodable>(_ value: T) -> JSONValue {
+        guard let data = try? JSONEncoder().encode(value),
+              let json = try? JSONDecoder().decode(JSONValue.self, from: data) else { return .null }
+        return json
+    }
+
+    private func refreshAgentSurfaces(thread: AgentThreadID, workspace: WorkspaceID? = nil, select: Bool = false) {
+        let resolvedWorkspace: WorkspaceID?
+        if let workspace {
+            resolvedWorkspace = workspace
+        } else if let thread = try? context?.threadRepo.get(id: thread) {
+            resolvedWorkspace = thread.workspaceId
+        } else {
+            resolvedWorkspace = nil
+        }
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface,
+                  resolvedWorkspace == nil || agent.viewModel.workspaceID == resolvedWorkspace! else { continue }
+            agent.viewModel.reloadThreads()
+            agent.viewModel.reloadQueuedMessages()
+            if select { agent.viewModel.selectThread(thread) }
+        }
+        windowController?.refreshFromState()
+    }
+
     /// Walk the restored layout state and instantiate fresh Surface
     /// views for every descriptor. Surfaces are rebuilt with new IDs
     /// (their old IDs were owned by surfaces that no longer exist), so
@@ -110,10 +154,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: title)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: title)
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
-                            guard ev.kind.hasPrefix("agent.thread.") else { return }
-                            DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
+                            guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
+                            DispatchQueue.main.async {
+                                agent?.viewModel.reloadThreads()
+                                agent?.viewModel.reloadQueuedMessages()
+                            }
                         }
                         agent.subscriptionToken = AnyHashable(token)
                         agent.viewModel.providerSnapshotLoader = { [weak self] in
@@ -145,6 +192,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                         }
                         agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
                             self?.publishAgentThreadUpdated(thread)
+                        }
+                        agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
+                            self?.publishQueuedMessage(kind: kind, message)
                         }
                         surface = agent
                     case .files:
@@ -780,8 +830,45 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         return try ctx.messageRepo.listRecent(threadId: thread, limit: max(0, min(limit, 500)))
     }
 
-    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentRunID {
+    public func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.queuedMessageRepo.list(threadId: thread)
+    }
+
+    public func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage {
+        guard let ctx = context,
+              let updated = try ctx.queuedMessageRepo.update(id: id, text: text, attachments: attachments) else {
+            throw JSONRPCError.invalidParams
+        }
+        publishQueuedMessage(kind: "agent.message.queue.updated", updated)
+        refreshAgentSurfaces(thread: updated.threadId)
+        return updated
+    }
+
+    public func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage {
+        guard let ctx = context,
+              let cancelled = try ctx.queuedMessageRepo.delete(id: id) else {
+            throw JSONRPCError.invalidParams
+        }
+        publishQueuedMessage(kind: "agent.message.queue.cancelled", cancelled)
+        refreshAgentSurfaces(thread: cancelled.threadId)
+        return cancelled
+    }
+
+    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentMessageSendResult {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        if let existing = try ctx.threadRepo.get(id: thread),
+           existing.status == .running || existing.status == .pending {
+            let queued = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread,
+                text: text,
+                attachments: attachments,
+                interactionMode: interactionMode ?? .default
+            )
+            publishQueuedMessage(kind: "agent.message.queued", queued)
+            refreshAgentSurfaces(thread: thread)
+            return AgentMessageSendResult(status: .queued, queuedMessage: queued)
+        }
         var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
         if AgentThreadTitle.isPlaceholder(t.title),
            ((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty {
@@ -824,14 +911,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         // thread + reload so the just-persisted user message and the
         // streaming turn render in the macOS window, not only over the
         // wire.
-        for s in SurfaceRegistry.shared.all() {
-            if let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId {
-                agent.viewModel.reloadThreads()
-                agent.viewModel.selectThread(thread)
-                windowController?.refreshFromState()
-            }
-        }
-        return runId
+        refreshAgentSurfaces(thread: thread, workspace: t.workspaceId, select: true)
+        return AgentMessageSendResult(status: .started, runId: runId)
+    }
+
+    public func drainNextQueuedAgentMessage(thread: AgentThreadID) async throws {
+        guard let ctx = context,
+              let queued = try ctx.queuedMessageRepo.first(threadId: thread),
+              let threadState = try ctx.threadRepo.get(id: thread),
+              threadState.status != .running,
+              threadState.status != .pending else { return }
+        _ = try ctx.queuedMessageRepo.delete(id: queued.id)
+        publishQueuedMessage(kind: "agent.message.queue.drained", queued)
+        refreshAgentSurfaces(thread: thread)
+        _ = try await sendAgentMessage(
+            thread: thread,
+            text: queued.text,
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            interactionMode: queued.interactionMode,
+            modelSelection: nil,
+            providerInstanceId: nil,
+            attachments: queued.attachments
+        )
     }
 
     private func prepareAgentExecutionCwd(thread: inout AgentThread) throws -> String {
@@ -891,7 +996,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         } else {
             implementationThread = source
         }
-        let runId = try await sendAgentMessage(
+        let sendResult = try await sendAgentMessage(
             thread: implementationThread.id,
             text: AgentPlanImplementationPrompt.make(markdown: markdown),
             provider: provider,
@@ -904,6 +1009,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
             providerInstanceId: source.providerInstanceId,
             attachments: []
         )
+        guard let runId = sendResult.runId else {
+            throw JSONRPCError(code: -32032, message: "Plan implementation was queued because the thread is already running.")
+        }
         try? ctx.proposedPlanRepo.markImplemented(threadId: thread, planId: planId, implementationThreadId: implementationThread.id)
         return (runId, implementationThread.id)
     }
@@ -1883,12 +1991,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: baseTitle)
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
-                    guard ev.kind.hasPrefix("agent.thread.") else { return }
-                    DispatchQueue.main.async { agent?.viewModel.reloadThreads() }
+                    guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
+                    DispatchQueue.main.async {
+                        agent?.viewModel.reloadThreads()
+                        agent?.viewModel.reloadQueuedMessages()
+                    }
                 }
                 agent.subscriptionToken = AnyHashable(token)
                 agent.viewModel.providerSnapshotLoader = { [weak self] in
@@ -1920,6 +2031,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 }
                 agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
                     self?.publishAgentThreadUpdated(thread)
+                }
+                agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
+                    self?.publishQueuedMessage(kind: kind, message)
                 }
                 surface = agent
             case .files:
