@@ -1111,6 +1111,76 @@ final class CodexAppServerAdapterTests: XCTestCase {
                       "turn.completed without finalMessage must return the completed agent_message text as the final user-visible answer")
     }
 
+    func test_adapterIgnoresRoleUserMessageItemsSoPromptsDoNotBecomeAssistantReplies() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "now count to 15"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-role-user-1",
+            "item": [
+                "id": "user-message-1",
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": "now count to 15"]]
+            ]
+        ])
+        client.notificationHandler?("item/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-role-user-1",
+            "item": [
+                "id": "user-message-1",
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": "now count to 15"]]
+            ]
+        ])
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-role-user-1",
+            "item": [
+                "id": "assistant-message-1",
+                "type": "message",
+                "role": "assistant",
+                "content": []
+            ]
+        ])
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-role-user-1",
+            "itemId": "assistant-message-1",
+            "delta": "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-role-user-1"
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        XCTAssertFalse(events.contains { if case .itemStarted(let item) = $0 { return item.id == "user-message-1" } else { return false } },
+                       "Codex app-server `type=message role=user` items are the submitted prompt; rendering them as assistant messages makes the UI look like the agent failed to answer")
+        XCTAssertFalse(events.contains { if case .itemDelta(let itemId, let body, _, _) = $0 { return itemId == "user-message-1" || body == "now count to 15" } else { return false } },
+                       "user prompts must not contaminate the accumulated final assistant response")
+        XCTAssertTrue(events.contains { if case .turnCompleted(let turnId, let final) = $0 { return turnId == "turn-role-user-1" && final == "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15" } else { return false } },
+                      "the next user message must still produce a clean assistant final response")
+    }
+
     func test_adapterMapsAppServerTurnPlanUpdatedToActivePlanState() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -1588,7 +1658,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
             ]
         ])
 
-        _ = try await waitForItemCompleted(in: sink, itemId: "cmd-1")
+        _ = try await waitForItemCompleted(in: sink, itemId: "raw-web-1")
         let events = await sink.snapshot()
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "cmd-1" && item.type == .commandExecution && item.summary == "swift test" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "cmd-1" && output == "ok\n" } else { return false } })

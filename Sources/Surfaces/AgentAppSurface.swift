@@ -1675,6 +1675,12 @@ public struct AgentAppView: View {
     private var conversationColumn: some View {
         VStack(spacing: 0) {
             header
+            if !vm.timeline.workActivities.isEmpty {
+                workLogRow
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, DS.Space.md)
+                    .background(DS.Palette.bg)
+            }
             timeline
             composer
         }
@@ -1758,21 +1764,22 @@ public struct AgentAppView: View {
             ZStack(alignment: .bottomTrailing) {
                 GeometryReader { viewport in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: DS.Space.huge) {
-                            if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
-                                emptyConversation.padding(.top, 56)
-                            }
+                        VStack(alignment: .leading, spacing: 32) {
+                            pendingCallbackRows
                             ForEach(transcriptEntries) { entry in
                                 switch entry {
-                                case .message(let msg): messageRow(msg)
-                                case .turn(let turn): turnView(turn)
+                                case .message(let message):
+                                    messageRow(message)
+                                case .turn(let turn):
+                                    turnView(turn)
                                 }
                             }
-                            workLogRow
                             if let plan = vm.activePlan {
                                 activePlanRow(plan)
                             }
-                            pendingCallbackRows
+                            if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
+                                emptyConversation
+                            }
                             if vm.status == .running { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
                             Color.clear
@@ -1787,9 +1794,10 @@ public struct AgentAppView: View {
                                     }
                                 )
                         }
-                        .padding(.horizontal, DS.Space.lg)
-                        .padding(.vertical, DS.Space.xl)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 32)
+                        .frame(maxWidth: 920, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
@@ -1807,9 +1815,9 @@ public struct AgentAppView: View {
                         scrollTimelineToBottom(proxy, force: true)
                     } label: {
                         Image(systemName: "arrow.down")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(DS.Palette.onAccent)
-                            .frame(width: 34, height: 34)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(width: 44, height: 44)
                             .background(DS.Palette.accent)
                             .clipShape(Circle())
                             .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
@@ -1817,8 +1825,8 @@ public struct AgentAppView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Scroll to latest message")
                     .help("Scroll to latest message")
-                    .padding(.trailing, DS.Space.xl)
-                    .padding(.bottom, DS.Space.lg)
+                    .padding(.trailing, 14)
+                    .padding(.bottom, 14)
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
                 }
             }
@@ -2057,7 +2065,7 @@ public struct AgentAppView: View {
     }
 
     private func updateTimelineBottomVisibility(bottomY: CGFloat, viewportHeight: CGFloat) {
-        let atBottom = bottomY <= viewportHeight + 28
+        let atBottom = bottomY <= viewportHeight + 36
         if atBottom {
             cancelPendingScrollDownReveal()
             timelineSticksToBottom = true
@@ -2092,9 +2100,9 @@ public struct AgentAppView: View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             TimelineView(.periodic(from: vm.runStartedAt ?? Date(), by: 1)) { _ in
                 HStack(spacing: DS.Space.sm) {
-                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                    ProgressView().controlSize(.small)
                     Text("Working for \(elapsedString)")
-                        .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                        .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                 }
             }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -2131,19 +2139,10 @@ public struct AgentAppView: View {
     }
 
     private var emptyConversation: some View {
-        VStack(spacing: DS.Space.lg) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 30, weight: .light))
-                .foregroundColor(DS.Palette.accent.opacity(0.7))
-            Text("Start a conversation")
-                .font(DS.Font.title3).foregroundColor(DS.Palette.textSecondary)
-            Text("Ask \(vm.provider.rawValue.capitalized) to build, refactor, or explain code in this workspace.")
-                .font(DS.Font.bodyDense)
-                .foregroundColor(DS.Palette.textTertiary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-        }
-        .frame(maxWidth: .infinity)
+        Text("No timeline yet. Send a prompt.")
+            .font(DS.Font.body)
+            .foregroundColor(DS.Palette.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -2163,25 +2162,19 @@ public struct AgentAppView: View {
     private func messageRow(_ msg: AgentMessage) -> some View {
         switch msg.role {
         case .user:
-            // Right-aligned bubble. The HStack MUST fill the reading column
-            // (.infinity) — otherwise the LazyVStack collapses to this
-            // row's intrinsic width and every message renders as a tiny
-            // pill centered in an empty pane.
             HStack(spacing: 0) {
-                Spacer(minLength: DS.Space.huge)
+                Spacer(minLength: 32)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    AgentMessageMarkdownView(text: msg.content, compact: true)
+                    Text(msg.content)
+                        .font(DS.Font.body)
                         .foregroundColor(DS.Palette.text)
                         .textSelection(.enabled)
-                        .multilineTextAlignment(.leading)
-                        .padding(.horizontal, DS.Space.lg)
-                        .padding(.vertical, DS.Space.md)
-                        .background(DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-                        // Bubble wraps its content and caps at 600; it must
-                        // hug the RIGHT edge (trailing), else a short message
-                        // floats in the middle of a 600-wide invisible box.
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 14)
+                        .background(DS.Palette.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .frame(maxWidth: 600, alignment: .trailing)
+                        .accessibilityIdentifier("agent.userMessageBubble")
                     Button { copyToPasteboard(msg.content) } label: {
                         Image(systemName: "doc.on.doc").font(.system(size: 10))
                     }
@@ -2273,11 +2266,11 @@ public struct AgentAppView: View {
             } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: presentation.icon)
-                        .font(.system(size: 10)).foregroundColor(DS.Palette.textTertiary)
+                        .font(.system(size: 10)).foregroundColor(DS.Palette.textSecondary)
                     (Text("\(presentation.verb) ")
-                        .font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                        .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                      + Text(presentation.label)
-                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary))
+                        .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary))
                     .lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 0)
                     if hasOutput {
@@ -2291,12 +2284,12 @@ public struct AgentAppView: View {
             .help(hasOutput ? (expanded ? "Hide tool output" : "Show tool output") : "Tool output unavailable")
             if expanded, let o = presentation.detail, !o.isEmpty {
                 Text(o)
-                    .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
+                    .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
                     .textSelection(.enabled)
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

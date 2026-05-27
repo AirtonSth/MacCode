@@ -498,7 +498,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
-            if rawType == "userMessage" { break }
+            if Self.isUserMessageItem(item, type: rawType) { break }
             if markStartedItem(threadId: threadId, turnId: turnId, itemId: itemId) {
                 events.append(.itemStarted(item: AssistantItem(
                     id: itemId,
@@ -529,7 +529,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = string(item, "id") ?? string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
-            if rawType == "userMessage" { break }
+            if Self.isUserMessageItem(item, type: rawType) { break }
             let itemType = Self.assistantItemType(for: rawType)
             let summary = Self.summary(for: item, type: rawType)
             if rawType == "plan",
@@ -1380,7 +1380,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     events.append(.proposedPlan(AssistantProposedPlan(id: planId, turnId: turnId, markdown: markdown)))
                 }
                 let type = string(item, "type") ?? ""
-                if assistantItemType(for: type) == .assistantMessage,
+                if isAssistantMessageItem(item, type: type),
                    let text = body(for: item, type: type),
                    !text.isEmpty {
                     finalMessage = text
@@ -1409,7 +1409,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if let items = candidate["items"] as? [[String: Any]] {
                 for item in items.reversed() {
                     let type = string(item, "type") ?? ""
-                    if assistantItemType(for: type) == .assistantMessage,
+                    if isAssistantMessageItem(item, type: type),
                        let text = body(for: item, type: type)?.trimmingCharacters(in: .whitespacesAndNewlines),
                        !text.isEmpty {
                         return text
@@ -1433,7 +1433,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private static func events(fromThreadItem item: [String: Any], turnId: String, startedAtMs: Int64) -> [AssistantEvent] {
         let id = string(item, "id") ?? UUID().uuidString
         let type = string(item, "type") ?? "unknown"
-        if type == "userMessage" { return [] }
+        if isUserMessageItem(item, type: type) { return [] }
         let itemType = assistantItemType(for: type)
         let state = itemState(for: string(item, "status"))
         let summary = summary(for: item, type: type)
@@ -1477,6 +1477,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "contextCompaction", "context_compaction", "compaction", "compaction_trigger": return .contextCompaction
         default: return .tool
         }
+    }
+
+    private static func isUserMessageItem(_ item: [String: Any], type: String) -> Bool {
+        switch type {
+        case "userMessage", "user_message":
+            return true
+        case "message":
+            return string(item, "role")?.lowercased() == "user"
+        default:
+            return false
+        }
+    }
+
+    private static func isAssistantMessageItem(_ item: [String: Any], type: String) -> Bool {
+        guard assistantItemType(for: type) == .assistantMessage else { return false }
+        return !isUserMessageItem(item, type: type)
     }
 
     private static func isRawResponseItemType(_ type: String) -> Bool {
