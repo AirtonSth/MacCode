@@ -255,4 +255,29 @@ final class ClaudeParserCLITests: XCTestCase {
             return false
         }, "Claude SDK canUseTool decisions must resolve the matching RemoteCode approval card")
     }
+
+    func test_sdkNestedStreamEventsRenderAssistantDeltasWithoutDuplicatingWholeMessage() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sdk-stream"}"#,
+            #"{"type":"stream_event","session_id":"sdk-stream","event":{"type":"message_start","message":{"id":"turn-sdk"}}}"#,
+            #"{"type":"stream_event","session_id":"sdk-stream","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            #"{"type":"stream_event","session_id":"sdk-stream","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"S partial "}}}"#,
+            #"{"type":"stream_event","session_id":"sdk-stream","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"visible"}}}"#,
+            #"{"type":"stream_event","session_id":"sdk-stream","event":{"type":"content_block_stop","index":0}}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"S partial visible"}]},"session_id":"sdk-stream"}"#,
+            #"{"type":"result","subtype":"success","is_error":false,"result":"S partial visible","session_id":"sdk-stream"}"#
+        ])
+
+        let assistantDeltas = evs.compactMap { event -> String? in
+            if case .itemDelta(_, let body, _, _) = event { return body }
+            return nil
+        }
+        XCTAssertTrue(assistantDeltas.contains("S partial "),
+                      "Claude Agent SDK nested stream_event text deltas must render immediately as assistant partial updates")
+        XCTAssertTrue(assistantDeltas.contains("visible"),
+                      "Claude Agent SDK nested stream_event continuation deltas must keep updating the same visible assistant item")
+        XCTAssertEqual(assistantDeltas.filter { $0 == "S partial visible" }.count, 0,
+                       "the later whole assistant message must not duplicate text already streamed from nested SDK events")
+        XCTAssertEqual(finalMessage(evs), "S partial visible")
+    }
 }

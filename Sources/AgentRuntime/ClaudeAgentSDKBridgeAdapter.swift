@@ -528,6 +528,16 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     private func finishTerminated(_ session: Session) {
+        session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        session.stderrPipe.fileHandleForReading.readabilityHandler = nil
+        let tail = session.stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
+            handleLine(line, session: session)
+        }
+        for event in session.parser.finalize() {
+            handleFinalizedEvent(event, session: session)
+        }
+
         lock.lock()
         if sessions[session.threadId] === session { sessions.removeValue(forKey: session.threadId) }
         let shouldFinish = session.inFlightRunId != nil
@@ -540,6 +550,32 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             callback?(.status(.cancelled))
             callback?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
         }
+    }
+
+    private func handleFinalizedEvent(_ event: AssistantEvent, session: Session) {
+        record(event, session: session)
+        emit(.event(event), session: session)
+        guard case .turnCompleted(let turnId, let finalMessage) = event else { return }
+
+        lock.lock()
+        if !session.completedTurnIds.contains(turnId) { session.completedTurnIds.append(turnId) }
+        session.activeTurnId = nil
+        lock.unlock()
+        emitSessionSnapshot(session: session, reason: "turn_completed")
+
+        let status: AgentRunStatus = session.sawError ? .failed : .completed
+        emit(.status(status), session: session)
+        emit(.finished(status, finalMessage: finalMessage, providerThreadId: session.providerThreadId), session: session)
+
+        lock.lock()
+        session.status = status
+        session.inFlightRunId = nil
+        session.onEvent = nil
+        session.sawError = false
+        session.pendingRequestIds.removeAll()
+        session.pendingUserInputIds.removeAll()
+        session.bridgeUserInputIds.removeAll()
+        lock.unlock()
     }
 
     private func terminate(_ session: Session) {

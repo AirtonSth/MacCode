@@ -1445,11 +1445,12 @@ public struct AgentAppView: View {
     static func shouldRenderPersistedAssistantMessage(_ text: String, timelineTurns: [AssistantTurnSnapshot]) -> Bool {
         guard !text.isEmpty else { return false }
         return !timelineTurns.contains { turn in
-            if assistantText(combinedAssistantItemText(in: turn), equals: text) { return true }
-            return turn.items.contains {
-                guard $0.type == .assistantMessage else { return false }
-                return assistantText($0.body, equals: text)
-            }
+            let visibleAssistantText = turn.items
+                .filter { $0.type == .assistantMessage }
+                .map(\.body)
+                .filter { shouldRenderAssistantItemBody($0, persistedAssistantTexts: [text]) }
+                .joined(separator: "\n")
+            return assistantText(visibleAssistantText, equals: text)
         }
     }
 

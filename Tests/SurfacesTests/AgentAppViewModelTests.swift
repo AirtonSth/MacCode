@@ -1107,6 +1107,24 @@ final class AgentAppViewModelTests: XCTestCase {
         ), "the persisted assistant row must not duplicate the live macOS timeline when all partial updates already render")
     }
 
+    func test_persistedAssistantMessageRendersWhenOnlyLiveItemIsDuplicateFinal() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "1 2 3 4 5 6 7 8 9 10",
+                              startedAtMs: 1)
+            ],
+            finalAssistantMessage: "1 2 3 4 5 6 7 8 9 10",
+            finished: true
+        )
+
+        XCTAssertTrue(AgentAppView.shouldRenderPersistedAssistantMessage(
+            "1 2 3 4 5 6 7 8 9 10",
+            timelineTurns: [turn]
+        ), "when the only live assistant item duplicates the persisted final, the live item is suppressed so the persisted answer must remain visible")
+    }
+
     func test_persistedAssistantMessageRendersWhenLiveItemsAreOnlyPartial() {
         let turn = AssistantTurnSnapshot(
             turnId: "turn-1",

@@ -66,6 +66,43 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    func test_streamingCLIAdapterFinalizesAssistantTextWhenProcessExitsWithoutResult() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-streaming-finalize-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys
+        session = "stream-finalize-session"
+        print(json.dumps({"type":"system","subtype":"init","session_id":session}), flush=True)
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":"STREAM_ONLY_FINAL"}]},"session_id":session}), flush=True)
+            sys.exit(0)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "count to 10"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        try await waitForFinish(in: sink, expected: "STREAM_ONLY_FINAL")
+        let events = await sink.snapshot()
+        XCTAssertTrue(Self.assistantTexts(in: events).contains("STREAM_ONLY_FINAL"),
+                      "Claude streaming adapter must finalize buffered assistant text on EOF so the user sees a response even when result is missing")
+    }
+
     func test_recoverableRateLimitTelemetryDoesNotFailSuccessfulStreamingTurn() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-rate-limit-\(UUID().uuidString)", isDirectory: true)
@@ -811,6 +848,46 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-finalize-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try """
+        import readline from 'node:readline';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          if (cmd.type === 'rc_configure') {
+            write({ type: 'system', subtype: 'init', session_id: 'sdk-finalize-session' });
+          } else if (cmd.type === 'rc_turn') {
+            write({ type: 'assistant', message: { content: [{ type: 'text', text: 'SDK_ONLY_FINAL' }] }, session_id: 'sdk-finalize-session' });
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "count to 10"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        try await waitForFinish(in: sink, expected: "SDK_ONLY_FINAL")
+        let events = await sink.snapshot()
+        XCTAssertTrue(Self.assistantTexts(in: events).contains("SDK_ONLY_FINAL"),
+                      "Claude SDK bridge must finalize buffered assistant text on EOF so a bridge exit cannot drop the response")
+    }
+
     func test_agentSDKBridgeRecoverableRateLimitTelemetryDoesNotFailSuccessfulTurn() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-rate-limit-\(UUID().uuidString)", isDirectory: true)
@@ -1295,6 +1372,20 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
     private static func completedTurnId(_ event: AssistantEvent) -> String? {
         if case .turnCompleted(let turnId, _) = event { return turnId }
         return nil
+    }
+
+    private static func assistantTexts(in events: [AssistantEvent]) -> [String] {
+        events.compactMap {
+            if case .itemDelta(_, let body, _, _) = $0 { return body }
+            return nil
+        }
+    }
+
+    private static func assistantTexts(in events: [AgentRunEvent]) -> [String] {
+        events.compactMap {
+            if case .event(.itemDelta(_, let body, _, _)) = $0 { return body }
+            return nil
+        }
     }
 }
 

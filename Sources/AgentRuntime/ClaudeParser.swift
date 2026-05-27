@@ -39,6 +39,14 @@ public final class ClaudeParser {
         // so the resume id is never lost.
         if let sid = obj["session_id"] as? String, !sid.isEmpty { sessionId = sid }
 
+        if type == "stream_event", var event = obj["event"] as? [String: Any] {
+            if event["session_id"] == nil, let sid = obj["session_id"] {
+                event["session_id"] = sid
+            }
+            guard let nestedLine = jsonString(event) else { return [] }
+            return parseLine(nestedLine)
+        }
+
         if type == "system" {
             // Emit threadStarted only on init (the shim's hook_* lines must
             // NOT trip the fallback before the real session id is known).
@@ -148,6 +156,7 @@ public final class ClaudeParser {
                 case "text":
                     let text = block["text"] as? String ?? ""
                     if text.isEmpty { break }
+                    if assistantText(assembledAssistantBody, equals: text) { break }
                     assembledAssistantBody += (assembledAssistantBody.isEmpty ? "" : "\n") + text
                     out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
@@ -586,6 +595,25 @@ public final class ClaudeParser {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func assistantText(_ lhs: String, equals rhs: String) -> Bool {
+        let left = normalizedAssistantText(lhs)
+        let right = normalizedAssistantText(rhs)
+        guard !left.isEmpty, !right.isEmpty else { return false }
+        return left == right || compactAssistantText(lhs) == compactAssistantText(rhs)
+    }
+
+    private func normalizedAssistantText(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func compactAssistantText(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func optionValues(_ value: Any?) -> [String] {
