@@ -2501,7 +2501,7 @@ public struct AgentAppView: View {
                             .scrollContentBackground(.hidden)
                             .background(DS.Palette.surface)
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .accessibilityLabel("Edit queued message \(message.position)")
+                            .accessibilityLabel("Steer queued message \(message.position)")
                     } else {
                         Text(message.text.isEmpty ? attachmentSummary(message) : message.text)
                             .font(DS.Font.body)
@@ -2527,16 +2527,22 @@ public struct AgentAppView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 } else {
-                    Button("Edit") { vm.editQueuedMessage(message) }
+                    Button {
+                        vm.editQueuedMessage(message)
+                    } label: {
+                        Label("Steer", systemImage: "slider.horizontal.3")
+                    }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .accessibilityLabel("Queued message \(message.position), edit")
-                    Button("Cancel") {
+                        .accessibilityLabel("Steer queued message \(message.position)")
+                    Button {
                         if message.attachments.isEmpty && message.text.count < 120 {
                             vm.cancelQueuedMessage(message)
                         } else {
                             queuedMessagePendingCancel = message
                         }
+                    } label: {
+                        Label("Cancel", systemImage: "xmark")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Darwin
+import Carbon.HIToolbox
 import CoreModel
 import Persistence
 import CSystem
@@ -47,6 +48,15 @@ final class TerminalTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if TerminalKeyboardInput.shouldUseTextInput(for: event) {
+            if let text = TerminalKeyboardInput.literalShellText(for: event),
+               let data = text.data(using: .utf8) {
+                onKey?(data)
+                return
+            }
+            interpretKeyEvents([event])
+            return
+        }
         guard let bytes = TerminalTextView.encode(event) else { return }
         onKey?(bytes)
     }
@@ -151,6 +161,76 @@ final class TerminalTextView: NSTextView {
             data.insert(0x1B, at: data.startIndex)
         }
         return data
+    }
+}
+
+enum TerminalKeyboardInput {
+    static func shouldUseTextInput(for event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) || flags.contains(.control) || flags.contains(.option) {
+            return false
+        }
+        return !isRawTerminalKey(event.keyCode)
+    }
+
+    static func isRawTerminalKey(_ keyCode: UInt16) -> Bool {
+        switch keyCode {
+        case 36, 76, 48, 51, 117, 53, 126, 125, 124, 123, 115, 119, 116, 121:
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func literalShellText(for event: NSEvent) -> String? {
+        guard shouldUseTextInput(for: event) else { return nil }
+        if let text = event.characters, !text.isEmpty {
+            return text == "\"" || text == "~" ? text : nil
+        }
+
+        let shifted = event.modifierFlags.contains(.shift)
+        switch (event.keyCode, shifted) {
+        case (50, true):
+            return "~"
+        case (50, false):
+            return "`"
+        case (39, true):
+            return "\""
+        case (39, false):
+            return "'"
+        default:
+            return translatedTextIgnoringDeadKeys(for: event)
+        }
+    }
+
+    private static func translatedTextIgnoringDeadKeys(for event: NSEvent) -> String? {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let rawLayoutData = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
+            return nil
+        }
+        let layoutData = unsafeBitCast(rawLayoutData, to: CFData.self)
+        guard let bytes = CFDataGetBytePtr(layoutData) else { return nil }
+
+        let modifierKeyState = UInt32((event.modifierFlags.rawValue >> 16) & 0xFF)
+        var deadKeyState: UInt32 = 0
+        var actualLength = 0
+        var unicode = [UniChar](repeating: 0, count: 8)
+        let status = bytes.withMemoryRebound(to: UCKeyboardLayout.self, capacity: 1) { layout in
+            UCKeyTranslate(
+                layout,
+                UInt16(event.keyCode),
+                UInt16(kUCKeyActionDown),
+                modifierKeyState,
+                UInt32(LMGetKbdType()),
+                OptionBits(kUCKeyTranslateNoDeadKeysMask),
+                &deadKeyState,
+                unicode.count,
+                &actualLength,
+                &unicode
+            )
+        }
+        guard status == noErr, actualLength > 0 else { return nil }
+        return String(utf16CodeUnits: unicode, count: actualLength)
     }
 }
 

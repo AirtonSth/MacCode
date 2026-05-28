@@ -707,6 +707,14 @@ final class GhosttyTerminalView: NSView {
                 break
             }
         }
+        if TerminalKeyboardInput.shouldUseTextInput(for: event) {
+            if let text = TerminalKeyboardInput.literalShellText(for: event) {
+                sendText(text, to: surface)
+                return
+            }
+            interpretKeyEvents([event])
+            return
+        }
         var key = ghosttyKeyEvent(for: event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
         if let text = textForEvent(event) {
             text.withCString { ptr in

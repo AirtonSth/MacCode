@@ -30,6 +30,66 @@ final class TerminalEncodeTests: XCTestCase {
         XCTAssertEqual(TerminalTextView.encode(e), Data("a".utf8))
     }
 
+    func test_shiftedQuoteAndTildeUseTextInputCompositionPath() {
+        let quote = key(39, chars: "\"", ignoring: "'", flags: [.shift])
+        let tilde = key(50, chars: "~", ignoring: "`", flags: [.shift])
+
+        XCTAssertTrue(TerminalKeyboardInput.shouldUseTextInput(for: quote),
+                      "shifted quote must go through AppKit text input so international dead-key layouts can commit a literal double quote")
+        XCTAssertTrue(TerminalKeyboardInput.shouldUseTextInput(for: tilde),
+                      "shifted tilde must go through AppKit text input so international dead-key layouts can commit a literal tilde")
+    }
+
+    func test_deadKeyEventsUseTextInputCompositionPath() {
+        let deadKey = key(50, chars: "", ignoring: "")
+
+        XCTAssertTrue(TerminalKeyboardInput.shouldUseTextInput(for: deadKey),
+                      "dead keys start with no printable characters; terminal input must let AppKit compose them instead of dropping the event")
+    }
+
+    func test_reportedQuoteAndTildeCommitLiteralShellCharacters() {
+        let quote = key(39, chars: "\"", ignoring: "'", flags: [.shift])
+        let tilde = key(50, chars: "~", ignoring: "`", flags: [.shift])
+
+        XCTAssertEqual(TerminalKeyboardInput.literalShellText(for: quote), "\"",
+                       "terminal input must commit a reported literal double quote instead of letting text composition swallow shell syntax")
+        XCTAssertEqual(TerminalKeyboardInput.literalShellText(for: tilde), "~",
+                       "terminal input must commit a reported literal tilde instead of letting text composition swallow shell syntax")
+    }
+
+    func test_deadQuoteAndTildeKeysCommitLiteralShellCharacters() {
+        let quote = key(39, chars: "", ignoring: "", flags: [.shift])
+        let tilde = key(50, chars: "", ignoring: "", flags: [.shift])
+
+        XCTAssertEqual(TerminalKeyboardInput.literalShellText(for: quote), "\"",
+                       "when the keyboard reports shifted quote as a dead key, terminal input must still commit a literal double quote")
+        XCTAssertEqual(TerminalKeyboardInput.literalShellText(for: tilde), "~",
+                       "when the keyboard reports shifted tilde as a dead key, terminal input must still commit a literal tilde")
+    }
+
+    func test_ordinaryPrintableTextDoesNotUseLiteralShellBypass() {
+        let e = key(0, chars: "a", ignoring: "a")
+
+        XCTAssertNil(TerminalKeyboardInput.literalShellText(for: e),
+                     "ordinary printable text should continue through AppKit text input instead of the shell literal bypass")
+    }
+
+    func test_controlOptionAndNavigationBypassTextInputCompositionPath() {
+        let ctrlC = key(8, chars: "\u{03}", ignoring: "c", flags: [.control])
+        let optionB = key(11, chars: "∫", ignoring: "b", flags: [.option])
+        let upArrow = key(126)
+        let enter = key(36)
+
+        XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: ctrlC),
+                       "terminal control shortcuts must stay raw so Ctrl-C still interrupts the PTY")
+        XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: optionB),
+                       "Option-as-Meta must stay raw so shells receive ESC-prefixed input")
+        XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: upArrow),
+                       "navigation keys must stay raw VT input instead of becoming text commands")
+        XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: enter),
+                       "Enter must stay raw CR input so command submission remains immediate")
+    }
+
     func test_ctrlC_isETX() {
         let e = key(8, chars: "c", ignoring: "c", flags: [.control])
         XCTAssertEqual(TerminalTextView.encode(e), Data([0x03]))   // Ctrl-C → 0x03
