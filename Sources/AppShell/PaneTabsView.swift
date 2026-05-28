@@ -1192,7 +1192,7 @@ final class HorizontalTabScrollView: NoDragScroll {
         documentView.scrollToVisible(rect)
     }
 
-    private func scrollHorizontally(by delta: CGFloat) {
+    func scrollHorizontally(by delta: CGFloat) {
         guard let documentView else { return }
         var bounds = contentView.bounds
         let maxX = max(0, documentView.bounds.width - bounds.width)

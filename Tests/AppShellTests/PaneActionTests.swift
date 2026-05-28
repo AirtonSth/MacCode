@@ -532,6 +532,18 @@ final class PaneActionTests: XCTestCase {
         XCTAssertTrue(fixedTooltips.contains("Split down (stacked)"))
     }
 
+    func test_tabHeaderScrollHelperMovesHorizontalViewport() {
+        let scrollView = HorizontalTabScrollView(frame: NSRect(x: 0, y: 0, width: 220, height: 34))
+        let document = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 34))
+        scrollView.documentView = document
+        scrollView.layoutSubtreeIfNeeded()
+
+        scrollView.scrollHorizontally(by: 90)
+
+        XCTAssertGreaterThan(scrollView.contentView.bounds.origin.x, 0,
+                             "wheel movement over a crowded tab header should move the horizontal tab viewport")
+    }
+
     func test_secondaryPaneHeader_onlyShowsPaneLocalControls() throws {
         let (ctx, router) = try makeContext()
         _ = ctx
