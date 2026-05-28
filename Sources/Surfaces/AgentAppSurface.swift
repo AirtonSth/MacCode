@@ -242,6 +242,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    public func forceQueuedMessageNow(_ message: AgentQueuedMessage) async {
+        guard let queuedMessageRepo else { return }
+        do {
+            if selectedThreadCanQueuePrompt {
+                guard try queuedMessageRepo.promoteToFront(id: message.id) != nil else {
+                    queueStatusMessage = "Already processing."
+                    reloadQueuedMessages()
+                    return
+                }
+                queueStatusMessage = "Queued message will run next."
+                reloadQueuedMessages()
+                for queued in queuedMessages {
+                    onQueuedMessageEvent?("agent.message.queue.updated", queued)
+                }
+                return
+            }
+            guard let queued = try queuedMessageRepo.delete(id: message.id) else {
+                queueStatusMessage = "Already processing."
+                reloadQueuedMessages()
+                return
+            }
+            if editingQueuedMessage?.id == message.id {
+                editingQueuedMessage = nil
+                queuedMessageDraft = ""
+            }
+            queueStatusMessage = nil
+            reloadQueuedMessages()
+            onQueuedMessageEvent?("agent.message.queue.drained", queued)
+            for queued in queuedMessages {
+                onQueuedMessageEvent?("agent.message.queue.updated", queued)
+            }
+            _ = await startProviderRun(
+                text: queued.text,
+                attached: queued.attachments.map(\.path),
+                recordHistory: false,
+                interactionMode: queued.interactionMode
+            )
+        } catch {
+            queueStatusMessage = "Queue force failed: \(error)"
+        }
+    }
+
     public func cancelQueuedMessage(_ message: AgentQueuedMessage) {
         guard let queuedMessageRepo else { return }
         do {
@@ -1820,6 +1862,7 @@ public struct AgentAppView: View {
                     .background(DS.Palette.bg)
             }
             timeline
+            pendingCallbackRows
             queuedMessagesSection
             composer
         }
@@ -1904,7 +1947,6 @@ public struct AgentAppView: View {
                 GeometryReader { viewport in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 32) {
-                            pendingCallbackRows
                             ForEach(transcriptEntries) { entry in
                                 switch entry {
                                 case .message(let message):
@@ -1980,11 +2022,21 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private var pendingCallbackRows: some View {
-        ForEach(vm.openPendingRequests) { request in
-            pendingRequestRow(request)
-        }
-        ForEach(vm.openPendingUserInputs) { request in
-            pendingUserInputRow(request)
+        if !vm.openPendingRequests.isEmpty || !vm.openPendingUserInputs.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                ForEach(vm.openPendingRequests) { request in
+                    pendingRequestRow(request)
+                }
+                ForEach(vm.openPendingUserInputs) { request in
+                    pendingUserInputRow(request)
+                }
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, DS.Space.sm)
+            .frame(maxWidth: 920, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .background(DS.Palette.bg)
+            .accessibilityIdentifier("agent.pendingCallbacks")
         }
     }
 
@@ -2501,7 +2553,7 @@ public struct AgentAppView: View {
                             .scrollContentBackground(.hidden)
                             .background(DS.Palette.surface)
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .accessibilityLabel("Steer queued message \(message.position)")
+                            .accessibilityLabel("Edit queued message \(message.position)")
                     } else {
                         Text(message.text.isEmpty ? attachmentSummary(message) : message.text)
                             .font(DS.Font.body)
@@ -2528,13 +2580,21 @@ public struct AgentAppView: View {
                     .controlSize(.small)
                 } else {
                     Button {
+                        Task { await vm.forceQueuedMessageNow(message) }
+                    } label: {
+                        Label("Force Now", systemImage: "forward.end.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .accessibilityLabel("Force queued message \(message.position) now")
+                    Button {
                         vm.editQueuedMessage(message)
                     } label: {
-                        Label("Steer", systemImage: "slider.horizontal.3")
+                        Label("Edit", systemImage: "pencil")
                     }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .accessibilityLabel("Steer queued message \(message.position)")
+                        .accessibilityLabel("Edit queued message \(message.position)")
                     Button {
                         if message.attachments.isEmpty && message.text.count < 120 {
                             vm.cancelQueuedMessage(message)

@@ -54,9 +54,11 @@ public protocol CommandRouting: AnyObject {
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
     func selectAgentThread(thread: AgentThreadID) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
+    func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?) throws -> AgentMessagePage
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
+    func forceAgentQueuedMessageNow(id: AgentQueuedMessageID) async throws -> AgentMessageSendResult
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
@@ -716,6 +718,17 @@ public final class JSONRPCDispatcher {
                 let result = queuedMessagePayload(cancelled)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
+            case "agent.message.queue.force_now":
+                guard let qid = params["queued_message_id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init)
+                        ?? params["id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init) else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let forced = try await router.forceAgentQueuedMessageNow(id: qid)
+                let result = messageSendResultPayload(forced)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.plan.implement":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let planId = params["plan_id"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -775,6 +788,10 @@ public final class JSONRPCDispatcher {
             case "agent.message.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let limit = params["limit"]?.intValue ?? 200
+                if params["pagination"]?.boolValue == true || params["page"]?.boolValue == true {
+                    let page = try router.listAgentMessagesPage(thread: tid, limit: limit, before: messageCursor(from: params["before"]))
+                    return .init(id: id, result: messagePagePayload(page))
+                }
                 return .init(id: id, result: encode(try router.listAgentMessages(thread: tid, limit: limit)))
             case "agent.run.stop":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
@@ -1384,6 +1401,42 @@ public final class JSONRPCDispatcher {
 
     private func iso8601(_ date: Date) -> String {
         ISO8601DateFormatter().string(from: date)
+    }
+
+    private func messageCursor(from value: JSONValue?) -> AgentMessageCursor? {
+        guard case .object(let object) = value,
+              let id = object["id"]?.stringValue.flatMap(UUID.init).map(AgentMessageID.init) else {
+            return nil
+        }
+        if let created = object["created_at"]?.stringValue ?? object["createdAt"]?.stringValue {
+            return AgentMessageCursor(createdAt: parseISO8601(created), id: id)
+        }
+        return nil
+    }
+
+    private func parseISO8601(_ value: String) -> Date {
+        ISO8601DateFormatter().date(from: value) ?? Date(timeIntervalSinceReferenceDate: 0)
+    }
+
+    private func messagePagePayload(_ page: AgentMessagePage) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "messages": encode(page.messages),
+            "has_more_older": .bool(page.hasMoreOlder),
+            "hasMoreOlder": .bool(page.hasMoreOlder)
+        ]
+        if let cursor = page.nextBefore {
+            let encoded: JSONValue = .object([
+                "created_at": .string(iso8601(cursor.createdAt)),
+                "createdAt": .string(iso8601(cursor.createdAt)),
+                "id": .string(cursor.id.value.uuidString)
+            ])
+            object["next_before"] = encoded
+            object["nextBefore"] = encoded
+        } else {
+            object["next_before"] = .null
+            object["nextBefore"] = .null
+        }
+        return .object(object)
     }
 
     private func modelSelection(from value: JSONValue?) -> AgentModelSelection? {

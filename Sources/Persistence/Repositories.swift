@@ -273,19 +273,11 @@ public final class AgentMessageRepository {
     }
 
     public func list(threadId: AgentThreadID) throws -> [AgentMessage] {
-        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at ASC;")
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at ASC, id ASC;")
         try st.bind(1, threadId.value.uuidString)
         var out: [AgentMessage] = []
         while try st.step() {
-            let id = AgentMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
-            let tid = AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID())
-            out.append(AgentMessage(
-                id: id,
-                threadId: tid,
-                role: AgentMessageRole(rawValue: st.columnText(2) ?? "") ?? .user,
-                content: st.columnText(3) ?? "",
-                createdAt: parseDate(st.columnText(4))
-            ))
+            out.append(message(from: st))
         }
         return out
     }
@@ -299,22 +291,61 @@ public final class AgentMessageRepository {
     /// The newest `limit` messages, returned oldest→newest for display.
     /// Backs the bounded message window (B4 pagination).
     public func listRecent(threadId: AgentThreadID, limit: Int) throws -> [AgentMessage] {
-        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?;")
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?;")
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, max(0, limit))
         var out: [AgentMessage] = []
         while try st.step() {
-            let id = AgentMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
-            let tid = AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID())
-            out.append(AgentMessage(
-                id: id,
-                threadId: tid,
-                role: AgentMessageRole(rawValue: st.columnText(2) ?? "") ?? .user,
-                content: st.columnText(3) ?? "",
-                createdAt: parseDate(st.columnText(4))
-            ))
+            out.append(message(from: st))
         }
         return out.reversed()
+    }
+
+    public func listPage(threadId: AgentThreadID, limit requestedLimit: Int, before cursor: AgentMessageCursor?) throws -> AgentMessagePage {
+        let limit = max(0, min(requestedLimit, 500))
+        let sql: String
+        if cursor == nil {
+            sql = "SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?;"
+        } else {
+            sql = """
+            SELECT id, thread_id, role, content, created_at
+            FROM agent_messages
+            WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?;
+            """
+        }
+        let st = try db.prepare(sql)
+        try st.bind(1, threadId.value.uuidString)
+        if let cursor {
+            let created = iso.string(from: cursor.createdAt)
+            try st.bind(2, created)
+            try st.bind(3, created)
+            try st.bind(4, cursor.id.value.uuidString)
+            try st.bind(5, limit + 1)
+        } else {
+            try st.bind(2, limit + 1)
+        }
+        var rows: [AgentMessage] = []
+        while try st.step() {
+            rows.append(message(from: st))
+        }
+        let pageRows = Array(rows.prefix(limit))
+        let display = Array(pageRows.reversed())
+        let next = display.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        return AgentMessagePage(messages: display, hasMoreOlder: rows.count > limit, nextBefore: next)
+    }
+
+    private func message(from st: SQLiteStatement) -> AgentMessage {
+        let id = AgentMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
+        let tid = AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID())
+        return AgentMessage(
+            id: id,
+            threadId: tid,
+            role: AgentMessageRole(rawValue: st.columnText(2) ?? "") ?? .user,
+            content: st.columnText(3) ?? "",
+            createdAt: parseDate(st.columnText(4))
+        )
     }
 
     public func delete(ids: [AgentMessageID]) throws {
@@ -422,6 +453,20 @@ public final class AgentQueuedMessageRepository {
         _ = try st.step()
         try normalizePositions(threadId: queued.threadId)
         return queued
+    }
+
+    public func promoteToFront(id: AgentQueuedMessageID) throws -> AgentQueuedMessage? {
+        guard let target = try get(id: id) else { return nil }
+        let ordered = [target] + (try list(threadId: target.threadId)).filter { $0.id != id }
+        let now = Date()
+        for (index, message) in ordered.enumerated() {
+            let st = try db.prepare("UPDATE agent_queued_messages SET position = ?, updated_at = ? WHERE id = ?;")
+            try st.bind(1, Int64(index + 1))
+            try st.bind(2, iso.string(from: now))
+            try st.bind(3, message.id.value.uuidString)
+            _ = try st.step()
+        }
+        return try get(id: id)
     }
 
     private func nextPosition(threadId: AgentThreadID) throws -> Int {

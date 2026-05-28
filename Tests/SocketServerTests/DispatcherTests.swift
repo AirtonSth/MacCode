@@ -209,6 +209,26 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
     }
+    func listAgentMessagesPage(thread: AgentThreadID, limit requestedLimit: Int, before cursor: AgentMessageCursor?) throws -> AgentMessagePage {
+        let limit = max(0, min(requestedLimit, 500))
+        let filtered = messageStore
+            .filter { message in
+                guard message.threadId == thread else { return false }
+                guard let cursor else { return true }
+                if message.createdAt != cursor.createdAt {
+                    return message.createdAt < cursor.createdAt
+                }
+                return message.id.value.uuidString < cursor.id.value.uuidString
+            }
+            .sorted {
+                if $0.createdAt != $1.createdAt { return $0.createdAt > $1.createdAt }
+                return $0.id.value.uuidString > $1.id.value.uuidString
+            }
+        let pageRows = Array(filtered.prefix(limit))
+        let display = Array(pageRows.reversed())
+        let next = display.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        return AgentMessagePage(messages: display, hasMoreOlder: filtered.count > limit, nextBefore: next)
+    }
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         queuedMessageStore.filter { $0.threadId == thread }.sorted { $0.position < $1.position }
     }
@@ -222,6 +242,37 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage {
         guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
         return queuedMessageStore.remove(at: idx)
+    }
+    func forceAgentQueuedMessageNow(id: AgentQueuedMessageID) async throws -> AgentMessageSendResult {
+        guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
+        let queued = queuedMessageStore.remove(at: idx)
+        if threadStore.first(where: { $0.id == queued.threadId })?.status == .running {
+            queuedMessageStore.insert(queued, at: 0)
+            normalizeQueuedPositions(thread: queued.threadId)
+            guard let promoted = queuedMessageStore.first(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
+            return AgentMessageSendResult(status: .queued, queuedMessage: promoted)
+        }
+        normalizeQueuedPositions(thread: queued.threadId)
+        return try await sendAgentMessage(thread: queued.threadId,
+                                          text: queued.text,
+                                          provider: nil,
+                                          model: nil,
+                                          permissionMode: nil,
+                                          reasoningEffort: nil,
+                                          serviceTier: nil,
+                                          interactionMode: queued.interactionMode,
+                                          modelSelection: nil,
+                                          providerInstanceId: nil,
+                                          attachments: queued.attachments)
+    }
+    private func normalizeQueuedPositions(thread: AgentThreadID) {
+        let sortedIds = queuedMessageStore
+            .filter { $0.threadId == thread }
+            .map(\.id)
+        for (offset, id) in sortedIds.enumerated() {
+            guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { continue }
+            queuedMessageStore[idx].position = offset + 1
+        }
     }
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult {
         sendAgentMessageCallCount += 1
@@ -1285,6 +1336,50 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentMessageQueueForceNowPromotesRunningThreadAndStartsIdleThread() async throws {
+        let router = FakeRouter()
+        var running = AgentThread(workspaceId: nil, title: "queue", provider: .codex, model: "gpt-5.5")
+        running.status = .running
+        let first = AgentQueuedMessage(threadId: running.id, text: "first", attachments: [], interactionMode: .default, position: 1)
+        let second = AgentQueuedMessage(threadId: running.id, text: "force me", attachments: [], interactionMode: .plan, position: 2)
+        router.threadStore = [running]
+        router.queuedMessageStore = [first, second]
+
+        let forceParams: [String: JSONValue] = [
+            "queued_message_id": .string(second.id.value.uuidString),
+            "client_request_id": .string("queue-force-1")
+        ]
+        let firstForce = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.queue.force_now", params: forceParams))
+        let secondForce = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.queue.force_now", params: forceParams))
+
+        XCTAssertEqual(firstForce.result, secondForce.result,
+                       "retries for Force Now must return the same host result and not start or promote twice")
+        XCTAssertEqual(router.queuedMessageStore.map(\.text), ["force me", "first"],
+                       "Force Now on a running thread must promote the selected queued message to the next slot")
+        guard case .object(let queuedResult)? = firstForce.result else { return XCTFail("Force Now must return queue status while the active run is still running") }
+        XCTAssertEqual(queuedResult["status"], .string("queued"))
+        XCTAssertEqual(queuedResult["position"], .number(1))
+
+        var idle = AgentThread(workspaceId: nil, title: "idle queue", provider: .codex, model: "gpt-5.5")
+        idle.status = .completed
+        let idleQueued = AgentQueuedMessage(threadId: idle.id, text: "start now", attachments: [], interactionMode: .default, position: 1)
+        router.threadStore = [idle]
+        router.queuedMessageStore = [idleQueued]
+        router.sendAgentMessageCallCount = 0
+
+        let started = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.message.queue.force_now", params: [
+            "queued_message_id": .string(idleQueued.id.value.uuidString)
+        ]))
+
+        guard case .object(let startedResult)? = started.result else { return XCTFail("Force Now must return run status once it can start immediately") }
+        XCTAssertEqual(startedResult["status"], .string("started"))
+        XCTAssertNotNil(startedResult["run_id"]?.stringValue)
+        XCTAssertEqual(router.lastSendText, "start now",
+                       "Force Now on an idle thread must drain and start the selected queued message immediately")
+        XCTAssertTrue(router.queuedMessageStore.isEmpty)
+    }
+
+    @MainActor
     func test_agentPlanImplementClientRequestIdIsIdempotent() async throws {
         let router = FakeRouter()
         let t = AgentThread(workspaceId: nil, title: "plan", provider: .codex, model: "gpt-5.5")
@@ -1662,6 +1757,60 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(first["content"], .string("old prompt"))
         XCTAssertEqual(last["role"], .string("assistant"))
         XCTAssertEqual(last["content"], .string("old answer"))
+    }
+
+    @MainActor
+    func test_agentMessageListPaginationReturnsEnvelopeAndOlderCursor() async throws {
+        let router = FakeRouter()
+        let t = AgentThread(workspaceId: nil, title: "history", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [t]
+        let base = Date(timeIntervalSinceReferenceDate: 1_000)
+        router.messageStore = (0..<35).map { index in
+            AgentMessage(
+                id: AgentMessageID(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index))!),
+                threadId: t.id,
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: "message-\(index)",
+                createdAt: base.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        let d = JSONRPCDispatcher(router: router)
+
+        let first = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(10),
+            "pagination": .bool(true)
+        ]))
+
+        guard case .object(let page)? = first.result,
+              case .array(let firstMessages)? = page["messages"],
+              case .object(let firstMessage)? = firstMessages.first,
+              case .object(let lastMessage)? = firstMessages.last,
+              case .object(let firstCursor)? = page["next_before"] else {
+            return XCTFail("paginated message list must return envelope with cursor")
+        }
+        XCTAssertEqual(firstMessages.count, 10)
+        XCTAssertEqual(firstMessage["content"], .string("message-25"))
+        XCTAssertEqual(lastMessage["content"], .string("message-34"))
+        XCTAssertEqual(page["has_more_older"], .bool(true))
+
+        let second = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(30),
+            "pagination": .bool(true),
+            "before": .object(firstCursor)
+        ]))
+
+        guard case .object(let olderPage)? = second.result,
+              case .array(let olderMessages)? = olderPage["messages"],
+              case .object(let firstOlderMessage)? = olderMessages.first,
+              case .object(let lastOlderMessage)? = olderMessages.last else {
+            return XCTFail("older paginated message list must return envelope")
+        }
+        XCTAssertEqual(olderMessages.count, 25)
+        XCTAssertEqual(firstOlderMessage["content"], .string("message-0"))
+        XCTAssertEqual(lastOlderMessage["content"], .string("message-24"))
+        XCTAssertEqual(olderPage["has_more_older"], .bool(false))
     }
 
     @MainActor

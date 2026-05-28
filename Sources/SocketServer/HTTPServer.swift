@@ -401,12 +401,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         var responseBody = body
         var extraHeaders = ""
         if contentType.contains("application/json"),
-           acceptEncoding?.lowercased().contains(PayloadCodec.lzfse.wireName) == true,
+           let codec = PayloadCodec.preferredResponseCodec(acceptEncoding: acceptEncoding),
            body.count >= 128,
-           let compressed = try? PayloadCodec.lzfse.encode(body),
+           let compressed = try? codec.encode(body),
            compressed.count < body.count {
             responseBody = compressed
-            extraHeaders += "Content-Encoding: \(PayloadCodec.lzfse.wireName)\r\n"
+            extraHeaders += "Content-Encoding: \(codec.wireName)\r\n"
         }
         let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\n\(extraHeaders)Content-Length: \(responseBody.count)\r\nConnection: close\r\n\r\n"
         var out = Data(head.utf8)

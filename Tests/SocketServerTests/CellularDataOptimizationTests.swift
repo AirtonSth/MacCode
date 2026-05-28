@@ -6,10 +6,14 @@ final class CellularDataOptimizationTests: XCTestCase {
     func testPayloadCodecRoundTripsAndRejectsInvalidData() throws {
         let payload = Data(String(repeating: #"{"event":"same visible state"}"#, count: 40).utf8)
         let encoded = try PayloadCodec.lzfse.encode(payload)
+        let gzip = try PayloadCodec.gzip.encode(payload)
 
         XCTAssertLessThan(encoded.count, payload.count)
         XCTAssertEqual(try PayloadCodec.lzfse.decode(encoded, expectedSize: payload.count), payload)
         XCTAssertThrowsError(try PayloadCodec.lzfse.decode(Data([0, 1, 2, 3]), expectedSize: payload.count))
+        XCTAssertEqual(gzip.prefix(2), Data([0x1f, 0x8b]), "gzip history compression must use the standard gzip wire header")
+        XCTAssertLessThan(gzip.count, payload.count)
+        XCTAssertEqual(try PayloadCodec.gzip.decode(gzip, expectedSize: payload.count), payload)
     }
 
     func testWebSocketEnvelopeRoundTripsAndRejectsInvalidData() throws {
@@ -62,10 +66,13 @@ final class CellularDataOptimizationTests: XCTestCase {
         URLSession.shared.dataTask(with: request) { data, response, error in
             XCTAssertNil(error)
             let http = response as? HTTPURLResponse
-            XCTAssertEqual(http?.value(forHTTPHeaderField: "Content-Encoding"), PayloadCodec.lzfse.wireName,
+            XCTAssertEqual(http?.value(forHTTPHeaderField: "Content-Encoding"), PayloadCodec.gzip.wireName,
                            "Mac must only compress after explicit iOS negotiation")
             do {
-                let decoded = try PayloadCodec.lzfse.decode(data ?? Data(), expectedSize: nil)
+                let responseData = data ?? Data()
+                let decoded = responseData.starts(with: Data([0x1f, 0x8b]))
+                    ? try PayloadCodec.gzip.decode(responseData, expectedSize: nil)
+                    : responseData
                 let obj = try JSONSerialization.jsonObject(with: decoded) as? [String: Any]
                 XCTAssertEqual(obj?["id"] as? String, "rpc-route")
             } catch {

@@ -764,6 +764,28 @@ public struct AgentMessage: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public struct AgentMessageCursor: Codable, Sendable, Equatable {
+    public let createdAt: Date
+    public let id: AgentMessageID
+
+    public init(createdAt: Date, id: AgentMessageID) {
+        self.createdAt = createdAt
+        self.id = id
+    }
+}
+
+public struct AgentMessagePage: Codable, Sendable, Equatable {
+    public let messages: [AgentMessage]
+    public let hasMoreOlder: Bool
+    public let nextBefore: AgentMessageCursor?
+
+    public init(messages: [AgentMessage], hasMoreOlder: Bool, nextBefore: AgentMessageCursor?) {
+        self.messages = messages
+        self.hasMoreOlder = hasMoreOlder
+        self.nextBefore = nextBefore
+    }
+}
+
 public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public let id: AgentQueuedMessageID
     public let threadId: AgentThreadID

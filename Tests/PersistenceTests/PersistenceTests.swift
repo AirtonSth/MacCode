@@ -93,6 +93,37 @@ final class PersistenceTests: XCTestCase {
                        "provider instance id must persist on runs so recovery/debugging can identify the exact provider identity used")
     }
 
+    func test_agentMessageRepositoryPagesOlderHistoryWithStableCursor() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let tr = AgentThreadRepository(db: db)
+        let t = AgentThread(title: "long history", provider: .codex, model: "gpt-5")
+        try tr.upsert(t)
+        let mr = AgentMessageRepository(db: db)
+        let base = Date(timeIntervalSinceReferenceDate: 2_000)
+        for index in 0..<35 {
+            let id = AgentMessageID(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index))!)
+            try mr.append(AgentMessage(
+                id: id,
+                threadId: t.id,
+                role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: "message-\(index)",
+                createdAt: base.addingTimeInterval(TimeInterval(index / 2))
+            ))
+        }
+
+        let first = try mr.listPage(threadId: t.id, limit: 10, before: nil)
+        let older = try mr.listPage(threadId: t.id, limit: 30, before: first.nextBefore)
+
+        XCTAssertEqual(first.messages.map(\.content), (25..<35).map { "message-\($0)" },
+                       "initial history page must return the newest 10 in display order")
+        XCTAssertTrue(first.hasMoreOlder)
+        XCTAssertEqual(older.messages.map(\.content), (0..<25).map { "message-\($0)" },
+                       "older page must use created_at plus id as the cursor so duplicate timestamps do not skip rows")
+        XCTAssertFalse(older.hasMoreOlder)
+    }
+
     func test_snapshot_roundtrip() throws {
         let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }

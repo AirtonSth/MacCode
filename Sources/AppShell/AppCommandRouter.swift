@@ -830,6 +830,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         return try ctx.messageRepo.listRecent(threadId: thread, limit: max(0, min(limit, 500)))
     }
 
+    public func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?) throws -> AgentMessagePage {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.messageRepo.listPage(threadId: thread, limit: max(0, min(limit, 500)), before: before)
+    }
+
     public func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.queuedMessageRepo.list(threadId: thread)
@@ -853,6 +858,43 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         publishQueuedMessage(kind: "agent.message.queue.cancelled", cancelled)
         refreshAgentSurfaces(thread: cancelled.threadId)
         return cancelled
+    }
+
+    public func forceAgentQueuedMessageNow(id: AgentQueuedMessageID) async throws -> AgentMessageSendResult {
+        guard let ctx = context,
+              let queued = try ctx.queuedMessageRepo.get(id: id),
+              let thread = try ctx.threadRepo.get(id: queued.threadId) else {
+            throw JSONRPCError.invalidParams
+        }
+        if thread.status == .running {
+            guard let promoted = try ctx.queuedMessageRepo.promoteToFront(id: id) else {
+                throw JSONRPCError.invalidParams
+            }
+            for message in try ctx.queuedMessageRepo.list(threadId: queued.threadId) {
+                publishQueuedMessage(kind: "agent.message.queue.updated", message)
+            }
+            refreshAgentSurfaces(thread: queued.threadId)
+            return AgentMessageSendResult(status: .queued, queuedMessage: promoted)
+        }
+        _ = try ctx.queuedMessageRepo.delete(id: queued.id)
+        publishQueuedMessage(kind: "agent.message.queue.drained", queued)
+        for message in try ctx.queuedMessageRepo.list(threadId: queued.threadId) {
+            publishQueuedMessage(kind: "agent.message.queue.updated", message)
+        }
+        refreshAgentSurfaces(thread: queued.threadId)
+        return try await sendAgentMessage(
+            thread: queued.threadId,
+            text: queued.text,
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            interactionMode: queued.interactionMode,
+            modelSelection: nil,
+            providerInstanceId: nil,
+            attachments: queued.attachments
+        )
     }
 
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentMessageSendResult {

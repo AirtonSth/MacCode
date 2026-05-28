@@ -56,6 +56,7 @@ public enum Schema {
             FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_agent_messages_thread ON agent_messages(thread_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_thread_created_id ON agent_messages(thread_id, created_at, id);
         CREATE TABLE IF NOT EXISTS agent_runs (
             id TEXT PRIMARY KEY,
             thread_id TEXT NOT NULL,
