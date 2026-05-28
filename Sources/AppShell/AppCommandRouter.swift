@@ -858,7 +858,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         if let existing = try ctx.threadRepo.get(id: thread),
-           existing.status == .running || existing.status == .pending {
+           existing.status == .running {
             let queued = try ctx.queuedMessageRepo.enqueue(
                 threadId: thread,
                 text: text,

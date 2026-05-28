@@ -565,6 +565,42 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.status, .cancelled,
                        "stopped runs must update persisted thread status so macOS and iOS leave running state")
     }
+
+    func test_sendAgentMessageStartsPendingNewThreadInsteadOfQueueing() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "pending-start", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "New thread",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        let result = try await router.sendAgentMessage(thread: thread.id,
+                                                       text: "count to 10",
+                                                       provider: nil,
+                                                       model: nil,
+                                                       permissionMode: nil,
+                                                       reasoningEffort: nil)
+
+        XCTAssertEqual(result.status, .started,
+                       "a freshly-created pending Agent thread must start its first provider run; queuing here leaves iOS waiting forever")
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id), [],
+                       "the first prompt in a new iOS thread must not be stored as an editable follow-up queue item")
+        XCTAssertEqual(runner.lastRequest?.prompt, "count to 10")
+    }
 }
 
 private final class RequestCaptureRunner: AgentProviderRunner, @unchecked Sendable {
