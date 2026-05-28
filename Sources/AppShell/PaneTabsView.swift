@@ -28,6 +28,7 @@ public final class PaneTabsView: NSObject {
     private let splitContext: PaneSplitContext?
     private let workspaceIDOverride: WorkspaceID?
     private let tabStrip = PaneTabDropStack()
+    private let tabScrollView = HorizontalTabScrollView()
     private let contentArea = NSView()
     private let addMenu = NSMenu()
     private var tabButtons: [SurfaceID: PaneTabButton] = [:]
@@ -62,6 +63,8 @@ public final class PaneTabsView: NSObject {
         tabStrip.alignment = .centerY
         tabStrip.translatesAutoresizingMaskIntoConstraints = false
         tabStrip.onDropSurface = { [weak self] sid in self?.appendDroppedSurface(sid) ?? false }
+        tabScrollView.translatesAutoresizingMaskIntoConstraints = false
+        tabScrollView.documentView = tabStrip
         for desc in pane.surfaces {
             let isSel = desc.id == selectedID
             let busy = Self.isSurfaceBusy(desc, router: router)
@@ -186,7 +189,7 @@ public final class PaneTabsView: NSObject {
         divider.translatesAutoresizingMaskIntoConstraints = false
 
         v.addSubview(headerBG)
-        headerBG.addSubview(tabStrip)
+        headerBG.addSubview(tabScrollView)
         headerBG.addSubview(rightCluster)
         v.addSubview(divider)
         v.addSubview(contentArea)
@@ -196,10 +199,15 @@ public final class PaneTabsView: NSObject {
             headerBG.trailingAnchor.constraint(equalTo: v.trailingAnchor),
             headerBG.heightAnchor.constraint(equalToConstant: 34),
 
-            tabStrip.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
-            tabStrip.topAnchor.constraint(equalTo: headerBG.topAnchor),
-            tabStrip.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
-            tabStrip.trailingAnchor.constraint(lessThanOrEqualTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
+            tabScrollView.leadingAnchor.constraint(equalTo: headerBG.leadingAnchor),
+            tabScrollView.topAnchor.constraint(equalTo: headerBG.topAnchor),
+            tabScrollView.bottomAnchor.constraint(equalTo: headerBG.bottomAnchor),
+            tabScrollView.trailingAnchor.constraint(equalTo: rightCluster.leadingAnchor, constant: -DS.Space.sm),
+
+            tabStrip.leadingAnchor.constraint(equalTo: tabScrollView.contentView.leadingAnchor),
+            tabStrip.topAnchor.constraint(equalTo: tabScrollView.contentView.topAnchor),
+            tabStrip.bottomAnchor.constraint(equalTo: tabScrollView.contentView.bottomAnchor),
+            tabStrip.heightAnchor.constraint(equalTo: tabScrollView.heightAnchor),
 
             rightCluster.trailingAnchor.constraint(equalTo: headerBG.trailingAnchor, constant: -DS.Space.md),
             rightCluster.centerYAnchor.constraint(equalTo: headerBG.centerYAnchor),
@@ -218,6 +226,12 @@ public final class PaneTabsView: NSObject {
         eventToken = EventBus.shared.subscribe(since: nil) { [weak self] event in
             DispatchQueue.main.async { self?.receive(event) }
         }
+        DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
+    }
+
+    private func scrollSelectedTabIntoView(_ selectedID: SurfaceID?) {
+        guard let selectedID, let tab = tabButtons[selectedID] else { return }
+        tabScrollView.scrollDocumentViewToVisible(tab)
     }
 
     private func buildMinimizedSideRail(in root: NSView, selectedSurfaceID: SurfaceID?) {
@@ -1134,8 +1148,58 @@ final class PaneTabDropStack: NoDragStack {
     }
 }
 
-final class NoDragScroll: NSScrollView {
+class NoDragScroll: NSScrollView {
     override var mouseDownCanMoveWindow: Bool { false }
+}
+
+final class HorizontalTabScrollView: NoDragScroll {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    private func configure() {
+        drawsBackground = false
+        borderType = .noBorder
+        hasHorizontalScroller = true
+        hasVerticalScroller = false
+        autohidesScrollers = true
+        scrollerStyle = .overlay
+        horizontalScrollElasticity = .allowed
+        verticalScrollElasticity = .none
+        contentView.postsBoundsChangedNotifications = true
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard abs(event.scrollingDeltaX) < abs(event.scrollingDeltaY),
+              abs(event.scrollingDeltaY) > 0 else {
+            super.scrollWheel(with: event)
+            return
+        }
+        scrollHorizontally(by: -event.scrollingDeltaY)
+    }
+
+    func scrollDocumentViewToVisible(_ view: NSView) {
+        guard let documentView else { return }
+        let rect = view.convert(view.bounds, to: documentView).insetBy(dx: -20, dy: 0)
+        documentView.scrollToVisible(rect)
+    }
+
+    private func scrollHorizontally(by delta: CGFloat) {
+        guard let documentView else { return }
+        var bounds = contentView.bounds
+        let maxX = max(0, documentView.bounds.width - bounds.width)
+        bounds.origin.x = min(max(0, bounds.origin.x + delta), maxX)
+        contentView.scroll(to: bounds.origin)
+        reflectScrolledClipView(contentView)
+    }
 }
 
 final class NoDragButton: NSButton {

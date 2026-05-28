@@ -501,6 +501,37 @@ final class PaneActionTests: XCTestCase {
                       "tab add and close buttons live in the titlebar band, so they must receive clicks instead of starting a window drag")
     }
 
+    func test_crowdedTabHeader_usesHorizontalScrollerWithoutScrollingPaneControls() throws {
+        let (_, router) = try makeContext()
+        let surfaces = (0..<14).map {
+            SurfaceDescriptor(type: .terminal, title: "terminal-\($0)-wide-title", iconName: "terminal")
+        }
+        let pane = PaneNode(surfaces: surfaces, selectedSurfaceID: surfaces.last?.id)
+        let ptv = PaneTabsView(pane: pane, router: router)
+        ptv.view.setFrameSize(NSSize(width: 360, height: 240))
+        ptv.view.layoutSubtreeIfNeeded()
+
+        let scrollView = try XCTUnwrap(
+            allSubviews(of: ptv.view).first { $0 is HorizontalTabScrollView } as? HorizontalTabScrollView,
+            "crowded tab headers must use a horizontal scroll container so tabs are reachable instead of clipped"
+        )
+        let tabStrip = try XCTUnwrap(scrollView.documentView as? PaneTabDropStack)
+        let scrolledButtons = allSubviews(of: tabStrip).compactMap { $0 as? NSButton }
+        let scrolledTooltips = scrolledButtons.compactMap(\.toolTip)
+        let fixedTooltips = allSubviews(of: ptv.view)
+            .compactMap { $0 as? NSButton }
+            .filter { !$0.isDescendant(of: tabStrip) }
+            .compactMap(\.toolTip)
+
+        XCTAssertTrue(scrollView.hasHorizontalScroller)
+        XCTAssertFalse(scrollView.hasVerticalScroller)
+        XCTAssertGreaterThanOrEqual(scrolledButtons.count, surfaces.count,
+                                    "every tab button must remain inside the scrollable document")
+        XCTAssertTrue(scrolledTooltips.contains("New surface"))
+        XCTAssertTrue(fixedTooltips.contains("Split right (side by side)"))
+        XCTAssertTrue(fixedTooltips.contains("Split down (stacked)"))
+    }
+
     func test_secondaryPaneHeader_onlyShowsPaneLocalControls() throws {
         let (ctx, router) = try makeContext()
         _ = ctx
