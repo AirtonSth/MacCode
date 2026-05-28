@@ -1555,7 +1555,8 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 }
 
 public struct AgentAppView: View {
-    private static let threadRailWidth: CGFloat = 220
+    private static let threadRailWidthRange: ClosedRange<CGFloat> = 180...360
+    private static let threadRailIdealWidth: CGFloat = 220
     @ObservedObject var vm: AgentAppViewModel
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
@@ -1687,10 +1688,14 @@ public struct AgentAppView: View {
         HSplitView {
             if showThreadRail {
                 threadRail
-                    .frame(width: Self.threadRailWidth)
+                    .frame(
+                        minWidth: Self.threadRailWidthRange.lowerBound,
+                        idealWidth: Self.threadRailIdealWidth,
+                        maxWidth: Self.threadRailWidthRange.upperBound
+                    )
             }
             conversationColumn
-                .frame(minWidth: 460)
+                .frame(minWidth: 0, maxWidth: .infinity)
             if vm.showPlanSidebar {
                 planSidebar.frame(minWidth: 240, idealWidth: 300, maxWidth: 420)
             }
@@ -1977,8 +1982,8 @@ public struct AgentAppView: View {
                         }
                         .padding(.horizontal, 22)
                         .padding(.vertical, 32)
-                        .frame(maxWidth: 920, alignment: .leading)
-                        .frame(maxWidth: .infinity, alignment: .center)
+                        .frame(width: viewport.size.width, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
@@ -2033,8 +2038,7 @@ public struct AgentAppView: View {
             }
             .padding(.horizontal, 22)
             .padding(.vertical, DS.Space.sm)
-            .frame(maxWidth: 920, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.bg)
             .accessibilityIdentifier("agent.pendingCallbacks")
         }
@@ -2683,28 +2687,39 @@ public struct AgentAppView: View {
     }
 
     private var composerToolbar: some View {
-        HStack(spacing: DS.Space.md) {
-            Button(action: pickAttachments) {
-                Image(systemName: "plus")
-                    .font(.system(size: 13, weight: .medium))
-                    .frame(width: 26, height: 26)
+        compactComposerToolbar
+            .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+    }
+
+    private var compactComposerToolbar: some View {
+        VStack(spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                attachmentButton
+                permissionMenu
+                executionMenu
+                Spacer(minLength: DS.Space.xs)
+                if vm.status == .running {
+                    ProgressView().controlSize(.small).scaleEffect(0.55)
+                    stopButton
+                }
+                sendStopButton
             }
-            .buttonStyle(.plain)
-            .foregroundColor(DS.Palette.textSecondary)
-            .help("Attach files").accessibilityLabel("Attach files")
-            permissionMenu
-            executionMenu
-            Spacer(minLength: DS.Space.sm)
-            if vm.status == .running {
-                ProgressView().controlSize(.small).scaleEffect(0.55)
+            HStack(spacing: DS.Space.sm) {
+                Spacer(minLength: 0)
+                modelMenu
             }
-            if vm.status == .running {
-                stopButton
-            }
-            modelMenu
-            sendStopButton
         }
-        .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
+    }
+
+    private var attachmentButton: some View {
+        Button(action: pickAttachments) {
+            Image(systemName: "plus")
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 26, height: 26)
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(DS.Palette.textSecondary)
+        .help("Attach files").accessibilityLabel("Attach files")
     }
 
     @ViewBuilder
@@ -2937,10 +2952,12 @@ public struct AgentAppView: View {
             HStack(spacing: DS.Space.xs) {
                 Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
                     .lineLimit(1)
+                    .truncationMode(.tail)
                 if vm.supportsReasoningForSelectedModel {
                     Text("·").foregroundColor(DS.Palette.textTertiary)
                     Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 if vm.serviceTier == .fast {
                     Text("·").foregroundColor(DS.Palette.textTertiary)
@@ -2951,17 +2968,18 @@ public struct AgentAppView: View {
                     Text("·").foregroundColor(DS.Palette.textTertiary)
                     Text(contextWindow).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
             }
-            .fixedSize()
+            .frame(maxWidth: 260, alignment: .trailing)
             .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
             .background(DS.Palette.surfaceRaised)
             .clipShape(Capsule())
             .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
         }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
         .disabled(vm.status == .running)
         .help(vm.providerLocked ? "Model · reasoning effort · service tier" : "Provider · model · reasoning effort · service tier")
     }
