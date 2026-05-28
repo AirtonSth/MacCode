@@ -169,8 +169,57 @@ public final class SidebarViewModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false; panel.canChooseDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
-            _ = try? router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+            _ = createWorkspace(fromFolder: url)
         }
+    }
+
+    @discardableResult
+    public func createWorkspace(fromFolder url: URL) -> Bool {
+        guard let router else { return false }
+        do {
+            _ = try router.createWorkspace(fromFolder: url)
+            reload()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    public func createWorkspaces(fromFolders urls: [URL]) -> Bool {
+        urls.reduce(false) { created, url in
+            createWorkspace(fromFolder: url) || created
+        }
+    }
+
+    @discardableResult
+    public func createWorkspaces(fromDroppedProviders providers: [NSItemProvider]) -> Bool {
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+
+        for provider in fileProviders {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
+                guard let url = Self.fileURL(fromDroppedItem: item) else { return }
+                DispatchQueue.main.async {
+                    _ = self?.createWorkspace(fromFolder: url)
+                }
+            }
+        }
+        return true
+    }
+
+    nonisolated static func fileURL(fromDroppedItem item: Any?) -> URL? {
+        if let url = item as? URL { return url }
+        if let data = item as? Data {
+            return URL(dataRepresentation: data, relativeTo: nil)
+        }
+        if let data = item as? NSData {
+            return URL(dataRepresentation: data as Data, relativeTo: nil)
+        }
+        if let string = item as? String {
+            return URL(string: string) ?? URL(fileURLWithPath: string)
+        }
+        return nil
     }
 
     public func toggleSidebar() {
@@ -441,6 +490,9 @@ public struct SidebarRootView: View {
             Rectangle()
                 .fill(Color.white.opacity(0.045))
                 .frame(width: DS.Border.hairline)
+        }
+        .onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
+            vm.createWorkspaces(fromDroppedProviders: providers)
         }
         // The sidebar material reaches the top edge; only its controls
         // start below the traffic-light band.

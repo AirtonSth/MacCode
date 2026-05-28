@@ -435,7 +435,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 	        panel.canChooseFiles = false
 	        panel.canChooseDirectories = true
 	        if panel.runModal() == .OK, let url = panel.url {
-	            _ = try? router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+	            _ = try? router?.createWorkspace(fromFolder: url)
 	        }
 	    }
 

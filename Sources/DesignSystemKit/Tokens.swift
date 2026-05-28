@@ -15,6 +15,7 @@ public enum DS {
         // Backgrounds, low → high elevation
         public static let bg          = Color(hex: 0x0F1419)
         public static let surface     = Color(hex: 0x171D24)
+        public static let sidebar     = surface
         public static let surfaceRaised = Color(hex: 0x1B222B)
         public static let surfaceOverlay = Color(hex: 0x212A34)
 
@@ -48,6 +49,7 @@ public enum DS {
     public enum NS {
         public static let bg            = NSColor(hex: 0x0F1419)
         public static let surface       = NSColor(hex: 0x171D24)
+        public static let sidebar       = surface
         public static let surfaceRaised = NSColor(hex: 0x1B222B)
         public static let line          = NSColor(hex: 0x2A3440)
         public static let lineStrong    = NSColor(hex: 0x394654)

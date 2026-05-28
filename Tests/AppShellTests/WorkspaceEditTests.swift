@@ -129,6 +129,44 @@ final class WorkspaceEditTests: XCTestCase {
                      "Open in Finder must fail loud instead of opening an invalid path")
     }
 
+    func test_sidebarDroppedFolderCreatesSelectedWorkspace() throws {
+        let (ctx, router) = try make()
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2DroppedWorkspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let vm = SidebarViewModel(context: ctx, router: router)
+
+        XCTAssertTrue(vm.createWorkspace(fromFolder: folder),
+                      "dropping a Finder folder onto the global sidebar must create a workspace from that folder")
+
+        let selected = try XCTUnwrap(ctx.state.window.selectedWorkspaceID)
+        let workspace = try XCTUnwrap(ctx.state.workspaces[selected])
+        XCTAssertEqual(workspace.name, folder.lastPathComponent)
+        XCTAssertEqual(workspace.cwd, folder.standardizedFileURL.path)
+    }
+
+    func test_sidebarDroppedFileIsRejectedForWorkspaceCreation() throws {
+        let (ctx, router) = try make()
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2DroppedFile-\(UUID().uuidString).txt")
+        try "not a workspace".write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let vm = SidebarViewModel(context: ctx, router: router)
+
+        XCTAssertFalse(vm.createWorkspace(fromFolder: file),
+                       "dropping a regular file must not create a broken workspace")
+        XCTAssertTrue(ctx.state.workspaces.isEmpty)
+    }
+
+    func test_sidebarDropDecodesFinderFileURLPayload() {
+        let folder = URL(fileURLWithPath: "/tmp/RC2 Finder Drop", isDirectory: true)
+        let data = folder.absoluteURL.dataRepresentation as NSData
+
+        XCTAssertEqual(SidebarViewModel.fileURL(fromDroppedItem: data)?.path, folder.path,
+                       "Finder drag payloads arrive as file-url data and must decode before workspace creation")
+    }
+
     func test_sidebarShiftSelection_tracksRangeWithoutOpeningWorkspace() throws {
         let (ctx, router) = try make()
         let first = try router.createWorkspace(name: "one", cwd: "/tmp")

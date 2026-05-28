@@ -814,13 +814,13 @@ private struct SSHSidebarView: View {
                     }
                     .focusable()
                 }
-                .background(DS.Palette.surface)
+                .background(DS.Palette.sidebar)
                 .overlay(alignment: .trailing) {
                     Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
                 }
             }
         }
-        .background(DS.Palette.surface)
+        .background(DS.Palette.sidebar)
         .sheet(isPresented: $vm.showForm) {
             SSHHostFormSheet(vm: vm)
         }
@@ -845,7 +845,7 @@ private struct SSHSidebarView: View {
         }
         .padding(.top, DS.Space.sm)
         .frame(width: 44)
-        .background(DS.Palette.surface)
+        .background(DS.Palette.sidebar)
         .overlay(alignment: .trailing) {
             Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
         }
@@ -860,9 +860,12 @@ private struct SSHSidebarView: View {
                 .padding(.horizontal, DS.Space.xs)
                 .padding(.top, DS.Space.xs)
             if vm.hosts.isEmpty {
-                DSEmptyState(icon: "network",
-                             title: "No hosts",
-                             subtitle: "Add a host to open an SSH terminal.")
+                DSEmptyState(
+                    icon: "network",
+                    title: "No hosts",
+                    subtitle: "Add a host to open an SSH terminal.",
+                    background: DS.Palette.sidebar
+                )
             } else {
                 ForEach(vm.hosts, id: \.id) { host in
                     SSHHostRow(
@@ -898,7 +901,7 @@ private struct SSHTransferSidebarView: View {
                 panel
             }
         }
-        .background(DS.Palette.surface)
+        .background(DS.Palette.sidebar)
     }
 
     private var collapsedRail: some View {

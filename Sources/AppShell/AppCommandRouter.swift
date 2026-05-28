@@ -354,6 +354,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         return ws
     }
 
+    public func createWorkspace(fromFolder url: URL) throws -> Workspace {
+        let folder = url.standardizedFileURL
+        var isDirectory = ObjCBool(false)
+        guard folder.isFileURL,
+              FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw LayoutError.workspaceNotFound
+        }
+        return try createWorkspace(name: folder.lastPathComponent, cwd: folder.path)
+    }
+
     public func selectWorkspace(_ id: WorkspaceID) throws {
         if context?.state.window.selectedWorkspaceID == id {
             return

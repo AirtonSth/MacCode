@@ -145,6 +145,34 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    public func application(_ application: NSApplication, open urls: [URL]) {
+        openDroppedWorkspaceFolders(urls)
+    }
+
+    public func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        openDroppedWorkspaceFolders([URL(fileURLWithPath: filename, isDirectory: true)])
+    }
+
+    public func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let opened = openDroppedWorkspaceFolders(filenames.map { URL(fileURLWithPath: $0, isDirectory: true) })
+        sender.reply(toOpenOrPrint: opened ? .success : .failure)
+    }
+
+    @discardableResult
+    public func openDroppedWorkspaceFolders(_ urls: [URL]) -> Bool {
+        guard let router else { return false }
+        var opened = false
+        for url in urls {
+            if (try? router.createWorkspace(fromFolder: url)) != nil {
+                opened = true
+            }
+        }
+        if opened {
+            windowController?.show()
+        }
+        return opened
+    }
+
     public func applicationDidBecomeActive(_ notification: Notification) {
         router?.reconcileSurfaceVisibility()
         windowController?.repairSelectedTerminalFocus(reason: "app_active")

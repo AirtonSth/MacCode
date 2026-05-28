@@ -29,6 +29,9 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(script.contains("BUNDLE_ID=\"${RC2_BUNDLE_ID:-io.remotecode.desktop}\""))
         XCTAssertTrue(script.contains("<key>CFBundleDisplayName</key><string>RemoteCode</string>"))
         XCTAssertTrue(script.contains("<key>CFBundleIconFile</key><string>AppIcon</string>"))
+        XCTAssertTrue(script.contains("<key>CFBundleDocumentTypes</key>"))
+        XCTAssertTrue(script.contains("<string>public.folder</string>"),
+                      "dragging a Finder folder onto the Dock app icon must route that folder to NSApplication open-file handling")
         XCTAssertTrue(script.contains("AppIcon.icns"))
         XCTAssertTrue(script.contains("<key>SUFeedURL</key><string>${SPARKLE_FEED_URL}</string>"),
                       "release bundles must point Sparkle at the stable appcast feed")
