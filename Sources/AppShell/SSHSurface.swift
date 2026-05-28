@@ -52,7 +52,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         )
         self.viewModel = SSHSurfaceViewModel()
 
-        let root = NSView()
+        let root = AdaptiveSSHRootView()
         root.translatesAutoresizingMaskIntoConstraints = false
         root.wantsLayer = true
         root.layer?.backgroundColor = DS.NS.bg.cgColor
@@ -113,6 +113,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
         super.init()
 
+        root.onSizeChanged = { [weak self] size in
+            self?.applyAdaptiveHostSidebar(width: size.width, event: .resize)
+        }
         hostResizeHandle.onDrag = { [weak self] delta, ended in
             self?.resizeHostSidebar(delta: delta, ended: ended)
         }
@@ -140,6 +143,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         showPlaceholder()
         reloadHosts()
         syncTransferSidebarWidth(animated: false)
+        applyAdaptiveHostSidebar(width: root.bounds.width, event: .structural)
     }
 
     private func setSidebarCollapsed(_ collapsed: Bool) {
@@ -148,6 +152,26 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             view.layoutSubtreeIfNeeded()
+        }
+    }
+
+    private func applyAdaptiveHostSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        let now = Date().timeIntervalSinceReferenceDate
+        let transferWidth = transferWidthConstraint?.constant ?? 0
+        let decision = AdaptiveSidebarPolicy.nextVisibility(
+            availableExtent: width - transferWidth,
+            contentMinimumExtent: 520,
+            sidebarExtent: Self.persistedHostSidebarWidth() + DS.ResizeDivider.thickness,
+            currentVisible: !viewModel.sidebarCollapsed,
+            intent: viewModel.hostSidebarIntent,
+            event: event,
+            now: now,
+            lastAutomaticChange: viewModel.lastAutomaticHostSidebarChange
+        )
+        guard decision.isVisible == viewModel.sidebarCollapsed else { return }
+        viewModel.sidebarCollapsed = !decision.isVisible
+        if decision.didChangeAutomatically {
+            viewModel.lastAutomaticHostSidebarChange = now
         }
     }
 
@@ -508,6 +532,8 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     @Published var sidebarCollapsed = false {
         didSet { onSidebarCollapsedChange?(sidebarCollapsed) }
     }
+    var hostSidebarIntent: AdaptiveSidebarIntent = .auto
+    var lastAutomaticHostSidebarChange: TimeInterval?
     @Published var status = "Disconnected"
     @Published var error: String?
     @Published var draft = SSHHostDraft()
@@ -547,6 +573,7 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         draft = SSHHostDraft()
         editingHostID = nil
         showForm = true
+        hostSidebarIntent = .forcedVisible
         sidebarCollapsed = false
     }
 
@@ -554,6 +581,7 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         draft = SSHHostDraft(host: host)
         editingHostID = host.id
         showForm = true
+        hostSidebarIntent = .forcedVisible
         sidebarCollapsed = false
     }
 
@@ -700,6 +728,17 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     }
 }
 
+private final class AdaptiveSSHRootView: NSView {
+    var onSizeChanged: ((NSSize) -> Void)?
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let oldSize = frame.size
+        super.setFrameSize(newSize)
+        guard oldSize != newSize else { return }
+        onSizeChanged?(newSize)
+    }
+}
+
 struct SSHHostDraft {
     var id: SSHHostID?
     var label = ""
@@ -758,6 +797,7 @@ private struct SSHSidebarView: View {
                     DSSectionHeader("SSH", trailing: AnyView(
                         HStack(spacing: DS.Space.xs) {
                             DSIconButton("sidebar.left", help: "Hide hosts") {
+                                vm.hostSidebarIntent = .forcedHidden
                                 vm.sidebarCollapsed = true
                             }
                             DSIconButton("plus", help: "Add SSH host") {
@@ -789,6 +829,7 @@ private struct SSHSidebarView: View {
     private var collapsedRail: some View {
         VStack(spacing: DS.Space.sm) {
             DSIconButton("sidebar.left", help: "Show hosts") {
+                vm.hostSidebarIntent = .forcedVisible
                 vm.sidebarCollapsed = false
             }
             DSIconButton("plus", help: "Add SSH host") {

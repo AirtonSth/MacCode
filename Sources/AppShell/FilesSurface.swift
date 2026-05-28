@@ -449,7 +449,9 @@ private final class FilesViewModel: ObservableObject {
 private struct FilesSurfaceRoot: View {
     @ObservedObject var model: FilesViewModel
     @AppStorage("files.sidebar.width.v2") private var sidebarWidth: Double = 260
+    @AppStorage("files.sidebar.intent.v1") private var sidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @State private var sidebarVisible = true
+    @State private var lastAutomaticSidebarChange: TimeInterval?
     @State private var selectedFileIDs: Set<String> = []
     @State private var pathInput = ""
     @State private var confirmDiscard = false
@@ -461,16 +463,25 @@ private struct FilesSurfaceRoot: View {
     @State private var confirmDelete = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            if sidebarVisible {
-                sidebar
-                    .frame(width: sidebarWidth)
-                DSResizeDivider(axis: .vertical, help: "Resize file list") { delta in
-                    sidebarWidth = min(560, max(240, sidebarWidth + Double(delta)))
+        GeometryReader { proxy in
+            HStack(spacing: 0) {
+                if sidebarVisible {
+                    sidebar
+                        .frame(width: sidebarWidth)
+                    DSResizeDivider(axis: .vertical, help: "Resize file list") { delta in
+                        sidebarWidth = min(560, max(240, sidebarWidth + Double(delta)))
+                    }
                 }
+                reader
+                    .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
             }
-            reader
-                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+            .onAppear { applyAdaptiveSidebar(width: proxy.size.width, event: .structural) }
+            .onChange(of: proxy.size.width) { width in
+                applyAdaptiveSidebar(width: width, event: .resize)
+            }
+            .onChange(of: model.readerMode) { _ in
+                applyAdaptiveSidebar(width: proxy.size.width, event: .structural)
+            }
         }
         .background(DS.Palette.bg)
         .foregroundStyle(DS.Palette.text)
@@ -522,6 +533,7 @@ private struct FilesSurfaceRoot: View {
                         .font(DS.Font.title3)
                     Spacer()
                     DSIconButton("sidebar.left", help: "Hide file sidebar") {
+                        sidebarIntent = .forcedHidden
                         sidebarVisible = false
                     }
                     .accessibilityLabel("Hide file sidebar")
@@ -674,6 +686,7 @@ private struct FilesSurfaceRoot: View {
                 HStack(spacing: 8) {
                     if !sidebarVisible {
                         DSIconButton("sidebar.left", help: "Show file sidebar") {
+                            sidebarIntent = .forcedVisible
                             sidebarVisible = true
                         }
                         .accessibilityLabel("Show file sidebar")
@@ -719,6 +732,34 @@ private struct FilesSurfaceRoot: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(DS.Palette.surfaceRaised)
+    }
+
+    private var sidebarIntent: AdaptiveSidebarIntent {
+        get { AdaptiveSidebarIntent(rawValue: sidebarIntentRaw) ?? .auto }
+        nonmutating set { sidebarIntentRaw = newValue.rawValue }
+    }
+
+    private var readerMinimumWidth: CGFloat {
+        model.readerMode == "split" ? 700 : 520
+    }
+
+    private func applyAdaptiveSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        let now = Date().timeIntervalSinceReferenceDate
+        let decision = AdaptiveSidebarPolicy.nextVisibility(
+            availableExtent: width,
+            contentMinimumExtent: readerMinimumWidth,
+            sidebarExtent: CGFloat(sidebarWidth) + DS.ResizeDivider.thickness,
+            currentVisible: sidebarVisible,
+            intent: sidebarIntent,
+            event: event,
+            now: now,
+            lastAutomaticChange: lastAutomaticSidebarChange
+        )
+        guard decision.isVisible != sidebarVisible else { return }
+        sidebarVisible = decision.isVisible
+        if decision.didChangeAutomatically {
+            lastAutomaticSidebarChange = now
+        }
     }
 
     @ViewBuilder

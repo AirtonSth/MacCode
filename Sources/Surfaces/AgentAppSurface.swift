@@ -1557,6 +1557,8 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 public struct AgentAppView: View {
     private static let threadRailWidthRange: ClosedRange<CGFloat> = 180...360
     private static let threadRailIdealWidth: CGFloat = 220
+    private static let conversationMinimumWidth: CGFloat = 560
+    private static let planSidebarIdealWidth: CGFloat = 300
     @ObservedObject var vm: AgentAppViewModel
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
@@ -1569,7 +1571,11 @@ public struct AgentAppView: View {
     @State private var userIsDraggingTimeline = false
     @State private var pendingScrollDownReveal: Task<Void, Never>?
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
+    @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
+    @AppStorage("agent.planSidebar.intent.v1") private var planSidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @State private var showThreadRail = true
+    @State private var lastAutomaticThreadRailChange: TimeInterval?
+    @State private var lastAutomaticPlanSidebarChange: TimeInterval?
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
@@ -1685,19 +1691,28 @@ public struct AgentAppView: View {
     }
 
     public var body: some View {
-        HSplitView {
-            if showThreadRail {
-                threadRail
-                    .frame(
-                        minWidth: Self.threadRailWidthRange.lowerBound,
-                        idealWidth: Self.threadRailIdealWidth,
-                        maxWidth: Self.threadRailWidthRange.upperBound
-                    )
+        GeometryReader { proxy in
+            HSplitView {
+                if showThreadRail {
+                    threadRail
+                        .frame(
+                            minWidth: Self.threadRailWidthRange.lowerBound,
+                            idealWidth: Self.threadRailIdealWidth,
+                            maxWidth: Self.threadRailWidthRange.upperBound
+                        )
+                }
+                conversationColumn
+                    .frame(minWidth: 0, maxWidth: .infinity)
+                if vm.showPlanSidebar {
+                    planSidebar.frame(minWidth: 240, idealWidth: Self.planSidebarIdealWidth, maxWidth: 420)
+                }
             }
-            conversationColumn
-                .frame(minWidth: 0, maxWidth: .infinity)
-            if vm.showPlanSidebar {
-                planSidebar.frame(minWidth: 240, idealWidth: 300, maxWidth: 420)
+            .onAppear { applyAdaptiveSidebars(width: proxy.size.width, event: .structural) }
+            .onChange(of: proxy.size.width) { width in
+                applyAdaptiveSidebars(width: width, event: .resize)
+            }
+            .onChange(of: vm.showPlanSidebar) { _ in
+                applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
             }
         }
         .background(DS.Palette.bg)
@@ -1712,7 +1727,10 @@ public struct AgentAppView: View {
             DSSectionHeader(vm.activeThreadCount > 0 ? "Threads · \(vm.activeThreadCount) active" : "Threads",
                             trailing: AnyView(
                 HStack(spacing: DS.Space.xs) {
-                    DSIconButton("sidebar.left", help: "Hide threads") { showThreadRail = false }
+                    DSIconButton("sidebar.left", help: "Hide threads") {
+                        threadRailIntent = .forcedHidden
+                        showThreadRail = false
+                    }
                     DSIconButton("plus", help: "New thread") { vm.createThread(title: "New thread") }
                 }
             ))
@@ -1881,7 +1899,10 @@ public struct AgentAppView: View {
     private var header: some View {
         HStack(spacing: DS.Space.sm) {
             if !showThreadRail {
-                DSIconButton("sidebar.left", help: "Show threads") { showThreadRail = true }
+                DSIconButton("sidebar.left", help: "Show threads") {
+                    threadRailIntent = .forcedVisible
+                    showThreadRail = true
+                }
             }
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 9, weight: .semibold))
@@ -1904,6 +1925,7 @@ public struct AgentAppView: View {
             Spacer(minLength: 0)
             DSPill(vm.status.rawValue, tone: statusTone(vm.status))
             DSIconButton("list.bullet.rectangle", help: "Toggle plan") {
+                planSidebarIntent = vm.showPlanSidebar ? .forcedHidden : .forcedVisible
                 vm.showPlanSidebar.toggle()
             }
         }
@@ -1930,6 +1952,61 @@ public struct AgentAppView: View {
     }
     private var effortLabel: String { vm.reasoningEffort.displayName }
     private var serviceTierLabel: String { vm.serviceTier == .fast ? "Fast" : "Auto" }
+
+    private var threadRailIntent: AdaptiveSidebarIntent {
+        get { AdaptiveSidebarIntent(rawValue: threadRailIntentRaw) ?? .auto }
+        nonmutating set { threadRailIntentRaw = newValue.rawValue }
+    }
+
+    private var planSidebarIntent: AdaptiveSidebarIntent {
+        get { AdaptiveSidebarIntent(rawValue: planSidebarIntentRaw) ?? .auto }
+        nonmutating set { planSidebarIntentRaw = newValue.rawValue }
+    }
+
+    private func applyAdaptiveSidebars(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        applyAdaptivePlanSidebar(width: width, event: event)
+        applyAdaptiveThreadRail(width: width, event: event)
+    }
+
+    private func applyAdaptivePlanSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        let now = Date().timeIntervalSinceReferenceDate
+        let reservedThreadWidth = showThreadRail ? Self.threadRailIdealWidth : 0
+        let decision = AdaptiveSidebarPolicy.nextVisibility(
+            availableExtent: width - reservedThreadWidth,
+            contentMinimumExtent: Self.conversationMinimumWidth,
+            sidebarExtent: Self.planSidebarIdealWidth,
+            currentVisible: vm.showPlanSidebar,
+            intent: planSidebarIntent,
+            event: event,
+            now: now,
+            lastAutomaticChange: lastAutomaticPlanSidebarChange
+        )
+        guard decision.isVisible != vm.showPlanSidebar else { return }
+        vm.showPlanSidebar = decision.isVisible
+        if decision.didChangeAutomatically {
+            lastAutomaticPlanSidebarChange = now
+        }
+    }
+
+    private func applyAdaptiveThreadRail(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        let now = Date().timeIntervalSinceReferenceDate
+        let reservedPlanWidth = vm.showPlanSidebar ? Self.planSidebarIdealWidth : 0
+        let decision = AdaptiveSidebarPolicy.nextVisibility(
+            availableExtent: width - reservedPlanWidth,
+            contentMinimumExtent: Self.conversationMinimumWidth,
+            sidebarExtent: Self.threadRailIdealWidth,
+            currentVisible: showThreadRail,
+            intent: threadRailIntent,
+            event: event,
+            now: now,
+            lastAutomaticChange: lastAutomaticThreadRailChange
+        )
+        guard decision.isVisible != showThreadRail else { return }
+        showThreadRail = decision.isVisible
+        if decision.didChangeAutomatically {
+            lastAutomaticThreadRailChange = now
+        }
+    }
 
     private func statusTone(_ s: AgentRunStatus) -> DSPill.Tone {
         switch s {
@@ -3092,7 +3169,10 @@ public struct AgentAppView: View {
     private var planSidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             DSSectionHeader("Plan", trailing: AnyView(
-                DSIconButton("xmark", help: "Hide plan") { vm.showPlanSidebar = false }
+                DSIconButton("xmark", help: "Hide plan") {
+                    planSidebarIntent = .forcedHidden
+                    vm.showPlanSidebar = false
+                }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             if let plan = vm.activePlan {
