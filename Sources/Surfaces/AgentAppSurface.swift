@@ -1039,7 +1039,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         recordPromptHistory(text)
-        if status == .running || status == .pending {
+        if selectedThreadCanQueuePrompt {
             await enqueuePromptWhileRunning(text: text, attached: attachments)
             return
         }
@@ -1060,6 +1060,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
+    }
+
+    private var selectedThreadCanQueuePrompt: Bool {
+        guard let selectedThreadId else { return false }
+        if status == .running { return true }
+        if coordinator.activeThreadIdsSnapshot().contains(selectedThreadId) { return true }
+        guard let currentRunId,
+              let runStatus = try? coordinator.runStatus(currentRunId) else { return false }
+        return runStatus == .running || runStatus == .pending
     }
 
     private func enqueuePromptWhileRunning(text: String, attached: [String]) async {

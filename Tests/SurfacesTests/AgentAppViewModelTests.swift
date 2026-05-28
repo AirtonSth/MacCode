@@ -900,6 +900,75 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
     }
 
+    func test_send_emptyPendingThreadStartsRunInsteadOfQueueing() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-empty-pending-send-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = CapturingProviderRunner(provider: .codex)
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: runner])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   queuedMessageRepo: queuedRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        vm.createThread(title: "New thread")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        XCTAssertEqual(try threadRepo.get(id: id)?.status, .pending,
+                       "a newly created empty thread may be persisted as pending, but it is not an active provider run")
+
+        vm.prompt = "Run this now"
+        await vm.send()
+
+        XCTAssertEqual(runner.prompts, ["Run this now"],
+                       "when no provider run is active, the first prompt must start immediately instead of being stranded in the queue")
+        XCTAssertTrue((try? queuedRepo.list(threadId: id))?.isEmpty ?? false,
+                      "the queue is only for follow-up prompts while a real run is active")
+        XCTAssertTrue(vm.queuedMessages.isEmpty,
+                      "the empty-thread send path must not render a queued-message row")
+    }
+
+    func test_send_runningThreadQueuesFollowupPrompt() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-running-queue-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = SlowStartRunner()
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: runner])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   queuedMessageRepo: queuedRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        vm.createThread(title: "busy")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        vm.prompt = "start slow run"
+
+        Task { await vm.send() }
+        await waitAsync("selected thread becomes a real active run") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+        vm.prompt = "follow up after current run"
+        await vm.send()
+
+        XCTAssertEqual((try? queuedRepo.list(threadId: id).map(\.text)) ?? [], ["follow up after current run"],
+                       "follow-up prompts should queue only while a real provider run is active")
+        vm.stop()
+        await waitAsync("slow run can still be stopped after queueing") {
+            runner.cancelled
+        }
+    }
+
     func test_reloadThreadsBackfillsPlaceholderTitleFromFirstUserMessage() throws {
         let (vm, repo) = try makeVM()
         let thread = AgentThread(workspaceId: vm.workspaceID, title: "Thread", provider: .claude, model: "fake-model")
