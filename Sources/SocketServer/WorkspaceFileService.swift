@@ -24,31 +24,7 @@ public struct WorkspaceFileService: Sendable {
         let entries = children.map { child -> (Bool, String, JSONValue) in
             let values = try? child.resourceValues(forKeys: Set(keys))
             let isDirectory = values?.isDirectory == true
-            let identity = (try? classify(root: rootURL, path: child.path)) ?? FileIdentity(
-                kind: isDirectory ? "directory" : "unknown",
-                mime: "application/octet-stream",
-                uti: nil,
-                ext: child.pathExtension.lowercased(),
-                size: Int64(values?.fileSize ?? 0),
-                modifiedAt: values?.contentModificationDate,
-                isBinary: !isDirectory,
-                isTextReadable: false,
-                isEditable: false,
-                editabilityReason: values?.isSymbolicLink == true ? "symlink outside workspace or unreadable" : "unreadable",
-                language: nil
-            )
-            return (isDirectory, child.lastPathComponent, .object([
-                "name": .string(child.lastPathComponent),
-                "path": .string(child.path),
-                "relative_path": .string(relativePath(root: rootURL, url: child)),
-                "type": .string(isDirectory ? "directory" : "file"),
-                "ext": .string(child.pathExtension.lowercased()),
-                "size": .number(Double(identity.size)),
-                "modified_at": identity.modifiedAt.map { .number($0.timeIntervalSince1970) } ?? .null,
-                "is_hidden": .bool(child.lastPathComponent.hasPrefix(".")),
-                "is_symlink": .bool(values?.isSymbolicLink == true),
-                "identity": identity.json
-            ]))
+            return (isDirectory, child.lastPathComponent, .object(entryJSON(root: rootURL, url: child, values: values)))
         }
         .sorted { lhs, rhs in
             if lhs.0 != rhs.0 { return lhs.0 && !rhs.0 }
@@ -116,6 +92,66 @@ public struct WorkspaceFileService: Sendable {
             "url_path": .string(grant.routePath),
             "mime": .string(identity.mime),
             "expires_at": .number(Date().addingTimeInterval(60 * 60).timeIntervalSince1970)
+        ])
+    }
+
+    public func createFile(root: String, path: String, content: String = "") throws -> JSONValue {
+        let rootURL = try safeRoot(root)
+        let file = try resolve(root: rootURL, path: path, mustExist: false)
+        guard file.path != rootURL.path else {
+            throw JSONRPCError(code: -32602, message: "file name required", data: .string(path))
+        }
+        guard !FileManager.default.fileExists(atPath: file.path) else {
+            throw JSONRPCError(code: -32602, message: "file already exists", data: .string(relativePath(root: rootURL, url: file)))
+        }
+        let parent = file.deletingLastPathComponent()
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDir), isDir.boolValue else {
+            throw JSONRPCError(code: -32602, message: "parent directory not found", data: .string(relativePath(root: rootURL, url: parent)))
+        }
+        guard FileManager.default.createFile(atPath: file.path, contents: Data(content.utf8)) else {
+            throw JSONRPCError(code: -32000, message: "file create failed", data: .string(relativePath(root: rootURL, url: file)))
+        }
+        return .object(entryJSON(root: rootURL, url: file))
+    }
+
+    public func rename(root: String, path: String, newName: String) throws -> JSONValue {
+        let rootURL = try safeRoot(root)
+        let source = try resolve(root: rootURL, path: path, mustExist: true)
+        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isSafeLeafName(name) else {
+            throw JSONRPCError(code: -32602, message: "invalid file name", data: .string(newName))
+        }
+        let destination = source.deletingLastPathComponent()
+            .appendingPathComponent(name)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        try ensureInside(root: rootURL, url: destination, requested: newName)
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw JSONRPCError(code: -32602, message: "file already exists", data: .string(relativePath(root: rootURL, url: destination)))
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
+        return .object(entryJSON(root: rootURL, url: destination))
+    }
+
+    public func delete(root: String, paths: [String]) throws -> JSONValue {
+        let rootURL = try safeRoot(root)
+        guard !paths.isEmpty else {
+            throw JSONRPCError(code: -32602, message: "file path required")
+        }
+        var deleted: [JSONValue] = []
+        for path in paths {
+            let file = try resolve(root: rootURL, path: path, mustExist: true)
+            guard file.path != rootURL.path else {
+                throw JSONRPCError(code: -32602, message: "cannot delete workspace root", data: .string(path))
+            }
+            let relative = relativePath(root: rootURL, url: file)
+            try FileManager.default.removeItem(at: file)
+            deleted.append(.string(relative))
+        }
+        return .object([
+            "deleted": .array(deleted),
+            "count": .number(Double(deleted.count))
         ])
     }
 
@@ -221,6 +257,52 @@ public struct WorkspaceFileService: Sendable {
             throw JSONRPCError(code: -32602, message: "not found", data: .string(standardized.path))
         }
         return standardized
+    }
+
+    private func ensureInside(root: URL, url: URL, requested: String) throws {
+        let rootPath = root.path
+        guard url.path == rootPath || url.path.hasPrefix(rootPath + "/") else {
+            throw JSONRPCError(code: -32602, message: "path escapes workspace", data: .string(requested))
+        }
+    }
+
+    private func isSafeLeafName(_ name: String) -> Bool {
+        !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains(":")
+    }
+
+    private func entryJSON(root: URL, url: URL, values: URLResourceValues? = nil) -> [String: JSONValue] {
+        let resourceValues: URLResourceValues?
+        if let values {
+            resourceValues = values
+        } else {
+            resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
+        }
+        let isDirectory = resourceValues?.isDirectory == true
+        let identity = (try? classify(root: root, path: url.path)) ?? FileIdentity(
+            kind: isDirectory ? "directory" : "unknown",
+            mime: "application/octet-stream",
+            uti: nil,
+            ext: url.pathExtension.lowercased(),
+            size: Int64(resourceValues?.fileSize ?? 0),
+            modifiedAt: resourceValues?.contentModificationDate,
+            isBinary: !isDirectory,
+            isTextReadable: false,
+            isEditable: false,
+            editabilityReason: resourceValues?.isSymbolicLink == true ? "symlink outside workspace or unreadable" : "unreadable",
+            language: nil
+        )
+        return [
+            "name": .string(url.lastPathComponent),
+            "path": .string(url.path),
+            "relative_path": .string(relativePath(root: root, url: url)),
+            "type": .string(isDirectory ? "directory" : "file"),
+            "ext": .string(url.pathExtension.lowercased()),
+            "size": .number(Double(identity.size)),
+            "modified_at": identity.modifiedAt.map { .number($0.timeIntervalSince1970) } ?? .null,
+            "is_hidden": .bool(url.lastPathComponent.hasPrefix(".")),
+            "is_symlink": .bool(resourceValues?.isSymbolicLink == true),
+            "identity": identity.json
+        ]
     }
 
     private func readSample(file: URL) throws -> Data {

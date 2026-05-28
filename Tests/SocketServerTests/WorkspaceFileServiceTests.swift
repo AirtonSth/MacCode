@@ -65,6 +65,43 @@ final class WorkspaceFileServiceTests: XCTestCase {
                      "unknown binary files must show metadata only; decoding arbitrary bytes can corrupt the reader and editor")
     }
 
+    func testCreateRenameAndDeleteStayInsideWorkspaceForFilesSidebarActions() throws {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("Sources"), withIntermediateDirectories: true)
+
+        let created = try service.createFile(root: root.path, path: "Sources/NewFile.swift", content: "")
+        let createdPath = try XCTUnwrap(created.objectValue?["relative_path"]?.stringValue)
+        XCTAssertEqual(createdPath, "Sources/NewFile.swift",
+                       "the Files sidebar add-file action must create the exact workspace-relative file the user requested")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(createdPath).path))
+
+        let renamed = try service.rename(root: root.path, path: "Sources/NewFile.swift", newName: "Renamed.swift")
+        XCTAssertEqual(renamed.objectValue?["relative_path"]?.stringValue, "Sources/Renamed.swift",
+                       "rename must keep the file in its current directory instead of allowing path injection")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Sources/NewFile.swift").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Sources/Renamed.swift").path))
+
+        _ = try service.createFile(root: root.path, path: "Sources/DeleteMe.swift", content: "")
+        let deleted = try service.delete(root: root.path, paths: ["Sources/Renamed.swift", "Sources/DeleteMe.swift"])
+        XCTAssertEqual(deleted.objectValue?["deleted"]?.arrayValue?.compactMap(\.stringValue).sorted(),
+                       ["Sources/DeleteMe.swift", "Sources/Renamed.swift"],
+                       "multi-select delete must remove every selected workspace-relative file in one host operation")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Sources/Renamed.swift").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Sources/DeleteMe.swift").path))
+    }
+
+    func testFilesSidebarMutationsRejectEscapingAndOverwritePaths() throws {
+        try service.createFile(root: root.path, path: "keep.txt", content: "")
+
+        XCTAssertThrowsError(try service.createFile(root: root.path, path: "../escape.txt", content: ""),
+                             "add-file must not write outside the workspace root")
+        XCTAssertThrowsError(try service.rename(root: root.path, path: "keep.txt", newName: "../escape.txt"),
+                             "rename from the Files context menu must reject names that escape the current directory")
+        XCTAssertThrowsError(try service.rename(root: root.path, path: "keep.txt", newName: "keep.txt"),
+                             "rename must not overwrite an existing workspace path silently")
+        XCTAssertThrowsError(try service.delete(root: root.path, paths: [""]),
+                             "bulk delete must not allow deleting the workspace root")
+    }
+
     func testEditSaveRejectsExternallyGrownFileBeforeReadingWholeFile() throws {
         let file = root.appendingPathComponent("notes.txt")
         try "small".write(to: file, atomically: true, encoding: .utf8)

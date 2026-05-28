@@ -24,6 +24,8 @@ public protocol CommandRouting: AnyObject {
     func reorderWorkspace(_ id: WorkspaceID, position: Int) throws
     func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor
     func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor
+    func filesOpenTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, path: String) throws -> SurfaceDescriptor
+    func filesSplitTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, direction: SplitDirection, path: String) throws -> SurfaceDescriptor
     func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws
     func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws
     func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws
@@ -132,6 +134,9 @@ public protocol CommandRouting: AnyObject {
     func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue
     func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue
     func fsWorkspacePreviewURL(workspace: WorkspaceID, path: String) throws -> JSONValue
+    func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue
+    func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue
+    func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue
     func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue
     func filesEditSave(sessionID: String) throws -> JSONValue
@@ -258,6 +263,25 @@ public final class JSONRPCDispatcher {
                         "p0": .array([.string("navigate"), .string("back"), .string("forward"), .string("reload"), .string("url.get"), .string("mirror_url.get")]),
                         "p1_unsupported": .bool(false)
                     ]),
+                    "files": .object([
+                        "methods": .array([
+                            .string("fs.workspace.list"),
+                            .string("fs.workspace.read"),
+                            .string("fs.workspace.preview_url"),
+                            .string("fs.workspace.create_file"),
+                            .string("fs.workspace.rename"),
+                            .string("fs.workspace.delete"),
+                            .string("files.tab.open"),
+                            .string("files.tab.split"),
+                            .string("files.state.get"),
+                            .string("files.state.update"),
+                            .string("files.edit.open"),
+                            .string("files.edit.apply_patch"),
+                            .string("files.edit.save"),
+                            .string("files.edit.discard"),
+                            .string("files.edit.close")
+                        ])
+                    ]),
                     "git": .object(["read_only": .bool(false)])
                 ]))
             case "system.identify":
@@ -377,6 +401,63 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: try router.fsWorkspacePreviewURL(workspace: wid, path: path))
+            case "fs.workspace.create_file":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let result = try router.fsWorkspaceCreateFile(workspace: wid, path: path, content: params["content"]?.stringValue ?? "")
+                EventBus.shared.publish(kind: "fs.workspace.changed", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "action": .string("create_file"),
+                    "paths": .array([.string(result.objectValue?["relative_path"]?.stringValue ?? path)])
+                ]))
+                return .init(id: id, result: result)
+            case "fs.workspace.rename":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let path = params["path"]?.stringValue,
+                      let newName = params["new_name"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let result = try router.fsWorkspaceRename(workspace: wid, path: path, newName: newName)
+                EventBus.shared.publish(kind: "fs.workspace.changed", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "action": .string("rename"),
+                    "paths": .array([.string(path), .string(result.objectValue?["relative_path"]?.stringValue ?? newName)])
+                ]))
+                return .init(id: id, result: result)
+            case "fs.workspace.delete":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let paths = params["paths"]?.arrayValue?.compactMap { $0.stringValue }
+                    ?? params["path"]?.stringValue.map { [$0] }
+                    ?? []
+                let result = try router.fsWorkspaceDelete(workspace: wid, paths: paths)
+                EventBus.shared.publish(kind: "fs.workspace.changed", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "action": .string("delete"),
+                    "paths": result.objectValue?["deleted"] ?? .array(paths.map { .string($0) })
+                ]))
+                return .init(id: id, result: result)
+            case "files.tab.open":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let sourceSurface = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init)
+                let pid = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
+                let surface = try router.filesOpenTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, path: path)
+                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface": encode(surface)
+                ]))
+                return .init(id: id, result: encode(surface))
+            case "files.tab.split":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let dirStr = params["direction"]?.stringValue,
+                      let dir = SplitDirection(rawValue: dirStr),
+                      let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let sourceSurface = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init)
+                let pid = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
+                let surface = try router.filesSplitTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, direction: dir, path: path)
+                EventBus.shared.publish(kind: "pane.split", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface": encode(surface)
+                ]))
+                return .init(id: id, result: encode(surface))
             case "files.state.get":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: try router.filesStateGet(surface: sid))

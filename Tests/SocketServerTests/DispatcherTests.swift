@@ -51,6 +51,22 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor {
         SurfaceDescriptor(type: surfaceType, title: title ?? surfaceType.rawValue)
     }
+    var filesOpenTabCalls: [(WorkspaceID, SurfaceID?, PaneID?, String)] = []
+    func filesOpenTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, path: String) throws -> SurfaceDescriptor {
+        filesOpenTabCalls.append((workspace, sourceSurface, paneID, path))
+        return SurfaceDescriptor(type: .files, title: (path as NSString).lastPathComponent, metadata: [
+            "selected_path": path,
+            "selected_relative_path": path
+        ])
+    }
+    var filesSplitTabCalls: [(WorkspaceID, SurfaceID?, PaneID?, SplitDirection, String)] = []
+    func filesSplitTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, direction: SplitDirection, path: String) throws -> SurfaceDescriptor {
+        filesSplitTabCalls.append((workspace, sourceSurface, paneID, direction, path))
+        return SurfaceDescriptor(type: .files, title: (path as NSString).lastPathComponent, metadata: [
+            "selected_path": path,
+            "selected_relative_path": path
+        ])
+    }
     var splitSurfaceCalls: [(WorkspaceID, PaneID, SurfaceID, SplitDirection)] = []
     func splitSurface(workspace: WorkspaceID, paneID: PaneID, surface: SurfaceID, direction: SplitDirection) throws {
         splitSurfaceCalls.append((workspace, paneID, surface, direction))
@@ -548,6 +564,9 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue { try WorkspaceFileService().list(root: projectCwd, path: path) }
     func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue { try WorkspaceFileService().read(root: projectCwd, path: path, maxBytes: maxBytes) }
     func fsWorkspacePreviewURL(workspace: WorkspaceID, path: String) throws -> JSONValue { try WorkspaceFileService().previewURL(root: projectCwd, path: path) }
+    func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue { try WorkspaceFileService().createFile(root: projectCwd, path: path, content: content) }
+    func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue { try WorkspaceFileService().rename(root: projectCwd, path: path, newName: newName) }
+    func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue { try WorkspaceFileService().delete(root: projectCwd, paths: paths) }
     func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue { try FileEditSessionStore.shared.open(surfaceID: surface, workspaceID: WorkspaceID(), root: projectCwd, path: path) }
     func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
         try FileEditSessionStore.shared.applyPatch(sessionID: sessionID, baseDraftRevision: baseDraftRevision, rangeLocation: rangeLocation, rangeLength: rangeLength, replacement: replacement, deviceID: deviceID)
@@ -1071,6 +1090,76 @@ final class DispatcherTests: XCTestCase {
 
         let missing = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.thread.rename", params: ["thread_id": tidParam, "title": .string("x")]))
         XCTAssertNotNil(missing.error, "renaming a deleted thread must fail loudly, not silently succeed")
+    }
+
+    @MainActor
+    func test_filesWorkspaceMutations_overSocket() async throws {
+        let dir = NSTemporaryDirectory() + "rc2-disp-files-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir + "/Sources", withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let router = FakeRouter(); router.projectCwd = dir
+        let d = JSONRPCDispatcher(router: router)
+        let wid = JSONValue.string(UUID().uuidString)
+
+        let created = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "fs.workspace.create_file", params: [
+            "workspace_id": wid,
+            "path": .string("Sources/NewFile.swift"),
+        ]))
+        XCTAssertEqual(created.result?.objectValue?["relative_path"], .string("Sources/NewFile.swift"),
+                       "add-file must be available over RPC so macOS and iOS use the same host mutation")
+
+        let renamed = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "fs.workspace.rename", params: [
+            "workspace_id": wid,
+            "path": .string("Sources/NewFile.swift"),
+            "new_name": .string("Renamed.swift"),
+        ]))
+        XCTAssertEqual(renamed.result?.objectValue?["relative_path"], .string("Sources/Renamed.swift"),
+                       "context-menu rename must return the new workspace-relative path over the socket")
+
+        let deleted = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "fs.workspace.delete", params: [
+            "workspace_id": wid,
+            "paths": .array([.string("Sources/Renamed.swift")]),
+        ]))
+        XCTAssertEqual(deleted.result?.objectValue?["deleted"]?.arrayValue?.compactMap { $0.stringValue }, ["Sources/Renamed.swift"],
+                       "bulk delete must delete every selected file through one RPC mutation")
+    }
+
+    @MainActor
+    func test_filesOpenNewTabAndSplit_overSocket() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let wid = UUID()
+        let sourceSurface = UUID()
+        let paneID = UUID()
+
+        let opened = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "files.tab.open", params: [
+            "workspace_id": .string(wid.uuidString),
+            "surface_id": .string(sourceSurface.uuidString),
+            "path": .string("Sources/App.swift"),
+        ]))
+        XCTAssertNil(opened.error, "Open in New Tab must be a Files RPC so macOS and iOS create the same source-reader tab")
+        XCTAssertEqual(opened.result?.objectValue?["type"], .string("files"))
+        XCTAssertEqual(opened.result?.objectValue?["metadata"]?.objectValue?["selected_path"], .string("Sources/App.swift"))
+        XCTAssertEqual(router.filesOpenTabCalls.first?.0, WorkspaceID(wid))
+        XCTAssertEqual(router.filesOpenTabCalls.first?.1, SurfaceID(sourceSurface))
+        XCTAssertNil(router.filesOpenTabCalls.first?.2)
+        XCTAssertEqual(router.filesOpenTabCalls.first?.3, "Sources/App.swift")
+
+        let split = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "files.tab.split", params: [
+            "workspace_id": .string(wid.uuidString),
+            "surface_id": .string(sourceSurface.uuidString),
+            "pane_id": .string(paneID.uuidString),
+            "direction": .string("right"),
+            "path": .string("Sources/App.swift"),
+        ]))
+        XCTAssertNil(split.error, "Dragging a file onto side/bottom split targets must create a Files tab in the split pane")
+        XCTAssertEqual(split.result?.objectValue?["type"], .string("files"))
+        XCTAssertEqual(split.result?.objectValue?["metadata"]?.objectValue?["selected_relative_path"], .string("Sources/App.swift"))
+        XCTAssertEqual(router.filesSplitTabCalls.first?.0, WorkspaceID(wid))
+        XCTAssertEqual(router.filesSplitTabCalls.first?.1, SurfaceID(sourceSurface))
+        XCTAssertEqual(router.filesSplitTabCalls.first?.2, PaneID(paneID))
+        XCTAssertEqual(router.filesSplitTabCalls.first?.3, .right)
+        XCTAssertEqual(router.filesSplitTabCalls.first?.4, "Sources/App.swift")
     }
 
     @MainActor

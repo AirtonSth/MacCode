@@ -14,9 +14,13 @@ final class FilesSurface: NSObject, Surface {
     let view: NSView
     private let model: FilesViewModel
 
-    init(workspaceID: WorkspaceID, cwd: String, title: String = "Files", router: AppCommandRouter, initialState: String?) {
+    init(workspaceID: WorkspaceID, cwd: String, title: String = "Files", router: AppCommandRouter, initialState: String?, selectedPath: String? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialState { metadata["files_state"] = initialState }
+        if let selectedPath {
+            metadata["selected_path"] = selectedPath
+            metadata["selected_relative_path"] = selectedPath
+        }
         self.descriptor = SurfaceDescriptor(type: .files, title: title, iconName: "folder", metadata: metadata)
         self.model = FilesViewModel(surfaceID: descriptor.id, workspaceID: workspaceID, root: cwd, router: router)
         self.view = NSHostingView(rootView: FilesSurfaceRoot(model: model))
@@ -30,6 +34,29 @@ final class FilesSurface: NSObject, Surface {
     func sendText(_ text: String) { model.insertText(text) }
     func readText() -> String { model.visibleText }
     func snapshot() -> [String: String] { ["selected_path": model.selectedPath ?? ""] }
+}
+
+private struct FileTabDragPayload {
+    static let prefix = "rc-file-tab|"
+    let workspaceID: String
+    let sourceSurfaceID: String
+    let path: String
+
+    static func encode(workspaceID: WorkspaceID, sourceSurfaceID: SurfaceID, path: String) -> String {
+        let encodedPath = Data(path.utf8).base64EncodedString()
+        return "\(prefix)\(workspaceID.value.uuidString)|\(sourceSurfaceID.value.uuidString)|\(encodedPath)"
+    }
+
+    static func decode(_ value: String) -> FileTabDragPayload? {
+        guard value.hasPrefix(prefix) else { return nil }
+        let raw = String(value.dropFirst(prefix.count))
+        let parts = raw.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 3,
+              let data = Data(base64Encoded: parts[2]),
+              let path = String(data: data, encoding: .utf8),
+              !path.isEmpty else { return nil }
+        return FileTabDragPayload(workspaceID: parts[0], sourceSurfaceID: parts[1], path: path)
+    }
 }
 
 private struct FileEntry: Identifiable, Equatable {
@@ -64,6 +91,25 @@ private struct FileEntry: Identifiable, Equatable {
         self.isEditable = identity["is_editable"]?.boolValue == true
         self.editabilityReason = identity["editability_reason"]?.stringValue ?? "not editable"
         self.language = identity["language"]?.stringValue
+    }
+}
+
+private struct FileTabDragModifier: ViewModifier {
+    let payload: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let payload {
+            content.draggable(payload)
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func fileTabDragPayload(_ payload: String?) -> some View {
+        modifier(FileTabDragModifier(payload: payload))
     }
 }
 
@@ -114,12 +160,25 @@ private final class FilesViewModel: ObservableObject {
 
     func loadInitialState() {
         do {
+            var initialSelectedPath: String?
             if let state = try router?.filesStateGet(surface: surfaceID).objectValue {
-                currentDirectory = state["current_directory"]?.stringValue ?? ""
+                initialSelectedPath = state["selected_path"]?.stringValue
+                let stateDirectory = state["current_directory"]?.stringValue ?? ""
+                if stateDirectory.isEmpty, let initialSelectedPath {
+                    let parent = (initialSelectedPath as NSString).deletingLastPathComponent
+                    currentDirectory = parent == "." ? "" : parent
+                } else {
+                    currentDirectory = stateDirectory
+                }
                 readerMode = state["reader_mode"]?.stringValue ?? "source"
                 dirtyPaths = Self.dirtyPaths(from: state)
             }
             loadDirectory(currentDirectory)
+            if let initialSelectedPath,
+               let entry = entries.first(where: { !$0.isDirectory && $0.relativePath == initialSelectedPath }) {
+                selectedEntry = entry
+                loadFile(entry)
+            }
         } catch {
             errorText = String(describing: error)
         }
@@ -204,6 +263,84 @@ private final class FilesViewModel: ObservableObject {
         } catch {
             errorText = String(describing: error)
         }
+    }
+
+    func createFile(named rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let path = currentDirectory.isEmpty ? name : "\(currentDirectory)/\(name)"
+        do {
+            let result = try router?.fsWorkspaceCreateFile(workspace: workspaceID, path: path, content: "")
+            let created = result.flatMap(FileEntry.init(value:))
+            loadDirectory(currentDirectory)
+            if let created {
+                selectedEntry = created
+                loadFile(created)
+            }
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    func rename(_ entry: FileEntry, to rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        closeSessionIfSelected(path: entry.relativePath)
+        do {
+            let result = try router?.fsWorkspaceRename(workspace: workspaceID, path: entry.relativePath, newName: name)
+            let renamed = result.flatMap(FileEntry.init(value:))
+            loadDirectory(currentDirectory)
+            if selectedEntry?.id == entry.id, let renamed {
+                selectedEntry = renamed
+                loadFile(renamed)
+            }
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    func delete(_ entries: [FileEntry]) {
+        let targets = entries.map(\.relativePath)
+        guard !targets.isEmpty else { return }
+        if let selectedPath, targets.contains(selectedPath) {
+            closeSessionIfSelected(path: selectedPath)
+            selectedEntry = nil
+            setDraft("")
+            renderedText = ""
+            isDirty = false
+        }
+        do {
+            _ = try router?.fsWorkspaceDelete(workspace: workspaceID, paths: targets)
+            dirtyPaths.subtract(targets)
+            loadDirectory(currentDirectory)
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    func openInNewTab(_ entry: FileEntry) {
+        guard !entry.isDirectory else { return }
+        do {
+            _ = try router?.filesOpenTab(workspace: workspaceID, sourceSurface: surfaceID, paneID: nil, path: entry.relativePath)
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    func splitFileTab(path: String, direction: SplitDirection) {
+        do {
+            _ = try router?.filesSplitTab(workspace: workspaceID, sourceSurface: surfaceID, paneID: nil, direction: direction, path: path)
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    func handleFileDropPayload(_ rawPayload: String, location: CGPoint, size: CGSize) -> Bool {
+        guard let payload = FileTabDragPayload.decode(rawPayload),
+              payload.workspaceID == workspaceID.value.uuidString else { return false }
+        let direction: SplitDirection = location.y >= size.height * 0.68 ? .down : .right
+        splitFileTab(path: payload.path, direction: direction)
+        return true
     }
 
     func insertText(_ text: String) {
@@ -301,20 +438,36 @@ private final class FilesViewModel: ObservableObject {
         lastSyncedText = text
         suppressEditorChange = false
     }
+
+    private func closeSessionIfSelected(path: String) {
+        guard selectedPath == path, let sessionID else { return }
+        _ = try? router?.filesEditClose(sessionID: sessionID)
+        self.sessionID = nil
+    }
 }
 
 private struct FilesSurfaceRoot: View {
     @ObservedObject var model: FilesViewModel
     @AppStorage("files.sidebar.width.v2") private var sidebarWidth: Double = 260
+    @State private var sidebarVisible = true
+    @State private var selectedFileIDs: Set<String> = []
     @State private var pathInput = ""
     @State private var confirmDiscard = false
+    @State private var showNewFileDialog = false
+    @State private var newFileName = ""
+    @State private var renamingEntry: FileEntry?
+    @State private var renameText = ""
+    @State private var deleteTargets: [FileEntry] = []
+    @State private var confirmDelete = false
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar
-                .frame(width: sidebarWidth)
-            DSResizeDivider(axis: .vertical, help: "Resize file list") { delta in
-                sidebarWidth = min(560, max(240, sidebarWidth + Double(delta)))
+            if sidebarVisible {
+                sidebar
+                    .frame(width: sidebarWidth)
+                DSResizeDivider(axis: .vertical, help: "Resize file list") { delta in
+                    sidebarWidth = min(560, max(240, sidebarWidth + Double(delta)))
+                }
             }
             reader
                 .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
@@ -327,15 +480,57 @@ private struct FilesSurfaceRoot: View {
         } message: {
             Text("This reverts the current draft to the last saved version.")
         }
+        .alert("New File", isPresented: $showNewFileDialog) {
+            TextField("File name", text: $newFileName)
+            Button("Create") { createNewFile() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(model.currentDirectory.isEmpty ? "Create in workspace root." : "Create in \(model.currentDirectory).")
+        }
+        .alert("Rename", isPresented: Binding(
+            get: { renamingEntry != nil },
+            set: { if !$0 { renamingEntry = nil } }
+        )) {
+            TextField("File name", text: $renameText)
+            Button("Rename") { commitRename() }
+            Button("Cancel", role: .cancel) { renamingEntry = nil }
+        }
+        .alert(deleteTitle, isPresented: $confirmDelete) {
+            Button("Delete", role: .destructive) { commitDelete() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(deleteTargets.count == 1 ? deleteTargets[0].relativePath : "\(deleteTargets.count) selected items will be deleted from the workspace.")
+        }
         .onAppear { pathInput = displayPath }
-        .onChange(of: model.currentDirectory) { _ in pathInput = displayPath }
+        .onChange(of: model.currentDirectory) { _ in
+            pathInput = displayPath
+            selectedFileIDs = []
+        }
+        .onChange(of: selectedFileIDs) { ids in
+            guard ids.count == 1,
+                  let id = ids.first,
+                  let entry = model.entries.first(where: { $0.id == id }) else { return }
+            model.select(entry)
+        }
     }
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Files")
-                    .font(DS.Font.title3)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text("Files")
+                        .font(DS.Font.title3)
+                    Spacer()
+                    DSIconButton("sidebar.left", help: "Hide file sidebar") {
+                        sidebarVisible = false
+                    }
+                    .accessibilityLabel("Hide file sidebar")
+                    DSIconButton("plus", help: "New file") {
+                        newFileName = ""
+                        showNewFileDialog = true
+                    }
+                    .accessibilityLabel("New file")
+                }
                 TextField("Path", text: $pathInput)
                     .font(DS.Font.monoSmall)
                     .textFieldStyle(.plain)
@@ -345,27 +540,31 @@ private struct FilesSurfaceRoot: View {
                     .help("Type a workspace path and press Return")
                     .accessibilityLabel("Workspace path")
             }
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    if !model.currentDirectory.isEmpty {
-                        Button {
-                            let parent = (model.currentDirectory as NSString).deletingLastPathComponent
-                            model.loadDirectory(parent == "." ? "" : parent)
-                        } label: {
-                            row(icon: "arrow.turn.up.left", name: "..", detail: "Parent", active: false)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Go to parent folder")
+            List(selection: $selectedFileIDs) {
+                if !model.currentDirectory.isEmpty {
+                    Button {
+                        let parent = (model.currentDirectory as NSString).deletingLastPathComponent
+                        model.loadDirectory(parent == "." ? "" : parent)
+                    } label: {
+                        row(icon: "arrow.turn.up.left", name: "..", detail: "Parent", active: false)
                     }
-                    ForEach(model.entries) { entry in
-                        Button { model.select(entry) } label: {
-                            row(icon: icon(for: entry), name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id, dirty: model.dirtyPaths.contains(entry.relativePath))
-                        }
-                        .buttonStyle(.plain)
+                    .buttonStyle(.plain)
+                    .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
+                    .listRowBackground(Color.clear)
+                    .help("Go to parent folder")
+                }
+                ForEach(model.entries) { entry in
+                    row(icon: icon(for: entry), name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath))
+                        .tag(entry.id)
+                        .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
+                        .listRowBackground(Color.clear)
+                        .contextMenu { fileContextMenu(for: entry) }
+                        .fileTabDragPayload(entry.isDirectory ? nil : FileTabDragPayload.encode(workspaceID: model.workspaceID, sourceSurfaceID: model.surfaceID, path: entry.relativePath))
                         .help(entry.relativePath.isEmpty ? entry.name : entry.relativePath)
-                    }
                 }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
             if model.isLoading {
                 ProgressView().controlSize(.small)
             }
@@ -393,29 +592,96 @@ private struct FilesSurfaceRoot: View {
         model.loadDirectory(relative)
     }
 
-    private var reader: some View {
-        VStack(spacing: 0) {
-            readerHeader
-            Divider().overlay(DS.Palette.line)
-            if let error = model.errorText {
-                FilesEmptyState(title: "Files error", symbol: "exclamationmark.triangle", detail: error)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.selectedEntry == nil {
-                FilesEmptyState(title: "Select a file", symbol: "doc.text.magnifyingglass", detail: "Workspace files stay scoped to this root.")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                previewBody
+    private var selectedEntries: [FileEntry] {
+        model.entries.filter { selectedFileIDs.contains($0.id) }
+    }
+
+    private var deleteTitle: String {
+        deleteTargets.count == 1 ? "Delete \(deleteTargets[0].name)?" : "Delete \(deleteTargets.count) items?"
+    }
+
+    @ViewBuilder
+    private func fileContextMenu(for entry: FileEntry) -> some View {
+        let targets = selectedFileIDs.contains(entry.id) && selectedEntries.count > 1 ? selectedEntries : [entry]
+        if targets.count == 1 {
+            if !entry.isDirectory {
+                Button("Open in New Tab") { model.openInNewTab(entry) }
+                Divider()
             }
+            Button("Rename...") { beginRename(entry) }
+            Divider()
+            Button("Delete", role: .destructive) { beginDelete(targets) }
+        } else {
+            Button("Delete \(targets.count) Items", role: .destructive) { beginDelete(targets) }
         }
-        .background(DS.Palette.bg)
+    }
+
+    private func createNewFile() {
+        model.createFile(named: newFileName)
+        newFileName = ""
+    }
+
+    private func beginRename(_ entry: FileEntry) {
+        selectedFileIDs = [entry.id]
+        renamingEntry = entry
+        renameText = entry.name
+    }
+
+    private func commitRename() {
+        guard let entry = renamingEntry else { return }
+        model.rename(entry, to: renameText)
+        selectedFileIDs = []
+        renamingEntry = nil
+    }
+
+    private func beginDelete(_ entries: [FileEntry]) {
+        deleteTargets = entries
+        confirmDelete = true
+    }
+
+    private func commitDelete() {
+        model.delete(deleteTargets)
+        selectedFileIDs.subtract(deleteTargets.map(\.id))
+        deleteTargets = []
+    }
+
+    private var reader: some View {
+        GeometryReader { proxy in
+            VStack(spacing: 0) {
+                readerHeader
+                Divider().overlay(DS.Palette.line)
+                if let error = model.errorText {
+                    FilesEmptyState(title: "Files error", symbol: "exclamationmark.triangle", detail: error)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if model.selectedEntry == nil {
+                    FilesEmptyState(title: "Select a file", symbol: "doc.text.magnifyingglass", detail: "Workspace files stay scoped to this root.")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    previewBody
+                }
+            }
+            .dropDestination(for: String.self) { values, location in
+                guard let payload = values.first else { return false }
+                return model.handleFileDropPayload(payload, location: location, size: proxy.size)
+            }
+            .background(DS.Palette.bg)
+        }
     }
 
     private var readerHeader: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(model.selectedEntry?.name ?? "No file selected")
-                    .font(DS.Font.bodyStrong)
-                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    if !sidebarVisible {
+                        DSIconButton("sidebar.left", help: "Show file sidebar") {
+                            sidebarVisible = true
+                        }
+                        .accessibilityLabel("Show file sidebar")
+                    }
+                    Text(model.selectedEntry?.name ?? "No file selected")
+                        .font(DS.Font.bodyStrong)
+                        .lineLimit(1)
+                }
                 Text(model.selectedEntry?.relativePath ?? model.root)
                     .font(DS.Font.monoSmall)
                     .foregroundStyle(DS.Palette.textTertiary)
@@ -737,6 +1003,11 @@ private struct CodeTextEditor: NSViewRepresentable {
         context.coordinator.textView = textView
         context.coordinator.applyHighlight(to: textView)
         scroll.documentView = textView
+        let ruler = CodeLineNumberRulerView(textView: textView)
+        scroll.hasVerticalRuler = true
+        scroll.rulersVisible = true
+        scroll.verticalRulerView = ruler
+        context.coordinator.lineNumberRuler = ruler
         return scroll
     }
 
@@ -750,6 +1021,7 @@ private struct CodeTextEditor: NSViewRepresentable {
         } else {
             context.coordinator.applyHighlight(to: textView)
         }
+        context.coordinator.lineNumberRuler?.needsDisplay = true
     }
 
     func makeCoordinator() -> Coordinator {
@@ -759,6 +1031,7 @@ private struct CodeTextEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         let onChange: (String) -> Void
         weak var textView: NSTextView?
+        weak var lineNumberRuler: CodeLineNumberRulerView?
         private var applyingHighlight = false
 
         init(onChange: @escaping (String) -> Void) {
@@ -769,6 +1042,7 @@ private struct CodeTextEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             onChange(textView.string)
             applyHighlight(to: textView)
+            lineNumberRuler?.needsDisplay = true
         }
 
         func applyHighlight(to textView: NSTextView) {
@@ -785,7 +1059,65 @@ private struct CodeTextEditor: NSViewRepresentable {
                 textView.enclosingScrollView?.contentView.scroll(to: scrollOrigin)
                 textView.enclosingScrollView?.reflectScrolledClipView(textView.enclosingScrollView!.contentView)
             }
+            lineNumberRuler?.needsDisplay = true
             applyingHighlight = false
+        }
+    }
+}
+
+private final class CodeLineNumberRulerView: NSRulerView {
+    private weak var textView: NSTextView?
+    private let attributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+        .foregroundColor: NSColor(red: 0.45, green: 0.47, blue: 0.50, alpha: 1)
+    ]
+
+    init(textView: NSTextView) {
+        self.textView = textView
+        super.init(scrollView: textView.enclosingScrollView, orientation: .verticalRuler)
+        clientView = textView
+        ruleThickness = 46
+        NotificationCenter.default.addObserver(self, selector: #selector(boundsChanged), name: NSView.boundsDidChangeNotification, object: textView.enclosingScrollView?.contentView)
+        textView.enclosingScrollView?.contentView.postsBoundsChangedNotifications = true
+    }
+
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func boundsChanged() {
+        needsDisplay = true
+    }
+
+    override func drawHashMarksAndLabels(in rect: NSRect) {
+        guard let textView,
+              let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer,
+              let clipView = textView.enclosingScrollView?.contentView else { return }
+        NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1).setFill()
+        bounds.fill()
+
+        let visibleRect = clipView.bounds
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
+        guard glyphRange.location < layoutManager.numberOfGlyphs else { return }
+        let text = textView.string as NSString
+        var lineNumber = text.substring(to: layoutManager.characterIndexForGlyph(at: glyphRange.location))
+            .filter { $0 == "\n" }
+            .count + 1
+        var glyphIndex = glyphRange.location
+        while glyphIndex < NSMaxRange(glyphRange) {
+            var lineRange = NSRange()
+            let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &lineRange, withoutAdditionalLayout: true)
+            let y = lineRect.minY + textView.textContainerOrigin.y - visibleRect.minY
+            let value = "\(lineNumber)" as NSString
+            let size = value.size(withAttributes: attributes)
+            value.draw(at: NSPoint(x: ruleThickness - size.width - 8, y: y + 1), withAttributes: attributes)
+            glyphIndex = NSMaxRange(lineRange)
+            lineNumber += 1
         }
     }
 }

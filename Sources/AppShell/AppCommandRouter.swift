@@ -198,7 +198,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                         }
                         surface = agent
                     case .files:
-                        surface = FilesSurface(workspaceID: wid, cwd: cwd, title: title, router: self, initialState: desc.metadata["files_state"])
+                        surface = FilesSurface(workspaceID: wid, cwd: cwd, title: title, router: self, initialState: desc.metadata["files_state"], selectedPath: desc.metadata["selected_path"] ?? desc.metadata["selected_relative_path"])
                     case .markdown:
                         surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
                     case .filePreview:
@@ -441,6 +441,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let desc = makeSurface(type: surfaceType, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.splitPane(workspace, paneID: paneID, direction: direction, newSurface: desc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        return desc
+    }
+
+    public func filesOpenTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, path: String) throws -> SurfaceDescriptor {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { throw LayoutError.workspaceNotFound }
+        let info = try fileTabInfo(workspace: workspace, path: path)
+        let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath)
+        let targetPane = paneID ?? sourceSurface.flatMap { paneIDContaining(surface: $0, in: ws.layout) }
+        try ctx.apply(.addSurface(workspace, paneID: targetPane, descriptor: desc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        return desc
+    }
+
+    public func filesSplitTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, direction: SplitDirection, path: String) throws -> SurfaceDescriptor {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { throw LayoutError.workspaceNotFound }
+        let info = try fileTabInfo(workspace: workspace, path: path)
+        let targetPane = paneID ?? sourceSurface.flatMap { paneIDContaining(surface: $0, in: ws.layout) } ?? ws.focusedPaneID ?? ws.layout.paneIDs().first
+        guard let targetPane else { throw LayoutError.paneNotFound }
+        let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath)
+        try ctx.apply(.splitPane(workspace, paneID: targetPane, direction: direction, newSurface: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         return desc
@@ -1557,6 +1580,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         return cwd
     }
 
+    private func fileTabInfo(workspace: WorkspaceID, path: String) throws -> (relativePath: String, title: String) {
+        let read = try WorkspaceFileService().read(root: try workspaceCwd(workspace), path: path, maxBytes: 0)
+        guard let object = read.objectValue,
+              let relativePath = object["relative_path"]?.stringValue else {
+            throw JSONRPCError(code: -32602, message: "file path unavailable", data: .string(path))
+        }
+        let title = (relativePath as NSString).lastPathComponent
+        return (relativePath, title.isEmpty ? "Files" : title)
+    }
+
     public func gitStatus(workspace: WorkspaceID) throws -> GitSummary {
         GitDiff.summary(in: try workspaceCwd(workspace))
     }
@@ -1935,6 +1968,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try WorkspaceFileService().previewURL(root: try workspaceCwd(workspace), path: path)
     }
 
+    public func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue {
+        try WorkspaceFileService().createFile(root: try workspaceCwd(workspace), path: path, content: content)
+    }
+
+    public func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue {
+        try WorkspaceFileService().rename(root: try workspaceCwd(workspace), path: path, newName: newName)
+    }
+
+    public func fsWorkspaceDelete(workspace: WorkspaceID, paths: [String]) throws -> JSONValue {
+        try WorkspaceFileService().delete(root: try workspaceCwd(workspace), paths: paths)
+    }
+
     public func filesStateGet(surface: SurfaceID) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
@@ -2083,7 +2128,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 }
                 surface = agent
             case .files:
-                surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: nil)
+                surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: nil, selectedPath: nil)
             case .markdown:
                 let path = title // optional: pass file path via title for now
                 surface = MarkdownSurface(workspaceID: workspace, filePath: path, title: baseTitle)
@@ -2117,6 +2162,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         } catch {
             return descriptor
         }
+    }
+
+    private func makeFilesSurface(workspace: WorkspaceID, cwd: String, title: String, selectedPath: String) -> SurfaceDescriptor {
+        let surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: title, router: self, initialState: nil, selectedPath: selectedPath)
+        SurfaceRegistry.shared.register(surface)
+        return surface.descriptor
     }
 
     private func defaultTitle(for type: SurfaceType) -> String {
@@ -2391,6 +2442,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 if let found = findSurface(surfaceID, in: child) { return found }
             }
             return nil
+        }
+    }
+
+    private func paneIDContaining(surface surfaceID: SurfaceID, in node: LayoutNode) -> PaneID? {
+        switch node {
+        case .pane(let pane):
+            return pane.surfaces.contains { $0.id == surfaceID } ? pane.id : nil
+        case .split(let split):
+            return split.children.compactMap { paneIDContaining(surface: surfaceID, in: $0) }.first
         }
     }
 
