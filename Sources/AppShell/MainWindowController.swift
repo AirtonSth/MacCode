@@ -156,6 +156,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private let collapsedSidebarButton = NoDragButton(frame: .zero)
     private let visibleWorkspaceHeader = NoDragView()
     private let visibleWorkspaceLabel = NSTextField(labelWithString: "")
+    private let visibleFinderButton = NoDragButton(frame: .zero)
     private let visibleNewWindowButton = NoDragButton(frame: .zero)
     private let split = NSSplitView()
     private let toolbarLabel = NSTextField(labelWithString: "RemoteCode")
@@ -373,6 +374,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 help: "Open in New Window",
                 action: #selector(openSelectedWorkspaceInNewWindow)
             )
+            configureHeaderButton(
+                visibleFinderButton,
+                symbol: "folder",
+                help: "Open in Finder",
+                action: #selector(openSelectedWorkspaceInFinder)
+            )
 
             let divider = NSView()
             divider.wantsLayer = true
@@ -380,15 +387,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             divider.translatesAutoresizingMaskIntoConstraints = false
 
             visibleWorkspaceHeader.addSubview(visibleWorkspaceLabel)
+            visibleWorkspaceHeader.addSubview(visibleFinderButton)
             visibleWorkspaceHeader.addSubview(visibleNewWindowButton)
             visibleWorkspaceHeader.addSubview(divider)
             NSLayoutConstraint.activate([
                 visibleWorkspaceLabel.centerXAnchor.constraint(equalTo: visibleWorkspaceHeader.centerXAnchor),
                 visibleWorkspaceLabel.centerYAnchor.constraint(equalTo: visibleWorkspaceHeader.centerYAnchor),
                 visibleWorkspaceLabel.leadingAnchor.constraint(greaterThanOrEqualTo: visibleWorkspaceHeader.leadingAnchor, constant: DS.Space.lg),
-                visibleWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: visibleNewWindowButton.leadingAnchor, constant: -DS.Space.sm),
+                visibleWorkspaceLabel.trailingAnchor.constraint(lessThanOrEqualTo: visibleFinderButton.leadingAnchor, constant: -DS.Space.sm),
                 visibleNewWindowButton.trailingAnchor.constraint(equalTo: visibleWorkspaceHeader.trailingAnchor, constant: -DS.Space.sm),
                 visibleNewWindowButton.centerYAnchor.constraint(equalTo: visibleWorkspaceHeader.centerYAnchor),
+                visibleFinderButton.trailingAnchor.constraint(equalTo: visibleNewWindowButton.leadingAnchor, constant: -DS.Space.xs),
+                visibleFinderButton.centerYAnchor.constraint(equalTo: visibleWorkspaceHeader.centerYAnchor),
                 divider.leadingAnchor.constraint(equalTo: visibleWorkspaceHeader.leadingAnchor),
                 divider.trailingAnchor.constraint(equalTo: visibleWorkspaceHeader.trailingAnchor),
                 divider.bottomAnchor.constraint(equalTo: visibleWorkspaceHeader.bottomAnchor),
@@ -422,11 +432,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 	              let ws = ctx.state.workspaces[wid] else {
 	            collapsedWorkspaceLabel.stringValue = "RemoteCode"
 	            visibleWorkspaceLabel.stringValue = "RemoteCode"
+                visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
 	            return
 	        }
 	        collapsedWorkspaceLabel.stringValue = ws.name
 	        visibleWorkspaceLabel.stringValue = ws.name
+            visibleFinderButton.isHidden = false
             visibleNewWindowButton.isHidden = isWorkspaceOpenInNewWindow(wid)
 	    }
 
@@ -443,6 +455,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             guard let wid = context?.state.window.selectedWorkspaceID,
                   !isWorkspaceOpenInNewWindow(wid) else { return }
             openWorkspaceInNewWindow(wid)
+        }
+
+        @objc private func openSelectedWorkspaceInFinder() {
+            guard let wid = context?.state.window.selectedWorkspaceID,
+                  let ws = context?.state.workspaces[wid],
+                  let url = SidebarViewModel.finderURL(for: ws) else {
+                NSSound.beep()
+                return
+            }
+            NSWorkspace.shared.open(url)
         }
 
     public func refreshFromState() {

@@ -31,6 +31,8 @@ public final class PaneTabsView: NSObject {
     private let tabScrollView = HorizontalTabScrollView()
     private let contentArea = NSView()
     private let addMenu = NSMenu()
+    private let splitRightMenu = NSMenu()
+    private let splitDownMenu = NSMenu()
     private var tabButtons: [SurfaceID: PaneTabButton] = [:]
     private var eventToken: UUID?
 
@@ -40,6 +42,7 @@ public final class PaneTabsView: NSObject {
         self.splitContext = splitContext
         self.workspaceIDOverride = workspaceID
         let v = PaneRootView()
+        v.paneID = pane.id
         v.translatesAutoresizingMaskIntoConstraints = false
         v.wantsLayer = true
         v.layer?.backgroundColor = DS.NS.bg.cgColor
@@ -88,8 +91,8 @@ public final class PaneTabsView: NSObject {
                 onDropSurface: { [weak self] draggedID in
                     self?.dropSurface(draggedID, before: sid) ?? false
                 },
-                onSplitSurface: { [weak self] draggedID, direction in
-                    self?.performSplitSurface(draggedID, direction: direction) ?? false
+                onSplitSurface: { [weak self] draggedID, targetPane, direction in
+                    self?.performSplitSurface(draggedID, targetPane: targetPane, direction: direction) ?? false
                 }
             )
             tabButtons[sid] = tab
@@ -132,23 +135,9 @@ public final class PaneTabsView: NSObject {
             symbol: "plus",
             help: "New surface",
             target: self, action: #selector(showAddMenu(_:)))
-        let addChoices: [(String, SurfaceType)] = [
-            ("Terminal", .terminal),
-            ("SSH", .ssh),
-            ("Browser", .browser),
-            ("Agent App", .agentApp),
-            ("Files", .files),
-            ("Git", .rightSidebarTool)
-        ]
-        for (label, type) in addChoices {
-            let it = NSMenuItem(title: label, action: #selector(addFromMenu(_:)), keyEquivalent: "")
-            it.target = self
-            it.representedObject = type.rawValue
-            let img = NSImage(systemSymbolName: Self.symbol(for: type), accessibilityDescription: label)
-            img?.isTemplate = true
-            it.image = img?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
-            addMenu.addItem(it)
-        }
+        Self.populateSurfaceMenu(addMenu, target: self, action: #selector(addFromMenu(_:)))
+        Self.populateSurfaceMenu(splitRightMenu, target: self, action: #selector(splitFromMenu(_:)), direction: .right)
+        Self.populateSurfaceMenu(splitDownMenu, target: self, action: #selector(splitFromMenu(_:)), direction: .down)
         tabStrip.addArrangedSubview(addButton)
 
         // Split controls live on the RIGHT of the toolbar as two icon
@@ -156,11 +145,11 @@ public final class PaneTabsView: NSObject {
         let splitColumns = Self.makeIconButton(
             symbol: "rectangle.split.2x1",
             help: "Split right (side by side)",
-            target: self, action: #selector(splitHorizontal))
+            target: self, action: #selector(showSplitRightMenu(_:)))
         let splitRows = Self.makeIconButton(
             symbol: "rectangle.split.1x2",
             help: "Split down (stacked)",
-            target: self, action: #selector(splitVertical))
+            target: self, action: #selector(showSplitDownMenu(_:)))
 
         var rightControls: [NSView] = [splitColumns, splitRows]
         if let splitContext {
@@ -377,9 +366,7 @@ public final class PaneTabsView: NSObject {
         ("Browser", .browser),
         ("Agent App", .agentApp),
         ("Files", .files),
-        ("Git", .rightSidebarTool),
-        ("Markdown", .markdown),
-        ("File Preview", .filePreview)
+        ("Git", .rightSidebarTool)
     ]
 
     private static func title(for type: SurfaceType) -> String {
@@ -409,18 +396,43 @@ public final class PaneTabsView: NSObject {
         return b
     }
 
+    private static func populateSurfaceMenu(_ menu: NSMenu, target: AnyObject, action: Selector, direction: SplitDirection? = nil) {
+        menu.removeAllItems()
+        for (label, type) in surfaceChoices {
+            let item = NSMenuItem(title: label, action: action, keyEquivalent: "")
+            item.target = target
+            item.representedObject = direction.map { "\($0.rawValue)|\(type.rawValue)" } ?? type.rawValue
+            let image = NSImage(systemSymbolName: symbol(for: type), accessibilityDescription: label)
+            image?.isTemplate = true
+            item.image = image?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            menu.addItem(item)
+        }
+    }
+
     deinit {
         if let eventToken { EventBus.shared.unsubscribe(eventToken) }
         NotificationCenter.default.removeObserver(self)
     }
 
     @objc private func showAddMenu(_ sender: NSButton) {
+        showMenu(addMenu, from: sender)
+    }
+
+    @objc private func showSplitRightMenu(_ sender: NSButton) {
+        showMenu(splitRightMenu, from: sender)
+    }
+
+    @objc private func showSplitDownMenu(_ sender: NSButton) {
+        showMenu(splitDownMenu, from: sender)
+    }
+
+    private func showMenu(_ menu: NSMenu, from sender: NSButton) {
         // Defer: popping the menu inside the mouse-up that triggered the
         // action makes the same event dismiss it immediately.
-        DispatchQueue.main.async { [weak self, weak sender] in
-            guard let self, let sender else { return }
+        DispatchQueue.main.async { [weak sender] in
+            guard let sender else { return }
             let origin = NSPoint(x: 0, y: sender.bounds.maxY + 4)
-            self.addMenu.popUp(positioning: nil, at: origin, in: sender)
+            menu.popUp(positioning: nil, at: origin, in: sender)
         }
     }
 
@@ -430,12 +442,13 @@ public final class PaneTabsView: NSObject {
         performAdd(type, title: Self.title(for: type))
     }
 
-    @objc private func splitHorizontal() {
-        performSplit(.right, type: .terminal, title: Self.title(for: .terminal))
-    }
-
-    @objc private func splitVertical() {
-        performSplit(.down, type: .terminal, title: Self.title(for: .terminal))
+    @objc private func splitFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String else { return }
+        let parts = raw.split(separator: "|", maxSplits: 1).map(String.init)
+        guard parts.count == 2,
+              let direction = SplitDirection(rawValue: parts[0]),
+              let type = SurfaceType(rawValue: parts[1]) else { return }
+        performSplit(direction, type: type, title: Self.title(for: type))
     }
 
     /// Testable seam shared by the @objc button handlers.
@@ -518,9 +531,14 @@ public final class PaneTabsView: NSObject {
 
     @discardableResult
     public func performSplitSurface(_ surface: SurfaceID, direction: SplitDirection) -> Bool {
+        performSplitSurface(surface, targetPane: pane.id, direction: direction)
+    }
+
+    @discardableResult
+    public func performSplitSurface(_ surface: SurfaceID, targetPane: PaneID, direction: SplitDirection) -> Bool {
         guard let wid = currentWorkspaceID() else { return false }
         do {
-            try router?.splitSurface(workspace: wid, paneID: pane.id, surface: surface, direction: direction)
+            try router?.splitSurface(workspace: wid, paneID: targetPane, surface: surface, direction: direction)
             return true
         } catch {
             return false
@@ -568,7 +586,7 @@ final class PaneTabButton: NSView {
     private let onRename: (() -> Void)?
     private let onSetColor: ((String) -> Void)?
     private let onDropSurface: ((SurfaceID) -> Bool)?
-    private let onSplitSurface: ((SurfaceID, SplitDirection) -> Bool)?
+    private let onSplitSurface: ((SurfaceID, PaneID, SplitDirection) -> Bool)?
     private let dropIndicator = NSView()
     private var hovering = false
     private var dragStarted = false
@@ -582,7 +600,7 @@ final class PaneTabButton: NSView {
          onSelect: @escaping () -> Void, onClose: @escaping () -> Void,
          onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil,
          onDropSurface: ((SurfaceID) -> Bool)? = nil,
-         onSplitSurface: ((SurfaceID, SplitDirection) -> Bool)? = nil) {
+         onSplitSurface: ((SurfaceID, PaneID, SplitDirection) -> Bool)? = nil) {
         self.surfaceID = surfaceID
         self.title = title
         self.symbol = symbol
@@ -834,8 +852,8 @@ final class PaneTabButton: NSView {
             _ = strip.onDropSurface?(surfaceID)
             return
         }
-        if let direction = splitDirection(for: hit, contentPoint: point, in: contentView) {
-            _ = onSplitSurface?(surfaceID, direction)
+        if let target = splitTarget(for: hit, contentPoint: point, in: contentView) {
+            _ = onSplitSurface?(surfaceID, target.paneID, target.direction)
         }
     }
 
@@ -857,19 +875,19 @@ final class PaneTabButton: NSView {
             Self.highlight(tab: nil, strip: strip)
             return
         }
-        if let direction = splitDirection(for: hit, contentPoint: point, in: contentView),
-           let root = enclosingView(from: self, as: PaneRootView.self) {
-            Self.highlight(tab: nil, strip: nil, splitRoot: root, splitDirection: direction)
+        if let target = splitTarget(for: hit, contentPoint: point, in: contentView) {
+            Self.highlight(tab: nil, strip: nil, splitRoot: target.root, splitDirection: target.direction)
             return
         }
         Self.clearDragFeedback()
     }
 
-    private func splitDirection(for hit: NSView, contentPoint: NSPoint, in contentView: NSView) -> SplitDirection? {
+    private func splitTarget(for hit: NSView, contentPoint: NSPoint, in contentView: NSView) -> (paneID: PaneID, direction: SplitDirection, root: PaneRootView)? {
         guard let root = enclosingView(from: hit, as: PaneRootView.self),
-              root === enclosingView(from: self, as: PaneRootView.self) else { return nil }
+              let paneID = root.paneID else { return nil }
         let point = root.convert(contentPoint, from: contentView)
-        return PaneTabsView.splitDropDirection(in: root.bounds, at: point)
+        guard let direction = PaneTabsView.splitDropDirection(in: root.bounds, at: point) else { return nil }
+        return (paneID, direction, root)
     }
 
     private func updateDragGhost(with event: NSEvent) {
@@ -1030,6 +1048,7 @@ class NoDragView: NSView {
 
 final class PaneRootView: NoDragView {
     static let splitDropOverlayLayerName = "split-drop-preview"
+    var paneID: PaneID?
     private let splitDropOverlay = CALayer()
     private var splitDropDirection: SplitDirection?
 

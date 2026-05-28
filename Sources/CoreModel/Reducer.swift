@@ -210,7 +210,7 @@ public struct LayoutReducer {
             return next
         case .splitSurface(let wid, let paneID, let sid, let direction):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
-            let (layout, newPaneID) = try splitExistingSurface(in: ws.layout, paneID: paneID, surfaceID: sid, direction: direction)
+            let (layout, newPaneID) = try splitMovingSurface(in: ws.layout, paneID: paneID, surfaceID: sid, direction: direction)
             ws.layout = layout
             ws.focusedPaneID = newPaneID
             next.workspaces[wid] = ws
@@ -411,6 +411,16 @@ public struct LayoutReducer {
             if found { return (.split(s), newID) }
             return (.split(s), paneID)
         }
+    }
+
+    private func splitMovingSurface(in node: LayoutNode, paneID: PaneID, surfaceID: SurfaceID, direction: SplitDirection) throws -> (LayoutNode, PaneID) {
+        if node.find(paneID: paneID)?.surfaces.contains(where: { $0.id == surfaceID }) == true {
+            return try splitExistingSurface(in: node, paneID: paneID, surfaceID: surfaceID, direction: direction)
+        }
+        guard let moved = findSurface(in: node, id: surfaceID) else { throw LayoutError.surfaceNotFound }
+        let withoutMoved = try removeSurface(in: node, surfaceID: surfaceID)
+        guard withoutMoved.find(paneID: paneID) != nil else { throw LayoutError.paneNotFound }
+        return try split(in: withoutMoved, paneID: paneID, direction: direction, newSurface: moved)
     }
 
     private func removeSurface(in node: LayoutNode, surfaceID: SurfaceID) throws -> LayoutNode {

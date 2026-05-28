@@ -322,9 +322,13 @@ final class PaneActionTests: XCTestCase {
     func test_surfaceChoices_haveSixDistinctTypes() {
         let types = PaneTabsView.surfaceChoices.map { $0.1 }
         XCTAssertEqual(Set(types).count, types.count)
+        XCTAssertEqual(PaneTabsView.surfaceChoices.map(\.0), ["Terminal", "SSH", "Browser", "Agent App", "Files", "Git"],
+                       "split-panel menus must expose the same choices as the tab + menu instead of defaulting straight to Terminal")
         XCTAssertTrue(types.contains(.terminal))
+        XCTAssertTrue(types.contains(.ssh))
         XCTAssertTrue(types.contains(.browser))
         XCTAssertTrue(types.contains(.agentApp))
+        XCTAssertTrue(types.contains(.files))
         XCTAssertTrue(types.contains(.rightSidebarTool),
                       "Git must be available as a normal tab surface option")
     }
@@ -440,6 +444,31 @@ final class PaneActionTests: XCTestCase {
         }
         XCTAssertEqual(split.orientation, .vertical)
         XCTAssertEqual(split.children.count, 2)
+    }
+
+    func test_performSplitSurface_movesDraggedTabIntoVerticalSplitOfAnotherPane() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "drag-split-other-pane-down", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane0) = ws.layout else { return XCTFail() }
+        let terminal = pane0.surfaces.first!.id
+        let view = PaneTabsView(pane: pane0, router: router)
+        let agent = try XCTUnwrap(view.performSplit(.right, type: .agentApp, title: "Agent App"))
+
+        let splitWorkspace = ctx.state.workspaces[ws.id]!
+        let sourcePaneID = try XCTUnwrap(splitWorkspace.layout.paneIDs().first {
+            splitWorkspace.layout.find(paneID: $0)?.surfaces.contains(where: { $0.id == agent.id }) == true
+        })
+        let dragView = PaneTabsView(pane: try XCTUnwrap(splitWorkspace.layout.find(paneID: sourcePaneID)), router: router)
+
+        XCTAssertTrue(dragView.performSplitSurface(agent.id, targetPane: pane0.id, direction: .down),
+                      "dragging a tab onto another pane's lower drop zone must split that target pane vertically")
+
+        guard case .split(let split) = ctx.state.workspaces[ws.id]!.layout else {
+            return XCTFail("expected a vertical split after dragging a tab into another pane")
+        }
+        XCTAssertEqual(split.orientation, .vertical)
+        XCTAssertEqual(split.children.first?.paneIDs().compactMap { split.children.first?.find(paneID: $0)?.surfaces.first?.id }, [terminal])
+        XCTAssertEqual(split.children.last?.paneIDs().compactMap { split.children.last?.find(paneID: $0)?.surfaces.first?.id }, [agent.id])
     }
 
     func test_performSplitSurface_singleTabDoesNotCreateEmptyPane() throws {
@@ -576,6 +605,8 @@ final class PaneActionTests: XCTestCase {
 
         XCTAssertFalse(visibleTooltips.contains("New workspace"),
                        "when the sidebar is visible, workspace creation belongs in the sidebar row, not a global + button")
+        XCTAssertTrue(visibleTooltips.contains("Open in Finder"),
+                      "the workspace title band needs a direct Finder affordance for the active workspace folder")
         XCTAssertTrue(visibleTooltips.contains("Open in New Window"),
                       "attached workspaces need a header affordance to detach the current workspace")
 
@@ -611,6 +642,8 @@ final class PaneActionTests: XCTestCase {
 
         XCTAssertFalse(visibleTooltips.contains("Open in New Window"),
                        "a workspace that is already detached must not offer a duplicate detached-window action")
+        XCTAssertTrue(visibleTooltips.contains("Open in Finder"),
+                      "detached status must not remove the active workspace's Finder shortcut")
     }
 
     func test_sidebarViewModel_listsWindowWorkspacesAndSelectedWorkspaceForSidebarBody() throws {

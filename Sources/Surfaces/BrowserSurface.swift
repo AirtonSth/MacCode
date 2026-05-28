@@ -15,10 +15,12 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     private let backButton = NSButton()
     private let forwardButton = NSButton()
     private let reloadButton = NSButton()
+    private let openExternalButton = NSButton()
     private var googleLegacyLayoutReloads = Set<String>()
     private var retainedURL: URL?
     private var isVisible = true
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
+    public var externalURLOpener: ((URL) -> Void)?
 
     public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
         self.descriptor = SurfaceDescriptor(
@@ -50,7 +52,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         for (b, glyph, help) in [
             (backButton, "chevron.backward", "Back"),
             (forwardButton, "chevron.forward", "Forward"),
-            (reloadButton, "arrow.clockwise", "Reload")
+            (reloadButton, "arrow.clockwise", "Reload"),
+            (openExternalButton, "arrow.up.forward.square", "Open in Default Browser")
         ] {
             b.isBordered = false
             b.bezelStyle = .inline
@@ -63,7 +66,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
         for v in [toolbar, wv] { v.translatesAutoresizingMaskIntoConstraints = false }
-        for v in [backButton, forwardButton, reloadButton, tf] { v.translatesAutoresizingMaskIntoConstraints = false; toolbar.addSubview(v) }
+        for v in [backButton, forwardButton, reloadButton, tf, openExternalButton] { v.translatesAutoresizingMaskIntoConstraints = false; toolbar.addSubview(v) }
         container.addSubview(toolbar)
         container.addSubview(wv)
         NSLayoutConstraint.activate([
@@ -78,8 +81,10 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             reloadButton.leadingAnchor.constraint(equalTo: forwardButton.trailingAnchor, constant: 2),
             reloadButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             tf.leadingAnchor.constraint(equalTo: reloadButton.trailingAnchor, constant: 6),
-            tf.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -6),
+            tf.trailingAnchor.constraint(equalTo: openExternalButton.leadingAnchor, constant: -6),
             tf.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            openExternalButton.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -6),
+            openExternalButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             wv.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
             wv.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             wv.trailingAnchor.constraint(equalTo: container.trailingAnchor),
@@ -106,6 +111,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         backButton.target = self; backButton.action = #selector(goBack)
         forwardButton.target = self; forwardButton.action = #selector(goForward)
         reloadButton.target = self; reloadButton.action = #selector(reload)
+        openExternalButton.target = self; openExternalButton.action = #selector(openInDefaultBrowser)
         tf.target = self; tf.action = #selector(goAddress)
 
         navigate(to: initialURL ?? Self.defaultInitialURL)
@@ -180,6 +186,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     public func goBackAction() { webView.goBack() }
     public func goForwardAction() { webView.goForward() }
     public func reloadAction() { webView.reload() }
+    public func openInDefaultBrowserAction() { openCurrentURLInDefaultBrowser() }
 
     public func evaluate(_ js: String, completion: @escaping (Any?, Error?) -> Void) {
         webView.evaluateJavaScript(js, completionHandler: completion)
@@ -331,11 +338,21 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     @objc private func goBack() { webView.goBack() }
     @objc private func goForward() { webView.goForward() }
     @objc private func reload() { webView.reload() }
+    @objc private func openInDefaultBrowser() { openCurrentURLInDefaultBrowser() }
     @objc private func goAddress() {
         var s = addressBar.stringValue.trimmingCharacters(in: .whitespaces)
         if !s.contains("://") { s = "https://" + s }
         guard let url = URL(string: s) else { return }
         navigate(to: url)
+    }
+
+    private func openCurrentURLInDefaultBrowser() {
+        guard let url = webView.url ?? retainedURL ?? URL(string: addressBar.stringValue.trimmingCharacters(in: .whitespaces)) else { return }
+        if let externalURLOpener {
+            externalURLOpener(url)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: WKNavigationDelegate

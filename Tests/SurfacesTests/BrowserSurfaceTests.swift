@@ -54,4 +54,31 @@ final class BrowserSurfaceTests: XCTestCase {
         XCTAssertEqual(observed?.2, "Local file")
         XCTAssertEqual(surface.descriptor.title, "Local file")
     }
+
+    func test_toolbarExposesOpenInDefaultBrowserButton() {
+        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
+
+        XCTAssertTrue(Self.containsButtonTooltip("Open in Default Browser", in: surface.view),
+                      "browser toolbar needs a direct affordance for opening the current URL in the Mac default browser")
+    }
+
+    func test_openInDefaultBrowserUsesCurrentRetainedURL() throws {
+        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
+        let url = try XCTUnwrap(URL(string: "https://example.com/docs"))
+        var opened: URL?
+        surface.externalURLOpener = { opened = $0 }
+
+        surface.navigate(to: url)
+        surface.openInDefaultBrowserAction()
+
+        XCTAssertEqual(opened, url,
+                       "opening externally must send the browser tab's current URL to macOS default URL handling")
+    }
+
+    private static func containsButtonTooltip(_ tooltip: String, in view: NSView) -> Bool {
+        if let button = view as? NSButton, button.toolTip == tooltip {
+            return true
+        }
+        return view.subviews.contains { containsButtonTooltip(tooltip, in: $0) }
+    }
 }
