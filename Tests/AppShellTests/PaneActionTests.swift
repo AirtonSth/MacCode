@@ -141,12 +141,26 @@ final class PaneActionTests: XCTestCase {
                        "after the user resizes the SSH hosts sidebar, later SSH tabs must restore the global width")
     }
 
+    func test_sshHostsAreScopedToWorkspace() throws {
+        let (_, router) = try makeContext()
+        let first = try router.createWorkspace(name: "ssh-a", cwd: NSTemporaryDirectory())
+        let second = try router.createWorkspace(name: "ssh-b", cwd: NSTemporaryDirectory())
+
+        let host = try router.sshHostUpsert(SSHHostProfile(label: "Workspace A SSH", destination: "a.example.invalid"),
+                                            workspace: first.id)
+
+        XCTAssertEqual(try router.sshHostList(workspace: first.id).map(\.id), [host.id],
+                       "workspace A must keep the SSH host it saved for one-tap reconnect")
+        XCTAssertTrue(try router.sshHostList(workspace: second.id).isEmpty,
+                      "workspace B must not inherit SSH hosts saved in another workspace")
+    }
+
     func test_sshOpenNewConnectionUsesCurrentSurfaceThenCreatesNewTabWhenActive() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "ssh-new-connection", cwd: NSTemporaryDirectory())
         let desc = try router.createSurface(workspace: ws.id, type: .ssh, paneID: nil, title: "SSH")
         let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? SSHSurface)
-        let host = try router.sshHostUpsert(SSHHostProfile(label: "Example SSH", destination: "example.invalid"))
+        let host = try router.sshHostUpsert(SSHHostProfile(label: "Example SSH", destination: "example.invalid"), workspace: ws.id)
 
         surface.openNewConnectionForTesting(host)
 

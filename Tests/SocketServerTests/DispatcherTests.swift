@@ -84,16 +84,18 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     var terminalHealth: JSONValue = .object(["alive": .bool(true), "process_alive": .bool(true), "input_accepting": .bool(true)])
     func surfaceHealthDetails(surface: SurfaceID) -> JSONValue { terminalHealth }
     func surfaceClearHistory(surface: SurfaceID) {}
-    var sshHosts: [SSHHostProfile] = []
-    func sshHostList() throws -> [SSHHostProfile] { sshHosts }
-    func sshHostUpsert(_ profile: SSHHostProfile) throws -> SSHHostProfile {
-        if let idx = sshHosts.firstIndex(where: { $0.id == profile.id }) { sshHosts[idx] = profile }
-        else { sshHosts.append(profile) }
+    var sshHostsByWorkspace: [WorkspaceID: [SSHHostProfile]] = [:]
+    func sshHostList(workspace: WorkspaceID) throws -> [SSHHostProfile] { sshHostsByWorkspace[workspace, default: []] }
+    func sshHostUpsert(_ profile: SSHHostProfile, workspace: WorkspaceID) throws -> SSHHostProfile {
+        var hosts = sshHostsByWorkspace[workspace, default: []]
+        if let idx = hosts.firstIndex(where: { $0.id == profile.id }) { hosts[idx] = profile }
+        else { hosts.append(profile) }
+        sshHostsByWorkspace[workspace] = hosts
         return profile
     }
-    func sshHostDelete(_ id: SSHHostID) throws { sshHosts.removeAll { $0.id == id } }
+    func sshHostDelete(_ id: SSHHostID, workspace: WorkspaceID) throws { sshHostsByWorkspace[workspace, default: []].removeAll { $0.id == id } }
     func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor {
-        let resolved = profile ?? profileID.flatMap { id in sshHosts.first { $0.id == id } } ?? SSHHostProfile(label: "SSH", destination: "example.test")
+        let resolved = profile ?? profileID.flatMap { id in sshHostsByWorkspace[workspace, default: []].first { $0.id == id } } ?? SSHHostProfile(label: "SSH", destination: "example.test")
         return SurfaceDescriptor(type: .ssh, title: title ?? resolved.label, iconName: "network", metadata: [
             "ssh_profile_id": resolved.id.value.uuidString,
             "ssh_destination": resolved.destination,
@@ -692,9 +694,10 @@ final class DispatcherTests: XCTestCase {
     func test_sshHostSaveListConnectAndTransferRoundTrip() async throws {
         let router = FakeRouter()
         let d = JSONRPCDispatcher(router: router)
-        let wid = JSONValue.string(UUID().uuidString)
+        let wid = UUID().uuidString
 
         let saved = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "ssh.host.upsert", params: [
+            "workspace_id": .string(wid),
             "label": .string("Prod"),
             "destination": .string("root@example.test"),
             "port": .number(2222),
@@ -706,7 +709,9 @@ final class DispatcherTests: XCTestCase {
             return XCTFail("saved SSH host must echo an id so iOS can reconnect without retyping")
         }
 
-        let list = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "ssh.host.list", params: nil))
+        let list = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "ssh.host.list", params: [
+            "workspace_id": .string(wid)
+        ]))
         guard case .array(let hosts)? = list.result else { return XCTFail("ssh.host.list must return saved hosts") }
         XCTAssertEqual(hosts.count, 1, "saving a host must make it available for reconnect")
         guard case .object(let listedHost)? = hosts.first else { return XCTFail("ssh.host.list must return host objects") }
@@ -714,7 +719,7 @@ final class DispatcherTests: XCTestCase {
                        "a saved password must stay on the saved host so reconnect can answer the SSH prompt without asking again")
 
         let connected = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "ssh.connect", params: [
-            "workspace_id": wid,
+            "workspace_id": .string(wid),
             "profile_id": .string(hostID)
         ]))
         guard case .object(let surface)? = connected.result,
@@ -741,6 +746,32 @@ final class DispatcherTests: XCTestCase {
         ]))
         guard case .object(let downloadResult)? = download.result else { return XCTFail("download must return an object") }
         XCTAssertEqual(downloadResult["ok"], .bool(true), "download must be exposed as a host-owned terminal/scp RPC")
+    }
+
+    @MainActor
+    func test_sshHostRPCsScopeSavedHostsToWorkspace() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let firstWorkspace = UUID().uuidString
+        let secondWorkspace = UUID().uuidString
+
+        _ = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "ssh.host.upsert", params: [
+            "workspace_id": .string(firstWorkspace),
+            "label": .string("Workspace A"),
+            "destination": .string("a.example.test")
+        ]))
+
+        let firstList = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "ssh.host.list", params: [
+            "workspace_id": .string(firstWorkspace)
+        ]))
+        let secondList = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "ssh.host.list", params: [
+            "workspace_id": .string(secondWorkspace)
+        ]))
+
+        XCTAssertEqual(firstList.result?.arrayValue?.count, 1,
+                       "the workspace that saved an SSH host must keep it for one-tap reconnect")
+        XCTAssertEqual(secondList.result?.arrayValue?.count, 0,
+                       "a different workspace must not inherit globally persisted SSH hosts")
     }
 
     @MainActor

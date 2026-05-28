@@ -35,9 +35,9 @@ public protocol CommandRouting: AnyObject {
     func surfaceHealth(surface: SurfaceID) -> Bool
     func surfaceClearHistory(surface: SurfaceID)
     // SSH
-    func sshHostList() throws -> [SSHHostProfile]
-    func sshHostUpsert(_ profile: SSHHostProfile) throws -> SSHHostProfile
-    func sshHostDelete(_ id: SSHHostID) throws
+    func sshHostList(workspace: WorkspaceID) throws -> [SSHHostProfile]
+    func sshHostUpsert(_ profile: SSHHostProfile, workspace: WorkspaceID) throws -> SSHHostProfile
+    func sshHostDelete(_ id: SSHHostID, workspace: WorkspaceID) throws
     func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor
     func sshDisconnect(surface: SurfaceID) throws
     func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue
@@ -302,17 +302,25 @@ public final class JSONRPCDispatcher {
                 ]))
                 return .init(id: id, result: .bool(true))
             case "ssh.host.list":
-                return .init(id: id, result: encode(try router.sshHostList()))
+                let workspace = try workspaceID(from: params)
+                return .init(id: id, result: encode(try router.sshHostList(workspace: workspace)))
             case "ssh.host.upsert":
+                let workspace = try workspaceID(from: params)
                 let profile = try sshProfile(from: params)
-                let saved = try router.sshHostUpsert(profile)
-                EventBus.shared.publish(kind: "ssh.host.updated", payload: encode(saved))
+                let saved = try router.sshHostUpsert(profile, workspace: workspace)
+                var payload = encode(saved).objectValue ?? [:]
+                payload["workspace_id"] = .string(workspace.value.uuidString)
+                EventBus.shared.publish(kind: "ssh.host.updated", payload: .object(payload))
                 return .init(id: id, result: encode(saved))
             case "ssh.host.delete":
+                let workspace = try workspaceID(from: params)
                 guard let raw = params["id"]?.stringValue,
                       let uuid = UUID(uuidString: raw) else { throw JSONRPCError.invalidParams }
-                try router.sshHostDelete(SSHHostID(uuid))
-                EventBus.shared.publish(kind: "ssh.host.deleted", payload: .object(["id": .string(raw)]))
+                try router.sshHostDelete(SSHHostID(uuid), workspace: workspace)
+                EventBus.shared.publish(kind: "ssh.host.deleted", payload: .object([
+                    "id": .string(raw),
+                    "workspace_id": .string(workspace.value.uuidString)
+                ]))
                 return .init(id: id, result: .bool(true))
             case "ssh.connect":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
@@ -1326,6 +1334,14 @@ public final class JSONRPCDispatcher {
             return .null
         }
         return JSONValue.from(any)
+    }
+
+    private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {
+        guard let raw = params["workspace_id"]?.stringValue ?? params["workspaceId"]?.stringValue,
+              let uuid = UUID(uuidString: raw) else {
+            throw JSONRPCError.invalidParams
+        }
+        return WorkspaceID(uuid)
     }
 
     private func optionalSSHProfile(from params: [String: JSONValue]) throws -> SSHHostProfile? {

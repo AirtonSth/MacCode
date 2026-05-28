@@ -214,7 +214,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func reloadHosts() {
         do {
-            viewModel.hosts = try router?.sshHostList() ?? []
+            viewModel.hosts = try router?.sshHostList(workspace: workspaceID) ?? []
             viewModel.error = nil
         } catch {
             viewModel.error = error.localizedDescription
@@ -233,7 +233,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             options: draft.options
         )
         do {
-            let saved = try router?.sshHostUpsert(host) ?? host
+            let saved = try router?.sshHostUpsert(host, workspace: workspaceID) ?? host
             reloadHosts()
             viewModel.showForm = false
             viewModel.editingHostID = nil
@@ -247,7 +247,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func delete(_ host: SSHHostProfile) {
         do {
-            try router?.sshHostDelete(host.id)
+            try router?.sshHostDelete(host.id, workspace: workspaceID)
             if viewModel.selectedHost?.id == host.id {
                 terminal?.close()
                 terminal = nil
@@ -266,7 +266,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func connect(_ host: SSHHostProfile) {
         do {
-            let saved = try router?.sshHostUpsert(host) ?? host
+            let saved = try router?.sshHostUpsert(host, workspace: workspaceID) ?? host
             terminal?.close()
             let next = try TerminalSurface(workspaceID: workspaceID, title: saved.label, launch: .ssh(profile: saved, cwd: cwd))
             terminal = next
@@ -357,7 +357,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             return
         }
         do {
-            let saved = try router?.sshHostUpsert(host) ?? host
+            let saved = try router?.sshHostUpsert(host, workspace: workspaceID) ?? host
             let desc = try router?.sshConnect(workspace: workspaceID, profileID: saved.id, profile: nil, title: saved.label, paneID: nil)
             if let desc {
                 try router?.focusSurface(workspace: workspaceID, surface: desc.id)

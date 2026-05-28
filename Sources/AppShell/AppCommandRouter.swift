@@ -575,14 +575,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         }
     }
 
-    public func sshHostList() throws -> [SSHHostProfile] {
+    public func sshHostList(workspace: WorkspaceID) throws -> [SSHHostProfile] {
         guard let ctx = context else { return [] }
-        return try readSSHHosts(from: ctx.settingsRepo)
+        try requireWorkspace(workspace, in: ctx)
+        return try readSSHHosts(workspace: workspace, from: ctx.settingsRepo)
     }
 
-    public func sshHostUpsert(_ profile: SSHHostProfile) throws -> SSHHostProfile {
+    public func sshHostUpsert(_ profile: SSHHostProfile, workspace: WorkspaceID) throws -> SSHHostProfile {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        var hosts = try readSSHHosts(from: ctx.settingsRepo)
+        try requireWorkspace(workspace, in: ctx)
+        var hosts = try readSSHHosts(workspace: workspace, from: ctx.settingsRepo)
         var saved = profile
         saved.updatedAt = Date()
         if let index = hosts.firstIndex(where: { $0.id == saved.id }) {
@@ -591,25 +593,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         } else {
             hosts.append(saved)
         }
-        try writeSSHHosts(hosts, to: ctx.settingsRepo)
+        try writeSSHHosts(hosts, workspace: workspace, to: ctx.settingsRepo)
         return saved
     }
 
-    public func sshHostDelete(_ id: SSHHostID) throws {
+    public func sshHostDelete(_ id: SSHHostID, workspace: WorkspaceID) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        var hosts = try readSSHHosts(from: ctx.settingsRepo)
+        try requireWorkspace(workspace, in: ctx)
+        var hosts = try readSSHHosts(workspace: workspace, from: ctx.settingsRepo)
         hosts.removeAll { $0.id == id }
-        try writeSSHHosts(hosts, to: ctx.settingsRepo)
+        try writeSSHHosts(hosts, workspace: workspace, to: ctx.settingsRepo)
     }
 
     public func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        let hosts = try readSSHHosts(from: ctx.settingsRepo)
+        try requireWorkspace(workspace, in: ctx)
+        let hosts = try readSSHHosts(workspace: workspace, from: ctx.settingsRepo)
         let resolved: SSHHostProfile
         if let profileID, let found = hosts.first(where: { $0.id == profileID }) {
             resolved = found
         } else if let profile {
-            resolved = try sshHostUpsert(profile)
+            resolved = try sshHostUpsert(profile, workspace: workspace)
         } else {
             throw LayoutError.surfaceNotFound
         }
@@ -2127,15 +2131,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         return surface.descriptor
     }
 
-    private func readSSHHosts(from repo: SettingsRepository) throws -> [SSHHostProfile] {
-        guard let raw = try repo.get("ssh.hosts"),
+    private func requireWorkspace(_ workspace: WorkspaceID, in context: AppContext) throws {
+        guard context.state.workspaces[workspace] != nil else { throw LayoutError.workspaceNotFound }
+    }
+
+    private func sshHostsKey(workspace: WorkspaceID) -> String {
+        "ssh.hosts.\(workspace.value.uuidString)"
+    }
+
+    private func readSSHHosts(workspace: WorkspaceID, from repo: SettingsRepository) throws -> [SSHHostProfile] {
+        guard let raw = try repo.get(sshHostsKey(workspace: workspace)),
               let data = raw.data(using: .utf8) else { return [] }
         return (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
     }
 
-    private func writeSSHHosts(_ hosts: [SSHHostProfile], to repo: SettingsRepository) throws {
+    private func writeSSHHosts(_ hosts: [SSHHostProfile], workspace: WorkspaceID, to repo: SettingsRepository) throws {
         let data = try JSONEncoder().encode(hosts)
-        try repo.set("ssh.hosts", String(data: data, encoding: .utf8) ?? "[]")
+        try repo.set(sshHostsKey(workspace: workspace), String(data: data, encoding: .utf8) ?? "[]")
     }
 
     private func runSSHTransfer(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) throws -> JSONValue {
