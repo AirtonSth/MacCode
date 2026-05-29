@@ -1,6 +1,13 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import readline from 'node:readline';
+
+const execFileAsync = promisify(execFile);
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 

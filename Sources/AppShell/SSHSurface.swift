@@ -156,6 +156,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     private func applyAdaptiveHostSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        guard width > 0 else { return }
+        guard view.window != nil else { return }
         let now = Date().timeIntervalSinceReferenceDate
         let transferWidth = transferWidthConstraint?.constant ?? 0
         let decision = AdaptiveSidebarPolicy.nextVisibility(

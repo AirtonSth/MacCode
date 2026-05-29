@@ -82,16 +82,22 @@ final class AppIdentityNotificationTests: XCTestCase {
 
     func testSidebarActionsKeepRequestedOrderAndWorkspaceFontSize() throws {
         let source = try String(contentsOf: sidebarViewURL())
+        let account = try XCTUnwrap(source.range(of: "if vm.privateAccountUser != nil"))
+        let settings = try XCTUnwrap(source.range(of: "Button(action: onOpenSettings)"))
+        let toggle = try XCTUnwrap(source.range(of: "Button { vm.toggleSidebar() }"))
         let newWorkspace = try XCTUnwrap(source.range(of: "title: \"New Workspace\""))
-        let settings = try XCTUnwrap(source.range(of: "title: \"Settings\""))
         let updates = try XCTUnwrap(source.range(of: "title: vm.updateActionTitle"))
 
-        XCTAssertLessThan(newWorkspace.lowerBound, settings.lowerBound,
-                          "sidebar actions must keep New Workspace above Settings")
-        XCTAssertLessThan(settings.lowerBound, updates.lowerBound,
+        XCTAssertLessThan(account.lowerBound, settings.lowerBound,
+                          "logged-in account avatar must stay directly before Settings in the sidebar header")
+        XCTAssertLessThan(settings.lowerBound, toggle.lowerBound,
+                          "Settings must stay as the cog icon directly before the sidebar toggle")
+        XCTAssertLessThan(newWorkspace.lowerBound, updates.lowerBound,
                           "the update/check action belongs below Settings, not above New Workspace")
         XCTAssertTrue(source.contains("Text(title)\n                .font(DS.Font.body)"),
                       "sidebar action labels must use the same base font size as normal workspace rows")
+        XCTAssertFalse(source.contains("sidebarActionRow(symbol: \"gearshape\", title: \"Settings\")"),
+                       "Settings must not move back into the full-width action row area")
     }
 
     func testSidebarLiquidGlassAvoidsOpaqueBottomBand() throws {

@@ -1004,8 +1004,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                                permissionMode: src.permissionMode, reasoningEffort: src.reasoningEffort,
                                serviceTier: src.serviceTier)
         try? threadRepo.upsert(copy)
-        for m in (try? messageRepo.list(threadId: tid)) ?? [] {
-            try? messageRepo.append(AgentMessage(threadId: copy.id, role: m.role, content: m.content))
+        let copyBaseDate = Date()
+        for (index, m) in ((try? messageRepo.list(threadId: tid)) ?? []).enumerated() {
+            try? messageRepo.append(AgentMessage(
+                threadId: copy.id,
+                role: m.role,
+                content: m.content,
+                createdAt: copyBaseDate.addingTimeInterval(Double(index) / 1000)
+            ))
         }
         reloadThreads()
         selectThread(copy.id)

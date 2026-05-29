@@ -273,7 +273,7 @@ public final class AgentMessageRepository {
     }
 
     public func list(threadId: AgentThreadID) throws -> [AgentMessage] {
-        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at ASC, id ASC;")
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at ASC, rowid ASC;")
         try st.bind(1, threadId.value.uuidString)
         var out: [AgentMessage] = []
         while try st.step() {

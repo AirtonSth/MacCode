@@ -392,23 +392,23 @@ public struct SidebarRootView: View {
                         headerAccountAvatar
                             .frame(width: 28, height: 32)
                             .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help(accountSubtitle)
-                    .accessibilityLabel("Account")
-                    .accessibilityValue(accountSubtitle)
-                }
-
-                Button(action: onOpenSettings) {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 28, height: 32)
-                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Settings")
-                .accessibilityLabel("Settings")
+                .help(accountSubtitle)
+                .accessibilityLabel("Account")
+                .accessibilityValue(accountSubtitle)
+            }
+
+            Button(action: onOpenSettings) {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 15, weight: .regular))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .frame(width: 28, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Settings")
+            .accessibilityLabel("Settings")
 
                 Button { vm.toggleSidebar() } label: {
                     Image(systemName: "sidebar.left")
