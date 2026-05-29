@@ -480,6 +480,9 @@ public final class TerminalSurface: NSObject, Surface {
         self.terminationSignal = nil
         self.terminalDeadReason = nil
         self.lastOutputAt = Date()
+        if !TerminalFileDescriptorFlags.enableNonBlocking(amaster) {
+            NSLog("RemoteCode terminal failed to enable nonblocking PTY input: %@", String(cString: strerror(errno)))
+        }
         configureInputPump(fd: amaster)
         applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
@@ -500,15 +503,38 @@ public final class TerminalSurface: NSObject, Surface {
         readSource = src
         src.setEventHandler { [weak self] in
             guard let self else { return }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            let n = read(self.masterFD, &buf, buf.count)
-            if n <= 0 {
-                DispatchQueue.main.async { self.handlePTYEOF() }
-                return
+            var output = Data()
+            var shouldClose = false
+
+            while true {
+                var buf = [UInt8](repeating: 0, count: 4096)
+                let n = read(self.masterFD, &buf, buf.count)
+                if n > 0 {
+                    output.append(contentsOf: buf[0..<Int(n)])
+                    continue
+                }
+                if n == 0 {
+                    shouldClose = true
+                    break
+                }
+                if errno == EINTR {
+                    continue
+                }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    break
+                }
+                shouldClose = true
+                break
             }
-            let data = Data(buf[0..<Int(n)])
-            let renderAllowedAtRead = self.readerAllowsRender
-            DispatchQueue.main.async { self.appendDataAsync(data, renderAllowedAtRead: renderAllowedAtRead) }
+
+            if !output.isEmpty {
+                let data = output
+                let renderAllowedAtRead = self.readerAllowsRender
+                DispatchQueue.main.async { self.appendDataAsync(data, renderAllowedAtRead: renderAllowedAtRead) }
+            }
+            if shouldClose {
+                DispatchQueue.main.async { self.handlePTYEOF() }
+            }
         }
         src.resume()
     }

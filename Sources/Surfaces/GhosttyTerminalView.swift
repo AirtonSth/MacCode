@@ -136,7 +136,7 @@ private final class RemoteCodeGhosttyRuntime {
 
     private(set) var app: ghostty_app_t?
     private var config: ghostty_config_t?
-    private var tickScheduled = false
+    private let tickCoalescer = TerminalTickCoalescer()
 
     private init() {
         initialize()
@@ -323,11 +323,10 @@ private final class RemoteCodeGhosttyRuntime {
     }
 
     private func scheduleTick() {
-        guard !tickScheduled else { return }
-        tickScheduled = true
+        guard tickCoalescer.trySchedule() else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.tickScheduled = false
+            self.tickCoalescer.complete()
             if let app = self.app {
                 ghostty_app_tick(app)
             }

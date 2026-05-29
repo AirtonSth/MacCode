@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import Darwin
 import CoreModel
 @testable import Surfaces
 
@@ -279,6 +280,42 @@ final class TerminalEncodeTests: XCTestCase {
                      "unmanaged user shell secrets must remain inherited instead of being logged, copied, or selectively erased")
         XCTAssertTrue(environment.removals.contains("NO_COLOR"))
     }
+
+    func test_tickCoalescerAllowsOnlyOnePendingMainQueueTickUnderConcurrentWakeups() {
+        let coalescer = TerminalTickCoalescer()
+        let accepted = LockedCounter()
+
+        DispatchQueue.concurrentPerform(iterations: 1_000) { _ in
+            if coalescer.trySchedule() {
+                _ = accepted.increment()
+            }
+        }
+
+        XCTAssertEqual(accepted.current, 1,
+                       "Ghostty can fire wakeups from renderer/io threads; the terminal runtime must coalesce them under a lock so bulk output cannot flood the main queue and freeze input")
+        XCTAssertFalse(coalescer.trySchedule(),
+                       "a pending tick must stay pending until the main-queue tick runs")
+
+        coalescer.complete()
+
+        XCTAssertTrue(coalescer.trySchedule(),
+                      "after the queued tick runs, a later Ghostty wakeup must be allowed to schedule the next render pass")
+    }
+
+    func test_terminalFileDescriptorEnablesNonBlockingWritesForBackpressure() {
+        var fds: [Int32] = [-1, -1]
+        XCTAssertEqual(pipe(&fds), 0)
+        defer {
+            close(fds[0])
+            close(fds[1])
+        }
+
+        XCTAssertTrue(TerminalFileDescriptorFlags.enableNonBlocking(fds[1]))
+        let flags = fcntl(fds[1], F_GETFL)
+
+        XCTAssertNotEqual(flags & O_NONBLOCK, 0,
+                          "PTY input must return EAGAIN under backpressure instead of blocking the input pump and making a long-running terminal stop accepting keystrokes")
+    }
 }
 
 private final class LockedTerminalChunks {
@@ -295,13 +332,18 @@ private final class LockedTerminalChunks {
     }
 }
 
-private final class LockedCounter {
+private final class LockedCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
 
     func increment() -> Int {
         lock.lock(); defer { lock.unlock() }
         value += 1
+        return value
+    }
+
+    var current: Int {
+        lock.lock(); defer { lock.unlock() }
         return value
     }
 }

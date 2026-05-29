@@ -158,7 +158,10 @@ function ensureQuery() {
       settings: current.settings,
       allowDangerouslySkipPermissions: current.permissionMode === 'bypassPermissions',
       env: current.env,
-      includePartialMessages: true,
+      // Partial assistant snapshots can contain evolving thinking blocks. Replaying
+      // those snapshots into the next Anthropic request can trip the API's
+      // "thinking blocks must remain unchanged" validation.
+      includePartialMessages: false,
       includeHookEvents: true,
       canUseTool: async (toolName, input, options) => {
         const requestId = options.toolUseID || `permission-${Date.now()}`;

@@ -1274,6 +1274,37 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    func test_agentSDKBridgeSourceDisablesPartialAssistantSnapshots() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("includePartialMessages: false"),
+                      "Claude SDK partial assistant snapshots must stay disabled so thinking blocks are not replayed in a mutated form on the next provider request")
+        XCTAssertFalse(source.contains("includePartialMessages: true"),
+                       "turning partial snapshots back on can reproduce Anthropic 400 errors for thinking/redacted_thinking continuations")
+    }
+
+    func test_agentSDKPackageSpecRefreshesStalePinnedCache() throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-version-\(UUID().uuidString)", isDirectory: true)
+        let packageJSON = tmp.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
+        try FileManager.default.createDirectory(at: packageJSON.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try #"{"name":"@anthropic-ai/claude-agent-sdk","version":"0.3.150"}"#
+            .write(to: packageJSON, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec, "@anthropic-ai/claude-agent-sdk@0.3.157")
+        XCTAssertFalse(ClaudeAgentSDKBridgeAdapter.installedSDKPackage(at: packageJSON, matches: ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec),
+                       "an old cached Claude SDK must be reinstalled instead of keeping the pre-fix package that can fail thinking-block continuations")
+
+        try #"{"name":"@anthropic-ai/claude-agent-sdk","version":"0.3.157"}"#
+            .write(to: packageJSON, atomically: true, encoding: .utf8)
+        XCTAssertTrue(ClaudeAgentSDKBridgeAdapter.installedSDKPackage(at: packageJSON, matches: ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec))
+    }
+
     private func waitForFinish(in sink: EventSink, expected: String) async throws {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {

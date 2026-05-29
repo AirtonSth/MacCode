@@ -2889,7 +2889,7 @@ public struct AgentAppView: View {
                     Button {
                         Task { await vm.forceQueuedMessageNow(message) }
                     } label: {
-                        Label("Force Now", systemImage: "forward.end.fill")
+                        Text("Force")
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
@@ -2897,7 +2897,7 @@ public struct AgentAppView: View {
                     Button {
                         vm.editQueuedMessage(message)
                     } label: {
-                        Label("Edit", systemImage: "pencil")
+                        Image(systemName: "pencil")
                     }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -2909,10 +2909,12 @@ public struct AgentAppView: View {
                             queuedMessagePendingCancel = message
                         }
                     } label: {
-                        Label("Cancel", systemImage: "xmark")
+                        Image(systemName: "trash")
+                            .foregroundColor(DS.Palette.danger)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .tint(DS.Palette.danger)
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityLabel("Cancel queued message \(message.position)")
                 }
@@ -3289,7 +3291,7 @@ public struct AgentAppView: View {
             Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: 260, alignment: .trailing)
         .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
         .background(DS.Palette.surfaceRaised)
         .clipShape(Capsule())

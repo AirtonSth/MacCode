@@ -2,6 +2,8 @@ import Foundation
 import CoreModel
 
 public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked Sendable {
+    static let defaultSDKPackageSpec = "@anthropic-ai/claude-agent-sdk@0.3.157"
+
     private final class Session: @unchecked Sendable {
         let threadId: AgentThreadID
         let process: Process
@@ -330,10 +332,37 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)
         }
-        if !FileManager.default.isReadableFile(atPath: cachedPackage.path) {
-            try installSDKPackage(in: cache)
+        let packageSpec = Self.sdkPackageSpec()
+        if !Self.installedSDKPackage(at: cachedPackage, matches: packageSpec) {
+            try installSDKPackage(in: cache, packageSpec: packageSpec)
         }
         return cachedBridge.path
+    }
+
+    static func sdkPackageSpec() -> String {
+        let package = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_PACKAGE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return package?.isEmpty == false ? package! : defaultSDKPackageSpec
+    }
+
+    static func installedSDKPackage(at packageJSON: URL, matches packageSpec: String) -> Bool {
+        guard FileManager.default.isReadableFile(atPath: packageJSON.path) else { return false }
+        guard let data = try? Data(contentsOf: packageJSON),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        guard let expectedVersion = pinnedNPMVersion(in: packageSpec) else {
+            return true
+        }
+        return object["version"] as? String == expectedVersion
+    }
+
+    private static func pinnedNPMVersion(in packageSpec: String) -> String? {
+        let prefix = "@anthropic-ai/claude-agent-sdk@"
+        guard packageSpec.hasPrefix(prefix) else { return nil }
+        let version = String(packageSpec.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !version.isEmpty, version.first?.isNumber == true else { return nil }
+        return version
     }
 
     private func sdkRuntimeCacheDirectory() throws -> URL {
@@ -362,16 +391,13 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return cache
     }
 
-    private func installSDKPackage(in directory: URL) throws {
-        let package = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_PACKAGE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let spec = package?.isEmpty == false ? package! : "@anthropic-ai/claude-agent-sdk@0.3.150"
+    private func installSDKPackage(in directory: URL, packageSpec: String) throws {
         guard let npm = ProcessLocator.resolve("npm") else {
             throw AgentRunError.missingBinary("npm")
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: npm)
-        process.arguments = ["install", "--silent", spec]
+        process.arguments = ["install", "--silent", packageSpec]
         process.currentDirectoryURL = directory
         process.environment = CodexRunner.processEnvironment(overrides: [:])
         let output = Pipe()

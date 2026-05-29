@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CoreModel
 
 public enum TerminalInputStatus: String, Sendable, Equatable {
@@ -194,6 +195,36 @@ enum TerminalWriteResult: Equatable {
     case wouldBlock
     case interrupted
     case failed(Int32)
+}
+
+final class TerminalTickCoalescer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var scheduled = false
+
+    func trySchedule() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !scheduled else { return false }
+        scheduled = true
+        return true
+    }
+
+    func complete() {
+        lock.lock()
+        scheduled = false
+        lock.unlock()
+    }
+}
+
+enum TerminalFileDescriptorFlags {
+    @discardableResult
+    static func enableNonBlocking(_ fd: Int32) -> Bool {
+        guard fd >= 0 else { return false }
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0 else { return false }
+        guard flags & O_NONBLOCK == 0 else { return true }
+        return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
+    }
 }
 
 final class TerminalInputPump: @unchecked Sendable {
