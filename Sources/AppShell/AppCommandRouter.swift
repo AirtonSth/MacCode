@@ -154,7 +154,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: title)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), title: title)
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                             DispatchQueue.main.async {
@@ -166,6 +166,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                         agent.viewModel.providerSnapshotLoader = { [weak self] in
                             await self?.listAgentProviderSnapshots() ?? []
                         }
+                        agent.viewModel.refreshProviderSnapshotsInBackground()
                         agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
                             (
                                 self?.providerBinary(provider: provider, instanceId: instanceId),
@@ -1432,7 +1433,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
             }
             return await listAgentModels(provider: provider)
         case .claude:
-            return ClaudeRunner.listModels(installedVersion: installedVersion)
+            let apiModels = await AnthropicModelDiscovery.listModels(environment: environment)
+            return apiModels.isEmpty ? ClaudeRunner.listModels(installedVersion: installedVersion) : apiModels
         }
     }
 
@@ -2093,7 +2095,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), title: baseTitle)
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
@@ -2107,6 +2109,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 agent.viewModel.providerSnapshotLoader = { [weak self] in
                     await self?.listAgentProviderSnapshots() ?? []
                 }
+                agent.viewModel.refreshProviderSnapshotsInBackground()
                 agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
                     (
                         self?.providerBinary(provider: provider, instanceId: instanceId),

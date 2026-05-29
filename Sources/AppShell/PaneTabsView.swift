@@ -83,6 +83,9 @@ public final class PaneTabsView: NSObject {
                 colorHex: colorHex,
                 onSelect: { [weak self] in self?.selectSurface(sid) },
                 onClose: { [weak self] in self?.closeSurface(sid) },
+                onCloseOthers: pane.surfaces.count > 1 ? { [weak self] in _ = self?.performCloseAllOthers(around: sid) } : nil,
+                onCloseToLeft: Self.surfaceIDs(in: pane, before: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToLeft(of: sid) },
+                onCloseToRight: Self.surfaceIDs(in: pane, after: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToRight(of: sid) },
                 onRename: { [weak self] in self?.promptRenameSurface(sid, current: desc.title) },
                 onSetColor: { [weak self] raw in
                     guard let wid = self?.currentWorkspaceID() else { return }
@@ -291,6 +294,51 @@ public final class PaneTabsView: NSObject {
         guard let wid = currentWorkspaceID() else { return }
         if surfaceIsUnsaved(id), !confirmCloseUnsavedSurface(id) { return }
         try? router?.closeSurface(workspace: wid, surface: id)
+    }
+
+    @discardableResult
+    public func performCloseAllOthers(around id: SurfaceID) -> Bool {
+        closeSurfaces(Self.surfaceIDs(excluding: id, in: pane))
+    }
+
+    @discardableResult
+    public func performCloseToLeft(of id: SurfaceID) -> Bool {
+        closeSurfaces(Self.surfaceIDs(in: pane, before: id))
+    }
+
+    @discardableResult
+    public func performCloseToRight(of id: SurfaceID) -> Bool {
+        closeSurfaces(Self.surfaceIDs(in: pane, after: id))
+    }
+
+    private func closeSurfaces(_ ids: [SurfaceID]) -> Bool {
+        guard let wid = currentWorkspaceID(), let router, !ids.isEmpty else { return false }
+        for id in ids where surfaceIsUnsaved(id) {
+            if !confirmCloseUnsavedSurface(id) { return false }
+        }
+        for id in ids {
+            do {
+                try router.closeSurface(workspace: wid, surface: id)
+            } catch {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func surfaceIDs(excluding id: SurfaceID, in pane: PaneNode) -> [SurfaceID] {
+        pane.surfaces.map(\.id).filter { $0 != id }
+    }
+
+    private static func surfaceIDs(in pane: PaneNode, before id: SurfaceID) -> [SurfaceID] {
+        guard let index = pane.surfaces.firstIndex(where: { $0.id == id }), index > 0 else { return [] }
+        return pane.surfaces[..<index].map(\.id)
+    }
+
+    private static func surfaceIDs(in pane: PaneNode, after id: SurfaceID) -> [SurfaceID] {
+        guard let index = pane.surfaces.firstIndex(where: { $0.id == id }),
+              index < pane.surfaces.index(before: pane.surfaces.endIndex) else { return [] }
+        return pane.surfaces[pane.surfaces.index(after: index)...].map(\.id)
     }
 
     private func surfaceIsUnsaved(_ id: SurfaceID) -> Bool {
@@ -583,6 +631,9 @@ final class PaneTabButton: NSView {
     private let symbol: String
     private let onSelect: () -> Void
     private let onClose: () -> Void
+    private let onCloseOthers: (() -> Void)?
+    private let onCloseToLeft: (() -> Void)?
+    private let onCloseToRight: (() -> Void)?
     private let onRename: (() -> Void)?
     private let onSetColor: ((String) -> Void)?
     private let onDropSurface: ((SurfaceID) -> Bool)?
@@ -598,6 +649,9 @@ final class PaneTabButton: NSView {
          dirty: Bool = false,
          colorHex: UInt32? = nil,
          onSelect: @escaping () -> Void, onClose: @escaping () -> Void,
+         onCloseOthers: (() -> Void)? = nil,
+         onCloseToLeft: (() -> Void)? = nil,
+         onCloseToRight: (() -> Void)? = nil,
          onRename: (() -> Void)? = nil, onSetColor: ((String) -> Void)? = nil,
          onDropSurface: ((SurfaceID) -> Bool)? = nil,
          onSplitSurface: ((SurfaceID, PaneID, SplitDirection) -> Bool)? = nil) {
@@ -606,6 +660,9 @@ final class PaneTabButton: NSView {
         self.symbol = symbol
         self.onSelect = onSelect
         self.onClose = onClose
+        self.onCloseOthers = onCloseOthers
+        self.onCloseToLeft = onCloseToLeft
+        self.onCloseToRight = onCloseToRight
         self.onRename = onRename
         self.onSetColor = onSetColor
         self.onDropSurface = onDropSurface
@@ -749,9 +806,25 @@ final class PaneTabButton: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        guard onRename != nil || onSetColor != nil else { return }
+        let menu = contextMenu()
+        guard !menu.items.isEmpty else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    func contextMenuForTesting() -> NSMenu {
+        contextMenu()
+    }
+
+    var surfaceIDForTesting: SurfaceID { surfaceID }
+
+    private func contextMenu() -> NSMenu {
         let menu = NSMenu()
+        addContextItem(menu, title: "Close all others", action: #selector(closeOthers), enabled: onCloseOthers != nil)
+        addContextItem(menu, title: "Close all to left", action: #selector(closeToLeft), enabled: onCloseToLeft != nil)
+        addContextItem(menu, title: "Close all to right", action: #selector(closeToRight), enabled: onCloseToRight != nil)
+
         if onRename != nil {
+            if !menu.items.isEmpty { menu.addItem(.separator()) }
             let r = NSMenuItem(title: "Rename…", action: #selector(renameTab), keyEquivalent: "")
             r.target = self
             menu.addItem(r)
@@ -771,10 +844,20 @@ final class PaneTabButton: NSView {
             colorItem.submenu = sub
             menu.addItem(colorItem)
         }
-        NSMenu.popUpContextMenu(menu, with: event, for: self)
+        return menu
+    }
+
+    private func addContextItem(_ menu: NSMenu, title: String, action: Selector, enabled: Bool) {
+        let item = NSMenuItem(title: title, action: enabled ? action : nil, keyEquivalent: "")
+        item.target = enabled ? self : nil
+        item.isEnabled = enabled
+        menu.addItem(item)
     }
 
     @objc private func renameTab() { onRename?() }
+    @objc private func closeOthers() { onCloseOthers?() }
+    @objc private func closeToLeft() { onCloseToLeft?() }
+    @objc private func closeToRight() { onCloseToRight?() }
     @objc private func colorTab(_ sender: NSMenuItem) {
         onSetColor?((sender.representedObject as? String) ?? "")
     }

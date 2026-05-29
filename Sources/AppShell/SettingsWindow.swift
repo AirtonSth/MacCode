@@ -17,6 +17,7 @@ public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
     public let trustRepo: DeviceTrustRepository
     public let settingsStore: SettingsStore
+    public let customModelStore: AgentCustomModelStore
     public let context: AppContext
     private let privateAccountAPI: PrivateAccountAPI
     private let privateAccountStore: PrivateAccountSessionStore
@@ -30,6 +31,7 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var newPairingCode: String?
     @Published public var updatingProviders: Set<AgentProvider> = []
     @Published public var providerUpdateMessages: [AgentProvider: String] = [:]
+    @Published public var customModelsByProvider: [AgentProvider: [String]] = [:]
     @Published public var privateAccountEmail: String = ""
     @Published public var privateAccountPassword: String = ""
     @Published public var privateAccountUser: PrivateAccountUser?
@@ -48,6 +50,7 @@ public final class SettingsViewModel: ObservableObject {
         self.settingsRepo = context.settingsRepo
         self.trustRepo = DeviceTrustRepository(db: context.db)
         self.settingsStore = SettingsStore(db: context.db)
+        self.customModelStore = AgentCustomModelStore(repo: context.settingsRepo)
         self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
         reload()
     }
@@ -57,6 +60,9 @@ public final class SettingsViewModel: ObservableObject {
         appSettings = settingsStore.load()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
+        customModelsByProvider = Dictionary(uniqueKeysWithValues: AgentProvider.allCases.map { provider in
+            (provider, customModelStore.list(provider: provider))
+        })
         devices = (try? trustRepo.list()) ?? []
         if let session = privateAccountStore.load() {
             privateAccountUser = session.user
@@ -94,6 +100,20 @@ public final class SettingsViewModel: ObservableObject {
     public func setClaudePath(_ path: String) {
         claudePath = path
         saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
+    }
+
+    public func setCustomModel(provider: AgentProvider, index: Int, value: String) {
+        customModelStore.update(provider: provider, index: index, value: value)
+        customModelsByProvider[provider] = customModelStore.list(provider: provider)
+    }
+
+    public func removeCustomModel(provider: AgentProvider, index: Int) {
+        customModelStore.remove(provider: provider, index: index)
+        customModelsByProvider[provider] = customModelStore.list(provider: provider)
+    }
+
+    public func providerDisplayName(_ provider: AgentProvider) -> String {
+        provider.rawValue.capitalized
     }
 
     public func updateProvider(_ provider: AgentProvider) async {
@@ -268,6 +288,7 @@ public struct SettingsView: View {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     remoteAccessSection
                     diffDefaultsSection
+                    customModelsSection
                     trustedDevicesSection
                     diagnosticsSection
                 }
@@ -325,6 +346,51 @@ public struct SettingsView: View {
             Text("These defaults seed new Git diff surfaces and match the toolbar toggles in the diff panel.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var customModelsSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Custom Models")
+            let hasModels = AgentProvider.allCases.contains { !(vm.customModelsByProvider[$0] ?? []).isEmpty }
+            if !hasModels {
+                Text("No custom models saved. Add one from the Agent model menu.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            ForEach(AgentProvider.allCases, id: \.self) { provider in
+                let models = vm.customModelsByProvider[provider] ?? []
+                if !models.isEmpty {
+                    VStack(alignment: .leading, spacing: DS.Space.sm) {
+                        Text(vm.providerDisplayName(provider))
+                            .font(DS.Font.caption2.weight(.semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                        ForEach(Array(models.enumerated()), id: \.offset) { index, _ in
+                            HStack(spacing: DS.Space.sm) {
+                                TextField("Model ID", text: Binding(
+                                    get: {
+                                        let values = vm.customModelsByProvider[provider] ?? []
+                                        return values.indices.contains(index) ? values[index] : ""
+                                    },
+                                    set: { vm.setCustomModel(provider: provider, index: index, value: $0) }
+                                ))
+                                .textFieldStyle(.roundedBorder)
+                                .font(DS.Font.monoSmall)
+                                Button {
+                                    vm.removeCustomModel(provider: provider, index: index)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .frame(width: 18, height: 18)
+                                }
+                                .help("Remove custom model")
+                                .buttonStyle(DSSecondaryButtonStyle())
+                            }
+                        }
+                    }
+                }
+            }
         }
         .dsPanel(padding: DS.Space.lg)
     }

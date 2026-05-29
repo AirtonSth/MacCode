@@ -1907,6 +1907,56 @@ final class AgentAppViewModelTests: XCTestCase {
                        "providers without custom-model support must ignore custom model entry instead of persisting an unsupported id")
     }
 
+    func test_customModelSelectionPersistsForFutureAgentModelMenus() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-custom-model-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let customStore = AgentCustomModelStore(db: db)
+        let models = [
+            AgentModelDescriptor(id: "", label: "Default", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.4-mini", label: "GPT-5.4-Mini", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true)
+        ]
+        let first = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            customModelStore: customStore
+        )
+        first.availableModels = models
+
+        first.setCustomModel("gpt-5.5-experimental")
+
+        XCTAssertEqual(first.customModelsForSelectedProvider, ["gpt-5.5-experimental"],
+                       "the Custom option must save the user-entered model so it appears in later model menus")
+        XCTAssertEqual(first.currentModelSelection.customModelId, "gpt-5.5-experimental",
+                       "custom selections must be sent as customModelId instead of masquerading as a built-in descriptor")
+
+        let reloaded = AgentAppViewModel(
+            workspaceID: WorkspaceID(),
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            customModelStore: customStore
+        )
+        reloaded.availableModels = models
+
+        XCTAssertEqual(reloaded.customModelsForSelectedProvider, ["gpt-5.5-experimental"],
+                       "custom model IDs must persist until the user edits or removes them in Settings")
+    }
+
     // MARK: B4 — bounded message window
 
     func test_messageWindow_capsThenLoadsEarlier() throws {

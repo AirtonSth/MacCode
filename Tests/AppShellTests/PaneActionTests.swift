@@ -25,6 +25,26 @@ final class PaneActionTests: XCTestCase {
         return (ctx, router)
     }
 
+    private func makePaneWithTabCount(_ count: Int, name: String) throws -> (AppContext, AppCommandRouter, WorkspaceID, PaneNode) {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: name, cwd: NSTemporaryDirectory())
+        guard case .pane(let initialPane) = ws.layout else {
+            throw NSError(domain: "PaneActionTests", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "expected single pane workspace"
+            ])
+        }
+        let view = PaneTabsView(pane: initialPane, router: router)
+        for index in 1..<count {
+            XCTAssertNotNil(view.performAdd(.browser, title: "tab-\(index)"))
+        }
+        return (ctx, router, ws.id, try currentPane(ctx, workspace: ws.id, paneID: initialPane.id))
+    }
+
+    private func currentPane(_ ctx: AppContext, workspace: WorkspaceID, paneID: PaneID) throws -> PaneNode {
+        let ws = try XCTUnwrap(ctx.state.workspaces[workspace])
+        return try XCTUnwrap(ws.layout.find(paneID: paneID))
+    }
+
     func test_newWorkspace_opensTerminalByDefault_andAddCreatesAnother() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
@@ -502,6 +522,61 @@ final class PaneActionTests: XCTestCase {
         XCTAssertFalse(p2.surfaces.contains { $0.id == a!.id })
     }
 
+    func test_tabContextMenu_exposesBulkCloseActions() throws {
+        let (_, router, _, pane) = try makePaneWithTabCount(4, name: "tab-menu")
+        let view = PaneTabsView(pane: pane, router: router)
+        let targetID = pane.surfaces[1].id
+        let tab = try XCTUnwrap(allSubviews(of: view.view).compactMap { $0 as? PaneTabButton }
+            .first { $0.surfaceIDForTesting == targetID })
+
+        let menu = tab.contextMenuForTesting()
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+
+        XCTAssertEqual(Array(titles.prefix(3)), ["Close all others", "Close all to left", "Close all to right"],
+                       "right-clicking a tab must expose bulk close actions before cosmetic tab actions")
+        XCTAssertTrue(menu.item(withTitle: "Close all others")?.isEnabled == true)
+        XCTAssertTrue(menu.item(withTitle: "Close all to left")?.isEnabled == true)
+        XCTAssertTrue(menu.item(withTitle: "Close all to right")?.isEnabled == true)
+        XCTAssertTrue(titles.contains("Rename…"))
+        XCTAssertTrue(titles.contains("Color"))
+    }
+
+    func test_tabBulkCloseActionsRespectClickedTabAndSide() throws {
+        do {
+            let (ctx, router, wsID, pane) = try makePaneWithTabCount(4, name: "close-others")
+            let targetID = pane.surfaces[2].id
+
+            XCTAssertTrue(PaneTabsView(pane: pane, router: router).performCloseAllOthers(around: targetID),
+                          "Close all others must keep the clicked tab and close every sibling in the pane")
+
+            XCTAssertEqual(try currentPane(ctx, workspace: wsID, paneID: pane.id).surfaces.map(\.id), [targetID])
+        }
+
+        do {
+            let (ctx, router, wsID, pane) = try makePaneWithTabCount(4, name: "close-left")
+            let targetIndex = 2
+            let targetID = pane.surfaces[targetIndex].id
+            let expected = pane.surfaces[targetIndex...].map(\.id)
+
+            XCTAssertTrue(PaneTabsView(pane: pane, router: router).performCloseToLeft(of: targetID),
+                          "Close all to left must remove only tabs before the clicked tab")
+
+            XCTAssertEqual(try currentPane(ctx, workspace: wsID, paneID: pane.id).surfaces.map(\.id), Array(expected))
+        }
+
+        do {
+            let (ctx, router, wsID, pane) = try makePaneWithTabCount(4, name: "close-right")
+            let targetIndex = 1
+            let targetID = pane.surfaces[targetIndex].id
+            let expected = pane.surfaces[...targetIndex].map(\.id)
+
+            XCTAssertTrue(PaneTabsView(pane: pane, router: router).performCloseToRight(of: targetID),
+                          "Close all to right must remove only tabs after the clicked tab")
+
+            XCTAssertEqual(try currentPane(ctx, workspace: wsID, paneID: pane.id).surfaces.map(\.id), Array(expected))
+        }
+    }
+
     func test_symbolForType_isDistinctNonEmpty() {
         let syms = SurfaceType.allCases.map { PaneTabsView.symbol(for: $0) }
         XCTAssertTrue(syms.allSatisfy { !$0.isEmpty })
@@ -853,6 +928,9 @@ final class PaneActionTests: XCTestCase {
         vm.setDiffIgnoreWhitespace(true)
         vm.setCodexPath("/usr/bin/env")
         vm.setClaudePath("/usr/bin/env")
+        AgentCustomModelStore(repo: ctx.settingsRepo).add("gpt-5.5-experimental", provider: .codex)
+        vm.reload()
+        vm.setCustomModel(provider: .codex, index: 0, value: "gpt-5.5-custom")
 
         let reloaded = SettingsViewModel(context: ctx)
         XCTAssertTrue(reloaded.appSettings.diffWordWrap,
@@ -865,6 +943,12 @@ final class PaneActionTests: XCTestCase {
                        "Settings must expose and persist the executable path used to launch Claude")
         XCTAssertTrue(reloaded.codexAvailable && reloaded.claudeAvailable,
                       "valid configured CLI paths must be reflected in diagnostics")
+        XCTAssertEqual(reloaded.customModelsByProvider[.codex], ["gpt-5.5-custom"],
+                       "Settings must edit custom model IDs saved from the Agent model menu so they persist until explicitly removed")
+
+        reloaded.removeCustomModel(provider: .codex, index: 0)
+        XCTAssertEqual(SettingsViewModel(context: ctx).customModelsByProvider[.codex], [],
+                       "Settings must remove custom model IDs instead of leaving stale rows in future Agent model menus")
     }
 
     func test_settingsViewModel_runsProviderUpdateFromConfiguredPath() async throws {

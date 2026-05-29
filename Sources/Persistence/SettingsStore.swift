@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 /// User-tunable preferences (t3code client-settings parity). Persisted as
 /// one JSON blob in the `settings` kv table so adding a field never needs
@@ -74,5 +75,72 @@ public final class SettingsStore {
     /// Read-modify-write a single field without clobbering the others.
     public func update(_ mutate: (inout AppSettings) -> Void) {
         var s = load(); mutate(&s); save(s)
+    }
+}
+
+public final class AgentCustomModelStore {
+    private let repo: SettingsRepository
+    private let keyPrefix = "agent.custom_models."
+
+    public init(repo: SettingsRepository) {
+        self.repo = repo
+    }
+
+    public init(db: SQLiteDB) {
+        self.repo = SettingsRepository(db: db)
+    }
+
+    public func list(provider: AgentProvider) -> [String] {
+        guard let raw = try? repo.get(keyPrefix + provider.rawValue),
+              let data = raw.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return normalized(values)
+    }
+
+    public func add(_ model: String, provider: AgentProvider) {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var values = list(provider: provider)
+        if !values.contains(trimmed) {
+            values.append(trimmed)
+        }
+        save(values, provider: provider)
+    }
+
+    public func update(provider: AgentProvider, index: Int, value: String) {
+        var values = list(provider: provider)
+        guard values.indices.contains(index) else { return }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            values.remove(at: index)
+        } else {
+            values[index] = trimmed
+        }
+        save(values, provider: provider)
+    }
+
+    public func remove(provider: AgentProvider, index: Int) {
+        var values = list(provider: provider)
+        guard values.indices.contains(index) else { return }
+        values.remove(at: index)
+        save(values, provider: provider)
+    }
+
+    private func save(_ models: [String], provider: AgentProvider) {
+        guard let data = try? JSONEncoder().encode(normalized(models)),
+              let raw = String(data: data, encoding: .utf8) else { return }
+        try? repo.set(keyPrefix + provider.rawValue, raw)
+    }
+
+    private func normalized(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for value in values {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
+            seen.insert(trimmed)
+            result.append(trimmed)
+        }
+        return result
     }
 }

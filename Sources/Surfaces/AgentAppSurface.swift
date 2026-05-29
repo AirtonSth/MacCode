@@ -30,7 +30,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var executionMode: AgentExecutionMode = .local
     @Published public var baseBranch: String = ""
     @Published public var worktreePath: String?
-    private var customModelSelections = Set<String>()
+    @Published public private(set) var customModelsByProvider: [AgentProvider: [String]] = [:]
     @Published public var status: AgentRunStatus = .pending
     @Published public var statusMessage: String = ""
     @Published public var currentRunId: AgentRunID?
@@ -91,6 +91,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let proposedPlanRepo: AgentProposedPlanRepository?
     public let checkpointRepo: AgentTurnCheckpointRepository?
     public let promptHistoryStore: PromptHistoryStore?
+    public let customModelStore: AgentCustomModelStore?
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
@@ -105,7 +106,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         pendingCallbackRepo: ProviderPendingCallbackRepository? = nil,
         proposedPlanRepo: AgentProposedPlanRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
-        promptHistoryStore: PromptHistoryStore? = nil
+        promptHistoryStore: PromptHistoryStore? = nil,
+        customModelStore: AgentCustomModelStore? = nil
     ) {
         self.workspaceID = workspaceID
         self.cwd = cwd
@@ -117,10 +119,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.proposedPlanRepo = proposedPlanRepo
         self.checkpointRepo = checkpointRepo
         self.promptHistoryStore = promptHistoryStore
+        self.customModelStore = customModelStore
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
+        reloadCustomModels()
         self.coordinator.addObserver(self)
         reloadThreads()
         loadGitBranch()
+    }
+
+    public func reloadCustomModels() {
+        guard let customModelStore else { return }
+        var next: [AgentProvider: [String]] = [:]
+        for provider in AgentProvider.allCases {
+            next[provider] = customModelStore.list(provider: provider)
+        }
+        customModelsByProvider = next
     }
 
     public func loadGitBranch() {
@@ -607,6 +620,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    public func refreshProviderSnapshotsInBackground() {
+        Task { await loadProviderSnapshots() }
+    }
+
     public var selectedProviderSnapshot: AgentProviderSnapshot? {
         providerSnapshots.first { $0.id == providerInstanceId }
             ?? providerSnapshots.first { $0.provider == provider }
@@ -643,6 +660,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         modelOptionsForSelectedProvider.contains { $0.supportsCustomModel }
     }
 
+    public var customModelsForSelectedProvider: [String] {
+        customModelsByProvider[provider] ?? []
+    }
+
     public var selectedModelContextWindowLabel: String? {
         guard let tokens = selectedModelDescriptor?.contextWindowTokens, tokens > 0 else { return nil }
         if tokens >= 1_000_000, tokens % 1_000_000 == 0 { return "\(tokens / 1_000_000)M ctx" }
@@ -654,7 +675,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !models.isEmpty else { return true }
         if models.contains(where: { $0.id == model && $0.provider == provider }) { return true }
         return !model.isEmpty
-            && customModelSelections.contains(model)
+            && (customModelsByProvider[provider] ?? []).contains(model)
             && models.contains { $0.provider == provider && $0.supportsCustomModel }
     }
 
@@ -873,7 +894,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !providerLocked else { return }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard supportsCustomModelForSelectedProvider else { return }
-        if !trimmed.isEmpty { customModelSelections.insert(trimmed) }
+        if !trimmed.isEmpty {
+            customModelStore?.add(trimmed, provider: provider)
+            var values = customModelsByProvider[provider] ?? []
+            if !values.contains(trimmed) {
+                values.append(trimmed)
+                customModelsByProvider[provider] = values
+            }
+        }
         model = trimmed.isEmpty ? (modelOptionsForSelectedProvider.first?.id ?? "") : trimmed
         normalizeSelectedModelOptions()
         persistThreadConfig()
@@ -1585,6 +1613,8 @@ public struct AgentAppView: View {
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
+    @State private var showModelOptions = false
+    @State private var showAllModelOptions = false
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -1722,7 +1752,11 @@ public struct AgentAppView: View {
             }
         }
         .background(DS.Palette.bg)
-        .task { await vm.loadProviderSnapshots() }
+        .task {
+            if vm.providerSnapshots.isEmpty {
+                await vm.loadProviderSnapshots()
+            }
+        }
         .onDeleteCommand { deleteSelectedThreads() }
     }
 
@@ -2417,10 +2451,28 @@ public struct AgentAppView: View {
     }
 
     private var emptyConversation: some View {
-        Text("No timeline yet. Send a prompt.")
-            .font(DS.Font.body)
-            .foregroundColor(DS.Palette.textSecondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: DS.Space.lg) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 44, weight: .regular))
+                .foregroundColor(DS.Palette.textTertiary)
+                .frame(width: 72, height: 72)
+                .background(DS.Palette.surfaceRaised)
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+            VStack(spacing: DS.Space.sm) {
+                Text("No messages")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                Text("Start a new agent run from the composer.")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -2775,22 +2827,17 @@ public struct AgentAppView: View {
     }
 
     private var compactComposerToolbar: some View {
-        VStack(spacing: DS.Space.sm) {
-            HStack(spacing: DS.Space.sm) {
-                attachmentButton
-                permissionMenu
-                executionMenu
-                Spacer(minLength: DS.Space.xs)
-                if vm.status == .running {
-                    ProgressView().controlSize(.small).scaleEffect(0.55)
-                    stopButton
-                }
-                sendStopButton
+        HStack(spacing: DS.Space.sm) {
+            attachmentButton
+            modelMenu
+            permissionMenu
+            executionMenu
+            Spacer(minLength: DS.Space.xs)
+            if vm.status == .running {
+                ProgressView().controlSize(.small).scaleEffect(0.55)
+                stopButton
             }
-            HStack(spacing: DS.Space.sm) {
-                Spacer(minLength: 0)
-                modelMenu
-            }
+            sendStopButton
         }
     }
 
@@ -2914,41 +2961,53 @@ public struct AgentAppView: View {
     }
 
     private var modelMenu: some View {
-        Menu {
+        Button {
+            showModelOptions.toggle()
+        } label: {
+            modelMenuLabel
+        }
+        .buttonStyle(.plain)
+        .disabled(vm.status == .running)
+        .popover(isPresented: $showModelOptions, arrowEdge: .bottom) {
+            modelOptionsPopover
+        }
+        .onChange(of: showModelOptions) { isShowing in
+            if !isShowing { showAllModelOptions = false }
+        }
+        .help(vm.providerLocked ? "Model · reasoning effort · service tier" : "Provider · model · reasoning effort · service tier")
+    }
+
+    private var modelOptionsPopover: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
             if !vm.providerLocked {
                 if !vm.providerSnapshots.isEmpty {
-                    Picker("Source", selection: Binding(
-                        get: { vm.providerInstanceId },
-                        set: { vm.setProviderInstance($0) }
-                    )) {
-                        ForEach(vm.providerSnapshots.filter(\.enabled), id: \.id) { snapshot in
-                            Text(snapshot.displayName).tag(snapshot.id)
+                    compactMenuSection("Source")
+                    ForEach(vm.providerSnapshots.filter(\.enabled), id: \.id) { snapshot in
+                        compactMenuRow(snapshot.displayName, selected: snapshot.id == vm.providerInstanceId) {
+                            vm.setProviderInstance(snapshot.id)
                         }
                     }
-                    .disabled(vm.status == .running)
+                    compactMenuDivider
                 } else {
-                    Picker("Source", selection: Binding(
-                        get: { vm.provider },
-                        set: { provider in
+                    compactMenuSection("Source")
+                    ForEach(AgentProvider.allCases, id: \.self) { provider in
+                        compactMenuRow(vm.providerDisplayName(provider), selected: provider == vm.provider) {
                             vm.setProvider(provider)
                             Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
                         }
-                    )) {
-                        ForEach(AgentProvider.allCases, id: \.self) { provider in
-                            Text(vm.providerDisplayName(provider)).tag(provider)
-                        }
                     }
-                    .disabled(vm.status == .running)
+                    compactMenuDivider
                 }
             }
             let modelOptions = vm.modelOptionsForSelectedProvider
+            let customModels = vm.customModelsForSelectedProvider
             if vm.modelListLoading {
                 Text("Loading models...")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
             }
             if vm.modelListStatusMessage != nil || vm.providerSnapshotStatusMessage != nil {
-                Button("Retry loading models") {
+                compactMenuRow("Retry loading models", selected: false) {
                     Task {
                         await vm.loadProviderSnapshots()
                         await vm.loadModels()
@@ -2966,105 +3025,195 @@ public struct AgentAppView: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
             }
-            if !modelOptions.isEmpty {
-                Picker("Model", selection: $vm.model) {
-                    ForEach(modelOptions, id: \.id) { m in Text(m.label).tag(m.id) }
-                    if vm.supportsCustomModelForSelectedProvider,
-                       !vm.model.isEmpty,
-                       !modelOptions.contains(where: { $0.id == vm.model }) {
-                        Text("Custom: \(vm.model)").tag(vm.model)
+            if !modelOptions.isEmpty || !customModels.isEmpty {
+                compactMenuSection("Model")
+                let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
+                let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
+                let visibleModels = Array(modelOptions.prefix(visibleModelCount))
+                let visibleCustomModels = Array(customModels.prefix(visibleCustomModelCount))
+                ForEach(visibleModels, id: \.id) { model in
+                    compactMenuRow(model.label, selected: model.id == vm.model) {
+                        vm.setModel(model.id)
+                        showModelOptions = false
                     }
                 }
-                .onChange(of: vm.model) { newValue in vm.setModel(newValue) }
-                .disabled(vm.status == .running || vm.providerLocked)
-            }
-            if vm.supportsCustomModelForSelectedProvider {
-                TextField("Custom model", text: Binding(
-                    get: { vm.model },
-                    set: { vm.setCustomModel($0) }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .disabled(vm.status == .running || vm.providerLocked)
-            }
-            if let contextWindow = vm.selectedModelContextWindowLabel {
-                Text(contextWindow)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
+                ForEach(visibleCustomModels, id: \.self) { customModel in
+                    compactMenuRow(customModel, selected: customModel == vm.model) {
+                        vm.setCustomModel(customModel)
+                        showModelOptions = false
+                    }
+                }
+                if modelOptions.count + customModels.count > 3, !showAllModelOptions {
+                    compactMenuRow("More...", selected: false) {
+                        showAllModelOptions = true
+                    }
+                }
+                if vm.supportsCustomModelForSelectedProvider {
+                    compactMenuRow("Custom...", selected: false) {
+                        promptCustomModel()
+                    }
+                }
             }
             if vm.supportsReasoningForSelectedModel || vm.supportsServiceTierForSelectedModel {
-                Divider()
+                compactMenuDivider
             }
             if vm.supportsReasoningForSelectedModel {
-                Picker("Reasoning effort", selection: $vm.reasoningEffort) {
-                    ForEach(vm.supportedReasoningEffortsForSelectedModel, id: \.self) { e in
-                        Text(e.displayName).tag(e)
+                compactMenuSection("Reasoning effort")
+                ForEach(vm.supportedReasoningEffortsForSelectedModel, id: \.self) { effort in
+                    compactMenuRow(effort.displayName, selected: effort == vm.reasoningEffort) {
+                        vm.setReasoningEffort(effort)
+                        showModelOptions = false
                     }
                 }
-                .onChange(of: vm.reasoningEffort) { newValue in vm.setReasoningEffort(newValue) }
             }
             if vm.supportsServiceTierForSelectedModel {
-                Picker("Service tier", selection: $vm.serviceTier) {
-                    Text("Auto").tag(AgentServiceTier.auto)
-                    Text("Fast").tag(AgentServiceTier.fast)
+                compactMenuSection("Service tier")
+                compactMenuRow("Auto", selected: vm.serviceTier == .auto) {
+                    vm.setServiceTier(.auto)
+                    showModelOptions = false
                 }
-                .onChange(of: vm.serviceTier) { newValue in vm.setServiceTier(newValue) }
+                compactMenuRow("Fast", selected: vm.serviceTier == .fast) {
+                    vm.setServiceTier(.fast)
+                    showModelOptions = false
+                }
             }
             if let providerStatus = vm.providerStatusMessage {
-                Divider()
+                compactMenuDivider
                 Text(providerStatus)
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
-            }
-            if let accountStatus = vm.providerAccountStatusMessage {
-                Text(accountStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             if let actionTitle = vm.providerRecoveryActionTitle {
-                Button(vm.providerRecoveryActionRunning ? "Working..." : actionTitle) {
+                compactMenuRow(vm.providerRecoveryActionRunning ? "Working..." : actionTitle, selected: false) {
                     Task { await vm.performProviderRecoveryAction() }
                 }
                 .disabled(vm.providerRecoveryActionRunning)
             }
-            if let actionStatus = vm.providerRecoveryStatusMessage {
+            if let actionStatus = vm.providerRecoveryStatusMessage,
+               actionStatus.hasPrefix("Update failed") {
                 Text(actionStatus)
                     .font(DS.Font.caption)
-                    .foregroundColor(actionStatus.hasPrefix("Update failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                    .foregroundColor(DS.Palette.danger)
             }
-        } label: {
-            HStack(spacing: DS.Space.xs) {
-                Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
+        }
+        .padding(DS.Space.sm)
+        .background(DS.Palette.surfaceOverlay)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var modelMenuLabel: some View {
+        HStack(spacing: DS.Space.xs) {
+            Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if vm.supportsReasoningForSelectedModel {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                if vm.supportsReasoningForSelectedModel {
-                    Text("·").foregroundColor(DS.Palette.textTertiary)
-                    Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                if vm.serviceTier == .fast {
-                    Text("·").foregroundColor(DS.Palette.textTertiary)
-                    Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
-                        .lineLimit(1)
-                }
-                if let contextWindow = vm.selectedModelContextWindowLabel {
-                    Text("·").foregroundColor(DS.Palette.textTertiary)
-                    Text(contextWindow).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
             }
-            .frame(maxWidth: 260, alignment: .trailing)
-            .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
-            .background(DS.Palette.surfaceRaised)
-            .clipShape(Capsule())
-            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+            if vm.serviceTier == .fast {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
+                    .lineLimit(1)
+            }
+            Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
         }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden)
-        .disabled(vm.status == .running)
-        .help(vm.providerLocked ? "Model · reasoning effort · service tier" : "Provider · model · reasoning effort · service tier")
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+    }
+
+    private func compactMenuSection(_ title: String) -> some View {
+        Text(title)
+            .font(DS.Font.caption2.weight(.semibold))
+            .foregroundColor(DS.Palette.textTertiary)
+            .padding(.top, DS.Space.xs)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func compactMenuRow(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 12)
+                    .opacity(selected ? 1 : 0)
+                Text(title)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.xs)
+            .padding(.vertical, DS.Space.xs)
+            .frame(width: compactModelMenuWidth, alignment: .leading)
+            .background(selected ? DS.Palette.selection : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var compactMenuDivider: some View {
+        Rectangle()
+            .fill(DS.Palette.line)
+            .frame(height: DS.Border.hairline)
+            .padding(.vertical, DS.Space.xs)
+            .frame(width: compactModelMenuWidth)
+    }
+
+    private func promptCustomModel() {
+        guard vm.supportsCustomModelForSelectedProvider else { return }
+        let alert = NSAlert()
+        alert.messageText = "Custom model"
+        alert.informativeText = "Enter the provider model ID to save it for future runs."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
+        alert.accessoryView = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            vm.setCustomModel(field.stringValue)
+            showModelOptions = false
+        }
+    }
+
+    private var compactModelMenuWidth: CGFloat {
+        var titles: [String] = []
+        if !vm.providerLocked {
+            if !vm.providerSnapshots.isEmpty {
+                titles.append(contentsOf: vm.providerSnapshots.filter(\.enabled).map(\.displayName))
+            } else {
+                titles.append(contentsOf: AgentProvider.allCases.map { vm.providerDisplayName($0) })
+            }
+        }
+        let modelOptions = vm.modelOptionsForSelectedProvider
+        let customModels = vm.customModelsForSelectedProvider
+        let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
+        let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
+        titles.append(contentsOf: modelOptions.prefix(visibleModelCount).map(\.label))
+        titles.append(contentsOf: customModels.prefix(visibleCustomModelCount))
+        if vm.supportsCustomModelForSelectedProvider {
+            titles.append("Custom...")
+        }
+        if modelOptions.count + customModels.count > 3, !showAllModelOptions {
+            titles.append("More...")
+        }
+        if vm.supportsReasoningForSelectedModel {
+            titles.append(contentsOf: vm.supportedReasoningEffortsForSelectedModel.map(\.displayName))
+        }
+        if vm.supportsServiceTierForSelectedModel {
+            titles.append(contentsOf: ["Auto", "Fast"])
+        }
+        if vm.providerRecoveryActionTitle != nil {
+            titles.append(vm.providerRecoveryActionRunning ? "Working..." : (vm.providerRecoveryActionTitle ?? ""))
+        }
+        let estimated = titles.map { CGFloat($0.count * 7 + 34) }.max() ?? 112
+        return min(max(estimated, 112), 260)
     }
 
     private var sendStopButton: some View {
@@ -3781,9 +3930,9 @@ public final class AgentAppSurface: NSObject, Surface {
     /// this already-open surface (wired by AppCommandRouter, like Feed).
     public var subscriptionToken: AnyHashable?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, title: String = "Agent App") {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

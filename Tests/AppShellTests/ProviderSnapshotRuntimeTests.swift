@@ -281,10 +281,52 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let snapshots = await router.listAgentProviderSnapshots()
         let claude = try XCTUnwrap(snapshots.first { $0.id == "claude-old" })
 
-        XCTAssertEqual(claude.models.map(\.id), ["claude-haiku-4-5-20251001"],
-                       "provider snapshots must gate Claude model options by the probed CLI version so the UI does not offer model ids this install cannot run")
-        XCTAssertEqual(claude.models.first?.supportedReasoningEfforts, [],
-                       "a non-thinking Claude model must also hide reasoning controls on macOS and iOS")
+        XCTAssertEqual(claude.models.map(\.id), ["opus", "sonnet", "haiku"],
+                       "provider snapshots must use versionless Claude Code model aliases when the dynamic Anthropic Models API is unavailable")
+        XCTAssertEqual(claude.models.first?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases,
+                       "alias fallback models must preserve thinking controls on macOS and iOS")
+    }
+
+    func test_agentSurfaceRefreshesCurrentProviderModelsOnStartup() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fakeClaude = dir.appendingPathComponent("fake-claude")
+        try """
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          printf 'Claude Code 2.1.156\\n'
+          exit 0
+        fi
+        if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+          printf 'Logged in as claude@example.com\\n'
+          exit 0
+        fi
+        exit 1
+        """.write(to: fakeClaude, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeClaude.path)
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try ctx.settingsRepo.set("cli.claude.path", fakeClaude.path)
+        let workspace = try router.createWorkspace(name: "startup-models", cwd: dir.path)
+        let descriptor = try router.createSurface(workspace: workspace.id, type: .agentApp, paneID: nil, title: "Agent App")
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface)
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if surface.viewModel.providerSnapshots.contains(where: {
+                $0.provider == .claude && $0.models.contains { $0.id == "opus" }
+            }) {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertTrue(surface.viewModel.providerSnapshots.contains(where: {
+            $0.provider == .claude && $0.models.contains { $0.id == "opus" }
+        }), "opening a macOS Agent App surface must refresh provider snapshots immediately so the model menu sees current Claude aliases without waiting for a manual retry")
     }
 
     func test_providerUpdateRunsSerializedForSelectedInstance() async throws {

@@ -73,29 +73,53 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_listModels_exposeClaudeOptionDescriptorsWithoutCodexFastTier() async {
         let models = await ClaudeRunner().listModels()
-        let opus = models.first { $0.id == "claude-opus-4-7" }
-        let haiku = models.first { $0.id == "claude-haiku-4-5-20251001" }
+        let opus = models.first { $0.id == "opus" }
 
+        XCTAssertEqual(models.first?.id, "opus",
+                       "Claude fallback model options must use Claude Code's latest-model alias instead of a hardcoded dated model id")
         XCTAssertEqual(opus?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases,
                        "Claude thinking-capable models must advertise the legal effort picker values")
         XCTAssertFalse(opus?.supportsServiceTier == true,
                        "Claude models must not expose Codex-only fast service-tier controls")
         XCTAssertTrue(opus?.supportsCustomModel == true)
-        XCTAssertEqual(haiku?.supportedReasoningEfforts, [],
-                       "Claude models without thinking support must not render a reasoning picker")
     }
 
-    func test_listModels_filtersNewerClaudeModelsByInstalledCliVersion() {
+    func test_anthropicModelDiscoveryParsesDynamicModels() {
+        let models = AnthropicModelDiscovery.modelDescriptors(fromListResponse: [
+            "data": [
+                [
+                    "id": "claude-opus-4-8",
+                    "display_name": "Claude Opus 4.8",
+                    "type": "model"
+                ],
+                [
+                    "id": "claude-sonnet-4-6",
+                    "display_name": "Claude Sonnet 4.6",
+                    "type": "model"
+                ],
+                [
+                    "id": "text-embedding-3-large",
+                    "display_name": "Embedding",
+                    "type": "model"
+                ]
+            ]
+        ])
+        XCTAssertEqual(models.map(\.id), ["claude-opus-4-8", "claude-sonnet-4-6"],
+                       "Claude model discovery must accept the Anthropic Models API response instead of relying on bundled model IDs")
+        XCTAssertEqual(models.first?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases)
+        XCTAssertTrue(models.allSatisfy(\.supportsCustomModel))
+    }
+
+    func test_listModels_fallbackDoesNotDependOnInstalledCliVersion() {
         let oldIds = ClaudeRunner.listModels(installedVersion: "Claude Code 1.5.0").map(\.id)
         let newIds = ClaudeRunner.listModels(installedVersion: "Claude Code 2.1.0").map(\.id)
         let unknownIds = ClaudeRunner.listModels(installedVersion: "Claude Code dev").map(\.id)
 
-        XCTAssertEqual(oldIds, ["claude-haiku-4-5-20251001"],
-                       "old Claude Code builds must not offer newer Opus/Sonnet ids that will fail only after the user starts a long run")
-        XCTAssertTrue(newIds.contains("claude-opus-4-7"))
-        XCTAssertTrue(newIds.contains("claude-sonnet-4-6"))
+        XCTAssertEqual(oldIds, ["opus", "sonnet", "haiku"],
+                       "fallback Claude options must be versionless aliases, not dated model IDs that go stale")
+        XCTAssertEqual(newIds, oldIds)
         XCTAssertEqual(unknownIds, newIds,
-                       "unparseable dev/nightly versions should preserve the full custom-capable list instead of hiding legal account models")
+                       "unparseable dev/nightly versions should preserve alias-based options instead of hiding legal account models")
     }
 
     func test_effortAlwaysForwarded() {

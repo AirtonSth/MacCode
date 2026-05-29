@@ -10,86 +10,12 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        Self.listModels(installedVersion: nil)
+        let dynamicModels = await AnthropicModelDiscovery.listModels()
+        return dynamicModels.isEmpty ? Self.listModels(installedVersion: nil) : dynamicModels
     }
 
     public static func listModels(installedVersion: String?) -> [AgentModelDescriptor] {
-        allModelCapabilities.filter { capability in
-            guard let version = installedVersion, !version.isEmpty else { return true }
-            guard let minimumVersion = capability.minimumClaudeCodeVersion else { return true }
-            guard let parsedVersion = ProviderVersion(version) else { return true }
-            return parsedVersion >= minimumVersion
-        }.map(\.descriptor)
-    }
-
-    private struct ModelCapability {
-        let descriptor: AgentModelDescriptor
-        let minimumClaudeCodeVersion: ProviderVersion?
-    }
-
-    private static let allModelCapabilities: [ModelCapability] = [
-        ModelCapability(
-            descriptor: AgentModelDescriptor(
-                id: "claude-opus-4-7",
-                label: "Claude Opus 4.7",
-                provider: .claude,
-                supportsReasoning: true,
-                supportedReasoningEfforts: AgentReasoningEffort.supportedCases,
-                supportsCustomModel: true,
-                contextWindowTokens: 200_000
-            ),
-            minimumClaudeCodeVersion: ProviderVersion(2, 1, 0)
-        ),
-        ModelCapability(
-            descriptor: AgentModelDescriptor(
-                id: "claude-sonnet-4-6",
-                label: "Claude Sonnet 4.6",
-                provider: .claude,
-                supportsReasoning: true,
-                supportedReasoningEfforts: AgentReasoningEffort.supportedCases,
-                supportsCustomModel: true,
-                contextWindowTokens: 200_000
-            ),
-            minimumClaudeCodeVersion: ProviderVersion(2, 0, 0)
-        ),
-        ModelCapability(
-            descriptor: AgentModelDescriptor(
-                id: "claude-haiku-4-5-20251001",
-                label: "Claude Haiku 4.5",
-                provider: .claude,
-                supportsReasoning: false,
-                supportedReasoningEfforts: [],
-                supportsCustomModel: true,
-                contextWindowTokens: 200_000
-            ),
-            minimumClaudeCodeVersion: ProviderVersion(1, 0, 0)
-        )
-    ]
-
-    private struct ProviderVersion: Comparable {
-        let parts: [Int]
-
-        init(_ major: Int, _ minor: Int, _ patch: Int) {
-            self.parts = [major, minor, patch]
-        }
-
-        init?(_ raw: String) {
-            let pattern = #"\d+(?:\.\d+){0,3}"#
-            guard let range = raw.range(of: pattern, options: .regularExpression) else { return nil }
-            let parsed = raw[range].split(separator: ".").compactMap { Int($0) }
-            guard !parsed.isEmpty else { return nil }
-            self.parts = parsed
-        }
-
-        static func < (lhs: ProviderVersion, rhs: ProviderVersion) -> Bool {
-            let count = max(lhs.parts.count, rhs.parts.count)
-            for index in 0..<count {
-                let l = index < lhs.parts.count ? lhs.parts[index] : 0
-                let r = index < rhs.parts.count ? rhs.parts[index] : 0
-                if l != r { return l < r }
-            }
-            return false
-        }
+        AnthropicModelDiscovery.latestAliasModels()
     }
 
     /// Builds the `claude` CLI argv. Pure + static so the exact flag
