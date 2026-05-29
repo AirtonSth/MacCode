@@ -8,4 +8,5 @@ if [ -z "${DEVELOPER_DIR:-}" ]; then
     export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
   fi
 fi
-swift test --parallel
+# The suite uses process-global fake provider state; parallel XCTest runs race.
+swift test
