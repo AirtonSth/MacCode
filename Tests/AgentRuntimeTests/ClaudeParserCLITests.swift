@@ -280,4 +280,26 @@ final class ClaudeParserCLITests: XCTestCase {
                        "the later whole assistant message must not duplicate text already streamed from nested SDK events")
         XCTAssertEqual(finalMessage(evs), "S partial visible")
     }
+
+    func test_cliRepeatedAssistantTextBlocksDoNotRenderTwiceWithinTurn() {
+        let final = "O committed + pushed. Done. Commit 3fcf1ceb fix(attendance): refresh camp report after attendance changes. Pre-commit passed."
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"sess-repeat"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"Pre-commit hooks passed. Push."}]}}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"Pre-commit hooks passed. Push."}]}}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"\#(final)"}]}}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"\#(final)"}]}}"#,
+            #"{"type":"result","subtype":"success","result":"\#(final)","session_id":"sess-repeat"}"#
+        ])
+
+        let assistantBodies = evs.compactMap { event -> String? in
+            if case .itemDelta(_, let body, _, _) = event { return body }
+            return nil
+        }
+        XCTAssertEqual(assistantBodies.filter { $0 == "Pre-commit hooks passed. Push." }.count, 1,
+                       "Claude whole-message replay can repeat a mid-turn assistant text block; the parser must emit it once")
+        XCTAssertEqual(assistantBodies.filter { $0 == final }.count, 1,
+                       "Claude whole-message replay can repeat the completed answer before result; the parser must not create two visible answer items")
+        XCTAssertEqual(finalMessage(evs), final)
+    }
 }

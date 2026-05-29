@@ -301,10 +301,32 @@ public final class AgentMessageRepository {
         return out.reversed()
     }
 
+    public func get(id: AgentMessageID) throws -> AgentMessage? {
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE id = ? LIMIT 1;")
+        try st.bind(1, id.value.uuidString)
+        return (try st.step()) ? message(from: st) : nil
+    }
+
     public func listPage(threadId: AgentThreadID, limit requestedLimit: Int, before cursor: AgentMessageCursor?) throws -> AgentMessagePage {
+        try listPage(threadId: threadId, limit: requestedLimit, before: cursor, after: nil)
+    }
+
+    public func listPage(threadId: AgentThreadID, limit requestedLimit: Int, after cursor: AgentMessageCursor?) throws -> AgentMessagePage {
+        try listPage(threadId: threadId, limit: requestedLimit, before: nil, after: cursor)
+    }
+
+    public func listPage(threadId: AgentThreadID, limit requestedLimit: Int, before beforeCursor: AgentMessageCursor?, after afterCursor: AgentMessageCursor?) throws -> AgentMessagePage {
         let limit = max(0, min(requestedLimit, 500))
         let sql: String
-        if cursor == nil {
+        if let _ = afterCursor {
+            sql = """
+            SELECT id, thread_id, role, content, created_at
+            FROM agent_messages
+            WHERE thread_id = ? AND (created_at > ? OR (created_at = ? AND id > ?))
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?;
+            """
+        } else if beforeCursor == nil {
             sql = "SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?;"
         } else {
             sql = """
@@ -317,7 +339,13 @@ public final class AgentMessageRepository {
         }
         let st = try db.prepare(sql)
         try st.bind(1, threadId.value.uuidString)
-        if let cursor {
+        if let cursor = afterCursor {
+            let created = iso.string(from: cursor.createdAt)
+            try st.bind(2, created)
+            try st.bind(3, created)
+            try st.bind(4, cursor.id.value.uuidString)
+            try st.bind(5, limit + 1)
+        } else if let cursor = beforeCursor {
             let created = iso.string(from: cursor.createdAt)
             try st.bind(2, created)
             try st.bind(3, created)
@@ -331,9 +359,16 @@ public final class AgentMessageRepository {
             rows.append(message(from: st))
         }
         let pageRows = Array(rows.prefix(limit))
-        let display = Array(pageRows.reversed())
+        let display = afterCursor == nil ? Array(pageRows.reversed()) : pageRows
         let next = display.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
-        return AgentMessagePage(messages: display, hasMoreOlder: rows.count > limit, nextBefore: next)
+        let after = display.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        return AgentMessagePage(
+            messages: display,
+            hasMoreOlder: afterCursor != nil || rows.count > limit,
+            nextBefore: next,
+            hasMoreNewer: beforeCursor != nil || (afterCursor != nil && rows.count > limit),
+            nextAfter: after
+        )
     }
 
     private func message(from st: SQLiteStatement) -> AgentMessage {

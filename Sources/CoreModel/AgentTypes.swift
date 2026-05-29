@@ -777,12 +777,22 @@ public struct AgentMessageCursor: Codable, Sendable, Equatable {
 public struct AgentMessagePage: Codable, Sendable, Equatable {
     public let messages: [AgentMessage]
     public let hasMoreOlder: Bool
+    public let hasMoreNewer: Bool
     public let nextBefore: AgentMessageCursor?
+    public let nextAfter: AgentMessageCursor?
 
-    public init(messages: [AgentMessage], hasMoreOlder: Bool, nextBefore: AgentMessageCursor?) {
+    public init(
+        messages: [AgentMessage],
+        hasMoreOlder: Bool,
+        nextBefore: AgentMessageCursor?,
+        hasMoreNewer: Bool = false,
+        nextAfter: AgentMessageCursor? = nil
+    ) {
         self.messages = messages
         self.hasMoreOlder = hasMoreOlder
+        self.hasMoreNewer = hasMoreNewer
         self.nextBefore = nextBefore
+        self.nextAfter = nextAfter
     }
 }
 

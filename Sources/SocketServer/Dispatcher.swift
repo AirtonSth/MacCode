@@ -56,7 +56,8 @@ public protocol CommandRouting: AnyObject {
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
     func selectAgentThread(thread: AgentThreadID) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
-    func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?) throws -> AgentMessagePage
+    func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) throws -> AgentMessagePage
+    func getAgentMessage(id: AgentMessageID) throws -> AgentMessage?
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
@@ -878,10 +879,19 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let limit = params["limit"]?.intValue ?? 200
                 if params["pagination"]?.boolValue == true || params["page"]?.boolValue == true {
-                    let page = try router.listAgentMessagesPage(thread: tid, limit: limit, before: messageCursor(from: params["before"]))
+                    let page = try router.listAgentMessagesPage(
+                        thread: tid,
+                        limit: limit,
+                        before: messageCursor(from: params["before"]),
+                        after: messageCursor(from: params["after"])
+                    )
                     return .init(id: id, result: messagePagePayload(page))
                 }
                 return .init(id: id, result: encode(try router.listAgentMessages(thread: tid, limit: limit)))
+            case "agent.message.get":
+                guard let mid = params["message_id"]?.stringValue.flatMap(UUID.init).map(AgentMessageID.init) else { throw JSONRPCError.invalidParams }
+                guard let message = try router.getAgentMessage(id: mid) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: encode(message))
             case "agent.run.stop":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let receiptKey = params["client_request_id"]?.stringValue
@@ -1519,7 +1529,9 @@ public final class JSONRPCDispatcher {
         var object: [String: JSONValue] = [
             "messages": encode(page.messages),
             "has_more_older": .bool(page.hasMoreOlder),
-            "hasMoreOlder": .bool(page.hasMoreOlder)
+            "hasMoreOlder": .bool(page.hasMoreOlder),
+            "has_more_newer": .bool(page.hasMoreNewer),
+            "hasMoreNewer": .bool(page.hasMoreNewer)
         ]
         if let cursor = page.nextBefore {
             let encoded: JSONValue = .object([
@@ -1532,6 +1544,18 @@ public final class JSONRPCDispatcher {
         } else {
             object["next_before"] = .null
             object["nextBefore"] = .null
+        }
+        if let cursor = page.nextAfter {
+            let encoded: JSONValue = .object([
+                "created_at": .string(iso8601(cursor.createdAt)),
+                "createdAt": .string(iso8601(cursor.createdAt)),
+                "id": .string(cursor.id.value.uuidString)
+            ])
+            object["next_after"] = encoded
+            object["nextAfter"] = encoded
+        } else {
+            object["next_after"] = .null
+            object["nextAfter"] = .null
         }
         return .object(object)
     }

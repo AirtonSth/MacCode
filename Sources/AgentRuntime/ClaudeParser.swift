@@ -22,7 +22,9 @@ public final class ClaudeParser {
     private var indexToType: [Int: AssistantItemType] = [:]
     private var indexToToolName: [Int: String] = [:]
     private var indexToToolInputJSON: [Int: String] = [:]
+    private var indexToAssistantBody: [Int: String] = [:]
     private var assembledAssistantBody: String = ""
+    private var emittedAssistantBodies: [String] = []
 
     public func parseLine(_ line: String) -> [AssistantEvent] {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -70,6 +72,9 @@ public final class ClaudeParser {
                 let msg = obj["message"] as? [String: Any]
                 let id = (msg?["id"] as? String) ?? UUID().uuidString
                 currentTurnId = id
+                assembledAssistantBody = ""
+                emittedAssistantBodies = []
+                indexToAssistantBody = [:]
                 out.append(.turnStarted(turnId: id))
             }
         case "content_block_start":
@@ -105,6 +110,9 @@ public final class ClaudeParser {
             case "text_delta":
                 let text = delta["text"] as? String
                 if let text { assembledAssistantBody += text }
+                if let text, indexToType[index] == .assistantMessage {
+                    indexToAssistantBody[index, default: ""] += text
+                }
                 out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
             case "thinking_delta":
                 let text = delta["thinking"] as? String
@@ -124,6 +132,12 @@ public final class ClaudeParser {
         case "content_block_stop":
             let index = obj["index"] as? Int ?? 0
             if let itemId = indexToItemId[index] {
+                if indexToType[index] == .assistantMessage,
+                   let emitted = indexToAssistantBody[index],
+                   !emitted.isEmpty,
+                   !hasEmittedAssistantBody(emitted) {
+                    emittedAssistantBodies.append(emitted)
+                }
                 out.append(.itemCompleted(itemId: itemId, finalState: .completed))
                 if indexToType[index] == .tool {
                     out.append(contentsOf: structuredClaudeToolEvents(
@@ -138,6 +152,7 @@ public final class ClaudeParser {
                 indexToType.removeValue(forKey: index)
                 indexToToolName.removeValue(forKey: index)
                 indexToToolInputJSON.removeValue(forKey: index)
+                indexToAssistantBody.removeValue(forKey: index)
             }
         case "message_delta", "message_stop":
             break
@@ -156,7 +171,8 @@ public final class ClaudeParser {
                 case "text":
                     let text = block["text"] as? String ?? ""
                     if text.isEmpty { break }
-                    if assistantText(assembledAssistantBody, equals: text) { break }
+                    if assistantText(assembledAssistantBody, equals: text) || hasEmittedAssistantBody(text) { break }
+                    emittedAssistantBodies.append(text)
                     assembledAssistantBody += (assembledAssistantBody.isEmpty ? "" : "\n") + text
                     out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
@@ -206,6 +222,8 @@ public final class ClaudeParser {
                 out.append(.turnCompleted(turnId: tid, finalMessage: final))
                 currentTurnId = nil
                 assembledAssistantBody = ""
+                emittedAssistantBodies = []
+                indexToAssistantBody = [:]
             }
         case "error":
             let msg = (obj["error"] as? [String: Any])?["message"] as? String ?? "claude error"
@@ -604,6 +622,10 @@ public final class ClaudeParser {
         return left == right || compactAssistantText(lhs) == compactAssistantText(rhs)
     }
 
+    private func hasEmittedAssistantBody(_ text: String) -> Bool {
+        emittedAssistantBodies.contains { assistantText($0, equals: text) }
+    }
+
     private func normalizedAssistantText(_ text: String) -> String {
         text
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -666,8 +688,12 @@ public final class ClaudeParser {
 
     public func finalize() -> [AssistantEvent] {
         guard let tid = currentTurnId else { return [] }
+        let final = assembledAssistantBody.isEmpty ? nil : assembledAssistantBody
         currentTurnId = nil
-        return [.turnCompleted(turnId: tid, finalMessage: assembledAssistantBody.isEmpty ? nil : assembledAssistantBody)]
+        assembledAssistantBody = ""
+        emittedAssistantBodies = []
+        indexToAssistantBody = [:]
+        return [.turnCompleted(turnId: tid, finalMessage: final)]
     }
 
     private static func progressValue(_ obj: [String: Any]) -> Double? {

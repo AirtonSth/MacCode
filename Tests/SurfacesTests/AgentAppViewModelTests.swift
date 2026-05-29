@@ -68,7 +68,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
     }
 
-    func test_modelChangeIsBlockedAfterConversationStarts() throws {
+    func test_modelChangePersistsAfterConversationStarts() throws {
         let (vm, repo) = try makeVM()
         vm.availableModels = [
             AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex),
@@ -81,10 +81,10 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.setModel("gpt-5.6")
 
-        XCTAssertEqual(vm.model, "gpt-5.5",
-                       "model changes after the first message must be blocked so resumed provider threads do not fork model state silently")
-        XCTAssertEqual(try repo.get(id: id)?.model, "gpt-5.5",
-                       "a locked model change must not persist to the thread configuration")
+        XCTAssertEqual(vm.model, "gpt-5.6",
+                       "provider/source locks after the first message, but model changes must still apply to the next run")
+        XCTAssertEqual(try repo.get(id: id)?.model, "gpt-5.6",
+                       "model changes after the first message must persist to the thread configuration")
     }
 
     func test_modelListLoadingAndRetryStateIsVisible() async throws {
@@ -1152,6 +1152,32 @@ final class AgentAppViewModelTests: XCTestCase {
         ), "live partial updates must stay visible even when an older persisted answer contains the same prefix")
     }
 
+    func test_turnViewHidesDuplicateAssistantItemBodiesWithinTurn() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "Pre-commit hooks passed. Push.",
+                              startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "Pre-commit hooks passed. Push.",
+                              startedAtMs: 2),
+                AssistantItem(id: "tool-1", turnId: "turn-1", type: .tool,
+                              summary: "Ran Bash",
+                              startedAtMs: 3)
+            ],
+            finished: true
+        )
+
+        let visibleAssistantBodies = AgentAppView.renderableItems(in: turn)
+            .filter { $0.type == .assistantMessage }
+            .map(\.body)
+        XCTAssertEqual(visibleAssistantBodies, ["Pre-commit hooks passed. Push."],
+                       "Claude can replay the same assistant text block with a new item id; the macOS transcript must still render that text once")
+        XCTAssertTrue(AgentAppView.renderableItems(in: turn).contains { $0.type == .tool },
+                      "deduping assistant text must not hide adjacent work-log/tool rows")
+    }
+
     func test_persistedAssistantMessageHidesWhenLiveItemsAlreadyRenderCombinedText() {
         let turn = AssistantTurnSnapshot(
             turnId: "turn-1",
@@ -1959,25 +1985,42 @@ final class AgentAppViewModelTests: XCTestCase {
 
     // MARK: B4 — bounded message window
 
-    func test_messageWindow_capsThenLoadsEarlier() throws {
+    func test_viewportHistoryHydratesOlderAndNewerPagesWithBodyEviction() throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "long")
         let tid = vm.selectedThreadId!
         let base = Date(timeIntervalSince1970: 1_000_000)
-        for i in 0..<60 {
+        for i in 0..<100 {
             try vm.messageRepo.append(AgentMessage(threadId: tid, role: .user,
                 content: "m\(i)", createdAt: base.addingTimeInterval(Double(i))))
         }
         vm.selectThread(tid)
-        XCTAssertEqual(vm.messages.count, AgentAppViewModel.baseMessageWindow,
-                       "the initial load must be capped to the base window")
-        XCTAssertEqual(vm.messages.last?.content, "m59", "newest message must be in the window")
-        XCTAssertEqual(vm.messages.first?.content, "m10", "window is the most-recent N, oldest→newest")
-        XCTAssertTrue(vm.hasMoreOlder, "60 messages > window of 50 → older remain")
-        vm.loadEarlierMessages()
-        XCTAssertEqual(vm.messages.count, 60, "expanding the window reveals the rest")
-        XCTAssertEqual(vm.messages.first?.content, "m0")
-        XCTAssertFalse(vm.hasMoreOlder, "nothing older remains once all are loaded")
+        XCTAssertEqual(vm.messages.count, AgentAppViewModel.viewportMessagePageSize,
+                       "initial Agent history must load only one viewport-sized page")
+        XCTAssertEqual(vm.messages.last?.content, "m99", "newest message must be in the initial viewport")
+        XCTAssertEqual(vm.messages.first?.content, "m70", "initial viewport is the latest page in display order")
+        XCTAssertTrue(vm.hasMoreOlder, "older DB pages must remain available")
+
+        let initialFirst = vm.messages.first!.id
+        vm.setVisibleMessageIdsForTesting([initialFirst])
+        XCTAssertEqual(vm.visibleTranscriptRowCount, 1)
+        XCTAssertEqual(vm.retainedTranscriptBodyCount, 1,
+                       "offscreen Agent message bodies must be evicted from display memory")
+
+        vm.loadOlderMessagesIfNeeded(anchorMessageId: initialFirst)
+        XCTAssertTrue(vm.messages.contains { $0.content == "m40" },
+                      "scrolling upward must hydrate an older page from the DB")
+        XCTAssertTrue(vm.hasMoreNewer, "after moving into older history, newer DB pages must be available")
+
+        let olderVisible = Set(vm.messages.prefix(3).map(\.id))
+        vm.setVisibleMessageIdsForTesting(olderVisible)
+        XCTAssertEqual(vm.retainedTranscriptBodyCount, olderVisible.count,
+                       "only the simulated visible rows may retain message bodies")
+
+        let newestId = vm.messages.last!.id
+        vm.setVisibleMessageIdsForTesting([newestId])
+        XCTAssertTrue(vm.messages.contains { $0.content == "m99" },
+                      "scrolling back down to an evicted row must hydrate its body from the DB")
     }
 
     func test_loadWindowClipsHugePersistedMessagesBeforeRendering() throws {
@@ -2031,7 +2074,7 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the Agent App must expose context compaction during long runs")
 
         vm.selectThread(threadId)
-        XCTAssertLessThanOrEqual(vm.messages.count, AgentAppViewModel.baseMessageWindow,
+        XCTAssertLessThanOrEqual(vm.messages.count, AgentAppViewModel.maximumMessageMetadataRows,
                                  "reopening a long thread must render only the bounded message window")
 
         if beforeKB >= 0 && afterKB >= 0 {

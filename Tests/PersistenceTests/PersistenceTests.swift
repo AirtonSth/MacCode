@@ -122,6 +122,11 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(older.messages.map(\.content), (0..<25).map { "message-\($0)" },
                        "older page must use created_at plus id as the cursor so duplicate timestamps do not skip rows")
         XCTAssertFalse(older.hasMoreOlder)
+
+        let newer = try mr.listPage(threadId: t.id, limit: 10, before: nil, after: older.nextAfter)
+        XCTAssertEqual(newer.messages.map(\.content), (25..<35).map { "message-\($0)" },
+                       "newer page must use created_at plus id as the cursor so viewport-only history can reload rows below the current scroll position")
+        XCTAssertFalse(newer.hasMoreNewer)
     }
 
     func test_snapshot_roundtrip() throws {

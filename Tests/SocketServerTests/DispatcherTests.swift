@@ -227,25 +227,45 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
     }
-    func listAgentMessagesPage(thread: AgentThreadID, limit requestedLimit: Int, before cursor: AgentMessageCursor?) throws -> AgentMessagePage {
+    func listAgentMessagesPage(thread: AgentThreadID, limit requestedLimit: Int, before beforeCursor: AgentMessageCursor?, after afterCursor: AgentMessageCursor?) throws -> AgentMessagePage {
         let limit = max(0, min(requestedLimit, 500))
         let filtered = messageStore
             .filter { message in
                 guard message.threadId == thread else { return false }
-                guard let cursor else { return true }
+                if let cursor = afterCursor {
+                    if message.createdAt != cursor.createdAt {
+                        return message.createdAt > cursor.createdAt
+                    }
+                    return message.id.value.uuidString > cursor.id.value.uuidString
+                }
+                guard let cursor = beforeCursor else { return true }
                 if message.createdAt != cursor.createdAt {
                     return message.createdAt < cursor.createdAt
                 }
                 return message.id.value.uuidString < cursor.id.value.uuidString
             }
             .sorted {
+                if afterCursor != nil {
+                    if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+                    return $0.id.value.uuidString < $1.id.value.uuidString
+                }
                 if $0.createdAt != $1.createdAt { return $0.createdAt > $1.createdAt }
                 return $0.id.value.uuidString > $1.id.value.uuidString
             }
         let pageRows = Array(filtered.prefix(limit))
-        let display = Array(pageRows.reversed())
+        let display = afterCursor == nil ? Array(pageRows.reversed()) : pageRows
         let next = display.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
-        return AgentMessagePage(messages: display, hasMoreOlder: filtered.count > limit, nextBefore: next)
+        let after = display.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        return AgentMessagePage(
+            messages: display,
+            hasMoreOlder: afterCursor != nil || filtered.count > limit,
+            nextBefore: next,
+            hasMoreNewer: beforeCursor != nil || (afterCursor != nil && filtered.count > limit),
+            nextAfter: after
+        )
+    }
+    func getAgentMessage(id: AgentMessageID) throws -> AgentMessage? {
+        messageStore.first { $0.id == id }
     }
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         queuedMessageStore.filter { $0.threadId == thread }.sorted { $0.position < $1.position }
@@ -1931,6 +1951,27 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(firstOlderMessage["content"], .string("message-0"))
         XCTAssertEqual(lastOlderMessage["content"], .string("message-24"))
         XCTAssertEqual(olderPage["has_more_older"], .bool(false))
+        XCTAssertEqual(olderPage["has_more_newer"], .bool(true))
+
+        guard case .object(let newerCursor)? = olderPage["next_after"] else {
+            return XCTFail("older page must expose newer cursor for viewport-only down-scroll hydration")
+        }
+        let third = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.message.list", params: [
+            "thread_id": .string(t.id.value.uuidString),
+            "limit": .number(10),
+            "pagination": .bool(true),
+            "after": .object(newerCursor)
+        ]))
+        guard case .object(let newerPage)? = third.result,
+              case .array(let newerMessages)? = newerPage["messages"],
+              case .object(let firstNewerMessage)? = newerMessages.first,
+              case .object(let lastNewerMessage)? = newerMessages.last else {
+            return XCTFail("newer paginated message list must return envelope")
+        }
+        XCTAssertEqual(newerMessages.count, 10)
+        XCTAssertEqual(firstNewerMessage["content"], .string("message-25"))
+        XCTAssertEqual(lastNewerMessage["content"], .string("message-34"))
+        XCTAssertEqual(newerPage["has_more_newer"], .bool(false))
     }
 
     @MainActor

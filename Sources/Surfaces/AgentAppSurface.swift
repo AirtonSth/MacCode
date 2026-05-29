@@ -80,6 +80,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
     @Published public var runStartedAt: Date?
+    @Published public private(set) var retainedTranscriptBodyCount: Int = 0
+    @Published public private(set) var visibleTranscriptRowCount: Int = 0
+    @Published public private(set) var hydrationDirection: String?
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -202,8 +205,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let idx = threads.firstIndex(where: { $0.id == id }), threads[idx].hasUnread {
             threads[idx].hasUnread = false
         }
-        messageWindow = Self.baseMessageWindow
-        loadWindow(id)
+        loadInitialMessagePage(id)
         timeline = AssistantTimelineState()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         let replayEvents = providerThreadSnapshotEvents(threadId: id).map {
@@ -358,8 +360,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         do {
             _ = try coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
             checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
-            messageWindow = Self.baseMessageWindow
-            loadWindow(selectedThreadId)
+            loadInitialMessagePage(selectedThreadId)
             reloadCheckpoints()
             reloadThreads()
         } catch {
@@ -422,22 +423,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    // MARK: B4 — bounded message window
+    // MARK: B4 — viewport-bound message history
 
-    static let baseMessageWindow = 50
-    private var messageWindow = AgentAppViewModel.baseMessageWindow
+    static let viewportMessagePageSize = 30
+    static let maximumMessageMetadataRows = 160
+    private var oldestLoadedCursor: AgentMessageCursor?
+    private var newestLoadedCursor: AgentMessageCursor?
+    private var visibleMessageIds = Set<AgentMessageID>()
+    private var suppressNextMessageAutoScroll = false
     @Published public var hasMoreOlder: Bool = false
+    @Published public var hasMoreNewer: Bool = false
 
-    private func loadWindow(_ id: AgentThreadID) {
-        let total = (try? messageRepo.count(threadId: id)) ?? 0
-        messages = ((try? messageRepo.listRecent(threadId: id, limit: messageWindow)) ?? [])
-            .map(Self.displayMessage)
-        hasMoreOlder = total > messages.count
+    private func loadInitialMessagePage(_ id: AgentThreadID) {
+        let page = (try? messageRepo.listPage(threadId: id, limit: Self.viewportMessagePageSize, before: nil, after: nil))
+            ?? AgentMessagePage(messages: [], hasMoreOlder: false, nextBefore: nil)
+        messages = page.messages.map(Self.displayMessage)
+        hasMoreOlder = page.hasMoreOlder
+        hasMoreNewer = page.hasMoreNewer
+        oldestLoadedCursor = page.nextBefore
+        newestLoadedCursor = page.nextAfter ?? messages.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        hydrationDirection = nil
+        visibleMessageIds = Set(messages.map(\.id))
+        refreshTranscriptBodyMetrics()
     }
 
     private static func displayMessage(_ message: AgentMessage) -> AgentMessage {
         var m = message
         m.content = AssistantTimelineState.cappedText(m.content)
+        return m
+    }
+
+    private static func metadataOnly(_ message: AgentMessage) -> AgentMessage {
+        var m = message
+        m.content = ""
         return m
     }
 
@@ -447,10 +465,119 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // cannot hide the final response.
     }
 
-    public func loadEarlierMessages() {
-        guard let id = selectedThreadId else { return }
-        messageWindow += Self.baseMessageWindow
-        loadWindow(id)
+    @discardableResult
+    public func loadOlderMessagesIfNeeded(anchorMessageId: AgentMessageID?) -> AgentMessageID? {
+        guard let id = selectedThreadId, hasMoreOlder, let cursor = oldestLoadedCursor else { return nil }
+        guard let page = try? messageRepo.listPage(threadId: id, limit: Self.viewportMessagePageSize, before: cursor, after: nil),
+              !page.messages.isEmpty else {
+            hasMoreOlder = false
+            return nil
+        }
+        hydrationDirection = "older"
+        suppressNextMessageAutoScroll = true
+        mergeLoadedMessages(page.messages, retainingBodiesFor: Set(page.messages.map(\.id)).union(anchorMessageId.map { [$0] } ?? []))
+        hasMoreOlder = page.hasMoreOlder
+        hasMoreNewer = true
+        oldestLoadedCursor = page.nextBefore ?? oldestLoadedCursor
+        newestLoadedCursor = messages.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        return anchorMessageId
+    }
+
+    @discardableResult
+    public func loadNewerMessagesIfNeeded(anchorMessageId: AgentMessageID?) -> AgentMessageID? {
+        guard let id = selectedThreadId, hasMoreNewer, let cursor = newestLoadedCursor else { return nil }
+        guard let page = try? messageRepo.listPage(threadId: id, limit: Self.viewportMessagePageSize, before: nil, after: cursor),
+              !page.messages.isEmpty else {
+            hasMoreNewer = false
+            return nil
+        }
+        hydrationDirection = "newer"
+        suppressNextMessageAutoScroll = true
+        mergeLoadedMessages(page.messages, retainingBodiesFor: Set(page.messages.map(\.id)).union(anchorMessageId.map { [$0] } ?? []))
+        hasMoreOlder = true
+        hasMoreNewer = page.hasMoreNewer
+        oldestLoadedCursor = messages.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        newestLoadedCursor = page.nextAfter ?? newestLoadedCursor
+        return anchorMessageId
+    }
+
+    public func markMessageVisible(_ id: AgentMessageID) {
+        visibleMessageIds.insert(id)
+        hydrateMessageBody(id)
+        refreshTranscriptBodyMetrics()
+    }
+
+    public func markMessageHidden(_ id: AgentMessageID) {
+        visibleMessageIds.remove(id)
+        evictMessageBody(id)
+        refreshTranscriptBodyMetrics()
+    }
+
+    public func setVisibleMessageIdsForTesting(_ ids: Set<AgentMessageID>) {
+        visibleMessageIds = ids
+        for message in messages {
+            if ids.contains(message.id) {
+                hydrateMessageBody(message.id)
+            } else {
+                evictMessageBody(message.id)
+            }
+        }
+        refreshTranscriptBodyMetrics()
+    }
+
+    public func consumeHistoryHydrationScrollSuppression() -> Bool {
+        guard suppressNextMessageAutoScroll else { return false }
+        suppressNextMessageAutoScroll = false
+        return true
+    }
+
+    private func mergeLoadedMessages(_ loaded: [AgentMessage], retainingBodiesFor retained: Set<AgentMessageID>) {
+        var byId = Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
+        for message in loaded {
+            byId[message.id] = Self.displayMessage(message)
+        }
+        let sorted = byId.values.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.value.uuidString < $1.id.value.uuidString
+        }
+        let anchorIds = retained.union(visibleMessageIds)
+        let capped = capMetadataRows(sorted, keeping: anchorIds)
+        messages = capped.map { anchorIds.contains($0.id) ? Self.displayMessage($0) : Self.metadataOnly($0) }
+        visibleMessageIds = anchorIds.intersection(Set(messages.map(\.id)))
+        refreshTranscriptBodyMetrics()
+    }
+
+    private func capMetadataRows(_ rows: [AgentMessage], keeping keepIds: Set<AgentMessageID>) -> [AgentMessage] {
+        guard rows.count > Self.maximumMessageMetadataRows else { return rows }
+        var kept = rows.filter { keepIds.contains($0.id) }
+        let keepSet = Set(kept.map(\.id))
+        let newest = rows.reversed().filter { !keepSet.contains($0.id) }
+        for row in newest where kept.count < Self.maximumMessageMetadataRows {
+            kept.append(row)
+        }
+        return kept.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.value.uuidString < $1.id.value.uuidString
+        }
+    }
+
+    private func hydrateMessageBody(_ id: AgentMessageID) {
+        guard let index = messages.firstIndex(where: { $0.id == id }),
+              messages[index].content.isEmpty,
+              let persisted = try? messageRepo.get(id: id) else { return }
+        messages[index].content = Self.displayMessage(persisted).content
+    }
+
+    private func evictMessageBody(_ id: AgentMessageID) {
+        guard let index = messages.firstIndex(where: { $0.id == id }),
+              !messages[index].content.isEmpty,
+              (try? messageRepo.get(id: id)) != nil else { return }
+        messages[index].content = ""
+    }
+
+    private func refreshTranscriptBodyMetrics() {
+        retainedTranscriptBodyCount = messages.filter { !$0.content.isEmpty }.count
+        visibleTranscriptRowCount = visibleMessageIds.count
     }
 
     /// B7: count of threads with an in-flight run, for the rail header.
@@ -884,14 +1011,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func setModel(_ model: String) {
-        guard !providerLocked else { return }
         self.model = model
         normalizeSelectedModelOptions()
         persistThreadConfig()
     }
 
     public func setCustomModel(_ raw: String) {
-        guard !providerLocked else { return }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard supportsCustomModelForSelectedProvider else { return }
         if !trimmed.isEmpty {
@@ -1186,7 +1311,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
            ((try? messageRepo.list(threadId: tid))?.isEmpty ?? true) {
             renameThread(tid, to: Self.deriveTitle(from: text))
         }
-        loadWindow(tid)
+        loadInitialMessagePage(tid)
         suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
         timelineUpdateTick = 0
@@ -1341,7 +1466,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // a background handler. Keep the restart contract here too.
                 self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
                 if finishedTid == self.selectedThreadId {
-                    self.loadWindow(finishedTid)
+                    self.loadInitialMessagePage(finishedTid)
                     self.suppressPersistedFinalDuplicatedByTimeline()
                 }
             }
@@ -1621,26 +1746,39 @@ public struct AgentAppView: View {
     static func shouldRenderFinalAssistantMessage(_ turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> Bool {
         guard let final = turn.finalAssistantMessage, !final.isEmpty else { return false }
         if assistantText(final, matchesAny: persistedAssistantTexts) { return false }
-        if assistantText(combinedAssistantItemText(in: turn), equals: final) { return false }
-        return !turn.items.contains {
-            guard $0.type == .assistantMessage else { return false }
-            return assistantText($0.body, matches: final)
-        }
+        let bodies = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: persistedAssistantTexts)
+        if assistantText(bodies.joined(separator: "\n"), equals: final) { return false }
+        return !bodies.contains { assistantText($0, matches: final) }
     }
 
-    static func shouldRenderAssistantItemBody(_ body: String, persistedAssistantTexts: [String] = []) -> Bool {
-        !body.isEmpty && !assistantText(body, equalsAny: persistedAssistantTexts)
+    static func shouldRenderAssistantItemBody(_ body: String, priorAssistantTexts: [String] = [], persistedAssistantTexts: [String] = []) -> Bool {
+        !body.isEmpty &&
+            !assistantText(body, equalsAny: priorAssistantTexts) &&
+            !assistantText(body, equalsAny: persistedAssistantTexts)
     }
 
     static func shouldRenderPersistedAssistantMessage(_ text: String, timelineTurns: [AssistantTurnSnapshot]) -> Bool {
         guard !text.isEmpty else { return false }
         return !timelineTurns.contains { turn in
-            let visibleAssistantText = turn.items
-                .filter { $0.type == .assistantMessage }
-                .map(\.body)
-                .filter { shouldRenderAssistantItemBody($0, persistedAssistantTexts: [text]) }
+            let visibleAssistantText = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: [text])
                 .joined(separator: "\n")
             return assistantText(visibleAssistantText, equals: text)
+        }
+    }
+
+    static func renderableItems(in turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> [AssistantItem] {
+        var priorAssistantTexts: [String] = []
+        return turn.items.filter { item in
+            guard item.type == .assistantMessage else { return true }
+            let shouldRender = shouldRenderAssistantItemBody(
+                item.body,
+                priorAssistantTexts: priorAssistantTexts,
+                persistedAssistantTexts: persistedAssistantTexts
+            )
+            if shouldRender {
+                priorAssistantTexts.append(item.body)
+            }
+            return shouldRender
         }
     }
 
@@ -1652,12 +1790,11 @@ public struct AgentAppView: View {
         candidates.contains { assistantText(text, equals: $0) }
     }
 
-    private static func combinedAssistantItemText(in turn: AssistantTurnSnapshot) -> String {
-        turn.items
+    private static func renderableAssistantItemBodies(in turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> [String] {
+        renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
             .filter { $0.type == .assistantMessage }
             .map(\.body)
             .filter { !$0.isEmpty }
-            .joined(separator: "\n")
     }
 
     private static func assistantText(_ lhs: String, matches rhs: String) -> Bool {
@@ -2068,11 +2205,27 @@ public struct AgentAppView: View {
             ZStack(alignment: .bottomTrailing) {
                 GeometryReader { viewport in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 32) {
+                        LazyVStack(alignment: .leading, spacing: 32) {
+                            if vm.hasMoreOlder, !vm.messages.isEmpty {
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("agent-history-top-sentinel")
+                                    .onAppear {
+                                        let anchor = vm.messages.first?.id
+                                        if let restored = vm.loadOlderMessagesIfNeeded(anchorMessageId: anchor) {
+                                            withAnimation(nil) {
+                                                proxy.scrollTo("message-\(restored.value.uuidString)", anchor: .top)
+                                            }
+                                        }
+                                    }
+                                    .accessibilityIdentifier("agent.history.top-sentinel")
+                            }
                             ForEach(transcriptEntries) { entry in
                                 switch entry {
                                 case .message(let message):
                                     messageRow(message)
+                                        .onAppear { vm.markMessageVisible(message.id) }
+                                        .onDisappear { vm.markMessageHidden(message.id) }
                                 case .turn(let turn):
                                     turnView(turn)
                                 }
@@ -2085,6 +2238,16 @@ public struct AgentAppView: View {
                             }
                             if vm.status == .running { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
+                            if vm.hasMoreNewer, !vm.messages.isEmpty {
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("agent-history-bottom-sentinel")
+                                    .onAppear {
+                                        let anchor = vm.messages.last?.id
+                                        _ = vm.loadNewerMessagesIfNeeded(anchorMessageId: anchor)
+                                    }
+                                    .accessibilityIdentifier("agent.history.bottom-sentinel")
+                            }
                             Color.clear
                                 .frame(height: 1)
                                 .id("BOTTOM")
@@ -2135,7 +2298,11 @@ public struct AgentAppView: View {
             }
             .onAppear { scrollTimelineToBottom(proxy) }
             .onChange(of: vm.focusTick) { _ in scrollTimelineToBottom(proxy, force: true) }
-            .onChange(of: vm.messages.count) { _ in scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.messages.count) { _ in
+                if !vm.consumeHistoryHydrationScrollSuppression() {
+                    scrollTimelineToBottom(proxy)
+                }
+            }
             .onChange(of: vm.timeline.turns.count) { _ in scrollTimelineToBottom(proxy) }
             .onChange(of: vm.timelineUpdateTick) { _ in scrollTimelineToBottom(proxy) }
             .onChange(of: vm.status) { _ in scrollTimelineToBottom(proxy) }
@@ -2532,8 +2699,9 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
         let turnPlans = proposedPlans(for: turn)
+        let renderableItems = Self.renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            ForEach(turn.items.filter { !($0.type == .plan && !turnPlans.isEmpty) }, id: \.id) { item in itemRow(item) }
+            ForEach(renderableItems.filter { !($0.type == .plan && !turnPlans.isEmpty) }, id: \.id) { item in itemRow(item) }
             ForEach(turnPlans) { plan in
                 proposedPlanRow(plan)
             }
