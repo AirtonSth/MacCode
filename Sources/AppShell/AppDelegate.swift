@@ -76,7 +76,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // refresh so the restored workspaces + tabs actually render
         // (the controller's init refresh ran before surfaces existed).
         router.reinstantiateRestoredSurfaces()
-        windowController.refreshFromState()
+        // UX-MAC_SHELL_WINDOW-014: surfaces now exist; drop the restoring
+        // affordance and render the real layout.
+        windowController.markRestorationComplete()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)
@@ -164,6 +166,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         var opened = false
         for url in urls {
             if (try? router.createWorkspace(fromFolder: url)) != nil {
+                // UX-MAC_SHELL_WINDOW-005: feed File ▸ Open Recent.
+                NSDocumentController.shared.noteNewRecentDocumentURL(url)
                 opened = true
             }
         }
@@ -266,6 +270,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let newWS = NSMenuItem(title: "New Workspace…", action: #selector(newWorkspace), keyEquivalent: "n")
         newWS.target = self
         fileMenu.addItem(newWS)
+        // UX-MAC_SHELL_WINDOW-005: standard Open Recent submenu, populated
+        // by AppKit from noteNewRecentDocumentURL; selections route through
+        // application(_:open:) which opens the folder as a workspace.
+        let openRecent = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+        let openRecentMenu = NSMenu(title: "Open Recent")
+        let clearRecent = NSMenuItem(title: "Clear Menu", action: Selector(("clearRecentDocuments:")), keyEquivalent: "")
+        openRecentMenu.addItem(clearRecent)
+        openRecent.submenu = openRecentMenu
+        fileMenu.addItem(openRecent)
         fileMenu.addItem(.separator())
         // UX-MAC_SHELL_WINDOW-003: ⌘W closes the focused tab when one
         // exists; it only closes the window when the workspace has none.
@@ -312,6 +325,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         surfaceMenu.addItem(term)
         surfaceMenu.addItem(browser)
         surfaceMenu.addItem(agent)
+        surfaceMenu.addItem(.separator())
+        // UX-MAC_SHELL_WINDOW-004: keyboard splits, defaulting to Terminal.
+        let splitRight = NSMenuItem(title: "Split Right", action: #selector(splitFocusedPaneRight), keyEquivalent: "d")
+        splitRight.keyEquivalentModifierMask = [.command]
+        splitRight.target = self
+        let splitDown = NSMenuItem(title: "Split Down", action: #selector(splitFocusedPaneDown), keyEquivalent: "d")
+        splitDown.keyEquivalentModifierMask = [.command, .shift]
+        splitDown.target = self
+        surfaceMenu.addItem(splitRight)
+        surfaceMenu.addItem(splitDown)
         surfaceItem.submenu = surfaceMenu
 
         // Tab
@@ -418,6 +441,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.canChooseDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
             _ = try? router.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+            // UX-MAC_SHELL_WINDOW-005: feed File ▸ Open Recent.
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
         }
     }
 
@@ -428,6 +453,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func newSurface(type: SurfaceType) {
         guard let wid = context.state.window.selectedWorkspaceID else { NSSound.beep(); return }
         _ = try? router.createSurface(workspace: wid, type: type, paneID: nil, title: nil)
+    }
+
+    // UX-MAC_SHELL_WINDOW-004: keyboard split entry points.
+    @objc private func splitFocusedPaneRight() {
+        if windowController?.splitFocusedPane(.right) != true { NSSound.beep() }
+    }
+
+    @objc private func splitFocusedPaneDown() {
+        if windowController?.splitFocusedPane(.down) != true { NSSound.beep() }
     }
 
     // MARK: - Tab keyboard navigation (UX-MAC_SHELL_WINDOW-002/003)

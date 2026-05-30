@@ -1,6 +1,12 @@
 import Foundation
 import CoreModel
 import Persistence
+import os
+
+// QA-MAC_AGENT-010: structured run-lifecycle logging so field issues and test
+// flakes (start/finish/duration, checkpoint outcomes) are diagnosable. Routes
+// through the unified logging system, keyed by thread/run ids.
+private let agentRunLog = Logger(subsystem: "io.remotecode.agent", category: "run")
 
 public protocol AgentRunObserver: AnyObject {
     func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)
@@ -22,6 +28,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var pendingThreadStops: Set<AgentThreadID> = []
     private var seq: [AgentRunID: Int] = [:]
+    // PERF-MAC_AGENT-005: reuse one encoder instead of allocating per stream
+    // event, and prune on a cadence rather than every event. Both are touched
+    // under `lock` (encode is serialized there) so they stay thread-safe.
+    private let streamEventEncoder = JSONEncoder()
+    private var streamEventsSincePrune: [AgentThreadID: Int] = [:]
+    private static let streamEventPruneInterval = 25
+    // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
+    // turnCompleted/finished pair without reloading the whole thread history.
+    private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
     private let lock = NSLock()
     private var observerRefs: [WeakAgentRunObserver] = []
     public var observer: AgentRunObserver? {
@@ -177,6 +192,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runtimePayloadJSON: existingRuntimePayload
         ))
         onRunStarted?(effectiveRequest.threadId, effectiveRequest.runId)
+        agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
         let runId = effectiveRequest.runId
         let coordinator = self
@@ -296,6 +312,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             seq.removeValue(forKey: runId)
             pendingThreadStops.remove(threadId)
         }
+        streamEventsSincePrune.removeValue(forKey: threadId)
         lock.unlock()
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)
@@ -391,6 +408,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try restoreWorkspace(to: checkpoint, newerCheckpoints: newer, cwd: cwd)
         try messageRepo.delete(ids: newer.compactMap(\.assistantMessageId))
         try checkpointRepo.deleteAfter(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
+        // PERF-MAC_AGENT-006: assistant rows were just deleted — drop the dedup
+        // cache so a re-run can legitimately re-persist matching text.
+        lock.lock(); lastPersistedAssistantContent.removeValue(forKey: threadId); lock.unlock()
         return checkpoint
     }
 
@@ -564,6 +584,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID, runId: AgentRunID) -> AgentMessage? {
         let text = AssistantTimelineState.cappedText(text)
         guard !text.isEmpty else { return nil }
+        // PERF-MAC_AGENT-006: the common duplicate is the same turn's final
+        // message arriving via both `turnCompleted` and `finished`. Skip the
+        // full-history load when the text matches the last one we persisted;
+        // only fall back to the O(history) scan on a cache miss (which still
+        // guards the rare cross-turn duplicate before appending).
+        lock.lock()
+        let cachedLast = lastPersistedAssistantContent[threadId]
+        lock.unlock()
+        if cachedLast == text { return nil }
         let existing: [AgentMessage]
         do {
             existing = try messageRepo.list(threadId: threadId)
@@ -571,7 +600,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             emitPersistenceIssue("message.list", error: error, runId: runId, threadId: threadId)
             return nil
         }
-        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return nil }
+        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
+            lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
+            return nil
+        }
         let message = AgentMessage(threadId: threadId, role: .assistant, content: text)
         do {
             try messageRepo.append(message)
@@ -579,6 +611,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             emitPersistenceIssue("message.append.assistant", error: error, runId: runId, threadId: threadId)
             return nil
         }
+        lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
         onMessageAppended?(message)
         return message
     }
@@ -589,14 +622,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             let s = (seq[runId] ?? 0) + 1
             seq[runId] = s
+            let data = try? streamEventEncoder.encode(ev)
+            // Prune at most once per `streamEventPruneInterval` events per thread
+            // instead of after every append; terminal events still flush below.
+            let pruneCount = (streamEventsSincePrune[threadId] ?? 0) + 1
+            let shouldPrune = pruneCount >= Self.streamEventPruneInterval
+            streamEventsSincePrune[threadId] = shouldPrune ? 0 : pruneCount
             lock.unlock()
-            if let data = try? JSONEncoder().encode(ev), let json = String(data: data, encoding: .utf8) {
+            if let data, let json = String(data: data, encoding: .utf8) {
                 do {
                     try runRepo.appendStreamEvent(runId: runId, seq: s, kind: ev.debugDescription, payloadJSON: json)
                     if case .providerRuntime(let runtimeEvent) = ev {
                         try runRepo.appendProviderEventLog(threadId: threadId, runId: runId, event: runtimeEvent)
                     }
-                    try runRepo.pruneStreamEvents(threadId: threadId)
+                    if shouldPrune {
+                        try runRepo.pruneStreamEvents(threadId: threadId)
+                    }
                     try providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: ev.debugDescription, lastErrorMessage: nil)
                 } catch {
                     emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
@@ -750,7 +791,23 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeAssistantMessageIds.removeValue(forKey: runId)
             pendingThreadStops.remove(threadId)
             seq.removeValue(forKey: runId)
+            // PERF-MAC_AGENT-005: flush a final prune at run end so events queued
+            // since the last cadence-prune don't linger unbounded.
+            let pendingPrune = (streamEventsSincePrune[threadId] ?? 0) > 0
+            streamEventsSincePrune.removeValue(forKey: threadId)
             lock.unlock()
+            if pendingPrune {
+                do {
+                    try runRepo.pruneStreamEvents(threadId: threadId)
+                } catch {
+                    emitPersistenceIssue("run.stream_event.prune.finish", error: error, runId: runId, threadId: threadId)
+                }
+            }
+            let durationMs = (try? runRepo.get(id: runId)).flatMap { row -> Int64? in
+                guard let finished = row.finishedAt else { return nil }
+                return Int64(finished.timeIntervalSince(row.startedAt) * 1000)
+            } ?? -1
+            agentRunLog.info("run.finished thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) durationMs=\(durationMs, privacy: .public)")
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didFinish: runId, threadId: threadId, status: status, finalMessage: finalMessage, providerThreadId: providerThreadId)
             }
@@ -834,6 +891,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         do {
             try checkpointRepo.upsert(summary)
+            agentRunLog.info("checkpoint.captured thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) count=\(count, privacy: .public) status=\(summary.status.rawValue, privacy: .public) files=\(summary.files.count, privacy: .public)")
         } catch {
             emitPersistenceIssue("checkpoint.upsert", error: error, runId: runId, threadId: threadId)
         }

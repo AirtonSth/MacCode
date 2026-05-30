@@ -3,8 +3,20 @@ import AppKit
 import CoreModel
 import Surfaces
 import DesignSystemKit
+import os
+
+/// QA-MAC_SHELL_WINDOW-006: structured logging for shell state
+/// transitions (sidebar collapse, detach/return/close, container
+/// rebuilds) so "my layout flashed / lost focus" reports are
+/// diagnosable and the PERF-002 rebuild cost is measurable.
+private let shellLog = Logger(subsystem: "io.remotecode.appshell", category: "shell")
 
 final class InteractiveTitlebarWindow: NSWindow {
+    /// QA-MAC_SHELL_WINDOW-005: the interactive titlebar band height. The
+    /// tab strip / header lives in the top `titlebarBandHeight` points of
+    /// the content view; clicks there route to tabs/zoom instead of a
+    /// window drag.
+    static let titlebarBandHeight: CGFloat = 44
     private weak var titlebarTabDragTarget: PaneTabButton?
     private var frameBeforeTitlebarZoom: NSRect?
     private var lastTitlebarClick: (time: TimeInterval, point: NSPoint)?
@@ -60,7 +72,7 @@ final class InteractiveTitlebarWindow: NSWindow {
               let contentView else { return nil }
 
         let point = contentView.convert(event.locationInWindow, from: nil)
-        guard point.y >= contentView.bounds.height - 44 else { return nil }
+        guard Self.isInTitlebarBand(point: point, contentHeight: contentView.bounds.height) else { return nil }
         guard let hit = contentView.hitTest(point) else { return point }
         guard enclosingView(from: hit, as: NoDragButton.self) == nil,
               enclosingView(from: hit, as: PaneTabButton.self) == nil else { return nil }
@@ -92,7 +104,7 @@ final class InteractiveTitlebarWindow: NSWindow {
         guard styleMask.contains(.fullSizeContentView),
               let contentView else { return nil }
         let point = contentView.convert(event.locationInWindow, from: nil)
-        guard point.y >= contentView.bounds.height - 44,
+        guard Self.isInTitlebarBand(point: point, contentHeight: contentView.bounds.height),
               let hit = contentView.hitTest(point),
               enclosingView(from: hit, as: NoDragButton.self) == nil else { return nil }
         return enclosingView(from: hit, as: PaneTabButton.self)
@@ -103,7 +115,7 @@ final class InteractiveTitlebarWindow: NSWindow {
               let contentView else { return false }
 
         let point = contentView.convert(event.locationInWindow, from: nil)
-        guard point.y >= contentView.bounds.height - 44,
+        guard Self.isInTitlebarBand(point: point, contentHeight: contentView.bounds.height),
               let hit = contentView.hitTest(point) else { return false }
 
         if let button = enclosingView(from: hit, as: NoDragButton.self) {
@@ -121,6 +133,14 @@ final class InteractiveTitlebarWindow: NSWindow {
             current = candidate.superview
         }
         return nil
+    }
+
+    /// QA-MAC_SHELL_WINDOW-005: testable band predicate. True when a
+    /// content-space point falls inside the interactive titlebar band of a
+    /// content view of the given height. Exposed so the routing decision
+    /// can be unit-tested with synthetic geometry instead of live events.
+    static func isInTitlebarBand(point: NSPoint, contentHeight: CGFloat) -> Bool {
+        point.y >= contentHeight - titlebarBandHeight
     }
 }
 
@@ -166,6 +186,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var sidebarCollapsed = false
     private static let defaultSidebarWidth: CGFloat = 444
     private static let sidebarWidthSettingsKey = "sidebar.width"
+    private static let sidebarCollapsedSettingsKey = "sidebar.collapsed"
     private var sidebarWidth: CGFloat = MainWindowController.defaultSidebarWidth
     private var didApplyInitialSidebarWidth = false
     private var isApplyingInitialSidebarWidth = false
@@ -179,6 +200,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// unchanged signature comes back through `refreshFromState` (app
     /// become-key/active/reopen) the full teardown/rebuild is skipped.
     private var lastWorkspaceContainerSignature: String?
+    /// UX-MAC_SHELL_WINDOW-014: true between launch and the first refresh
+    /// after restored surfaces are reinstantiated. While restoring, an
+    /// empty container shows a "Restoring workspaces…" affordance instead
+    /// of the bare no-workspace empty state.
+    private var isRestoringLayout = true
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -208,6 +234,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         super.init()
         win.delegate = self
         setupLayout()
+        // UX-MAC_SHELL_WINDOW-009: restore the collapsed sidebar state so a
+        // user who works collapsed does not have to re-collapse on launch.
+        if Self.storedSidebarCollapsed(context: context) {
+            applyStoredCollapsedLayout()
+        }
         refreshFromState()
         win.center()
         NotificationCenter.default.addObserver(
@@ -221,6 +252,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     @objc private func handleToggleSidebar() {
         sidebarCollapsed.toggle()
+        shellLog.debug("sidebar.toggle collapsed=\(self.sidebarCollapsed, privacy: .public)")
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18
             ctx.allowsImplicitAnimation = true
@@ -243,6 +275,21 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         NotificationCenter.default.post(
             name: .rc2SidebarVisibility, object: nil,
             userInfo: ["collapsed": sidebarCollapsed])
+        // UX-MAC_SHELL_WINDOW-009: persist so the state survives relaunch.
+        try? context?.settingsRepo.set(Self.sidebarCollapsedSettingsKey, sidebarCollapsed ? "1" : "0")
+    }
+
+    /// UX-MAC_SHELL_WINDOW-009: apply the collapsed layout synchronously at
+    /// launch (no animation) so a restored collapsed sidebar renders
+    /// correctly on the first frame.
+    private func applyStoredCollapsedLayout() {
+        sidebarCollapsed = true
+        sidebar.view.isHidden = true
+        collapsedWorkspaceHeader.isHidden = false
+        visibleWorkspaceHeader.isHidden = true
+        splitTopConstraint?.constant = collapsedHeaderHeight
+        workspaceContentTopConstraint?.constant = 0
+        updateCollapsedWorkspaceHeader()
     }
 
     private func setupLayout() {
@@ -307,7 +354,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         guard !didApplyInitialSidebarWidth else { return }
         isApplyingInitialSidebarWidth = true
         didApplyInitialSidebarWidth = true
-        split.setPosition(sidebarWidth, ofDividerAt: 0)
+        // UX-MAC_SHELL_WINDOW-016: clamp the requested width to what the
+        // current window can actually grant (the max-divider math caps it
+        // at width-520) so the divider lands where it will stay, instead
+        // of silently shrinking the sidebar below its stored value.
+        let maxAllowed = max(220, split.bounds.width - 520)
+        let applied = min(sidebarWidth, maxAllowed)
+        split.setPosition(applied, ofDividerAt: 0)
         isApplyingInitialSidebarWidth = false
     }
 
@@ -332,9 +385,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 	        configureHeaderButton(collapsedPlusButton, symbol: "plus",
 	                              help: "New workspace",
 	                              action: #selector(newWorkspace))
+	        collapsedPlusButton.setAccessibilityIdentifier("shell.collapsed.newWorkspace")
 	        configureHeaderButton(collapsedSidebarButton, symbol: "sidebar.left",
 	                              help: "Toggle sidebar",
 	                              action: #selector(handleToggleSidebar))
+	        collapsedSidebarButton.setAccessibilityIdentifier("shell.collapsed.toggleSidebar")
 
 	        let divider = NSView()
 	        divider.wantsLayer = true
@@ -379,12 +434,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
                 help: "Open in New Window",
                 action: #selector(openSelectedWorkspaceInNewWindow)
             )
+            visibleNewWindowButton.setAccessibilityIdentifier("workspaceHeader.openInNewWindow")
             configureHeaderButton(
                 visibleFinderButton,
                 symbol: "folder",
                 help: "Open in Finder",
                 action: #selector(openSelectedWorkspaceInFinder)
             )
+            visibleFinderButton.setAccessibilityIdentifier("workspaceHeader.openInFinder")
 
             let divider = NSView()
             divider.wantsLayer = true
@@ -489,6 +546,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         restoreProtectedFocus(focusedInput)
     }
 
+    /// UX-MAC_SHELL_WINDOW-014: called once restored surfaces have been
+    /// reinstantiated so subsequent empty states render as the normal
+    /// no-workspace view rather than the restoring affordance.
+    public func markRestorationComplete() {
+        guard isRestoringLayout else { return }
+        isRestoringLayout = false
+        lastWorkspaceContainerSignature = nil
+        refreshFromState()
+    }
+
     public func detachedVisibleWorkspaceIDsForSurfaceReconciliation() -> Set<WorkspaceID> {
         Set(workspaceWindows.compactMap { workspaceID, controller in
             guard controller.window.isVisible,
@@ -517,6 +584,22 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
               let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
                 ?? paneControllers.first else { return false }
         return controller.closeSelectedSurface()
+    }
+
+    /// UX-MAC_SHELL_WINDOW-004: split the focused pane (defaulting to a
+    /// Terminal surface) via the keyboard. Returns false when there is no
+    /// focused pane controller to split.
+    @discardableResult
+    public func splitFocusedPane(_ direction: SplitDirection) -> Bool {
+        guard let ctx = context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid],
+              !detachedWorkspaceIDs.contains(wid) else { return false }
+        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
+        guard let focusedPaneID,
+              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
+                ?? paneControllers.first else { return false }
+        return controller.performSplit(direction, type: .terminal, title: "Terminal") != nil
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
@@ -576,6 +659,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             return
         }
         detachedWorkspaceIDs.insert(workspaceID)
+        shellLog.debug("workspace.detach id=\(workspaceID.value.uuidString, privacy: .public)")
         if ctx.state.window.selectedWorkspaceID == workspaceID,
            let fallback = ctx.state.window.workspaces.first(where: { $0 != workspaceID }) {
             try? router.selectWorkspace(fallback)
@@ -605,6 +689,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     private func returnWorkspaceToSidebar(_ workspaceID: WorkspaceID) {
+        shellLog.debug("workspace.return id=\(workspaceID.value.uuidString, privacy: .public)")
         let controller = workspaceWindows.removeValue(forKey: workspaceID)
         detachedWorkspaceIDs.remove(workspaceID)
         if sidebarCollapsed {
@@ -619,6 +704,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     private func workspaceWindowClosed(_ workspaceID: WorkspaceID) {
+        shellLog.debug("workspace.windowClosed id=\(workspaceID.value.uuidString, privacy: .public)")
         workspaceWindows.removeValue(forKey: workspaceID)
         detachedWorkspaceIDs.remove(workspaceID)
         if context?.state.workspaces[workspaceID] != nil {
@@ -637,9 +723,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         // already correct.
         let signature = workspaceContainerSignature()
         if signature == lastWorkspaceContainerSignature, !paneControllers.isEmpty {
+            shellLog.debug("rebuildWorkspaceContainer skipped (signature unchanged)")
             return
         }
         lastWorkspaceContainerSignature = signature
+        let rebuildStart = DispatchTime.now()
 
         window.disableScreenUpdatesUntilFlush()
         for sub in workspaceContent.subviews { sub.removeFromSuperview() }
@@ -651,14 +739,21 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
               let wid = ctx.state.window.selectedWorkspaceID,
               let ws = ctx.state.workspaces[wid],
               !detachedWorkspaceIDs.contains(wid) else {
-            let empty = makeEmptyState()
+            // UX-MAC_SHELL_WINDOW-014: during launch restoration, show a
+            // "Restoring workspaces…" affordance when state has workspaces
+            // but their surfaces are not reinstantiated yet.
+            let hasWorkspaces = !(context?.state.window.workspaces.isEmpty ?? true)
+            let empty = (isRestoringLayout && hasWorkspaces) ? makeRestoringState() : makeEmptyState()
             workspaceContent.addSubview(empty)
             pin(empty, to: workspaceContent)
+            shellLog.debug("rebuildWorkspaceContainer empty restoring=\(self.isRestoringLayout && hasWorkspaces, privacy: .public)")
             return
         }
         var primaryControlsAvailable = true
         let layoutView = buildLayoutView(node: ws.layout, primaryControlsAvailable: &primaryControlsAvailable)
         attachRootLayoutView(layoutView)
+        let rebuildMs = Double(DispatchTime.now().uptimeNanoseconds - rebuildStart.uptimeNanoseconds) / 1_000_000
+        shellLog.debug("rebuildWorkspaceContainer panes=\(self.paneControllers.count, privacy: .public) ms=\(rebuildMs, privacy: .public)")
         // Freshly built pane headers default to "sidebar visible"; if it
         // is actually collapsed, re-sync them so the workspace name shows.
         if sidebarCollapsed {
@@ -734,17 +829,26 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         title.textColor = DS.NS.textSecondary
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let sub = NSTextField(labelWithString: "Press ⌘N or the sidebar + button to open a folder as a workspace.")
+        let sub = NSTextField(labelWithString: "Open a folder as a workspace to get started.")
         sub.font = NSFont.systemFont(ofSize: 12)
         sub.textColor = DS.NS.textTertiary
         sub.alignment = .center
         sub.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView(views: [icon, title, sub])
+        // UX-MAC_SHELL_WINDOW-010: an actionable button instead of copy
+        // that points at a control which may be off-screen when collapsed.
+        let action = NSButton(title: "New Workspace", target: self, action: #selector(newWorkspace))
+        action.bezelStyle = .rounded
+        action.keyEquivalent = "\r"
+        action.translatesAutoresizingMaskIntoConstraints = false
+        action.setAccessibilityIdentifier("shell.emptyState.newWorkspace")
+
+        let stack = NSStackView(views: [icon, title, sub, action])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 10
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setCustomSpacing(16, after: sub)
         v.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
@@ -800,6 +904,40 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         ])
     }
 
+    /// UX-MAC_SHELL_WINDOW-014: a brief restoring affordance shown while a
+    /// saved layout is being reinstantiated, so a large restore does not
+    /// flash the bare "No workspace selected" empty state.
+    private func makeRestoringState() -> NSView {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = DS.NS.bg.cgColor
+        v.translatesAutoresizingMaskIntoConstraints = false
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .regular
+        spinner.isIndeterminate = true
+        spinner.startAnimation(nil)
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: "Restoring workspaces…")
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        label.textColor = DS.NS.textSecondary
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [spinner, label])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: v.centerYAnchor)
+        ])
+        return v
+    }
+
     // MARK: NSWindowDelegate
     public func windowWillClose(_ notification: Notification) {
         context?.saveSnapshot()
@@ -842,6 +980,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             return defaultSidebarWidth
         }
         return min(560, max(180, CGFloat(value)))
+    }
+
+    private static func storedSidebarCollapsed(context: AppContext) -> Bool {
+        ((try? context.settingsRepo.get(sidebarCollapsedSettingsKey)) ?? nil) == "1"
     }
 }
 
@@ -951,6 +1093,7 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
         backButton.toolTip = "Back to sidebar"
         backButton.target = self
         backButton.action = #selector(backToSidebar)
+        backButton.setAccessibilityIdentifier("workspaceWindow.back")
 
         titleLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         titleLabel.textColor = DS.NS.text
@@ -1220,8 +1363,10 @@ final class RatioSplitView: NSView {
                     let share = flexibleTotal > 0 ? norm[i] / flexibleTotal : 1.0 / CGFloat(max(1, n - collapsed.count))
                     w = (avail * share).rounded()
                 }
-                sv.frame = NSRect(x: x, y: 0, width: w, height: bounds.height)
-                relayoutChild(sv)
+                let newFrame = NSRect(x: x, y: 0, width: w, height: bounds.height)
+                let sizeChanged = sv.frame.size != newFrame.size
+                sv.frame = newFrame
+                relayoutChild(sv, sizeChanged: sizeChanged)
                 x += w + dt
             }
         } else {
@@ -1243,19 +1388,27 @@ final class RatioSplitView: NSView {
                     h = (avail * share).rounded()
                 }
                 y -= h
-                sv.frame = NSRect(x: 0, y: y, width: bounds.width, height: h)
-                relayoutChild(sv)
+                let newFrame = NSRect(x: 0, y: y, width: bounds.width, height: h)
+                let sizeChanged = sv.frame.size != newFrame.size
+                sv.frame = newFrame
+                relayoutChild(sv, sizeChanged: sizeChanged)
                 y -= dt
             }
         }
         layoutDividerLayers()
     }
 
-    private func relayoutChild(_ child: NSView) {
-        child.needsLayout = true
+    private func relayoutChild(_ child: NSView, sizeChanged: Bool) {
+        // PERF-MAC_SHELL_WINDOW-004: only force a synchronous subtree
+        // layout when the child actually resized. A nested split still
+        // re-runs its own ratio layout (its panes may have shifted even at
+        // the same outer size), but unchanged leaf panes (terminal/browser)
+        // skip the forced `layoutSubtreeIfNeeded` on every drag tick.
         if let split = child as? RatioSplitView {
+            child.needsLayout = true
             split.layoutByRatios()
-        } else {
+        } else if sizeChanged {
+            child.needsLayout = true
             child.layoutSubtreeIfNeeded()
         }
     }

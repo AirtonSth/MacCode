@@ -64,6 +64,7 @@ public final class FilePreviewSurface: NSObject, Surface {
         let iv = NSImageView()
         iv.imageScaling = .scaleProportionallyDown
         iv.translatesAutoresizingMaskIntoConstraints = false
+        iv.setAccessibilityIdentifier("filePreview.image")
         containerStack.addSubview(iv)
         pin(iv)
         // Decode off the main thread into a downsampled image rather than synchronously
@@ -95,6 +96,7 @@ public final class FilePreviewSurface: NSObject, Surface {
         pdf.document = PDFDocument(url: URL(fileURLWithPath: path))
         pdf.autoScales = true
         pdf.translatesAutoresizingMaskIntoConstraints = false
+        pdf.setAccessibilityIdentifier("filePreview.pdf")
         containerStack.addSubview(pdf)
         pin(pdf)
     }
@@ -111,6 +113,7 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.minSize = NSSize(width: 0, height: 0)
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
+        tv.setAccessibilityIdentifier("filePreview.text")
         scroll.documentView = tv
         tv.string = Self.previewText(path: path)
         containerStack.addSubview(scroll)

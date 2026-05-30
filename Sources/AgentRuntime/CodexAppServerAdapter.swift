@@ -61,9 +61,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private let clientFactory: ClientFactory
     private let lock = NSLock()
     private var sessions: [AgentThreadID: Session] = [:]
+    // QA-011: blocking-bridge timeouts are injectable so tests can drive the
+    // typed `unsupported(... timed out)` path deterministically instead of
+    // coupling to the production 10s / 30s wall-clock waits. `openTimeout`
+    // covers recover/read/settings; `rollbackTimeout` the longer rollback.
+    private let openTimeout: TimeInterval
+    private let rollbackTimeout: TimeInterval
 
-    public init(binaryNameOverride: String? = nil, clientFactory: ClientFactory? = nil) {
+    public init(binaryNameOverride: String? = nil,
+                clientFactory: ClientFactory? = nil,
+                openTimeout: TimeInterval = 10,
+                rollbackTimeout: TimeInterval = 30) {
         self.binaryNameOverride = binaryNameOverride
+        self.openTimeout = openTimeout
+        self.rollbackTimeout = rollbackTimeout
         self.clientFactory = clientFactory ?? { request, notificationHandler, serverRequestHandler in
             let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? request.providerBinary!
@@ -196,7 +207,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
             semaphore.signal()
         }
-        guard semaphore.wait(timeout: .now() + 10) == .success else {
+        guard semaphore.wait(timeout: .now() + openTimeout) == .success else {
             client.stop()
             throw AgentProviderAdapterError.unsupported("Codex app-server session recovery timed out")
         }
@@ -240,7 +251,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
             semaphore.signal()
         }
-        guard semaphore.wait(timeout: .now() + 10) == .success else {
+        guard semaphore.wait(timeout: .now() + openTimeout) == .success else {
             throw AgentProviderAdapterError.unsupported("Codex app-server thread/read timed out")
         }
         let response = try box.get().get()
@@ -276,7 +287,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
             semaphore.signal()
         }
-        guard semaphore.wait(timeout: .now() + 30) == .success else {
+        guard semaphore.wait(timeout: .now() + rollbackTimeout) == .success else {
             throw AgentProviderAdapterError.unsupported("Codex app-server thread/rollback timed out")
         }
         _ = try box.get().get()
@@ -385,7 +396,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             }
             semaphore.signal()
         }
-        guard semaphore.wait(timeout: .now() + 10) == .success else {
+        guard semaphore.wait(timeout: .now() + openTimeout) == .success else {
             throw AgentProviderAdapterError.unsupported("Codex app-server thread/settings/update timed out")
         }
         try box.get().get()
@@ -1041,6 +1052,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         if let turnId, !turnId.isEmpty, sessions[threadId]?.completedTurnIds.contains(turnId) == false {
             sessions[threadId]?.completedTurnIds.append(turnId)
         }
+        // PERF-007: per-turn buffers only matter within the turn they
+        // accumulate in (final-message text, item-start/stream dedup keys,
+        // proposed-plan deltas). Reset them on turn completion so a
+        // long-lived session does not hold an ever-growing final message
+        // and unbounded item-id sets for its whole lifetime. completedTurnIds
+        // (rollback window) and emittedProposedPlanIds (proposed-plan dedup)
+        // are intentionally retained.
+        sessions[threadId]?.finalAssistantMessage = ""
+        sessions[threadId]?.startedItemIds.removeAll(keepingCapacity: false)
+        sessions[threadId]?.streamedItemIds.removeAll(keepingCapacity: false)
+        sessions[threadId]?.proposedPlanBuffers.removeAll(keepingCapacity: false)
         lock.unlock()
     }
 

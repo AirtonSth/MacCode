@@ -1,8 +1,12 @@
 import Foundation
 import CoreModel
 import Persistence
+import os
 
 public struct PrivateAccountUser: Codable, Equatable, Sendable {
+    // Backend spelling: the API ships a misspelled `daysRemaing` key alongside
+    // the correct `daysRemaining`. Keep this property name exactly as-is — it
+    // must match the wire format until the backend is renamed.
     public let daysRemaing: Int?
     public let daysRemaining: Int
     public let email: String
@@ -176,6 +180,8 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
 public final class PrivateAccountSessionStore: @unchecked Sendable {
     private let repo: SettingsRepository
     private let key = "private.account.session"
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(repo: SettingsRepository) {
         self.repo = repo
@@ -184,11 +190,11 @@ public final class PrivateAccountSessionStore: @unchecked Sendable {
     public func load() -> PrivateAccountSession? {
         guard let json = try? repo.get(key),
               let data = json.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(PrivateAccountSession.self, from: data)
+        return try? decoder.decode(PrivateAccountSession.self, from: data)
     }
 
     public func save(_ session: PrivateAccountSession) {
-        guard let data = try? JSONEncoder().encode(session),
+        guard let data = try? encoder.encode(session),
               let json = String(data: data, encoding: .utf8) else { return }
         try? repo.set(key, json)
     }
@@ -209,6 +215,8 @@ public struct PrivatePushTarget: Codable, Equatable, Sendable {
 public final class PrivatePushTargetStore: @unchecked Sendable {
     private let repo: SettingsRepository
     private let key = "private.push.target"
+    private let decoder = JSONDecoder()
+    private let encoder = JSONEncoder()
 
     public init(repo: SettingsRepository) {
         self.repo = repo
@@ -217,7 +225,7 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
     public func load() -> PrivatePushTarget? {
         guard let json = try? repo.get(key),
               let data = json.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(PrivatePushTarget.self, from: data)
+        return try? decoder.decode(PrivatePushTarget.self, from: data)
     }
 
     public func save(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceId: String?) {
@@ -228,7 +236,7 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
             pushTokenType: pushTokenType,
             updatedAt: Date()
         )
-        guard let data = try? JSONEncoder().encode(target),
+        guard let data = try? encoder.encode(target),
               let json = String(data: data, encoding: .utf8) else { return }
         try? repo.set(key, json)
     }
@@ -239,6 +247,7 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
 }
 
 public final class PrivateNotificationBridge: @unchecked Sendable {
+    private static let log = Logger(subsystem: "io.remotecode.app", category: "private-push")
     private let accountStore: PrivateAccountSessionStore
     private let pushTargetStore: PrivatePushTargetStore
     private let api: PrivateAccountAPI
@@ -265,6 +274,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 pushTargetStore.clear()
             }
         } catch {
+            Self.log.error("Private push delivery failed: \(String(describing: error), privacy: .public)")
             return
         }
     }

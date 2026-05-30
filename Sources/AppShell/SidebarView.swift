@@ -12,7 +12,15 @@ public final class SidebarViewModel: ObservableObject {
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
-    @Published public var workspaces: [Workspace] = []
+    @Published public var workspaces: [Workspace] = [] {
+        didSet { busyStateCache.removeAll(keepingCapacity: true) }
+    }
+    /// PERF-MAC_SHELL_WINDOW-003: memoize per-workspace busy state for the
+    /// lifetime of one `workspaces` snapshot so repeated SwiftUI `body`
+    /// evaluations don't re-walk panes/surfaces (and the registry) on
+    /// every render. Invalidated whenever `workspaces` is reassigned via
+    /// `reload`, which is driven by the same mutations that change busy.
+    private var busyStateCache: [WorkspaceID: Bool] = [:]
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
     @Published public var privateAccountUser: PrivateAccountUser?
@@ -22,6 +30,9 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowSystemSleepWhenDisplayClosed: Bool = false
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     public var draggingWorkspaceID: WorkspaceID?
+    /// UX-MAC_SHELL_WINDOW-012: the row the drag is currently hovering,
+    /// so the list can draw an insertion line instead of reordering live.
+    @Published public var dropTargetWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
     private var privateAccountObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
@@ -145,12 +156,23 @@ public final class SidebarViewModel: ObservableObject {
         try? router?.selectWorkspace(wid)
     }
 
-    public func selectWorkspaceRow(_ ws: Workspace, extendingSelection: Bool) {
-        if extendingSelection {
+    public func selectWorkspaceRow(_ ws: Workspace, extendingSelection: Bool, togglingSelection: Bool = false) {
+        if togglingSelection {
+            toggleWorkspaceSelection(ws.id)
+        } else if extendingSelection {
             extendWorkspaceSelection(to: ws.id)
         } else {
             select(ws.id)
         }
+    }
+
+    private func toggleWorkspaceSelection(_ id: WorkspaceID) {
+        if selectedWorkspaceIDs.contains(id) {
+            selectedWorkspaceIDs.remove(id)
+        } else {
+            selectedWorkspaceIDs.insert(id)
+        }
+        selectionAnchorID = id
     }
 
     private func extendWorkspaceSelection(to id: WorkspaceID) {
@@ -178,6 +200,9 @@ public final class SidebarViewModel: ObservableObject {
         guard let router else { return false }
         do {
             _ = try router.createWorkspace(fromFolder: url)
+            // UX-MAC_SHELL_WINDOW-005: remember opened folders so they
+            // appear under File ▸ Open Recent on the next open.
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
             reload()
             return true
         } catch {
@@ -280,13 +305,25 @@ public final class SidebarViewModel: ObservableObject {
     // MARK: cmux-style workspace editing (AppKit prompts — reliable,
     // no SwiftUI sheet plumbing).
 
-    private func prompt(title: String, message: String, initial: String) -> String? {
+    private func prompt(title: String, message: String, initial: String, multiline: Bool = false) -> String? {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        let field: NSTextField
+        if multiline {
+            // UX-MAC_SHELL_WINDOW-006: descriptions get a taller, wrapping
+            // field instead of a single-line entry.
+            field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 84))
+            field.cell?.wraps = true
+            field.cell?.isScrollable = false
+            field.usesSingleLineMode = false
+            field.maximumNumberOfLines = 0
+            field.lineBreakMode = .byWordWrapping
+        } else {
+            field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        }
         field.stringValue = initial
         field.placeholderString = title
         alert.accessoryView = field
@@ -307,7 +344,8 @@ public final class SidebarViewModel: ObservableObject {
         let current = ws.metadata["description"] ?? ""
         guard let text = prompt(title: "Workspace description",
                                 message: "Optional note for “\(ws.name)”.",
-                                initial: current) else { return }
+                                initial: current,
+                                multiline: true) else { return }
         try? router?.setWorkspaceDescription(ws.id, text)
     }
 
@@ -321,6 +359,13 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func isWorkspaceBusy(_ ws: Workspace) -> Bool {
+        if let cached = busyStateCache[ws.id] { return cached }
+        let busy = computeWorkspaceBusy(ws)
+        busyStateCache[ws.id] = busy
+        return busy
+    }
+
+    private func computeWorkspaceBusy(_ ws: Workspace) -> Bool {
         if ws.metadata["busy"] == "true" { return true }
         return ws.layout.paneIDs().contains { pid in
             (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
@@ -334,6 +379,7 @@ public final class SidebarViewModel: ObservableObject {
               let targetIndex = workspaces.firstIndex(where: { $0.id == target }) else { return }
         try? router?.reorderWorkspace(dragged, position: targetIndex)
         draggingWorkspaceID = nil
+        dropTargetWorkspaceID = nil
         reload()
     }
 
@@ -420,6 +466,7 @@ public struct SidebarRootView: View {
                 .buttonStyle(.plain)
                 .help("Toggle sidebar")
                 .accessibilityLabel("Toggle sidebar")
+                .accessibilityIdentifier("shell.toggleSidebar")
             }
             .padding(.horizontal, DS.Space.md)
             .frame(height: 44)
@@ -430,6 +477,7 @@ public struct SidebarRootView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Create new workspace")
+                .accessibilityIdentifier("sidebar.newWorkspace")
 
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
@@ -457,6 +505,7 @@ public struct SidebarRootView: View {
                         .buttonStyle(.plain)
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.danger)
+                        .accessibilityIdentifier("sidebar.removeSelected")
                 }
             }
             .padding(.horizontal, DS.Space.lg)
@@ -602,17 +651,34 @@ public struct SidebarRootView: View {
     private var insomniaControl: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
             insomniaToggle
-            Text("Insomnia")
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .lineLimit(1)
-                .frame(height: 24, alignment: .center)
+            // UX-MAC_SHELL_WINDOW-013: a subtitle summarises which power
+            // exceptions are active so the state is legible at a glance.
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Insomnia")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Text(insomniaStateSummary)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
+            .frame(height: 32, alignment: .center)
             Spacer(minLength: 0)
             insomniaOptionsMenu
         }
         .padding(.horizontal, DS.Space.sm)
-        .frame(height: 36)
+        .frame(height: 40)
         .help(insomniaHelpText)
+    }
+
+    private var insomniaStateSummary: String {
+        guard vm.insomniaEnabled else { return "Off" }
+        var allowances: [String] = []
+        if vm.insomniaAllowDisplaySleep { allowances.append("display can sleep") }
+        if vm.insomniaAllowSystemSleepWhenDisplayClosed { allowances.append("sleep when closed") }
+        if vm.insomniaAllowScreenSaverAfter45MinutesOfInactivity { allowances.append("screen saver after 45m") }
+        return allowances.isEmpty ? "Mac stays awake" : allowances.joined(separator: " · ")
     }
 
     private var insomniaToggle: some View {
@@ -643,6 +709,7 @@ public struct SidebarRootView: View {
         .accessibilityLabel("Insomnia")
         .accessibilityValue(vm.insomniaEnabled ? "on" : "off")
         .accessibilityHint(insomniaHelpText)
+        .accessibilityIdentifier("sidebar.insomnia.toggle")
     }
 
     private var insomniaOptionsMenu: some View {
@@ -650,9 +717,9 @@ public struct SidebarRootView: View {
             showsInsomniaOptions.toggle()
         } label: {
             Image(systemName: "chevron.up.chevron.down")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 24, height: 24)
+                .frame(width: 36, height: 36)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -661,6 +728,7 @@ public struct SidebarRootView: View {
         }
         .help(insomniaHelpText)
         .accessibilityLabel("Insomnia settings")
+        .accessibilityIdentifier("sidebar.insomnia.options")
     }
 
     private var insomniaOptionsPopover: some View {
@@ -735,7 +803,11 @@ public struct SidebarRootView: View {
         let pinned = ws.metadata["pinned"] == "true"
         let busy = vm.isWorkspaceBusy(ws)
         Button {
-            vm.selectWorkspaceRow(ws, extendingSelection: NSEvent.modifierFlags.contains(.shift))
+            let flags = NSEvent.modifierFlags
+            vm.selectWorkspaceRow(
+                ws,
+                extendingSelection: flags.contains(.shift),
+                togglingSelection: flags.contains(.command))
         } label: {
             HStack(spacing: DS.Space.sm) {
                 if checked {
@@ -775,9 +847,18 @@ public struct SidebarRootView: View {
                           : Color.white.opacity(0.001))
             )
             .contentShape(Rectangle())
+            .overlay(alignment: .top) {
+                if vm.dropTargetWorkspaceID == ws.id {
+                    Capsule()
+                        .fill(DS.Palette.accent)
+                        .frame(height: 2)
+                        .padding(.horizontal, DS.Space.sm)
+                }
+            }
         }
         .buttonStyle(.plain)
         .help(ws.cwd.isEmpty ? ws.name : ws.cwd)
+        .accessibilityIdentifier("sidebar.workspaceRow.\(ws.id.value.uuidString)")
         .onDrag {
             vm.draggingWorkspaceID = ws.id
             return NSItemProvider(object: ws.id.value.uuidString as NSString)
@@ -834,12 +915,27 @@ private struct WorkspaceDropDelegate: DropDelegate {
     let target: Workspace
 
     func dropEntered(info: DropInfo) {
-        guard let dragged = vm.draggingWorkspaceID else { return }
-        vm.reorderWorkspace(dragged, before: target.id)
+        guard vm.draggingWorkspaceID != nil, vm.draggingWorkspaceID != target.id else {
+            vm.dropTargetWorkspaceID = nil
+            return
+        }
+        // UX-MAC_SHELL_WINDOW-012: show an insertion line on hover and
+        // commit the reorder on drop, rather than shuffling rows live.
+        vm.dropTargetWorkspaceID = target.id
+    }
+
+    func dropExited(info: DropInfo) {
+        if vm.dropTargetWorkspaceID == target.id {
+            vm.dropTargetWorkspaceID = nil
+        }
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        if let dragged = vm.draggingWorkspaceID, dragged != target.id {
+            vm.reorderWorkspace(dragged, before: target.id)
+        }
         vm.draggingWorkspaceID = nil
+        vm.dropTargetWorkspaceID = nil
         return true
     }
 

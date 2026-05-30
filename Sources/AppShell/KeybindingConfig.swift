@@ -69,11 +69,33 @@ public struct KeybindingConfig: Equatable {
         return hit
     }
 
-    public static func loadDefaultPath() -> KeybindingConfig {
-        let path = NSHomeDirectory() + "/.remotecode/keybindings.json"
+    /// QA-005: testable seam — load + parse from an explicit path so tests can
+    /// point at a fixture URL without mutating the process HOME.
+    public static func load(path: String) -> KeybindingConfig {
         guard let data = FileManager.default.contents(atPath: path) else {
             return KeybindingConfig()
         }
         return parse(data)
+    }
+
+    public static var defaultPath: String {
+        NSHomeDirectory() + "/.remotecode/keybindings.json"
+    }
+
+    /// PERF-008: the keybindings file is unchanging within a session, so parse
+    /// it once and serve the cached config. `loadDefaultPath()` previously
+    /// re-read + re-parsed the file on every menu-item override. Call
+    /// `invalidateCache()` from a file-watch event if live reload is wired.
+    private static var cached: KeybindingConfig?
+
+    public static func loadDefaultPath() -> KeybindingConfig {
+        if let cached { return cached }
+        let config = load(path: defaultPath)
+        cached = config
+        return config
+    }
+
+    public static func invalidateCache() {
+        cached = nil
     }
 }

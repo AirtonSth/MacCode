@@ -3,10 +3,16 @@ import AppKit
 import WebKit
 import CoreModel
 import DesignSystemKit
+import os
 
 @MainActor
-public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
+public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUIDelegate {
     public static let defaultInitialURLString = "https://www.remotecode.io/from-app"
+
+    // Structured navigation/diagnostics logging (QA-MAC_BROWSER-006) so mirror
+    // desyncs and field load failures are traceable. URLs are %{public}-omitted
+    // by default to avoid leaking browsed addresses; only outcomes/codes log.
+    private static let log = Logger(subsystem: "io.remotecode.app", category: "browser")
 
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
@@ -17,12 +23,22 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     private let reloadButton = NSButton()
     private let openExternalButton = NSButton()
     private let progressBar = NSProgressIndicator()
+    private let findBar = NSView()
+    private let findField = NSTextField()
+    private let findPrevButton = NSButton()
+    private let findNextButton = NSButton()
+    private let findCloseButton = NSButton()
     private let errorOverlay = NSView()
     private let errorLabel = NSTextField(labelWithString: "")
     private let retryButton = NSButton()
     private var googleLegacyLayoutReloads = Set<String>()
+    private var googleLegacyLayoutReloadOrder: [String] = []
+    private static let googleLegacyLayoutReloadCap = 32
     private var retainedURL: URL?
     private var isVisible = true
+    /// Test-only read of the hidden/visible gate (QA-MAC_BROWSER-004) so tests
+    /// can assert the "navigate while hidden is deferred" contract directly.
+    var isVisibleForTesting: Bool { isVisible }
     private var progressObservation: NSKeyValueObservation?
     private var loadingObservation: NSKeyValueObservation?
     private var waitForToken = 0
@@ -42,26 +58,29 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         cfg.websiteDataStore = WKWebsiteDataStore.default()
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = Self.currentSafariUserAgent()
+        wv.setAccessibilityIdentifier("browser.webview")
         self.webView = wv
 
         let tf = NSTextField()
-        tf.placeholderString = "Enter URL and press Return"
+        tf.placeholderString = "Search or enter address"
         tf.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         tf.drawsBackground = true
         tf.backgroundColor = DS.NS.surfaceRaised
         tf.textColor = DS.NS.text
         tf.bezelStyle = .roundedBezel
         tf.focusRingType = .none
+        tf.setAccessibilityIdentifier("browser.url-field")
+        tf.setAccessibilityLabel("Address")
         self.addressBar = tf
 
         let toolbar = NSView()
         toolbar.wantsLayer = true
         toolbar.layer?.backgroundColor = DS.NS.surface.cgColor
-        for (b, glyph, help) in [
-            (backButton, "chevron.backward", "Back"),
-            (forwardButton, "chevron.forward", "Forward"),
-            (reloadButton, "arrow.clockwise", "Reload"),
-            (openExternalButton, "arrow.up.forward.square", "Open in Default Browser")
+        for (b, glyph, help, axID) in [
+            (backButton, "chevron.backward", "Back", "browser.back"),
+            (forwardButton, "chevron.forward", "Forward", "browser.forward"),
+            (reloadButton, "arrow.clockwise", "Reload", "browser.reload"),
+            (openExternalButton, "arrow.up.forward.square", "Open in Default Browser", "browser.open-external")
         ] {
             b.isBordered = false
             b.bezelStyle = .inline
@@ -69,9 +88,11 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             b.contentTintColor = DS.NS.textSecondary
             b.imageScaling = .scaleProportionallyDown
             b.toolTip = help
+            b.setAccessibilityIdentifier(axID)
+            b.setAccessibilityLabel(help)
         }
 
-        let container = NSView()
+        let container = BrowserContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
         for v in [toolbar, wv] { v.translatesAutoresizingMaskIntoConstraints = false }
         for v in [backButton, forwardButton, reloadButton, tf, openExternalButton] { v.translatesAutoresizingMaskIntoConstraints = false; toolbar.addSubview(v) }
@@ -127,9 +148,52 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             progressBar.heightAnchor.constraint(equalToConstant: 2)
         ])
 
+        // In-page Find bar (UX-MAC_BROWSER-010), shown on Cmd-F over the webView.
+        findBar.wantsLayer = true
+        findBar.layer?.backgroundColor = DS.NS.surface.cgColor
+        findBar.isHidden = true
+        findBar.setAccessibilityIdentifier("browser.find-bar")
+        findBar.translatesAutoresizingMaskIntoConstraints = false
+        findField.placeholderString = "Find on page"
+        findField.bezelStyle = .roundedBezel
+        findField.focusRingType = .none
+        findField.setAccessibilityIdentifier("browser.find-field")
+        findField.setAccessibilityLabel("Find on page")
+        findField.translatesAutoresizingMaskIntoConstraints = false
+        for (b, glyph, help, axID) in [
+            (findPrevButton, "chevron.up", "Previous match", "browser.find-prev"),
+            (findNextButton, "chevron.down", "Next match", "browser.find-next"),
+            (findCloseButton, "xmark", "Close find", "browser.find-close")
+        ] {
+            b.isBordered = false
+            b.bezelStyle = .inline
+            b.image = NSImage(systemSymbolName: glyph, accessibilityDescription: help)
+            b.contentTintColor = DS.NS.textSecondary
+            b.imageScaling = .scaleProportionallyDown
+            b.toolTip = help
+            b.setAccessibilityIdentifier(axID)
+            b.setAccessibilityLabel(help)
+        }
+        let findStack = NSStackView(views: [findField, findPrevButton, findNextButton, findCloseButton])
+        findStack.orientation = .horizontal
+        findStack.spacing = 4
+        findStack.translatesAutoresizingMaskIntoConstraints = false
+        findBar.addSubview(findStack)
+        container.addSubview(findBar)
+        NSLayoutConstraint.activate([
+            findBar.trailingAnchor.constraint(equalTo: wv.trailingAnchor, constant: -12),
+            findBar.topAnchor.constraint(equalTo: wv.topAnchor, constant: 8),
+            findStack.topAnchor.constraint(equalTo: findBar.topAnchor, constant: 6),
+            findStack.bottomAnchor.constraint(equalTo: findBar.bottomAnchor, constant: -6),
+            findStack.leadingAnchor.constraint(equalTo: findBar.leadingAnchor, constant: 8),
+            findStack.trailingAnchor.constraint(equalTo: findBar.trailingAnchor, constant: -8),
+            findField.widthAnchor.constraint(equalToConstant: 180)
+        ])
+
         errorOverlay.wantsLayer = true
         errorOverlay.layer?.backgroundColor = DS.NS.bg.cgColor
         errorOverlay.isHidden = true
+        errorOverlay.setAccessibilityIdentifier("browser.error-overlay")
         errorOverlay.translatesAutoresizingMaskIntoConstraints = false
         let errorIcon = NSImageView()
         errorIcon.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Error")
@@ -141,6 +205,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         errorLabel.translatesAutoresizingMaskIntoConstraints = false
         retryButton.title = "Retry"
         retryButton.bezelStyle = .rounded
+        retryButton.setAccessibilityIdentifier("browser.error-retry")
         retryButton.translatesAutoresizingMaskIntoConstraints = false
         let errorStack = NSStackView(views: [errorIcon, errorLabel, retryButton])
         errorStack.orientation = .vertical
@@ -167,12 +232,20 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         self.view = container
         super.init()
         wv.navigationDelegate = self
+        wv.uiDelegate = self
         backButton.target = self; backButton.action = #selector(goBack)
         forwardButton.target = self; forwardButton.action = #selector(goForward)
         reloadButton.target = self; reloadButton.action = #selector(reload)
         openExternalButton.target = self; openExternalButton.action = #selector(openInDefaultBrowser)
         retryButton.target = self; retryButton.action = #selector(reload)
         tf.target = self; tf.action = #selector(goAddress)
+        findField.target = self; findField.action = #selector(findNext)
+        findPrevButton.target = self; findPrevButton.action = #selector(findPrev)
+        findNextButton.target = self; findNextButton.action = #selector(findNext)
+        findCloseButton.target = self; findCloseButton.action = #selector(closeFind)
+        container.onFocusAddressBar = { [weak self] in self?.focusAddressBar() }
+        container.onShowFind = { [weak self] in self?.showFind() }
+        container.onEscape = { [weak self] in self?.closeFind() }
 
         backButton.isEnabled = false
         forwardButton.isEnabled = false
@@ -262,10 +335,14 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         return host == "google.com" || host.hasSuffix(".google.com")
     }
 
+    // Computed once per process: installedSafariVersion() walks bundle/plist
+    // disk paths, and the result is identical for every surface (PERF-003).
+    private static let cachedSafariUserAgent: String = safariLikeUserAgent(
+        safariVersion: installedSafariVersion() ?? "17.0"
+    )
+
     private static func currentSafariUserAgent() -> String {
-        safariLikeUserAgent(
-            safariVersion: installedSafariVersion() ?? "17.0"
-        )
+        cachedSafariUserAgent
     }
 
     private static func installedSafariVersion() -> String? {
@@ -284,12 +361,27 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     }
 
     public func navigate(string: String) -> Bool {
-        var s = string.trimmingCharacters(in: .whitespaces)
+        let s = string.trimmingCharacters(in: .whitespaces)
         if s.isEmpty { return false }
-        if !s.contains("://") { s = "https://" + s }
-        guard let u = URL(string: s) else { return false }
+        guard let u = Self.resolveURL(from: s) else { return false }
         navigate(to: u)
         return true
+    }
+
+    /// Maps raw address-bar input to a URL. Scheme-less input that looks like
+    /// a host (has a dot, no spaces) is treated as `https://…`; anything else
+    /// (e.g. "weather tomorrow") becomes a search query against the default
+    /// engine — matching Safari/Chrome omnibox behavior.
+    static func resolveURL(from input: String) -> URL? {
+        let s = input.trimmingCharacters(in: .whitespaces)
+        if s.isEmpty { return nil }
+        if s.contains("://") { return URL(string: s) }
+        let looksLikeHost = !s.contains(" ") && s.contains(".")
+        if looksLikeHost, let u = URL(string: "https://" + s) {
+            return u
+        }
+        let q = s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
+        return URL(string: "https://www.google.com/search?q=\(q)")
     }
 
     public func currentURL() -> String { webView.url?.absoluteString ?? "" }
@@ -310,7 +402,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     public func snapshot(completion: @escaping (String) -> Void) {
         let js = #"""
         (function(){
-          window.__rc2 = window.__rc2 || { refs: new Map(), counter: 0 };
+          // Reset refs each snapshot so detached DOM nodes from prior
+          // snapshots can be GC'd (PERF-008) instead of accumulating.
+          window.__rc2 = { refs: new Map(), counter: 0 };
           const out = [];
           const isVisible = (el) => {
             if (!el) return false;
@@ -327,8 +421,13 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             if (el.getAttribute('contenteditable') === 'true') return true;
             return false;
           };
-          document.querySelectorAll('*').forEach(el => {
-            if (!isVisible(el) || !interactable(el)) return;
+          // Cap emitted elements so the JSON payload ferried to iOS over RPC
+          // stays bounded on huge DOMs (PERF-007); flag when truncated.
+          const MAX = 1500;
+          let truncated = false;
+          for (const el of document.querySelectorAll('*')) {
+            if (out.length >= MAX) { truncated = true; break; }
+            if (!isVisible(el) || !interactable(el)) continue;
             const ref = 'rc2-' + (++window.__rc2.counter);
             window.__rc2.refs.set(ref, el);
             out.push({
@@ -343,13 +442,16 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
               value: ('value' in el) ? el.value : null,
               bounding: (() => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })()
             });
-          });
-          return JSON.stringify({ url: location.href, title: document.title, elements: out });
+          }
+          return JSON.stringify({ url: location.href, title: document.title, truncated, elements: out });
         })()
         """#
-        evaluate(js) { value, _ in
+        evaluate(js) { value, error in
             if let s = value as? String { completion(s) }
-            else { completion("{\"error\":\"snapshot failed\"}") }
+            else {
+                Self.log.error("snapshot eval failed err=\(error?.localizedDescription ?? "nil", privacy: .public)")
+                completion("{\"error\":\"snapshot failed\"}")
+            }
         }
     }
 
@@ -464,10 +566,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     }
     @objc private func openInDefaultBrowser() { openCurrentURLInDefaultBrowser() }
     @objc private func goAddress() {
-        var s = addressBar.stringValue.trimmingCharacters(in: .whitespaces)
-        if !s.contains("://") { s = "https://" + s }
-        guard let url = URL(string: s) else { return }
-        navigate(to: url)
+        _ = navigate(string: addressBar.stringValue)
     }
 
     private func openCurrentURLInDefaultBrowser() {
@@ -482,10 +581,12 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     // MARK: WKNavigationDelegate
 
     public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        Self.log.debug("nav start host=\(webView.url?.host ?? "?", privacy: .public)")
         hideError()
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        Self.log.debug("nav finish host=\(webView.url?.host ?? "?", privacy: .public)")
         if let url = webView.url {
             addressBar.stringValue = url.absoluteString
             publishNavigationChange(url: url, title: webView.title)
@@ -507,8 +608,21 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         let ns = error as NSError
         // Ignore user/programmatic cancellations (e.g. stopLoading, new navigation superseding this one).
         if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
+        Self.log.error("nav fail domain=\(ns.domain, privacy: .public) code=\(ns.code, privacy: .public)")
         showError(error.localizedDescription)
         updateNavigationButtons()
+    }
+
+    // MARK: WKUIDelegate
+
+    /// target=_blank / window.open links have no destination view in a
+    /// single-webView surface, so WKWebView silently drops them
+    /// (UX-MAC_BROWSER-012). Load the request in this view instead.
+    public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            webView.load(URLRequest(url: url))
+        }
+        return nil
     }
 
     public func publishNavigationChange(url: URL, title: String?) {
@@ -517,6 +631,19 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             descriptor.title = title
         }
         onNavigationChange?(descriptor.id, url.absoluteString, title)
+    }
+
+    // Bounded insert (PERF-005): the reload-dedup set previously grew without
+    // limit for every distinct Google URL the tab ever visited. Cap it and
+    // evict oldest so membership stays O(1) and memory stays flat.
+    private func recordGoogleLegacyLayoutReload(_ key: String) {
+        guard googleLegacyLayoutReloads.insert(key).inserted else { return }
+        Self.log.debug("google legacy-layout reload count=\(self.googleLegacyLayoutReloads.count, privacy: .public)")
+        googleLegacyLayoutReloadOrder.append(key)
+        if googleLegacyLayoutReloadOrder.count > Self.googleLegacyLayoutReloadCap {
+            let evicted = googleLegacyLayoutReloadOrder.removeFirst()
+            googleLegacyLayoutReloads.remove(evicted)
+        }
     }
 
     private func scheduleGoogleLegacyLayoutRefresh(for key: String) {
@@ -544,14 +671,46 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         let js = "document.cookie='__Secure-STRP=; Max-Age=0; path=/; domain=.google.com; Secure'"
         evaluate(js) { [weak self] _, _ in
             guard let self, self.webView.url?.absoluteString == key else { return }
-            self.googleLegacyLayoutReloads.insert(key)
+            self.recordGoogleLegacyLayoutReload(key)
             self.webView.reload()
         }
     }
 
     // MARK: Surface
 
+    /// Drives the tab spinner during page loads (UX-MAC_BROWSER-008) via the
+    /// existing Surface.isBusy hook the tab/sidebar views already read.
+    public var isBusy: Bool { webView.isLoading }
     public func focus() { view.window?.makeFirstResponder(webView) }
+    public func focusAddressBar() {
+        view.window?.makeFirstResponder(addressBar)
+        addressBar.currentEditor()?.selectAll(nil)
+    }
+
+    private func showFind() {
+        findBar.isHidden = false
+        view.window?.makeFirstResponder(findField)
+        findField.currentEditor()?.selectAll(nil)
+    }
+
+    @objc private func closeFind() {
+        guard !findBar.isHidden else { return }
+        findBar.isHidden = true
+        view.window?.makeFirstResponder(webView)
+    }
+
+    @objc private func findNext() { runFind(forward: true) }
+    @objc private func findPrev() { runFind(forward: false) }
+
+    private func runFind(forward: Bool) {
+        let query = findField.stringValue
+        guard !query.isEmpty else { return }
+        let cfg = WKFindConfiguration()
+        cfg.backwards = !forward
+        cfg.caseSensitive = false
+        cfg.wraps = true
+        webView.find(query, configuration: cfg) { _ in }
+    }
     public func unfocus() {}
     public func didBecomeVisible() {
         guard !isVisible else { return }
@@ -583,12 +742,42 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         loadingObservation?.invalidate()
         loadingObservation = nil
         onNavigationChange = nil
+        externalURLOpener = nil
         webView.navigationDelegate = nil
+        webView.uiDelegate = nil
         webView.stopLoading()
     }
     public func sendText(_ text: String) { /* not applicable for browser */ }
     public func readText() -> String { webView.url?.absoluteString ?? "" }
     public func snapshot() -> [String: String] {
         ["url": webView.url?.absoluteString ?? "", "title": webView.title ?? ""]
+    }
+}
+
+/// Container view that intercepts Cmd-L to focus the address bar, giving
+/// keyboard users a way to reach the URL field (UX-MAC_BROWSER-006).
+private final class BrowserContainerView: NSView {
+    var onFocusAddressBar: (() -> Void)?
+    var onShowFind: (() -> Void)?
+    var onEscape: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command {
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "l": onFocusAddressBar?(); return true
+            case "f": onShowFind?(); return true
+            default: break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // Escape (keyCode 53) dismisses the find bar.
+        if event.keyCode == 53 {
+            onEscape?()
+            return
+        }
+        super.keyDown(with: event)
     }
 }

@@ -22,6 +22,7 @@ public struct TerminalRuntimeHealth: Sendable, Equatable {
     public var outputPartial: Bool
     public var outputPendingBytes: Int
     public var historyWriteFailures: Int
+    public var droppedOutputBytes: Int = 0
     public var rows: Int
     public var cols: Int
     public var renderDiagnostics: TerminalRenderDiagnostics? = nil

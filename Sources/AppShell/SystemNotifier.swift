@@ -8,7 +8,18 @@ import UserNotifications
 /// the in-app feed is unaffected.
 public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     public static let shared = SystemNotifier()
-    private var authorized = false
+
+    // `authorized` is written from UNUserNotificationCenter's authorization
+    // callback (arbitrary queue) and read from `post(...)` on arbitrary
+    // callers. Guard both with a lock so the access is a proper barrier
+    // (previously a plain Bool, which TSan flagged and could drop the first
+    // post after launch).
+    private let authLock = NSLock()
+    private var _authorized = false
+    private var authorized: Bool {
+        get { authLock.lock(); defer { authLock.unlock() }; return _authorized }
+        set { authLock.lock(); _authorized = newValue; authLock.unlock() }
+    }
 
     private override init() {
         super.init()

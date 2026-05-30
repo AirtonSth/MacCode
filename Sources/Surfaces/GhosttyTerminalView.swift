@@ -364,6 +364,12 @@ final class GhosttyTerminalView: NSView {
     private var lastScale = NSSize(width: 0, height: 0)
     private var renderGeneration = 0
     private var visibleInUI = true
+    private var dropHighlightLayer: CALayer?
+    /// Count of bytes discarded from the front of `pendingOutput` on overflow
+    /// while truly unrenderable (no live surface). Should stay 0 in normal
+    /// operation; exposed via runtime health so tests/telemetry catch the drop
+    /// path being hit (QA-006, guards PERF-009).
+    private(set) var droppedOutputBytes = 0
 
     private static let immediateOutputFlushBytes = 64 * 1024
     private static let maxPendingOutputBytes = 1024 * 1024
@@ -388,6 +394,11 @@ final class GhosttyTerminalView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override var isOpaque: Bool { false }
+
+    // Expose the live viewport text as the accessibility value so XCUITest /
+    // VoiceOver can read what the terminal currently shows (QA-001).
+    override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
+    override func accessibilityValue() -> Any? { readViewportText() }
 
     override func makeBackingLayer() -> CALayer {
         let metalLayer = CAMetalLayer()
@@ -471,7 +482,9 @@ final class GhosttyTerminalView: NSView {
         }
         // No surface to flush to yet (truly unrenderable): bound memory as a last
         // resort by discarding the oldest bytes.
-        pendingOutput.removeFirst(pendingOutput.count - Self.maxPendingOutputBytes)
+        let dropped = pendingOutput.count - Self.maxPendingOutputBytes
+        droppedOutputBytes += dropped
+        pendingOutput.removeFirst(dropped)
     }
 
     private func scheduleOutputFlush() {
@@ -555,9 +568,12 @@ final class GhosttyTerminalView: NSView {
     private func readText(pointTag: ghostty_point_tag_e) -> String? {
         ensureSurface()
         guard let surface = surfaceSlot.liveSurface() else { return nil }
-        flushPendingOutput(to: surface, render: isRenderable)
-        if isRenderable {
-            ghostty_surface_render_now(surface)
+        // Only force a synchronous render when there is actually pending output
+        // to apply; flushing it already renders the fresh frame. With nothing
+        // pending, read the existing frame's text directly to avoid a redundant
+        // GPU/main-thread render on every mirror poll (PERF-005).
+        if pendingOutput.isEmpty == false {
+            flushPendingOutput(to: surface, render: isRenderable)
         }
 
         let topLeft = ghostty_point_s(
@@ -711,6 +727,15 @@ final class GhosttyTerminalView: NSView {
             case "v":
                 pasteText(to: surface)
                 return
+            case "+", "=": // Cmd-+ (and bare Cmd-= without shift) → zoom in
+                changeFontSize("increase_font_size:1")
+                return
+            case "-", "_": // Cmd-- → zoom out
+                changeFontSize("decrease_font_size:1")
+                return
+            case "0": // Cmd-0 → reset zoom
+                changeFontSize("reset_font_size")
+                return
             default:
                 break
             }
@@ -766,11 +791,128 @@ final class GhosttyTerminalView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_RIGHT)
+        // When the foreground app is reporting mouse events (TUIs like vim/htop),
+        // forward the right button so it reaches the program. Otherwise let
+        // AppKit present the context menu from `menu(for:)` (UX-007).
+        if isMouseCaptured {
+            sendMouseButton(event, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_RIGHT)
+        } else {
+            super.rightMouseDown(with: event)
+        }
     }
 
     override func rightMouseUp(with event: NSEvent) {
+        guard isMouseCaptured else { return }
         sendMouseButton(event, state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_RIGHT)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        // No AppKit menu while the program owns the mouse; the right button was
+        // already forwarded in `rightMouseDown` (UX-007).
+        guard !isMouseCaptured else { return nil }
+        return makeContextMenu()
+    }
+
+    private var isMouseCaptured: Bool {
+        guard let surface = surfaceSlot.liveSurface() else { return false }
+        return ghostty_surface_mouse_captured(surface)
+    }
+
+    private func makeContextMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let hasSelection = surfaceSlot.liveSurface().map { ghostty_surface_has_selection($0) } ?? false
+        let hasClipboardText = (NSPasteboard.general.string(forType: .string)?.isEmpty == false)
+
+        let copy = menu.addItem(withTitle: "Copy", action: #selector(contextCopy(_:)), keyEquivalent: "")
+        copy.target = self
+        copy.isEnabled = hasSelection
+        copy.setAccessibilityIdentifier("surface.terminal.menu.copy")
+
+        let copyAll = menu.addItem(withTitle: "Copy All", action: #selector(contextCopyAll(_:)), keyEquivalent: "")
+        copyAll.target = self
+        copyAll.setAccessibilityIdentifier("surface.terminal.menu.copyAll")
+
+        let paste = menu.addItem(withTitle: "Paste", action: #selector(contextPaste(_:)), keyEquivalent: "")
+        paste.target = self
+        paste.isEnabled = hasClipboardText
+        paste.setAccessibilityIdentifier("surface.terminal.menu.paste")
+
+        menu.addItem(.separator())
+
+        let selectAll = menu.addItem(withTitle: "Select All", action: #selector(contextSelectAll(_:)), keyEquivalent: "")
+        selectAll.target = self
+        selectAll.setAccessibilityIdentifier("surface.terminal.menu.selectAll")
+
+        let jumpToBottom = menu.addItem(withTitle: "Jump to Bottom", action: #selector(contextJumpToBottom(_:)), keyEquivalent: "")
+        jumpToBottom.target = self
+        jumpToBottom.setAccessibilityIdentifier("surface.terminal.menu.jumpToBottom")
+
+        let clear = menu.addItem(withTitle: "Clear", action: #selector(contextClear(_:)), keyEquivalent: "")
+        clear.target = self
+        clear.setAccessibilityIdentifier("surface.terminal.menu.clear")
+
+        return menu
+    }
+
+    @objc private func contextCopy(_ sender: Any?) {
+        guard let surface = surfaceSlot.liveSurface() else { return }
+        copySelection(from: surface)
+    }
+
+    @objc private func contextCopyAll(_ sender: Any?) {
+        guard let text = readViewportText(), !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    @objc private func contextPaste(_ sender: Any?) {
+        guard let surface = surfaceForInput() else { return }
+        pasteText(to: surface)
+    }
+
+    @objc private func contextSelectAll(_ sender: Any?) {
+        performBindingAction("select_all")
+    }
+
+    @objc private func contextJumpToBottom(_ sender: Any?) {
+        performBindingAction("scroll_to_bottom")
+    }
+
+    @objc private func contextClear(_ sender: Any?) {
+        performBindingAction("clear_screen")
+    }
+
+    private func performBindingAction(_ action: String) {
+        guard let surface = surfaceForInput() else { return }
+        action.withCString { ptr in
+            _ = ghostty_surface_binding_action(surface, ptr, UInt(strlen(ptr)))
+        }
+        if isRenderable {
+            ghostty_surface_render_now(surface)
+            ghostty_surface_refresh(surface)
+        }
+    }
+
+    // Cmd-+/Cmd--/Cmd-0 zoom: drive Ghostty's font-size action, then re-derive
+    // and re-emit the grid size so the PTY winsize follows the new cell metrics
+    // (UX-008).
+    private func changeFontSize(_ action: String) {
+        performBindingAction(action)
+        updateGhosttySize(force: true)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        // Middle-click pastes the current terminal selection (X11/iTerm style)
+        // when the program isn't reporting mouse events; otherwise forward the
+        // middle button to the program (UX-012).
+        if event.buttonNumber == 2, !isMouseCaptured,
+           let surface = surfaceForInput(), ghostty_surface_has_selection(surface) {
+            window?.makeFirstResponder(self)
+            pasteSelection(from: surface)
+            return
+        }
+        super.otherMouseDown(with: event)
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -802,19 +944,55 @@ final class GhosttyTerminalView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : []
+        let accepts = DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard)
+        setDropHighlight(accepts)
+        return accepts ? .copy : []
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : []
     }
 
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        setDropHighlight(false)
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        setDropHighlight(false)
+    }
+
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        setDropHighlight(false)
         let paths = DroppedFilePaths.paths(from: sender.draggingPasteboard)
         guard !paths.isEmpty else { return false }
         guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return false }
         writeInputData(data)
         return true
+    }
+
+    // Visual drop target: a highlighted border while a file drag is over the
+    // terminal so users can tell the path will be pasted on release (UX-010).
+    private func setDropHighlight(_ active: Bool) {
+        if active {
+            let layer = dropHighlightLayer ?? makeDropHighlightLayer()
+            dropHighlightLayer = layer
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.frame = bounds
+            self.layer?.addSublayer(layer)
+            CATransaction.commit()
+        } else {
+            dropHighlightLayer?.removeFromSuperlayer()
+        }
+    }
+
+    private func makeDropHighlightLayer() -> CALayer {
+        let layer = CALayer()
+        layer.borderWidth = 2
+        layer.borderColor = NSColor.controlAccentColor.cgColor
+        layer.cornerRadius = 2
+        layer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor
+        return layer
     }
 
     private func surfaceForInput() -> ghostty_surface_t? {
@@ -831,6 +1009,16 @@ final class GhosttyTerminalView: NSView {
     private func pasteText(to surface: ghostty_surface_t) {
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
         sendText(text, to: surface)
+    }
+
+    private func pasteSelection(from surface: ghostty_surface_t) {
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_selection(surface, &text) else { return }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let raw = text.text, text.text_len > 0 else { return }
+        let value = String(decoding: Data(bytes: raw, count: Int(text.text_len)), as: UTF8.self)
+        guard !value.isEmpty else { return }
+        sendText(value, to: surface)
     }
 
     private func copySelection(from surface: ghostty_surface_t) {

@@ -8,6 +8,23 @@ import CoreModel
 import SocketServer
 import Surfaces
 import DesignSystemKit
+import os
+
+// Structured telemetry for the Files surface. Logs operation + error code + coarse size bucket
+// only — never paths or file contents — so field save/conflict/decode failures are visible
+// without leaking PII (QA-MAC_FILES-008).
+private let filesLog = Logger(subsystem: "io.remotecode.appshell", category: "files")
+
+private func sizeBucket(_ bytes: Int) -> String {
+    switch bytes {
+    case ..<0: return "unknown"
+    case 0..<16_384: return "<16KB"
+    case 16_384..<262_144: return "16KB-256KB"
+    case 262_144..<2_097_152: return "256KB-2MB"
+    case 2_097_152..<67_108_864: return "2MB-64MB"
+    default: return ">64MB"
+    }
+}
 
 @MainActor
 final class FilesSurface: NSObject, Surface {
@@ -73,6 +90,11 @@ private struct FileEntry: Identifiable, Equatable {
     let isEditable: Bool
     let editabilityReason: String
     let language: String?
+    // Precomputed once per entry so List rows don't recompute the icon or re-encode the base64
+    // drag payload on every redraw (PERF-MAC_FILES-010). `dragPayload` is filled in by the VM,
+    // which holds the workspace/surface IDs the payload needs.
+    let icon: String
+    var dragPayload: String?
 
     init?(value: JSONValue) {
         guard let object = value.objectValue,
@@ -84,14 +106,30 @@ private struct FileEntry: Identifiable, Equatable {
         self.path = path
         self.relativePath = relative
         self.id = path
-        self.isDirectory = object["type"]?.stringValue == "directory"
-        self.kind = identity["kind"]?.stringValue ?? (isDirectory ? "directory" : "unknown")
+        let isDirectory = object["type"]?.stringValue == "directory"
+        self.isDirectory = isDirectory
+        let kind = identity["kind"]?.stringValue ?? (isDirectory ? "directory" : "unknown")
+        self.kind = kind
         self.mime = identity["mime"]?.stringValue ?? "application/octet-stream"
         self.size = object["size"]?.intValue ?? 0
         self.modifiedAt = object["modified_at"]?.doubleValue
         self.isEditable = identity["is_editable"]?.boolValue == true
         self.editabilityReason = identity["editability_reason"]?.stringValue ?? "not editable"
         self.language = identity["language"]?.stringValue
+        self.icon = Self.icon(isDirectory: isDirectory, kind: kind)
+    }
+
+    static func icon(isDirectory: Bool, kind: String) -> String {
+        if isDirectory { return "folder" }
+        switch kind {
+        case "markdown": return "doc.richtext"
+        case "html": return "globe"
+        case "image": return "photo"
+        case "video": return "play.rectangle"
+        case "pdf": return "doc.text.magnifyingglass"
+        case "code": return "chevron.left.forwardslash.chevron.right"
+        default: return "doc"
+        }
     }
 }
 
@@ -127,7 +165,8 @@ private final class FilesViewModel: ObservableObject {
     @Published var dirtyPaths: Set<String> = []
     @Published var readerMode = "source"
     @Published var previewURL: URL?
-    @Published var syncLabel = "Host synced"
+    @Published var syncLabel = "Up to date"
+    @Published var syncDetail = ""
     @Published var conflictActive = false
 
     let surfaceID: SurfaceID
@@ -206,7 +245,13 @@ private final class FilesViewModel: ObservableObject {
         do {
             let result = try router?.fsWorkspaceList(workspace: workspaceID, path: relativePath)
             let values = result?.objectValue?["entries"]?.arrayValue ?? []
-            entries = values.compactMap(FileEntry.init(value:))
+            entries = values.compactMap(FileEntry.init(value:)).map { entry in
+                var entry = entry
+                if !entry.isDirectory {
+                    entry.dragPayload = FileTabDragPayload.encode(workspaceID: workspaceID, sourceSurfaceID: surfaceID, path: entry.relativePath)
+                }
+                return entry
+            }
             currentDirectory = result?.objectValue?["relative_path"]?.stringValue ?? relativePath
             isLoading = false
             _ = try? router?.filesStateUpdate(surface: surfaceID, patch: [
@@ -253,8 +298,9 @@ private final class FilesViewModel: ObservableObject {
                 setDraft(content)
                 renderedText = content
             }
-            syncLabel = "Synced r\(draftRevision)"
+            setSyncLabel("Up to date", revision: draftRevision)
         } catch {
+            logFailure("open", error: error)
             errorText = String(describing: error)
         }
     }
@@ -274,6 +320,7 @@ private final class FilesViewModel: ObservableObject {
             let result = try router?.filesEditSave(sessionID: sessionID)
             applyEditPayload(result?.objectValue ?? [:], remote: false)
         } catch {
+            logFailure("save", error: error)
             errorText = String(describing: error)
         }
     }
@@ -284,6 +331,7 @@ private final class FilesViewModel: ObservableObject {
             let result = try router?.filesEditDiscard(sessionID: sessionID)
             applyEditPayload(result?.objectValue ?? [:], remote: false)
         } catch {
+            logFailure("discard", error: error)
             errorText = String(describing: error)
         }
     }
@@ -394,6 +442,7 @@ private final class FilesViewModel: ObservableObject {
             )
             applyEditPayload(result?.objectValue ?? [:], remote: false)
         } catch {
+            logFailure("patch", error: error)
             errorText = String(describing: error)
         }
         applying = false
@@ -436,13 +485,29 @@ private final class FilesViewModel: ObservableObject {
             readerMode = state["reader_mode"]?.stringValue ?? readerMode
             dirtyPaths = Self.dirtyPaths(from: state)
             isDirty = selectedPath.map { dirtyPaths.contains($0) } ?? isDirty
-            syncLabel = "State r\(state["revision"]?.intValue ?? 0)"
+            setSyncLabel(isDirty ? "Unsaved" : "Up to date", revision: state["revision"]?.intValue ?? 0)
         case "files.edit.opened", "files.edit.patch_applied", "files.edit.saved", "files.edit.discarded":
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString else { return }
             applyEditPayload(payload, remote: payload["updated_by_device"]?.stringValue != "mac-local")
         case "files.edit.conflict":
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString else { return }
             conflictActive = true
+            filesLog.notice("files.conflict kind=\(self.selectedEntry?.kind ?? "none", privacy: .public) size=\(sizeBucket(self.selectedEntry?.size ?? -1), privacy: .public)")
+        case "files.edit.closed":
+            // A session closed elsewhere (e.g. another device or a server-side cleanup) must clear
+            // our local session/dirty state for that path; otherwise we'd keep editing against a
+            // session the host no longer has (QA-MAC_FILES-007).
+            guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString,
+                  let closedID = payload["session_id"]?.stringValue else { return }
+            if let path = payload["path"]?.stringValue {
+                dirtyPaths.remove(path)
+                sessionCache.removeValue(forKey: path)
+            }
+            if sessionID == closedID {
+                sessionID = nil
+                sessionPath = nil
+                isDirty = false
+            }
         default:
             break
         }
@@ -471,7 +536,32 @@ private final class FilesViewModel: ObservableObject {
             }
             renderedText = content
         }
-        syncLabel = remote ? "Edited on other device r\(draftRevision)" : "Synced r\(draftRevision)"
+        if remote {
+            setSyncLabel("Edited on another device", revision: draftRevision)
+        } else if isDirty {
+            setSyncLabel("Unsaved", revision: draftRevision)
+        } else {
+            setSyncLabel("Saved", revision: draftRevision)
+        }
+    }
+
+    /// Human-readable sync status with the internal revision kept only as a tooltip detail
+    /// (UX-MAC_FILES-006).
+    private func setSyncLabel(_ label: String, revision: Int) {
+        syncLabel = label
+        syncDetail = "Revision \(revision)"
+    }
+
+    /// Record an operation failure with its RPC error code, file kind, and a coarse size bucket —
+    /// no paths or contents — so flaky save/conflict/decode reports are reproducible (QA-MAC_FILES-008).
+    private func logFailure(_ operation: String, error: Error) {
+        let kind = selectedEntry?.kind ?? "none"
+        let bucket = sizeBucket(selectedEntry?.size ?? -1)
+        if let rpc = error as? JSONRPCError {
+            filesLog.error("files.\(operation, privacy: .public) failed code=\(rpc.code, privacy: .public) kind=\(kind, privacy: .public) size=\(bucket, privacy: .public)")
+        } else {
+            filesLog.error("files.\(operation, privacy: .public) failed kind=\(kind, privacy: .public) size=\(bucket, privacy: .public)")
+        }
     }
 
     private static func dirtyPaths(from state: [String: JSONValue]) -> Set<String> {
@@ -515,7 +605,7 @@ private final class FilesViewModel: ObservableObject {
         setDraft(snapshot.draftText)
         lastSyncedText = snapshot.lastSyncedText
         renderedText = snapshot.draftText
-        syncLabel = "Synced r\(draftRevision)"
+        setSyncLabel(isDirty ? "Unsaved" : "Up to date", revision: draftRevision)
     }
 }
 
@@ -534,6 +624,8 @@ private struct FilesSurfaceRoot: View {
     @State private var renameText = ""
     @State private var deleteTargets: [FileEntry] = []
     @State private var confirmDelete = false
+    @State private var pathInvalid = false
+    @State private var dropTargeted = false
     @FocusState private var newFileFieldFocused: Bool
 
     var body: some View {
@@ -569,7 +661,9 @@ private struct FilesSurfaceRoot: View {
             TextField("File name", text: $newFileName)
                 .focused($newFileFieldFocused)
                 .onSubmit { createNewFile() }
+                .accessibilityIdentifier("files.newFile.field")
             Button("Create") { createNewFile() }
+                .accessibilityIdentifier("files.newFile.create")
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(model.currentDirectory.isEmpty ? "Create in workspace root." : "Create in \(model.currentDirectory).")
@@ -623,43 +717,52 @@ private struct FilesSurfaceRoot: View {
                         showNewFileDialog = true
                     }
                     .accessibilityLabel("New file")
+                    .accessibilityIdentifier("files.newFile.button")
                 }
                 TextField("Path", text: $pathInput)
                     .font(DS.Font.monoSmall)
                     .textFieldStyle(.plain)
-                    .foregroundStyle(DS.Palette.textSecondary)
+                    .foregroundStyle(pathInvalid ? DS.Palette.danger : DS.Palette.textSecondary)
                     .lineLimit(1)
                     .onSubmit { submitPath() }
                     .help("Type a workspace path and press Return")
                     .accessibilityLabel("Workspace path")
+                    .accessibilityIdentifier("files.path.field")
+                breadcrumb
             }
             List(selection: $selectedFileIDs) {
                 if !model.currentDirectory.isEmpty {
                     Button {
-                        let parent = (model.currentDirectory as NSString).deletingLastPathComponent
-                        model.loadDirectory(parent == "." ? "" : parent)
+                        navigateToParent()
                     } label: {
                         row(icon: "arrow.turn.up.left", name: "..", detail: "Parent", active: false)
                     }
                     .buttonStyle(.plain)
                     .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
                     .listRowBackground(Color.clear)
-                    .help("Go to parent folder")
+                    // Cmd+Up navigates up a level for keyboard users, since the ".." row is not part
+                    // of the List selection set and arrow keys never reach it (UX-MAC_FILES-012).
+                    .keyboardShortcut(.upArrow, modifiers: .command)
+                    .help("Go to parent folder (⌘↑)")
+                    .accessibilityIdentifier("files.parent.button")
                 }
                 ForEach(model.entries) { entry in
-                    row(icon: icon(for: entry), name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath))
+                    row(icon: entry.icon, name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath), dirtyPath: entry.relativePath)
                         .tag(entry.id)
                         .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
                         .listRowBackground(Color.clear)
                         .contextMenu { fileContextMenu(for: entry) }
-                        .fileTabDragPayload(entry.isDirectory ? nil : FileTabDragPayload.encode(workspaceID: model.workspaceID, sourceSurfaceID: model.surfaceID, path: entry.relativePath))
+                        .fileTabDragPayload(entry.dragPayload)
                         .help(entry.relativePath.isEmpty ? entry.name : entry.relativePath)
+                        .accessibilityIdentifier("files.row.\(entry.relativePath)")
                 }
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            .accessibilityIdentifier("files.sidebar.list")
             if model.isLoading {
                 ProgressView().controlSize(.small)
+                    .accessibilityIdentifier("files.sidebar.loading")
             }
         }
         .padding(12)
@@ -669,6 +772,81 @@ private struct FilesSurfaceRoot: View {
     private var displayPath: String {
         guard !model.currentDirectory.isEmpty else { return model.root }
         return (model.root as NSString).appendingPathComponent(model.currentDirectory)
+    }
+
+    // Language badge, size, and modified-ago for the selected text file so users get context
+    // that previously only appeared in the binary view (UX-MAC_FILES-007).
+    private func fileMetaSubtitle(_ entry: FileEntry) -> String? {
+        var parts: [String] = []
+        if let language = entry.language, !language.isEmpty {
+            parts.append(language)
+        } else if !entry.kind.isEmpty {
+            parts.append(entry.kind)
+        }
+        parts.append(ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file))
+        if let modified = entry.modifiedAt {
+            let date = Date(timeIntervalSince1970: modified)
+            parts.append(Self.relativeDateFormatter.localizedString(for: date, relativeTo: Date()))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+
+    // Map developer-facing error descriptions (raw JSONRPCError) to friendly copy so that
+    // "workspace root not found" vs "path escapes workspace" no longer look identical and
+    // unfriendly, and offer a recovery path where it makes sense (UX-MAC_FILES-017).
+    private static func friendlyError(_ raw: String) -> (title: String, symbol: String, detail: String, offerRoot: Bool) {
+        let lower = raw.lowercased()
+        if lower.contains("escapes workspace") {
+            return ("Outside the workspace", "lock.shield", "That path is outside this workspace. Files stay scoped to the workspace root.", true)
+        }
+        if lower.contains("workspace root not found") {
+            return ("Workspace unavailable", "folder.badge.questionmark", "The workspace folder could not be found. It may have been moved or deleted.", false)
+        }
+        if lower.contains("not found") {
+            return ("Not found", "questionmark.folder", "This path no longer exists in the workspace.", true)
+        }
+        if lower.contains("permission") || lower.contains("not permitted") {
+            return ("Permission denied", "hand.raised", "RemoteCode can't access this path.", true)
+        }
+        return ("Files error", "exclamationmark.triangle", raw, true)
+    }
+
+    // Clickable breadcrumb so users can jump to any ancestor without typing full paths or
+    // clicking up through ".." repeatedly (UX-MAC_FILES-014).
+    private var breadcrumb: some View {
+        let segments = model.currentDirectory.split(separator: "/").map(String.init)
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                Button("root") { model.loadDirectory("") }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(segments.isEmpty ? DS.Palette.text : DS.Palette.accent)
+                    .accessibilityIdentifier("files.breadcrumb.root")
+                ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8))
+                        .foregroundStyle(DS.Palette.textTertiary)
+                    Button(segment) {
+                        model.loadDirectory(segments[0...index].joined(separator: "/"))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(index == segments.count - 1 ? DS.Palette.text : DS.Palette.accent)
+                    .accessibilityIdentifier("files.breadcrumb.\(segment)")
+                }
+            }
+            .font(DS.Font.caption2)
+            .lineLimit(1)
+        }
+    }
+
+    private func navigateToParent() {
+        let parent = (model.currentDirectory as NSString).deletingLastPathComponent
+        model.loadDirectory(parent == "." ? "" : parent)
     }
 
     private func submitPath() {
@@ -683,6 +861,15 @@ private struct FilesSurfaceRoot: View {
             relative = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         }
         model.loadDirectory(relative)
+        // On a bad path the error surfaces far away in the reader; flag the field red and restore
+        // the last valid path so the input doesn't silently keep invalid text (UX-MAC_FILES-013).
+        if model.errorText != nil {
+            pathInvalid = true
+            pathInput = displayPath
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { pathInvalid = false }
+        } else {
+            pathInvalid = false
+        }
     }
 
     private var selectedEntries: [FileEntry] {
@@ -701,6 +888,11 @@ private struct FilesSurfaceRoot: View {
                 Button("Open in New Tab") { model.openInNewTab(entry) }
                 Divider()
             }
+            Button("Reveal in Finder") { revealInFinder(entry) }
+            if !entry.isDirectory {
+                Button("Open with Default App") { openWithDefaultApp(entry) }
+            }
+            Divider()
             Button("Rename...") { beginRename(entry) }
             Divider()
             Button("Delete", role: .destructive) { beginDelete(targets) }
@@ -712,6 +904,16 @@ private struct FilesSurfaceRoot: View {
     private func createNewFile() {
         model.createFile(named: newFileName)
         newFileName = ""
+    }
+
+    // Escape hatches to the real file via Finder / default app, for binaries and large media
+    // that RemoteCode can't render usefully (UX-MAC_FILES-009).
+    private func revealInFinder(_ entry: FileEntry) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: entry.path)])
+    }
+
+    private func openWithDefaultApp(_ entry: FileEntry) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: entry.path))
     }
 
     private func beginRename(_ entry: FileEntry) {
@@ -748,18 +950,48 @@ private struct FilesSurfaceRoot: View {
                     Divider().overlay(DS.Palette.line)
                 }
                 if let error = model.errorText {
-                    FilesEmptyState(title: "Files error", symbol: "exclamationmark.triangle", detail: error)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    let mapped = Self.friendlyError(error)
+                    FilesEmptyState(title: mapped.title, symbol: mapped.symbol, detail: mapped.detail) {
+                        if mapped.offerRoot {
+                            Button("Go to Workspace Root") { model.loadDirectory("") }
+                                .accessibilityIdentifier("files.error.goRoot")
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("files.emptyState.error")
                 } else if model.selectedEntry == nil {
                     FilesEmptyState(title: "Select a file", symbol: "doc.text.magnifyingglass", detail: "Workspace files stay scoped to this root.")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("files.emptyState.select")
                 } else {
                     previewBody
                 }
             }
             .dropDestination(for: String.self) { values, location in
+                dropTargeted = false
                 guard let payload = values.first else { return false }
                 return model.handleFileDropPayload(payload, location: location, size: proxy.size)
+            } isTargeted: { targeted in
+                dropTargeted = targeted
+            }
+            // Show where a dragged file tab will land so the user isn't guessing right-vs-bottom
+            // split until release (UX-MAC_FILES-018). The destination computes direction by the
+            // drop's y-position; the overlay mirrors that split affordance during drag-over.
+            .overlay {
+                if dropTargeted {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: DS.Radius.control)
+                            .stroke(DS.Palette.accent, lineWidth: 2)
+                        Text("Drop to split")
+                            .font(DS.Font.captionStrong)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(DS.Palette.surfaceRaised, in: Capsule())
+                            .foregroundStyle(DS.Palette.accent)
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("files.split.dropIndicator")
+                }
             }
             .background(DS.Palette.bg)
         }
@@ -785,8 +1017,10 @@ private struct FilesSurfaceRoot: View {
             Spacer(minLength: 8)
             Button("Keep Editing") { model.conflictActive = false }
                 .help("Dismiss this notice and keep your unsaved draft")
+                .accessibilityIdentifier("files.conflict.keepEditing")
             Button("Reload from Disk") { model.discard() }
                 .help("Replace your draft with the current file on disk")
+                .accessibilityIdentifier("files.conflict.reload")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -813,6 +1047,13 @@ private struct FilesSurfaceRoot: View {
                     .foregroundStyle(DS.Palette.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                if let entry = model.selectedEntry, !entry.isDirectory, let detail = fileMetaSubtitle(entry) {
+                    Text(detail)
+                        .font(DS.Font.caption2)
+                        .foregroundStyle(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                        .accessibilityIdentifier("files.header.meta")
+                }
             }
             Spacer()
             if model.isDirty {
@@ -823,6 +1064,8 @@ private struct FilesSurfaceRoot: View {
             Text(model.syncLabel)
                 .font(DS.Font.caption)
                 .foregroundStyle(DS.Palette.textSecondary)
+                .help(model.syncDetail)
+                .accessibilityIdentifier("files.sync.label")
             Picker("", selection: $model.readerMode) {
                 Text("Source").tag("source")
                 Text("Preview").tag("preview")
@@ -831,6 +1074,7 @@ private struct FilesSurfaceRoot: View {
             .pickerStyle(.segmented)
             .frame(width: 190)
             .onChange(of: model.readerMode) { newValue in model.setReaderMode(newValue) }
+            .accessibilityIdentifier("files.readerMode.picker")
             Button { model.save() } label: {
                 DisketteIcon()
                     .frame(width: 16, height: 16)
@@ -838,9 +1082,11 @@ private struct FilesSurfaceRoot: View {
                 .help("Save")
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(!model.isDirty)
+                .accessibilityIdentifier("files.save.button")
             Button { confirmDiscard = true } label: { Image(systemName: "arrow.uturn.backward") }
                 .help("Discard")
                 .disabled(!model.isDirty)
+                .accessibilityIdentifier("files.discard.button")
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12)
@@ -885,11 +1131,11 @@ private struct FilesSurfaceRoot: View {
             case "html":
                 sourcePreview(markdown: false)
             case "image":
-                ImagePreview(url: model.previewURL)
+                LargeMediaGuard(entry: entry, url: model.previewURL) { url in ImagePreview(url: url) }
             case "video":
-                VideoPreview(url: model.previewURL)
+                LargeMediaGuard(entry: entry, url: model.previewURL) { url in VideoPreview(url: url) }
             case "pdf":
-                WebFileView(url: model.previewURL)
+                LargeMediaGuard(entry: entry, url: model.previewURL) { url in WebFileView(url: url) }
             case "code", "text":
                 sourcePreview(markdown: false)
             default:
@@ -904,12 +1150,12 @@ private struct FilesSurfaceRoot: View {
             ? MarkdownSurface.renderHTML(markdown: model.draftText)
             : (model.selectedEntry?.kind == "html" ? model.draftText : highlightedHTML(text: model.draftText, language: model.selectedEntry?.language))
         if model.readerMode == "preview" {
-            WebHTMLView(html: preview, baseURL: model.previewURL?.deletingLastPathComponent())
+            PreviewWebView(html: preview, baseURL: model.previewURL?.deletingLastPathComponent())
         } else if model.readerMode == "split" {
             HStack(spacing: 0) {
                 editor
                 Divider().overlay(DS.Palette.line)
-                WebHTMLView(html: preview, baseURL: model.previewURL?.deletingLastPathComponent())
+                PreviewWebView(html: preview, baseURL: model.previewURL?.deletingLastPathComponent())
             }
         } else {
             editor
@@ -922,7 +1168,7 @@ private struct FilesSurfaceRoot: View {
         }
     }
 
-    private func row(icon: String, name: String, detail: String, active: Bool, dirty: Bool = false) -> some View {
+    private func row(icon: String, name: String, detail: String, active: Bool, dirty: Bool = false, dirtyPath: String? = nil) -> some View {
         HStack(spacing: 8) {
             Image(systemName: icon)
                 .frame(width: 18)
@@ -937,6 +1183,7 @@ private struct FilesSurfaceRoot: View {
                     .fill(DS.Palette.warning)
                     .frame(width: 7, height: 7)
                     .accessibilityLabel("Unsaved changes")
+                    .accessibilityIdentifier("files.dirtyDot.\(dirtyPath ?? "")")
             }
         }
         .padding(.horizontal, 7)
@@ -946,17 +1193,46 @@ private struct FilesSurfaceRoot: View {
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control))
         .contentShape(Rectangle())
     }
+}
 
-    private func icon(for entry: FileEntry) -> String {
-        if entry.isDirectory { return "folder" }
-        switch entry.kind {
-        case "markdown": return "doc.richtext"
-        case "html": return "globe"
-        case "image": return "photo"
-        case "video": return "play.rectangle"
-        case "pdf": return "doc.text.magnifyingglass"
-        case "code": return "chevron.left.forwardslash.chevron.right"
-        default: return "doc"
+/// Gate large media (image/video/PDF) behind an explicit confirmation so selecting a multi-GB
+/// video or huge image does not stall/spike memory by decoding/streaming it immediately. Text
+/// reads are already byte-capped; media previews load straight from disk (UX-MAC_FILES-008).
+private struct LargeMediaGuard<Content: View>: View {
+    static var threshold: Int { 64 * 1024 * 1024 }
+    let entry: FileEntry
+    let url: URL?
+    @ViewBuilder let content: (URL?) -> Content
+    @State private var loadAnyway = false
+
+    var body: some View {
+        if entry.size > Self.threshold && !loadAnyway {
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 28))
+                    .foregroundStyle(DS.Palette.textTertiary)
+                Text("Large file")
+                    .font(DS.Font.title3)
+                Text("\(ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file)) — loading it in RemoteCode may be slow.")
+                    .font(DS.Font.bodyDense)
+                    .foregroundStyle(DS.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+                HStack(spacing: 8) {
+                    Button("Open Externally") {
+                        if let url { NSWorkspace.shared.open(url) }
+                    }
+                    .accessibilityIdentifier("files.largeMedia.openExternal")
+                    Button("Load Anyway") { loadAnyway = true }
+                        .accessibilityIdentifier("files.largeMedia.loadAnyway")
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(DS.Palette.bg)
+            .onChange(of: entry.id) { _ in loadAnyway = false }
+        } else {
+            content(url)
+                .onChange(of: entry.id) { _ in loadAnyway = false }
         }
     }
 }
@@ -1119,10 +1395,11 @@ private final class VideoPlayerHolder: ObservableObject {
     }
 }
 
-private struct FilesEmptyState: View {
+private struct FilesEmptyState<Actions: View>: View {
     let title: String
     let symbol: String
     let detail: String
+    @ViewBuilder let actions: () -> Actions
 
     var body: some View {
         VStack(spacing: 10) {
@@ -1138,9 +1415,16 @@ private struct FilesEmptyState: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 360)
             }
+            actions()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.bg)
+    }
+}
+
+extension FilesEmptyState where Actions == EmptyView {
+    init(title: String, symbol: String, detail: String) {
+        self.init(title: title, symbol: symbol, detail: detail, actions: { EmptyView() })
     }
 }
 
@@ -1157,6 +1441,17 @@ private struct BinaryMetadataView: View {
                 GridRow { Text("MIME"); Text(entry.mime).font(DS.Font.monoSmall) }
                 GridRow { Text("Size"); Text("\(entry.size) bytes").font(DS.Font.monoSmall) }
             }
+            // Escape hatch to the real file for binaries RemoteCode can't render (UX-MAC_FILES-009).
+            HStack(spacing: 8) {
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: entry.path)])
+                }
+                .accessibilityIdentifier("files.binary.reveal")
+                Button("Open with Default App") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: entry.path))
+                }
+                .accessibilityIdentifier("files.binary.openExternal")
+            }
             Spacer()
         }
         .padding(20)
@@ -1165,28 +1460,88 @@ private struct BinaryMetadataView: View {
     }
 }
 
+// Light placeholder while the web view first paints, so large markdown/HTML previews don't show
+// a blank pane that then pops in (UX-MAC_FILES-015).
+private struct PreviewWebView: View {
+    let html: String
+    let baseURL: URL?
+    @State private var firstPaintDone = false
+
+    var body: some View {
+        ZStack {
+            WebHTMLView(html: html, baseURL: baseURL) { firstPaintDone = true }
+            if !firstPaintDone {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(DS.Palette.bg)
+                    .accessibilityIdentifier("files.preview.loading")
+            }
+        }
+    }
+}
+
 private struct WebHTMLView: NSViewRepresentable {
     let html: String
     let baseURL: URL?
+    var onFirstPaint: (() -> Void)? = nil
+
     func makeNSView(context: Context) -> WKWebView {
         let view = WKWebView()
         view.setValue(false, forKey: "drawsBackground")
+        view.navigationDelegate = context.coordinator
         return view
     }
+
+    // Only reload when the HTML actually changes. Previously every unrelated @Published change
+    // (sync label, dirty flag) re-ran updateNSView and reloaded the web view, causing a full
+    // reflow/flash and CPU spike — amplified in split mode while typing (PERF-MAC_FILES-006).
     func updateNSView(_ view: WKWebView, context: Context) {
+        guard context.coordinator.lastHTML != html else { return }
+        context.coordinator.lastHTML = html
         view.loadHTMLString(html, baseURL: baseURL)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onFirstPaint: onFirstPaint) }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var lastHTML: String?
+        private let onFirstPaint: (() -> Void)?
+        private var firstPaintReported = false
+
+        init(onFirstPaint: (() -> Void)?) {
+            self.onFirstPaint = onFirstPaint
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard !firstPaintReported else { return }
+            firstPaintReported = true
+            onFirstPaint?()
+        }
     }
 }
 
 private struct WebFileView: NSViewRepresentable {
     let url: URL?
+
     func makeNSView(context: Context) -> WKWebView {
         let view = WKWebView()
         view.setValue(false, forKey: "drawsBackground")
         return view
     }
+
+    // Skip the reload when the URL is unchanged so unrelated state updates don't reload the PDF
+    // (PERF-MAC_FILES-006).
     func updateNSView(_ view: WKWebView, context: Context) {
-        if let url { view.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent()) }
+        guard let url, context.coordinator.lastURL != url else { return }
+        context.coordinator.lastURL = url
+        view.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var lastURL: URL?
     }
 }
 
@@ -1314,6 +1669,7 @@ private struct CodeTextEditor: NSViewRepresentable {
 
 private final class CodeLineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
+    private var lastVisibleGlyphRange = NSRange(location: NSNotFound, length: 0)
     private let attributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
         .foregroundColor: NSColor(red: 0.45, green: 0.47, blue: 0.50, alpha: 1)
@@ -1336,7 +1692,19 @@ private final class CodeLineNumberRulerView: NSRulerView {
         NotificationCenter.default.removeObserver(self)
     }
 
+    // Coalesce scroll-driven redraws: only repaint when the set of visible lines actually changes,
+    // not on every bounds tick (e.g. horizontal scroll, sub-pixel jitter) (PERF-MAC_FILES-012).
     @objc private func boundsChanged() {
+        guard let textView,
+              let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer,
+              let clipView = textView.enclosingScrollView?.contentView else {
+            needsDisplay = true
+            return
+        }
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: clipView.bounds, in: textContainer)
+        guard !NSEqualRanges(glyphRange, lastVisibleGlyphRange) else { return }
+        lastVisibleGlyphRange = glyphRange
         needsDisplay = true
     }
 

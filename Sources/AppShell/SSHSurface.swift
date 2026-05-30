@@ -4,6 +4,11 @@ import CoreModel
 import DesignSystemKit
 import SocketServer
 import Surfaces
+import os
+
+// Structured logging for SSH connect/transfer/listing so flaky sessions can be
+// diagnosed from logs instead of the short in-memory log (QA-MAC_SSH-006).
+private let sshLog = Logger(subsystem: "io.remotecode.appshell", category: "ssh")
 
 @MainActor
 protocol SSHTransferSurface: Surface {
@@ -27,6 +32,12 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface?
     private var activeTransferCount = 0
+    // Injectable file pickers so tests can supply a path without a blocking
+    // NSOpenPanel modal (QA-MAC_SSH-003). Default nil → real panel.
+    var localPathPickerForTesting: (() -> (path: String, isDirectory: Bool)?)?
+    var identityFilePickerForTesting: (() -> String?)? {
+        didSet { viewModel.identityFilePicker = identityFilePickerForTesting }
+    }
     static let hostSidebarWidthDefaultsKey = "ssh.hosts.sidebar.width.v1"
     static let transferSidebarWidthDefaultsKey = "ssh.files.sidebar.width.v1"
     static let transferSidebarExpandedDefaultsKey = "ssh.files.sidebar.expanded.v1"
@@ -157,9 +168,15 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     private func applyAdaptiveHostSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
-        guard width > 0 else { return }
         guard view.window != nil else { return }
-        let now = Date().timeIntervalSinceReferenceDate
+        applyAdaptiveHostSidebar(width: width, event: event, now: Date().timeIntervalSinceReferenceDate)
+    }
+
+    // Window-independent, clock-injectable core so the policy can be driven
+    // deterministically in tests without attaching a real window or relying on
+    // wall-clock debounce (QA-MAC_SSH-010).
+    private func applyAdaptiveHostSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent, now: TimeInterval) {
+        guard width > 0 else { return }
         let transferWidth = transferWidthConstraint?.constant ?? 0
         let decision = AdaptiveSidebarPolicy.nextVisibility(
             availableExtent: width - transferWidth,
@@ -176,6 +193,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         if decision.didChangeAutomatically {
             viewModel.lastAutomaticHostSidebarChange = now
         }
+    }
+
+    func applyAdaptiveHostSidebarForTesting(width: CGFloat, event: AdaptiveSidebarLayoutEvent, now: TimeInterval) {
+        applyAdaptiveHostSidebar(width: width, event: event, now: now)
     }
 
     private static func persistedHostSidebarWidth() -> CGFloat {
@@ -203,8 +224,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         let start = dragStartSidebarWidth ?? Self.persistedHostSidebarWidth()
         let next = min(520, max(220, start + delta))
         sidebarWidthConstraint?.constant = next
-        UserDefaults.standard.set(Double(next), forKey: Self.hostSidebarWidthDefaultsKey)
+        // Persist only when the drag ends, not on every delta, to avoid hundreds
+        // of synchronous UserDefaults writes per drag (PERF-MAC_SSH-012).
         if ended {
+            UserDefaults.standard.set(Double(next), forKey: Self.hostSidebarWidthDefaultsKey)
             dragStartSidebarWidth = nil
         }
     }
@@ -233,8 +256,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         let start = dragStartTransferWidth ?? Self.persistedTransferSidebarWidth()
         let next = min(1120, max(480, start - delta))
         transferWidthConstraint?.constant = next
-        UserDefaults.standard.set(Double(next), forKey: Self.transferSidebarWidthDefaultsKey)
+        // Persist only on drag end (PERF-MAC_SSH-012).
         if ended {
+            UserDefaults.standard.set(Double(next), forKey: Self.transferSidebarWidthDefaultsKey)
             dragStartTransferWidth = nil
         }
     }
@@ -301,6 +325,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     private func performConnect(_ host: SSHHostProfile) {
+        sshLog.info("ssh connect start: \(host.destination, privacy: .private)")
         do {
             let saved = try router?.sshHostUpsert(host, workspace: workspaceID) ?? host
             terminal?.close()
@@ -326,9 +351,11 @@ final class SSHSurface: NSObject, SSHTransferSurface {
                 "status": .string("connected")
             ]))
             reloadHosts()
+            sshLog.info("ssh connect ok: \(saved.destination, privacy: .private)")
         } catch {
             viewModel.status = "Failed"
             viewModel.error = error.localizedDescription
+            sshLog.error("ssh connect failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -338,6 +365,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: .queued)
         viewModel.transferStatus = "\(kind) running"
         activeTransferCount += 1
+        sshLog.info("ssh transfer start: \(kind, privacy: .public)")
         Task { [weak self] in
             guard let self else { return }
             // Process execution runs off the main run loop inside the router's
@@ -350,10 +378,12 @@ final class SSHSurface: NSObject, SSHTransferSurface {
                 ok = result?.objectValue?["ok"]?.boolValue == true
                 self.viewModel.transferStatus = ok ? "\(kind) completed" : "\(kind) failed"
                 self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: ok ? .successful : .failed)
+                sshLog.info("ssh transfer end: \(kind, privacy: .public) ok=\(ok, privacy: .public)")
             } catch {
                 self.viewModel.transferStatus = "\(kind) failed"
                 self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: .failed)
                 self.viewModel.error = error.localizedDescription
+                sshLog.error("ssh transfer error: \(kind, privacy: .public) \(error.localizedDescription, privacy: .public)")
             }
             self.activeTransferCount -= 1
             // Coalesce listing refreshes: only refresh once the whole batch
@@ -371,7 +401,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             viewModel.applyLocalListing(listing?.objectValue ?? [:])
         } catch {
             viewModel.transferStatus = "Local list failed"
+            viewModel.localListError = error.localizedDescription
             viewModel.addTransferLog("Local: \(error.localizedDescription)")
+            sshLog.error("ssh local list failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -382,7 +414,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             viewModel.applyRemoteListing(listing?.objectValue ?? [:])
         } catch {
             viewModel.transferStatus = "Remote list failed"
+            viewModel.remoteListError = error.localizedDescription
             viewModel.addTransferLog("Remote: \(error.localizedDescription)")
+            sshLog.error("ssh remote list failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -396,19 +430,27 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             viewModel.applyRemoteListing(listing?.objectValue ?? [:])
         } catch {
             viewModel.transferStatus = "Remote list failed"
+            viewModel.remoteListError = error.localizedDescription
             viewModel.addTransferLog("Remote: \(error.localizedDescription)")
+            sshLog.error("ssh remote list (async) failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
     private func chooseLocalTransferPath() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        if panel.runModal() == .OK, let url = panel.url {
-            viewModel.selectLocalPath(url.path, isDirectory: url.hasDirectoryPath)
-            if url.hasDirectoryPath { refreshLocalFiles() }
+        let picked: (path: String, isDirectory: Bool)?
+        if let localPathPickerForTesting {
+            picked = localPathPickerForTesting()
+        } else {
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
+            panel.prompt = "Choose"
+            picked = panel.runModal() == .OK ? panel.url.map { ($0.path, $0.hasDirectoryPath) } : nil
+        }
+        if let picked {
+            viewModel.selectLocalPath(picked.path, isDirectory: picked.isDirectory)
+            if picked.isDirectory { refreshLocalFiles() }
         }
     }
 
@@ -507,6 +549,22 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         sidebarWidthConstraint?.constant = min(520, max(220, width))
         UserDefaults.standard.set(Double(sidebarWidthConstraint?.constant ?? width), forKey: Self.hostSidebarWidthDefaultsKey)
     }
+
+    // Testing accessors over the fileprivate view model so tests can assert
+    // transfer/queue/selection state without reaching into private types
+    // (QA-MAC_SSH-008). Plain value types keep the VM itself encapsulated.
+    var transferStatusForTesting: String { viewModel.transferStatus }
+    var queueCountForTesting: Int { viewModel.queueItems.count }
+    var queuedCountForTesting: Int { viewModel.queueItems.filter { $0.status == .queued }.count }
+    var selectedLocalCountForTesting: Int { viewModel.selectedLocalIDs.count }
+    var selectedRemoteCountForTesting: Int { viewModel.selectedRemoteIDs.count }
+    var transferLogForTesting: [String] { viewModel.transferLogs }
+
+    /// Drives a single transfer end-to-end through the same path the UI uses so
+    /// tests can exercise queue/status updates with a fake router.
+    func runTransferForTesting(upload: Bool, localPath: String, remotePath: String) {
+        runTransfer(upload: upload, localPath: localPath, remotePath: remotePath)
+    }
 }
 
 private struct SSHFileEntry: Identifiable, Hashable {
@@ -570,10 +628,9 @@ private struct SSHQueueColumnWidths {
     var direction: CGFloat = 86
     var remote: CGFloat = 180
     var size: CGFloat = 70
-    var priority: CGFloat = 74
     var status: CGFloat = 86
 
-    var total: CGFloat { local + direction + remote + size + priority + status }
+    var total: CGFloat { local + direction + remote + size + status }
 }
 
 @MainActor
@@ -598,6 +655,10 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     @Published var remoteSitePath = "/"
     @Published var localEntries: [SSHFileEntry] = []
     @Published var remoteEntries: [SSHFileEntry] = []
+    // Per-pane listing error so the empty state can distinguish "empty
+    // directory" from "listing failed / permission denied" (UX-MAC_SSH-011).
+    @Published var localListError: String?
+    @Published var remoteListError: String?
     // Derived once per listing so the views don't filter/map/reduce on every
     // render (PERF-MAC_SSH-008 / PERF-MAC_SSH-009).
     @Published var localDerived = SSHPaneDerived()
@@ -624,6 +685,9 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     var onRefreshLocalFiles: (() -> Void)?
     var onRefreshRemoteFiles: (() -> Void)?
     var onChooseLocalPath: (() -> Void)?
+    // Injectable identity-file picker so the form sheet can be driven without a
+    // blocking NSOpenPanel modal (QA-MAC_SSH-003). Default nil → real panel.
+    var identityFilePicker: (() -> String?)?
 
     func resetDraft() {
         draft = SSHHostDraft()
@@ -654,6 +718,7 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     }
 
     func applyLocalListing(_ object: [String: JSONValue]) {
+        localListError = nil
         localSitePath = object["path"]?.stringValue ?? localSitePath
         localEntries = decodeEntries(object["entries"]?.arrayValue)
         localDerived = SSHPaneDerived(entries: localEntries)
@@ -666,6 +731,7 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     }
 
     func applyRemoteListing(_ object: [String: JSONValue]) {
+        remoteListError = nil
         remoteSitePath = object["path"]?.stringValue ?? remoteSitePath
         remoteEntries = decodeEntries(object["entries"]?.arrayValue)
         remoteDerived = SSHPaneDerived(entries: remoteEntries)
@@ -776,7 +842,11 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     }
 
     func recordTransfer(direction: SSHTransferDirection, localPath: String, remotePath: String, status: SSHTransferState) {
-        let item = SSHTransferQueueItem(direction: direction, localPath: localPath, remotePath: remotePath, size: "", status: status)
+        // Populate the queue Size column from the matching listed file entry so
+        // the column isn't permanently blank (UX-MAC_SSH-009). The source side
+        // (local for uploads, remote for downloads) holds the authoritative size.
+        let size = transferSize(direction: direction, localPath: localPath, remotePath: remotePath)
+        let item = SSHTransferQueueItem(direction: direction, localPath: localPath, remotePath: remotePath, size: size, status: status)
         if status != .queued {
             queueItems.removeAll { $0.localPath == localPath && $0.remotePath == remotePath && $0.status == .queued }
         }
@@ -803,14 +873,24 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
 
     private static let queueHistoryLimit = 200
 
+    private func transferSize(direction: SSHTransferDirection, localPath: String, remotePath: String) -> String {
+        let entries = direction == .upload ? localEntries : remoteEntries
+        let sourcePath = direction == .upload ? localPath : remotePath
+        return entries.first { $0.path == sourcePath }?.size ?? ""
+    }
+
     func clearFinishedTransfers() {
         queueItems.removeAll { $0.status != .queued }
     }
 
     func addTransferLog(_ line: String) {
         transferLogs.append(line)
-        transferLogs = Array(transferLogs.suffix(5))
+        // Keep a longer rolling history so transient errors don't scroll off
+        // instantly; the log pane is scrollable (UX-MAC_SSH-010).
+        transferLogs = Array(transferLogs.suffix(Self.transferLogLimit))
     }
+
+    private static let transferLogLimit = 200
 
     private func decodeEntries(_ values: [JSONValue]?) -> [SSHFileEntry] {
         values?.compactMap { value in
@@ -915,9 +995,11 @@ private struct SSHSidebarView: View {
                                 vm.hostSidebarIntent = .forcedHidden
                                 vm.sidebarCollapsed = true
                             }
+                            .accessibilityIdentifier("ssh.sidebar.host.toggle")
                             DSIconButton("plus", help: "Add SSH host") {
                                 vm.resetDraft()
                             }
+                            .accessibilityIdentifier("ssh.host.add")
                         }
                     ))
                     Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -947,9 +1029,11 @@ private struct SSHSidebarView: View {
                 vm.hostSidebarIntent = .forcedVisible
                 vm.sidebarCollapsed = false
             }
+            .accessibilityIdentifier("ssh.sidebar.host.toggle")
             DSIconButton("plus", help: "Add SSH host") {
                 vm.resetDraft()
             }
+            .accessibilityIdentifier("ssh.host.add")
             Divider().overlay(DS.Palette.line)
             Image(systemName: "network")
                 .font(.system(size: 14, weight: .semibold))
@@ -1005,6 +1089,7 @@ private struct SSHTransferSidebarView: View {
     @State private var localPaneWidth: CGFloat = 340
     @State private var treeHeight: CGFloat = 126
     @State private var queueHeight: CGFloat = 166
+    @State private var showLog = false
 
     var body: some View {
         Group {
@@ -1024,6 +1109,7 @@ private struct SSHTransferSidebarView: View {
             DSIconButton("sidebar.right", help: "Show file transfer") {
                 vm.transferSidebarCollapsed = false
             }
+            .accessibilityIdentifier("ssh.sidebar.transfer.toggle")
             Image(systemName: "arrow.up.arrow.down")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundColor(DS.Palette.accent)
@@ -1044,13 +1130,15 @@ private struct SSHTransferSidebarView: View {
             VStack(alignment: .leading, spacing: 0) {
                 DSSectionHeader("Files", trailing: AnyView(
                     HStack(spacing: DS.Space.xs) {
-                        DSIconButton("arrow.clockwise", help: "Refresh local and remote files") {
+                        DSIconButton("arrow.clockwise", help: "Refresh both panes") {
                             vm.onRefreshLocalFiles?()
                             vm.onRefreshRemoteFiles?()
                         }
+                        .accessibilityIdentifier("ssh.transfer.refresh.both")
                         DSIconButton("sidebar.right", help: "Hide file transfer") {
                             vm.transferSidebarCollapsed = true
                         }
+                        .accessibilityIdentifier("ssh.sidebar.transfer.toggle")
                     }
                 ))
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -1086,6 +1174,7 @@ private struct SSHTransferSidebarView: View {
                              entries: vm.localEntries,
                              derived: vm.localDerived,
                              selectedIDs: vm.selectedLocalIDs,
+                             listError: vm.localListError,
                              refresh: { vm.onRefreshLocalFiles?() },
                              up: { vm.goUpLocal() },
                              choose: { vm.onChooseLocalPath?() },
@@ -1102,6 +1191,7 @@ private struct SSHTransferSidebarView: View {
                              entries: vm.remoteEntries,
                              derived: vm.remoteDerived,
                              selectedIDs: vm.selectedRemoteIDs,
+                             listError: vm.remoteListError,
                              refresh: { vm.onRefreshRemoteFiles?() },
                              up: { vm.goUpRemote() },
                              choose: nil,
@@ -1118,6 +1208,7 @@ private struct SSHTransferSidebarView: View {
                               entries: [SSHFileEntry],
                               derived: SSHPaneDerived,
                               selectedIDs: Set<String>,
+                              listError: String?,
                               refresh: @escaping () -> Void,
                               up: @escaping () -> Void,
                               choose: (() -> Void)?,
@@ -1125,7 +1216,10 @@ private struct SSHTransferSidebarView: View {
                               select: @escaping (SSHFileEntry, Bool) -> Void,
                               transferTitle: String,
                               transfer: @escaping (SSHFileEntry) -> Void) -> some View {
-        VStack(spacing: 0) {
+        // Derive a stable side key (local/remote) for accessibility identifiers
+        // so UI automation can address each pane's controls (QA-MAC_SSH-001).
+        let side = title.lowercased().hasPrefix("local") ? "local" : "remote"
+        return VStack(spacing: 0) {
             HStack(spacing: DS.Space.xs) {
                 Text(title + ":")
                     .font(DS.Font.caption.weight(.semibold))
@@ -1135,6 +1229,7 @@ private struct SSHTransferSidebarView: View {
                     .frame(width: 28, height: 28)
                     .help("Go to parent directory")
                     .accessibilityLabel("Go to parent directory")
+                    .accessibilityIdentifier("ssh.transfer.\(side).up")
                 TextField("/", text: path, onCommit: refresh)
                     .textFieldStyle(.plain)
                     .font(DS.Font.monoSmall)
@@ -1142,18 +1237,21 @@ private struct SSHTransferSidebarView: View {
                     .frame(height: 26)
                     .background(RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.bg))
                     .overlay(RoundedRectangle(cornerRadius: DS.Radius.control).stroke(DS.Palette.line))
+                    .accessibilityIdentifier("ssh.transfer.\(side).path")
                 if let choose {
                     Button(action: choose) { Image(systemName: "folder") }
                         .buttonStyle(.plain)
                         .frame(width: 28, height: 28)
                         .help("Choose local file or folder")
                         .accessibilityLabel("Choose local file or folder")
+                        .accessibilityIdentifier("ssh.transfer.\(side).choose")
                 }
                 Button(action: refresh) { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.plain)
                     .frame(width: 28, height: 28)
                     .help("Refresh \(title.lowercased())")
                     .accessibilityLabel("Refresh \(title)")
+                    .accessibilityIdentifier("ssh.transfer.\(side).refresh")
             }
             .padding(DS.Space.xs)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -1164,6 +1262,7 @@ private struct SSHTransferSidebarView: View {
             }
             fileTable(entries: entries,
                       selectedIDs: selectedIDs,
+                      listError: listError,
                       select: select,
                       open: open,
                       transferTitle: transferTitle,
@@ -1206,6 +1305,7 @@ private struct SSHTransferSidebarView: View {
 
     private func fileTable(entries: [SSHFileEntry],
                            selectedIDs: Set<String>,
+                           listError: String?,
                            select: @escaping (SSHFileEntry, Bool) -> Void,
                            open: @escaping (SSHFileEntry) -> Void,
                            transferTitle: String,
@@ -1222,11 +1322,16 @@ private struct SSHTransferSidebarView: View {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         if entries.isEmpty {
-                            Text("No files listed")
+                            // Differentiate an empty directory from a failed
+                            // listing so the user knows whether to retry or pick
+                            // another path (UX-MAC_SSH-011).
+                            Text(listError.map { "Listing failed — \($0)" } ?? "This folder is empty.")
                                 .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.textTertiary)
+                                .foregroundColor(listError == nil ? DS.Palette.textTertiary : DS.Palette.danger)
+                                .multilineTextAlignment(.center)
                                 .frame(width: fileColumns.total)
                                 .frame(minHeight: 72)
+                                .accessibilityIdentifier(listError == nil ? "ssh.file.empty" : "ssh.file.error")
                         } else {
                             ForEach(entries.indices, id: \.self) { index in
                                 let entry = entries[index]
@@ -1264,6 +1369,15 @@ private struct SSHTransferSidebarView: View {
                                     .background(rowBackground(index: index, isSelected: selectedIDs.contains(entry.id)))
                                 }
                                 .buttonStyle(.plain)
+                                // Mac users expect double-click to open a folder
+                                // (UX-MAC_SSH-007). A simultaneous double-tap opens
+                                // directories without breaking the single-click select.
+                                .simultaneousGesture(
+                                    TapGesture(count: 2).onEnded {
+                                        if entry.isDirectory { open(entry) } else { transfer(entry) }
+                                    }
+                                )
+                                .accessibilityIdentifier("ssh.file.row.\(entry.path)")
                                 .contextMenu {
                                     if entry.isDirectory {
                                         Button("Open Folder") { open(entry) }
@@ -1334,6 +1448,7 @@ private struct SSHTransferSidebarView: View {
                             .background(vm.selectedQueueState == state ? DS.Palette.bg : Color.clear)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("ssh.queue.tab.\(state.rawValue.lowercased())")
                 }
                 Spacer()
                 Text("Queue: \(vm.queueItems.contains { $0.status == .queued } ? "active" : "empty")")
@@ -1348,6 +1463,7 @@ private struct SSHTransferSidebarView: View {
                 .disabled(!vm.queueItems.contains { $0.status != .queued })
                 .help("Clear finished transfers")
                 .accessibilityLabel("Clear finished transfers")
+                .accessibilityIdentifier("ssh.queue.clearFinished")
                 .padding(.trailing, DS.Space.sm)
             }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -1358,7 +1474,6 @@ private struct SSHTransferSidebarView: View {
                         resizableHeader("Direction", width: $queueColumns.direction, minWidth: 74)
                         resizableHeader("Remote", width: $queueColumns.remote, minWidth: 140)
                         resizableHeader("Size", width: $queueColumns.size, minWidth: 56, alignment: .trailing)
-                        resizableHeader("Priority", width: $queueColumns.priority, minWidth: 64)
                         resizableHeader("Status", width: $queueColumns.status, minWidth: 74)
                     }
                     ScrollView(.vertical) {
@@ -1377,7 +1492,6 @@ private struct SSHTransferSidebarView: View {
                                         Text(item.direction.rawValue).frame(width: queueColumns.direction, alignment: .leading)
                                         Text(item.remotePath).frame(width: queueColumns.remote, alignment: .leading)
                                         Text(item.size).frame(width: queueColumns.size, alignment: .trailing)
-                                        Text("Normal").frame(width: queueColumns.priority, alignment: .leading)
                                         Text(item.status.rawValue).frame(width: queueColumns.status, alignment: .leading)
                                     }
                                     .font(DS.Font.caption)
@@ -1388,6 +1502,60 @@ private struct SSHTransferSidebarView: View {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            logFooter
+        }
+    }
+
+    // Scrollable log/status footer so transient transfer errors stay reviewable
+    // instead of vanishing after a few lines (UX-MAC_SSH-010).
+    private var logFooter: some View {
+        VStack(spacing: 0) {
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            Button { showLog.toggle() } label: {
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: showLog ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                    Text(vm.transferStatus)
+                        .font(DS.Font.caption)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Text("Log")
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .foregroundColor(DS.Palette.textSecondary)
+                .padding(.horizontal, DS.Space.sm)
+                .frame(height: 24)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show transfer log")
+            .accessibilityIdentifier("ssh.transfer.log.toggle")
+            if showLog {
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        LazyVStack(alignment: .leading, spacing: 1) {
+                            ForEach(Array(vm.transferLogs.enumerated()), id: \.offset) { index, line in
+                                Text(line)
+                                    .font(DS.Font.monoSmall)
+                                    .foregroundColor(DS.Palette.textSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id(index)
+                            }
+                        }
+                        .padding(.horizontal, DS.Space.sm)
+                        .padding(.vertical, DS.Space.xxs)
+                    }
+                    .frame(height: 96)
+                    .background(DS.Palette.bg.opacity(0.42))
+                    .accessibilityIdentifier("ssh.transfer.log")
+                    .onChange(of: vm.transferLogs.count) { _ in
+                        proxy.scrollTo(vm.transferLogs.count - 1, anchor: .bottom)
                     }
                 }
             }
@@ -1449,10 +1617,21 @@ private struct SSHHostFormSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             HStack {
-                Text(vm.editingHostID == nil ? "New Host" : "Edit Host")
-                    .font(DS.Font.caption2.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .textCase(.uppercase)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(vm.editingHostID == nil ? "New Host" : "Edit Host")
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .textCase(.uppercase)
+                    if vm.editingHostID == nil {
+                        // Clarify that saving a brand-new host also connects it,
+                        // which is otherwise only signalled by the button label
+                        // ("Save + Connect" vs "Save"). (UX-MAC_SSH-013)
+                        Text("Saving connects to this host.")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .textCase(nil)
+                    }
+                }
                 Spacer()
                 Button { vm.cancelDraft() } label: {
                     Image(systemName: "xmark")
@@ -1461,21 +1640,25 @@ private struct SSHHostFormSheet: View {
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
                 .accessibilityLabel("Close SSH host editor")
+                .accessibilityIdentifier("ssh.form.close")
                 .help("Cancel")
             }
             formField("Host", requirement: "Required") {
                 TextField("user@host or ssh-config alias", text: $vm.draft.destination)
                     .textFieldStyle(.roundedBorder)
                     .focused($hostFieldFocused)
+                    .accessibilityIdentifier("ssh.form.destination")
             }
             formField("Port", requirement: "Optional") {
                 VStack(alignment: .leading, spacing: DS.Space.xxs) {
                     TextField("22", text: $vm.draft.portText)
                         .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("ssh.form.port")
                     if let portError {
                         Text(portError)
                             .font(DS.Font.caption2)
                             .foregroundColor(DS.Palette.danger)
+                            .accessibilityIdentifier("ssh.form.port.error")
                     }
                 }
             }
@@ -1483,43 +1666,51 @@ private struct SSHHostFormSheet: View {
                 HStack(spacing: DS.Space.xs) {
                     TextField("~/.ssh/id_ed25519", text: $vm.draft.identityFileText)
                         .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("ssh.form.identityFile")
                     Button {
                         chooseIdentityFile()
                     } label: {
                         Label("Choose", systemImage: "folder")
                     }
                     .help("Choose identity file")
+                    .accessibilityIdentifier("ssh.form.identityFile.choose")
                 }
             }
             formField("Password", requirement: "Optional") {
                 SecureField("Saved password", text: $vm.draft.passwordText)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("ssh.form.password")
             }
             fieldLabel("SSH options", requirement: "Optional")
             TextEditor(text: $vm.draft.optionLines)
                 .font(DS.Font.monoSmall)
                 .frame(minHeight: 84)
                 .overlay(RoundedRectangle(cornerRadius: DS.Radius.control).stroke(DS.Palette.line))
+                .accessibilityIdentifier("ssh.form.options")
             Divider()
             formField("Label", requirement: "Optional") {
                 TextField("Production server", text: $vm.draft.label)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("ssh.form.label")
             }
             if let error = vm.error {
                 Text(error)
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
+                    .accessibilityIdentifier("ssh.form.error")
             }
             HStack(spacing: DS.Space.sm) {
                 Spacer()
                 Button("Cancel") { vm.cancelDraft() }
                     .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("ssh.form.cancel")
                 Button(vm.editingHostID == nil ? "Save + Connect" : "Save") {
                     vm.onSave?(vm.draft)
                 }
                     .disabled(vm.draft.destination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || portError != nil)
                     .buttonStyle(DSPrimaryButtonStyle())
                     .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("ssh.form.save")
             }
         }
         .padding(DS.Space.lg)
@@ -1547,6 +1738,10 @@ private struct SSHHostFormSheet: View {
     }
 
     private func chooseIdentityFile() {
+        if let picker = vm.identityFilePicker {
+            if let path = picker() { vm.draft.identityFileText = path }
+            return
+        }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1574,6 +1769,7 @@ private struct SSHHostRow: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(connected ? DS.Palette.accent : DS.Palette.textTertiary)
                     .frame(width: 8, height: 8)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(host.label)
                         .font(DS.Font.bodyDense.weight(connected ? .semibold : .regular))
@@ -1586,10 +1782,22 @@ private struct SSHHostRow: View {
                 }
                 Spacer(minLength: 0)
                 if connected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(DS.Palette.accent)
-                        .accessibilityLabel("Connected")
+                    // A text "Connected" pill so the connected state isn't
+                    // conveyed by color + a tiny glyph alone (UX-MAC_SSH-014).
+                    HStack(spacing: 3) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Connected")
+                            .font(DS.Font.caption2.weight(.semibold))
+                    }
+                    .foregroundColor(DS.Palette.accent)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(
+                        Capsule().fill(DS.Palette.accent.opacity(0.14))
+                    )
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Connected")
                 }
                 Button { confirmingDelete = true } label: {
                     Image(systemName: "trash")
@@ -1598,6 +1806,8 @@ private struct SSHHostRow: View {
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
                 .help("Delete host")
+                .accessibilityLabel("Delete host")
+                .accessibilityIdentifier("ssh.host.delete.\(host.id.value.uuidString)")
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.vertical, DS.Space.sm)
@@ -1610,6 +1820,7 @@ private struct SSHHostRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier("ssh.host.connect.\(host.id.value.uuidString)")
         .contextMenu {
             Button("Open New Connection", action: onOpenNewConnection)
             Button("Edit Host", action: onEdit)
@@ -1629,6 +1840,7 @@ private struct SSHHostRow: View {
                  : "This permanently removes the saved host.")
         }
         .help(host.label)
+        .accessibilityIdentifier("ssh.host.row.\(host.id.value.uuidString)")
     }
 
     private var subtitle: String {

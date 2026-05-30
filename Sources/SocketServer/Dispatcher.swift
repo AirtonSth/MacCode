@@ -349,6 +349,12 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .bool(true))
             case "ssh.connect":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                // UX-010: idempotent connect — a retried request must not
+                // open a duplicate SSH surface.
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let pid: PaneID? = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
                 let profileID = params["profile_id"]?.stringValue.flatMap(UUID.init).map(SSHHostID.init)
                 let profile = try optionalSSHProfile(from: params)
@@ -362,7 +368,9 @@ public final class JSONRPCDispatcher {
                     "status": .string(s.metadata["ssh_status"] ?? "connected"),
                     "destination": .string(s.metadata["ssh_destination"] ?? "")
                 ]))
-                return .init(id: id, result: encode(s))
+                let result = encode(s)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "ssh.disconnect":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.sshDisconnect(surface: sid)
@@ -494,11 +502,19 @@ public final class JSONRPCDispatcher {
                 let w = try router.currentWindow()
                 return .init(id: id, result: encode(w))
             case "workspace.create":
+                // UX-010: idempotent create — a retried request over a flaky
+                // mobile link must not produce a duplicate workspace.
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let name = params["name"]?.stringValue ?? "workspace"
                 let cwd = params["cwd"]?.stringValue ?? FileManager.default.currentDirectoryPath
                 let ws = try router.createWorkspace(name: name, cwd: cwd)
                 EventBus.shared.publish(kind: "workspace.created", payload: encode(ws))
-                return .init(id: id, result: encode(ws))
+                let result = encode(ws)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "workspace.select":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.selectWorkspace(wid)
@@ -562,6 +578,12 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let tStr = params["type"]?.stringValue,
                       let type = SurfaceType(rawValue: normalizeSurfaceTypeString(tStr)) else { throw JSONRPCError.invalidParams }
+                // UX-010: idempotent create — a retried request must not
+                // produce a duplicate surface/pane.
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let pid: PaneID? = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
                 let title = params["title"]?.stringValue
                 let s = try router.createSurface(workspace: wid, type: type, paneID: pid, title: title)
@@ -569,7 +591,9 @@ public final class JSONRPCDispatcher {
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(s)
                 ]))
-                return .init(id: id, result: encode(s))
+                let result = encode(s)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "surface.split":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let pid = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init),
@@ -630,7 +654,17 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: try terminalRouter.sendTextResult(surface: sid, text: text))
                 }
                 try router.sendText(surface: sid, text: text)
-                return .init(id: id, result: .object(["status": .string("accepted"), "accepted": .bool(true)]))
+                // UX-009: fold a liveness check into the response so a
+                // non-terminal surface reports "delivered" only when the
+                // target is alive; a dead surface reports "accepted" + a
+                // warning instead of falsely reading as success.
+                let alive = router.surfaceHealth(surface: sid)
+                return .init(id: id, result: .object([
+                    "status": .string(alive ? "delivered" : "accepted"),
+                    "accepted": .bool(true),
+                    "delivered": .bool(alive),
+                    "surface_alive": .bool(alive)
+                ]))
             case "surface.send_key":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let key = params["key"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -639,7 +673,15 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: try terminalRouter.sendTextResult(surface: sid, text: sequence))
                 }
                 try router.sendText(surface: sid, text: sequence)
-                return .init(id: id, result: .object(["status": .string("accepted"), "accepted": .bool(true)]))
+                // UX-009: same delivered/accepted liveness contract as
+                // surface.send_text for non-terminal surfaces.
+                let alive = router.surfaceHealth(surface: sid)
+                return .init(id: id, result: .object([
+                    "status": .string(alive ? "delivered" : "accepted"),
+                    "accepted": .bool(true),
+                    "delivered": .bool(alive),
+                    "surface_alive": .bool(alive)
+                ]))
             case "surface.health":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 if let terminalRouter = router as? TerminalCommandRouting {
@@ -1106,9 +1148,17 @@ public final class JSONRPCDispatcher {
             case "git.commit":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let message = params["message"]?.stringValue else { throw JSONRPCError.invalidParams }
+                // UX-010: idempotent commit — a retried request over a flaky
+                // link must not double-commit.
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let r = try router.gitCommit(workspace: wid, message: message)
                 EventBus.shared.publish(kind: "git.commit", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
-                return .init(id: id, result: encode(r))
+                let result = encode(r)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "git.log":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let limit = params["limit"]?.intValue ?? 100
@@ -1120,9 +1170,17 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .string(try router.gitDiff(workspace: wid, path: path, ignoreWhitespace: iw)))
             case "git.push":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                // UX-010: idempotent push — a retried request must not push
+                // twice.
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
                 let r = try router.gitPush(workspace: wid)
                 EventBus.shared.publish(kind: "git.push", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
-                return .init(id: id, result: encode(r))
+                let result = encode(r)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "git.pull_request_url":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let url = try router.gitPullRequestURL(workspace: wid)
@@ -1333,7 +1391,52 @@ public final class JSONRPCDispatcher {
         } catch let e as JSONRPCError {
             return .init(id: id, error: e)
         } catch {
-            return .init(id: id, error: JSONRPCError(code: -32000, message: String(describing: error)))
+            // UX-005: map known domain errors to a stable code + concise,
+            // user-presentable message + structured data so the client can
+            // classify them and avoid surfacing raw Swift debug dumps. The
+            // verbose form is logged separately; only truly unexpected
+            // errors fall through to -32000/String(describing:).
+            return .init(id: id, error: Self.mapDomainError(error, method: req.method))
+        }
+    }
+
+    /// UX-005: translate known domain errors into stable JSON-RPC codes.
+    /// `-32010` provider/agent, `-32011` persistence, `-32012` missing
+    /// binary. Unknown errors keep `-32000` + `String(describing:)` (the
+    /// previous behavior) but the verbose form is always logged.
+    static func mapDomainError(_ error: Error, method: String) -> JSONRPCError {
+        let verbose = String(describing: error)
+        switch error {
+        case let e as AgentProviderAdapterError:
+            switch e {
+            case .sessionNotFound:
+                NSLog("[RC2.Dispatch] %@ provider session not found: %@", method, verbose)
+                return JSONRPCError(code: -32010, message: "Agent session not found.",
+                                    data: .object(["domain": .string("agent"), "kind": .string("session_not_found")]))
+            case .unsupported(let op):
+                NSLog("[RC2.Dispatch] %@ provider unsupported: %@", method, verbose)
+                return JSONRPCError(code: -32010, message: "Agent operation is not available right now.",
+                                    data: .object(["domain": .string("agent"), "kind": .string("unsupported"), "detail": .string(op)]))
+            }
+        case let e as PersistenceDataError:
+            NSLog("[RC2.Dispatch] %@ persistence error: %@", method, verbose)
+            return JSONRPCError(code: -32011, message: "Stored data could not be read.",
+                                data: .object(["domain": .string("persistence"), "detail": .string(e.description)]))
+        case let e as CocoaError where e.code == .fileNoSuchFile || e.code == .fileReadNoSuchFile:
+            NSLog("[RC2.Dispatch] %@ file not found: %@", method, verbose)
+            return JSONRPCError(code: -32012, message: "A required file was not found.",
+                                data: .object(["domain": .string("filesystem"), "kind": .string("not_found")]))
+        default:
+            // Heuristic: provider binaries (codex/claude/git) report
+            // "missing"/"not found" via untyped errors; classify those.
+            let lowered = verbose.lowercased()
+            if lowered.contains("missingbinary") || lowered.contains("binary not found") || lowered.contains("executable not found") {
+                NSLog("[RC2.Dispatch] %@ missing binary: %@", method, verbose)
+                return JSONRPCError(code: -32012, message: "A required command-line tool is not installed.",
+                                    data: .object(["domain": .string("binary"), "detail": .string(verbose)]))
+            }
+            NSLog("[RC2.Dispatch] %@ unexpected error: %@", method, verbose)
+            return JSONRPCError(code: -32000, message: verbose)
         }
     }
 

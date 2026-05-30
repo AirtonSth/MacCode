@@ -310,6 +310,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var awaitingSSHFirstOutput = false
     private var isVisible = true
     private let historyRepo: TerminalOutputRepository?
+    private let outputBus: SurfaceOutputBus
     private let historyWorkspaceID: String
     private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
     private var pendingHistoryData = Data()
@@ -341,8 +342,15 @@ public final class TerminalSurface: NSObject, Surface {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
     }
 
-    public init(workspaceID: WorkspaceID, title: String, launch: Launch, historyRepo: TerminalOutputRepository? = nil) throws {
+    public init(
+        workspaceID: WorkspaceID,
+        title: String,
+        launch: Launch,
+        historyRepo: TerminalOutputRepository? = nil,
+        outputBus: SurfaceOutputBus = .shared
+    ) throws {
         self.historyRepo = historyRepo
+        self.outputBus = outputBus
         self.historyWorkspaceID = workspaceID.value.uuidString
         let cwd: String
         let type: SurfaceType
@@ -393,9 +401,11 @@ public final class TerminalSurface: NSObject, Surface {
         )
         let terminalView = GhosttyTerminalView(frame: initialFrame)
         terminalView.translatesAutoresizingMaskIntoConstraints = false
+        terminalView.setAccessibilityIdentifier("surface.terminal.view.\(descriptor.id.value.uuidString)")
         self.ghosttyView = terminalView
         let container = TerminalDropContainerView(frame: initialFrame)
         container.translatesAutoresizingMaskIntoConstraints = false
+        container.setAccessibilityIdentifier("surface.terminal.\(descriptor.id.value.uuidString)")
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.terminalBG.cgColor
         container.layer?.masksToBounds = true
@@ -515,13 +525,13 @@ public final class TerminalSurface: NSObject, Surface {
     private func startReader() {
         let src = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: .global())
         readSource = src
+        var buf = [UInt8](repeating: 0, count: 4096)
         src.setEventHandler { [weak self] in
             guard let self else { return }
             var output = Data()
             var shouldClose = false
 
             while true {
-                var buf = [UInt8](repeating: 0, count: 4096)
                 let n = read(self.masterFD, &buf, buf.count)
                 if n > 0 {
                     output.append(contentsOf: buf[0..<Int(n)])
@@ -585,7 +595,7 @@ public final class TerminalSurface: NSObject, Surface {
         lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
         // HC-1: stream raw PTY output to the mirror in real time.
-        SurfaceOutputBus.shared.emit(descriptor.id, data)
+        outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
             renderer.feed(data)
         }
@@ -603,7 +613,7 @@ public final class TerminalSurface: NSObject, Surface {
         enqueueHistory(data)
         renderer.feed(data)
         lastOutputAt = Date()
-        SurfaceOutputBus.shared.emit(descriptor.id, data)
+        outputBus.emit(descriptor.id, data)
         if renderDiagnostics().canRender {
             ghosttyView.processOutput(data)
         } else {
@@ -705,6 +715,7 @@ public final class TerminalSurface: NSObject, Surface {
             outputPartial: outputPartial,
             outputPendingBytes: outputPendingBytes,
             historyWriteFailures: historyWriteFailures,
+            droppedOutputBytes: ghosttyView.droppedOutputBytes,
             rows: terminalSize.rows,
             cols: terminalSize.cols,
             renderDiagnostics: renderDiagnostics()
@@ -837,19 +848,20 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func focus() {
-        repairTerminalFocus(reason: "surface_focus")
+        // Explicit user request: allowed to take focus from a field editor.
+        repairTerminalFocus(reason: "surface_focus", force: true)
     }
 
-    public func repairTerminalFocus(reason: String) {
+    public func repairTerminalFocus(reason: String, force: Bool = false) {
         focusRepairGeneration &+= 1
         let generation = focusRepairGeneration
-        guard !applyFocusIfReady() else { return }
-        scheduleFocusRetry(generation: generation, delay: nil)
-        scheduleFocusRetry(generation: generation, delay: 0.05)
+        guard !applyFocusIfReady(force: force) else { return }
+        scheduleFocusRetry(generation: generation, delay: nil, force: force)
+        scheduleFocusRetry(generation: generation, delay: 0.05, force: force)
     }
 
     @discardableResult
-    private func applyFocusIfReady() -> Bool {
+    private func applyFocusIfReady(force: Bool = false) -> Bool {
         guard isVisible,
               !isClosing,
               let window = view.window,
@@ -857,11 +869,31 @@ public final class TerminalSurface: NSObject, Surface {
               view.bounds.width > 1,
               view.bounds.height > 1,
               !Self.isHiddenOrHasHiddenAncestor(view),
-              window.attachedSheet == nil else { return false }
+              window.attachedSheet == nil,
+              force || !Self.anotherResponderIsEditing(in: window, terminalView: ghosttyView) else { return false }
         window.makeFirstResponder(ghosttyView)
         ghosttyView.refreshSurfaceOnly()
         descriptor.hasUnreadActivity = false
         return true
+    }
+
+    /// Don't yank focus back to the terminal if the user is actively editing
+    /// another control in the same window (e.g. a sidebar text field). A field
+    /// editor (`NSText`) or text view that is the current first responder and
+    /// isn't our own terminal view means focus is intentionally elsewhere
+    /// (UX-011).
+    private static func anotherResponderIsEditing(in window: NSWindow, terminalView: NSView) -> Bool {
+        guard let responder = window.firstResponder else { return false }
+        guard responder !== terminalView else { return false }
+        if let text = responder as? NSText {
+            // The shared field editor's delegate is the control being edited.
+            if let edited = text.delegate as? NSView, edited === terminalView { return false }
+            return true
+        }
+        if let textView = responder as? NSTextView, textView !== terminalView {
+            return true
+        }
+        return false
     }
 
     private static func isHiddenOrHasHiddenAncestor(_ view: NSView) -> Bool {
@@ -873,11 +905,11 @@ public final class TerminalSurface: NSObject, Surface {
         return false
     }
 
-    private func scheduleFocusRetry(generation: Int, delay: TimeInterval?) {
+    private func scheduleFocusRetry(generation: Int, delay: TimeInterval?, force: Bool) {
         let attempt = { [weak self] in
             guard let self else { return }
             guard self.focusRepairGeneration == generation else { return }
-            _ = self.applyFocusIfReady()
+            _ = self.applyFocusIfReady(force: force)
         }
         if let delay {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: attempt)
@@ -898,7 +930,12 @@ public final class TerminalSurface: NSObject, Surface {
         if hadHiddenOutput {
             beginHiddenBacklogDrain()
         }
-        ghosttyView.refreshSurfaceOnly()
+        // Paint the latest frame synchronously on reveal so a busy terminal
+        // shows its current state immediately instead of a stale/partial frame
+        // for the quiet-delay window; the drain timer now only settles the
+        // pending/partial flags, it no longer gates the visible refresh
+        // (UX-013).
+        ghosttyView.forceRefresh()
         scheduleVisibleRefresh()
     }
 
@@ -1049,8 +1086,12 @@ public final class TerminalSurface: NSObject, Surface {
             }
             return
         }
+        // Hand ownership of the accumulated buffer to the write item instead of
+        // copying it out and clearing in place: with copy-on-write, reassigning
+        // a fresh empty Data lets the write item keep the only reference, so the
+        // >64KB burst is moved rather than duplicated (PERF-007).
         let data = pendingHistoryData
-        pendingHistoryData.removeAll(keepingCapacity: true)
+        pendingHistoryData = Data()
         let surfaceID = descriptor.id.value.uuidString
         let workspaceID = historyWorkspaceID
         let chunkIndex = nextHistoryChunkIndex

@@ -17,21 +17,84 @@ public final class FeedPanelViewModel: ObservableObject {
         public let kind: String
         public let title: String
         public let ts: Date
+        /// Precomputed lowercased haystack so the filter scan doesn't
+        /// allocate a fresh `lowercased()` per item per keystroke (PERF-004).
+        let searchKey: String
+
+        public init(id: Int64, kind: String, title: String, ts: Date) {
+            self.id = id; self.kind = kind; self.title = title; self.ts = ts
+            self.searchKey = (kind + " " + title).lowercased()
+        }
     }
 
+    /// Newest-last storage: events append at the end (O(1)) and the view
+    /// renders `displayed` reversed, avoiding the O(n) `insert(at:0)` per
+    /// event and the per-event full-array trim at cap (PERF-003).
     @Published public private(set) var items: [Item] = []
-    @Published public var filter: String = ""
+    @Published public var filter: String = "" { didSet { recomputeFiltered() } }
+    /// When paused, incoming events are buffered (not dropped) so the user
+    /// can read without the list jumping; resume flushes them (UX-008).
+    @Published public var paused: Bool = false { didSet { if !paused { flushPending() } } }
+
+    /// Cached newest-first filtered view; recomputed only when `items` or
+    /// `filter` change rather than on every body pass (PERF-004).
+    @Published public private(set) var filtered: [Item] = []
+
+    private var pending: [Item] = []
+    private static let cap = 200
+    /// Trim only when crossing this slack threshold, not every event (PERF-003).
+    private static let trimAt = 256
+
+    /// Injectable clock so snapshot tests get deterministic timestamps
+    /// instead of `Date()`-derived live values (QA-009).
+    private let now: () -> Date
+    public init(now: @escaping () -> Date = Date.init) { self.now = now }
 
     public func receive(seq: Int64, kind: String, title: String, ts: Double) {
         let item = Item(id: seq, kind: kind, title: title, ts: Date(timeIntervalSince1970: ts))
-        items.insert(item, at: 0)
-        if items.count > 200 { items = Array(items.prefix(200)) }
+        if paused { pending.append(item); return }
+        append(item)
     }
 
-    public var filtered: [Item] {
-        guard !filter.isEmpty else { return items }
-        let q = filter.lowercased()
-        return items.filter { $0.kind.lowercased().contains(q) || $0.title.lowercased().contains(q) }
+    private func append(_ item: Item) {
+        items.append(item)
+        if items.count > Self.trimAt { items.removeFirst(items.count - Self.cap) }
+        recomputeFiltered()
+    }
+
+    private func flushPending() {
+        guard !pending.isEmpty else { return }
+        items.append(contentsOf: pending)
+        pending.removeAll()
+        if items.count > Self.trimAt { items.removeFirst(items.count - Self.cap) }
+        recomputeFiltered()
+    }
+
+    /// UX-008: drop all events and reset the stream.
+    public func clear() {
+        items.removeAll()
+        pending.removeAll()
+        recomputeFiltered()
+    }
+
+    private func recomputeFiltered() {
+        let reversed = items.reversed()
+        if filter.isEmpty {
+            filtered = Array(reversed)
+        } else {
+            let q = filter.lowercased()
+            filtered = reversed.filter { $0.searchKey.contains(q) }
+        }
+    }
+
+    /// Compact "12s ago" relative label for the row timestamp (UX-008).
+    public func relativeTime(for item: Item) -> String {
+        let secs = Int(now().timeIntervalSince(item.ts))
+        if secs < 2 { return "now" }
+        if secs < 60 { return "\(secs)s ago" }
+        if secs < 3600 { return "\(secs / 60)m ago" }
+        if secs < 86_400 { return "\(secs / 3600)h ago" }
+        return "\(secs / 86_400)d ago"
     }
 }
 
@@ -44,23 +107,54 @@ public struct FeedPanelView: View {
             HStack(spacing: DS.Space.md) {
                 Text("FEED").font(DS.Font.caption2.weight(.semibold))
                     .tracking(0.6).foregroundColor(DS.Palette.textTertiary)
+                // UX-009: subtle "N of M" so an empty list reads as
+                // "filter excludes everything" vs "no events".
+                if !vm.filter.isEmpty {
+                    Text("\(vm.filtered.count) of \(vm.items.count)")
+                        .font(DS.Font.caption2.monospacedDigit())
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityIdentifier("feed.resultCount")
+                }
                 Spacer()
-                TextField("filter", text: $vm.filter)
-                    .textFieldStyle(.plain)
-                    .font(DS.Font.caption)
-                    .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.xs)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    .frame(maxWidth: 150)
+                // UX-008: pause freezes the stream while reading; clear resets it.
+                DSIconButton(vm.paused ? "play.fill" : "pause.fill",
+                             help: vm.paused ? "Resume feed" : "Pause feed") { vm.paused.toggle() }
+                    .accessibilityLabel(vm.paused ? "Resume feed" : "Pause feed")
+                    .accessibilityIdentifier("feed.pause")
+                DSIconButton("trash", help: "Clear feed") { vm.clear() }
+                    .accessibilityLabel("Clear feed")
+                    .accessibilityIdentifier("feed.clear")
+                    .disabled(vm.items.isEmpty)
+                HStack(spacing: DS.Space.xs) {
+                    TextField("filter", text: $vm.filter)
+                        .textFieldStyle(.plain)
+                        .font(DS.Font.caption)
+                        .accessibilityIdentifier("feed.filter")
+                    if !vm.filter.isEmpty {
+                        Button { vm.filter = "" } label: {
+                            Image(systemName: "xmark.circle.fill").font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityLabel("Clear filter")
+                        .accessibilityIdentifier("feed.filter.clear")
+                    }
+                }
+                .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.xs)
+                .background(DS.Palette.surfaceRaised)
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                .frame(maxWidth: 150)
             }
             .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
             .dsBar(edge: .bottom)
             if vm.filtered.isEmpty {
                 DSEmptyState(icon: "dot.radiowaves.left.and.right",
-                             title: "No activity",
-                             subtitle: "Domain events (workspace, surface, notification, window) stream here as they happen.")
+                             title: vm.filter.isEmpty ? "No activity" : "No matches",
+                             subtitle: vm.filter.isEmpty
+                                ? "Domain events (workspace, surface, notification, window) stream here as they happen."
+                                : "No events match \"\(vm.filter)\". Clear the filter to see all activity.")
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -72,8 +166,9 @@ public struct FeedPanelView: View {
                                         .foregroundColor(DS.Palette.textTertiary)
                                     DSPill(item.kind, tone: kindTone(item.kind))
                                     Spacer()
-                                    Text(item.ts, style: .time)
+                                    Text(vm.relativeTime(for: item))
                                         .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
+                                        .help(item.ts.formatted(date: .abbreviated, time: .standard))
                                 }
                                 if !item.title.isEmpty {
                                     Text(item.title).font(DS.Font.caption)
@@ -85,6 +180,7 @@ public struct FeedPanelView: View {
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                             .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                            .accessibilityIdentifier("feed.item.\(item.id)")
                         }
                     }.padding(DS.Space.md)
                 }
