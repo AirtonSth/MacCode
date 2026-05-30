@@ -460,9 +460,18 @@ final class GhosttyTerminalView: NSView {
 
     private func appendPendingOutput(_ data: Data) {
         pendingOutput.append(data)
-        if pendingOutput.count > Self.maxPendingOutputBytes {
-            pendingOutput.removeFirst(pendingOutput.count - Self.maxPendingOutputBytes)
+        guard pendingOutput.count > Self.maxPendingOutputBytes else { return }
+        // Never drop from the front while a live surface exists: that splits ANSI
+        // escape sequences mid-stream and garbles rendering (PERF-009). Flush the
+        // backlog synchronously to the live surface (Ghostty owns scrollback)
+        // instead of discarding bytes.
+        if let surface = surfaceSlot.liveSurface() {
+            flushPendingOutput(to: surface, render: isRenderable)
+            return
         }
+        // No surface to flush to yet (truly unrenderable): bound memory as a last
+        // resort by discarding the oldest bytes.
+        pendingOutput.removeFirst(pendingOutput.count - Self.maxPendingOutputBytes)
     }
 
     private func scheduleOutputFlush() {

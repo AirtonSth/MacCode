@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ImageIO
 import SwiftUI
 import WebKit
 import AVKit
@@ -127,6 +128,7 @@ private final class FilesViewModel: ObservableObject {
     @Published var readerMode = "source"
     @Published var previewURL: URL?
     @Published var syncLabel = "Host synced"
+    @Published var conflictActive = false
 
     let surfaceID: SurfaceID
     let workspaceID: WorkspaceID
@@ -158,7 +160,11 @@ private final class FilesViewModel: ObservableObject {
         self.workspaceID = workspaceID
         self.root = root
         self.router = router
-        eventToken = EventBus.shared.subscribe(since: nil) { [weak self] event in
+        // Subscribe from the current head, not `nil` (which replays the entire retained
+        // backlog into this surface on the main thread). This surface loads its own state
+        // explicitly via loadInitialState()/filesStateGet (PERF-MAC_FILES-003).
+        let head = EventBus.shared.snapshot().lastSeq
+        eventToken = EventBus.shared.subscribe(since: head) { [weak self] event in
             DispatchQueue.main.async { self?.receive(event) }
         }
     }
@@ -436,13 +442,14 @@ private final class FilesViewModel: ObservableObject {
             applyEditPayload(payload, remote: payload["updated_by_device"]?.stringValue != "mac-local")
         case "files.edit.conflict":
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString else { return }
-            errorText = "Disk changed outside RemoteCode. Keep the draft, discard, or reload before saving."
+            conflictActive = true
         default:
             break
         }
     }
 
     private func applyEditPayload(_ payload: [String: JSONValue], remote: Bool) {
+        conflictActive = false
         if let id = payload["session_id"]?.stringValue { sessionID = id }
         if let revision = payload["draft_revision"]?.intValue { draftRevision = revision }
         if let dirty = payload["dirty"]?.boolValue {
@@ -527,6 +534,7 @@ private struct FilesSurfaceRoot: View {
     @State private var renameText = ""
     @State private var deleteTargets: [FileEntry] = []
     @State private var confirmDelete = false
+    @FocusState private var newFileFieldFocused: Bool
 
     var body: some View {
         GeometryReader { proxy in
@@ -559,10 +567,17 @@ private struct FilesSurfaceRoot: View {
         }
         .alert("New File", isPresented: $showNewFileDialog) {
             TextField("File name", text: $newFileName)
+                .focused($newFileFieldFocused)
+                .onSubmit { createNewFile() }
             Button("Create") { createNewFile() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(model.currentDirectory.isEmpty ? "Create in workspace root." : "Create in \(model.currentDirectory).")
+        }
+        // Focus the name field as soon as the New File dialog appears so keyboard users can
+        // type immediately without clicking first (UX-MAC_FILES-001).
+        .onChange(of: showNewFileDialog) { presented in
+            if presented { newFileFieldFocused = true }
         }
         .alert("Rename", isPresented: Binding(
             get: { renamingEntry != nil },
@@ -728,6 +743,10 @@ private struct FilesSurfaceRoot: View {
             VStack(spacing: 0) {
                 readerHeader
                 Divider().overlay(DS.Palette.line)
+                if model.conflictActive {
+                    conflictBanner
+                    Divider().overlay(DS.Palette.line)
+                }
                 if let error = model.errorText {
                     FilesEmptyState(title: "Files error", symbol: "exclamationmark.triangle", detail: error)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -744,6 +763,34 @@ private struct FilesSurfaceRoot: View {
             }
             .background(DS.Palette.bg)
         }
+    }
+
+    // Conflict is rendered as an actionable banner instead of a dead-end sentence in errorText,
+    // so the named actions actually exist inline (UX-MAC_FILES-016). "Reload from Disk" is the
+    // host-backed resolution (discard re-reads disk); "Keep Editing" hides the banner so the user
+    // can continue with their draft. A force-save ("Keep My Changes") needs a host change and is
+    // intentionally not offered here, since filesEditSave rejects a save over a changed disk.
+    private var conflictBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(DS.Palette.warning)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("File changed outside RemoteCode")
+                    .font(DS.Font.bodyStrong)
+                Text("Saving is blocked until you reload. Reloading replaces your draft with the on-disk version.")
+                    .font(DS.Font.caption)
+                    .foregroundStyle(DS.Palette.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            Button("Keep Editing") { model.conflictActive = false }
+                .help("Dismiss this notice and keep your unsaved draft")
+            Button("Reload from Disk") { model.discard() }
+                .help("Replace your draft with the current file on disk")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(DS.Palette.surfaceRaised)
     }
 
     private var readerHeader: some View {
@@ -789,6 +836,7 @@ private struct FilesSurfaceRoot: View {
                     .frame(width: 16, height: 16)
             }
                 .help("Save")
+                .keyboardShortcut("s", modifiers: .command)
                 .disabled(!model.isDirty)
             Button { confirmDiscard = true } label: { Image(systemName: "arrow.uturn.backward") }
                 .help("Discard")
@@ -915,18 +963,50 @@ private struct FilesSurfaceRoot: View {
 
 private struct ImagePreview: View {
     let url: URL?
+    @State private var image: NSImage?
+    @State private var failed = false
+
     var body: some View {
         GeometryReader { proxy in
-            if let url, let image = NSImage(contentsOf: url) {
+            if let image {
                 Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
                     .frame(width: proxy.size.width, height: proxy.size.height)
                     .background(DS.Palette.bg)
-            } else {
+            } else if failed {
                 FilesEmptyState(title: "Image unavailable", symbol: "photo", detail: "")
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(DS.Palette.bg)
             }
         }
+        // Decode once off the main thread into a downsampled image instead of re-decoding the
+        // full-resolution NSImage on every layout pass (resize, sidebar drag) (PERF-MAC_FILES-005).
+        .task(id: url) {
+            image = nil
+            failed = false
+            guard let url else { failed = true; return }
+            let decoded = await Self.decodeDownsampled(url: url)
+            guard !Task.isCancelled else { return }
+            if let decoded { image = decoded } else { failed = true }
+        }
+    }
+
+    private static func decodeDownsampled(url: URL) async -> NSImage? {
+        await Task.detached(priority: .userInitiated) {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: 4096
+            ]
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }.value
     }
 }
 
@@ -995,13 +1075,47 @@ private struct DisketteShutter: Shape {
 
 private struct VideoPreview: View {
     let url: URL?
+    @StateObject private var holder = VideoPlayerHolder()
+
     var body: some View {
-        if let url {
-            VideoPlayer(player: AVPlayer(url: url))
-                .background(DS.Palette.bg)
-        } else {
-            FilesEmptyState(title: "Video unavailable", symbol: "play.rectangle", detail: "")
+        Group {
+            if url != nil {
+                VideoPlayer(player: holder.player)
+                    .background(DS.Palette.bg)
+            } else {
+                FilesEmptyState(title: "Video unavailable", symbol: "play.rectangle", detail: "")
+            }
         }
+        // Reuse a single AVPlayer across layout passes and swap its item only when the URL
+        // changes, instead of allocating a fresh player on every body eval (PERF-MAC_FILES-011).
+        .onChange(of: url) { newValue in holder.load(newValue) }
+        .onAppear { holder.load(url) }
+        .onDisappear { holder.teardown() }
+    }
+}
+
+/// Owns the AVPlayer for VideoPreview so it survives SwiftUI body re-evaluations and is
+/// paused/cleared when the preview disappears, preventing background decode/buffer drain
+/// (PERF-MAC_FILES-011).
+@MainActor
+private final class VideoPlayerHolder: ObservableObject {
+    let player = AVPlayer()
+    private var currentURL: URL?
+
+    func load(_ url: URL?) {
+        guard url != currentURL else { return }
+        currentURL = url
+        if let url {
+            player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        } else {
+            player.replaceCurrentItem(with: nil)
+        }
+    }
+
+    func teardown() {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        currentURL = nil
     }
 }
 

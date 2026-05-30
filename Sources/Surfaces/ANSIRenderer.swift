@@ -48,6 +48,13 @@ public final class ANSIRenderer {
     private var inverse = false
     private var cursorVisible = true
 
+    /// Bumped on every content mutation so read-path snapshots can be memoized
+    /// and only rebuilt when output actually changed (PERF-004).
+    private var contentVersion: UInt64 = 0
+    private var cachedSnapshot: (version: UInt64, value: NSAttributedString)?
+    private var cachedANSIWithScrollback: (version: UInt64, value: String)?
+    private var cachedANSIViewport: (version: UInt64, value: String)?
+
     public init(rows: Int = 40, cols: Int = 120, scrollbackLimit: Int = ANSIRenderer.defaultScrollbackLimit) {
         self.rows = rows
         self.cols = cols
@@ -81,6 +88,7 @@ public final class ANSIRenderer {
     }
 
     public func feed(byte b: UInt8) {
+        contentVersion &+= 1
         switch state {
         case .ground:
             handleGround(b)
@@ -471,6 +479,15 @@ public final class ANSIRenderer {
     public var showCursor = true
 
     public func snapshot() -> NSAttributedString {
+        if let cachedSnapshot, cachedSnapshot.version == contentVersion {
+            return cachedSnapshot.value
+        }
+        let value = buildSnapshot()
+        cachedSnapshot = (contentVersion, value)
+        return value
+    }
+
+    private func buildSnapshot() -> NSAttributedString {
         let out = NSMutableAttributedString()
         let font = DS.NS.terminalFont()
         let curRow = cursorRow
@@ -512,6 +529,23 @@ public final class ANSIRenderer {
     }
 
     public func ansiSnapshot(includeScrollback: Bool = false) -> String {
+        if includeScrollback {
+            if let cachedANSIWithScrollback, cachedANSIWithScrollback.version == contentVersion {
+                return cachedANSIWithScrollback.value
+            }
+            let value = buildANSISnapshot(includeScrollback: true)
+            cachedANSIWithScrollback = (contentVersion, value)
+            return value
+        }
+        if let cachedANSIViewport, cachedANSIViewport.version == contentVersion {
+            return cachedANSIViewport.value
+        }
+        let value = buildANSISnapshot(includeScrollback: false)
+        cachedANSIViewport = (contentVersion, value)
+        return value
+    }
+
+    private func buildANSISnapshot(includeScrollback: Bool) -> String {
         let allRows = usesAlternateScreen || !includeScrollback ? grid : scrollback + grid
         var out = ""
         var currentStyle: ANSIStyle?
@@ -670,6 +704,7 @@ public final class ANSIRenderer {
 
     public func resize(rows newRows: Int, cols newCols: Int) {
         guard newRows > 0, newCols > 0 else { return }
+        contentVersion &+= 1
         let removedTopRows = max(0, rows - newRows)
         if removedTopRows > 0, !usesAlternateScreen {
             for row in grid.prefix(removedTopRows) {

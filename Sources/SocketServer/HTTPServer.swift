@@ -42,6 +42,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestBodyBytes = 2 * 1024 * 1024
     static let maxClientFramePayloadBytes = 1024 * 1024
     static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+    static let wsHeartbeatInterval: TimeInterval = 20
 
     public let port: UInt16
     public let bindLoopbackOnly: Bool
@@ -200,12 +201,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     guard let self else { return false }
                     return self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
                 },
-                onClose: { reason in
+                onClose: { [weak self] reason in
                     if let id = subIDBox.value { EventBus.shared.unsubscribe(id) }
                     EventBus.shared.publish(kind: "diagnostic.ws_slow_client", payload: .object([
                         "reason": .string(reason),
                         "baseline_required": .bool(true)
                     ]))
+                    // UX-001: tell the client *why* the socket is closing and
+                    // what to do, so it can show a transient banner and
+                    // auto-reconnect with a baseline instead of silently freezing.
+                    if let self,
+                       let closeObj = try? JSONSerialization.data(withJSONObject: [
+                           "type": "server_close",
+                           "reason": reason,
+                           "action": "reconnect_with_baseline"
+                       ]) {
+                        self.sendWSText(fd: fd, data: closeObj)
+                    }
                     shutdown(fd, SHUT_RDWR)
                 }
             )
@@ -225,8 +237,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             subIDBox.value = id
             subID = id
+            // UX-003: server-initiated heartbeat so the client can tell
+            // "idle but healthy" from "silently dead socket" and surface an
+            // honest live/stale indicator ("last synced Ns ago"). Seq-less so
+            // it never collides with the ordered event stream.
+            let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+            heartbeat.schedule(deadline: .now() + Self.wsHeartbeatInterval, repeating: Self.wsHeartbeatInterval)
+            heartbeat.setEventHandler {
+                guard let data = try? JSONSerialization.data(withJSONObject: [
+                    "type": "heartbeat",
+                    "ts": Date().timeIntervalSince1970
+                ]) else { return }
+                _ = outbound.enqueue(data)
+            }
+            heartbeat.resume()
             // keep connection open; read incoming frames (ping/pong/close)
             wsServeLoop(fd: fd, outbound: outbound)
+            heartbeat.cancel()
             outbound.drain()
             return
         }
@@ -374,6 +401,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
+    /// PERF-001: cap how many pool threads may be parked on the
+    /// main-actor hop at once. A burst of concurrent RPCs (iOS foreground
+    /// firing list/status/get) would otherwise grow the global pool with
+    /// N semaphore-blocked workers all queued behind the serial main actor.
+    /// Bounding the gate keeps thread-pool growth and head-of-line blocking
+    /// in check; main-actor dispatch is already serial so throughput is
+    /// unchanged.
+    private static let rpcHopGate = DispatchSemaphore(value: 8)
+
     /// Decode + dispatch one JSON-RPC request on the main actor and
     /// return the encoded response bytes. Mirrors UnixSocketServer's
     /// hop pattern so synchronous AppKit/SwiftUI calls stay on main.
@@ -384,6 +420,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let resp = JSONRPCResponse(id: nil, error: .parseError)
             return (try? encoder.encode(resp)) ?? Data("{}".utf8)
         }
+        Self.rpcHopGate.wait()
+        defer { Self.rpcHopGate.signal() }
         let semaphore = DispatchSemaphore(value: 0)
         final class Slot: @unchecked Sendable { var value: JSONRPCResponse? }
         let slot = Slot()

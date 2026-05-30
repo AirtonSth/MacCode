@@ -215,7 +215,12 @@ public final class PaneTabsView: NSObject {
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
 
+        // PERF-MAC_SHELL_WINDOW-001: the tab strip only reacts to
+        // `files.state.updated`. Drop every other kind on the publishing
+        // thread instead of bouncing the full EventBus firehose to main
+        // just to discard it in `receive`.
         eventToken = EventBus.shared.subscribe(since: nil) { [weak self] event in
+            guard event.kind == "files.state.updated" else { return }
             DispatchQueue.main.async { self?.receive(event) }
         }
         DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
@@ -294,6 +299,17 @@ public final class PaneTabsView: NSObject {
         guard let wid = currentWorkspaceID() else { return }
         if surfaceIsUnsaved(id), !confirmCloseUnsavedSurface(id) { return }
         try? router?.closeSurface(workspace: wid, surface: id)
+    }
+
+    /// UX-MAC_SHELL_WINDOW-003: ⌘W close-tab seam. Closes this pane's
+    /// selected surface through the same unsaved-changes confirm the tab
+    /// "×" uses. Returns false when the pane has no surface to close so
+    /// the caller can fall back to closing the window.
+    @discardableResult
+    public func closeSelectedSurface() -> Bool {
+        guard let id = pane.selectedSurfaceID ?? pane.surfaces.first?.id else { return false }
+        closeSurface(id)
+        return true
     }
 
     @discardableResult
@@ -503,13 +519,25 @@ public final class PaneTabsView: NSObject {
     @discardableResult
     public func performAdd(_ type: SurfaceType, title: String) -> SurfaceDescriptor? {
         guard let wid = currentWorkspaceID() else { return nil }
-        return try? router?.createSurface(workspace: wid, type: type, paneID: pane.id, title: title)
+        let desc = try? router?.createSurface(workspace: wid, type: type, paneID: pane.id, title: title)
+        if let desc { focusNewlyCreatedSurface(desc.id, in: wid) }
+        return desc
     }
 
     @discardableResult
     public func performSplit(_ direction: SplitDirection, type: SurfaceType, title: String) -> SurfaceDescriptor? {
         guard let wid = currentWorkspaceID() else { return nil }
-        return try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
+        let desc = try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
+        if let desc { focusNewlyCreatedSurface(desc.id, in: wid) }
+        return desc
+    }
+
+    /// UX-MAC_SHELL_WINDOW-001: route a freshly created surface through
+    /// the focus path so its input is first responder immediately — no
+    /// extra click before the user can type.
+    private func focusNewlyCreatedSurface(_ id: SurfaceID, in workspace: WorkspaceID) {
+        try? router?.focusSurface(workspace: workspace, surface: id)
+        router?.windowController?.repairSelectedTerminalFocus(reason: "new_surface")
     }
 
     @discardableResult

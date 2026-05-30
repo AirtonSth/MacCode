@@ -16,9 +16,17 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     private let forwardButton = NSButton()
     private let reloadButton = NSButton()
     private let openExternalButton = NSButton()
+    private let progressBar = NSProgressIndicator()
+    private let errorOverlay = NSView()
+    private let errorLabel = NSTextField(labelWithString: "")
+    private let retryButton = NSButton()
     private var googleLegacyLayoutReloads = Set<String>()
     private var retainedURL: URL?
     private var isVisible = true
+    private var progressObservation: NSKeyValueObservation?
+    private var loadingObservation: NSKeyValueObservation?
+    private var waitForToken = 0
+    private var isClosed = false
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
     public var externalURLOpener: ((URL) -> Void)?
 
@@ -103,6 +111,57 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
             toolbarDivider.heightAnchor.constraint(equalToConstant: 1)
         ])
 
+        progressBar.style = .bar
+        progressBar.isIndeterminate = false
+        progressBar.minValue = 0
+        progressBar.maxValue = 1
+        progressBar.doubleValue = 0
+        progressBar.isHidden = true
+        progressBar.controlSize = .small
+        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(progressBar)
+        NSLayoutConstraint.activate([
+            progressBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            progressBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            progressBar.topAnchor.constraint(equalTo: toolbarDivider.bottomAnchor),
+            progressBar.heightAnchor.constraint(equalToConstant: 2)
+        ])
+
+        errorOverlay.wantsLayer = true
+        errorOverlay.layer?.backgroundColor = DS.NS.bg.cgColor
+        errorOverlay.isHidden = true
+        errorOverlay.translatesAutoresizingMaskIntoConstraints = false
+        let errorIcon = NSImageView()
+        errorIcon.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "Error")
+        errorIcon.contentTintColor = DS.NS.textSecondary
+        errorIcon.translatesAutoresizingMaskIntoConstraints = false
+        errorLabel.alignment = .center
+        errorLabel.maximumNumberOfLines = 0
+        errorLabel.textColor = DS.NS.text
+        errorLabel.translatesAutoresizingMaskIntoConstraints = false
+        retryButton.title = "Retry"
+        retryButton.bezelStyle = .rounded
+        retryButton.translatesAutoresizingMaskIntoConstraints = false
+        let errorStack = NSStackView(views: [errorIcon, errorLabel, retryButton])
+        errorStack.orientation = .vertical
+        errorStack.alignment = .centerX
+        errorStack.spacing = 12
+        errorStack.translatesAutoresizingMaskIntoConstraints = false
+        errorOverlay.addSubview(errorStack)
+        container.addSubview(errorOverlay)
+        NSLayoutConstraint.activate([
+            errorOverlay.topAnchor.constraint(equalTo: wv.topAnchor),
+            errorOverlay.leadingAnchor.constraint(equalTo: wv.leadingAnchor),
+            errorOverlay.trailingAnchor.constraint(equalTo: wv.trailingAnchor),
+            errorOverlay.bottomAnchor.constraint(equalTo: wv.bottomAnchor),
+            errorStack.centerXAnchor.constraint(equalTo: errorOverlay.centerXAnchor),
+            errorStack.centerYAnchor.constraint(equalTo: errorOverlay.centerYAnchor),
+            errorStack.leadingAnchor.constraint(greaterThanOrEqualTo: errorOverlay.leadingAnchor, constant: 24),
+            errorStack.trailingAnchor.constraint(lessThanOrEqualTo: errorOverlay.trailingAnchor, constant: -24),
+            errorIcon.widthAnchor.constraint(equalToConstant: 32),
+            errorIcon.heightAnchor.constraint(equalToConstant: 32)
+        ])
+
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.bg.cgColor
         self.view = container
@@ -112,9 +171,59 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         forwardButton.target = self; forwardButton.action = #selector(goForward)
         reloadButton.target = self; reloadButton.action = #selector(reload)
         openExternalButton.target = self; openExternalButton.action = #selector(openInDefaultBrowser)
+        retryButton.target = self; retryButton.action = #selector(reload)
         tf.target = self; tf.action = #selector(goAddress)
 
+        backButton.isEnabled = false
+        forwardButton.isEnabled = false
+        observeLoadingState()
+
         navigate(to: initialURL ?? Self.defaultInitialURL)
+    }
+
+    private func observeLoadingState() {
+        progressObservation = webView.observe(\.estimatedProgress, options: [.new]) { [weak self] webView, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.progressBar.doubleValue = webView.estimatedProgress
+            }
+        }
+        loadingObservation = webView.observe(\.isLoading, options: [.new]) { [weak self] webView, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.updateLoadingChrome(isLoading: webView.isLoading)
+            }
+        }
+    }
+
+    private func updateLoadingChrome(isLoading: Bool) {
+        if isLoading {
+            progressBar.isHidden = false
+            reloadButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Stop")
+            reloadButton.toolTip = "Stop"
+        } else {
+            progressBar.isHidden = true
+            progressBar.doubleValue = 0
+            reloadButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Reload")
+            reloadButton.toolTip = "Reload"
+        }
+        updateNavigationButtons()
+    }
+
+    private func updateNavigationButtons() {
+        backButton.isEnabled = webView.canGoBack
+        forwardButton.isEnabled = webView.canGoForward
+        backButton.contentTintColor = webView.canGoBack ? DS.NS.textSecondary : DS.NS.textSecondary.withAlphaComponent(0.35)
+        forwardButton.contentTintColor = webView.canGoForward ? DS.NS.textSecondary : DS.NS.textSecondary.withAlphaComponent(0.35)
+    }
+
+    private func showError(_ message: String) {
+        errorLabel.stringValue = message
+        errorOverlay.isHidden = false
+    }
+
+    private func hideError() {
+        errorOverlay.isHidden = true
     }
 
     public static var defaultInitialURL: URL {
@@ -134,6 +243,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
         let url = Self.normalizedInitialURL(url)
         retainedURL = url
         addressBar.stringValue = url.absoluteString
+        hideError()
+        waitForToken &+= 1
         guard isVisible else { return }
         webView.load(URLRequest(url: url))
         if Self.isGoogleHost(url.host) {
@@ -312,9 +423,15 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     public func waitFor(_ selector: String, timeoutMs: Int, completion: @escaping (String) -> Void) {
         let deadline = Date().addingTimeInterval(TimeInterval(timeoutMs) / 1000.0)
         let escaped = selector.replacingOccurrences(of: "`", with: "\\`")
+        waitForToken &+= 1
+        let token = waitForToken
         func poll() {
             let probe = "(function(){ return document.querySelector(`\(escaped)`) ? true : false; })()"
-            self.evaluate(probe) { value, _ in
+            self.evaluate(probe) { [weak self] value, _ in
+                guard let self, !self.isClosed, self.waitForToken == token else {
+                    completion("{\"ok\":false,\"error\":\"cancelled\"}")
+                    return
+                }
                 if (value as? Bool) == true {
                     completion("{\"ok\":true}")
                 } else if Date() > deadline {
@@ -337,7 +454,14 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
 
     @objc private func goBack() { webView.goBack() }
     @objc private func goForward() { webView.goForward() }
-    @objc private func reload() { webView.reload() }
+    @objc private func reload() {
+        if webView.isLoading {
+            webView.stopLoading()
+        } else {
+            hideError()
+            webView.reload()
+        }
+    }
     @objc private func openInDefaultBrowser() { openCurrentURLInDefaultBrowser() }
     @objc private func goAddress() {
         var s = addressBar.stringValue.trimmingCharacters(in: .whitespaces)
@@ -357,12 +481,34 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
 
     // MARK: WKNavigationDelegate
 
+    public func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        hideError()
+    }
+
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if let url = webView.url {
             addressBar.stringValue = url.absoluteString
             publishNavigationChange(url: url, title: webView.title)
         }
+        hideError()
+        updateNavigationButtons()
         reloadGoogleOnceAfterClearingLegacyLayoutCookie()
+    }
+
+    public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        handleNavigationFailure(error)
+    }
+
+    public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        handleNavigationFailure(error)
+    }
+
+    private func handleNavigationFailure(_ error: Error) {
+        let ns = error as NSError
+        // Ignore user/programmatic cancellations (e.g. stopLoading, new navigation superseding this one).
+        if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
+        showError(error.localizedDescription)
+        updateNavigationButtons()
     }
 
     public func publishNavigationChange(url: URL, title: String?) {
@@ -410,16 +556,36 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate {
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
-        navigate(to: retainedURL ?? webView.url ?? Self.defaultInitialURL)
+        // The webView stayed resident while hidden (WebKit suspends the
+        // offscreen process), so scroll/forms/history survive. Only load
+        // fresh content if nothing is loaded yet, or a navigate() arrived
+        // while hidden and was deferred (retainedURL diverged from the
+        // resident page).
+        if webView.url == nil {
+            navigate(to: retainedURL ?? Self.defaultInitialURL)
+        } else if let pending = retainedURL, pending != webView.url {
+            navigate(to: pending)
+        }
     }
     public func didBecomeHidden() {
         guard isVisible else { return }
         isVisible = false
         retainedURL = webView.url ?? retainedURL
-        webView.stopLoading()
-        webView.loadHTMLString("", baseURL: nil)
+        // Keep the document resident; WebKit suspends the offscreen web
+        // process. Blanking + reloading on every tab switch destroyed
+        // scroll position, form input, and back/forward history.
     }
-    public func close() { webView.stopLoading() }
+    public func close() {
+        isClosed = true
+        waitForToken &+= 1
+        progressObservation?.invalidate()
+        progressObservation = nil
+        loadingObservation?.invalidate()
+        loadingObservation = nil
+        onNavigationChange = nil
+        webView.navigationDelegate = nil
+        webView.stopLoading()
+    }
     public func sendText(_ text: String) { /* not applicable for browser */ }
     public func readText() -> String { webView.url?.absoluteString ?? "" }
     public func snapshot() -> [String: String] {

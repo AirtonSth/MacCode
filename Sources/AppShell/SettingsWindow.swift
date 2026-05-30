@@ -22,13 +22,17 @@ public final class SettingsViewModel: ObservableObject {
     private let privateAccountAPI: PrivateAccountAPI
     private let privateAccountStore: PrivateAccountSessionStore
     private let openURL: @MainActor (URL) -> Void
+    private var changeObservers: [NSObjectProtocol] = []
 
     @Published public var remoteAccessEnabled: Bool = false
     @Published public var appSettings: AppSettings = AppSettings()
     @Published public var codexPath: String = ""
     @Published public var claudePath: String = ""
+    @Published public var codexAvailable: Bool = false
+    @Published public var claudeAvailable: Bool = false
     @Published public var devices: [DeviceTrust] = []
     @Published public var newPairingCode: String?
+    @Published public var pairingCodeExpiresAt: Date?
     @Published public var updatingProviders: Set<AgentProvider> = []
     @Published public var providerUpdateMessages: [AgentProvider: String] = [:]
     @Published public var customModelsByProvider: [AgentProvider: [String]] = [:]
@@ -53,6 +57,20 @@ public final class SettingsViewModel: ObservableObject {
         self.customModelStore = AgentCustomModelStore(repo: context.settingsRepo)
         self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
         reload()
+        // Keep separate Settings/Account window instances in sync: when either
+        // posts an account/remote-access change, refresh this instance too so it
+        // never shows stale status (mirrors SidebarViewModel's observer).
+        for name in [Notification.Name.rc2PrivateAccountChanged, .rc2RemoteAccessSettingChanged] {
+            changeObservers.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.reload() }
+            })
+        }
+    }
+
+    deinit {
+        changeObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
     public func reload() {
@@ -60,6 +78,8 @@ public final class SettingsViewModel: ObservableObject {
         appSettings = settingsStore.load()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
+        codexAvailable = resolveAvailable(codexPath)
+        claudeAvailable = resolveAvailable(claudePath)
         customModelsByProvider = Dictionary(uniqueKeysWithValues: AgentProvider.allCases.map { provider in
             (provider, customModelStore.list(provider: provider))
         })
@@ -94,11 +114,13 @@ public final class SettingsViewModel: ObservableObject {
 
     public func setCodexPath(_ path: String) {
         codexPath = path
+        codexAvailable = resolveAvailable(path)
         saveCLIPath(key: "cli.codex.path", provider: .codex, path: path)
     }
 
     public func setClaudePath(_ path: String) {
         claudePath = path
+        claudeAvailable = resolveAvailable(path)
         saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
     }
 
@@ -146,6 +168,7 @@ public final class SettingsViewModel: ObservableObject {
     public func createPairingCode() {
         if let pc = try? trustRepo.createPairingCode(ttlSeconds: 600) {
             newPairingCode = pc.code
+            pairingCodeExpiresAt = Date().addingTimeInterval(600)
         }
     }
 
@@ -239,8 +262,9 @@ public final class SettingsViewModel: ObservableObject {
         NotificationCenter.default.post(name: .rc2PrivateAccountChanged, object: nil)
     }
 
-    public var codexAvailable: Bool { ProcessLocator.resolve(codexPath).map { !$0.isEmpty } ?? false }
-    public var claudeAvailable: Bool { ProcessLocator.resolve(claudePath).map { !$0.isEmpty } ?? false }
+    private func resolveAvailable(_ path: String) -> Bool {
+        ProcessLocator.resolve(path).map { !$0.isEmpty } ?? false
+    }
 
     private func cliPath(key: String, fallback: String) -> String {
         let stored = ((try? settingsRepo.get(key)) ?? "")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -266,6 +290,8 @@ public final class SettingsViewModel: ObservableObject {
 public struct SettingsView: View {
     @ObservedObject var vm: SettingsViewModel
     private let onClose: (() -> Void)?
+
+    @State private var deviceToRevoke: DeviceTrust?
 
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -398,13 +424,35 @@ public struct SettingsView: View {
     private var trustedDevicesSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeader("Trusted Devices")
-            HStack(spacing: DS.Space.lg) {
+            if let c = vm.newPairingCode, let expiresAt = vm.pairingCodeExpiresAt {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let remaining = max(0, Int(expiresAt.timeIntervalSince(context.date).rounded(.up)))
+                    let expired = remaining <= 0
+                    HStack(spacing: DS.Space.lg) {
+                        Button(expired ? "Generate again" : "Generate pairing code") { vm.createPairingCode() }
+                            .buttonStyle(DSSecondaryButtonStyle())
+                        Text(c).font(DS.Font.title2.monospaced())
+                            .foregroundColor(expired ? DS.Palette.textTertiary : DS.Palette.success)
+                            .textSelection(.enabled)
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(c, forType: .string)
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 12, weight: .semibold))
+                                .frame(width: 18, height: 18)
+                        }
+                        .help("Copy pairing code")
+                        .buttonStyle(DSSecondaryButtonStyle())
+                        .disabled(expired)
+                        Text(expired ? "Expired" : String(format: "Expires in %d:%02d", remaining / 60, remaining % 60))
+                            .font(DS.Font.caption)
+                            .foregroundColor(expired ? DS.Palette.danger : DS.Palette.textTertiary)
+                    }
+                }
+            } else {
                 Button("Generate pairing code") { vm.createPairingCode() }
                     .buttonStyle(DSSecondaryButtonStyle())
-                if let c = vm.newPairingCode {
-                    Text(c).font(DS.Font.title2.monospaced())
-                        .foregroundColor(DS.Palette.success).textSelection(.enabled)
-                }
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -424,7 +472,7 @@ public struct SettingsView: View {
                             if d.revokedAt != nil {
                                 DSPill("revoked", tone: .danger)
                             } else {
-                                Button("Revoke") { vm.revoke(d.id) }
+                                Button("Revoke") { deviceToRevoke = d }
                                     .buttonStyle(DSSecondaryButtonStyle())
                             }
                         }
@@ -434,6 +482,14 @@ public struct SettingsView: View {
             }.frame(maxHeight: 150)
         }
         .dsPanel(padding: DS.Space.lg)
+        .alert("Revoke device?",
+               isPresented: Binding(get: { deviceToRevoke != nil }, set: { if !$0 { deviceToRevoke = nil } }),
+               presenting: deviceToRevoke) { device in
+            Button("Revoke", role: .destructive) { vm.revoke(device.id) }
+            Button("Cancel", role: .cancel) {}
+        } message: { device in
+            Text("\(device.displayName) will need to pair again to access this Mac.")
+        }
     }
 
     private var diagnosticsSection: some View {
@@ -487,6 +543,9 @@ public struct SettingsView: View {
 public struct AccountView: View {
     @ObservedObject var vm: SettingsViewModel
     private let onClose: (() -> Void)?
+
+    private enum SignInField: Hashable { case email, password }
+    @FocusState private var focusedField: SignInField?
 
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -548,6 +607,8 @@ public struct AccountView: View {
                 TextField("you@example.com", text: Binding(get: { vm.privateAccountEmail }, set: { vm.privateAccountEmail = $0 }))
                     .textFieldStyle(.roundedBorder)
                     .font(DS.Font.body)
+                    .focused($focusedField, equals: .email)
+                    .onSubmit { focusedField = .password }
             }
 
             VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -557,6 +618,8 @@ public struct AccountView: View {
                 SecureField("Password", text: Binding(get: { vm.privateAccountPassword }, set: { vm.privateAccountPassword = $0 }))
                     .textFieldStyle(.roundedBorder)
                     .font(DS.Font.body)
+                    .focused($focusedField, equals: .password)
+                    .onSubmit { Task { await vm.connectPrivateAccount() } }
             }
 
             Button {
@@ -573,6 +636,7 @@ public struct AccountView: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(DSPrimaryButtonStyle())
+            .keyboardShortcut(.defaultAction)
             .disabled(vm.privateAccountBusy)
 
             if vm.privateAccountStatus == "Sign in failed" {
@@ -582,6 +646,7 @@ public struct AccountView: View {
             }
         }
         .dsPanel(padding: DS.Space.xl, raised: true)
+        .onAppear { focusedField = .email }
     }
 
     private var signedInPanel: some View {

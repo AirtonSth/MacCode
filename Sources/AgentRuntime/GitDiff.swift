@@ -268,6 +268,17 @@ public enum GitDiff {
         return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
     }
 
+    /// Stash the working tree (incl. untracked) then checkout `branch`.
+    /// Used by the dirty-checkout guard so users with uncommitted work
+    /// can switch branches without losing changes (UX-004).
+    public static func stashAndCheckout(in cwd: String, branch: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let stash = run(["stash", "push", "--include-untracked", "-m", "remote-code: switch to \(branch)"], cwd: cwd)
+        guard stash.exit == 0 else { return GitActionResult(ok: false, message: actionMessage(stash)) }
+        let r = run(["checkout", branch], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
     public static func restorePathToHead(in cwd: String, path: String) -> GitActionResult {
         guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
         let r = run(["checkout", "HEAD", "--", path], cwd: cwd)

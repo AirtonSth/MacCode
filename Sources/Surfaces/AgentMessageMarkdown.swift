@@ -177,3 +177,48 @@ struct AgentMessageMarkdownView: View {
         }
     }
 }
+
+/// UX-MAC_AGENT-006: monospace diff preview for approval requests, colorizing
+/// +/-/@@/header lines. Caps rendered lines so a large patch can't dominate.
+struct DiffPreviewText: View {
+    private let attributed: AttributedString
+
+    init(_ diff: String, maxLines: Int = 200) {
+        self.attributed = Self.render(diff, maxLines: maxLines)
+    }
+
+    var body: some View {
+        Text(attributed)
+            .font(DS.Font.monoSmall)
+            .textSelection(.enabled)
+    }
+
+    private static func render(_ diff: String, maxLines: Int) -> AttributedString {
+        let lines = diff.split(separator: "\n", omittingEmptySubsequences: false)
+        let shown = lines.prefix(maxLines)
+        var out = AttributedString()
+        for line in shown {
+            var seg = AttributedString(String(line) + "\n")
+            if line.hasPrefix("+") && !line.hasPrefix("+++") {
+                seg.foregroundColor = DS.Palette.success
+                seg.backgroundColor = DS.Palette.success.opacity(0.08)
+            } else if line.hasPrefix("-") && !line.hasPrefix("---") {
+                seg.foregroundColor = DS.Palette.danger
+                seg.backgroundColor = DS.Palette.danger.opacity(0.08)
+            } else if line.hasPrefix("@@") {
+                seg.foregroundColor = DS.Palette.accent
+            } else if line.hasPrefix("diff --git") || line.hasPrefix("+++") || line.hasPrefix("---") {
+                seg.foregroundColor = DS.Palette.warning
+            } else {
+                seg.foregroundColor = DS.Palette.textSecondary
+            }
+            out.append(seg)
+        }
+        if lines.count > maxLines {
+            var more = AttributedString("… \(lines.count - maxLines) more lines")
+            more.foregroundColor = DS.Palette.textTertiary
+            out.append(more)
+        }
+        return out
+    }
+}

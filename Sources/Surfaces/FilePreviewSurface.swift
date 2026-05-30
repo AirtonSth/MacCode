@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ImageIO
 import Quartz
 import CoreModel
 
@@ -62,10 +63,31 @@ public final class FilePreviewSurface: NSObject, Surface {
     private func renderImage(path: String) {
         let iv = NSImageView()
         iv.imageScaling = .scaleProportionallyDown
-        iv.image = NSImage(contentsOfFile: path)
         iv.translatesAutoresizingMaskIntoConstraints = false
         containerStack.addSubview(iv)
         pin(iv)
+        // Decode off the main thread into a downsampled image rather than synchronously
+        // decoding the full-resolution NSImage on the RPC/main path (PERF-MAC_FILES-005).
+        let url = URL(fileURLWithPath: path)
+        Task { [weak self, weak iv] in
+            let image = await Task.detached(priority: .userInitiated) {
+                Self.decodeDownsampled(url: url)
+            }.value
+            guard let self, self.filePath == path else { return }
+            iv?.image = image
+        }
+    }
+
+    private nonisolated static func decodeDownsampled(url: URL) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 4096
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     private func renderPDF(path: String) {

@@ -307,6 +307,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var terminalSize = TerminalViewportGeometry.fallbackSize
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
+    private var awaitingSSHFirstOutput = false
     private var isVisible = true
     private let historyRepo: TerminalOutputRepository?
     private let historyWorkspaceID: String
@@ -322,6 +323,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
     private var focusRepairGeneration = 0
+    private var didBeepForDeadInput = false
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
@@ -411,7 +413,14 @@ public final class TerminalSurface: NSObject, Surface {
             nextHistoryChunkIndex = (try? historyRepo.nextChunkIndex(surfaceID: descriptor.id.value.uuidString)) ?? 1
         }
 
-        terminalView.onInputData = { [weak self] data in _ = self?.writeToPTY(data) }
+        terminalView.onInputData = { [weak self] data in
+            guard let self else { return }
+            let status = self.writeToPTY(data)
+            if status == .processExited, !self.didBeepForDeadInput {
+                self.didBeepForDeadInput = true
+                NSSound.beep()
+            }
+        }
         terminalView.onTerminalSizeChange = { [weak self] size in
             guard let self else { return }
             self.applyTerminalSize(size, sendToPTY: self.masterFD >= 0)
@@ -486,6 +495,11 @@ public final class TerminalSurface: NSObject, Surface {
         configureInputPump(fd: amaster)
         applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
+        if case .ssh(let profile, _) = launch {
+            awaitingSSHFirstOutput = true
+            let host = profile.label.isEmpty ? profile.destination : profile.label
+            appendString("[connecting to \(host)…]\r\n")
+        }
         publishRuntimeHealth()
     }
 
@@ -563,6 +577,10 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
         enqueueHistory(data)
+        if awaitingSSHFirstOutput {
+            awaitingSSHFirstOutput = false
+            descriptor.metadata["ssh_status"] = "connected"
+        }
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
@@ -781,11 +799,23 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func markTerminalDead(reason: String, exitStatus: Int32?) {
         guard processAlive || terminalDeadReason == nil else { return }
+        let wasAlive = processAlive
         processAlive = false
         self.exitStatus = exitStatus ?? self.exitStatus
         terminalDeadReason = reason
         inputPump?.stop(reason: .processExited)
+        if wasAlive, !isClosing {
+            appendString("\r\n" + Self.processExitedBanner(rawStatus: exitStatus) + "\r\n")
+        }
         publishRuntimeHealth()
+    }
+
+    private static func processExitedBanner(rawStatus: Int32?) -> String {
+        guard let rawStatus else { return "[process exited]" }
+        if (rawStatus & 0x7F) != 0 {
+            return "[process terminated (signal \(rawStatus & 0x7F))]"
+        }
+        return "[process exited (code \((rawStatus >> 8) & 0xFF))]"
     }
 
     public func readText() -> String {

@@ -174,6 +174,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var workspaceContentTopConstraint: NSLayoutConstraint?
     private var workspaceWindows: [WorkspaceID: WorkspaceWindowController] = [:]
     private var detachedWorkspaceIDs: Set<WorkspaceID> = []
+    /// PERF-MAC_SHELL_WINDOW-002: signature of the last container build
+    /// (selected workspace + pane/surface/selection structure). When an
+    /// unchanged signature comes back through `refreshFromState` (app
+    /// become-key/active/reopen) the full teardown/rebuild is skipped.
+    private var lastWorkspaceContainerSignature: String?
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -498,6 +503,22 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
     }
 
+    /// UX-MAC_SHELL_WINDOW-003: close the focused pane's selected surface
+    /// (with its unsaved-changes confirm). Returns false when there is no
+    /// surface to close so ⌘W can fall back to closing the window.
+    @discardableResult
+    public func closeFocusedSurface() -> Bool {
+        guard let ctx = context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid],
+              !detachedWorkspaceIDs.contains(wid) else { return false }
+        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
+        guard let focusedPaneID,
+              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
+                ?? paneControllers.first else { return false }
+        return controller.closeSelectedSurface()
+    }
+
     public func repairSelectedTerminalFocus(reason: String) {
         guard protectedFocusedView() == nil else { return }
         router?.repairSelectedTerminalFocus(reason: reason)
@@ -610,6 +631,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     private func rebuildWorkspaceContainer() {
+        // PERF-MAC_SHELL_WINDOW-002: a refresh whose layout signature
+        // matches the live tree (e.g. app become-key/active/reopen) does
+        // not need a teardown/rebuild — the existing pane controllers are
+        // already correct.
+        let signature = workspaceContainerSignature()
+        if signature == lastWorkspaceContainerSignature, !paneControllers.isEmpty {
+            return
+        }
+        lastWorkspaceContainerSignature = signature
+
         window.disableScreenUpdatesUntilFlush()
         for sub in workspaceContent.subviews { sub.removeFromSuperview() }
         // Drop references to the previous pane controllers; new ones are
@@ -634,6 +665,34 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             NotificationCenter.default.post(
                 name: .rc2SidebarVisibility, object: nil,
                 userInfo: ["collapsed": true])
+        }
+    }
+
+    /// Structural fingerprint of what `rebuildWorkspaceContainer` would
+    /// produce: selected workspace, sidebar/detached state, and the
+    /// pane/surface/selection/title shape of the layout tree.
+    private func workspaceContainerSignature() -> String {
+        guard let ctx = context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid],
+              !detachedWorkspaceIDs.contains(wid) else {
+            return "empty"
+        }
+        var parts: [String] = ["ws:\(wid.value.uuidString)", "collapsed:\(sidebarCollapsed)"]
+        appendLayoutSignature(ws.layout, into: &parts)
+        return parts.joined(separator: "|")
+    }
+
+    private func appendLayoutSignature(_ node: LayoutNode, into parts: inout [String]) {
+        switch node {
+        case .pane(let p):
+            let sel = (p.selectedSurfaceID ?? p.surfaces.first?.id)?.value.uuidString ?? "none"
+            let surfaces = p.surfaces.map { "\($0.id.value.uuidString):\($0.title)" }.joined(separator: ",")
+            parts.append("pane(\(p.id.value.uuidString);sel=\(sel);[\(surfaces)])")
+        case .split(let s):
+            parts.append("split(\(s.orientation);\(s.ratios.map { String(format: "%.3f", $0) }.joined(separator: ",")){")
+            for child in s.children { appendLayoutSignature(child, into: &parts) }
+            parts.append("}")
         }
     }
 

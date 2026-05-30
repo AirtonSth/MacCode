@@ -83,6 +83,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var retainedTranscriptBodyCount: Int = 0
     @Published public private(set) var visibleTranscriptRowCount: Int = 0
     @Published public private(set) var hydrationDirection: String?
+    /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
+    /// the transcript can offer a Retry of the last prompt instead of forcing a
+    /// retype. Cleared when a run starts or any non-error event arrives.
+    @Published public private(set) var lastErrorRecoverable: Bool = false
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -219,6 +223,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         timelineUpdateTick = 0
+        // UX-MAC_AGENT-001: route first-responder to the composer on every
+        // open/switch so the user can type without a manual click.
+        focusTick &+= 1
     }
 
     public func reloadQueuedMessages() {
@@ -642,6 +649,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } catch {
             timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
             timeline.apply(.requestResolved(requestId: request.id, state: .stale))
+            // Response-failure, not a prompt failure — no prompt Retry offered.
+            lastErrorRecoverable = false
         }
         timelineUpdateTick += 1
     }
@@ -661,6 +670,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 timeline.pendingUserInputs[idx].state = .stale
                 timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
             }
+            // Response-failure, not a prompt failure — no prompt Retry offered.
+            lastErrorRecoverable = false
         }
         timelineUpdateTick += 1
     }
@@ -1315,6 +1326,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
         timelineUpdateTick = 0
+        lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         let resolvedAttachments: [AgentAttachment]
         do {
             resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
@@ -1400,6 +1412,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         promptHistoryCursor = nil
     }
 
+    /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
+    /// without forcing the user to retype it.
+    public func retryLastPrompt() async {
+        guard let last = promptHistory.last, !last.isEmpty else { return }
+        lastErrorRecoverable = false
+        _ = await startProviderRun(text: last, attached: [], recordHistory: false, interactionMode: interactionMode)
+    }
+
     @discardableResult
     public func recallPreviousPrompt() -> Bool {
         guard prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || promptHistoryCursor != nil else { return false }
@@ -1451,6 +1471,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if self.status != .running { self.status = .running }
             }
             self.timeline.apply(event)
+            // UX-MAC_AGENT-009: track recoverability of the latest error so the
+            // transcript can offer Retry; any other event clears the flag.
+            if case let .error(_, recoverable) = event {
+                self.lastErrorRecoverable = recoverable
+            } else {
+                self.lastErrorRecoverable = false
+            }
             self.timelineUpdateTick &+= 1
         }
     }
@@ -1739,6 +1766,7 @@ public struct AgentAppView: View {
     @State private var showWorkLog = false
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: AssistantPendingRequest?
+    @State private var expandedRequestPreviews: Set<String> = []
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
 
@@ -1818,16 +1846,44 @@ public struct AgentAppView: View {
             compactAssistantText(lhs) == compactAssistantText(rhs)
     }
 
+    // PERF-MAC_AGENT-002: collapse whitespace manually over unicode scalars
+    // instead of regex; these run for every assistant row on every render, and
+    // regex over capped 80k-char bodies dominated the dedup cost. Results are
+    // memoized so repeated comparisons of the same body don't re-scan.
+    private static let normalizedTextCache = NSCache<NSString, NSString>()
+    private static let compactTextCache = NSCache<NSString, NSString>()
+
     private static func normalizedAssistantText(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cached = normalizedTextCache.object(forKey: text as NSString) {
+            return cached as String
+        }
+        var out = String()
+        out.reserveCapacity(text.count)
+        var pendingSpace = false
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                pendingSpace = !out.isEmpty
+            } else {
+                if pendingSpace { out.unicodeScalars.append(" ") }
+                pendingSpace = false
+                out.unicodeScalars.append(scalar)
+            }
+        }
+        normalizedTextCache.setObject(out as NSString, forKey: text as NSString)
+        return out
     }
 
     private static func compactAssistantText(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cached = compactTextCache.object(forKey: text as NSString) {
+            return cached as String
+        }
+        var out = String()
+        out.reserveCapacity(text.count)
+        for scalar in text.unicodeScalars where !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+            out.unicodeScalars.append(scalar)
+        }
+        compactTextCache.setObject(out as NSString, forKey: text as NSString)
+        return out
     }
 
     private enum TranscriptEntry: Identifiable {
@@ -1852,12 +1908,49 @@ public struct AgentAppView: View {
         }
     }
 
+    // PERF-MAC_AGENT-001: the merged+sorted transcript is read from `body`, so
+    // it recomputed (O(n log n)) on every @Published change — every streaming
+    // delta and every keystroke. Memoize it, re-sorting only when the message
+    // or turn identities actually change (cheap signature compare).
+    private final class TranscriptCache {
+        var signature: String?
+        var entries: [TranscriptEntry] = []
+    }
+    private let transcriptCache = TranscriptCache()
+
     private var transcriptEntries: [TranscriptEntry] {
-        (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
+        let signature = transcriptSignature
+        if transcriptCache.signature == signature {
+            return transcriptCache.entries
+        }
+        let merged = (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
             .sorted { lhs, rhs in
                 if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
                 return lhs.sortTime < rhs.sortTime
             }
+        transcriptCache.signature = signature
+        transcriptCache.entries = merged
+        return merged
+    }
+
+    /// Cheap identity signature: changes only when a message/turn is added,
+    /// removed, or reordered (id list), not on streaming text deltas.
+    private var transcriptSignature: String {
+        var sig = String()
+        sig.reserveCapacity((vm.messages.count + vm.timeline.turns.count) * 8)
+        for message in vm.messages {
+            sig += "m"
+            sig += message.id.value.uuidString
+        }
+        for turn in vm.timeline.turns {
+            sig += "t"
+            sig += turn.turnId
+            // A turn's sortTime derives from its items' min startedAtMs, which
+            // is set when its first item appears; fold item count in so the
+            // sort refreshes on item add (not on pure text deltas).
+            sig += "#\(turn.items.count)"
+        }
+        return sig
     }
 
     private var persistedAssistantTexts: [String] {
@@ -2475,30 +2568,36 @@ public struct AgentAppView: View {
                 Text(stale ? "Stale provider request" : "Provider approval")
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.textSecondary)
+                // UX-MAC_AGENT-005: label what is being approved.
+                requestKindChip(request.kind)
                 Spacer(minLength: 0)
             }
             Text(request.title)
                 .font(DS.Font.bodyDense.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
                 .lineLimit(2)
-            if let detail = request.detail, !detail.isEmpty {
-                Text(detail)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(4)
-                    .textSelection(.enabled)
-            }
+            // UX-MAC_AGENT-006: surface the actual command / patch so users
+            // don't approve exec/applyPatch requests blind.
+            requestPreview(request)
             if stale {
                 Text("Restart the turn to continue.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.warning)
             } else {
+                // UX-MAC_AGENT-005: emphasize the safe one-time Approve;
+                // de-emphasize/warning-tint the session-wide auto-approve;
+                // separate Decline.
                 HStack(spacing: DS.Space.sm) {
                     Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
+                        .buttonStyle(.borderedProminent)
                     Button("Approve Session") { pendingSessionApproval = request }
+                        .buttonStyle(.bordered)
+                        .tint(DS.Palette.warning)
+                        .help("Auto-approve every request like this for the rest of this session")
+                    Spacer(minLength: DS.Space.md)
                     Button("Decline") { vm.respondToPendingRequest(request, response: .decline(nil)) }
+                        .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
                 .controlSize(.small)
             }
         }
@@ -2507,6 +2606,89 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
         .accessibilityIdentifier("agent.pendingRequest.\(request.id)")
+    }
+
+    // UX-MAC_AGENT-005: a small chip naming the request kind.
+    private func requestKindChip(_ kind: AssistantRequestKind) -> some View {
+        Text(requestKindLabel(kind))
+            .font(DS.Font.caption2.weight(.semibold))
+            .foregroundColor(DS.Palette.accent)
+            .padding(.horizontal, DS.Space.xs)
+            .padding(.vertical, 1)
+            .background(DS.Palette.accent.opacity(0.13))
+            .clipShape(Capsule())
+    }
+
+    private func requestKindLabel(_ kind: AssistantRequestKind) -> String {
+        switch kind {
+        case .commandExecution, .exec: return "Run command"
+        case .applyPatch: return "Apply patch"
+        case .fileChange: return "Edit file"
+        case .fileRead: return "Read file"
+        case .toolUserInput: return "Tool input"
+        case .authTokensRefresh: return "Refresh auth"
+        case .dynamic: return "Tool"
+        }
+    }
+
+    // UX-MAC_AGENT-006: command kinds render monospace + copy; patch kinds
+    // render a collapsible diff. Other kinds fall back to the prior detail row.
+    @ViewBuilder
+    private func requestPreview(_ request: AssistantPendingRequest) -> some View {
+        if let detail = request.detail, !detail.isEmpty {
+            switch request.kind {
+            case .commandExecution, .exec:
+                HStack(alignment: .top, spacing: DS.Space.sm) {
+                    Text(detail)
+                        .font(DS.Font.mono)
+                        .foregroundColor(DS.Palette.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(DS.Space.sm)
+                        .background(DS.Palette.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    Button { copyToPasteboard(detail) } label: {
+                        Image(systemName: "doc.on.doc").font(.system(size: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .help("Copy command")
+                }
+            case .applyPatch, .fileChange:
+                let expanded = expandedRequestPreviews.contains(request.id)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Button {
+                        if expanded { expandedRequestPreviews.remove(request.id) }
+                        else { expandedRequestPreviews.insert(request.id) }
+                    } label: {
+                        HStack(spacing: DS.Space.xs) {
+                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
+                            Text(expanded ? "Hide diff" : "Show diff")
+                                .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    if expanded {
+                        DiffPreviewText(detail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(DS.Space.sm)
+                            .background(DS.Palette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    }
+                }
+            default:
+                Text(detail)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+        }
     }
 
     @ViewBuilder
@@ -2695,13 +2877,30 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func errorRow(_ err: String) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.sm) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 11)).foregroundColor(DS.Palette.danger)
-            Text(err)
-                .font(DS.Font.monoSmall).foregroundColor(DS.Palette.danger)
-                .lineSpacing(3).textSelection(.enabled)
-            Spacer(minLength: 0)
+        let recoverable = vm.lastErrorRecoverable
+        return VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: recoverable ? "exclamationmark.triangle" : "xmark.octagon")
+                    .font(.system(size: 11))
+                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
+                Text(err)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
+                    .lineSpacing(3).textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+            // UX-MAC_AGENT-009: recoverable failures get a Retry of the last
+            // prompt; fatal ones don't.
+            if recoverable {
+                Button {
+                    Task { await vm.retryLastPrompt() }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.error.retry")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2995,6 +3194,7 @@ public struct AgentAppView: View {
             PromptComposerEditor(
                 text: $vm.prompt,
                 height: $composerEditorHeight,
+                focusTick: vm.focusTick,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
                 isEnabled: true,
                 onSend: { Task { await vm.send() } },
@@ -3219,6 +3419,13 @@ public struct AgentAppView: View {
                     }
                     compactMenuDivider
                 }
+            } else {
+                // UX-MAC_AGENT-003: the source is fixed after the first
+                // message. Show a disabled row that names the locked source so
+                // the picker doesn't simply vanish with no explanation.
+                compactMenuSection("Source")
+                lockedSourceRow
+                compactMenuDivider
             }
             let modelOptions = vm.modelOptionsForSelectedProvider
             let customModels = vm.customModelsForSelectedProvider
@@ -3385,6 +3592,28 @@ public struct AgentAppView: View {
             .frame(height: DS.Border.hairline)
             .padding(.vertical, DS.Space.xs)
             .frame(width: compactModelMenuWidth)
+    }
+
+    // UX-MAC_AGENT-003: disabled row explaining why the source can't change.
+    private var lockedSourceRow: some View {
+        let name = vm.providerSnapshots.isEmpty
+            ? vm.providerDisplayName(vm.provider)
+            : vm.providerInstanceDisplayName(vm.providerInstanceId)
+        return HStack(spacing: DS.Space.sm) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 12)
+                .foregroundColor(DS.Palette.textTertiary)
+            Text("\(name) (locked after first message)")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, DS.Space.xs)
+        .padding(.vertical, DS.Space.xs)
+        .frame(width: compactModelMenuWidth, alignment: .leading)
+        .help("The source is fixed once a thread has a conversation. Start a new thread to use a different source.")
     }
 
     private func promptCustomModel() {
@@ -3972,6 +4201,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
 
     @Binding var text: String
     @Binding var height: CGFloat
+    let focusTick: Int
     let placeholder: String
     let isEnabled: Bool
     let onSend: () -> Void
@@ -4034,6 +4264,13 @@ private struct PromptComposerEditor: NSViewRepresentable {
         }
         context.coordinator.recalculateHeight()
         scroll.hasVerticalScroller = height >= Self.maxHeight
+        if isEnabled, context.coordinator.appliedFocusTick != focusTick {
+            context.coordinator.appliedFocusTick = focusTick
+            DispatchQueue.main.async {
+                guard let window = textView.window, window.firstResponder !== textView else { return }
+                window.makeFirstResponder(textView)
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -4045,6 +4282,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
         @Binding var height: CGFloat
         let onTextEdited: () -> Void
         weak var textView: PromptComposerTextView?
+        var appliedFocusTick: Int?
         private var externallyAppliedText: String?
 
         init(text: Binding<String>, height: Binding<CGFloat>, onTextEdited: @escaping () -> Void) {
