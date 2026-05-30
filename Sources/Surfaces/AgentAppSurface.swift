@@ -1738,6 +1738,7 @@ public struct AgentAppView: View {
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
+    @State private var pendingSessionApproval: AssistantPendingRequest?
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
 
@@ -2055,6 +2056,9 @@ public struct AgentAppView: View {
     private var conversationColumn: some View {
         VStack(spacing: 0) {
             header
+            if vm.permissionMode == .fullAccess {
+                fullAccessBanner
+            }
             if !vm.timeline.workActivities.isEmpty {
                 workLogRow
                     .padding(.horizontal, 22)
@@ -2108,6 +2112,33 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
         .dsBar(edge: .bottom)
+    }
+
+    // Persistent, prominent banner while full access is on, beyond the small
+    // permission pill in the composer footer (UX-MAC_AGENT-004).
+    private var fullAccessBanner: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.danger)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Full access is on")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.danger)
+                Text("The agent runs tools and edits without asking for the rest of this session.")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            Spacer(minLength: 0)
+            Button("Switch to supervised") { vm.setPermissionMode(.supervised) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.danger.opacity(0.12))
+        .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.danger.opacity(0.3)).frame(height: 1) }
+        .accessibilityIdentifier("agent.fullAccessBanner")
     }
 
     private var modelLabel: String {
@@ -2325,6 +2356,26 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.bg)
             .accessibilityIdentifier("agent.pendingCallbacks")
+            .confirmationDialog(
+                "Allow this agent to act without approvals for the rest of this session?",
+                isPresented: Binding(
+                    get: { pendingSessionApproval != nil },
+                    set: { if !$0 { pendingSessionApproval = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Allow full access", role: .destructive) {
+                    if let pendingSessionApproval {
+                        vm.respondToPendingRequest(pendingSessionApproval, response: .approveForSession)
+                    }
+                    pendingSessionApproval = nil
+                }
+                Button("Keep approving each action", role: .cancel) {
+                    pendingSessionApproval = nil
+                }
+            } message: {
+                Text("Full access lets the agent run tools and edits without asking. Keeping per-action approval is safer.")
+            }
         }
     }
 
@@ -2444,7 +2495,7 @@ public struct AgentAppView: View {
             } else {
                 HStack(spacing: DS.Space.sm) {
                     Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
-                    Button("Approve Session") { vm.respondToPendingRequest(request, response: .approveForSession) }
+                    Button("Approve Session") { pendingSessionApproval = request }
                     Button("Decline") { vm.respondToPendingRequest(request, response: .decline(nil)) }
                 }
                 .buttonStyle(.bordered)

@@ -109,6 +109,10 @@ public final class FeedPanelSurface: NSObject, Surface {
     public let view: NSView
     public let viewModel = FeedPanelViewModel()
     public var subscriptionToken: AnyHashable?
+    /// Teardown hook set by the surface factory so `close()` releases the
+    /// EventBus subscription without this module depending on SocketServer
+    /// (PERF-MAC_DIFF_FEED_MARKDOWN-001).
+    public var onClose: (() -> Void)?
 
     public init(workspaceID: WorkspaceID, title: String = "Feed") {
         self.descriptor = SurfaceDescriptor(type: .rightSidebarTool, title: title,
@@ -131,7 +135,7 @@ public final class FeedPanelSurface: NSObject, Surface {
 
     public func focus() { view.window?.makeFirstResponder(view) }
     public func unfocus() {}
-    public func close() {}
+    public func close() { onClose?(); onClose = nil }
     public func sendText(_ text: String) {}
     public func readText() -> String { viewModel.items.map(\.title).joined(separator: "\n") }
     public func snapshot() -> [String: String] { ["count": String(viewModel.items.count)] }

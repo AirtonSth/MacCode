@@ -139,6 +139,16 @@ private final class FilesViewModel: ObservableObject {
     private var pendingText: String?
     private var suppressEditorChange = false
     private var eventToken: UUID?
+    private var sessionCache: [String: EditSessionSnapshot] = [:]
+    private var sessionPath: String?
+
+    private struct EditSessionSnapshot {
+        var sessionID: String
+        var draftText: String
+        var draftRevision: Int
+        var lastSyncedText: String
+        var isDirty: Bool
+    }
 
     var selectedPath: String? { selectedEntry?.relativePath }
     var visibleText: String { draftText.isEmpty ? renderedText : draftText }
@@ -213,6 +223,7 @@ private final class FilesViewModel: ObservableObject {
     }
 
     func loadFile(_ entry: FileEntry) {
+        snapshotCurrentSession()
         do {
             _ = try router?.filesStateUpdate(surface: surfaceID, patch: [
                 "selected_path": .string(entry.relativePath),
@@ -220,10 +231,16 @@ private final class FilesViewModel: ObservableObject {
             ], baseRevision: nil, deviceID: "mac-local")
             previewURL = URL(fileURLWithPath: entry.path)
             if entry.isEditable {
-                let opened = try router?.filesEditOpen(surface: surfaceID, path: entry.relativePath)
-                applyEditPayload(opened?.objectValue ?? [:], remote: false)
+                if let cached = sessionCache[entry.relativePath], cached.isDirty {
+                    restoreSession(cached)
+                } else {
+                    let opened = try router?.filesEditOpen(surface: surfaceID, path: entry.relativePath)
+                    applyEditPayload(opened?.objectValue ?? [:], remote: false)
+                }
+                sessionPath = entry.relativePath
             } else {
                 sessionID = nil
+                sessionPath = nil
                 isDirty = false
                 let read = try router?.fsWorkspaceRead(workspace: workspaceID, path: entry.relativePath, maxBytes: WorkspaceFileLimits.readBytes)
                 let content = read?.objectValue?["content"]?.stringValue ?? ""
@@ -358,14 +375,15 @@ private final class FilesViewModel: ObservableObject {
 
     private func applyFullDraft(_ newText: String) {
         guard let sessionID else { return }
+        let delta = Self.minimalEdit(from: lastSyncedText, to: newText)
         applying = true
         do {
             let result = try router?.filesEditApplyPatch(
                 sessionID: sessionID,
                 baseDraftRevision: draftRevision,
-                rangeLocation: 0,
-                rangeLength: lastSyncedText.utf16.count,
-                replacement: newText,
+                rangeLocation: delta.location,
+                rangeLength: delta.length,
+                replacement: delta.replacement,
                 deviceID: "mac-local"
             )
             applyEditPayload(result?.objectValue ?? [:], remote: false)
@@ -379,6 +397,27 @@ private final class FilesViewModel: ObservableObject {
         } else {
             pendingText = nil
         }
+    }
+
+    /// Minimal changed range as a UTF-16 NSRange over `old` plus the UTF-16 replacement,
+    /// found by trimming the common prefix and suffix between `old` and `new`.
+    private static func minimalEdit(from old: String, to new: String) -> (location: Int, length: Int, replacement: String) {
+        let oldUnits = Array(old.utf16)
+        let newUnits = Array(new.utf16)
+        var prefix = 0
+        let maxPrefix = min(oldUnits.count, newUnits.count)
+        while prefix < maxPrefix && oldUnits[prefix] == newUnits[prefix] {
+            prefix += 1
+        }
+        var suffix = 0
+        let maxSuffix = min(oldUnits.count, newUnits.count) - prefix
+        while suffix < maxSuffix && oldUnits[oldUnits.count - 1 - suffix] == newUnits[newUnits.count - 1 - suffix] {
+            suffix += 1
+        }
+        let location = prefix
+        let length = oldUnits.count - prefix - suffix
+        let replacement = String(utf16CodeUnits: Array(newUnits[prefix..<(newUnits.count - suffix)]), count: newUnits.count - prefix - suffix)
+        return (location, length, replacement)
     }
 
     private func receive(_ event: EventBus.Event) {
@@ -413,6 +452,7 @@ private final class FilesViewModel: ObservableObject {
                     dirtyPaths.insert(path)
                 } else {
                     dirtyPaths.remove(path)
+                    sessionCache.removeValue(forKey: path)
                 }
             }
         }
@@ -443,6 +483,32 @@ private final class FilesViewModel: ObservableObject {
         guard selectedPath == path, let sessionID else { return }
         _ = try? router?.filesEditClose(sessionID: sessionID)
         self.sessionID = nil
+        if sessionPath == path { sessionPath = nil }
+        sessionCache.removeValue(forKey: path)
+    }
+
+    /// Persist the currently open edit session so reselecting its path restores the draft
+    /// instead of reopening from disk (UX-MAC_FILES-004/005). Keyed by the live session's
+    /// own path (`sessionPath`), not `selectedPath`, since selection is updated before loadFile.
+    private func snapshotCurrentSession() {
+        guard let sessionID, let path = sessionPath else { return }
+        sessionCache[path] = EditSessionSnapshot(
+            sessionID: sessionID,
+            draftText: draftText,
+            draftRevision: draftRevision,
+            lastSyncedText: lastSyncedText,
+            isDirty: isDirty
+        )
+    }
+
+    private func restoreSession(_ snapshot: EditSessionSnapshot) {
+        sessionID = snapshot.sessionID
+        draftRevision = snapshot.draftRevision
+        isDirty = snapshot.isDirty
+        setDraft(snapshot.draftText)
+        lastSyncedText = snapshot.lastSyncedText
+        renderedText = snapshot.draftText
+        syncLabel = "Synced r\(draftRevision)"
     }
 }
 
@@ -1059,10 +1125,10 @@ private struct CodeTextEditor: NSViewRepresentable {
             textView.string = text
             context.coordinator.applyHighlight(to: textView)
             textView.selectedRanges = selectedRanges
-        } else {
-            context.coordinator.applyHighlight(to: textView)
+            context.coordinator.lineNumberRuler?.needsDisplay = true
         }
-        context.coordinator.lineNumberRuler?.needsDisplay = true
+        // When text is unchanged the edit originated from the text view itself and was
+        // already highlighted in textDidChange; re-highlighting here is redundant (PERF-MAC_FILES-001/008).
     }
 
     func makeCoordinator() -> Coordinator {
@@ -1082,8 +1148,34 @@ private struct CodeTextEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             onChange(textView.string)
-            applyHighlight(to: textView)
+            highlightEditedRange(in: textView)
             lineNumberRuler?.needsDisplay = true
+        }
+
+        /// Re-highlight only the paragraph(s) touched by the last edit instead of the whole
+        /// document, keeping per-keystroke cost bounded for large files (PERF-MAC_FILES-001).
+        /// Mutates attributes in place over the changed range; never touches characters.
+        private func highlightEditedRange(in textView: NSTextView) {
+            guard !applyingHighlight, let storage = textView.textStorage else { return }
+            applyingHighlight = true
+            defer { applyingHighlight = false }
+            let nsText = storage.string as NSString
+            // editedRange covers the just-changed characters; expand to whole paragraphs so
+            // multi-line tokens (strings/comments) re-tokenize cleanly.
+            let edited = storage.editedRange.location == NSNotFound
+                ? NSRange(location: 0, length: nsText.length)
+                : storage.editedRange
+            let clampedLocation = min(edited.location, nsText.length)
+            let safeEdited = NSRange(location: clampedLocation,
+                                     length: min(edited.length, nsText.length - clampedLocation))
+            let paragraphRange = nsText.paragraphRange(for: safeEdited)
+            storage.beginEditing()
+            storage.setAttributes(codeBaseAttributes, range: paragraphRange)
+            nsText.enumerateSubstrings(in: paragraphRange, options: [.byLines, .substringNotRequired]) { _, range, _, _ in
+                let lineText = nsText.substring(with: range)
+                applyHighlightSpans(highlightCodeLine(lineText), lineRange: range, to: storage)
+            }
+            storage.endEditing()
         }
 
         func applyHighlight(to textView: NSTextView) {

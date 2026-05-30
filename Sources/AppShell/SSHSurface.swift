@@ -26,6 +26,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private var dragStartSidebarWidth: CGFloat?
     private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface?
+    private var activeTransferCount = 0
     static let hostSidebarWidthDefaultsKey = "ssh.hosts.sidebar.width.v1"
     static let transferSidebarWidthDefaultsKey = "ssh.files.sidebar.width.v1"
     static let transferSidebarExpandedDefaultsKey = "ssh.files.sidebar.expanded.v1"
@@ -291,6 +292,18 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     private func connect(_ host: SSHHostProfile) {
+        // Surface an explicit "Connecting…" state before the blocking session
+        // setup, and defer the work one run-loop turn so the spinner/status
+        // actually paints instead of jumping straight to Connected/Failed
+        // (UX-MAC_SSH-002).
+        viewModel.status = "Connecting…"
+        viewModel.error = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.performConnect(host)
+        }
+    }
+
+    private func performConnect(_ host: SSHHostProfile) {
         do {
             let saved = try router?.sshHostUpsert(host, workspace: workspaceID) ?? host
             terminal?.close()
@@ -324,23 +337,34 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func runTransfer(upload: Bool, localPath: String, remotePath: String) {
         let kind = upload ? "Upload" : "Download"
-        viewModel.recordTransfer(direction: upload ? .upload : .download, localPath: localPath, remotePath: remotePath, status: .queued)
+        let direction: SSHTransferDirection = upload ? .upload : .download
+        viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: .queued)
         viewModel.transferStatus = "\(kind) running"
-        do {
-            let result = upload
-                ? try router?.sshTransferUpload(surface: descriptor.id, localPath: localPath, remotePath: remotePath)
-                : try router?.sshTransferDownload(surface: descriptor.id, remotePath: remotePath, localPath: localPath)
-            let ok = result?.objectValue?["ok"]?.boolValue == true
-            viewModel.transferStatus = ok ? "\(kind) completed" : "\(kind) failed"
-            viewModel.recordTransfer(direction: upload ? .upload : .download, localPath: localPath, remotePath: remotePath, status: ok ? .successful : .failed)
-            if ok {
-                refreshLocalFiles()
-                refreshRemoteFiles()
+        activeTransferCount += 1
+        Task { [weak self] in
+            guard let self else { return }
+            // Process execution runs off the main run loop inside the router's
+            // async transfer; UI updates resume here on the main actor.
+            var ok = false
+            do {
+                let result = upload
+                    ? try await self.router?.sshTransferUploadAsync(surface: self.descriptor.id, localPath: localPath, remotePath: remotePath)
+                    : try await self.router?.sshTransferDownloadAsync(surface: self.descriptor.id, remotePath: remotePath, localPath: localPath)
+                ok = result?.objectValue?["ok"]?.boolValue == true
+                self.viewModel.transferStatus = ok ? "\(kind) completed" : "\(kind) failed"
+                self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: ok ? .successful : .failed)
+            } catch {
+                self.viewModel.transferStatus = "\(kind) failed"
+                self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: .failed)
+                self.viewModel.error = error.localizedDescription
             }
-        } catch {
-            viewModel.transferStatus = "\(kind) failed"
-            viewModel.recordTransfer(direction: upload ? .upload : .download, localPath: localPath, remotePath: remotePath, status: .failed)
-            viewModel.error = error.localizedDescription
+            self.activeTransferCount -= 1
+            // Coalesce listing refreshes: only refresh once the whole batch
+            // (e.g. a multi-file uploadLocalSelection loop) has drained.
+            if self.activeTransferCount == 0 {
+                self.refreshLocalFiles()
+                await self.refreshRemoteFilesAsync()
+            }
         }
     }
 
@@ -358,6 +382,20 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         guard descriptor.metadata["ssh_status"] == "connected" else { return }
         do {
             let listing = try router?.sshFilesRemoteList(surface: descriptor.id, path: viewModel.remoteSitePath)
+            viewModel.applyRemoteListing(listing?.objectValue ?? [:])
+        } catch {
+            viewModel.transferStatus = "Remote list failed"
+            viewModel.addTransferLog("Remote: \(error.localizedDescription)")
+        }
+    }
+
+    /// Async remote listing so post-transfer refreshes never block the main
+    /// run loop (PERF-MAC_SSH-002). Spawns the remote shell off-thread via the
+    /// router; UI updates resume on the main actor.
+    private func refreshRemoteFilesAsync() async {
+        guard descriptor.metadata["ssh_status"] == "connected" else { return }
+        do {
+            let listing = try await router?.sshFilesRemoteListAsync(surface: descriptor.id, path: viewModel.remoteSitePath)
             viewModel.applyRemoteListing(listing?.objectValue ?? [:])
         } catch {
             viewModel.transferStatus = "Remote list failed"
