@@ -1037,6 +1037,7 @@ private final class RecordingAppUpdateChecker: AppUpdateChecking {
         didSet { onAvailabilityChanged?(availability) }
     }
     var onAvailabilityChanged: ((AppUpdateAvailability) -> Void)?
+    var onWillInstallUpdate: (() -> Void)?
     private(set) var checks = 0
 
     init(availability: AppUpdateAvailability) {

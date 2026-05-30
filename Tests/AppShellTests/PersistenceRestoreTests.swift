@@ -111,6 +111,41 @@ final class PersistenceRestoreTests: XCTestCase {
                        "browser tab title must persist with the last visited page")
     }
 
+    func test_terminalHistoryKeepsRestoredSurfaceIDAcrossRelaunch() throws {
+        let dir = NSTemporaryDirectory() + "RC2Persist-" + UUID().uuidString
+        let marker = "remote-code-update-history-marker\n"
+        var terminalID: SurfaceID!
+
+        do {
+            let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            let ws = try router.createWorkspace(name: "UPDATE", cwd: NSTemporaryDirectory())
+            let terminal = try router.createSurface(workspace: ws.id, type: .terminal, paneID: nil, title: "terminal")
+            terminalID = terminal.id
+            try ctx.terminalOutputRepo.append(surfaceID: terminal.id.value.uuidString, workspaceID: ws.id.value.uuidString, chunkIndex: 1, data: Data(marker.utf8))
+            ctx.saveSnapshot()
+            defer { closeAndUnregisterAllSurfaces() }
+        }
+
+        let ctx2 = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router2 = AppCommandRouter(context: ctx2)
+        ctx2.router = router2
+        router2.reinstantiateRestoredSurfaces()
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let restored = try XCTUnwrap(ctx2.state.workspaces.values.first { $0.name == "UPDATE" })
+        guard case .pane(let pane) = restored.layout else {
+            return XCTFail("expected restored workspace to keep its terminal pane")
+        }
+        let restoredTerminal = try XCTUnwrap(pane.surfaces.first { $0.title == "terminal" })
+        XCTAssertEqual(restoredTerminal.id, terminalID,
+                       "terminal restore must keep the persisted surface id because scrollback/history is keyed by surface id")
+        let history = try ctx2.terminalOutputRepo.readWindow(surfaceID: restoredTerminal.id.value.uuidString)
+        XCTAssertTrue(history.text.contains(marker),
+                      "terminal scrollback must still be readable after a Sparkle update/relaunch instead of reopening as a clean terminal")
+    }
+
     func test_providerCallbackState_persistsAndMarksOpenCallbacksStaleOnRestart() throws {
         let dir = NSTemporaryDirectory() + "RC2Callbacks-" + UUID().uuidString
         let threadId: AgentThreadID

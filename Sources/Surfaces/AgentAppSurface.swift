@@ -1871,6 +1871,8 @@ public struct AgentAppView: View {
     private static let threadRailIdealWidth: CGFloat = 220
     private static let conversationMinimumWidth: CGFloat = 560
     private static let planSidebarIdealWidth: CGFloat = 300
+    private static let timelineBottomRevealSlack: CGFloat = 4
+    private static let scrollDownButtonBottomInset: CGFloat = 22
     @ObservedObject var vm: AgentAppViewModel
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
@@ -2515,6 +2517,11 @@ public struct AgentAppView: View {
                 GeometryReader { viewport in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 32) {
+                            TimelineScrollPositionObserver(slack: Self.timelineBottomRevealSlack) { isAtBottom in
+                                updateTimelineBottomState(isAtBottom: isAtBottom)
+                            }
+                            .frame(width: 0, height: 0)
+                            .accessibilityHidden(true)
                             if vm.hasMoreOlder, !vm.messages.isEmpty {
                                 Color.clear
                                     .frame(height: 1)
@@ -2613,9 +2620,11 @@ public struct AgentAppView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Scroll to latest message")
+                    .accessibilityIdentifier("agent.timeline.scrollToBottom")
                     .help("Scroll to latest message")
                     .padding(.trailing, 14)
-                    .padding(.bottom, 14)
+                    .padding(.bottom, Self.scrollDownButtonBottomInset)
+                    .zIndex(1)
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
                 }
             }
@@ -2998,8 +3007,12 @@ public struct AgentAppView: View {
     }
 
     private func updateTimelineBottomVisibility(bottomY: CGFloat, viewportHeight: CGFloat) {
-        let atBottom = bottomY <= viewportHeight + 36
-        if atBottom {
+        let atBottom = bottomY <= viewportHeight + Self.timelineBottomRevealSlack
+        updateTimelineBottomState(isAtBottom: atBottom)
+    }
+
+    private func updateTimelineBottomState(isAtBottom: Bool) {
+        if isAtBottom {
             // PERF-MAC_AGENT-013: the preference key fires every scroll frame.
             // Only mutate state when actually crossing back to the bottom, not on
             // every Y change, to avoid per-frame state writes.
@@ -3984,7 +3997,7 @@ public struct AgentAppView: View {
             Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
         }
-        .frame(maxWidth: 260, alignment: .trailing)
+        .frame(width: currentModelMenuLabelWidth, alignment: .trailing)
         .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
         .background(DS.Palette.surfaceRaised)
         .clipShape(Capsule())
@@ -4134,6 +4147,34 @@ public struct AgentAppView: View {
         modelMenuWidthCache.signature = signature
         modelMenuWidthCache.width = width
         return width
+    }
+
+    private var currentModelMenuLabelWidth: CGFloat {
+        let label = currentModelMenuLabelParts.joined(separator: " · ")
+        let measured = Self.measureCurrentModelMenuLabel(label)
+        let chevronWidth: CGFloat = 8
+        let separatorCount = max(0, currentModelMenuLabelParts.count - 1)
+        let spacing = CGFloat(separatorCount + 1) * DS.Space.xs
+        return min(max(ceil(measured + chevronWidth + spacing), 44), 260)
+    }
+
+    private var currentModelMenuLabelParts: [String] {
+        var parts = [modelLabel]
+        if vm.supportsReasoningForSelectedModel {
+            parts.append(effortLabel)
+        }
+        if vm.serviceTier == .fast {
+            parts.append(serviceTierLabel)
+        }
+        if let ctx = vm.selectedModelContextWindowLabel {
+            parts.append(ctx)
+        }
+        return parts
+    }
+
+    private static func measureCurrentModelMenuLabel(_ label: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        return (label as NSString).size(withAttributes: [.font: font]).width
     }
 
     private var sendStopButton: some View {
@@ -4834,6 +4875,80 @@ private struct TimelineBottomPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private struct TimelineScrollPositionObserver: NSViewRepresentable {
+    let slack: CGFloat
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ObserverView {
+        let view = ObserverView()
+        view.slack = slack
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ view: ObserverView, context: Context) {
+        view.slack = slack
+        view.onChange = onChange
+        view.report()
+    }
+
+    final class ObserverView: NSView {
+        var slack: CGFloat = 0
+        var onChange: ((Bool) -> Void)?
+        private weak var observedScrollView: NSScrollView?
+        private var observer: NSObjectProtocol?
+        private var lastIsAtBottom: Bool?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+        }
+
+        deinit {
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+
+        func report() {
+            DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+        }
+
+        private func attachIfNeeded() {
+            guard let scroll = enclosingScrollView, scroll !== observedScrollView else {
+                reportCurrentPosition()
+                return
+            }
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            observedScrollView = scroll
+            scroll.contentView.postsBoundsChangedNotifications = true
+            observer = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: scroll.contentView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reportCurrentPosition()
+            }
+            reportCurrentPosition()
+        }
+
+        private func reportCurrentPosition() {
+            guard let scroll = observedScrollView ?? enclosingScrollView,
+                  let documentView = scroll.documentView else { return }
+            let contentHeight = documentView.bounds.height
+            let visibleHeight = scroll.contentView.bounds.height
+            let scrollerValue = scroll.verticalScroller?.doubleValue ?? 1
+            let isAtBottom = contentHeight <= visibleHeight + slack
+                || scrollerValue >= 0.999
+            guard isAtBottom != lastIsAtBottom else { return }
+            lastIsAtBottom = isAtBottom
+            onChange?(isAtBottom)
+        }
     }
 }
 

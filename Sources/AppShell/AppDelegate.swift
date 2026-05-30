@@ -4,6 +4,7 @@ import CoreModel
 import Persistence
 import AgentRuntime
 import SocketServer
+import Surfaces
 
 @MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -70,6 +71,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
         }
         updater = SparkleAppUpdater.defaultIfConfigured()
+        updater?.onWillInstallUpdate = { [weak self] in
+            self?.persistRestorableStateBeforeUpdate()
+        }
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
         // Rebuild Surface objects from restored layout descriptors, then
@@ -130,12 +134,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
-        context?.saveSnapshot()
+        persistRestorableStateBeforeUpdate()
         socketServer?.stop()
         httpServer?.stop()
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    private func persistRestorableStateBeforeUpdate() {
+        context?.saveSnapshot()
+        for surface in SurfaceRegistry.shared.all() {
+            (surface as? TerminalSurface)?.flushPersistedHistory()
+        }
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

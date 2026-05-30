@@ -14,6 +14,7 @@ public enum AppUpdateAvailability: Equatable {
 public protocol AppUpdateChecking: AnyObject {
     var availability: AppUpdateAvailability { get }
     var onAvailabilityChanged: ((AppUpdateAvailability) -> Void)? { get set }
+    var onWillInstallUpdate: (() -> Void)? { get set }
     func checkForUpdates()
 }
 
@@ -23,6 +24,7 @@ public final class SparkleAppUpdater: NSObject, AppUpdateChecking, SPUUpdaterDel
         didSet { onAvailabilityChanged?(availability) }
     }
     public var onAvailabilityChanged: ((AppUpdateAvailability) -> Void)?
+    public var onWillInstallUpdate: (() -> Void)?
 
     private var updaterController: SPUStandardUpdaterController!
     private var observers: [NSObjectProtocol] = []
@@ -91,5 +93,13 @@ public final class SparkleAppUpdater: NSObject, AppUpdateChecking, SPUUpdaterDel
             if case .available = self.availability { return }
             self.availability = .failed(message)
         }
+    }
+
+    public func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) {
+        onWillInstallUpdate?()
+    }
+
+    public func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        onWillInstallUpdate?()
     }
 }

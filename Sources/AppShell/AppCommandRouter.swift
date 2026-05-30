@@ -145,10 +145,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                     let surface: Surface
                     switch desc.type {
                     case .terminal:
-                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), historyRepo: ctx.terminalOutputRepo)
+                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo)
                     case .ssh:
                         if let profile = sshProfile(from: desc) {
-                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), historyRepo: ctx.terminalOutputRepo)
+                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo)
                         } else {
                             surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self)
                         }

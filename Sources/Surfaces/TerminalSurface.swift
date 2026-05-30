@@ -348,6 +348,7 @@ public final class TerminalSurface: NSObject, Surface {
         workspaceID: WorkspaceID,
         title: String,
         launch: Launch,
+        restoredSurfaceID: SurfaceID? = nil,
         historyRepo: TerminalOutputRepository? = nil,
         outputBus: SurfaceOutputBus = .shared
     ) throws {
@@ -387,6 +388,7 @@ public final class TerminalSurface: NSObject, Surface {
             ]
         }
         self.descriptor = SurfaceDescriptor(
+            id: restoredSurfaceID ?? SurfaceID(),
             type: type,
             title: title,
             iconName: type == .ssh ? "network" : "terminal",
