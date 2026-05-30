@@ -14,7 +14,24 @@ public struct CommandPaletteFilter {
         if t.contains(q) { return 60 }
         if subtitle.lowercased().contains(q) { return 40 }
         if keywords.contains(where: { $0.lowercased().contains(q) }) { return 20 }
+        // IMP-004: subsequence tier — "ntm" matches "New Terminal Surface".
+        // Ranked below all substring tiers so exact/prefix/contains always win.
+        if isSubsequence(q, of: t) { return 10 }
         return nil
+    }
+
+    /// IMP-004: true when every character of `needle` appears in `haystack`
+    /// in order (not necessarily contiguous). Both are assumed lowercased.
+    static func isSubsequence(_ needle: String, of haystack: String) -> Bool {
+        var it = haystack.makeIterator()
+        for ch in needle {
+            var matched = false
+            while let h = it.next() {
+                if h == ch { matched = true; break }
+            }
+            if !matched { return false }
+        }
+        return true
     }
 
     /// Rank `items` against `query`, dropping non-matches. Ties keep the

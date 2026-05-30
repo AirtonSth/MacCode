@@ -41,6 +41,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     var isVisibleForTesting: Bool { isVisible }
     private var progressObservation: NSKeyValueObservation?
     private var loadingObservation: NSKeyValueObservation?
+    private var titleObservation: NSKeyValueObservation?
     private var waitForToken = 0
     private var isClosed = false
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
@@ -246,6 +247,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         container.onFocusAddressBar = { [weak self] in self?.focusAddressBar() }
         container.onShowFind = { [weak self] in self?.showFind() }
         container.onEscape = { [weak self] in self?.closeFind() }
+        container.onZoomIn = { [weak self] in self?.adjustZoom(by: 0.1) }
+        container.onZoomOut = { [weak self] in self?.adjustZoom(by: -0.1) }
+        container.onZoomReset = { [weak self] in self?.resetZoom() }
 
         backButton.isEnabled = false
         forwardButton.isEnabled = false
@@ -265,6 +269,15 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.updateLoadingChrome(isLoading: webView.isLoading)
+            }
+        }
+        // Push title changes to the iOS mirror as they happen (IMP-MAC_BROWSER-011),
+        // not just on didFinish, so the mirror shows the human title between
+        // SPA navigations that never fire a fresh navigation finish.
+        titleObservation = webView.observe(\.title, options: [.new]) { [weak self] webView, _ in
+            MainActor.assumeIsolated {
+                guard let self, let url = webView.url else { return }
+                self.publishNavigationChange(url: url, title: webView.title)
             }
         }
     }
@@ -625,6 +638,11 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         return nil
     }
 
+    // IMP-MAC_BROWSER-008/012 (link/page context menu) reverted: the iOS-only
+    // `contextMenuConfigurationForElement`/`WKContextMenuElementInfo` API does
+    // not exist on macOS WKWebView. A macOS-correct version needs NSMenu
+    // customization via the view's `willOpenMenu`/`menu(for:)` path — deferred.
+
     public func publishNavigationChange(url: URL, title: String?) {
         descriptor.metadata["url"] = url.absoluteString
         if let title, !title.isEmpty {
@@ -711,6 +729,15 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         cfg.wraps = true
         webView.find(query, configuration: cfg) { _ in }
     }
+
+    /// Cmd-+/Cmd-- adjust page zoom; Cmd-0 resets (IMP-MAC_BROWSER-007).
+    /// Clamped to a sane range so content never collapses or runs away.
+    private func adjustZoom(by delta: CGFloat) {
+        webView.pageZoom = min(3.0, max(0.5, webView.pageZoom + delta))
+    }
+    private func resetZoom() {
+        webView.pageZoom = 1.0
+    }
     public func unfocus() {}
     public func didBecomeVisible() {
         guard !isVisible else { return }
@@ -741,6 +768,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         progressObservation = nil
         loadingObservation?.invalidate()
         loadingObservation = nil
+        titleObservation?.invalidate()
+        titleObservation = nil
         onNavigationChange = nil
         externalURLOpener = nil
         webView.navigationDelegate = nil
@@ -760,12 +789,21 @@ private final class BrowserContainerView: NSView {
     var onFocusAddressBar: (() -> Void)?
     var onShowFind: (() -> Void)?
     var onEscape: (() -> Void)?
+    var onZoomIn: (() -> Void)?
+    var onZoomOut: (() -> Void)?
+    var onZoomReset: (() -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == .command || mods == [.command, .shift] {
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "l": onFocusAddressBar?(); return true
             case "f": onShowFind?(); return true
+            // Cmd-= and Cmd-+ zoom in (the + key is shift-=), Cmd-- zooms out,
+            // Cmd-0 resets (IMP-MAC_BROWSER-007).
+            case "=", "+": onZoomIn?(); return true
+            case "-": onZoomOut?(); return true
+            case "0": onZoomReset?(); return true
             default: break
             }
         }

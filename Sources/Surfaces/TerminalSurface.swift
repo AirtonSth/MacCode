@@ -325,9 +325,11 @@ public final class TerminalSurface: NSObject, Surface {
     private var hiddenBacklogDrainGeneration = 0
     private var focusRepairGeneration = 0
     private var didBeepForDeadInput = false
+    private var bellFlashGeneration = 0
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
+    private static let bellFlashDuration: TimeInterval = 0.18
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
 
     public var viewportSize: TerminalViewportSize {
@@ -594,6 +596,9 @@ public final class TerminalSurface: NSObject, Surface {
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
+        // BEL (0x07): visual flash so background-tab completion is noticeable;
+        // the unread badge above already covers the tab indicator (IMP-011).
+        if data.contains(0x07) { handleBell() }
         // HC-1: stream raw PTY output to the mirror in real time.
         outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
@@ -806,6 +811,27 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func publishRuntimeHealth() {
         SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
+    }
+
+    /// Brief background flash on terminal bell so completion in a background
+    /// tab is noticeable; the unread badge is already set by the caller (IMP-011).
+    private func handleBell() {
+        guard isVisible, !isClosing, let layer = view.layer else { return }
+        bellFlashGeneration &+= 1
+        let generation = bellFlashGeneration
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = DS.NS.terminalFG.withAlphaComponent(0.18).cgColor
+        CATransaction.commit()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.bellFlashDuration) { [weak self] in
+            guard let self,
+                  self.bellFlashGeneration == generation,
+                  let layer = self.view.layer else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.backgroundColor = DS.NS.terminalBG.cgColor
+            CATransaction.commit()
+        }
     }
 
     private func markTerminalDead(reason: String, exitStatus: Int32?) {

@@ -87,6 +87,7 @@ private struct FileEntry: Identifiable, Equatable {
     let mime: String
     let size: Int
     let modifiedAt: Double?
+    let isHidden: Bool
     let isEditable: Bool
     let editabilityReason: String
     let language: String?
@@ -113,6 +114,7 @@ private struct FileEntry: Identifiable, Equatable {
         self.mime = identity["mime"]?.stringValue ?? "application/octet-stream"
         self.size = object["size"]?.intValue ?? 0
         self.modifiedAt = object["modified_at"]?.doubleValue
+        self.isHidden = object["is_hidden"]?.boolValue == true
         self.isEditable = identity["is_editable"]?.boolValue == true
         self.editabilityReason = identity["editability_reason"]?.stringValue ?? "not editable"
         self.language = identity["language"]?.stringValue
@@ -613,6 +615,7 @@ private struct FilesSurfaceRoot: View {
     @ObservedObject var model: FilesViewModel
     @AppStorage("files.sidebar.width.v2") private var sidebarWidth: Double = 260
     @AppStorage("files.sidebar.intent.v1") private var sidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
+    @AppStorage("files.sidebar.showHidden.v1") private var showHidden = false
     @State private var sidebarVisible = true
     @State private var lastAutomaticSidebarChange: TimeInterval?
     @State private var selectedFileIDs: Set<String> = []
@@ -712,6 +715,13 @@ private struct FilesSurfaceRoot: View {
                         sidebarVisible = false
                     }
                     .accessibilityLabel("Hide file sidebar")
+                    // Toggle dotfile visibility; off by default so common dev clutter (.git, .DS_Store)
+                    // stays hidden until asked for (IMP-MAC_FILES-014).
+                    DSIconButton(showHidden ? "eye" : "eye.slash", help: showHidden ? "Hide hidden files" : "Show hidden files") {
+                        showHidden.toggle()
+                    }
+                    .accessibilityLabel(showHidden ? "Hide hidden files" : "Show hidden files")
+                    .accessibilityIdentifier("files.showHidden.toggle")
                     DSIconButton("plus", help: "New file") {
                         newFileName = ""
                         showNewFileDialog = true
@@ -746,7 +756,7 @@ private struct FilesSurfaceRoot: View {
                     .help("Go to parent folder (⌘↑)")
                     .accessibilityIdentifier("files.parent.button")
                 }
-                ForEach(model.entries) { entry in
+                ForEach(visibleEntries) { entry in
                     row(icon: entry.icon, name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath), dirtyPath: entry.relativePath)
                         .tag(entry.id)
                         .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
@@ -772,6 +782,11 @@ private struct FilesSurfaceRoot: View {
     private var displayPath: String {
         guard !model.currentDirectory.isEmpty else { return model.root }
         return (model.root as NSString).appendingPathComponent(model.currentDirectory)
+    }
+
+    // Dotfiles are hidden unless the user opts in via the sidebar toggle (IMP-MAC_FILES-014).
+    private var visibleEntries: [FileEntry] {
+        showHidden ? model.entries : model.entries.filter { !$0.isHidden }
     }
 
     // Language badge, size, and modified-ago for the selected text file so users get context
@@ -1562,6 +1577,11 @@ private struct CodeTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.allowsUndo = true
+        // Native Cmd+F find-in-file over the editor via NSTextView's built-in find bar
+        // (IMP-MAC_FILES-001). The responder chain routes Cmd+F to performTextFinderAction:
+        // automatically once the find bar is enabled.
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
         textView.delegate = context.coordinator
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         textView.backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1)

@@ -306,6 +306,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
         switch (method, path) {
         case ("GET", "/healthz"):
             send(fd: fd, status: 200, contentType: "text/plain", body: "ok\n".data(using: .utf8)!)
+        case ("GET", "/v1/health"):
+            // IMP-MAC_SERVER_SYNC-009: authenticated sync diagnostics so
+            // power users / support can answer "why is sync slow". Gated by
+            // the /v1 auth check above (not in the exempt list). Sourced from
+            // EventBus's public snapshot — last emitted seq plus the retained
+            // replay window (count + encoded bytes) the client re-baselines
+            // against. Subscriber/WS-client counts and provider-session status
+            // need the reserved EventBus/Dispatcher surface and are omitted.
+            let snap = EventBus.shared.snapshot()
+            let retainedBytes = snap.recent.reduce(0) { acc, ev in
+                acc + ((try? JSONEncoder().encode(ev).count) ?? 0)
+            }
+            let body: [String: Any] = [
+                "status": "ok",
+                "server_id": serverId,
+                "server_time": Date().timeIntervalSince1970,
+                "events": [
+                    "last_seq": snap.lastSeq,
+                    "retained_count": snap.recent.count,
+                    "retained_bytes": retainedBytes,
+                    "oldest_retained_seq": snap.recent.first?.seq ?? 0
+                ]
+            ]
+            sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/rpc"):
             // GAP-1: the authenticated JSON-RPC surface the mobile client
             // uses for every feature call. Routes to the same dispatcher
@@ -374,7 +398,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "host": bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0",
                 "port": port,
                 "vpn_required": !bindLoopbackOnly,
-                "relay": false
+                "relay": false,
+                // IMP-MAC_SERVER_SYNC-001: anchor for client clock-drift /
+                // freshness math. Pairs with the WS `heartbeat` frame (ts) so
+                // the client can show an honest "live / last synced Ns ago".
+                "server_time": Date().timeIntervalSince1970
             ]
             sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("GET", "/v1/capabilities"):

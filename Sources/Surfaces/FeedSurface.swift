@@ -87,6 +87,22 @@ public final class FeedPanelViewModel: ObservableObject {
         }
     }
 
+    /// IMP-007: serialize an event's fields to pretty JSON for the per-row
+    /// "Copy JSON" action — lets users grab a raw event for debugging.
+    public func json(for item: Item) -> String {
+        let obj: [String: Any] = [
+            "seq": item.id,
+            "kind": item.kind,
+            "title": item.title,
+            "ts": item.ts.timeIntervalSince1970
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+              let s = String(data: data, encoding: .utf8) else {
+            return "{\"seq\":\(item.id),\"kind\":\"\(item.kind)\"}"
+        }
+        return s
+    }
+
     /// Compact "12s ago" relative label for the row timestamp (UX-008).
     public func relativeTime(for item: Item) -> String {
         let secs = Int(now().timeIntervalSince(item.ts))
@@ -181,6 +197,16 @@ public struct FeedPanelView: View {
                             .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
                             .accessibilityIdentifier("feed.item.\(item.id)")
+                            // IMP-007: grab an event's raw payload as JSON.
+                            .contextMenu {
+                                Button {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(vm.json(for: item), forType: .string)
+                                } label: {
+                                    Label("Copy JSON", systemImage: "curlybraces")
+                                }
+                                .accessibilityIdentifier("feed.item.\(item.id).copyJSON")
+                            }
                         }
                     }.padding(DS.Space.md)
                 }

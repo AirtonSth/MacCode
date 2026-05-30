@@ -220,10 +220,15 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
                 .compactMap({ $0 as? AgentAppSurface })
                 .first(where: { $0.descriptor.metadata["workspace"] == wid.value.uuidString }) {
                 let vm = agent.viewModel
-                cmds.append(PaletteCommand(id: "agent.provider.codex", title: "Agent: Use Codex", subtitle: "Switch provider", keywords: ["provider", "codex"], category: .agent, iconName: "cpu") {
+                // UX-IMP-010: mark the row matching the live selection so the
+                // user sees what provider/model/thread is already active.
+                let currentProvider = vm.provider
+                let currentModel = vm.model
+                let currentThread = vm.selectedThreadId
+                cmds.append(PaletteCommand(id: "agent.provider.codex", title: "Agent: Use Codex", subtitle: Self.currentSubtitle("Switch provider", isCurrent: currentProvider == .codex), keywords: ["provider", "codex"], category: .agent, iconName: "cpu") {
                     vm.provider = .codex; Task { await vm.loadModels() }
                 })
-                cmds.append(PaletteCommand(id: "agent.provider.claude", title: "Agent: Use Claude", subtitle: "Switch provider", keywords: ["provider", "claude"], category: .agent, iconName: "cpu") {
+                cmds.append(PaletteCommand(id: "agent.provider.claude", title: "Agent: Use Claude", subtitle: Self.currentSubtitle("Switch provider", isCurrent: currentProvider == .claude), keywords: ["provider", "claude"], category: .agent, iconName: "cpu") {
                     vm.provider = .claude; Task { await vm.loadModels() }
                 })
                 cmds.append(PaletteCommand(id: "agent.thread.new", title: "Agent: New Thread", subtitle: "Start a fresh thread", keywords: ["thread", "new", "chat"], category: .agent, iconName: "plus.bubble") {
@@ -244,7 +249,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
                 // UX-006: add the full catalog; cap only the default view.
                 let modelCap = 12
                 for (i, m) in vm.availableModels.enumerated() {
-                    cmds.append(PaletteCommand(id: "agent.model.\(m.id)", title: "Agent: Model → \(m.label)", subtitle: m.provider.rawValue, keywords: ["model", "switch", m.id, m.label.lowercased()], defaultHidden: i >= modelCap, category: .agent, iconName: "cube") {
+                    cmds.append(PaletteCommand(id: "agent.model.\(m.id)", title: "Agent: Model → \(m.label)", subtitle: Self.currentSubtitle(m.provider.rawValue, isCurrent: m.id == currentModel), keywords: ["model", "switch", m.id, m.label.lowercased()], defaultHidden: i >= modelCap, category: .agent, iconName: "cube") {
                         vm.model = m.id
                     })
                 }
@@ -252,7 +257,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
                 let threadCap = 9
                 for (i, t) in vm.threads.enumerated() {
                     let n = i + 1
-                    cmds.append(PaletteCommand(id: "agent.thread.jump.\(n)", title: "Agent: Jump to \(t.title)", subtitle: "Thread \(n) · \(t.provider.rawValue)", keywords: ["thread", "jump", "\(n)"], defaultHidden: i >= threadCap, category: .agent, iconName: "bubble.left.and.bubble.right") {
+                    cmds.append(PaletteCommand(id: "agent.thread.jump.\(n)", title: "Agent: Jump to \(t.title)", subtitle: Self.currentSubtitle("Thread \(n) · \(t.provider.rawValue)", isCurrent: t.id == currentThread), keywords: ["thread", "jump", "\(n)"], defaultHidden: i >= threadCap, category: .agent, iconName: "bubble.left.and.bubble.right") {
                         vm.selectThread(t.id)
                     })
                 }
@@ -272,6 +277,13 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         cmds.append(PaletteCommand(id: "app.quit", title: "Quit RemoteCode", keywords: ["exit", "quit"], shortcut: "⌘Q", category: .app, iconName: "power", destructive: true) { NSApp.terminate(nil) })
         self.all = cmds
         applyFilter(currentQuery)
+    }
+
+    /// UX-IMP-010: prefix an active row's subtitle with a check badge so the
+    /// user sees the currently-selected provider/model/thread at a glance.
+    private static func currentSubtitle(_ base: String, isCurrent: Bool) -> String {
+        guard isCurrent else { return base }
+        return base.isEmpty ? "✓ Current" : "✓ Current · \(base)"
     }
 
     /// UX-005: append a non-runnable "Show all N more <noun>…" row when the

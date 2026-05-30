@@ -199,14 +199,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// IMP-MAC_AGENT-011: unsent composer text, keyed by thread, so switching
+    /// threads mid-typing doesn't lose the draft.
+    private var composerDraftsByThread: [AgentThreadID: String] = [:]
+
     public func selectThread(_ id: AgentThreadID) {
         // PERF-MAC_AGENT-007: a different thread's bodies are irrelevant; free
         // the LRU cache so it stays bounded as the user moves between threads.
-        if selectedThreadId != id {
+        let isThreadSwitch = selectedThreadId != id
+        if isThreadSwitch {
             bodyCache.removeAll()
             bodyCacheOrder.removeAll()
+            // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
+            // then restore the opened thread's draft (an in-progress prompt on a
+            // re-select of the same thread is left untouched).
+            if let previous = selectedThreadId {
+                composerDraftsByThread[previous] = prompt.isEmpty ? nil : prompt
+            }
+            selectedThreadId = id
+            prompt = composerDraftsByThread[id] ?? ""
+        } else {
+            selectedThreadId = id
         }
-        selectedThreadId = id
         reloadQueuedMessages()
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
@@ -1049,6 +1063,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         persistThreadConfig()
     }
 
+    /// IMP-MAC_AGENT-006: cycle reasoning effort across the model's supported
+    /// efforts (for the Cmd+Shift+. power-user shortcut). No-op when the model
+    /// has no reasoning efforts. Returns the new effort for transient feedback.
+    @discardableResult
+    public func cycleReasoningEffort() -> AgentReasoningEffort? {
+        let efforts = supportedReasoningEffortsForSelectedModel
+        guard !efforts.isEmpty else { return nil }
+        let index = efforts.firstIndex(of: reasoningEffort) ?? -1
+        let next = efforts[(index + 1) % efforts.count]
+        setReasoningEffort(next)
+        return next
+    }
+
     public func setExecutionMode(_ mode: AgentExecutionMode) {
         guard !executionLocked else { return }
         executionMode = mode
@@ -1209,6 +1236,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func statusSummary() -> String {
         let t = threads.first(where: { $0.id == selectedThreadId })?.title ?? "—"
         return "provider=\(provider.rawValue) model=\(model) permission=\(permissionMode.rawValue) reasoning=\(reasoningEffort.rawValue) status=\(status.rawValue) thread=\(t)"
+    }
+
+    /// IMP-MAC_AGENT-013: serialize a full thread (read from the durable store,
+    /// not the paged in-memory window) to shareable markdown.
+    public func exportThreadMarkdown(_ id: AgentThreadID) -> (fileName: String, contents: String)? {
+        guard let thread = threads.first(where: { $0.id == id }) ?? (try? threadRepo.get(id: id)) else { return nil }
+        let rows = (try? messageRepo.list(threadId: id)) ?? []
+        var lines = ["# \(thread.title)", ""]
+        for message in rows {
+            let heading: String
+            switch message.role {
+            case .user: heading = "## User"
+            case .assistant: heading = "## Assistant"
+            case .system: heading = "## System"
+            }
+            lines.append(heading)
+            lines.append("")
+            lines.append(message.content)
+            lines.append("")
+        }
+        let safeName = thread.title
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:?%*|\"<>"))
+            .joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fileName = (safeName.isEmpty ? "agent-thread" : safeName) + ".md"
+        return (fileName, lines.joined(separator: "\n"))
     }
 
     private func systemNote(_ text: String) {
@@ -1831,6 +1884,8 @@ public struct AgentAppView: View {
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
     @State private var userIsDraggingTimeline = false
+    // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
+    @State private var timelineDropTargeted = false
     @State private var pendingScrollDownReveal: Task<Void, Never>?
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
@@ -2202,6 +2257,9 @@ public struct AgentAppView: View {
                     }
                 }
                 Divider()
+                // IMP-MAC_AGENT-013: export the thread to a shareable markdown file.
+                Button("Export…") { exportThread(t) }
+                Divider()
                 Button("Delete", role: .destructive) {
                     deleteThreads(selectedThreadIds.isEmpty ? [t.id] : selectedThreadIds)
                 }
@@ -2261,6 +2319,15 @@ public struct AgentAppView: View {
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
         .onExitCommand { if vm.status == .running { vm.stop() } }
+        // IMP-MAC_AGENT-006: power-user shortcut to cycle reasoning effort
+        // without opening the model popover; the composer model pill reflects
+        // the new effort immediately. Hidden control carries the shortcut.
+        .background(
+            Button("") { vm.cycleReasoningEffort() }
+                .keyboardShortcut(".", modifiers: [.command, .shift])
+                .opacity(0)
+                .accessibilityHidden(true)
+        )
     }
 
     // Thin context header. Run-config (provider/model/permission) lives in
@@ -2509,6 +2576,20 @@ public struct AgentAppView: View {
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
+                    // IMP-MAC_AGENT-010: the conversation area is a natural drop
+                    // target — accept file drops here too, routing them to the
+                    // same composer attachments as the composer's own drop zone.
+                    .onDrop(of: [UTType.fileURL], isTargeted: $timelineDropTargeted) { providers in
+                        loadDroppedFileAttachments(from: providers)
+                    }
+                    .overlay {
+                        if timelineDropTargeted {
+                            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+                                .strokeBorder(DS.Palette.accent, lineWidth: 2)
+                                .padding(DS.Space.sm)
+                                .allowsHitTesting(false)
+                        }
+                    }
                     .onPreferenceChange(TimelineBottomPreferenceKey.self) { bottomY in
                         updateTimelineBottomVisibility(bottomY: bottomY, viewportHeight: viewport.size.height)
                     }
@@ -3002,6 +3083,17 @@ public struct AgentAppView: View {
         _ = try? vm.saveLatestProposedPlan(to: url)
     }
 
+    // IMP-MAC_AGENT-013: write a thread's markdown export via a save panel.
+    private func exportThread(_ thread: AgentThread) {
+        guard let export = vm.exportThreadMarkdown(thread.id) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = export.fileName
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? export.contents.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
     @ViewBuilder
     private func assistantProse(_ text: String) -> some View {
         AgentMessageMarkdownView(text: text)
@@ -3009,6 +3101,15 @@ public struct AgentAppView: View {
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    // IMP-MAC_AGENT-007: tappable starter prompts on an empty thread reduce
+    // blank-page friction and hint at what the agent can do.
+    private static let emptyConversationStarters: [(icon: String, title: String, prompt: String)] = [
+        ("magnifyingglass", "Explain this codebase", "Give me a high-level tour of this codebase: the main modules, how they fit together, and where to start reading."),
+        ("ant", "Find and fix a bug", "Find a bug in the current changes and fix it. Show me the diff and explain the root cause."),
+        ("checklist", "Plan a change", "I want to add a feature. Help me plan it step by step before writing any code."),
+        ("text.alignleft", "Write tests", "Add tests for the most recently changed files. Cover the edge cases.")
+    ]
 
     private var emptyConversation: some View {
         VStack(spacing: DS.Space.lg) {
@@ -3024,15 +3125,47 @@ public struct AgentAppView: View {
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
-                Text("Start a new agent run from the composer.")
+                Text("Start a new agent run, or pick a starter below.")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
             }
+            VStack(spacing: DS.Space.sm) {
+                ForEach(Self.emptyConversationStarters, id: \.title) { starter in
+                    Button {
+                        vm.prompt = starter.prompt
+                        vm.focusTick &+= 1
+                    } label: {
+                        HStack(spacing: DS.Space.sm) {
+                            Image(systemName: starter.icon)
+                                .font(.system(size: 12))
+                                .foregroundColor(DS.Palette.accent)
+                                .frame(width: 16)
+                            Text(starter.title)
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.text)
+                            Spacer(minLength: 0)
+                            Image(systemName: "arrow.up.left")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        .padding(.horizontal, DS.Space.md)
+                        .padding(.vertical, DS.Space.sm)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Insert this starter prompt into the composer")
+                    .accessibilityIdentifier("agent.starter.\(starter.title)")
+                }
+            }
+            .frame(maxWidth: 420)
         }
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
-        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -3473,6 +3606,10 @@ public struct AgentAppView: View {
             HStack(spacing: DS.Space.sm) {
                 Text("\(s.files.count) file\(s.files.count == 1 ? "" : "s") changed")
                     .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                    // IMP-MAC_AGENT-008: per-file +/- breakdown on hover, so users
+                    // can preview the changed-files detail without leaving the
+                    // composer to open the Git panel.
+                    .help(changedFilesBreakdown(s))
                 Text("+\(s.totalAdditions)")
                     .font(DS.Font.caption.monospacedDigit()).foregroundColor(DS.Palette.success)
                 Text("−\(s.totalDeletions)")
@@ -3490,6 +3627,17 @@ public struct AgentAppView: View {
             .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
         }
+    }
+
+    // IMP-MAC_AGENT-008: a per-file "path  +A −B" listing for the changed-files
+    // hover tooltip; caps the list so a large change set stays readable.
+    private func changedFilesBreakdown(_ s: GitSummary) -> String {
+        let maxRows = 20
+        var rows = s.files.prefix(maxRows).map { "\($0.path)  +\($0.additions) −\($0.deletions)" }
+        if s.files.count > maxRows {
+            rows.append("… \(s.files.count - maxRows) more")
+        }
+        return rows.joined(separator: "\n")
     }
 
     private var composerToolbar: some View {
@@ -3828,6 +3976,13 @@ public struct AgentAppView: View {
                 Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
                     .lineLimit(1)
             }
+            // IMP-MAC_AGENT-014: surface the model's context window on the pill so
+            // the active limit is visible at a glance without opening the popover.
+            if let ctx = vm.selectedModelContextWindowLabel {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(ctx).font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
             Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
         }
@@ -4055,6 +4210,20 @@ public struct AgentAppView: View {
         if panel.runModal() == .OK {
             vm.addAttachments(panel.urls.map { $0.path })
         }
+    }
+
+    // IMP-MAC_AGENT-010: resolve dropped item providers to file paths and
+    // attach them to the next message. Returns true if any provider is a file.
+    private func loadDroppedFileAttachments(from providers: [NSItemProvider]) -> Bool {
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+        for provider in fileProviders {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                DispatchQueue.main.async { vm.addAttachments([url.path]) }
+            }
+        }
+        return true
     }
 
     private var sendIdleDisabled: Bool {

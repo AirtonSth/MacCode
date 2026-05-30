@@ -113,6 +113,10 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.minSize = NSSize(width: 0, height: 0)
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
+        // Native Cmd+F find within the preview text via NSTextView's built-in find bar
+        // (IMP-MAC_FILES-001). Selectable read-only text still supports find/search.
+        tv.usesFindBar = true
+        tv.isIncrementalSearchingEnabled = true
         tv.setAccessibilityIdentifier("filePreview.text")
         scroll.documentView = tv
         tv.string = Self.previewText(path: path)

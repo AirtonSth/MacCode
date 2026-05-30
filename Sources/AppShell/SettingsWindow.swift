@@ -6,6 +6,7 @@ import Persistence
 import AgentRuntime
 import SocketServer
 import DesignSystemKit
+import UserNotifications
 import os
 
 extension Notification.Name {
@@ -370,9 +371,15 @@ public struct SettingsView: View {
 
     // Hoisted so device rows don't each allocate a formatter on every render.
     private static let deviceDateFormatter = ISO8601DateFormatter()
+    private static let deviceRelativeFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f
+    }()
 
     @State private var deviceToRevoke: DeviceTrust?
     @State private var expandedUpdateDetails: Set<AgentProvider> = []
+    @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
 
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -406,6 +413,7 @@ public struct SettingsView: View {
         .padding(DS.Space.xl)
         .frame(width: 620, height: 560)
         .background(DS.Palette.bg)
+        .task { notificationStatus = await SystemNotifier.shared.authorizationStatus() }
     }
 
     private func settingRow<Content: View>(_ label: String, @ViewBuilder _ control: () -> Content) -> some View {
@@ -562,7 +570,7 @@ public struct SettingsView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(d.displayName).font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
-                                Text(d.id.prefix(8) + " · " + Self.deviceDateFormatter.string(from: d.createdAt))
+                                Text(deviceSubtitle(d))
                                     .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textTertiary)
                             }
                             Spacer()
@@ -590,6 +598,17 @@ public struct SettingsView: View {
         }
     }
 
+    /// Device row caption: short id, paired date, and a relative "last seen"
+    /// when the device has connected since pairing so users can recognize an
+    /// active device instead of only an 8-char hash.
+    private func deviceSubtitle(_ d: DeviceTrust) -> String {
+        var parts = [d.id.prefix(8) + " · " + Self.deviceDateFormatter.string(from: d.createdAt)]
+        if let lastSeen = d.lastSeenAt {
+            parts.append("seen " + Self.deviceRelativeFormatter.localizedString(for: lastSeen, relativeTo: Date()))
+        }
+        return parts.joined(separator: " · ")
+    }
+
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeader("Diagnostics")
@@ -604,6 +623,7 @@ public struct SettingsView: View {
             if vm.showsAppUpdates {
                 appUpdatesRow
             }
+            notificationsRow
             Text("State directory")
                 .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
             HStack(spacing: DS.Space.md) {
@@ -643,6 +663,37 @@ public struct SettingsView: View {
                 Text(status)
                     .font(DS.Font.caption)
                     .foregroundColor(updateStatusIsError ? DS.Palette.danger : DS.Palette.textTertiary)
+            }
+        }
+    }
+
+    private var notificationsRow: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(spacing: DS.Space.md) {
+                Text("Notifications")
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer()
+                if notificationStatus == .denied {
+                    Button("Open Notification Settings") {
+                        SystemNotifier.shared.openSystemNotificationSettings()
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("settings.notifications.openSettings")
+                } else {
+                    Button("Test notification") {
+                        SystemNotifier.shared.postTestNotification()
+                        Task { notificationStatus = await SystemNotifier.shared.authorizationStatus() }
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("settings.notifications.test")
+                }
+            }
+            if notificationStatus == .denied {
+                Text("Notifications are turned off for RemoteCode. Thread banners won't appear until you re-enable them in System Settings.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityIdentifier("settings.notifications.deniedNote")
             }
         }
     }
@@ -896,6 +947,13 @@ public struct AccountView: View {
                 DSPill(vm.privateAccountStatus, tone: vm.privateAccountUser?.subscribed == true ? .success : .warning)
             }
 
+            if let detail = subscriptionDetailCaption {
+                Text(detail)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityIdentifier("account.subscriptionDetail")
+            }
+
             if vm.privateAccountUser?.subscribed == false {
                 Button {
                     Task { await vm.openPrivateBillingPortal() }
@@ -957,6 +1015,16 @@ public struct AccountView: View {
         case "Session expired": return "Your session expired. Sign in again."
         default: return nil
         }
+    }
+
+    /// At-a-glance renewal/trial copy from the already-loaded account snapshot
+    /// (`daysRemaining`), so subscribed users see "Renews in N days" rather than
+    /// only a bare status pill. Nil when there is no meaningful countdown.
+    private var subscriptionDetailCaption: String? {
+        guard let user = vm.privateAccountUser, user.daysRemaining > 0 else { return nil }
+        let days = user.daysRemaining
+        let unit = days == 1 ? "day" : "days"
+        return user.subscribed ? "Renews in \(days) \(unit)." : "Trial ends in \(days) \(unit)."
     }
 
     private var accountName: String {

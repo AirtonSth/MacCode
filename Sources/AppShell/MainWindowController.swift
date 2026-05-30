@@ -187,6 +187,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private static let defaultSidebarWidth: CGFloat = 444
     private static let sidebarWidthSettingsKey = "sidebar.width"
     private static let sidebarCollapsedSettingsKey = "sidebar.collapsed"
+    /// IMP-MAC_SHELL_WINDOW-005: AppKit frame-autosave key for the main
+    /// window so its size/position survive relaunch.
+    private static let mainWindowFrameAutosaveName = "io.remotecode.mainWindow"
     private var sidebarWidth: CGFloat = MainWindowController.defaultSidebarWidth
     private var didApplyInitialSidebarWidth = false
     private var isApplyingInitialSidebarWidth = false
@@ -240,7 +243,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             applyStoredCollapsedLayout()
         }
         refreshFromState()
-        win.center()
+        // IMP-MAC_SHELL_WINDOW-005: persist and restore the main window
+        // frame across launches (matching the sidebar width/collapse state
+        // that already persist). AppKit returns false when no saved frame
+        // exists, so first launch still centers.
+        if !win.setFrameUsingName(Self.mainWindowFrameAutosaveName) {
+            win.center()
+        }
+        win.setFrameAutosaveName(Self.mainWindowFrameAutosaveName)
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleToggleSidebar),
             name: .rc2ToggleSidebar, object: nil)

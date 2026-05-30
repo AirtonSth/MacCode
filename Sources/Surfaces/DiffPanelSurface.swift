@@ -721,6 +721,9 @@ public struct DiffPanelView: View {
                     Text("−\(f.deletions)")
                         .font(DS.Font.caption2.monospacedDigit())
                         .foregroundColor(DS.Palette.danger)
+                    // IMP-012: proportional add/del bar for at-a-glance
+                    // change magnitude per file (GitHub-style).
+                    changeBar(additions: f.additions, deletions: f.deletions)
                 } else {
                     Text("binary")
                         .font(DS.Font.caption2)
@@ -769,6 +772,27 @@ public struct DiffPanelView: View {
         alert.addButton(withTitle: "Discard")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn { vm.discardFile(path) }
+    }
+
+    /// IMP-012: a thin proportional add/del bar (≈24pt) that fills green
+    /// for additions and red for deletions, sized by their relative weight.
+    /// A pure-context (0/0) change collapses to nothing so it never shows an
+    /// empty rail.
+    private func changeBar(additions: Int, deletions: Int) -> some View {
+        let total = additions + deletions
+        let addFrac = total > 0 ? CGFloat(additions) / CGFloat(total) : 0
+        return GeometryReader { geo in
+            HStack(spacing: 0) {
+                Rectangle().fill(DS.Palette.success)
+                    .frame(width: geo.size.width * addFrac)
+                Rectangle().fill(DS.Palette.danger)
+            }
+        }
+        .frame(width: 24, height: 4)
+        .clipShape(Capsule())
+        .opacity(total > 0 ? 1 : 0)
+        .help("+\(additions) −\(deletions)")
+        .accessibilityHidden(true)
     }
 
     private func statusBadge(_ s: GitFileStatus) -> some View {

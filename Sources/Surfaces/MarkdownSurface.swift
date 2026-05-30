@@ -163,8 +163,13 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
         h1 { font-size: 28px; border-bottom: 1px solid #d6dde4; padding-bottom: 8px; }
         h2 { font-size: 22px; border-bottom: 1px solid #d6dde4; padding-bottom: 4px; }
         h3 { font-size: 18px; }
-        pre { background: #f4f6f8; border: 1px solid #d6dde4; border-radius: 6px; padding: 12px; overflow: auto; }
+        pre { position: relative; background: #f4f6f8; border: 1px solid #d6dde4; border-radius: 6px; padding: 12px; overflow: auto; }
         code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+        /* IMP-010: per-fence copy button, revealed on hover. */
+        pre code { background: none; padding: 0; }
+        .rc-copy { position: absolute; top: 6px; right: 6px; opacity: 0; transition: opacity .12s; cursor: pointer; font: 11px -apple-system, system-ui; color: #1c2530; background: #ffffff; border: 1px solid #d6dde4; border-radius: 4px; padding: 2px 7px; }
+        pre:hover .rc-copy { opacity: 1; }
+        .rc-copy:hover { background: #eef1f4; }
         a { color: #1769c9; text-decoration: none; }
         a:hover { text-decoration: underline; }
         ul { padding-left: 22px; }
@@ -176,13 +181,32 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
           code { background: #1a1f26; }
           a { color: #7cc7ff; }
           hr { border-top-color: #2a3440; }
+          .rc-copy { color: #e7edf3; background: #1a1f26; border-color: #2a3440; }
+          .rc-copy:hover { background: #222831; }
         }
         """
         // UX-016: restore the saved scroll offset after the body lays out.
-        let scrollScript = scrollY > 0
-            ? "<script>window.addEventListener('load',function(){window.scrollTo(0,\(Int(scrollY)));});</script>"
-            : ""
-        return "<!doctype html><html><head><meta charset=\"utf-8\"><style>\(css)</style></head><body>\(body)\(scrollScript)</body></html>"
+        let scrollJS = scrollY > 0 ? "window.scrollTo(0,\(Int(scrollY)));" : ""
+        // IMP-010: inject a "Copy" button into every <pre> that copies the
+        // raw fenced code to the clipboard; self-contained, no parser change.
+        let copyJS = """
+        function rcCopy(t,b){
+          function ok(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1200);}
+          if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(ok,function(){rcExec(t,ok);});}
+          else{rcExec(t,ok);}
+        }
+        function rcExec(t,ok){
+          var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';
+          document.body.appendChild(ta);ta.select();try{document.execCommand('copy');ok();}catch(e){}document.body.removeChild(ta);
+        }
+        document.querySelectorAll('pre').forEach(function(pre){
+          var b=document.createElement('button');b.className='rc-copy';b.textContent='Copy';
+          b.addEventListener('click',function(){var c=pre.querySelector('code');rcCopy(c?c.innerText:pre.innerText,b);});
+          pre.appendChild(b);
+        });
+        """
+        let script = "<script>window.addEventListener('load',function(){\(copyJS)\(scrollJS)});</script>"
+        return "<!doctype html><html><head><meta charset=\"utf-8\"><style>\(css)</style></head><body>\(body)\(script)</body></html>"
     }
 
     private nonisolated static func headingLevel(_ line: String) -> Int? {

@@ -952,6 +952,14 @@ final class PaneTabButton: NSView {
         if dragStarted {
             performManualDrop(with: event)
             Self.clearDragFeedback()
+        } else if event.modifierFlags.contains(.command) {
+            // IMP-MAC_SHELL_WINDOW-006: ⌘-click closes the tab (browser
+            // muscle memory); ⌥⌘-click closes the other tabs instead.
+            if event.modifierFlags.contains(.option) {
+                (onCloseOthers ?? onClose)()
+            } else {
+                onClose()
+            }
         } else {
             onSelect()
         }

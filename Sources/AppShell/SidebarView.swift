@@ -23,6 +23,11 @@ public final class SidebarViewModel: ObservableObject {
     private var busyStateCache: [WorkspaceID: Bool] = [:]
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
+    /// IMP-MAC_SHELL_WINDOW-009: free-text filter applied to the rendered
+    /// workspace list. Empty string shows everything; matching is over
+    /// name, description, and cwd. The backing `workspaces` array stays
+    /// canonical so drag-reorder indices remain correct.
+    @Published public var filterText: String = ""
     @Published public var privateAccountUser: PrivateAccountUser?
     @Published public var updateAvailability: AppUpdateAvailability = .unknown
     @Published public private(set) var insomniaEnabled: Bool = false
@@ -185,6 +190,20 @@ public final class SidebarViewModel: ObservableObject {
         }
         let range = start <= end ? start...end : end...start
         selectedWorkspaceIDs = Set(range.map { workspaces[$0].id })
+    }
+
+    /// IMP-MAC_SHELL_WINDOW-009: the workspace rows to render, narrowed by
+    /// `filterText`. Order matches the canonical `workspaces` array so the
+    /// shown rows still carry the real workspace identities used by
+    /// drag-reorder (which resolves indices against `workspaces`).
+    public var filteredWorkspaces: [Workspace] {
+        let query = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return workspaces }
+        return workspaces.filter { ws in
+            if ws.name.lowercased().contains(query) { return true }
+            if (ws.metadata["description"]?.lowercased().contains(query)) == true { return true }
+            return ws.cwd.lowercased().contains(query)
+        }
     }
 
     public func newWorkspace() {
@@ -511,7 +530,16 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
 
+            // IMP-MAC_SHELL_WINDOW-009: filter field shown only once the
+            // list is long enough that scanning becomes a chore.
+            if vm.workspaces.count > 6 {
+                workspaceFilterField
+                    .padding(.horizontal, DS.Space.md)
+                    .padding(.bottom, DS.Space.sm)
+            }
+
             ScrollView {
+                let rows = vm.filteredWorkspaces
                 LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
                     if vm.workspaces.isEmpty {
                         Text("No workspaces")
@@ -519,8 +547,14 @@ public struct SidebarRootView: View {
                             .foregroundColor(DS.Palette.textTertiary)
                             .padding(.horizontal, DS.Space.md)
                             .padding(.vertical, DS.Space.sm)
+                    } else if rows.isEmpty {
+                        Text("No matches")
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, DS.Space.md)
+                            .padding(.vertical, DS.Space.sm)
                     } else {
-                        ForEach(vm.workspaces, id: \.id) { ws in
+                        ForEach(rows, id: \.id) { ws in
                             workspaceRow(ws)
                         }
                     }
@@ -546,6 +580,38 @@ public struct SidebarRootView: View {
         // The sidebar material reaches the top edge; only its controls
         // start below the traffic-light band.
         .ignoresSafeArea(.container, edges: .top)
+    }
+
+    private var workspaceFilterField: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(DS.Palette.textTertiary)
+            TextField("Filter workspaces", text: $vm.filterText)
+                .textFieldStyle(.plain)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .accessibilityIdentifier("sidebar.workspaceFilter")
+            if !vm.filterText.isEmpty {
+                Button { vm.filterText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear filter")
+            }
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .frame(height: 30)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(DS.Palette.surfaceRaised.opacity(0.6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .strokeBorder(DS.Palette.lineStrong.opacity(0.5), lineWidth: DS.Border.hairline)
+                )
+        )
     }
 
     private func sidebarActionRow(symbol: String, title: String, isEmphasized: Bool = false) -> some View {
