@@ -3443,8 +3443,8 @@ public struct AgentAppView: View {
                         .font(DS.Font.caption)
                         .foregroundColor(message.contains("failed") ? DS.Palette.danger : DS.Palette.textSecondary)
                 }
-                ForEach(Array(vm.queuedMessages.enumerated()), id: \.element.id) { index, message in
-                    queuedMessageRow(message, ordinal: index + 1)
+                ForEach(vm.queuedMessages, id: \.id) { message in
+                    queuedMessageRow(message)
                 }
             }
             .padding(.horizontal, DS.Space.lg)
@@ -3470,12 +3470,10 @@ public struct AgentAppView: View {
         }
     }
 
-    private func queuedMessageRow(_ message: AgentQueuedMessage, ordinal: Int) -> some View {
+    private func queuedMessageRow(_ message: AgentQueuedMessage) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(alignment: .top, spacing: DS.Space.sm) {
-                // UX-MAC_AGENT-012: show 1-based ordinals so the first queued
-                // item reads "#1", not "#0"; internal position is unchanged.
-                Text("#\(ordinal)")
+                Text("#\(message.position)")
                     .font(DS.Font.caption.monospacedDigit().weight(.semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                     .frame(width: 28, alignment: .leading)
@@ -3487,7 +3485,7 @@ public struct AgentAppView: View {
                             .scrollContentBackground(.hidden)
                             .background(DS.Palette.surface)
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .accessibilityLabel("Edit queued message \(ordinal)")
+                            .accessibilityLabel("Edit queued message \(message.position)")
                             .accessibilityIdentifier("agent.queued.editor.\(message.id.value.uuidString)")
                     } else {
                         Text(message.text.isEmpty ? attachmentSummary(message) : message.text)
@@ -3521,7 +3519,7 @@ public struct AgentAppView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .accessibilityLabel("Force queued message \(ordinal) now")
+                    .accessibilityLabel("Force queued message \(message.position) now")
                     .accessibilityIdentifier("agent.queued.force.\(message.id.value.uuidString)")
                     Button {
                         vm.editQueuedMessage(message)
@@ -3530,7 +3528,7 @@ public struct AgentAppView: View {
                     }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .accessibilityLabel("Edit queued message \(ordinal)")
+                        .accessibilityLabel("Edit queued message \(message.position)")
                         .accessibilityIdentifier("agent.queued.edit.\(message.id.value.uuidString)")
                     Button {
                         if message.attachments.isEmpty && message.text.count < 120 {
@@ -3546,7 +3544,7 @@ public struct AgentAppView: View {
                     .controlSize(.small)
                     .tint(DS.Palette.danger)
                     .foregroundColor(DS.Palette.danger)
-                    .accessibilityLabel("Cancel queued message \(ordinal)")
+                    .accessibilityLabel("Cancel queued message \(message.position)")
                     .accessibilityIdentifier("agent.queued.cancel.\(message.id.value.uuidString)")
                 }
             }
