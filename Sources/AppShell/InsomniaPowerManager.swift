@@ -240,7 +240,21 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     private func startScreenSaverTimerIfNeeded() {
         guard !options.allowDisplaySleep,
               options.allowScreenSaverAfter45MinutesOfInactivity else { return }
-        screenSaverTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        scheduleNextScreenSaverCheck()
+    }
+
+    /// PERF-MAC_SHELL_WINDOW-007: instead of a fixed 60s poll for the
+    /// app's lifetime, reschedule adaptively: when the user is far below
+    /// the 45m inactivity threshold, sleep most of the way to it (capped at
+    /// 5 minutes) so the timer fires rarely; only near the threshold do we
+    /// poll at the fine 60s cadence. This lets App Nap engage between
+    /// checks while keeping the assertion transition accurate.
+    private func scheduleNextScreenSaverCheck() {
+        let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .null)
+        let remaining = Self.screenSaverInactivityInterval - idle
+        let interval: TimeInterval = remaining <= 60 ? 60 : min(300, remaining - 30)
+        screenSaverTimer?.invalidate()
+        screenSaverTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             self?.refreshDisplaySleepAssertion()
         }
     }
@@ -250,6 +264,10 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
             _ = createDisplaySleepAssertion()
         } else {
             releaseDisplaySleepAssertion()
+        }
+        // Keep the adaptive cadence going while screen-saver mode is active.
+        if !options.allowDisplaySleep, options.allowScreenSaverAfter45MinutesOfInactivity {
+            scheduleNextScreenSaverCheck()
         }
     }
 

@@ -12,10 +12,28 @@ public enum GitPanelMode: String, CaseIterable, Sendable {
 
 @MainActor
 public final class DiffPanelViewModel: ObservableObject {
+    /// Cap the rendered diff so a giant `git show` can't stall TextKit
+    /// layout / spike memory (PERF-006). ~400K chars is already far
+    /// beyond what is human-reviewable in one pass.
+    private static let maxDiffRenderChars = 400 * 1024
+
     @Published public var cwd: String
     @Published public var summary: GitSummary
     @Published public var selectedPath: String?
-    @Published public var rawDiff: String = ""
+    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiff() } }
+    /// Styled diff rebuilt once when `rawDiff` changes, not on every body
+    /// pass, so unrelated @Published changes (wrap toggle, error banner,
+    /// summary refresh) don't re-parse the whole diff (PERF-005). Capped
+    /// to avoid laying out a multi-MB attributed string at once (PERF-006).
+    @Published public private(set) var styledDiff: AttributedString = AttributedString()
+    /// True when the rendered diff was clipped to `maxDiffRenderBytes`.
+    @Published public private(set) var diffTruncated: Bool = false
+    /// In-flight git work. `isLoading` gates the read-only refresh spinner
+    /// (UX-001); `isBusy` gates mutating actions and their spinner (UX-002).
+    @Published public private(set) var isLoading: Bool = false
+    @Published public private(set) var isBusy: Bool = false
+    /// Transient confirmation after a successful mutating action (UX-002).
+    @Published public var actionSuccess: String?
     @Published public var wordWrap: Bool = false { didSet { persistPrefs() } }
     @Published public var ignoreWhitespace: Bool = false { didSet { persistPrefs() } }
 
@@ -24,8 +42,16 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var commitMessage: String = ""
     @Published public var mode: GitPanelMode = .changes
     @Published public var selectedCommit: String?
+    /// UX-015: `lastError` is friendly/humanized copy shown in the banner;
+    /// `lastErrorRaw` keeps the original git stderr for the "Copy details"
+    /// expander so nothing is lost.
     @Published public var lastError: String?
+    @Published public private(set) var lastErrorRaw: String?
     private var historyLoaded = false
+    /// Monotonic token: each reloadDiff bumps it; only the matching
+    /// completion may write rawDiff so a slow earlier git process can't
+    /// overwrite the diff of a newer selection (PERF-007).
+    private var diffGeneration = 0
     private let settings: SettingsStore?
 
     /// C8: diff view prefs persist across launches via SettingsStore.
@@ -48,11 +74,72 @@ public final class DiffPanelViewModel: ObservableObject {
         }
     }
 
+    /// Build the +/−/@@/header-tinted AttributedString once per rawDiff
+    /// change (PERF-005). Clip overly large diffs so TextKit doesn't lay
+    /// out megabytes at once (PERF-006).
+    private func rebuildStyledDiff() {
+        // Cap by character count (always a valid index, unlike a raw UTF-8
+        // byte offset). maxDiffRenderBytes is a coarse safety valve.
+        let source: Substring
+        if rawDiff.count > Self.maxDiffRenderChars {
+            source = rawDiff.prefix(Self.maxDiffRenderChars)
+            diffTruncated = true
+        } else {
+            source = rawDiff[...]
+            diffTruncated = false
+        }
+        var out = AttributedString()
+        for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
+            var seg = AttributedString(String(line) + "\n")
+            // QA-007: classification lives in a pure, tested helper; the view
+            // only maps kind → color here.
+            switch DiffLineKind.classify(line) {
+            case .add:
+                seg.foregroundColor = DS.Palette.success
+                seg.backgroundColor = DS.Palette.success.opacity(0.08)
+            case .del:
+                seg.foregroundColor = DS.Palette.danger
+                seg.backgroundColor = DS.Palette.danger.opacity(0.08)
+            case .hunk:
+                seg.foregroundColor = DS.Palette.accent
+                seg.backgroundColor = DS.Palette.accent.opacity(0.08)
+            case .header:
+                seg.foregroundColor = DS.Palette.warning
+            case .context:
+                seg.foregroundColor = DS.Palette.textSecondary
+            }
+            out.append(seg)
+        }
+        styledDiff = out
+    }
+
     public func refresh() {
         let cwd = self.cwd
         DispatchQueue.global().async { [weak self] in
             let s = GitDiff.summary(in: cwd)
             DispatchQueue.main.async { self?.summary = s }
+        }
+    }
+
+    /// Refresh-button entry point: one background pass that reloads
+    /// summary, branches and history together, with a visible spinner so
+    /// the panel never looks frozen during git work (UX-001).
+    public func reloadAll() {
+        guard !isLoading else { return }
+        let cwd = self.cwd
+        isLoading = true
+        DispatchQueue.global().async { [weak self] in
+            let s = GitDiff.summary(in: cwd)
+            let b = GitDiff.branches(in: cwd)
+            let log = GitDiff.log(in: cwd)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.summary = s
+                self.branches = b
+                self.commits = log
+                self.historyLoaded = true
+                self.isLoading = false
+            }
         }
     }
 
@@ -90,6 +177,23 @@ public final class DiffPanelViewModel: ObservableObject {
         reloadDiff()
     }
 
+    /// UX-012: move the selection up/down the active list (changed files
+    /// in Changes mode, commits in History mode) for keyboard review.
+    public func selectAdjacent(_ direction: Int) {
+        if mode == .history {
+            guard !commits.isEmpty else { return }
+            let idx = commits.firstIndex { $0.hash == selectedCommit } ?? -1
+            let next = max(0, min(commits.count - 1, idx + direction))
+            selectCommit(commits[next].hash)
+        } else {
+            let files = summary.files
+            guard !files.isEmpty else { return }
+            let idx = files.firstIndex { $0.path == selectedPath } ?? -1
+            let next = max(0, min(files.count - 1, idx + direction))
+            selectFile(files[next].path)
+        }
+    }
+
     /// Re-fetch the diff for whatever is currently selected. Called on
     /// selection change and whenever the ignore-whitespace toggle flips,
     /// so the toggle has a visible effect instead of being inert.
@@ -98,7 +202,10 @@ public final class DiffPanelViewModel: ObservableObject {
         let ws = self.ignoreWhitespace
         let path = self.selectedPath
         let commit = self.selectedCommit
-        guard path != nil || commit != nil else { rawDiff = ""; return }
+        guard path != nil || commit != nil else { rawDiff = ""; isLoading = false; return }
+        diffGeneration &+= 1
+        let gen = diffGeneration
+        isLoading = true
         DispatchQueue.global().async { [weak self] in
             let d: String
             if let p = path {
@@ -108,39 +215,79 @@ public final class DiffPanelViewModel: ObservableObject {
             } else {
                 d = ""
             }
-            DispatchQueue.main.async { self?.rawDiff = d }
+            DispatchQueue.main.async {
+                guard let self, gen == self.diffGeneration else { return }
+                self.rawDiff = d
+                self.isLoading = false
+            }
         }
     }
 
     public func switchBranch(_ name: String) {
-        runAction { GitDiff.checkout(in: $0, branch: name) }
+        runAction(successMessage: "Switched to \(name)") { GitDiff.checkout(in: $0, branch: name) }
+    }
+
+    /// UX-004: stash uncommitted work, then switch — the guarded path
+    /// offered when the working tree is dirty.
+    public func stashAndSwitchBranch(_ name: String) {
+        runAction(successMessage: "Stashed changes and switched to \(name)") {
+            GitDiff.stashAndCheckout(in: $0, branch: name)
+        }
     }
 
     public func newBranch(_ name: String) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty else { return }
-        runAction { GitDiff.createBranch(in: $0, name: n) }
+        runAction(successMessage: "Created branch \(n)") { GitDiff.createBranch(in: $0, name: n) }
     }
 
     public func commit() {
         let msg = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !msg.isEmpty else { return }
-        runAction(clearMessageOnOK: true) { GitDiff.commit(in: $0, message: msg) }
+        // `git add -A` commits the entire working tree — there is no
+        // staging model, so the success copy says "all changes" to match
+        // what actually happens (UX-005). Clear selection so the panel
+        // doesn't keep showing a now-committed file's stale diff.
+        let n = summary.files.count
+        runAction(clearMessageOnOK: true,
+                  successMessage: "Committed all changes (\(n) file\(n == 1 ? "" : "s"))") {
+            GitDiff.commit(in: $0, message: msg)
+        }
+        selectedPath = nil
+        selectedCommit = nil
+        rawDiff = ""
+    }
+
+    /// UX-006: throw away a file's working-tree edits (git checkout HEAD --).
+    /// Clears the diff if the discarded file was the one on screen.
+    public func discardFile(_ path: String) {
+        runAction(successMessage: "Discarded changes in \(path)") {
+            GitDiff.restorePathToHead(in: $0, path: path)
+        }
+        if selectedPath == path {
+            selectedPath = nil
+            rawDiff = ""
+        }
     }
 
     /// D4: fill the composer with a generated fallback subject.
+    /// UX-014: only fill when the field is empty so a typed message is
+    /// never silently clobbered.
     public func suggestMessage() {
+        guard commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         commitMessage = GitDiff.suggestCommitMessage(summary)
     }
 
     /// D2: push the current branch (sets upstream if needed).
     public func push() {
-        runAction { GitDiff.push(in: $0) }
+        let branch = branches.current ?? "branch"
+        runAction(successMessage: "Pushed \(branch)") { GitDiff.push(in: $0) }
     }
 
     /// D2: open a PR/MR page for the current branch in the browser.
     public func openPullRequest() {
         guard let url = GitDiff.pullRequestURL(in: cwd), let u = URL(string: url) else {
+            lastErrorRaw = nil
             lastError = "No remote 'origin' / branch to open a pull request for."
             return
         }
@@ -151,8 +298,11 @@ public final class DiffPanelViewModel: ObservableObject {
     /// branches and log so the panel always reflects post-op truth.
     /// Failures surface in `lastError` — never silent (CLAUDE.md Rule 6).
     private func runAction(clearMessageOnOK: Bool = false,
+                           successMessage: String? = nil,
                            _ op: @escaping @Sendable (String) -> GitActionResult) {
         let cwd = self.cwd
+        isBusy = true
+        actionSuccess = nil
         DispatchQueue.global().async { [weak self] in
             let r = op(cwd)
             let s = GitDiff.summary(in: cwd)
@@ -163,11 +313,16 @@ public final class DiffPanelViewModel: ObservableObject {
                 self.summary = s
                 self.branches = b
                 self.commits = log
+                self.isBusy = false
                 if r.ok {
                     self.lastError = nil
+                    self.lastErrorRaw = nil
                     if clearMessageOnOK { self.commitMessage = "" }
+                    if let successMessage { self.actionSuccess = successMessage }
                 } else {
-                    self.lastError = r.message
+                    // UX-015: show actionable copy; keep raw stderr for details.
+                    self.lastErrorRaw = r.message
+                    self.lastError = GitDiff.humanizeError(r.message)
                 }
             }
         }
@@ -209,6 +364,9 @@ public struct DiffPanelView: View {
     @ObservedObject var vm: DiffPanelViewModel
     @State private var showNewBranchField = false
     @State private var newBranchName = ""
+    /// UX-013: focus the new-branch field the moment it is revealed so the
+    /// user can type immediately; Esc cancels.
+    @FocusState private var newBranchFocused: Bool
     public init(vm: DiffPanelViewModel) { self.vm = vm }
 
     public var body: some View {
@@ -217,6 +375,23 @@ public struct DiffPanelView: View {
             diffBody.frame(minWidth: 440)
         }
         .background(DS.Palette.bg)
+        // UX-012: arrow keys move the selection through the active list;
+        // ⌘C copies the current diff without reaching for the toolbar.
+        .focusable()
+        .onMoveCommand { direction in
+            switch direction {
+            case .up: vm.selectAdjacent(-1)
+            case .down: vm.selectAdjacent(1)
+            default: break
+            }
+        }
+        .background(
+            Button("", action: copyDiff)
+                .keyboardShortcut("c", modifiers: .command)
+                .opacity(0)
+                .disabled(vm.rawDiff.isEmpty)
+                .accessibilityHidden(true)
+        )
     }
 
     // MARK: Left column
@@ -256,10 +431,19 @@ public struct DiffPanelView: View {
                             .foregroundColor(DS.Palette.danger)
                     }
                 }
-                DSIconButton("arrow.clockwise", help: "Refresh") {
-                    vm.refresh(); vm.loadBranches(); vm.loadHistory(force: true)
+                if vm.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                        .frame(width: 18, height: 18)
+                        .accessibilityLabel("Loading git status")
+                } else {
+                    DSIconButton("arrow.clockwise", help: "Refresh") {
+                        vm.reloadAll()
+                    }
+                    .accessibilityLabel("Refresh git status")
+                    .accessibilityIdentifier("diff.refresh")
                 }
-                .accessibilityLabel("Refresh git status")
             }
             if showNewBranchField { newBranchComposer }
             modeSwitch
@@ -274,21 +458,24 @@ public struct DiffPanelView: View {
                 Text("No branches")
             }
             ForEach(vm.branches.locals, id: \.self) { b in
-                Button { vm.switchBranch(b) } label: {
+                Button { requestSwitch(to: b) } label: {
                     if b == vm.branches.current {
                         Label(b, systemImage: "checkmark")
                     } else {
                         Text(b)
                     }
                 }
+                .accessibilityIdentifier("diff.branch.\(b)")
             }
             Divider()
             Button {
                 newBranchName = ""
                 withAnimation(DS.Motion.standard) { showNewBranchField = true }
+                newBranchFocused = true   // UX-013: type immediately.
             } label: {
                 Label("New branch…", systemImage: "plus")
             }
+            .accessibilityIdentifier("diff.branch.new")
         } label: {
             HStack(spacing: DS.Space.xs) {
                 Image(systemName: "arrow.triangle.branch")
@@ -315,6 +502,7 @@ public struct DiffPanelView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Switch or create branch")
+        .accessibilityIdentifier("diff.branchChip")
     }
 
     private var newBranchComposer: some View {
@@ -325,20 +513,22 @@ public struct DiffPanelView: View {
             TextField("new-branch-name", text: $newBranchName)
                 .textFieldStyle(.plain)
                 .font(DS.Font.monoSmall)
+                .focused($newBranchFocused)
                 .onSubmit(confirmNewBranch)
+                .onExitCommand(perform: cancelNewBranch)   // UX-013: Esc cancels.
+                .accessibilityIdentifier("diff.newBranch.field")
             Button("Create", action: confirmNewBranch)
                 .buttonStyle(DSSecondaryButtonStyle())
                 .controlSize(.small)
                 .disabled(newBranchName.trimmingCharacters(in: .whitespaces).isEmpty)
-            Button {
-                withAnimation(DS.Motion.standard) { showNewBranchField = false }
-                newBranchName = ""
-            } label: {
+                .accessibilityIdentifier("diff.newBranch.create")
+            Button(action: cancelNewBranch) {
                 Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
             }
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textTertiary)
             .accessibilityLabel("Cancel new branch")
+            .accessibilityIdentifier("diff.newBranch.cancel")
             .help("Cancel new branch")
         }
         .padding(.horizontal, DS.Space.md)
@@ -350,6 +540,9 @@ public struct DiffPanelView: View {
                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
         )
         .transition(.opacity.combined(with: .move(edge: .top)))
+        .onChange(of: showNewBranchField) { shown in
+            if shown { newBranchFocused = true }   // UX-013 backstop.
+        }
     }
 
     /// Token-styled segmented control — the native `.segmented` picker
@@ -394,6 +587,7 @@ public struct DiffPanelView: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(on ? .isSelected : [])
+        .accessibilityIdentifier("diff.mode.\(mode.rawValue)")
     }
 
     private func confirmNewBranch() {
@@ -404,25 +598,69 @@ public struct DiffPanelView: View {
         withAnimation(DS.Motion.standard) { showNewBranchField = false }
     }
 
+    private func cancelNewBranch() {
+        newBranchFocused = false
+        withAnimation(DS.Motion.standard) { showNewBranchField = false }
+        newBranchName = ""
+    }
+
+    /// UX-004: a clean tree switches immediately; a dirty tree gets a
+    /// guard offering "Stash & switch" instead of dumping a cryptic git
+    /// "would be overwritten by checkout" error into the banner.
+    private func requestSwitch(to branch: String) {
+        guard branch != vm.branches.current else { return }
+        guard vm.summary.dirty else { vm.switchBranch(branch); return }
+        let alert = NSAlert()
+        alert.messageText = "You have uncommitted changes"
+        alert.informativeText = "Switching to \"\(branch)\" with a dirty working tree may fail or overwrite changes. Stash your changes first?"
+        alert.addButton(withTitle: "Stash & Switch")
+        alert.addButton(withTitle: "Switch Anyway")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: vm.stashAndSwitchBranch(branch)
+        case .alertSecondButtonReturn: vm.switchBranch(branch)
+        default: break
+        }
+    }
+
     private func errorBanner(_ msg: String) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.sm) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(DS.Palette.danger)
-                .font(.system(size: 11))
-            Text(msg)
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.danger)
-                .lineLimit(4)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            Button { withAnimation(DS.Motion.micro) { vm.lastError = nil } } label: {
-                Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(DS.Palette.danger)
+                    .font(.system(size: 11))
+                Text(msg)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.danger)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button {
+                    withAnimation(DS.Motion.micro) { vm.lastError = nil }
+                } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Dismiss error")
+                .accessibilityIdentifier("diff.error.dismiss")
+                .help("Dismiss error")
             }
-            .buttonStyle(.plain)
-            .foregroundColor(DS.Palette.textTertiary)
-            .accessibilityLabel("Dismiss error")
-            .help("Dismiss error")
+            // UX-015: when the friendly copy differs from the raw git stderr,
+            // offer a "Copy details" affordance so the original is recoverable.
+            if let raw = vm.lastErrorRaw, raw != msg {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(raw, forType: .string)
+                } label: {
+                    Text("Copy details").font(DS.Font.caption2.weight(.medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.danger.opacity(0.85))
+                .accessibilityIdentifier("diff.error.copyDetails")
+                .help("Copy the raw git error to the clipboard")
+            }
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.md)
@@ -431,6 +669,7 @@ public struct DiffPanelView: View {
             Rectangle().fill(DS.Palette.danger.opacity(0.4)).frame(height: DS.Border.hairline)
         }
         .transition(.opacity)
+        .accessibilityIdentifier("diff.error.banner")
     }
 
     // MARK: Changes
@@ -482,6 +721,9 @@ public struct DiffPanelView: View {
                     Text("−\(f.deletions)")
                         .font(DS.Font.caption2.monospacedDigit())
                         .foregroundColor(DS.Palette.danger)
+                    // IMP-012: proportional add/del bar for at-a-glance
+                    // change magnitude per file (GitHub-style).
+                    changeBar(additions: f.additions, deletions: f.deletions)
                 } else {
                     Text("binary")
                         .font(DS.Font.caption2)
@@ -491,6 +733,66 @@ public struct DiffPanelView: View {
         }
         .buttonStyle(GitRowButtonStyle(selected: selected))
         .help(f.path)
+        .accessibilityIdentifier("diff.file.\(f.path)")
+        // UX-006: discard a file's working-tree edits without a terminal.
+        // UX-017: binary files have no textual diff — give them an escape
+        // hatch (Open / Reveal) instead of a dead-end "binary" label.
+        .contextMenu {
+            if f.binary {
+                Button { openFile(f.path) } label: {
+                    Label("Open in default app", systemImage: "arrow.up.forward.app")
+                }
+                Button { revealFile(f.path) } label: {
+                    Label("Reveal in Finder", systemImage: "folder")
+                }
+                Divider()
+            }
+            if f.status != .untracked {
+                Button(role: .destructive) { requestDiscard(f.path) } label: {
+                    Label("Discard changes", systemImage: "arrow.uturn.backward")
+                }
+            }
+        }
+    }
+
+    private func absoluteURL(_ path: String) -> URL {
+        URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: vm.cwd)).standardizedFileURL
+    }
+    private func openFile(_ path: String) { NSWorkspace.shared.open(absoluteURL(path)) }
+    private func revealFile(_ path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([absoluteURL(path)])
+    }
+
+    /// UX-006: confirm before throwing away a file's edits — git checkout
+    /// HEAD is irreversible for unsaved working-tree changes.
+    private func requestDiscard(_ path: String) {
+        let alert = NSAlert()
+        alert.messageText = "Discard changes in this file?"
+        alert.informativeText = "“\(path)” will be reverted to the last committed version. This cannot be undone."
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { vm.discardFile(path) }
+    }
+
+    /// IMP-012: a thin proportional add/del bar (≈24pt) that fills green
+    /// for additions and red for deletions, sized by their relative weight.
+    /// A pure-context (0/0) change collapses to nothing so it never shows an
+    /// empty rail.
+    private func changeBar(additions: Int, deletions: Int) -> some View {
+        let total = additions + deletions
+        let addFrac = total > 0 ? CGFloat(additions) / CGFloat(total) : 0
+        return GeometryReader { geo in
+            HStack(spacing: 0) {
+                Rectangle().fill(DS.Palette.success)
+                    .frame(width: geo.size.width * addFrac)
+                Rectangle().fill(DS.Palette.danger)
+            }
+        }
+        .frame(width: 24, height: 4)
+        .clipShape(Capsule())
+        .opacity(total > 0 ? 1 : 0)
+        .help("+\(additions) −\(deletions)")
+        .accessibilityHidden(true)
     }
 
     private func statusBadge(_ s: GitFileStatus) -> some View {
@@ -522,7 +824,8 @@ public struct DiffPanelView: View {
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.accent)
                 .disabled(vm.summary.files.isEmpty)
-                .help("Generate a fallback commit message")
+                .help("Generate a fallback commit message (only when empty)")
+                .accessibilityIdentifier("diff.commit.suggest")
             }
             .padding(.top, DS.Space.xs)
             TextField("Message (summarize the change)", text: $vm.commitMessage, axis: .vertical)
@@ -536,17 +839,39 @@ public struct DiffPanelView: View {
                     RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                         .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
                 )
+                .accessibilityIdentifier("diff.commitMessage")
+            if let ok = vm.actionSuccess {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "checkmark.circle.fill").font(.system(size: 11))
+                        .foregroundColor(DS.Palette.success)
+                    Text(ok).font(DS.Font.caption2.weight(.medium))
+                        .foregroundColor(DS.Palette.success)
+                    Spacer(minLength: 0)
+                }
+                .transition(.opacity)
+                .accessibilityIdentifier("diff.actionSuccess")
+                .task(id: ok) {
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    withAnimation(DS.Motion.micro) { vm.actionSuccess = nil }
+                }
+            }
             Button(action: vm.commit) {
                 HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "checkmark.circle.fill").font(.system(size: 12))
+                    if vm.isBusy {
+                        ProgressView().controlSize(.small).scaleEffect(0.6)
+                    } else {
+                        Image(systemName: "checkmark.circle.fill").font(.system(size: 12))
+                    }
                     Text(commitButtonTitle)
                 }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(DSPrimaryButtonStyle())
-            .disabled(commitDisabled)
-            .opacity(commitDisabled ? 0.45 : 1)
+            .disabled(commitDisabled || vm.isBusy)
+            .opacity((commitDisabled || vm.isBusy) ? 0.45 : 1)
             .animation(DS.Motion.micro, value: commitDisabled)
+            .animation(DS.Motion.micro, value: vm.isBusy)
+            .accessibilityIdentifier("diff.commitButton")
             HStack(spacing: DS.Space.sm) {
                 Button(action: vm.push) {
                     HStack(spacing: DS.Space.xs) {
@@ -555,7 +880,9 @@ public struct DiffPanelView: View {
                     }.frame(maxWidth: .infinity)
                 }
                 .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(vm.isBusy)
                 .help("git push (sets upstream if needed)")
+                .accessibilityIdentifier("diff.pushButton")
                 Button(action: vm.openPullRequest) {
                     HStack(spacing: DS.Space.xs) {
                         Image(systemName: "arrow.triangle.pull").font(.system(size: 11))
@@ -564,6 +891,7 @@ public struct DiffPanelView: View {
                 }
                 .buttonStyle(DSSecondaryButtonStyle())
                 .help("Open a PR/MR page for this branch")
+                .accessibilityIdentifier("diff.prButton")
             }
             if commitDisabled {
                 Text(commitHint)
@@ -576,8 +904,10 @@ public struct DiffPanelView: View {
     }
 
     private var commitButtonTitle: String {
+        // `git add -A` stages everything, so the label must say "all"
+        // rather than implying the per-file selection is committed (UX-005).
         let n = vm.summary.files.count
-        return n == 0 ? "Commit" : "Commit \(n) file\(n == 1 ? "" : "s")"
+        return n == 0 ? "Commit" : "Commit all \(n) file\(n == 1 ? "" : "s")"
     }
 
     private var commitDisabled: Bool {
@@ -602,8 +932,10 @@ public struct DiffPanelView: View {
                 DSSectionHeader("History · \(vm.commits.count)")
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(Array(vm.commits.enumerated()), id: \.element.hash) { idx, c in
-                            commitRow(c, isFirst: idx == 0, isLast: idx == vm.commits.count - 1)
+                        // PERF-013: iterate over `indices` so we don't allocate
+                        // a fresh `Array(enumerated())` on every body pass.
+                        ForEach(vm.commits.indices, id: \.self) { idx in
+                            commitRow(vm.commits[idx], isFirst: idx == 0, isLast: idx == vm.commits.count - 1)
                         }
                     }
                     .padding(.horizontal, DS.Space.sm)
@@ -660,6 +992,7 @@ public struct DiffPanelView: View {
         }
         .buttonStyle(GitRowButtonStyle(selected: selected))
         .help("\(c.shortHash) — \(c.subject)")
+        .accessibilityIdentifier("diff.commit.\(c.shortHash)")
     }
 
     // MARK: Diff viewer
@@ -668,22 +1001,48 @@ public struct DiffPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             diffToolbar
             if vm.rawDiff.isEmpty {
-                DSEmptyState(
-                    icon: "doc.text.magnifyingglass",
-                    title: vm.mode == .history ? "Select a commit" : "Select a file",
-                    subtitle: vm.mode == .history
-                        ? "Pick a commit from History to inspect its full diff."
-                        : "Pick a changed file to view its diff side by side."
-                )
+                if vm.isLoading {
+                    DSEmptyState(
+                        icon: "doc.text.magnifyingglass",
+                        title: "Loading diff…",
+                        subtitle: "Running git — this can take a moment on large repos."
+                    )
+                    .overlay(alignment: .center) {
+                        ProgressView().controlSize(.small).padding(.top, 64)
+                    }
+                } else {
+                    DSEmptyState(
+                        icon: "doc.text.magnifyingglass",
+                        title: vm.mode == .history ? "Select a commit" : "Select a file",
+                        subtitle: vm.mode == .history
+                            ? "Pick a commit from History to inspect its full diff."
+                            : "Pick a changed file to view its diff side by side."
+                    )
+                }
             } else {
                 ScrollView([.vertical, vm.wordWrap ? .init() : .horizontal]) {
-                    Text(displayDiff)
-                        .font(DS.Font.mono)
-                        .textSelection(.enabled)
-                        .padding(DS.Space.lg)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(vm.styledDiff)
+                            .font(DS.Font.mono)
+                            .textSelection(.enabled)
+                            .padding(DS.Space.lg)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityIdentifier("diff.body")
+                        if vm.diffTruncated {
+                            Text("Diff truncated — too large to render fully. Use Copy diff for the complete text.")
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .padding(.horizontal, DS.Space.lg)
+                                .padding(.bottom, DS.Space.lg)
+                        }
+                    }
                 }
                 .background(DS.Palette.bg)
+                .overlay(alignment: .topTrailing) {
+                    if vm.isLoading {
+                        ProgressView().controlSize(.small).padding(DS.Space.md)
+                    }
+                }
             }
         }
         .onChange(of: vm.ignoreWhitespace) { _ in vm.reloadDiff() }
@@ -709,8 +1068,11 @@ public struct DiffPanelView: View {
                     .foregroundColor(DS.Palette.textTertiary)
             }
             Spacer(minLength: DS.Space.lg)
-            wsToggle("Wrap", $vm.wordWrap)
-            wsToggle("Ignore WS", $vm.ignoreWhitespace)
+            wsToggle("Wrap", $vm.wordWrap,
+                     icon: vm.wordWrap ? "arrow.turn.down.left" : "arrow.left.and.right",
+                     identifier: "diff.toggle.wrap")
+            wsToggle("Ignore WS", $vm.ignoreWhitespace,
+                     icon: nil, identifier: "diff.toggle.ignoreWS")
             Button(action: copyDiff) {
                 Image(systemName: "doc.on.doc").font(.system(size: 11))
             }
@@ -719,6 +1081,7 @@ public struct DiffPanelView: View {
             .disabled(vm.rawDiff.isEmpty)
             .help("Copy diff")
             .accessibilityLabel("Copy diff to clipboard")
+            .accessibilityIdentifier("diff.copyButton")
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.sm)
@@ -726,9 +1089,15 @@ public struct DiffPanelView: View {
         .dsBar(edge: .bottom)
     }
 
-    private func wsToggle(_ title: String, _ binding: Binding<Bool>) -> some View {
+    /// UX-011: the optional `icon` reflects the active mode in the toolbar
+    /// (wrap vs horizontal-scroll) so the effect isn't only conveyed by the
+    /// subtle pill fill.
+    private func wsToggle(_ title: String, _ binding: Binding<Bool>, icon: String? = nil, identifier: String) -> some View {
         Button { binding.wrappedValue.toggle() } label: {
-            Text(title)
+            HStack(spacing: 3) {
+                if let icon { Image(systemName: icon).font(.system(size: 9, weight: .semibold)) }
+                Text(title)
+            }
                 .font(DS.Font.caption2.weight(.medium))
                 .foregroundColor(binding.wrappedValue ? DS.Palette.onAccent : DS.Palette.textSecondary)
                 .padding(.horizontal, DS.Space.sm)
@@ -742,6 +1111,7 @@ public struct DiffPanelView: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(binding.wrappedValue ? .isSelected : [])
+        .accessibilityIdentifier(identifier)
         .help(title == "Wrap" ? "Toggle line wrapping" : "Ignore whitespace in diff")
     }
 
@@ -752,29 +1122,6 @@ public struct DiffPanelView: View {
 
     private func statusForPath(_ p: String) -> GitFileStatus {
         vm.summary.files.first { $0.path == p }?.status ?? .modified
-    }
-
-    private var displayDiff: AttributedString {
-        var out = AttributedString()
-        for line in vm.rawDiff.split(separator: "\n", omittingEmptySubsequences: false) {
-            var seg = AttributedString(String(line) + "\n")
-            if line.hasPrefix("+") && !line.hasPrefix("+++") {
-                seg.foregroundColor = DS.Palette.success
-                seg.backgroundColor = DS.Palette.success.opacity(0.08)
-            } else if line.hasPrefix("-") && !line.hasPrefix("---") {
-                seg.foregroundColor = DS.Palette.danger
-                seg.backgroundColor = DS.Palette.danger.opacity(0.08)
-            } else if line.hasPrefix("@@") {
-                seg.foregroundColor = DS.Palette.accent
-                seg.backgroundColor = DS.Palette.accent.opacity(0.08)
-            } else if line.hasPrefix("diff --git") || line.hasPrefix("+++") || line.hasPrefix("---") {
-                seg.foregroundColor = DS.Palette.warning
-            } else {
-                seg.foregroundColor = DS.Palette.textSecondary
-            }
-            out.append(seg)
-        }
-        return out
     }
 
     private func statusGlyph(_ s: GitFileStatus) -> String {

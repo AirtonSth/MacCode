@@ -4,6 +4,7 @@ import CoreModel
 import Persistence
 import AgentRuntime
 import SocketServer
+import Surfaces
 
 @MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -70,13 +71,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
         }
         updater = SparkleAppUpdater.defaultIfConfigured()
+        updater?.onWillInstallUpdate = { [weak self] in
+            self?.persistRestorableStateBeforeUpdate()
+        }
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
         // Rebuild Surface objects from restored layout descriptors, then
         // refresh so the restored workspaces + tabs actually render
         // (the controller's init refresh ran before surfaces existed).
         router.reinstantiateRestoredSurfaces()
-        windowController.refreshFromState()
+        // UX-MAC_SHELL_WINDOW-014: surfaces now exist; drop the restoring
+        // affordance and render the real layout.
+        windowController.markRestorationComplete()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)
@@ -128,12 +134,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
-        context?.saveSnapshot()
+        persistRestorableStateBeforeUpdate()
         socketServer?.stop()
         httpServer?.stop()
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    private func persistRestorableStateBeforeUpdate() {
+        context?.saveSnapshot()
+        for surface in SurfaceRegistry.shared.all() {
+            (surface as? TerminalSurface)?.flushPersistedHistory()
+        }
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -164,6 +177,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         var opened = false
         for url in urls {
             if (try? router.createWorkspace(fromFolder: url)) != nil {
+                // UX-MAC_SHELL_WINDOW-005: feed File ▸ Open Recent.
+                NSDocumentController.shared.noteNewRecentDocumentURL(url)
                 opened = true
             }
         }
@@ -266,8 +281,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let newWS = NSMenuItem(title: "New Workspace…", action: #selector(newWorkspace), keyEquivalent: "n")
         newWS.target = self
         fileMenu.addItem(newWS)
+        // UX-MAC_SHELL_WINDOW-005: standard Open Recent submenu, populated
+        // by AppKit from noteNewRecentDocumentURL; selections route through
+        // application(_:open:) which opens the folder as a workspace.
+        let openRecent = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+        let openRecentMenu = NSMenu(title: "Open Recent")
+        let clearRecent = NSMenuItem(title: "Clear Menu", action: Selector(("clearRecentDocuments:")), keyEquivalent: "")
+        openRecentMenu.addItem(clearRecent)
+        openRecent.submenu = openRecentMenu
+        fileMenu.addItem(openRecent)
         fileMenu.addItem(.separator())
+        // UX-MAC_SHELL_WINDOW-003: ⌘W closes the focused tab when one
+        // exists; it only closes the window when the workspace has none.
+        let closeTab = NSMenuItem(title: "Close Tab", action: #selector(closeActiveTabOrWindow), keyEquivalent: "w")
+        closeTab.target = self
+        fileMenu.addItem(closeTab)
         let closeWin = NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        closeWin.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(closeWin)
         fileMenuItem.submenu = fileMenu
 
@@ -306,7 +336,45 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         surfaceMenu.addItem(term)
         surfaceMenu.addItem(browser)
         surfaceMenu.addItem(agent)
+        surfaceMenu.addItem(.separator())
+        // UX-MAC_SHELL_WINDOW-004: keyboard splits, defaulting to Terminal.
+        let splitRight = NSMenuItem(title: "Split Right", action: #selector(splitFocusedPaneRight), keyEquivalent: "d")
+        splitRight.keyEquivalentModifierMask = [.command]
+        splitRight.target = self
+        let splitDown = NSMenuItem(title: "Split Down", action: #selector(splitFocusedPaneDown), keyEquivalent: "d")
+        splitDown.keyEquivalentModifierMask = [.command, .shift]
+        splitDown.target = self
+        surfaceMenu.addItem(splitRight)
+        surfaceMenu.addItem(splitDown)
         surfaceItem.submenu = surfaceMenu
+
+        // Tab
+        // UX-MAC_SHELL_WINDOW-002: keyboard navigation for the tab strip.
+        let tabItem = NSMenuItem()
+        mainMenu.addItem(tabItem)
+        let tabMenu = NSMenu(title: "Tab")
+        let nextTab = NSMenuItem(title: "Next Tab", action: #selector(selectNextTab), keyEquivalent: "]")
+        nextTab.keyEquivalentModifierMask = [.command, .shift]
+        nextTab.target = self
+        let prevTab = NSMenuItem(title: "Previous Tab", action: #selector(selectPreviousTab), keyEquivalent: "[")
+        prevTab.keyEquivalentModifierMask = [.command, .shift]
+        prevTab.target = self
+        tabMenu.addItem(nextTab)
+        tabMenu.addItem(prevTab)
+        tabMenu.addItem(.separator())
+        for n in 1...9 {
+            let item = NSMenuItem(title: "Select Tab \(n)", action: #selector(selectTabByNumber(_:)), keyEquivalent: "\(n)")
+            item.keyEquivalentModifierMask = [.command]
+            item.tag = n
+            item.target = self
+            tabMenu.addItem(item)
+        }
+        tabMenu.addItem(.separator())
+        let nextPane = NSMenuItem(title: "Focus Next Pane", action: #selector(focusNextPane), keyEquivalent: "\t")
+        nextPane.keyEquivalentModifierMask = [.control]
+        nextPane.target = self
+        tabMenu.addItem(nextPane)
+        tabItem.submenu = tabMenu
 
         // Window
         let windowItem = NSMenuItem()
@@ -384,6 +452,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.canChooseDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
             _ = try? router.createWorkspace(name: url.lastPathComponent, cwd: url.path)
+            // UX-MAC_SHELL_WINDOW-005: feed File ▸ Open Recent.
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
         }
     }
 
@@ -395,6 +465,69 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let wid = context.state.window.selectedWorkspaceID else { NSSound.beep(); return }
         _ = try? router.createSurface(workspace: wid, type: type, paneID: nil, title: nil)
     }
+
+    // UX-MAC_SHELL_WINDOW-004: keyboard split entry points.
+    @objc private func splitFocusedPaneRight() {
+        if windowController?.splitFocusedPane(.right) != true { NSSound.beep() }
+    }
+
+    @objc private func splitFocusedPaneDown() {
+        if windowController?.splitFocusedPane(.down) != true { NSSound.beep() }
+    }
+
+    // MARK: - Tab keyboard navigation (UX-MAC_SHELL_WINDOW-002/003)
+
+    /// The focused pane of the selected workspace, plus its ordered
+    /// surfaces and the currently selected surface index.
+    private func focusedPaneContext() -> (workspace: WorkspaceID, surfaces: [SurfaceDescriptor], selectedIndex: Int)? {
+        guard let wid = context?.state.window.selectedWorkspaceID,
+              let ws = context?.state.workspaces[wid] else { return nil }
+        let paneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
+        guard let paneID, let pane = ws.layout.find(paneID: paneID),
+              !pane.surfaces.isEmpty else { return nil }
+        let selected = pane.selectedSurfaceID ?? pane.surfaces.first?.id
+        let index = pane.surfaces.firstIndex { $0.id == selected } ?? 0
+        return (wid, pane.surfaces, index)
+    }
+
+    @objc private func selectNextTab() { stepTab(by: 1) }
+    @objc private func selectPreviousTab() { stepTab(by: -1) }
+
+    private func stepTab(by delta: Int) {
+        guard let ctx = focusedPaneContext(), ctx.surfaces.count > 1 else { NSSound.beep(); return }
+        let count = ctx.surfaces.count
+        let next = ((ctx.selectedIndex + delta) % count + count) % count
+        try? router?.focusSurface(workspace: ctx.workspace, surface: ctx.surfaces[next].id)
+    }
+
+    @objc private func selectTabByNumber(_ sender: NSMenuItem) {
+        guard let ctx = focusedPaneContext(),
+              sender.tag >= 1, sender.tag <= ctx.surfaces.count else { NSSound.beep(); return }
+        try? router?.focusSurface(workspace: ctx.workspace, surface: ctx.surfaces[sender.tag - 1].id)
+    }
+
+    @objc private func closeActiveTabOrWindow() {
+        // Route through the window controller so the focused pane's
+        // unsaved-changes confirm runs; fall back to closing the key
+        // window only when no surface is open.
+        if windowController?.closeFocusedSurface() == true { return }
+        (NSApp.keyWindow ?? window)?.performClose(nil)
+    }
+
+    @objc private func focusNextPane() {
+        guard let wid = context?.state.window.selectedWorkspaceID,
+              let ws = context?.state.workspaces[wid] else { NSSound.beep(); return }
+        let paneIDs = ws.layout.paneIDs()
+        guard paneIDs.count > 1 else { NSSound.beep(); return }
+        let current = ws.focusedPaneID ?? paneIDs.first
+        let idx = current.flatMap { paneIDs.firstIndex(of: $0) } ?? 0
+        let nextPane = paneIDs[(idx + 1) % paneIDs.count]
+        guard let pane = ws.layout.find(paneID: nextPane),
+              let surface = pane.selectedSurfaceID ?? pane.surfaces.first?.id else { NSSound.beep(); return }
+        try? router?.focusSurface(workspace: wid, surface: surface)
+    }
+
+    private var window: NSWindow? { windowController?.window }
 
     /// GAP-4: publish `_remotecode._tcp` so the iOS app can find this
     /// Mac on the LAN. TXT carries the stable identity + version so the

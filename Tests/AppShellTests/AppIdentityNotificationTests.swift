@@ -39,8 +39,8 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "release bundles must embed the Sparkle EdDSA public key used to verify update archives")
         XCTAssertTrue(script.contains("<key>SUEnableAutomaticChecks</key><true/>"),
                       "auto-update must enable Sparkle background update checks")
-        XCTAssertTrue(script.contains("<key>SUAutomaticallyUpdate</key><true/>"),
-                      "auto-update must let Sparkle download/install eligible updates instead of only linking a DMG")
+        XCTAssertTrue(script.contains("<key>SUAutomaticallyUpdate</key><false/>"),
+                      "RemoteCode must not silently install and relaunch while sessions are active; Sparkle should ask before installing")
         XCTAssertTrue(script.contains("Contents/Frameworks/Sparkle.framework"),
                       "the SwiftPM-built app bundle must embed Sparkle.framework for the updater to load")
         XCTAssertTrue(script.contains("install_name_tool -add_rpath \"@executable_path/../Frameworks\""),

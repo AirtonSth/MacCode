@@ -138,6 +138,7 @@ public final class PaneTabsView: NSObject {
             symbol: "plus",
             help: "New surface",
             target: self, action: #selector(showAddMenu(_:)))
+        addButton.setAccessibilityIdentifier("pane.add")
         Self.populateSurfaceMenu(addMenu, target: self, action: #selector(addFromMenu(_:)))
         Self.populateSurfaceMenu(splitRightMenu, target: self, action: #selector(splitFromMenu(_:)), direction: .right)
         Self.populateSurfaceMenu(splitDownMenu, target: self, action: #selector(splitFromMenu(_:)), direction: .down)
@@ -149,10 +150,12 @@ public final class PaneTabsView: NSObject {
             symbol: "rectangle.split.2x1",
             help: "Split right (side by side)",
             target: self, action: #selector(showSplitRightMenu(_:)))
+        splitColumns.setAccessibilityIdentifier("pane.splitRight")
         let splitRows = Self.makeIconButton(
             symbol: "rectangle.split.1x2",
             help: "Split down (stacked)",
             target: self, action: #selector(showSplitDownMenu(_:)))
+        splitRows.setAccessibilityIdentifier("pane.splitDown")
 
         var rightControls: [NSView] = [splitColumns, splitRows]
         if let splitContext {
@@ -215,7 +218,12 @@ public final class PaneTabsView: NSObject {
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
 
+        // PERF-MAC_SHELL_WINDOW-001: the tab strip only reacts to
+        // `files.state.updated`. Drop every other kind on the publishing
+        // thread instead of bouncing the full EventBus firehose to main
+        // just to discard it in `receive`.
         eventToken = EventBus.shared.subscribe(since: nil) { [weak self] event in
+            guard event.kind == "files.state.updated" else { return }
             DispatchQueue.main.async { self?.receive(event) }
         }
         DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
@@ -296,6 +304,17 @@ public final class PaneTabsView: NSObject {
         try? router?.closeSurface(workspace: wid, surface: id)
     }
 
+    /// UX-MAC_SHELL_WINDOW-003: ⌘W close-tab seam. Closes this pane's
+    /// selected surface through the same unsaved-changes confirm the tab
+    /// "×" uses. Returns false when the pane has no surface to close so
+    /// the caller can fall back to closing the window.
+    @discardableResult
+    public func closeSelectedSurface() -> Bool {
+        guard let id = pane.selectedSurfaceID ?? pane.surfaces.first?.id else { return false }
+        closeSurface(id)
+        return true
+    }
+
     @discardableResult
     public func performCloseAllOthers(around id: SurfaceID) -> Bool {
         closeSurfaces(Self.surfaceIDs(excluding: id, in: pane))
@@ -344,7 +363,13 @@ public final class PaneTabsView: NSObject {
     private func surfaceIsUnsaved(_ id: SurfaceID) -> Bool {
         if let desc = pane.surfaces.first(where: { $0.id == id }) {
             if desc.isDirty { return true }
-            if let count = Int(desc.metadata["dirty_count"] ?? "0"), count > 0 { return true }
+            // PERF-MAC_SHELL_WINDOW-006: trust the dirty_count streamed via
+            // `files.state.updated` when present (even "0") instead of a
+            // synchronous per-tab RPC. Only when the descriptor carries no
+            // dirty_count at all (state unknown) do we fall back to the RPC.
+            if let raw = desc.metadata["dirty_count"] {
+                return (Int(raw) ?? 0) > 0
+            }
             guard desc.type == .files else { return false }
         }
         guard let state = try? router?.filesStateGet(surface: id).objectValue,
@@ -503,13 +528,25 @@ public final class PaneTabsView: NSObject {
     @discardableResult
     public func performAdd(_ type: SurfaceType, title: String) -> SurfaceDescriptor? {
         guard let wid = currentWorkspaceID() else { return nil }
-        return try? router?.createSurface(workspace: wid, type: type, paneID: pane.id, title: title)
+        let desc = try? router?.createSurface(workspace: wid, type: type, paneID: pane.id, title: title)
+        if let desc { focusNewlyCreatedSurface(desc.id, in: wid) }
+        return desc
     }
 
     @discardableResult
     public func performSplit(_ direction: SplitDirection, type: SurfaceType, title: String) -> SurfaceDescriptor? {
         guard let wid = currentWorkspaceID() else { return nil }
-        return try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
+        let desc = try? router?.splitPane(workspace: wid, paneID: pane.id, direction: direction, surfaceType: type, title: title)
+        if let desc { focusNewlyCreatedSurface(desc.id, in: wid) }
+        return desc
+    }
+
+    /// UX-MAC_SHELL_WINDOW-001: route a freshly created surface through
+    /// the focus path so its input is first responder immediately — no
+    /// extra click before the user can type.
+    private func focusNewlyCreatedSurface(_ id: SurfaceID, in workspace: WorkspaceID) {
+        try? router?.focusSurface(workspace: workspace, surface: id)
+        router?.windowController?.repairSelectedTerminalFocus(reason: "new_surface")
     }
 
     @discardableResult
@@ -672,6 +709,8 @@ final class PaneTabButton: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = (selected ? DS.NS.bg : DS.NS.surface).cgColor
+        // QA-MAC_SHELL_WINDOW-001: addressable tab for UI automation.
+        setAccessibilityIdentifier("pane.tab.\(surfaceID.value.uuidString)")
 
         // A3: a busy surface shows a spinner where its icon would be.
         let icon: NSView
@@ -719,6 +758,7 @@ final class PaneTabButton: NSView {
         close.target = self
         close.action = #selector(closeClicked)
         close.toolTip = "Close tab"
+        close.setAccessibilityIdentifier("pane.tab.\(surfaceID.value.uuidString).close")
 
         addSubview(icon); addSubview(label); addSubview(dirtyBadge); addSubview(close)
         NSLayoutConstraint.activate([
@@ -881,6 +921,15 @@ final class PaneTabButton: NSView {
     // treat clicks here as a window drag and the tab/close never fire.
     override var mouseDownCanMoveWindow: Bool { false }
 
+    // PERF-MAC_SHELL_WINDOW-005: if this tab is torn out of its window
+    // mid-drag (e.g. window closed during a drag), the static drag-feedback
+    // refs would otherwise leak a ghost/highlight until the next clear.
+    // Clearing on detach scopes cleanup to the originating window.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { Self.clearDragFeedback() }
+    }
+
     override func mouseDown(with event: NSEvent) {
         dragStarted = false
         mouseDownLocation = event.locationInWindow
@@ -903,9 +952,28 @@ final class PaneTabButton: NSView {
         if dragStarted {
             performManualDrop(with: event)
             Self.clearDragFeedback()
+        } else if event.modifierFlags.contains(.command) {
+            // IMP-MAC_SHELL_WINDOW-006: ⌘-click closes the tab (browser
+            // muscle memory); ⌥⌘-click closes the other tabs instead.
+            if event.modifierFlags.contains(.option) {
+                (onCloseOthers ?? onClose)()
+            } else {
+                onClose()
+            }
         } else {
             onSelect()
         }
+    }
+
+    // UX-MAC_SHELL_WINDOW-015: middle-click closes the tab (browser/editor
+    // expectation). Routes through onClose so the unsaved-changes confirm
+    // runs exactly as the "×" button does.
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        onClose()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -927,6 +995,18 @@ final class PaneTabButton: NSView {
         guard let contentView = window?.contentView else { return }
         let point = contentView.convert(event.locationInWindow, from: nil)
         guard let hit = contentView.hitTest(point) else { return }
+        routeManualDrop(hit: hit, contentPoint: point, in: contentView)
+    }
+
+    /// QA-MAC_SHELL_WINDOW-004: the drop-routing decision (tab vs strip vs
+    /// split) extracted from the live mouse event so it can be exercised
+    /// with a synthetic hit view + content-space point in tests, without a
+    /// real drag gesture.
+    func performManualDropForTesting(hit: NSView, contentPoint: NSPoint, in contentView: NSView) {
+        routeManualDrop(hit: hit, contentPoint: contentPoint, in: contentView)
+    }
+
+    private func routeManualDrop(hit: NSView, contentPoint point: NSPoint, in contentView: NSView) {
         if let target = enclosingView(from: hit, as: PaneTabButton.self), target !== self {
             _ = target.onDropSurface?(surfaceID)
             return

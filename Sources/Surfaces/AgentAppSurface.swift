@@ -7,6 +7,11 @@ import CoreModel
 import Persistence
 import AgentRuntime
 import DesignSystemKit
+import os
+
+// QA-MAC_AGENT-010: surface-side lifecycle logging (approvals, queue depth) so
+// field issues and flakes are diagnosable beyond transient UI strings.
+private let agentSurfaceLog = Logger(subsystem: "io.remotecode.agent", category: "surface")
 
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
@@ -83,6 +88,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var retainedTranscriptBodyCount: Int = 0
     @Published public private(set) var visibleTranscriptRowCount: Int = 0
     @Published public private(set) var hydrationDirection: String?
+    /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
+    /// the transcript can offer a Retry of the last prompt instead of forcing a
+    /// retype. Cleared when a run starts or any non-error event arrives.
+    @Published public private(set) var lastErrorRecoverable: Bool = false
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -151,6 +160,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    // PERF-MAC_AGENT-008: per-finish git refresh shelled out a subprocess every
+    // completion; when several threads finish together this multiplied. Coalesce
+    // bursts into a single refresh after a short trailing delay.
+    private var pendingGitRefresh: Task<Void, Never>?
+
+    public func loadGitBranchThrottled() {
+        guard pendingGitRefresh == nil else { return }
+        pendingGitRefresh = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self, !Task.isCancelled else { return }
+            self.pendingGitRefresh = nil
+            self.loadGitBranch()
+        }
+    }
+
     /// Maps an in-flight run back to its thread so a completion can mark
     /// the right thread unread even after the user navigated away (B6).
     private var runThreads: [AgentRunID: AgentThreadID] = [:]
@@ -175,8 +199,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// IMP-MAC_AGENT-011: unsent composer text, keyed by thread, so switching
+    /// threads mid-typing doesn't lose the draft.
+    private var composerDraftsByThread: [AgentThreadID: String] = [:]
+
     public func selectThread(_ id: AgentThreadID) {
-        selectedThreadId = id
+        // PERF-MAC_AGENT-007: a different thread's bodies are irrelevant; free
+        // the LRU cache so it stays bounded as the user moves between threads.
+        let isThreadSwitch = selectedThreadId != id
+        if isThreadSwitch {
+            bodyCache.removeAll()
+            bodyCacheOrder.removeAll()
+            // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
+            // then restore the opened thread's draft (an in-progress prompt on a
+            // re-select of the same thread is left untouched).
+            if let previous = selectedThreadId {
+                composerDraftsByThread[previous] = prompt.isEmpty ? nil : prompt
+            }
+            selectedThreadId = id
+            prompt = composerDraftsByThread[id] ?? ""
+        } else {
+            selectedThreadId = id
+        }
         reloadQueuedMessages()
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
@@ -219,6 +263,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         timelineUpdateTick = 0
+        // UX-MAC_AGENT-001: route first-responder to the composer on every
+        // open/switch so the user can type without a manual click.
+        focusTick &+= 1
     }
 
     public func reloadQueuedMessages() {
@@ -359,6 +406,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let selectedThreadId, let turnCount = selectedCheckpointTurnCount else { return }
         do {
             _ = try coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
+            // PERF-MAC_AGENT-006: revert deleted assistant rows — drop the cache.
+            lastPersistedAssistantContentByThread.removeValue(forKey: selectedThreadId)
             checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
             loadInitialMessagePage(selectedThreadId)
             reloadCheckpoints()
@@ -561,18 +610,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    // PERF-MAC_AGENT-007: small LRU cache of hydrated bodies so a row that
+    // scrolls back into view doesn't re-hit the DB. Capped so memory stays
+    // bounded during long fast scrolls.
+    private var bodyCache: [AgentMessageID: String] = [:]
+    private var bodyCacheOrder: [AgentMessageID] = []
+    private static let bodyCacheLimit = 60
+
+    private func cacheBody(_ body: String, for id: AgentMessageID) {
+        if bodyCache[id] == nil {
+            bodyCacheOrder.append(id)
+            if bodyCacheOrder.count > Self.bodyCacheLimit {
+                let evicted = bodyCacheOrder.removeFirst()
+                bodyCache.removeValue(forKey: evicted)
+            }
+        }
+        bodyCache[id] = body
+    }
+
     private func hydrateMessageBody(_ id: AgentMessageID) {
         guard let index = messages.firstIndex(where: { $0.id == id }),
-              messages[index].content.isEmpty,
-              let persisted = try? messageRepo.get(id: id) else { return }
-        messages[index].content = Self.displayMessage(persisted).content
+              messages[index].content.isEmpty else { return }
+        // Re-appearing rows resolve from the in-memory cache without a DB read.
+        if let cached = bodyCache[id] {
+            messages[index].content = cached
+            return
+        }
+        guard let persisted = try? messageRepo.get(id: id) else { return }
+        let body = Self.displayMessage(persisted).content
+        messages[index].content = body
+        cacheBody(body, for: id)
     }
 
     private func evictMessageBody(_ id: AgentMessageID) {
         guard let index = messages.firstIndex(where: { $0.id == id }),
-              !messages[index].content.isEmpty,
-              (try? messageRepo.get(id: id)) != nil else { return }
-        messages[index].content = ""
+              !messages[index].content.isEmpty else { return }
+        // Keep the body in the cache (so it can re-hydrate without a DB read)
+        // only when it is actually persisted; otherwise don't drop in-memory-only
+        // content we can't restore.
+        if bodyCache[id] != nil || (try? messageRepo.get(id: id)) != nil {
+            cacheBody(messages[index].content, for: id)
+            messages[index].content = ""
+        }
     }
 
     private func refreshTranscriptBodyMetrics() {
@@ -636,12 +715,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         do {
             try coordinator.respondToRequest(threadId: threadId, requestId: request.id, response: response)
             timeline.apply(.requestResolved(requestId: request.id, state: state))
+            // QA-MAC_AGENT-010: record approval outcomes for diagnostics.
+            agentSurfaceLog.info("approval.resolved thread=\(threadId.value.uuidString, privacy: .public) request=\(request.id, privacy: .public) state=\(state.rawValue, privacy: .public)")
             if response == .approveForSession {
                 setPermissionMode(.fullAccess)
             }
         } catch {
             timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
             timeline.apply(.requestResolved(requestId: request.id, state: .stale))
+            // Response-failure, not a prompt failure — no prompt Retry offered.
+            lastErrorRecoverable = false
         }
         timelineUpdateTick += 1
     }
@@ -661,6 +744,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 timeline.pendingUserInputs[idx].state = .stale
                 timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
             }
+            // Response-failure, not a prompt failure — no prompt Retry offered.
+            lastErrorRecoverable = false
         }
         timelineUpdateTick += 1
     }
@@ -978,6 +1063,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         persistThreadConfig()
     }
 
+    /// IMP-MAC_AGENT-006: cycle reasoning effort across the model's supported
+    /// efforts (for the Cmd+Shift+. power-user shortcut). No-op when the model
+    /// has no reasoning efforts. Returns the new effort for transient feedback.
+    @discardableResult
+    public func cycleReasoningEffort() -> AgentReasoningEffort? {
+        let efforts = supportedReasoningEffortsForSelectedModel
+        guard !efforts.isEmpty else { return nil }
+        let index = efforts.firstIndex(of: reasoningEffort) ?? -1
+        let next = efforts[(index + 1) % efforts.count]
+        setReasoningEffort(next)
+        return next
+    }
+
     public func setExecutionMode(_ mode: AgentExecutionMode) {
         guard !executionLocked else { return }
         executionMode = mode
@@ -1140,6 +1238,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return "provider=\(provider.rawValue) model=\(model) permission=\(permissionMode.rawValue) reasoning=\(reasoningEffort.rawValue) status=\(status.rawValue) thread=\(t)"
     }
 
+    /// IMP-MAC_AGENT-013: serialize a full thread (read from the durable store,
+    /// not the paged in-memory window) to shareable markdown.
+    public func exportThreadMarkdown(_ id: AgentThreadID) -> (fileName: String, contents: String)? {
+        guard let thread = threads.first(where: { $0.id == id }) ?? (try? threadRepo.get(id: id)) else { return nil }
+        let rows = (try? messageRepo.list(threadId: id)) ?? []
+        var lines = ["# \(thread.title)", ""]
+        for message in rows {
+            let heading: String
+            switch message.role {
+            case .user: heading = "## User"
+            case .assistant: heading = "## Assistant"
+            case .system: heading = "## System"
+            }
+            lines.append(heading)
+            lines.append("")
+            lines.append(message.content)
+            lines.append("")
+        }
+        let safeName = thread.title
+            .components(separatedBy: CharacterSet(charactersIn: "/\\:?%*|\"<>"))
+            .joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fileName = (safeName.isEmpty ? "agent-thread" : safeName) + ".md"
+        return (fileName, lines.joined(separator: "\n"))
+    }
+
     private func systemNote(_ text: String) {
         guard let tid = selectedThreadId else { return }
         let m = AgentMessage(threadId: tid, role: .system, content: text)
@@ -1290,8 +1414,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             prompt = ""
             attachments = []
-            queueStatusMessage = nil
+            // UX-MAC_AGENT-019: a run is in flight, so this message was queued,
+            // not sent now — confirm that explicitly near the composer.
+            queueStatusMessage = "Queued — will run after the current turn."
             reloadQueuedMessages()
+            // QA-MAC_AGENT-010: track queue depth for diagnostics.
+            agentSurfaceLog.info("queue.enqueued thread=\(selectedThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
             onQueuedMessageEvent?("agent.message.queued", queued)
         } catch {
             queueStatusMessage = "Queue send failed: \(error)"
@@ -1315,6 +1443,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
         timelineUpdateTick = 0
+        lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         let resolvedAttachments: [AgentAttachment]
         do {
             resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
@@ -1400,6 +1529,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         promptHistoryCursor = nil
     }
 
+    /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
+    /// without forcing the user to retype it.
+    public func retryLastPrompt() async {
+        guard let last = promptHistory.last, !last.isEmpty else { return }
+        lastErrorRecoverable = false
+        _ = await startProviderRun(text: last, attached: [], recordHistory: false, interactionMode: interactionMode)
+    }
+
     @discardableResult
     public func recallPreviousPrompt() -> Bool {
         guard prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || promptHistoryCursor != nil else { return false }
@@ -1433,11 +1570,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    // PERF-MAC_AGENT-006: last assistant text this VM persisted per thread, to
+    // skip the O(history) reload when re-deduping the same completed answer.
+    private var lastPersistedAssistantContentByThread: [AgentThreadID: String] = [:]
+
     private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
         let text = AssistantTimelineState.cappedText(text)
+        if lastPersistedAssistantContentByThread[threadId] == text { return }
         let existing = (try? messageRepo.list(threadId: threadId)) ?? []
-        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else { return }
+        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
+            lastPersistedAssistantContentByThread[threadId] = text
+            return
+        }
         try? messageRepo.append(AgentMessage(threadId: threadId, role: .assistant, content: text))
+        lastPersistedAssistantContentByThread[threadId] = text
     }
 
     // MARK: AgentRunObserver
@@ -1451,6 +1597,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if self.status != .running { self.status = .running }
             }
             self.timeline.apply(event)
+            // UX-MAC_AGENT-009: track recoverability of the latest error so the
+            // transcript can offer Retry; any other event clears the flag.
+            if case let .error(_, recoverable) = event {
+                self.lastErrorRecoverable = recoverable
+            } else {
+                self.lastErrorRecoverable = false
+            }
             self.timelineUpdateTick &+= 1
         }
     }
@@ -1482,7 +1635,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runStartedAt = nil
             }
             self.reloadThreads()
-            self.loadGitBranch()   // the run may have changed the tree
+            self.loadGitBranchThrottled()   // the run may have changed the tree
             if status == .completed {
                 self.onRunCompleted?()
             }
@@ -1718,16 +1871,23 @@ public struct AgentAppView: View {
     private static let threadRailIdealWidth: CGFloat = 220
     private static let conversationMinimumWidth: CGFloat = 560
     private static let planSidebarIdealWidth: CGFloat = 300
+    private static let timelineBottomRevealSlack: CGFloat = 4
+    private static let scrollDownButtonBottomInset: CGFloat = 22
     @ObservedObject var vm: AgentAppViewModel
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
+    // UX-MAC_AGENT-010: reasoning rows collapse to "Thought" by default once
+    // completed; ids here are the ones the user explicitly expanded.
+    @State private var expandedReasoning: Set<String> = []
     @State private var selectedThreadIds: Set<AgentThreadID> = []
     @State private var lastSelectedThreadId: AgentThreadID?
     @State private var draggingThreadId: AgentThreadID?
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
     @State private var userIsDraggingTimeline = false
+    // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
+    @State private var timelineDropTargeted = false
     @State private var pendingScrollDownReveal: Task<Void, Never>?
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
@@ -1738,8 +1898,13 @@ public struct AgentAppView: View {
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
+    @State private var pendingSessionApproval: AssistantPendingRequest?
+    @State private var expandedRequestPreviews: Set<String> = []
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
+    // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
+    @State private var showCustomModelField = false
+    @State private var customModelDraft = ""
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -1817,16 +1982,44 @@ public struct AgentAppView: View {
             compactAssistantText(lhs) == compactAssistantText(rhs)
     }
 
+    // PERF-MAC_AGENT-002: collapse whitespace manually over unicode scalars
+    // instead of regex; these run for every assistant row on every render, and
+    // regex over capped 80k-char bodies dominated the dedup cost. Results are
+    // memoized so repeated comparisons of the same body don't re-scan.
+    private static let normalizedTextCache = NSCache<NSString, NSString>()
+    private static let compactTextCache = NSCache<NSString, NSString>()
+
     private static func normalizedAssistantText(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cached = normalizedTextCache.object(forKey: text as NSString) {
+            return cached as String
+        }
+        var out = String()
+        out.reserveCapacity(text.count)
+        var pendingSpace = false
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                pendingSpace = !out.isEmpty
+            } else {
+                if pendingSpace { out.unicodeScalars.append(" ") }
+                pendingSpace = false
+                out.unicodeScalars.append(scalar)
+            }
+        }
+        normalizedTextCache.setObject(out as NSString, forKey: text as NSString)
+        return out
     }
 
     private static func compactAssistantText(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cached = compactTextCache.object(forKey: text as NSString) {
+            return cached as String
+        }
+        var out = String()
+        out.reserveCapacity(text.count)
+        for scalar in text.unicodeScalars where !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+            out.unicodeScalars.append(scalar)
+        }
+        compactTextCache.setObject(out as NSString, forKey: text as NSString)
+        return out
     }
 
     private enum TranscriptEntry: Identifiable {
@@ -1851,12 +2044,49 @@ public struct AgentAppView: View {
         }
     }
 
+    // PERF-MAC_AGENT-001: the merged+sorted transcript is read from `body`, so
+    // it recomputed (O(n log n)) on every @Published change — every streaming
+    // delta and every keystroke. Memoize it, re-sorting only when the message
+    // or turn identities actually change (cheap signature compare).
+    private final class TranscriptCache {
+        var signature: String?
+        var entries: [TranscriptEntry] = []
+    }
+    private let transcriptCache = TranscriptCache()
+
     private var transcriptEntries: [TranscriptEntry] {
-        (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
+        let signature = transcriptSignature
+        if transcriptCache.signature == signature {
+            return transcriptCache.entries
+        }
+        let merged = (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
             .sorted { lhs, rhs in
                 if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
                 return lhs.sortTime < rhs.sortTime
             }
+        transcriptCache.signature = signature
+        transcriptCache.entries = merged
+        return merged
+    }
+
+    /// Cheap identity signature: changes only when a message/turn is added,
+    /// removed, or reordered (id list), not on streaming text deltas.
+    private var transcriptSignature: String {
+        var sig = String()
+        sig.reserveCapacity((vm.messages.count + vm.timeline.turns.count) * 8)
+        for message in vm.messages {
+            sig += "m"
+            sig += message.id.value.uuidString
+        }
+        for turn in vm.timeline.turns {
+            sig += "t"
+            sig += turn.turnId
+            // A turn's sortTime derives from its items' min startedAtMs, which
+            // is set when its first item appears; fold item count in so the
+            // sort refreshes on item add (not on pure text deltas).
+            sig += "#\(turn.items.count)"
+        }
+        return sig
     }
 
     private var persistedAssistantTexts: [String] {
@@ -1889,12 +2119,23 @@ public struct AgentAppView: View {
             }
         }
         .background(DS.Palette.bg)
+        .background(newThreadShortcut)
         .task {
             if vm.providerSnapshots.isEmpty {
                 await vm.loadProviderSnapshots()
             }
         }
         .onDeleteCommand { deleteSelectedThreads() }
+    }
+
+    // UX-MAC_AGENT-002: ⌘N starts a thread even when the rail (and its "+"
+    // button) is collapsed. A zero-size button carries the shortcut.
+    private var newThreadShortcut: some View {
+        Button { vm.createThread(title: "New thread") } label: { EmptyView() }
+            .buttonStyle(.plain)
+            .frame(width: 0, height: 0)
+            .keyboardShortcut("n", modifiers: .command)
+            .accessibilityHidden(true)
     }
 
     // MARK: Thread rail
@@ -1908,7 +2149,8 @@ public struct AgentAppView: View {
                         threadRailIntent = .forcedHidden
                         showThreadRail = false
                     }
-                    DSIconButton("plus", help: "New thread") { vm.createThread(title: "New thread") }
+                    DSIconButton("plus", help: "New thread (⌘N)") { vm.createThread(title: "New thread") }
+                        .accessibilityIdentifier("agent.thread.new")
                 }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -1956,6 +2198,8 @@ public struct AgentAppView: View {
                         // A3: spinner while this thread has a run in flight.
                         ProgressView().controlSize(.small).scaleEffect(0.5)
                             .frame(width: 8, height: 8)
+                            .accessibilityLabel("Running")
+                            .accessibilityIdentifier("agent.thread.row.running.\(t.id.value.uuidString)")
                     } else if showLeadingStatus {
                         Image(systemName: t.pinned ? "pin.fill" : "circle.fill")
                             .font(.system(size: t.pinned ? 9 : 7, weight: .semibold))
@@ -1975,6 +2219,7 @@ public struct AgentAppView: View {
                     if t.hasUnread {
                         Circle().fill(DS.Palette.accent).frame(width: 7, height: 7)
                             .accessibilityLabel("Unread activity")
+                            .accessibilityIdentifier("agent.thread.row.unread.\(t.id.value.uuidString)")
                     }
                     if AgentThreadRowPresentation.showsSelectionCheck(
                         threadStatus: t.status,
@@ -1995,6 +2240,7 @@ public struct AgentAppView: View {
             }
             .buttonStyle(.plain)
             .help(t.title)
+            .accessibilityIdentifier("agent.thread.row.\(t.id.value.uuidString)")
             .onDrag {
                 draggingThreadId = t.id
                 return NSItemProvider(object: t.id.value.uuidString as NSString)
@@ -2012,6 +2258,9 @@ public struct AgentAppView: View {
                         }
                     }
                 }
+                Divider()
+                // IMP-MAC_AGENT-013: export the thread to a shareable markdown file.
+                Button("Export…") { exportThread(t) }
                 Divider()
                 Button("Delete", role: .destructive) {
                     deleteThreads(selectedThreadIds.isEmpty ? [t.id] : selectedThreadIds)
@@ -2055,6 +2304,9 @@ public struct AgentAppView: View {
     private var conversationColumn: some View {
         VStack(spacing: 0) {
             header
+            if vm.permissionMode == .fullAccess {
+                fullAccessBanner
+            }
             if !vm.timeline.workActivities.isEmpty {
                 workLogRow
                     .padding(.horizontal, 22)
@@ -2069,6 +2321,15 @@ public struct AgentAppView: View {
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
         .onExitCommand { if vm.status == .running { vm.stop() } }
+        // IMP-MAC_AGENT-006: power-user shortcut to cycle reasoning effort
+        // without opening the model popover; the composer model pill reflects
+        // the new effort immediately. Hidden control carries the shortcut.
+        .background(
+            Button("") { vm.cycleReasoningEffort() }
+                .keyboardShortcut(".", modifiers: [.command, .shift])
+                .opacity(0)
+                .accessibilityHidden(true)
+        )
     }
 
     // Thin context header. Run-config (provider/model/permission) lives in
@@ -2080,6 +2341,10 @@ public struct AgentAppView: View {
                     threadRailIntent = .forcedVisible
                     showThreadRail = true
                 }
+                // UX-MAC_AGENT-002: keep a new-thread affordance reachable while
+                // the rail's "+" button is collapsed away.
+                DSIconButton("plus", help: "New thread (⌘N)") { vm.createThread(title: "New thread") }
+                    .accessibilityIdentifier("agent.thread.new.collapsed")
             }
             Image(systemName: "arrow.triangle.branch")
                 .font(.system(size: 9, weight: .semibold))
@@ -2108,6 +2373,33 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
         .dsBar(edge: .bottom)
+    }
+
+    // Persistent, prominent banner while full access is on, beyond the small
+    // permission pill in the composer footer (UX-MAC_AGENT-004).
+    private var fullAccessBanner: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.danger)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Full access is on")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.danger)
+                Text("The agent runs tools and edits without asking for the rest of this session.")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            Spacer(minLength: 0)
+            Button("Switch to supervised") { vm.setPermissionMode(.supervised) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.danger.opacity(0.12))
+        .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.danger.opacity(0.3)).frame(height: 1) }
+        .accessibilityIdentifier("agent.fullAccessBanner")
     }
 
     private var modelLabel: String {
@@ -2140,7 +2432,19 @@ public struct AgentAppView: View {
         nonmutating set { planSidebarIntentRaw = newValue.rawValue }
     }
 
+    // QA-MAC_AGENT-013: UI tests can pin both sidebars visible to get a stable
+    // layout that resize-driven auto-collapse can't flake. Set via launch arg
+    // `-agent.pinSidebars` or env `RC_AGENT_PIN_SIDEBARS=1`.
+    private static let sidebarsPinnedForTesting: Bool =
+        ProcessInfo.processInfo.arguments.contains("-agent.pinSidebars")
+        || ProcessInfo.processInfo.environment["RC_AGENT_PIN_SIDEBARS"] == "1"
+
     private func applyAdaptiveSidebars(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
+        if Self.sidebarsPinnedForTesting {
+            showThreadRail = true
+            vm.showPlanSidebar = true
+            return
+        }
         applyAdaptivePlanSidebar(width: width, event: event)
         applyAdaptiveThreadRail(width: width, event: event)
     }
@@ -2162,6 +2466,13 @@ public struct AgentAppView: View {
         vm.showPlanSidebar = decision.isVisible
         if decision.didChangeAutomatically {
             lastAutomaticPlanSidebarChange = now
+            // UX-MAC_AGENT-011: make auto-collapse one-way — once the policy
+            // hides the plan sidebar for being too narrow, persist that intent so
+            // a later resize never surprises the user by auto-showing it. The
+            // header "Toggle plan" button restores it explicitly (.forcedVisible).
+            if !decision.isVisible, planSidebarIntent == .auto {
+                planSidebarIntent = .forcedHidden
+            }
         }
     }
 
@@ -2206,6 +2517,11 @@ public struct AgentAppView: View {
                 GeometryReader { viewport in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 32) {
+                            TimelineScrollPositionObserver(slack: Self.timelineBottomRevealSlack) { isAtBottom in
+                                updateTimelineBottomState(isAtBottom: isAtBottom)
+                            }
+                            .frame(width: 0, height: 0)
+                            .accessibilityHidden(true)
                             if vm.hasMoreOlder, !vm.messages.isEmpty {
                                 Color.clear
                                     .frame(height: 1)
@@ -2267,6 +2583,20 @@ public struct AgentAppView: View {
                     }
                     .coordinateSpace(name: "agentTimeline")
                     .background(DS.Palette.bg)
+                    // IMP-MAC_AGENT-010: the conversation area is a natural drop
+                    // target — accept file drops here too, routing them to the
+                    // same composer attachments as the composer's own drop zone.
+                    .onDrop(of: [UTType.fileURL], isTargeted: $timelineDropTargeted) { providers in
+                        loadDroppedFileAttachments(from: providers)
+                    }
+                    .overlay {
+                        if timelineDropTargeted {
+                            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+                                .strokeBorder(DS.Palette.accent, lineWidth: 2)
+                                .padding(DS.Space.sm)
+                                .allowsHitTesting(false)
+                        }
+                    }
                     .onPreferenceChange(TimelineBottomPreferenceKey.self) { bottomY in
                         updateTimelineBottomVisibility(bottomY: bottomY, viewportHeight: viewport.size.height)
                     }
@@ -2290,9 +2620,11 @@ public struct AgentAppView: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Scroll to latest message")
+                    .accessibilityIdentifier("agent.timeline.scrollToBottom")
                     .help("Scroll to latest message")
                     .padding(.trailing, 14)
-                    .padding(.bottom, 14)
+                    .padding(.bottom, Self.scrollDownButtonBottomInset)
+                    .zIndex(1)
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
                 }
             }
@@ -2303,10 +2635,24 @@ public struct AgentAppView: View {
                     scrollTimelineToBottom(proxy)
                 }
             }
-            .onChange(of: vm.timeline.turns.count) { _ in scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.timeline.turns.count) { _ in
+                scrollTimelineToBottom(proxy)
+                // PERF-MAC_AGENT-012: turns trim at 80; drop expansion ids for
+                // items that no longer exist so the sets don't leak over a long
+                // session. Runs only on a turn add/remove, not per text delta.
+                pruneExpandedItemIds()
+            }
             .onChange(of: vm.timelineUpdateTick) { _ in scrollTimelineToBottom(proxy) }
             .onChange(of: vm.status) { _ in scrollTimelineToBottom(proxy) }
         }
+    }
+
+    private func pruneExpandedItemIds() {
+        let liveItemIds = Set(vm.timeline.turns.flatMap { $0.items.map(\.id) })
+        if !expandedTools.isEmpty { expandedTools.formIntersection(liveItemIds) }
+        if !expandedReasoning.isEmpty { expandedReasoning.formIntersection(liveItemIds) }
+        let liveRequestIds = Set(vm.timeline.pendingRequests.map(\.id))
+        if !expandedRequestPreviews.isEmpty { expandedRequestPreviews.formIntersection(liveRequestIds) }
     }
 
     @ViewBuilder
@@ -2325,6 +2671,26 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.bg)
             .accessibilityIdentifier("agent.pendingCallbacks")
+            .confirmationDialog(
+                "Allow this agent to act without approvals for the rest of this session?",
+                isPresented: Binding(
+                    get: { pendingSessionApproval != nil },
+                    set: { if !$0 { pendingSessionApproval = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Allow full access", role: .destructive) {
+                    if let pendingSessionApproval {
+                        vm.respondToPendingRequest(pendingSessionApproval, response: .approveForSession)
+                    }
+                    pendingSessionApproval = nil
+                }
+                Button("Keep approving each action", role: .cancel) {
+                    pendingSessionApproval = nil
+                }
+            } message: {
+                Text("Full access lets the agent run tools and edits without asking. Keeping per-action approval is safer.")
+            }
         }
     }
 
@@ -2424,30 +2790,36 @@ public struct AgentAppView: View {
                 Text(stale ? "Stale provider request" : "Provider approval")
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.textSecondary)
+                // UX-MAC_AGENT-005: label what is being approved.
+                requestKindChip(request.kind)
                 Spacer(minLength: 0)
             }
             Text(request.title)
                 .font(DS.Font.bodyDense.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
                 .lineLimit(2)
-            if let detail = request.detail, !detail.isEmpty {
-                Text(detail)
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(4)
-                    .textSelection(.enabled)
-            }
+            // UX-MAC_AGENT-006: surface the actual command / patch so users
+            // don't approve exec/applyPatch requests blind.
+            requestPreview(request)
             if stale {
                 Text("Restart the turn to continue.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.warning)
             } else {
+                // UX-MAC_AGENT-005: emphasize the safe one-time Approve;
+                // de-emphasize/warning-tint the session-wide auto-approve;
+                // separate Decline.
                 HStack(spacing: DS.Space.sm) {
                     Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
-                    Button("Approve Session") { vm.respondToPendingRequest(request, response: .approveForSession) }
+                        .buttonStyle(.borderedProminent)
+                    Button("Approve Session") { pendingSessionApproval = request }
+                        .buttonStyle(.bordered)
+                        .tint(DS.Palette.warning)
+                        .help("Auto-approve every request like this for the rest of this session")
+                    Spacer(minLength: DS.Space.md)
                     Button("Decline") { vm.respondToPendingRequest(request, response: .decline(nil)) }
+                        .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
                 .controlSize(.small)
             }
         }
@@ -2456,6 +2828,89 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
         .accessibilityIdentifier("agent.pendingRequest.\(request.id)")
+    }
+
+    // UX-MAC_AGENT-005: a small chip naming the request kind.
+    private func requestKindChip(_ kind: AssistantRequestKind) -> some View {
+        Text(requestKindLabel(kind))
+            .font(DS.Font.caption2.weight(.semibold))
+            .foregroundColor(DS.Palette.accent)
+            .padding(.horizontal, DS.Space.xs)
+            .padding(.vertical, 1)
+            .background(DS.Palette.accent.opacity(0.13))
+            .clipShape(Capsule())
+    }
+
+    private func requestKindLabel(_ kind: AssistantRequestKind) -> String {
+        switch kind {
+        case .commandExecution, .exec: return "Run command"
+        case .applyPatch: return "Apply patch"
+        case .fileChange: return "Edit file"
+        case .fileRead: return "Read file"
+        case .toolUserInput: return "Tool input"
+        case .authTokensRefresh: return "Refresh auth"
+        case .dynamic: return "Tool"
+        }
+    }
+
+    // UX-MAC_AGENT-006: command kinds render monospace + copy; patch kinds
+    // render a collapsible diff. Other kinds fall back to the prior detail row.
+    @ViewBuilder
+    private func requestPreview(_ request: AssistantPendingRequest) -> some View {
+        if let detail = request.detail, !detail.isEmpty {
+            switch request.kind {
+            case .commandExecution, .exec:
+                HStack(alignment: .top, spacing: DS.Space.sm) {
+                    Text(detail)
+                        .font(DS.Font.mono)
+                        .foregroundColor(DS.Palette.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(DS.Space.sm)
+                        .background(DS.Palette.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    Button { copyToPasteboard(detail) } label: {
+                        Image(systemName: "doc.on.doc").font(.system(size: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .help("Copy command")
+                }
+            case .applyPatch, .fileChange:
+                let expanded = expandedRequestPreviews.contains(request.id)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Button {
+                        if expanded { expandedRequestPreviews.remove(request.id) }
+                        else { expandedRequestPreviews.insert(request.id) }
+                    } label: {
+                        HStack(spacing: DS.Space.xs) {
+                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
+                            Text(expanded ? "Hide diff" : "Show diff")
+                                .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    if expanded {
+                        DiffPreviewText(detail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(DS.Space.sm)
+                            .background(DS.Palette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    }
+                }
+            default:
+                Text(detail)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+        }
     }
 
     @ViewBuilder
@@ -2540,19 +2995,41 @@ public struct AgentAppView: View {
         cancelPendingScrollDownReveal()
         timelineSticksToBottom = true
         showScrollDownButton = false
-        withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
+        // PERF-MAC_AGENT-003: the four onChange triggers all funnel here and
+        // fire per streaming delta. Skip the per-token animation while running
+        // (it caused a layout pass + animation churn on every delta); only
+        // animate on settle (idle, or an explicit forced scroll).
+        if vm.status == .running && !force {
+            proxy.scrollTo("BOTTOM", anchor: .bottom)
+        } else {
+            withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
+        }
     }
 
     private func updateTimelineBottomVisibility(bottomY: CGFloat, viewportHeight: CGFloat) {
-        let atBottom = bottomY <= viewportHeight + 36
-        if atBottom {
+        let atBottom = bottomY <= viewportHeight + Self.timelineBottomRevealSlack
+        updateTimelineBottomState(isAtBottom: atBottom)
+    }
+
+    private func updateTimelineBottomState(isAtBottom: Bool) {
+        if isAtBottom {
+            // PERF-MAC_AGENT-013: the preference key fires every scroll frame.
+            // Only mutate state when actually crossing back to the bottom, not on
+            // every Y change, to avoid per-frame state writes.
+            if timelineSticksToBottom, !showScrollDownButton, pendingScrollDownReveal == nil {
+                return
+            }
             cancelPendingScrollDownReveal()
             timelineSticksToBottom = true
             showScrollDownButton = false
             return
         }
 
-        if userIsDraggingTimeline {
+        // UX-MAC_AGENT-015: reveal immediately on a user-initiated scroll-away.
+        // The 180ms debounce only guards against flicker while the run is
+        // streaming and growing content programmatically; when idle there is no
+        // programmatic growth to debounce against, so show the button at once.
+        if userIsDraggingTimeline || vm.status != .running {
             cancelPendingScrollDownReveal()
             timelineSticksToBottom = false
             showScrollDownButton = true
@@ -2577,11 +3054,21 @@ public struct AgentAppView: View {
     // "Working for 2m 21s" + hairline, while a run is in flight.
     private var workingStatus: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            TimelineView(.periodic(from: vm.runStartedAt ?? Date(), by: 1)) { _ in
+            // PERF-MAC_AGENT-004: tick every second for the first minute, then
+            // every 5 seconds, so a long run doesn't force 600 re-evaluations.
+            TimelineView(ElapsedTickSchedule(start: vm.runStartedAt ?? Date())) { _ in
                 HStack(spacing: DS.Space.sm) {
                     ProgressView().controlSize(.small)
                     Text("Working for \(elapsedString)")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+                    // UX-MAC_AGENT-008: inline Stop where the user looks when a
+                    // run is taking too long, plus the Esc hint.
+                    Button("Stop") { vm.stop() }
+                        .buttonStyle(.plain)
+                        .font(DS.Font.body.weight(.medium))
+                        .foregroundColor(DS.Palette.danger)
+                        .help("Stop running agent (press Esc to interrupt)")
+                        .accessibilityIdentifier("agent.working.stop")
                 }
             }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
@@ -2609,6 +3096,17 @@ public struct AgentAppView: View {
         _ = try? vm.saveLatestProposedPlan(to: url)
     }
 
+    // IMP-MAC_AGENT-013: write a thread's markdown export via a save panel.
+    private func exportThread(_ thread: AgentThread) {
+        guard let export = vm.exportThreadMarkdown(thread.id) else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = export.fileName
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? export.contents.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
     @ViewBuilder
     private func assistantProse(_ text: String) -> some View {
         AgentMessageMarkdownView(text: text)
@@ -2616,6 +3114,15 @@ public struct AgentAppView: View {
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    // IMP-MAC_AGENT-007: tappable starter prompts on an empty thread reduce
+    // blank-page friction and hint at what the agent can do.
+    private static let emptyConversationStarters: [(icon: String, title: String, prompt: String)] = [
+        ("magnifyingglass", "Explain this codebase", "Give me a high-level tour of this codebase: the main modules, how they fit together, and where to start reading."),
+        ("ant", "Find and fix a bug", "Find a bug in the current changes and fix it. Show me the diff and explain the root cause."),
+        ("checklist", "Plan a change", "I want to add a feature. Help me plan it step by step before writing any code."),
+        ("text.alignleft", "Write tests", "Add tests for the most recently changed files. Cover the edge cases.")
+    ]
 
     private var emptyConversation: some View {
         VStack(spacing: DS.Space.lg) {
@@ -2631,28 +3138,117 @@ public struct AgentAppView: View {
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
-                Text("Start a new agent run from the composer.")
+                Text("Start a new agent run, or pick a starter below.")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
             }
+            VStack(spacing: DS.Space.sm) {
+                ForEach(Self.emptyConversationStarters, id: \.title) { starter in
+                    Button {
+                        vm.prompt = starter.prompt
+                        vm.focusTick &+= 1
+                    } label: {
+                        HStack(spacing: DS.Space.sm) {
+                            Image(systemName: starter.icon)
+                                .font(.system(size: 12))
+                                .foregroundColor(DS.Palette.accent)
+                                .frame(width: 16)
+                            Text(starter.title)
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.text)
+                            Spacer(minLength: 0)
+                            Image(systemName: "arrow.up.left")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        .padding(.horizontal, DS.Space.md)
+                        .padding(.vertical, DS.Space.sm)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Insert this starter prompt into the composer")
+                    .accessibilityIdentifier("agent.starter.\(starter.title)")
+                }
+            }
+            .frame(maxWidth: 420)
         }
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
-        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
     private func errorRow(_ err: String) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.sm) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 11)).foregroundColor(DS.Palette.danger)
-            Text(err)
-                .font(DS.Font.monoSmall).foregroundColor(DS.Palette.danger)
-                .lineSpacing(3).textSelection(.enabled)
-            Spacer(minLength: 0)
+        let recoverable = vm.lastErrorRecoverable
+        return VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: recoverable ? "exclamationmark.triangle" : "xmark.octagon")
+                    .font(.system(size: 11))
+                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
+                Text(err)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
+                    .lineSpacing(3).textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+            // UX-MAC_AGENT-009: recoverable failures get a Retry of the last
+            // prompt; fatal ones don't.
+            if recoverable {
+                Button {
+                    Task { await vm.retryLastPrompt() }
+                } label: {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.error.retry")
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // UX-MAC_AGENT-017: relative ("2m ago") + absolute (hover) timestamps.
+    private static let relativeTimestampFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .abbreviated
+        return f
+    }()
+    private static let absoluteTimestampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    static func relativeTimestamp(_ date: Date, now: Date = Date()) -> String {
+        if now.timeIntervalSince(date) < 60 { return "just now" }
+        return relativeTimestampFormatter.localizedString(for: date, relativeTo: now)
+    }
+
+    static func absoluteTimestamp(_ date: Date) -> String {
+        absoluteTimestampFormatter.string(from: date)
+    }
+
+    // UX-MAC_AGENT-018: composer chips classify by extension for the icon.
+    private static let imageChipExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"
+    ]
+    static func isImagePath(_ path: String) -> Bool {
+        imageChipExtensions.contains((path as NSString).pathExtension.lowercased())
+    }
+
+    // Per-turn duration from items' earliest start to latest finish.
+    static func turnDurationLabel(_ turn: AssistantTurnSnapshot) -> String? {
+        guard let start = turn.items.map(\.startedAtMs).min() else { return nil }
+        let finishes = turn.items.compactMap(\.finishedAtMs)
+        guard finishes.count == turn.items.count, let end = finishes.max(), end >= start else { return nil }
+        let seconds = Int((end - start) / 1000)
+        guard seconds > 0 else { return nil }
+        return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
     }
 
     @ViewBuilder
@@ -2672,13 +3268,21 @@ public struct AgentAppView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .frame(maxWidth: 600, alignment: .trailing)
                         .accessibilityIdentifier("agent.userMessageBubble")
-                    Button { copyToPasteboard(msg.content) } label: {
-                        Image(systemName: "doc.on.doc").font(.system(size: 10))
+                    // UX-MAC_AGENT-017: subtle relative timestamp so long threads
+                    // show when each message was sent.
+                    HStack(spacing: DS.Space.xs) {
+                        Button { copyToPasteboard(msg.content) } label: {
+                            Image(systemName: "doc.on.doc").font(.system(size: 10))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityLabel("Copy message")
+                        .help("Copy message")
+                        Text(Self.relativeTimestamp(msg.createdAt))
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .help(Self.absoluteTimestamp(msg.createdAt))
                     }
-                    .buttonStyle(.plain)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityLabel("Copy message")
-                    .help("Copy message")
                 }
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -2711,6 +3315,12 @@ public struct AgentAppView: View {
                Self.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
                 assistantProse(final)
             }
+            // UX-MAC_AGENT-017: per-turn duration once the turn has finished.
+            if turn.finished, let duration = Self.turnDurationLabel(turn) {
+                Text("Took \(duration)")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2729,20 +3339,7 @@ public struct AgentAppView: View {
                 assistantProse(item.body)
             }
         case .reasoning:
-            VStack(alignment: .leading, spacing: DS.Space.xs) {
-                Text(item.state == .streaming ? "Thinking…" : "Thought")
-                    .font(DS.Font.caption2.weight(.semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                let text = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
-                if !text.isEmpty {
-                    Text(text)
-                        .font(DS.Font.bodyDense)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineSpacing(3)
-                        .textSelection(.enabled)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            reasoningRow(item)
         case .plan:
             VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text("PLAN").font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
@@ -2752,6 +3349,44 @@ public struct AgentAppView: View {
         case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .review, .contextCompaction, .error:
             toolRow(item)
         }
+    }
+
+    // UX-MAC_AGENT-010: long chain-of-thought no longer pushes the answer down.
+    // It stays open while streaming, then collapses to a tappable "Thought" row.
+    @ViewBuilder
+    private func reasoningRow(_ item: AssistantItem) -> some View {
+        let text = item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
+        let streaming = item.state == .streaming
+        let expanded = streaming || expandedReasoning.contains(item.id)
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Button {
+                guard !streaming, !text.isEmpty else { return }
+                if expanded { expandedReasoning.remove(item.id) } else { expandedReasoning.insert(item.id) }
+            } label: {
+                HStack(spacing: DS.Space.xs) {
+                    if !streaming, !text.isEmpty {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
+                    }
+                    Text(streaming ? "Thinking…" : "Thought")
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(streaming ? "" : (text.isEmpty ? "" : (expanded ? "Hide reasoning" : "Show reasoning")))
+            if expanded, !text.isEmpty {
+                Text(text)
+                    .font(DS.Font.bodyDense)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("agent.reasoning.\(item.id)")
     }
 
     @ViewBuilder
@@ -2801,24 +3436,27 @@ public struct AgentAppView: View {
     private var queuedMessagesSection: some View {
         if !vm.queuedMessages.isEmpty || vm.queueStatusMessage != nil {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
+                // UX-MAC_AGENT-019: emphasize the Queued header (accent) so it's
+                // clear new sends are queuing behind the active turn.
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "text.line.first.and.arrowtriangle.forward")
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(DS.Palette.textSecondary)
+                        .foregroundColor(DS.Palette.accent)
                     Text("Queued")
                         .font(DS.Font.caption.weight(.semibold))
-                        .foregroundColor(DS.Palette.textSecondary)
+                        .foregroundColor(DS.Palette.accent)
                     Text("\(vm.queuedMessages.count)")
                         .font(DS.Font.caption.monospacedDigit())
                         .foregroundColor(DS.Palette.textTertiary)
                     Spacer(minLength: 0)
                 }
+                .accessibilityIdentifier("agent.queued.header")
                 if let message = vm.queueStatusMessage {
                     Text(message)
                         .font(DS.Font.caption)
                         .foregroundColor(message.contains("failed") ? DS.Palette.danger : DS.Palette.textSecondary)
                 }
-                ForEach(vm.queuedMessages) { message in
+                ForEach(vm.queuedMessages, id: \.id) { message in
                     queuedMessageRow(message)
                 }
             }
@@ -2861,6 +3499,7 @@ public struct AgentAppView: View {
                             .background(DS.Palette.surface)
                             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                             .accessibilityLabel("Edit queued message \(message.position)")
+                            .accessibilityIdentifier("agent.queued.editor.\(message.id.value.uuidString)")
                     } else {
                         Text(message.text.isEmpty ? attachmentSummary(message) : message.text)
                             .font(DS.Font.body)
@@ -2894,6 +3533,7 @@ public struct AgentAppView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .accessibilityLabel("Force queued message \(message.position) now")
+                    .accessibilityIdentifier("agent.queued.force.\(message.id.value.uuidString)")
                     Button {
                         vm.editQueuedMessage(message)
                     } label: {
@@ -2902,6 +3542,7 @@ public struct AgentAppView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .accessibilityLabel("Edit queued message \(message.position)")
+                        .accessibilityIdentifier("agent.queued.edit.\(message.id.value.uuidString)")
                     Button {
                         if message.attachments.isEmpty && message.text.count < 120 {
                             vm.cancelQueuedMessage(message)
@@ -2917,6 +3558,7 @@ public struct AgentAppView: View {
                     .tint(DS.Palette.danger)
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityLabel("Cancel queued message \(message.position)")
+                    .accessibilityIdentifier("agent.queued.cancel.\(message.id.value.uuidString)")
                 }
             }
         }
@@ -2925,6 +3567,7 @@ public struct AgentAppView: View {
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
             .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        .accessibilityIdentifier("agent.queued.row.\(message.id.value.uuidString)")
     }
 
     private func attachmentSummary(_ message: AgentQueuedMessage) -> String {
@@ -2944,6 +3587,7 @@ public struct AgentAppView: View {
             PromptComposerEditor(
                 text: $vm.prompt,
                 height: $composerEditorHeight,
+                focusTick: vm.focusTick,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
                 isEnabled: true,
                 onSend: { Task { await vm.send() } },
@@ -2956,6 +3600,7 @@ public struct AgentAppView: View {
             .padding(.horizontal, DS.Space.lg)
             .padding(.top, DS.Space.sm)
             .padding(.bottom, DS.Space.xs)
+            .accessibilityIdentifier("agent.composer.input")
             composerSuggestions
             composerToolbar
         }
@@ -2972,6 +3617,10 @@ public struct AgentAppView: View {
             HStack(spacing: DS.Space.sm) {
                 Text("\(s.files.count) file\(s.files.count == 1 ? "" : "s") changed")
                     .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                    // IMP-MAC_AGENT-008: per-file +/- breakdown on hover, so users
+                    // can preview the changed-files detail without leaving the
+                    // composer to open the Git panel.
+                    .help(changedFilesBreakdown(s))
                 Text("+\(s.totalAdditions)")
                     .font(DS.Font.caption.monospacedDigit()).foregroundColor(DS.Palette.success)
                 Text("−\(s.totalDeletions)")
@@ -2991,6 +3640,17 @@ public struct AgentAppView: View {
         }
     }
 
+    // IMP-MAC_AGENT-008: a per-file "path  +A −B" listing for the changed-files
+    // hover tooltip; caps the list so a large change set stays readable.
+    private func changedFilesBreakdown(_ s: GitSummary) -> String {
+        let maxRows = 20
+        var rows = s.files.prefix(maxRows).map { "\($0.path)  +\($0.additions) −\($0.deletions)" }
+        if s.files.count > maxRows {
+            rows.append("… \(s.files.count - maxRows) more")
+        }
+        return rows.joined(separator: "\n")
+    }
+
     private var composerToolbar: some View {
         compactComposerToolbar
             .padding(.horizontal, DS.Space.md).padding(.vertical, DS.Space.sm)
@@ -3006,6 +3666,13 @@ public struct AgentAppView: View {
             if vm.status == .running {
                 ProgressView().controlSize(.small).scaleEffect(0.55)
                 stopButton
+                // UX-MAC_AGENT-007: separate the red Stop circle from the accent
+                // Queue circle so the two adjacent buttons don't read as one
+                // ambiguous control.
+                Rectangle()
+                    .fill(DS.Palette.line)
+                    .frame(width: DS.Border.hairline, height: 18)
+                    .padding(.horizontal, DS.Space.xxs)
             }
             sendStopButton
         }
@@ -3020,6 +3687,7 @@ public struct AgentAppView: View {
         .buttonStyle(.plain)
         .foregroundColor(DS.Palette.textSecondary)
         .help("Attach files").accessibilityLabel("Attach files")
+        .accessibilityIdentifier("agent.attach")
     }
 
     @ViewBuilder
@@ -3046,6 +3714,7 @@ public struct AgentAppView: View {
                         }
                         .buttonStyle(.plain)
                         .help(suggestion.subtitle)
+                        .accessibilityIdentifier("agent.suggestion.\(suggestion.insertText.trimmingCharacters(in: .whitespaces))")
                     }
                 }
                 .padding(.horizontal, DS.Space.lg)
@@ -3074,6 +3743,7 @@ public struct AgentAppView: View {
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .help("Permission mode")
+        .accessibilityIdentifier("agent.permission.menu")
     }
 
     private var executionMenu: some View {
@@ -3128,6 +3798,7 @@ public struct AgentAppView: View {
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .disabled(vm.executionLocked)
         .help(vm.executionLocked ? "Execution mode locks after the first message" : "Execution mode")
+        .accessibilityIdentifier("agent.execution.menu")
     }
 
     private var modelMenu: some View {
@@ -3137,18 +3808,32 @@ public struct AgentAppView: View {
             modelMenuLabel
         }
         .buttonStyle(.plain)
-        .disabled(vm.status == .running)
+        .accessibilityIdentifier("agent.model.menu")
+        // UX-MAC_AGENT-016: keep the menu openable while running so the user can
+        // read the current model/effort/tier; the mutating rows inside disable
+        // themselves (see modelOptionsPopover) so nothing changes mid-run.
         .popover(isPresented: $showModelOptions, arrowEdge: .bottom) {
             modelOptionsPopover
         }
         .onChange(of: showModelOptions) { isShowing in
-            if !isShowing { showAllModelOptions = false }
+            if !isShowing {
+                showAllModelOptions = false
+                showCustomModelField = false
+                customModelDraft = ""
+            }
         }
         .help(vm.providerLocked ? "Model · reasoning effort · service tier" : "Provider · model · reasoning effort · service tier")
     }
 
     private var modelOptionsPopover: some View {
         VStack(alignment: .leading, spacing: DS.Space.xs) {
+            // UX-MAC_AGENT-016: readable while running; the rows below disable.
+            if vm.status == .running {
+                Text("Read-only while running")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
             if !vm.providerLocked {
                 if !vm.providerSnapshots.isEmpty {
                     compactMenuSection("Source")
@@ -3168,6 +3853,13 @@ public struct AgentAppView: View {
                     }
                     compactMenuDivider
                 }
+            } else {
+                // UX-MAC_AGENT-003: the source is fixed after the first
+                // message. Show a disabled row that names the locked source so
+                // the picker doesn't simply vanish with no explanation.
+                compactMenuSection("Source")
+                lockedSourceRow
+                compactMenuDivider
             }
             let modelOptions = vm.modelOptionsForSelectedProvider
             let customModels = vm.customModelsForSelectedProvider
@@ -3219,8 +3911,13 @@ public struct AgentAppView: View {
                     }
                 }
                 if vm.supportsCustomModelForSelectedProvider {
-                    compactMenuRow("Custom...", selected: false) {
-                        promptCustomModel()
+                    if showCustomModelField {
+                        customModelInlineField
+                    } else {
+                        compactMenuRow("Custom...", selected: false) {
+                            customModelDraft = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
+                            showCustomModelField = true
+                        }
                     }
                 }
             }
@@ -3267,9 +3964,11 @@ public struct AgentAppView: View {
                     .foregroundColor(DS.Palette.danger)
             }
         }
+        .disabled(vm.status == .running)
         .padding(DS.Space.sm)
         .background(DS.Palette.surfaceOverlay)
         .fixedSize(horizontal: true, vertical: false)
+        .accessibilityIdentifier("agent.model.popover")
     }
 
     private var modelMenuLabel: some View {
@@ -3288,10 +3987,17 @@ public struct AgentAppView: View {
                 Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
                     .lineLimit(1)
             }
+            // IMP-MAC_AGENT-014: surface the model's context window on the pill so
+            // the active limit is visible at a glance without opening the popover.
+            if let ctx = vm.selectedModelContextWindowLabel {
+                Text("·").foregroundColor(DS.Palette.textTertiary)
+                Text(ctx).font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
             Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
         }
-        .frame(maxWidth: 260, alignment: .trailing)
+        .frame(width: currentModelMenuLabelWidth, alignment: .trailing)
         .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
         .background(DS.Palette.surfaceRaised)
         .clipShape(Capsule())
@@ -3336,21 +4042,71 @@ public struct AgentAppView: View {
             .frame(width: compactModelMenuWidth)
     }
 
-    private func promptCustomModel() {
-        guard vm.supportsCustomModelForSelectedProvider else { return }
-        let alert = NSAlert()
-        alert.messageText = "Custom model"
-        alert.informativeText = "Enter the provider model ID to save it for future runs."
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.stringValue = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
-        alert.accessoryView = field
-        if alert.runModal() == .alertFirstButtonReturn {
-            vm.setCustomModel(field.stringValue)
-            showModelOptions = false
+    // UX-MAC_AGENT-003: disabled row explaining why the source can't change.
+    private var lockedSourceRow: some View {
+        let name = vm.providerSnapshots.isEmpty
+            ? vm.providerDisplayName(vm.provider)
+            : vm.providerInstanceDisplayName(vm.providerInstanceId)
+        return HStack(spacing: DS.Space.sm) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 12)
+                .foregroundColor(DS.Palette.textTertiary)
+            Text("\(name) (locked after first message)")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
         }
+        .padding(.horizontal, DS.Space.xs)
+        .padding(.vertical, DS.Space.xs)
+        .frame(width: compactModelMenuWidth, alignment: .leading)
+        .help("The source is fixed once a thread has a conversation. Start a new thread to use a different source.")
     }
+
+    // UX-MAC_AGENT-013: inline custom-model field, no blocking modal. Validates
+    // non-empty (trimmed) before saving; Esc/blur-style Cancel dismisses it.
+    private var customModelInlineField: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            TextField("Model ID", text: $customModelDraft)
+                .textFieldStyle(.roundedBorder)
+                .font(DS.Font.caption)
+                .frame(width: compactModelMenuWidth)
+                .onSubmit { commitCustomModelDraft() }
+                .accessibilityIdentifier("agent.model.custom.input")
+            HStack(spacing: DS.Space.xs) {
+                Button("Save") { commitCustomModelDraft() }
+                    .controlSize(.small)
+                    .disabled(customModelDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("agent.model.custom.save")
+                Button("Cancel") {
+                    showCustomModelField = false
+                    customModelDraft = ""
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, DS.Space.xs)
+        .padding(.vertical, DS.Space.xs)
+    }
+
+    private func commitCustomModelDraft() {
+        let trimmed = customModelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        vm.setCustomModel(trimmed)
+        showCustomModelField = false
+        customModelDraft = ""
+        showModelOptions = false
+    }
+
+    // PERF-MAC_AGENT-009: the menu width was recomputed (build title array +
+    // max width) on every popover re-render and inside every row's layout.
+    // Memoize it, recomputing only when the option set actually changes.
+    private final class ModelMenuWidthCache {
+        var signature: String?
+        var width: CGFloat = 112
+    }
+    private let modelMenuWidthCache = ModelMenuWidthCache()
 
     private var compactModelMenuWidth: CGFloat {
         var titles: [String] = []
@@ -3382,8 +4138,43 @@ public struct AgentAppView: View {
         if vm.providerRecoveryActionTitle != nil {
             titles.append(vm.providerRecoveryActionRunning ? "Working..." : (vm.providerRecoveryActionTitle ?? ""))
         }
+        let signature = titles.joined(separator: "\u{1}")
+        if modelMenuWidthCache.signature == signature {
+            return modelMenuWidthCache.width
+        }
         let estimated = titles.map { CGFloat($0.count * 7 + 34) }.max() ?? 112
-        return min(max(estimated, 112), 260)
+        let width = min(max(estimated, 112), 260)
+        modelMenuWidthCache.signature = signature
+        modelMenuWidthCache.width = width
+        return width
+    }
+
+    private var currentModelMenuLabelWidth: CGFloat {
+        let label = currentModelMenuLabelParts.joined(separator: " · ")
+        let measured = Self.measureCurrentModelMenuLabel(label)
+        let chevronWidth: CGFloat = 8
+        let separatorCount = max(0, currentModelMenuLabelParts.count - 1)
+        let spacing = CGFloat(separatorCount + 1) * DS.Space.xs
+        return min(max(ceil(measured + chevronWidth + spacing), 44), 260)
+    }
+
+    private var currentModelMenuLabelParts: [String] {
+        var parts = [modelLabel]
+        if vm.supportsReasoningForSelectedModel {
+            parts.append(effortLabel)
+        }
+        if vm.serviceTier == .fast {
+            parts.append(serviceTierLabel)
+        }
+        if let ctx = vm.selectedModelContextWindowLabel {
+            parts.append(ctx)
+        }
+        return parts
+    }
+
+    private static func measureCurrentModelMenuLabel(_ label: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        return (label as NSString).size(withAttributes: [.font: font]).width
     }
 
     private var sendStopButton: some View {
@@ -3403,6 +4194,7 @@ public struct AgentAppView: View {
         .disabled(sendIdleDisabled)
         .keyboardShortcut(.return, modifiers: [.command])
         .accessibilityLabel(vm.status == .running ? "Queue message" : "Send")
+        .accessibilityIdentifier("agent.composer.send")
         .help(vm.status == .running ? "Queue message for this thread" : "Send prompt")
     }
 
@@ -3419,6 +4211,7 @@ public struct AgentAppView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Stop running agent")
+        .accessibilityIdentifier("agent.composer.stop")
         .help("Stop running agent")
     }
 
@@ -3427,7 +4220,8 @@ public struct AgentAppView: View {
             HStack(spacing: DS.Space.sm) {
                 ForEach(vm.attachments, id: \.self) { path in
                     HStack(spacing: DS.Space.xs) {
-                        Image(systemName: "doc").font(.system(size: 9))
+                        // UX-MAC_AGENT-018: image attachments read as images.
+                        Image(systemName: Self.isImagePath(path) ? "photo" : "doc").font(.system(size: 9))
                         Text((path as NSString).lastPathComponent)
                             .font(DS.Font.caption2).lineLimit(1)
                         Button { vm.removeAttachment(path) } label: {
@@ -3455,6 +4249,20 @@ public struct AgentAppView: View {
         if panel.runModal() == .OK {
             vm.addAttachments(panel.urls.map { $0.path })
         }
+    }
+
+    // IMP-MAC_AGENT-010: resolve dropped item providers to file paths and
+    // attach them to the next message. Returns true if any provider is a file.
+    private func loadDroppedFileAttachments(from providers: [NSItemProvider]) -> Bool {
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+        for provider in fileProviders {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                DispatchQueue.main.async { vm.addAttachments([url.path]) }
+            }
+        }
+        return true
     }
 
     private var sendIdleDisabled: Bool {
@@ -3566,6 +4374,15 @@ public struct AgentAppView: View {
             checkpointBrowserCard
             if !vm.checkpoints.isEmpty {
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            }
+            // UX-MAC_AGENT-014: when the panel has no plan/checkpoints yet, the
+            // bare Notes editor reads as broken — explain what fills this panel.
+            if vm.activePlan == nil, vm.latestProposedPlan == nil, vm.checkpoints.isEmpty {
+                Text("The agent's plan and turn checkpoints appear here.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, DS.Space.md).padding(.top, DS.Space.sm)
             }
             Text("NOTES")
                 .font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
@@ -3845,12 +4662,17 @@ enum PromptComposerKeyAction: Equatable {
     case ignore
 
     static func action(for event: NSEvent) -> PromptComposerKeyAction {
-        if event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
-            if event.keyCode == 126 { return .previousHistory }
-            if event.keyCode == 125 { return .nextHistory }
+        action(keyCode: event.keyCode, modifiers: event.modifierFlags)
+    }
+
+    // QA-MAC_AGENT-012: pure key mapping, testable without building an NSEvent.
+    static func action(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> PromptComposerKeyAction {
+        if modifiers.intersection([.command, .control, .option]).isEmpty {
+            if keyCode == 126 { return .previousHistory }
+            if keyCode == 125 { return .nextHistory }
         }
-        guard event.keyCode == 36 || event.keyCode == 76 else { return .ignore }
-        return event.modifierFlags.contains(.shift) ? .insertNewline : .send
+        guard keyCode == 36 || keyCode == 76 else { return .ignore }
+        return modifiers.contains(.shift) ? .insertNewline : .send
     }
 }
 
@@ -3921,6 +4743,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
 
     @Binding var text: String
     @Binding var height: CGFloat
+    let focusTick: Int
     let placeholder: String
     let isEnabled: Bool
     let onSend: () -> Void
@@ -3961,6 +4784,9 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.onNextHistory = onNextHistory
         textView.onFileDrop = onFileDrop
         textView.placeholderString = placeholder
+        // QA-MAC_AGENT-001: stable identifier on the AppKit text view so
+        // XCUITest can address the composer input directly.
+        textView.setAccessibilityIdentifier("agent.composer.input")
         context.coordinator.textView = textView
         context.coordinator.recalculateHeight()
         scroll.documentView = textView
@@ -3983,6 +4809,13 @@ private struct PromptComposerEditor: NSViewRepresentable {
         }
         context.coordinator.recalculateHeight()
         scroll.hasVerticalScroller = height >= Self.maxHeight
+        if isEnabled, context.coordinator.appliedFocusTick != focusTick {
+            context.coordinator.appliedFocusTick = focusTick
+            DispatchQueue.main.async {
+                guard let window = textView.window, window.firstResponder !== textView else { return }
+                window.makeFirstResponder(textView)
+            }
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -3994,6 +4827,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
         @Binding var height: CGFloat
         let onTextEdited: () -> Void
         weak var textView: PromptComposerTextView?
+        var appliedFocusTick: Int?
         private var externallyAppliedText: String?
 
         init(text: Binding<String>, height: Binding<CGFloat>, onTextEdited: @escaping () -> Void) {
@@ -4041,6 +4875,97 @@ private struct TimelineBottomPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
+    }
+}
+
+private struct TimelineScrollPositionObserver: NSViewRepresentable {
+    let slack: CGFloat
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ObserverView {
+        let view = ObserverView()
+        view.slack = slack
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ view: ObserverView, context: Context) {
+        view.slack = slack
+        view.onChange = onChange
+        view.report()
+    }
+
+    final class ObserverView: NSView {
+        var slack: CGFloat = 0
+        var onChange: ((Bool) -> Void)?
+        private weak var observedScrollView: NSScrollView?
+        private var observer: NSObjectProtocol?
+        private var lastIsAtBottom: Bool?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+        }
+
+        deinit {
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+        }
+
+        func report() {
+            DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+        }
+
+        private func attachIfNeeded() {
+            guard let scroll = enclosingScrollView, scroll !== observedScrollView else {
+                reportCurrentPosition()
+                return
+            }
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            observedScrollView = scroll
+            scroll.contentView.postsBoundsChangedNotifications = true
+            observer = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: scroll.contentView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reportCurrentPosition()
+            }
+            reportCurrentPosition()
+        }
+
+        private func reportCurrentPosition() {
+            guard let scroll = observedScrollView ?? enclosingScrollView,
+                  let documentView = scroll.documentView else { return }
+            let contentHeight = documentView.bounds.height
+            let visibleHeight = scroll.contentView.bounds.height
+            let scrollerValue = scroll.verticalScroller?.doubleValue ?? 1
+            let isAtBottom = contentHeight <= visibleHeight + slack
+                || scrollerValue >= 0.999
+            guard isAtBottom != lastIsAtBottom else { return }
+            lastIsAtBottom = isAtBottom
+            onChange?(isAtBottom)
+        }
+    }
+}
+
+// PERF-MAC_AGENT-004: 1s cadence for the first minute, 5s after, so the
+// "Working for Xs" row stops forcing a re-render every second on long runs.
+private struct ElapsedTickSchedule: TimelineSchedule {
+    let start: Date
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next = startDate
+        return AnyIterator {
+            let current = next
+            let elapsed = current.timeIntervalSince(start)
+            let step: TimeInterval = elapsed < 60 ? 1 : 5
+            next = current.addingTimeInterval(step)
+            return current
+        }
     }
 }
 

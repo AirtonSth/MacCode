@@ -42,6 +42,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestBodyBytes = 2 * 1024 * 1024
     static let maxClientFramePayloadBytes = 1024 * 1024
     static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+    static let wsHeartbeatInterval: TimeInterval = 20
 
     public let port: UInt16
     public let bindLoopbackOnly: Bool
@@ -200,12 +201,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     guard let self else { return false }
                     return self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
                 },
-                onClose: { reason in
+                onClose: { [weak self] reason in
+                    // QA-008: structured log on the WS slow-client disconnect
+                    // path so flaky-sync reports are diagnosable beyond the
+                    // single diagnostic.ws_slow_client event.
+                    NSLog("[RC2.WS] slow-client close: reason=%@ baseline_required=true", reason)
                     if let id = subIDBox.value { EventBus.shared.unsubscribe(id) }
                     EventBus.shared.publish(kind: "diagnostic.ws_slow_client", payload: .object([
                         "reason": .string(reason),
                         "baseline_required": .bool(true)
                     ]))
+                    // UX-001: tell the client *why* the socket is closing and
+                    // what to do, so it can show a transient banner and
+                    // auto-reconnect with a baseline instead of silently freezing.
+                    if let self,
+                       let closeObj = try? JSONSerialization.data(withJSONObject: [
+                           "type": "server_close",
+                           "reason": reason,
+                           "action": "reconnect_with_baseline"
+                       ]) {
+                        self.sendWSText(fd: fd, data: closeObj)
+                    }
                     shutdown(fd, SHUT_RDWR)
                 }
             )
@@ -225,8 +241,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             subIDBox.value = id
             subID = id
+            // UX-003: server-initiated heartbeat so the client can tell
+            // "idle but healthy" from "silently dead socket" and surface an
+            // honest live/stale indicator ("last synced Ns ago"). Seq-less so
+            // it never collides with the ordered event stream.
+            let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+            heartbeat.schedule(deadline: .now() + Self.wsHeartbeatInterval, repeating: Self.wsHeartbeatInterval)
+            heartbeat.setEventHandler {
+                guard let data = try? JSONSerialization.data(withJSONObject: [
+                    "type": "heartbeat",
+                    "ts": Date().timeIntervalSince1970
+                ]) else { return }
+                _ = outbound.enqueue(data)
+            }
+            heartbeat.resume()
             // keep connection open; read incoming frames (ping/pong/close)
             wsServeLoop(fd: fd, outbound: outbound)
+            heartbeat.cancel()
             outbound.drain()
             return
         }
@@ -275,6 +306,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
         switch (method, path) {
         case ("GET", "/healthz"):
             send(fd: fd, status: 200, contentType: "text/plain", body: "ok\n".data(using: .utf8)!)
+        case ("GET", "/v1/health"):
+            // IMP-MAC_SERVER_SYNC-009: authenticated sync diagnostics so
+            // power users / support can answer "why is sync slow". Gated by
+            // the /v1 auth check above (not in the exempt list). Sourced from
+            // EventBus's public snapshot — last emitted seq plus the retained
+            // replay window (count + encoded bytes) the client re-baselines
+            // against. Subscriber/WS-client counts and provider-session status
+            // need the reserved EventBus/Dispatcher surface and are omitted.
+            let snap = EventBus.shared.snapshot()
+            let retainedBytes = snap.recent.reduce(0) { acc, ev in
+                acc + ((try? JSONEncoder().encode(ev).count) ?? 0)
+            }
+            let body: [String: Any] = [
+                "status": "ok",
+                "server_id": serverId,
+                "server_time": Date().timeIntervalSince1970,
+                "events": [
+                    "last_seq": snap.lastSeq,
+                    "retained_count": snap.recent.count,
+                    "retained_bytes": retainedBytes,
+                    "oldest_retained_seq": snap.recent.first?.seq ?? 0
+                ]
+            ]
+            sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/rpc"):
             // GAP-1: the authenticated JSON-RPC surface the mobile client
             // uses for every feature call. Routes to the same dispatcher
@@ -343,7 +398,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "host": bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0",
                 "port": port,
                 "vpn_required": !bindLoopbackOnly,
-                "relay": false
+                "relay": false,
+                // IMP-MAC_SERVER_SYNC-001: anchor for client clock-drift /
+                // freshness math. Pairs with the WS `heartbeat` frame (ts) so
+                // the client can show an honest "live / last synced Ns ago".
+                "server_time": Date().timeIntervalSince1970
             ]
             sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("GET", "/v1/capabilities"):
@@ -374,30 +433,50 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    /// Decode + dispatch one JSON-RPC request on the main actor and
-    /// return the encoded response bytes. Mirrors UnixSocketServer's
-    /// hop pattern so synchronous AppKit/SwiftUI calls stay on main.
-    private func dispatchRPCSync(_ bodyData: Data) -> Data {
+    /// PERF-001: cap how many pool threads may be parked on the
+    /// main-actor hop at once. A burst of concurrent RPCs (iOS foreground
+    /// firing list/status/get) would otherwise grow the global pool with
+    /// N semaphore-blocked workers all queued behind the serial main actor.
+    /// Bounding the gate keeps thread-pool growth and head-of-line blocking
+    /// in check; main-actor dispatch is already serial so throughput is
+    /// unchanged.
+    private static let rpcHopGate = DispatchSemaphore(value: 8)
+
+    /// QA-003: pure async request/response seam — decode → dispatch →
+    /// encode with no semaphore and no socket. Lets framing, compression,
+    /// and auth-gating be unit-tested deterministically by feeding body
+    /// bytes and awaiting the response bytes, instead of driving a real
+    /// socket and a real main runloop. The socket path (`dispatchRPCSync`)
+    /// is a thin synchronous bridge over this.
+    public func dispatchRPC(bodyData: Data) async -> Data {
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
         guard let req = try? decoder.decode(JSONRPCRequest.self, from: bodyData) else {
             let resp = JSONRPCResponse(id: nil, error: .parseError)
             return (try? encoder.encode(resp)) ?? Data("{}".utf8)
         }
+        let resp = await dispatcher.dispatch(req)
+        return (try? encoder.encode(resp)) ?? Data("{}".utf8)
+    }
+
+    /// Decode + dispatch one JSON-RPC request on the main actor and
+    /// return the encoded response bytes. Mirrors UnixSocketServer's
+    /// hop pattern so synchronous AppKit/SwiftUI calls stay on main.
+    private func dispatchRPCSync(_ bodyData: Data) -> Data {
+        Self.rpcHopGate.wait()
+        defer { Self.rpcHopGate.signal() }
         let semaphore = DispatchSemaphore(value: 0)
-        final class Slot: @unchecked Sendable { var value: JSONRPCResponse? }
+        final class Slot: @unchecked Sendable { var value: Data? }
         let slot = Slot()
         DispatchQueue.main.async {
             let task = Task { @MainActor in
-                let resp = await self.dispatcher.dispatch(req)
-                slot.value = resp
+                slot.value = await self.dispatchRPC(bodyData: bodyData)
                 semaphore.signal()
             }
             _ = task
         }
         semaphore.wait()
-        let resp = slot.value ?? JSONRPCResponse(id: req.id, error: .internalError)
-        return (try? encoder.encode(resp)) ?? Data("{}".utf8)
+        return slot.value ?? (try? JSONEncoder().encode(JSONRPCResponse(id: nil, error: .internalError))) ?? Data("{}".utf8)
     }
 
     private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil) {
@@ -412,9 +491,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
             extraHeaders += "Content-Encoding: \(codec.wireName)\r\n"
         }
         let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\n\(extraHeaders)Content-Length: \(responseBody.count)\r\nConnection: close\r\n\r\n"
-        var out = Data(head.utf8)
-        out.append(responseBody)
-        _ = writeAll(fd: fd, data: out)
+        // PERF-010: write headers then body separately (as sendFile does)
+        // instead of concatenating into one Data — avoids a full-body copy
+        // per response, which doubled transient memory for large payloads
+        // (agent.message.list / git.diff).
+        guard writeAll(fd: fd, data: Data(head.utf8)) else { return }
+        if !responseBody.isEmpty {
+            _ = writeAll(fd: fd, data: responseBody)
+        }
     }
 
     private func sendFile(fd: Int32, status: Int, contentType: String, url: URL) {
@@ -497,14 +581,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func wsServeLoop(fd: Int32, outbound: WebSocketOutboundQueue) {
-        var buf = Data()
+        // PERF-009: keep a contiguous [UInt8] buffer with a read offset
+        // instead of Data + removeFirst(consumed). removeFirst is O(n) per
+        // frame (shifting the whole buffer), which is quadratic under
+        // pipelined input; advancing an offset is O(1). The buffer is
+        // compacted only once the offset passes its midpoint.
+        var buf = [UInt8]()
+        var offset = 0
         var tmp = [UInt8](repeating: 0, count: 4096)
         while running {
             let n = read(fd, &tmp, tmp.count)
             if n <= 0 { return }
-            buf.append(tmp, count: n)
-            while let (frame, consumed) = parseClientFrame(buf) {
-                buf.removeFirst(consumed)
+            buf.append(contentsOf: tmp[0..<n])
+            while let (frame, consumed) = parseClientFrame(buf, from: offset) {
+                offset += consumed
                 switch frame.opcode {
                 case 0x8: // close
                     sendCloseFrame(fd: fd); return
@@ -521,28 +611,39 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 default: continue
                 }
             }
+            if offset > 0 {
+                if offset >= buf.count {
+                    buf.removeAll(keepingCapacity: true)
+                } else if offset > buf.count / 2 {
+                    buf.removeFirst(offset)
+                } else {
+                    continue
+                }
+                offset = 0
+            }
         }
     }
 
     private struct WSFrame { let opcode: UInt8; let payload: Data }
 
-    private func parseClientFrame(_ buf: Data) -> (WSFrame, Int)? {
-        guard buf.count >= 2 else { return nil }
-        let b0 = buf[buf.startIndex]
-        let b1 = buf[buf.index(buf.startIndex, offsetBy: 1)]
+    private func parseClientFrame(_ buf: [UInt8], from start: Int) -> (WSFrame, Int)? {
+        let available = buf.count - start
+        guard available >= 2 else { return nil }
+        let b0 = buf[start]
+        let b1 = buf[start + 1]
         let opcode = b0 & 0x0F
         let masked = (b1 & 0x80) != 0
         var len = Int(b1 & 0x7F)
         var idx = 2
         if len == 126 {
-            guard buf.count >= 4 else { return nil }
-            len = (Int(buf[buf.index(buf.startIndex, offsetBy: 2)]) << 8) | Int(buf[buf.index(buf.startIndex, offsetBy: 3)])
+            guard available >= 4 else { return nil }
+            len = (Int(buf[start + 2]) << 8) | Int(buf[start + 3])
             idx = 4
         } else if len == 127 {
-            guard buf.count >= 10 else { return nil }
+            guard available >= 10 else { return nil }
             var wideLen: UInt64 = 0
             for i in 0..<8 {
-                wideLen = (wideLen << 8) | UInt64(buf[buf.index(buf.startIndex, offsetBy: 2 + i)])
+                wideLen = (wideLen << 8) | UInt64(buf[start + 2 + i])
             }
             guard wideLen <= UInt64(Int.max) else {
                 return (WSFrame(opcode: 0x8, payload: Data()), 10)
@@ -555,17 +656,25 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         var maskKey: [UInt8] = [0, 0, 0, 0]
         if masked {
-            guard buf.count >= idx + 4 else { return nil }
-            for i in 0..<4 { maskKey[i] = buf[buf.index(buf.startIndex, offsetBy: idx + i)] }
+            guard available >= idx + 4 else { return nil }
+            for i in 0..<4 { maskKey[i] = buf[start + idx + i] }
             idx += 4
         }
-        guard buf.count >= idx + len else { return nil }
-        var payload = Data(count: len)
-        for i in 0..<len {
-            let b = buf[buf.index(buf.startIndex, offsetBy: idx + i)]
-            payload[i] = masked ? (b ^ maskKey[i % 4]) : b
+        guard available >= idx + len else { return nil }
+        let payloadStart = start + idx
+        var payload = [UInt8](repeating: 0, count: len)
+        if masked {
+            for i in 0..<len {
+                payload[i] = buf[payloadStart + i] ^ maskKey[i & 3]
+            }
+        } else if len > 0 {
+            buf.withUnsafeBufferPointer { src in
+                payload.withUnsafeMutableBufferPointer { dst in
+                    dst.baseAddress!.update(from: src.baseAddress!.advanced(by: payloadStart), count: len)
+                }
+            }
         }
-        return (WSFrame(opcode: opcode, payload: payload), idx + len)
+        return (WSFrame(opcode: opcode, payload: Data(payload)), idx + len)
     }
 
     private func sendPongFrame(fd: Int32, payload: Data) {
@@ -638,8 +747,19 @@ public final class DirectStaticFileRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var grants: [String: Grant] = [:]
     private let ttl: TimeInterval = 60 * 60
+    // QA-002: clock is an injectable instance dependency, not a per-call
+    // `Date()` default that every grant test must remember to override. The
+    // per-call `now:` parameters still work (explicit override wins), but
+    // when omitted they read this clock — so a test injects a fixed clock
+    // once via `setClockForTests` and all TTL-dependent paths use it.
+    private var clock: @Sendable () -> Date
 
-    public func register(fileURL: URL, now: Date = Date()) -> DirectStaticFileGrant? {
+    public init(clock: @escaping @Sendable () -> Date = { Date() }) {
+        self.clock = clock
+    }
+
+    public func register(fileURL: URL, now: Date? = nil) -> DirectStaticFileGrant? {
+        let now = now ?? currentTime()
         guard fileURL.isFileURL else { return nil }
         let standardized = fileURL.standardizedFileURL
         var isDirectory: ObjCBool = false
@@ -658,7 +778,8 @@ public final class DirectStaticFileRegistry: @unchecked Sendable {
         return DirectStaticFileGrant(token: token, rootPath: root, routePath: routePath)
     }
 
-    public func resolve(routePath: String, now: Date = Date()) -> (url: URL, contentType: String)? {
+    public func resolve(routePath: String, now: Date? = nil) -> (url: URL, contentType: String)? {
+        let now = now ?? currentTime()
         guard routePath.hasPrefix(Self.routePrefix) else { return nil }
         let rest = String(routePath.dropFirst(Self.routePrefix.count))
         guard let slash = rest.firstIndex(of: "/") else { return nil }
@@ -687,6 +808,19 @@ public final class DirectStaticFileRegistry: @unchecked Sendable {
         lock.lock()
         grants.removeAll()
         lock.unlock()
+    }
+
+    /// QA-002: inject a fixed/controllable clock so TTL-dependent grant
+    /// tests are deterministic without threading `now:` through every call.
+    public func setClockForTests(_ clock: @escaping @Sendable () -> Date) {
+        lock.lock()
+        self.clock = clock
+        lock.unlock()
+    }
+
+    private func currentTime() -> Date {
+        lock.lock(); defer { lock.unlock() }
+        return clock()
     }
 
     private func purgeExpired(now: Date) {

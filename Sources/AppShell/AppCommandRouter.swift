@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Security
 import CoreModel
 import Persistence
 import AgentRuntime
@@ -144,10 +145,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                     let surface: Surface
                     switch desc.type {
                     case .terminal:
-                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), historyRepo: ctx.terminalOutputRepo)
+                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo)
                     case .ssh:
                         if let profile = sshProfile(from: desc) {
-                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), historyRepo: ctx.terminalOutputRepo)
+                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo)
                         } else {
                             surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self)
                         }
@@ -2161,15 +2162,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                     let feed = FeedPanelSurface(workspaceID: workspace, title: baseTitle)
                     // Wire the in-process EventBus to the feed VM so any
                     // dispatcher mutation lights up the panel in real time.
-                    let token = EventBus.shared.subscribe(since: 0) { ev in
+                    // since: nil → future events only; avoids replaying the whole retained
+                    // backlog synchronously on open (PERF-MAC_DIFF_FEED_MARKDOWN-002).
+                    let token = EventBus.shared.subscribe(since: nil) { [weak feed] ev in
+                        guard feed != nil else { return }
                         let kind = ev.kind
                         let payload = JSONValue.object(ev.payload.objectValue ?? [:])
                         let summary = Self.summary(of: payload)
-                        DispatchQueue.main.async {
-                            feed.viewModel.receive(seq: ev.seq, kind: kind, title: summary, ts: ev.ts)
+                        DispatchQueue.main.async { [weak feed] in
+                            feed?.viewModel.receive(seq: ev.seq, kind: kind, title: summary, ts: ev.ts)
                         }
                     }
                     feed.subscriptionToken = AnyHashable(token)
+                    // Release the subscription when the surface is torn down so the
+                    // panel/VM/NSHostingView don't leak for the app's lifetime.
+                    feed.onClose = { EventBus.shared.unsubscribe(token) }
                     surface = feed
                 } else {
                     surface = DiffPanelSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, settings: context.map { SettingsStore(db: $0.db) })
@@ -2212,11 +2219,31 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     private func readSSHHosts(workspace: WorkspaceID, from repo: SettingsRepository) throws -> [SSHHostProfile] {
         guard let raw = try repo.get(sshHostsKey(workspace: workspace)),
               let data = raw.data(using: .utf8) else { return [] }
-        return (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
+        let hosts = (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
+        // Passwords are never stored in the on-disk JSON (UX-MAC_SSH-002b);
+        // rehydrate them from the Keychain for the in-memory profile.
+        return hosts.map { host in
+            var h = host
+            if h.password == nil || h.password?.isEmpty == true {
+                h.password = SSHKeychainStore.load(account: host.id.value.uuidString)
+            }
+            return h
+        }
     }
 
     private func writeSSHHosts(_ hosts: [SSHHostProfile], workspace: WorkspaceID, to repo: SettingsRepository) throws {
-        let data = try JSONEncoder().encode(hosts)
+        // Persist secrets in the Keychain, not as plaintext JSON on disk.
+        let stripped: [SSHHostProfile] = hosts.map { host in
+            var h = host
+            if let pw = host.password, !pw.isEmpty {
+                SSHKeychainStore.save(account: host.id.value.uuidString, password: pw)
+            } else {
+                SSHKeychainStore.delete(account: host.id.value.uuidString)
+            }
+            h.password = nil
+            return h
+        }
+        let data = try JSONEncoder().encode(stripped)
         try repo.set(sshHostsKey(workspace: workspace), String(data: data, encoding: .utf8) ?? "[]")
     }
 
@@ -2251,6 +2278,88 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         ])
     }
 
+    /// Async transfer: resolves actor state on the main actor, runs the scp
+    /// process off the main run loop, then marshals results/output back. Used
+    /// by the macOS SSH surface so transfers never freeze the UI.
+    func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
+        try await runSSHTransferAsync(surface: surface, upload: true, localPath: localPath, remotePath: remotePath)
+    }
+
+    func sshTransferDownloadAsync(surface: SurfaceID, remotePath: String, localPath: String) async throws -> JSONValue {
+        try await runSSHTransferAsync(surface: surface, upload: false, localPath: localPath, remotePath: remotePath)
+    }
+
+    private func runSSHTransferAsync(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) async throws -> JSONValue {
+        let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
+        let args = upload
+            ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
+            : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
+        let kind = upload ? "upload" : "download"
+        EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+            "surface_id": .string(surface.value.uuidString),
+            "direction": .string(kind),
+            "local_path": .string(localPath),
+            "remote_path": .string(remotePath)
+        ]))
+        appendOutput("\n[ssh \(kind) started]\n")
+        let password = profile.password
+        let result = try await Task.detached {
+            try Self.runCommandBlocking(executable: "/usr/bin/scp", arguments: args, password: password)
+        }.value
+        if !result.output.isEmpty { appendOutput(result.output) }
+        let ok = result.exitCode == 0
+        appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
+        EventBus.shared.publish(kind: ok ? "ssh.transfer.completed" : "ssh.transfer.failed", payload: .object([
+            "surface_id": .string(surface.value.uuidString),
+            "direction": .string(kind),
+            "local_path": .string(localPath),
+            "remote_path": .string(remotePath),
+            "exit_code": .number(Double(result.exitCode))
+        ]))
+        return .object([
+            "ok": .bool(ok),
+            "exit_code": .number(Double(result.exitCode)),
+            "output": .string(result.output)
+        ])
+    }
+
+    /// Async remote listing: spawns the remote shell off the main run loop.
+    func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue {
+        let profile = try sshTransferProfile(for: surface)
+        let requested = (path?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? path! : "."
+        let script = """
+        p=\(shellQuote(requested))
+        [ -z "$p" ] && p=.
+        cd "$p" 2>/dev/null || exit 2
+        pwd
+        for f in .. .* *; do
+          [ "$f" = "." ] && continue
+          [ -e "$f" ] || continue
+          if [ -d "$f" ]; then
+            kind=directory
+            type="File folder"
+            size=""
+          else
+            kind=file
+            ext="${f##*.}"
+            [ "$ext" = "$f" ] && type="File" || type="$ext file"
+            size=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+          fi
+          mod=$(date -r "$f" "+%Y-%m-%d %H:%M" 2>/dev/null || stat -c %y "$f" 2>/dev/null | cut -c1-16)
+          printf '%s\t%s\t%s\t%s\n' "$f" "$kind" "$size" "$mod"
+        done
+        """
+        let args = SSHCommandBuilder.sshArguments(for: profile) + ["sh", "-lc", script]
+        let password = profile.password
+        let result = try await Task.detached {
+            try Self.runCommandBlocking(executable: "/usr/bin/ssh", arguments: args, password: password)
+        }.value
+        guard result.exitCode == 0 else {
+            throw JSONRPCError(code: -32020, message: "remote list failed", data: .string(result.output))
+        }
+        return makeRemoteSSHFileListing(output: result.output, requestedPath: requested)
+    }
+
     private func sshTransferProfile(for surface: SurfaceID) throws -> SSHHostProfile {
         try sshTransferProfileAndOutput(for: surface).profile
     }
@@ -2270,6 +2379,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     }
 
     private func runCommand(executable: String, arguments: [String], password: String?) throws -> (exitCode: Int32, output: String) {
+        try Self.runCommandBlocking(executable: executable, arguments: arguments, password: password)
+    }
+
+    /// Off-actor process execution. Pure local work (no actor state), so it is
+    /// safe to invoke from a detached task to keep blocking scp/ssh waits off
+    /// the main run loop. The synchronous RPC path keeps calling `runCommand`.
+    nonisolated static func runCommandBlocking(executable: String, arguments: [String], password: String?) throws -> (exitCode: Int32, output: String) {
         let process = Process()
         var expectScriptURL: URL?
         if let password, !password.isEmpty, FileManager.default.fileExists(atPath: "/usr/bin/expect") {
@@ -2639,4 +2755,44 @@ private func terminalRenderDiagnosticsJSON(_ diagnostics: TerminalRenderDiagnost
         "can_render": .bool(diagnostics.canRender),
         "blocked_reason": diagnostics.blockedReason.map { .string($0) } ?? .null
     ])
+}
+
+/// Keychain-backed storage for SSH passwords so they are never persisted as
+/// plaintext in the settings JSON (UX-MAC_SSH-002b). Generic-password items
+/// keyed by host profile id. Failures are non-fatal: the in-memory session
+/// still works; only durable persistence of the secret is lost.
+enum SSHKeychainStore {
+    private static let service = "com.remotecode.ssh.password"
+
+    private static func baseQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+    }
+
+    static func save(account: String, password: String) {
+        let data = Data(password.utf8)
+        SecItemDelete(baseQuery(account: account) as CFDictionary)
+        var add = baseQuery(account: account)
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    static func load(account: String) -> String? {
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        return value
+    }
+
+    static func delete(account: String) {
+        SecItemDelete(baseQuery(account: account) as CFDictionary)
+    }
 }

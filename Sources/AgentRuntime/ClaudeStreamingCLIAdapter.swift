@@ -28,6 +28,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingRequestIds = Set<String>()
         var pendingUserInputIds = Set<String>()
         var environment: [String: String] = [:]
+        // PERF-008: last emitted snapshot JSON (state fields only, reason
+        // excluded) so identical snapshots fired by high-frequency tool
+        // deltas are not re-encoded and re-broadcast.
+        var lastSnapshotStateJSON: String?
 
         init(threadId: AgentThreadID,
              process: Process,
@@ -597,6 +601,19 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.lock()
         let payload = Self.sessionSnapshotPayload(session: session, reason: reason)
         let providerTurnId = session.activeTurnId ?? session.completedTurnIds.last
+        // PERF-008: coalesce identical snapshots. Compute a signature over
+        // the state fields (the payload minus the per-call `reason`); if it
+        // matches the last emitted snapshot, skip the encode + broadcast.
+        // This drops the dozens-of-encodes/sec a tool-heavy turn would
+        // otherwise produce on the stdout-readability thread.
+        var stateForSignature = payload
+        stateForSignature.removeValue(forKey: "reason")
+        let signature = Self.jsonString(stateForSignature)
+        if let signature, signature == session.lastSnapshotStateJSON {
+            lock.unlock()
+            return
+        }
+        session.lastSnapshotStateJSON = signature
         lock.unlock()
         guard let payloadJSON = Self.jsonString(payload) else { return }
         let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(

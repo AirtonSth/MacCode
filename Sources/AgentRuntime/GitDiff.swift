@@ -159,6 +159,21 @@ public struct GitDeliveryResult: Codable, Sendable, Equatable {
     }
 }
 
+/// Classification of a single diff line for colorization. Extracted from
+/// the SwiftUI view so the `+++`/`---` vs `+`/`-` guard is unit-testable
+/// without instantiating a view (QA-007).
+public enum DiffLineKind: String, Sendable, Equatable {
+    case add, del, hunk, header, context
+
+    public static func classify(_ line: some StringProtocol) -> DiffLineKind {
+        if line.hasPrefix("+") && !line.hasPrefix("+++") { return .add }
+        if line.hasPrefix("-") && !line.hasPrefix("---") { return .del }
+        if line.hasPrefix("@@") { return .hunk }
+        if line.hasPrefix("diff --git") || line.hasPrefix("+++") || line.hasPrefix("---") { return .header }
+        return .context
+    }
+}
+
 /// Lightweight git-diff helpers. Spawns `git` directly so we never link
 /// libgit. Used by the changed-files summary and the diff panel surface.
 public enum GitDiff {
@@ -264,6 +279,17 @@ public enum GitDiff {
 
     public static func checkout(in cwd: String, branch: String) -> GitActionResult {
         guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let r = run(["checkout", branch], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
+    /// Stash the working tree (incl. untracked) then checkout `branch`.
+    /// Used by the dirty-checkout guard so users with uncommitted work
+    /// can switch branches without losing changes (UX-004).
+    public static func stashAndCheckout(in cwd: String, branch: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let stash = run(["stash", "push", "--include-untracked", "-m", "remote-code: switch to \(branch)"], cwd: cwd)
+        guard stash.exit == 0 else { return GitActionResult(ok: false, message: actionMessage(stash)) }
         let r = run(["checkout", branch], cwd: cwd)
         return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
     }
@@ -497,14 +523,62 @@ public enum GitDiff {
     public static func pullRequestURL(in cwd: String) -> String? {
         guard isGit(cwd) else { return nil }
         guard let context = pullRequestContext(in: cwd) else { return nil }
-        let host = context.host
-        let path = context.repositoryPath
-        let branch = context.branch
+        return pullRequestURL(host: context.host, repositoryPath: context.repositoryPath, branch: context.branch)
+    }
+
+    /// QA-010: pure URL builder taking host/path/branch as inputs (no git
+    /// I/O) so the host-parsing matrix (github vs gitlab) is table-testable
+    /// without a real remote.
+    public static func pullRequestURL(host: String, repositoryPath path: String, branch: String) -> String? {
+        guard !host.isEmpty, !path.isEmpty, !branch.isEmpty else { return nil }
         if host.contains("gitlab") {
             return "https://\(host)/\(path)/-/merge_requests/new?merge_request%5Bsource_branch%5D=\(branch)"
         }
         // GitHub (and GitHub-compatible) compare page.
         return "https://\(host)/\(path)/compare/\(branch)?expand=1"
+    }
+
+    /// QA-010: pure host/path extractor for a remote URL (git@ and https
+    /// forms, `.git` suffix), independent of a real repo — table-testable.
+    public static func parseRemote(_ remote: String) -> (host: String, path: String)? {
+        var host = "", path = ""
+        if remote.hasPrefix("git@"), let colon = remote.firstIndex(of: ":") {
+            host = String(remote[remote.index(remote.startIndex, offsetBy: 4)..<colon])
+            path = String(remote[remote.index(after: colon)...])
+        } else if let r = URL(string: remote), let h = r.host {
+            host = h
+            path = String(r.path.drop(while: { $0 == "/" }))
+        } else {
+            return nil
+        }
+        if path.hasSuffix(".git") { path = String(path.dropLast(4)) }
+        guard !host.isEmpty, !path.isEmpty else { return nil }
+        return (host, path)
+    }
+
+    /// UX-015: translate common raw git stderr into actionable human copy.
+    /// Returns the original text when no pattern matches so nothing is lost.
+    public static func humanizeError(_ raw: String) -> String {
+        let lower = raw.lowercased()
+        if lower.contains("would be overwritten by checkout") || lower.contains("please commit your changes or stash") {
+            return "You have uncommitted changes that conflict with this switch. Commit or stash them first."
+        }
+        if lower.contains("no upstream") || lower.contains("has no upstream") || lower.contains("set-upstream") {
+            return "This branch has no upstream. Push with “set upstream” to create one on the remote."
+        }
+        if lower.contains("does not appear to be a git repository") || lower.contains("could not read from remote repository") {
+            return "Can’t reach the remote. Check that ‘origin’ is configured and you have network/auth access."
+        }
+        if lower.contains("authentication failed") || lower.contains("permission denied") || lower.contains("403") {
+            return "Authentication failed. Check your git credentials or SSH key for this remote."
+        }
+        if lower.contains("nothing to commit") {
+            return "Nothing to commit — the working tree is clean."
+        }
+        if lower.contains("'origin' does not appear") || lower.contains("no such remote") {
+            return "No ‘origin’ remote is configured for this repository."
+        }
+        return raw
     }
 
     private struct PullRequestContext {
@@ -528,18 +602,7 @@ public enum GitDiff {
             .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !branch.isEmpty, branch != "HEAD" else { return nil }
         // Normalize git@host:owner/repo(.git) and https://host/owner/repo(.git)
-        var host = "", path = ""
-        if remote.hasPrefix("git@"), let colon = remote.firstIndex(of: ":") {
-            host = String(remote[remote.index(remote.startIndex, offsetBy: 4)..<colon])
-            path = String(remote[remote.index(after: colon)...])
-        } else if let r = URL(string: remote), let h = r.host {
-            host = h
-            path = String(r.path.drop(while: { $0 == "/" }))
-        } else {
-            return nil
-        }
-        if path.hasSuffix(".git") { path = String(path.dropLast(4)) }
-        guard !host.isEmpty, !path.isEmpty else { return nil }
+        guard let (host, path) = parseRemote(remote) else { return nil }
         let originHead = run(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd: cwd)
             .stdout
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -730,11 +793,17 @@ public enum GitDiff {
 
     private struct ProcessResult { let exit: Int32; let stdout: String; let stderr: String }
 
+    /// Carries the background stderr read back to the caller (PERF-008).
+    /// Access is serialized by the serial drain queue + `sync {}` barrier,
+    /// so the unchecked-Sendable conformance is safe.
+    private final class DataBox: @unchecked Sendable { var data = Data() }
+
     private static func run(_ args: [String], cwd: String) -> ProcessResult {
         runCommand(["git"] + args, cwd: cwd, environment: nil)
     }
 
     private static func runCommand(_ args: [String], cwd: String, environment: [String: String]?) -> ProcessResult {
+        let started = Date()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = args
@@ -745,14 +814,47 @@ public enum GitDiff {
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
-        do { try p.run() } catch { return ProcessResult(exit: -1, stdout: "", stderr: String(describing: error)) }
-        p.waitUntilExit()
+        do { try p.run() } catch {
+            let r = ProcessResult(exit: -1, stdout: "", stderr: String(describing: error))
+            logCommand(args, result: r, elapsed: Date().timeIntervalSince(started))
+            return r
+        }
+        // PERF-008: drain stderr on a background thread while reading stdout
+        // on the current one, so a child writing more than a pipe buffer
+        // (large `git show`/`git diff`) can't block on a full pipe before
+        // exit. Reading both only after `waitUntilExit()` on a single thread
+        // is the classic Process deadlock. A reference box carries the
+        // background result back without mutating a captured `var`.
+        let errBox = DataBox()
+        let errReader = err.fileHandleForReading
+        let q = DispatchQueue(label: "git.pipe.drain")
+        q.async { errBox.data = errReader.readDataToEndOfFile() }
         let oData = out.fileHandleForReading.readDataToEndOfFile()
-        let eData = err.fileHandleForReading.readDataToEndOfFile()
-        return ProcessResult(
+        q.sync {}   // barrier: ensure stderr drain finished before reading box.
+        p.waitUntilExit()
+        let r = ProcessResult(
             exit: p.terminationStatus,
             stdout: String(data: oData, encoding: .utf8) ?? "",
-            stderr: String(data: eData, encoding: .utf8) ?? ""
+            stderr: String(data: errBox.data, encoding: .utf8) ?? ""
         )
+        logCommand(args, result: r, elapsed: Date().timeIntervalSince(started))
+        return r
+    }
+
+    /// QA-004: structured logging of git command, exit code, and elapsed
+    /// time behind an env flag (`RC_GIT_DEBUG`) so debugging a "commit
+    /// didn't work" report isn't blind. Off by default — zero cost in
+    /// release runs that don't set the flag.
+    private static let gitDebug = ProcessInfo.processInfo.environment["RC_GIT_DEBUG"] != nil
+    private static func logCommand(_ args: [String], result: ProcessResult, elapsed: TimeInterval) {
+        guard gitDebug else { return }
+        let cmd = args.joined(separator: " ")
+        let ms = Int(elapsed * 1000)
+        if result.exit == 0 {
+            FileHandle.standardError.write(Data("[git] ok exit=0 \(ms)ms  \(cmd)\n".utf8))
+        } else {
+            let msg = actionMessage(result).split(separator: "\n").first.map(String.init) ?? ""
+            FileHandle.standardError.write(Data("[git] FAIL exit=\(result.exit) \(ms)ms  \(cmd)  — \(msg)\n".utf8))
+        }
     }
 }

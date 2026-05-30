@@ -137,7 +137,7 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
   <key>SUFeedURL</key><string>${SPARKLE_FEED_URL}</string>
   <key>SUPublicEDKey</key><string>${SPARKLE_PUBLIC_ED_KEY}</string>
   <key>SUEnableAutomaticChecks</key><true/>
-  <key>SUAutomaticallyUpdate</key><true/>
+  <key>SUAutomaticallyUpdate</key><false/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>

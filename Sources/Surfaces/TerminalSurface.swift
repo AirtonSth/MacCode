@@ -307,8 +307,10 @@ public final class TerminalSurface: NSObject, Surface {
     private var terminalSize = TerminalViewportGeometry.fallbackSize
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
+    private var awaitingSSHFirstOutput = false
     private var isVisible = true
     private let historyRepo: TerminalOutputRepository?
+    private let outputBus: SurfaceOutputBus
     private let historyWorkspaceID: String
     private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
     private var pendingHistoryData = Data()
@@ -322,9 +324,12 @@ public final class TerminalSurface: NSObject, Surface {
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
     private var focusRepairGeneration = 0
+    private var didBeepForDeadInput = false
+    private var bellFlashGeneration = 0
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
+    private static let bellFlashDuration: TimeInterval = 0.18
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
 
     public var viewportSize: TerminalViewportSize {
@@ -339,8 +344,16 @@ public final class TerminalSurface: NSObject, Surface {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
     }
 
-    public init(workspaceID: WorkspaceID, title: String, launch: Launch, historyRepo: TerminalOutputRepository? = nil) throws {
+    public init(
+        workspaceID: WorkspaceID,
+        title: String,
+        launch: Launch,
+        restoredSurfaceID: SurfaceID? = nil,
+        historyRepo: TerminalOutputRepository? = nil,
+        outputBus: SurfaceOutputBus = .shared
+    ) throws {
         self.historyRepo = historyRepo
+        self.outputBus = outputBus
         self.historyWorkspaceID = workspaceID.value.uuidString
         let cwd: String
         let type: SurfaceType
@@ -375,6 +388,7 @@ public final class TerminalSurface: NSObject, Surface {
             ]
         }
         self.descriptor = SurfaceDescriptor(
+            id: restoredSurfaceID ?? SurfaceID(),
             type: type,
             title: title,
             iconName: type == .ssh ? "network" : "terminal",
@@ -391,9 +405,11 @@ public final class TerminalSurface: NSObject, Surface {
         )
         let terminalView = GhosttyTerminalView(frame: initialFrame)
         terminalView.translatesAutoresizingMaskIntoConstraints = false
+        terminalView.setAccessibilityIdentifier("surface.terminal.view.\(descriptor.id.value.uuidString)")
         self.ghosttyView = terminalView
         let container = TerminalDropContainerView(frame: initialFrame)
         container.translatesAutoresizingMaskIntoConstraints = false
+        container.setAccessibilityIdentifier("surface.terminal.\(descriptor.id.value.uuidString)")
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.terminalBG.cgColor
         container.layer?.masksToBounds = true
@@ -411,7 +427,14 @@ public final class TerminalSurface: NSObject, Surface {
             nextHistoryChunkIndex = (try? historyRepo.nextChunkIndex(surfaceID: descriptor.id.value.uuidString)) ?? 1
         }
 
-        terminalView.onInputData = { [weak self] data in _ = self?.writeToPTY(data) }
+        terminalView.onInputData = { [weak self] data in
+            guard let self else { return }
+            let status = self.writeToPTY(data)
+            if status == .processExited, !self.didBeepForDeadInput {
+                self.didBeepForDeadInput = true
+                NSSound.beep()
+            }
+        }
         terminalView.onTerminalSizeChange = { [weak self] size in
             guard let self else { return }
             self.applyTerminalSize(size, sendToPTY: self.masterFD >= 0)
@@ -486,6 +509,11 @@ public final class TerminalSurface: NSObject, Surface {
         configureInputPump(fd: amaster)
         applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
+        if case .ssh(let profile, _) = launch {
+            awaitingSSHFirstOutput = true
+            let host = profile.label.isEmpty ? profile.destination : profile.label
+            appendString("[connecting to \(host)…]\r\n")
+        }
         publishRuntimeHealth()
     }
 
@@ -501,13 +529,13 @@ public final class TerminalSurface: NSObject, Surface {
     private func startReader() {
         let src = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: .global())
         readSource = src
+        var buf = [UInt8](repeating: 0, count: 4096)
         src.setEventHandler { [weak self] in
             guard let self else { return }
             var output = Data()
             var shouldClose = false
 
             while true {
-                var buf = [UInt8](repeating: 0, count: 4096)
                 let n = read(self.masterFD, &buf, buf.count)
                 if n > 0 {
                     output.append(contentsOf: buf[0..<Int(n)])
@@ -563,11 +591,18 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
         enqueueHistory(data)
+        if awaitingSSHFirstOutput {
+            awaitingSSHFirstOutput = false
+            descriptor.metadata["ssh_status"] = "connected"
+        }
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
+        // BEL (0x07): visual flash so background-tab completion is noticeable;
+        // the unread badge above already covers the tab indicator (IMP-011).
+        if data.contains(0x07) { handleBell() }
         // HC-1: stream raw PTY output to the mirror in real time.
-        SurfaceOutputBus.shared.emit(descriptor.id, data)
+        outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
             renderer.feed(data)
         }
@@ -585,7 +620,7 @@ public final class TerminalSurface: NSObject, Surface {
         enqueueHistory(data)
         renderer.feed(data)
         lastOutputAt = Date()
-        SurfaceOutputBus.shared.emit(descriptor.id, data)
+        outputBus.emit(descriptor.id, data)
         if renderDiagnostics().canRender {
             ghosttyView.processOutput(data)
         } else {
@@ -687,6 +722,7 @@ public final class TerminalSurface: NSObject, Surface {
             outputPartial: outputPartial,
             outputPendingBytes: outputPendingBytes,
             historyWriteFailures: historyWriteFailures,
+            droppedOutputBytes: ghosttyView.droppedOutputBytes,
             rows: terminalSize.rows,
             cols: terminalSize.cols,
             renderDiagnostics: renderDiagnostics()
@@ -779,13 +815,46 @@ public final class TerminalSurface: NSObject, Surface {
         SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
     }
 
+    /// Brief background flash on terminal bell so completion in a background
+    /// tab is noticeable; the unread badge is already set by the caller (IMP-011).
+    private func handleBell() {
+        guard isVisible, !isClosing, let layer = view.layer else { return }
+        bellFlashGeneration &+= 1
+        let generation = bellFlashGeneration
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = DS.NS.terminalFG.withAlphaComponent(0.18).cgColor
+        CATransaction.commit()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.bellFlashDuration) { [weak self] in
+            guard let self,
+                  self.bellFlashGeneration == generation,
+                  let layer = self.view.layer else { return }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.backgroundColor = DS.NS.terminalBG.cgColor
+            CATransaction.commit()
+        }
+    }
+
     private func markTerminalDead(reason: String, exitStatus: Int32?) {
         guard processAlive || terminalDeadReason == nil else { return }
+        let wasAlive = processAlive
         processAlive = false
         self.exitStatus = exitStatus ?? self.exitStatus
         terminalDeadReason = reason
         inputPump?.stop(reason: .processExited)
+        if wasAlive, !isClosing {
+            appendString("\r\n" + Self.processExitedBanner(rawStatus: exitStatus) + "\r\n")
+        }
         publishRuntimeHealth()
+    }
+
+    private static func processExitedBanner(rawStatus: Int32?) -> String {
+        guard let rawStatus else { return "[process exited]" }
+        if (rawStatus & 0x7F) != 0 {
+            return "[process terminated (signal \(rawStatus & 0x7F))]"
+        }
+        return "[process exited (code \((rawStatus >> 8) & 0xFF))]"
     }
 
     public func readText() -> String {
@@ -807,19 +876,20 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func focus() {
-        repairTerminalFocus(reason: "surface_focus")
+        // Explicit user request: allowed to take focus from a field editor.
+        repairTerminalFocus(reason: "surface_focus", force: true)
     }
 
-    public func repairTerminalFocus(reason: String) {
+    public func repairTerminalFocus(reason: String, force: Bool = false) {
         focusRepairGeneration &+= 1
         let generation = focusRepairGeneration
-        guard !applyFocusIfReady() else { return }
-        scheduleFocusRetry(generation: generation, delay: nil)
-        scheduleFocusRetry(generation: generation, delay: 0.05)
+        guard !applyFocusIfReady(force: force) else { return }
+        scheduleFocusRetry(generation: generation, delay: nil, force: force)
+        scheduleFocusRetry(generation: generation, delay: 0.05, force: force)
     }
 
     @discardableResult
-    private func applyFocusIfReady() -> Bool {
+    private func applyFocusIfReady(force: Bool = false) -> Bool {
         guard isVisible,
               !isClosing,
               let window = view.window,
@@ -827,11 +897,31 @@ public final class TerminalSurface: NSObject, Surface {
               view.bounds.width > 1,
               view.bounds.height > 1,
               !Self.isHiddenOrHasHiddenAncestor(view),
-              window.attachedSheet == nil else { return false }
+              window.attachedSheet == nil,
+              force || !Self.anotherResponderIsEditing(in: window, terminalView: ghosttyView) else { return false }
         window.makeFirstResponder(ghosttyView)
         ghosttyView.refreshSurfaceOnly()
         descriptor.hasUnreadActivity = false
         return true
+    }
+
+    /// Don't yank focus back to the terminal if the user is actively editing
+    /// another control in the same window (e.g. a sidebar text field). A field
+    /// editor (`NSText`) or text view that is the current first responder and
+    /// isn't our own terminal view means focus is intentionally elsewhere
+    /// (UX-011).
+    private static func anotherResponderIsEditing(in window: NSWindow, terminalView: NSView) -> Bool {
+        guard let responder = window.firstResponder else { return false }
+        guard responder !== terminalView else { return false }
+        if let text = responder as? NSText {
+            // The shared field editor's delegate is the control being edited.
+            if let edited = text.delegate as? NSView, edited === terminalView { return false }
+            return true
+        }
+        if let textView = responder as? NSTextView, textView !== terminalView {
+            return true
+        }
+        return false
     }
 
     private static func isHiddenOrHasHiddenAncestor(_ view: NSView) -> Bool {
@@ -843,11 +933,11 @@ public final class TerminalSurface: NSObject, Surface {
         return false
     }
 
-    private func scheduleFocusRetry(generation: Int, delay: TimeInterval?) {
+    private func scheduleFocusRetry(generation: Int, delay: TimeInterval?, force: Bool) {
         let attempt = { [weak self] in
             guard let self else { return }
             guard self.focusRepairGeneration == generation else { return }
-            _ = self.applyFocusIfReady()
+            _ = self.applyFocusIfReady(force: force)
         }
         if let delay {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: attempt)
@@ -868,7 +958,12 @@ public final class TerminalSurface: NSObject, Surface {
         if hadHiddenOutput {
             beginHiddenBacklogDrain()
         }
-        ghosttyView.refreshSurfaceOnly()
+        // Paint the latest frame synchronously on reveal so a busy terminal
+        // shows its current state immediately instead of a stale/partial frame
+        // for the quiet-delay window; the drain timer now only settles the
+        // pending/partial flags, it no longer gates the visible refresh
+        // (UX-013).
+        ghosttyView.forceRefresh()
         scheduleVisibleRefresh()
     }
 
@@ -1019,8 +1114,12 @@ public final class TerminalSurface: NSObject, Surface {
             }
             return
         }
+        // Hand ownership of the accumulated buffer to the write item instead of
+        // copying it out and clearing in place: with copy-on-write, reassigning
+        // a fresh empty Data lets the write item keep the only reference, so the
+        // >64KB burst is moved rather than duplicated (PERF-007).
         let data = pendingHistoryData
-        pendingHistoryData.removeAll(keepingCapacity: true)
+        pendingHistoryData = Data()
         let surfaceID = descriptor.id.value.uuidString
         let workspaceID = historyWorkspaceID
         let chunkIndex = nextHistoryChunkIndex

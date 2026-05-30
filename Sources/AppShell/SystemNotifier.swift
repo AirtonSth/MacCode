@@ -8,7 +8,18 @@ import UserNotifications
 /// the in-app feed is unaffected.
 public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     public static let shared = SystemNotifier()
-    private var authorized = false
+
+    // `authorized` is written from UNUserNotificationCenter's authorization
+    // callback (arbitrary queue) and read from `post(...)` on arbitrary
+    // callers. Guard both with a lock so the access is a proper barrier
+    // (previously a plain Bool, which TSan flagged and could drop the first
+    // post after launch).
+    private let authLock = NSLock()
+    private var _authorized = false
+    private var authorized: Bool {
+        get { authLock.lock(); defer { authLock.unlock() }; return _authorized }
+        set { authLock.lock(); _authorized = newValue; authLock.unlock() }
+    }
 
     private override init() {
         super.init()
@@ -53,6 +64,50 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     public func post(_ content: RemoteCodeNotificationContent) {
         guard authorized, Bundle.main.bundleIdentifier != nil else { return }
         UNUserNotificationCenter.current().add(content.makeRequest(), withCompletionHandler: nil)
+    }
+
+    /// Current OS authorization status, used by Settings to decide whether to
+    /// show a "Test notification" button or a "permission denied" prompt.
+    /// Returns `.notDetermined` for non-bundled (`swift run`) processes where
+    /// UNUserNotificationCenter is unavailable.
+    public func authorizationStatus() async -> UNAuthorizationStatus {
+        guard Bundle.main.bundleIdentifier != nil else { return .notDetermined }
+        return await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    /// Best-effort test notification for the Settings "Test notification"
+    /// button. Re-requests authorization when still undetermined so the first
+    /// press also triggers the OS prompt.
+    public func postTestNotification() {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        let deliver = {
+            let content = UNMutableNotificationContent()
+            content.title = "RemoteCode"
+            content.body = "Test notification — delivery is working."
+            content.sound = .default
+            let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(req, withCompletionHandler: nil)
+        }
+        if authorized {
+            deliver()
+        } else {
+            center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                self.authorized = granted
+                if granted { deliver() }
+            }
+        }
+    }
+
+    /// Deep-links to System Settings > Notifications so a user who denied the
+    /// permission can re-enable it without hunting through panes.
+    @MainActor
+    public func openSystemNotificationSettings() {
+        let fallback = "x-apple.systempreferences:com.apple.preference.notifications"
+        let url = Bundle.main.bundleIdentifier
+            .map { "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\($0)" }
+            .flatMap(URL.init(string:)) ?? URL(string: fallback)!
+        NSWorkspace.shared.open(url)
     }
 
     public func userNotificationCenter(

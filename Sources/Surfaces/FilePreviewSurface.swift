@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ImageIO
 import Quartz
 import CoreModel
 
@@ -62,10 +63,32 @@ public final class FilePreviewSurface: NSObject, Surface {
     private func renderImage(path: String) {
         let iv = NSImageView()
         iv.imageScaling = .scaleProportionallyDown
-        iv.image = NSImage(contentsOfFile: path)
         iv.translatesAutoresizingMaskIntoConstraints = false
+        iv.setAccessibilityIdentifier("filePreview.image")
         containerStack.addSubview(iv)
         pin(iv)
+        // Decode off the main thread into a downsampled image rather than synchronously
+        // decoding the full-resolution NSImage on the RPC/main path (PERF-MAC_FILES-005).
+        let url = URL(fileURLWithPath: path)
+        Task { [weak self, weak iv] in
+            let image = await Task.detached(priority: .userInitiated) {
+                Self.decodeDownsampled(url: url)
+            }.value
+            guard let self, self.filePath == path else { return }
+            iv?.image = image
+        }
+    }
+
+    private nonisolated static func decodeDownsampled(url: URL) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 4096
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 
     private func renderPDF(path: String) {
@@ -73,6 +96,7 @@ public final class FilePreviewSurface: NSObject, Surface {
         pdf.document = PDFDocument(url: URL(fileURLWithPath: path))
         pdf.autoScales = true
         pdf.translatesAutoresizingMaskIntoConstraints = false
+        pdf.setAccessibilityIdentifier("filePreview.pdf")
         containerStack.addSubview(pdf)
         pin(pdf)
     }
@@ -89,6 +113,11 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.minSize = NSSize(width: 0, height: 0)
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
+        // Native Cmd+F find within the preview text via NSTextView's built-in find bar
+        // (IMP-MAC_FILES-001). Selectable read-only text still supports find/search.
+        tv.usesFindBar = true
+        tv.isIncrementalSearchingEnabled = true
+        tv.setAccessibilityIdentifier("filePreview.text")
         scroll.documentView = tv
         tv.string = Self.previewText(path: path)
         containerStack.addSubview(scroll)

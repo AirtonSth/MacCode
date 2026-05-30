@@ -288,6 +288,20 @@ public final class AgentMessageRepository {
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
     }
 
+    /// PERF-006: the set of thread ids that have at least one message,
+    /// computed in a single query. Lets thread-list payloads derive
+    /// `provider_locked` for every thread without one query per thread.
+    public func threadIdsWithMessages() throws -> Set<AgentThreadID> {
+        let st = try db.prepare("SELECT DISTINCT thread_id FROM agent_messages;")
+        var out: Set<AgentThreadID> = []
+        while try st.step() {
+            if let uuid = (st.columnText(0)).flatMap({ UUID(uuidString: $0) }) {
+                out.insert(AgentThreadID(uuid))
+            }
+        }
+        return out
+    }
+
     /// The newest `limit` messages, returned oldest→newest for display.
     /// Backs the bounded message window (B4 pagination).
     public func listRecent(threadId: AgentThreadID, limit: Int) throws -> [AgentMessage] {
