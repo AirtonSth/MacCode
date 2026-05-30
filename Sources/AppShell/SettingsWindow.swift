@@ -122,7 +122,7 @@ public final class SettingsViewModel: ObservableObject {
             changeObservers.append(NotificationCenter.default.addObserver(
                 forName: name, object: nil, queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in self?.reload() }
+                Task { @MainActor [weak self] in self?.reload() }
             })
         }
     }
