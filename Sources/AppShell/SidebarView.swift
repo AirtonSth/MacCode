@@ -61,7 +61,9 @@ public final class SidebarViewModel: ObservableObject {
         updateChecker: AppUpdateChecking? = nil,
         insomniaPower: InsomniaPowerManaging = MacOSInsomniaPowerManager(),
         powerMonitor: ExternalPowerMonitoring = MacOSExternalPowerMonitor(),
-        insomniaBatteryPrompt: @escaping InsomniaBatteryPrompt = SidebarViewModel.defaultInsomniaBatteryPrompt
+        insomniaBatteryPrompt: @escaping InsomniaBatteryPrompt = {
+            SidebarViewModel.defaultInsomniaBatteryPrompt()
+        }
     ) {
         self.context = context
         self.router = router
