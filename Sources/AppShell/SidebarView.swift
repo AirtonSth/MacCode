@@ -9,6 +9,13 @@ import DesignSystemKit
 
 @MainActor
 public final class SidebarViewModel: ObservableObject {
+    public enum InsomniaBatteryDecision {
+        case disable
+        case keepEnabled
+    }
+
+    public typealias InsomniaBatteryPrompt = @MainActor () -> InsomniaBatteryDecision
+
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
@@ -43,12 +50,18 @@ public final class SidebarViewModel: ObservableObject {
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
+    private let powerMonitor: ExternalPowerMonitoring
+    private let insomniaBatteryPrompt: InsomniaBatteryPrompt
+    private var lastPowerState: ExternalPowerState
+    private var showingInsomniaBatteryPrompt = false
 
     public init(
         context: AppContext,
         router: AppCommandRouter,
         updateChecker: AppUpdateChecking? = nil,
-        insomniaPower: InsomniaPowerManaging = MacOSInsomniaPowerManager()
+        insomniaPower: InsomniaPowerManaging = MacOSInsomniaPowerManager(),
+        powerMonitor: ExternalPowerMonitoring = MacOSExternalPowerMonitor(),
+        insomniaBatteryPrompt: @escaping InsomniaBatteryPrompt = SidebarViewModel.defaultInsomniaBatteryPrompt
     ) {
         self.context = context
         self.router = router
@@ -56,6 +69,9 @@ public final class SidebarViewModel: ObservableObject {
         self.updateAvailability = updateChecker?.availability ?? .unknown
         self.settingsStore = SettingsStore(db: context.db)
         self.insomniaPower = insomniaPower
+        self.powerMonitor = powerMonitor
+        self.insomniaBatteryPrompt = insomniaBatteryPrompt
+        self.lastPowerState = powerMonitor.currentPowerState
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
             object: nil,
@@ -67,6 +83,10 @@ public final class SidebarViewModel: ObservableObject {
         self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
             self?.updateAvailability = availability
         }
+        self.powerMonitor.onPowerStateChanged = { [weak self] state in
+            self?.handleExternalPowerStateChanged(state)
+        }
+        self.powerMonitor.start()
         reload()
         reloadInsomnia()
     }
@@ -75,6 +95,7 @@ public final class SidebarViewModel: ObservableObject {
         if let privateAccountObserver {
             NotificationCenter.default.removeObserver(privateAccountObserver)
         }
+        powerMonitor.stop()
         insomniaPower.releaseProcessAssertions()
     }
 
@@ -128,6 +149,33 @@ public final class SidebarViewModel: ObservableObject {
 
     public func disableInsomniaForAppClose() {
         finishInsomniaSession()
+    }
+
+    public static func defaultInsomniaBatteryPrompt() -> InsomniaBatteryDecision {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Insomnia is on while your MacBook is on battery"
+        alert.informativeText = "Insomnia can drain the battery because it keeps this Mac awake. Do you want to keep Insomnia on or disable it now?"
+        alert.addButton(withTitle: "Disable Insomnia")
+        alert.addButton(withTitle: "Keep Insomnia On")
+        return alert.runModal() == .alertFirstButtonReturn ? .disable : .keepEnabled
+    }
+
+    private func handleExternalPowerStateChanged(_ state: ExternalPowerState) {
+        let previousPowerState = lastPowerState
+        lastPowerState = state
+        guard previousPowerState != .battery, state == .battery else { return }
+        confirmInsomniaOnBatteryIfNeeded()
+    }
+
+    private func confirmInsomniaOnBatteryIfNeeded() {
+        guard insomniaEnabled, !showingInsomniaBatteryPrompt else { return }
+        showingInsomniaBatteryPrompt = true
+        let decision = insomniaBatteryPrompt()
+        showingInsomniaBatteryPrompt = false
+        if decision == .disable {
+            setInsomniaEnabled(false)
+        }
     }
 
     private func applyInsomniaPower() {

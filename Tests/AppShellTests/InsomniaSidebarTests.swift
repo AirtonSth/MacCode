@@ -23,10 +23,37 @@ final class InsomniaSidebarTests: XCTestCase {
         func releaseProcessAssertions() {}
     }
 
+    private final class FakeExternalPowerMonitor: ExternalPowerMonitoring {
+        var currentPowerState: ExternalPowerState
+        var onPowerStateChanged: (@MainActor (ExternalPowerState) -> Void)?
+        var startCount = 0
+        var stopCount = 0
+
+        init(powerState: ExternalPowerState = .externalPower) {
+            self.currentPowerState = powerState
+        }
+
+        func start() {
+            startCount += 1
+        }
+
+        func stop() {
+            stopCount += 1
+        }
+
+        @MainActor
+        func send(_ state: ExternalPowerState) {
+            currentPowerState = state
+            onPowerStateChanged?(state)
+        }
+    }
+
     private func make(
         dir: String = NSTemporaryDirectory() + "RC2Insomnia-" + UUID().uuidString,
         seedSettings: AppSettings? = nil,
-        power: FakeInsomniaPowerManager = FakeInsomniaPowerManager()
+        power: FakeInsomniaPowerManager = FakeInsomniaPowerManager(),
+        powerMonitor: ExternalPowerMonitoring = FakeExternalPowerMonitor(),
+        insomniaBatteryPrompt: @escaping SidebarViewModel.InsomniaBatteryPrompt = { .keepEnabled }
     ) throws -> (AppContext, AppCommandRouter, SidebarViewModel, FakeInsomniaPowerManager) {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
@@ -34,7 +61,13 @@ final class InsomniaSidebarTests: XCTestCase {
         if let seedSettings {
             SettingsStore(db: ctx.db).save(seedSettings)
         }
-        let vm = SidebarViewModel(context: ctx, router: router, insomniaPower: power)
+        let vm = SidebarViewModel(
+            context: ctx,
+            router: router,
+            insomniaPower: power,
+            powerMonitor: powerMonitor,
+            insomniaBatteryPrompt: insomniaBatteryPrompt
+        )
         return (ctx, router, vm, power)
     }
 
@@ -101,6 +134,94 @@ final class InsomniaSidebarTests: XCTestCase {
         XCTAssertFalse(reloaded.insomniaEnabled)
         XCTAssertTrue(reloadedPower.activateReasons.isEmpty,
                       "reopening the app after a normal close must not silently restart Insomnia")
+    }
+
+    func test_unpluggingMacBookWhileInsomniaEnabledPromptsAndCanDisable() throws {
+        let monitor = FakeExternalPowerMonitor(powerState: .externalPower)
+        var promptCount = 0
+        let (ctx, _, vm, power) = try make(
+            seedSettings: AppSettings(insomniaEnabled: false),
+            powerMonitor: monitor,
+            insomniaBatteryPrompt: {
+                promptCount += 1
+                return .disable
+            }
+        )
+
+        vm.setInsomniaEnabled(true)
+        monitor.send(.battery)
+
+        XCTAssertEqual(promptCount, 1,
+                       "unplugging while Insomnia is active must ask before letting a keep-awake session drain battery")
+        XCTAssertFalse(vm.insomniaEnabled)
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaEnabled,
+                       "choosing Disable Insomnia from the battery warning must persist the safer off state")
+        XCTAssertGreaterThan(power.deactivateCount, 0,
+                             "choosing Disable Insomnia from the battery warning must release keep-awake assertions")
+    }
+
+    func test_unpluggingMacBookWhileInsomniaEnabledCanKeepSession() throws {
+        let monitor = FakeExternalPowerMonitor(powerState: .externalPower)
+        var promptCount = 0
+        let (ctx, _, vm, power) = try make(
+            seedSettings: AppSettings(insomniaEnabled: false),
+            powerMonitor: monitor,
+            insomniaBatteryPrompt: {
+                promptCount += 1
+                return .keepEnabled
+            }
+        )
+
+        vm.setInsomniaEnabled(true)
+        let deactivateCountBeforeWarning = power.deactivateCount
+        monitor.send(.battery)
+
+        XCTAssertEqual(promptCount, 1,
+                       "unplugging while Insomnia is active must let the user intentionally keep the session on")
+        XCTAssertTrue(vm.insomniaEnabled)
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().insomniaEnabled,
+                      "choosing Keep Insomnia On must not silently turn off a requested keep-awake session")
+        XCTAssertEqual(power.deactivateCount, deactivateCountBeforeWarning,
+                       "choosing Keep Insomnia On must not release the active keep-awake assertion")
+    }
+
+    func test_batteryNotificationWhileInsomniaOffDoesNotPrompt() throws {
+        let monitor = FakeExternalPowerMonitor(powerState: .externalPower)
+        var promptCount = 0
+        let (_, _, vm, _) = try make(
+            seedSettings: AppSettings(insomniaEnabled: false),
+            powerMonitor: monitor,
+            insomniaBatteryPrompt: {
+                promptCount += 1
+                return .disable
+            }
+        )
+
+        monitor.send(.battery)
+
+        XCTAssertEqual(promptCount, 0,
+                       "battery warnings must not interrupt users when Insomnia is already off")
+        XCTAssertFalse(vm.insomniaEnabled)
+    }
+
+    func test_launchingAlreadyOnBatteryDoesNotPromptWithoutUnplugTransition() throws {
+        let monitor = FakeExternalPowerMonitor(powerState: .battery)
+        var promptCount = 0
+        let (_, _, vm, _) = try make(
+            seedSettings: AppSettings(insomniaEnabled: false),
+            powerMonitor: monitor,
+            insomniaBatteryPrompt: {
+                promptCount += 1
+                return .disable
+            }
+        )
+
+        vm.setInsomniaEnabled(true)
+        monitor.send(.battery)
+
+        XCTAssertEqual(promptCount, 0,
+                       "the warning is for an unplug event, not for every refresh while already on battery")
+        XCTAssertTrue(vm.insomniaEnabled)
     }
 
     func test_optionsPersistAndUpdateActiveSession() throws {

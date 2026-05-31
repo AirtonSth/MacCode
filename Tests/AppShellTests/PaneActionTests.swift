@@ -13,7 +13,23 @@ final class PaneActionTests: XCTestCase {
         surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
     }
 
+    private func closeAllTestWindows() {
+        let windows = Array(NSApplication.shared.windows)
+        for window in windows {
+            if let sheet = window.attachedSheet {
+                window.endSheet(sheet)
+            }
+            if let parent = window.sheetParent {
+                parent.endSheet(window)
+            }
+        }
+        for window in windows {
+            window.orderOut(nil)
+        }
+    }
+
     override func tearDown() {
+        closeAllTestWindows()
         closeAndUnregisterAllSurfaces()
         super.tearDown()
     }
@@ -785,6 +801,7 @@ final class PaneActionTests: XCTestCase {
 
         NotificationCenter.default.post(name: .rc2ToggleSidebar, object: nil)
         controller.window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
 
         let content = try XCTUnwrap(controller.window.contentView)
         let buttons = visibleSubviews(of: content).compactMap { $0 as? NSButton }
@@ -935,21 +952,26 @@ final class PaneActionTests: XCTestCase {
                        "startup update checks must drive the visible checking state instead of staying idle")
     }
 
-    func test_settingsController_presentsSettingsAsModalSheet() throws {
-        let (ctx, router) = try makeContext()
-        _ = try router.createWorkspace(name: "settings", cwd: NSTemporaryDirectory())
-        let controller = MainWindowController(context: ctx, router: router)
-        controller.window.setFrame(NSRect(x: 0, y: 0, width: 900, height: 700), display: false)
-        controller.window.contentView?.layoutSubtreeIfNeeded()
-
+    func test_aaa_settingsController_presentsSettingsAsModalSheet() throws {
+        let (ctx, _) = try makeContext()
+        let parent = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
         let settings = SettingsWindowController(context: ctx)
-        settings.show(attachedTo: controller.window)
+        parent.animationBehavior = .none
+        settings.window.animationBehavior = .none
+        settings.show(attachedTo: parent)
 
-        XCTAssertTrue(controller.window.attachedSheet === settings.window,
+        XCTAssertTrue(parent.attachedSheet === settings.window,
                       "Settings must open as a modal sheet attached to the main window, not as another floating preferences window")
         settings.close()
-        XCTAssertNil(controller.window.attachedSheet,
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertNil(parent.attachedSheet,
                      "Settings must expose a close path that dismisses the modal sheet")
+        parent.orderOut(nil)
     }
 
     func test_settingsViewModel_persistsAllUserTunableAppSettings() throws {
@@ -983,7 +1005,7 @@ final class PaneActionTests: XCTestCase {
                        "Settings must remove custom model IDs instead of leaving stale rows in future Agent model menus")
     }
 
-    func test_settingsViewModel_runsProviderUpdateFromConfiguredPath() async throws {
+    func test_aab_settingsViewModel_runsProviderUpdateFromConfiguredPath() async throws {
         let (ctx, _) = try makeContext()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -41,6 +41,14 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     private var reason: String = "RemoteCode Insomnia"
     private var options: InsomniaPowerOptions = .defaultSession
     private var screenSaverTimer: Timer?
+    private lazy var privilegedPMSet = PrivilegedPMSetSleepDisabler(
+        runPrivilegedShellCommand: { [weak self] command in
+            self?.runPrivilegedShellCommand(command) ?? false
+        },
+        rootDomainSleepDisabled: { [weak self] in
+            self?.rootDomainSleepDisabled() ?? false
+        }
+    )
 
     public init() {}
 
@@ -101,7 +109,13 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
         releaseProcessAssertions()
         if clamshellSleepDisabled {
             if !setClamshellSleepDisabled(false) || rootDomainSleepDisabled() {
-                _ = runPrivilegedPMSetDisableSleep(false)
+                if privilegedPMSet.disableUsingCachedPermission() {
+                    if !waitForRootDomainSleepDisabled(false) {
+                        NSLog("RemoteCode Insomnia cached pmset disable did not clear before timeout.")
+                    }
+                } else {
+                    _ = runPrivilegedPMSetDisableSleep(false)
+                }
             }
             clamshellSleepDisabled = rootDomainSleepDisabled()
         }
@@ -170,9 +184,7 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     }
 
     private func runPrivilegedPMSetDisableSleep(_ disabled: Bool) -> Bool {
-        let value = disabled ? "1" : "0"
-        let command = "/usr/bin/pmset -a disablesleep \(value)"
-        guard runPrivilegedShellCommand(command) else {
+        guard privilegedPMSet.setDisabled(disabled) else {
             NSLog("RemoteCode Insomnia privileged pmset failed.")
             return false
         }
@@ -180,6 +192,15 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
         guard effective == disabled else { return false }
         clamshellSleepDisabled = disabled
         return true
+    }
+
+    private func waitForRootDomainSleepDisabled(_ disabled: Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if rootDomainSleepDisabled() == disabled { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return rootDomainSleepDisabled() == disabled
     }
 
     private func ensureClamshellSleepDisabled() -> Bool {
@@ -273,5 +294,125 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
 
     deinit {
         releaseProcessAssertions()
+    }
+}
+
+final class PrivilegedPMSetSleepDisabler {
+    private struct Session {
+        let directory: URL
+        let stopFile: URL
+    }
+
+    private let fileManager: FileManager
+    private let processIdentifier: Int32
+    private let makeSessionDirectory: () -> URL
+    private let runPrivilegedShellCommand: (String) -> Bool
+    private let rootDomainSleepDisabled: () -> Bool
+    private var session: Session?
+
+    init(
+        fileManager: FileManager = .default,
+        processIdentifier: Int32 = ProcessInfo.processInfo.processIdentifier,
+        makeSessionDirectory: @escaping () -> URL = {
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent("RemoteCodeInsomnia-\(UUID().uuidString)", isDirectory: true)
+        },
+        runPrivilegedShellCommand: @escaping (String) -> Bool,
+        rootDomainSleepDisabled: @escaping () -> Bool
+    ) {
+        self.fileManager = fileManager
+        self.processIdentifier = processIdentifier
+        self.makeSessionDirectory = makeSessionDirectory
+        self.runPrivilegedShellCommand = runPrivilegedShellCommand
+        self.rootDomainSleepDisabled = rootDomainSleepDisabled
+    }
+
+    @discardableResult
+    func setDisabled(_ disabled: Bool) -> Bool {
+        if disabled {
+            return enableWithReusablePermission()
+        }
+        let succeeded = runOneShotPMSet(disabled: false)
+        if succeeded {
+            session = nil
+        }
+        return succeeded
+    }
+
+    @discardableResult
+    func disableUsingCachedPermission() -> Bool {
+        guard let session else { return false }
+        do {
+            try Data().write(to: session.stopFile, options: .atomic)
+            self.session = nil
+            return true
+        } catch {
+            NSLog("RemoteCode Insomnia failed to signal cached pmset helper: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    private func enableWithReusablePermission() -> Bool {
+        let session = makeSession()
+        do {
+            try fileManager.createDirectory(at: session.directory, withIntermediateDirectories: true)
+        } catch {
+            NSLog("RemoteCode Insomnia failed to create pmset helper state: %@", error.localizedDescription)
+            return false
+        }
+
+        let command = [
+            "/usr/bin/pmset -a disablesleep 1",
+            "status=$?",
+            "if [ $status -ne 0 ]; then exit $status; fi",
+            watcherCommand(for: session)
+        ].joined(separator: "; ")
+
+        guard runPrivilegedShellCommand(command) else {
+            removeSessionDirectory(session)
+            return false
+        }
+        guard rootDomainSleepDisabled() else {
+            _ = signal(session)
+            return false
+        }
+        self.session = session
+        return true
+    }
+
+    private func runOneShotPMSet(disabled: Bool) -> Bool {
+        let value = disabled ? "1" : "0"
+        return runPrivilegedShellCommand("/usr/bin/pmset -a disablesleep \(value)")
+    }
+
+    private func makeSession() -> Session {
+        let directory = makeSessionDirectory()
+        return Session(
+            directory: directory,
+            stopFile: directory.appendingPathComponent("disable", isDirectory: false)
+        )
+    }
+
+    private func watcherCommand(for session: Session) -> String {
+        let stopFile = shellQuote(session.stopFile.path)
+        let directory = shellQuote(session.directory.path)
+        return "( while [ ! -e \(stopFile) ] && /bin/kill -0 \(processIdentifier) 2>/dev/null; do /bin/sleep 0.5; done; /usr/bin/pmset -a disablesleep 0; /bin/rm -rf \(directory) ) >/dev/null 2>&1 &"
+    }
+
+    private func signal(_ session: Session) -> Bool {
+        do {
+            try Data().write(to: session.stopFile, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func removeSessionDirectory(_ session: Session) {
+        try? fileManager.removeItem(at: session.directory)
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }
