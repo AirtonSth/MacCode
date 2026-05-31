@@ -109,6 +109,19 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "the account footer must not repaint the bottom as a dark block after hide/show restores the sidebar")
     }
 
+    func testSidebarWorkspaceFilterStaysVisibleWithoutAutofocus() throws {
+        let source = try String(contentsOf: sidebarViewURL())
+
+        XCTAssertTrue(source.contains("if !vm.workspaces.isEmpty {\n                workspaceFilterField"),
+                      "the Workspaces filter must stay visible for normal short workspace lists, not only after the list grows past an arbitrary count")
+        XCTAssertFalse(source.contains("vm.workspaces.count > 6"),
+                       "the Workspaces filter must not disappear for users with only a few workspaces")
+        XCTAssertTrue(source.contains("NonAutoFocusTextField("),
+                      "the Workspaces filter must keep manual focus behavior so opening the sidebar does not steal keyboard focus")
+        XCTAssertTrue(source.contains("accessibilityIdentifier: \"sidebar.workspaceFilter\""),
+                      "the restored Workspaces filter must keep a stable accessibility identifier for UI checks")
+    }
+
     func testThreadOutcomeNotificationContentMatchesLegacyActionablePhases() {
         XCTAssertNil(RemoteCodeNotificationContent.threadOutcome(
             threadId: "t1",

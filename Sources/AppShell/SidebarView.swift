@@ -530,9 +530,9 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
 
-            // IMP-MAC_SHELL_WINDOW-009: filter field shown only once the
-            // list is long enough that scanning becomes a chore.
-            if vm.workspaces.count > 6 {
+            // IMP-MAC_SHELL_WINDOW-009: keep the filter available whenever
+            // there are workspaces, but do not auto-focus it on sidebar load.
+            if !vm.workspaces.isEmpty {
                 workspaceFilterField
                     .padding(.horizontal, DS.Space.md)
                     .padding(.bottom, DS.Space.sm)
