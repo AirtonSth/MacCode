@@ -126,6 +126,10 @@ public final class SidebarViewModel: ObservableObject {
         applyInsomniaPower()
     }
 
+    public func disableInsomniaForAppClose() {
+        finishInsomniaSession()
+    }
+
     private func applyInsomniaPower() {
         guard insomniaEnabled else {
             insomniaPower.deactivate()
@@ -1128,6 +1132,10 @@ public final class SidebarView: NSObject {
 
     public func refresh() {
         viewModel.reload()
+    }
+
+    public func disableInsomniaForAppClose() {
+        viewModel.disableInsomniaForAppClose()
     }
 
     @objc private func showSettings() {

@@ -134,12 +134,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        disableInsomniaForAppClose()
         persistRestorableStateBeforeUpdate()
         socketServer?.stop()
         httpServer?.stop()
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    private func disableInsomniaForAppClose() {
+        windowController?.disableInsomniaForAppClose()
+        if let context {
+            SettingsStore(db: context.db).update { $0.insomniaEnabled = false }
+        }
     }
 
     private func persistRestorableStateBeforeUpdate() {

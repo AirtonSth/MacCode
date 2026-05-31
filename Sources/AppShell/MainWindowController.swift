@@ -382,6 +382,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         window.makeKeyAndOrderFront(nil)
     }
 
+    public func disableInsomniaForAppClose() {
+        sidebar.disableInsomniaForAppClose()
+    }
+
 	    private func configureCollapsedWorkspaceHeader() {
 	        collapsedWorkspaceHeader.translatesAutoresizingMaskIntoConstraints = false
 	        collapsedWorkspaceHeader.wantsLayer = true
@@ -953,6 +957,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     // MARK: NSWindowDelegate
     public func windowWillClose(_ notification: Notification) {
         context?.saveSnapshot()
+        disableInsomniaForAppClose()
     }
 
     public func windowDidBecomeKey(_ notification: Notification) {

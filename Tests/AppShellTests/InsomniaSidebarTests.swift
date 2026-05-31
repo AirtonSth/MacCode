@@ -84,6 +84,25 @@ final class InsomniaSidebarTests: XCTestCase {
                        "a saved on choice must survive relaunch and reacquire keep-awake")
     }
 
+    func test_appCloseDisablesInsomniaAndPreventsRelaunchReactivation() throws {
+        let dir = NSTemporaryDirectory() + "RC2InsomniaClose-" + UUID().uuidString
+        let (ctx, _, vm, power) = try make(dir: dir, seedSettings: AppSettings(insomniaEnabled: false))
+
+        vm.setInsomniaEnabled(true)
+        vm.disableInsomniaForAppClose()
+
+        XCTAssertFalse(vm.insomniaEnabled)
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaEnabled,
+                       "closing the macOS app must persist Insomnia off so keep-awake cannot outlive the app session")
+        XCTAssertGreaterThan(power.deactivateCount, 0,
+                             "closing the macOS app must release all Insomnia power assertions")
+
+        let (_, _, reloaded, reloadedPower) = try make(dir: dir)
+        XCTAssertFalse(reloaded.insomniaEnabled)
+        XCTAssertTrue(reloadedPower.activateReasons.isEmpty,
+                      "reopening the app after a normal close must not silently restart Insomnia")
+    }
+
     func test_optionsPersistAndUpdateActiveSession() throws {
         let (ctx, _, vm, power) = try make(seedSettings: AppSettings(insomniaEnabled: false))
 
