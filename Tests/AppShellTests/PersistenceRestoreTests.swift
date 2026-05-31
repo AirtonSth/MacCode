@@ -121,7 +121,7 @@ final class PersistenceRestoreTests: XCTestCase {
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
             let ws = try router.createWorkspace(name: "UPDATE", cwd: NSTemporaryDirectory())
-            let terminal = try router.createSurface(workspace: ws.id, type: .terminal, paneID: nil, title: "terminal")
+            let terminal = try router.createSurface(workspace: ws.id, type: .terminal, paneID: nil, title: "update-history-terminal")
             terminalID = terminal.id
             try ctx.terminalOutputRepo.append(surfaceID: terminal.id.value.uuidString, workspaceID: ws.id.value.uuidString, chunkIndex: 1, data: Data(marker.utf8))
             ctx.saveSnapshot()
@@ -138,7 +138,7 @@ final class PersistenceRestoreTests: XCTestCase {
         guard case .pane(let pane) = restored.layout else {
             return XCTFail("expected restored workspace to keep its terminal pane")
         }
-        let restoredTerminal = try XCTUnwrap(pane.surfaces.first { $0.title == "terminal" })
+        let restoredTerminal = try XCTUnwrap(pane.surfaces.first { $0.id == terminalID })
         XCTAssertEqual(restoredTerminal.id, terminalID,
                        "terminal restore must keep the persisted surface id because scrollback/history is keyed by surface id")
         let history = try ctx2.terminalOutputRepo.readWindow(surfaceID: restoredTerminal.id.value.uuidString)

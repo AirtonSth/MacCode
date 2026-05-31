@@ -65,7 +65,9 @@ if [[ "$RSS_KB" -gt "$MAX_RSS_KB" ]]; then
   exit 1
 fi
 
-if log show --style compact --last 5m --predicate 'process == "RemoteCode" AND (eventMessage CONTAINS[c] "OutOfMemory" OR eventMessage CONTAINS[c] "fatal" OR eventMessage CONTAINS[c] "crash" OR eventMessage CONTAINS[c] "error initializing surface")' 2>/dev/null | grep -E 'OutOfMemory|fatal|crash|error initializing surface' >/dev/null; then
+LOG_HITS="$(log show --style compact --last 5m --predicate "process == \"RemoteCode\" AND processID == $PID AND (eventMessage CONTAINS[c] \"OutOfMemory\" OR eventMessage CONTAINS[c] \"fatal\" OR eventMessage CONTAINS[c] \"crash\" OR eventMessage CONTAINS[c] \"error initializing surface\")" 2>/dev/null | grep -E 'OutOfMemory|fatal|crash|error initializing surface' || true)"
+if [[ -n "$LOG_HITS" ]]; then
+  printf '%s\n' "$LOG_HITS" >&2
   echo "logs=FAIL fatal memory/crash line found" >&2
   exit 1
 fi
