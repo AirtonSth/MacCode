@@ -3,6 +3,7 @@ import XCTest
 @testable import CoreModel
 @testable import Surfaces
 import Persistence
+import SocketServer
 
 @MainActor
 final class PaneActionTests: XCTestCase {
@@ -520,6 +521,37 @@ final class PaneActionTests: XCTestCase {
         guard case .pane(let p2) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
         XCTAssertEqual(p2.surfaces.count, 2)
         XCTAssertFalse(p2.surfaces.contains { $0.id == a!.id })
+    }
+
+    func test_nativeSurfaceMutationsPublishMirrorLifecycleEvents() throws {
+        let before = EventBus.shared.snapshot().lastSeq
+        let (_, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "mirror-events", cwd: NSTemporaryDirectory())
+
+        let added = try router.createSurface(workspace: ws.id, type: .browser, paneID: nil, title: "Mirror Created")
+        try router.focusSurface(workspace: ws.id, surface: added.id)
+        try router.closeSurface(workspace: ws.id, surface: added.id)
+
+        let events = EventBus.shared.recentEvents(since: before, maxBytes: nil).events
+
+        XCTAssertTrue(events.contains { event in
+            let payload = event.payload.objectValue
+            return event.kind == "surface.created"
+                && payload?["workspace_id"]?.stringValue == ws.id.value.uuidString
+                && payload?["surface"]?.objectValue?["title"]?.stringValue == "Mirror Created"
+        }, "macOS-created tabs must publish surface.created so iOS opens the same tab without manual refresh")
+        XCTAssertTrue(events.contains { event in
+            let payload = event.payload.objectValue
+            return event.kind == "surface.focused"
+                && payload?["workspace_id"]?.stringValue == ws.id.value.uuidString
+                && payload?["id"]?.stringValue == added.id.value.uuidString
+        }, "macOS tab focus must publish surface.focused so iOS selects the same visible tab")
+        XCTAssertTrue(events.contains { event in
+            let payload = event.payload.objectValue
+            return event.kind == "surface.closed"
+                && payload?["workspace_id"]?.stringValue == ws.id.value.uuidString
+                && payload?["id"]?.stringValue == added.id.value.uuidString
+        }, "macOS tab close must publish surface.closed so iOS removes stale tabs")
     }
 
     func test_tabContextMenu_exposesBulkCloseActions() throws {

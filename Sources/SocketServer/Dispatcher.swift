@@ -159,6 +159,11 @@ public protocol TerminalCommandRouting: AnyObject {
 }
 
 @MainActor
+public protocol LayoutEventSuppressionRouting: AnyObject {
+    func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T
+}
+
+@MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
     private var volatileCommandReceipts: [String: JSONValue] = [:]
@@ -179,6 +184,13 @@ public final class JSONRPCDispatcher {
         guard let clientRequestId else { return }
         volatileCommandReceipts["\(method):\(clientRequestId)"] = result
         router.recordCommandReceipt(method: method, clientRequestId: clientRequestId, result: result)
+    }
+
+    private func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T {
+        if let suppressingRouter = router as? LayoutEventSuppressionRouting {
+            return try suppressingRouter.withSuppressedLayoutEvents(body)
+        }
+        return try body()
     }
 
     /// Translate symbolic key names (cmux v2 contract) into raw bytes
@@ -358,7 +370,9 @@ public final class JSONRPCDispatcher {
                 let pid: PaneID? = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
                 let profileID = params["profile_id"]?.stringValue.flatMap(UUID.init).map(SSHHostID.init)
                 let profile = try optionalSSHProfile(from: params)
-                let s = try router.sshConnect(workspace: wid, profileID: profileID, profile: profile, title: params["title"]?.stringValue, paneID: pid)
+                let s = try withSuppressedLayoutEvents {
+                    try router.sshConnect(workspace: wid, profileID: profileID, profile: profile, title: params["title"]?.stringValue, paneID: pid)
+                }
                 EventBus.shared.publish(kind: "surface.created", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(s)
@@ -448,7 +462,9 @@ public final class JSONRPCDispatcher {
                       let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let sourceSurface = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init)
                 let pid = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
-                let surface = try router.filesOpenTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, path: path)
+                let surface = try withSuppressedLayoutEvents {
+                    try router.filesOpenTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, path: path)
+                }
                 EventBus.shared.publish(kind: "surface.created", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(surface)
@@ -461,7 +477,9 @@ public final class JSONRPCDispatcher {
                       let path = params["path"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let sourceSurface = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init)
                 let pid = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
-                let surface = try router.filesSplitTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, direction: dir, path: path)
+                let surface = try withSuppressedLayoutEvents {
+                    try router.filesSplitTab(workspace: wid, sourceSurface: sourceSurface, paneID: pid, direction: dir, path: path)
+                }
                 EventBus.shared.publish(kind: "pane.split", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(surface)
@@ -586,7 +604,9 @@ public final class JSONRPCDispatcher {
                 }
                 let pid: PaneID? = params["pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
                 let title = params["title"]?.stringValue
-                let s = try router.createSurface(workspace: wid, type: type, paneID: pid, title: title)
+                let s = try withSuppressedLayoutEvents {
+                    try router.createSurface(workspace: wid, type: type, paneID: pid, title: title)
+                }
                 EventBus.shared.publish(kind: "surface.created", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "surface": encode(s)
@@ -600,7 +620,9 @@ public final class JSONRPCDispatcher {
                       let dirStr = params["direction"]?.stringValue,
                       let dir = SplitDirection(rawValue: dirStr) else { throw JSONRPCError.invalidParams }
                 if let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) {
-                    try router.splitSurface(workspace: wid, paneID: pid, surface: sid, direction: dir)
+                    try withSuppressedLayoutEvents {
+                        try router.splitSurface(workspace: wid, paneID: pid, surface: sid, direction: dir)
+                    }
                     EventBus.shared.publish(kind: "surface.moved", payload: .object([
                         "workspace_id": .string(wid.value.uuidString),
                         "id": .string(sid.value.uuidString)
@@ -610,19 +632,25 @@ public final class JSONRPCDispatcher {
                 guard let tStr = params["type"]?.stringValue,
                       let type = SurfaceType(rawValue: normalizeSurfaceTypeString(tStr)) else { throw JSONRPCError.invalidParams }
                 let title = params["title"]?.stringValue
-                let s = try router.splitPane(workspace: wid, paneID: pid, direction: dir, surfaceType: type, title: title)
+                let s = try withSuppressedLayoutEvents {
+                    try router.splitPane(workspace: wid, paneID: pid, direction: dir, surfaceType: type, title: title)
+                }
                 EventBus.shared.publish(kind: "pane.split", payload: .object(["workspace_id": .string(wid.value.uuidString), "surface": encode(s)]))
                 return .init(id: id, result: encode(s))
             case "surface.close":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
-                try router.closeSurface(workspace: wid, surface: sid)
+                try withSuppressedLayoutEvents {
+                    try router.closeSurface(workspace: wid, surface: sid)
+                }
                 EventBus.shared.publish(kind: "surface.closed", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.focus":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
-                try router.focusSurface(workspace: wid, surface: sid)
+                try withSuppressedLayoutEvents {
+                    try router.focusSurface(workspace: wid, surface: sid)
+                }
                 EventBus.shared.publish(kind: "surface.focused", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.rename":
@@ -1322,9 +1350,18 @@ public final class JSONRPCDispatcher {
                 let panes = try router.paneList(workspace: wid)
                 return .init(id: id, result: .array(panes.map { .object($0) }))
             case "pane.surfaces":
-                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
-                      let pid = params["id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
-                let surfaces = try router.paneSurfaces(pane: pid, workspace: wid)
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let surfaces: [SurfaceDescriptor]
+                if let pid = params["id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) {
+                    surfaces = try router.paneSurfaces(pane: pid, workspace: wid)
+                } else {
+                    let paneIDs = try router.paneList(workspace: wid).compactMap { row in
+                        row["kind"]?.stringValue == "pane"
+                            ? row["id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
+                            : nil
+                    }
+                    surfaces = try paneIDs.flatMap { try router.paneSurfaces(pane: $0, workspace: wid) }
+                }
                 return .init(id: id, result: encode(surfaces))
             case "pane.resize":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -1333,14 +1370,18 @@ public final class JSONRPCDispatcher {
                 if case .array(let arr) = params["ratios"] ?? .null {
                     for v in arr { if case .number(let n) = v { ratios.append(n) } }
                 }
-                try router.paneResize(workspace: wid, splitID: split, ratios: ratios)
+                try withSuppressedLayoutEvents {
+                    try router.paneResize(workspace: wid, splitID: split, ratios: ratios)
+                }
                 EventBus.shared.publish(kind: "pane.resized", payload: .object(["workspace_id": .string(wid.value.uuidString), "split_id": .string(split.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.move":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let pid = params["target_pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
-                try router.surfaceMove(workspace: wid, surface: sid, targetPane: pid)
+                try withSuppressedLayoutEvents {
+                    try router.surfaceMove(workspace: wid, surface: sid, targetPane: pid)
+                }
                 EventBus.shared.publish(kind: "surface.moved", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString), "target_pane_id": .string(pid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "surface.reorder":
@@ -1348,7 +1389,9 @@ public final class JSONRPCDispatcher {
                       let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let pid = params["target_pane_id"]?.stringValue.flatMap(UUID.init).map(PaneID.init) else { throw JSONRPCError.invalidParams }
                 let pos = params["position"]?.intValue ?? 0
-                try router.surfaceReorder(workspace: wid, surface: sid, toPane: pid, position: pos)
+                try withSuppressedLayoutEvents {
+                    try router.surfaceReorder(workspace: wid, surface: sid, toPane: pid, position: pos)
+                }
                 EventBus.shared.publish(kind: "surface.reordered", payload: .object(["workspace_id": .string(wid.value.uuidString), "id": .string(sid.value.uuidString), "target_pane_id": .string(pid.value.uuidString), "position": .number(Double(pos))]))
                 return .init(id: id, result: .bool(true))
             case "window.list":

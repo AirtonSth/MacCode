@@ -47,12 +47,13 @@ private struct ProviderProbeCapabilities {
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
+public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting {
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
+    private var suppressedLayoutEventDepth = 0
 
     public init(context: AppContext) {
         self.context = context
@@ -108,6 +109,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         guard let data = try? JSONEncoder().encode(value),
               let json = try? JSONDecoder().decode(JSONValue.self, from: data) else { return .null }
         return json
+    }
+
+    public func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T {
+        suppressedLayoutEventDepth += 1
+        defer { suppressedLayoutEventDepth -= 1 }
+        return try body()
+    }
+
+    private var shouldPublishLayoutEvents: Bool {
+        suppressedLayoutEventDepth == 0
     }
 
     private func refreshAgentSurfaces(thread: AgentThreadID, workspace: WorkspaceID? = nil, select: Bool = false) {
@@ -441,12 +452,75 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         windowController?.refreshFromState()
     }
 
+    private func publishSurfaceCreated(workspace: WorkspaceID, surface: SurfaceDescriptor) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "surface.created", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "surface": jsonValue(surface)
+        ]))
+    }
+
+    private func publishPaneSplit(workspace: WorkspaceID, surface: SurfaceDescriptor) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "pane.split", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "surface": jsonValue(surface)
+        ]))
+    }
+
+    private func publishSurfaceClosed(workspace: WorkspaceID, surface: SurfaceID) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "surface.closed", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surface.value.uuidString)
+        ]))
+    }
+
+    private func publishSurfaceFocused(workspace: WorkspaceID, surface: SurfaceID) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "surface.focused", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surface.value.uuidString)
+        ]))
+    }
+
+    private func publishSurfaceMoved(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID? = nil) {
+        guard shouldPublishLayoutEvents else { return }
+        var payload: [String: JSONValue] = [
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surface.value.uuidString)
+        ]
+        if let targetPane {
+            payload["target_pane_id"] = .string(targetPane.value.uuidString)
+        }
+        EventBus.shared.publish(kind: "surface.moved", payload: .object(payload))
+    }
+
+    private func publishSurfaceReordered(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID, position: Int) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "surface.reordered", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surface.value.uuidString),
+            "target_pane_id": .string(targetPane.value.uuidString),
+            "position": .number(Double(position))
+        ]))
+    }
+
+    private func publishPaneResized(workspace: WorkspaceID, splitID: UUID) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "pane.resized", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "split_id": .string(splitID.uuidString)
+        ]))
+    }
+
     public func createSurface(workspace: WorkspaceID, type: SurfaceType, paneID: PaneID?, title: String?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let desc = makeSurface(type: type, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.addSurface(workspace, paneID: paneID, descriptor: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspace, surface: desc)
         return desc
     }
 
@@ -456,6 +530,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try ctx.apply(.splitPane(workspace, paneID: paneID, direction: direction, newSurface: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishPaneSplit(workspace: workspace, surface: desc)
         return desc
     }
 
@@ -467,6 +542,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try ctx.apply(.addSurface(workspace, paneID: targetPane, descriptor: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspace, surface: desc)
         return desc
     }
 
@@ -479,6 +555,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try ctx.apply(.splitPane(workspace, paneID: targetPane, direction: direction, newSurface: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishPaneSplit(workspace: workspace, surface: desc)
         return desc
     }
 
@@ -486,6 +563,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         try context?.apply(.splitSurface(workspace, paneID: paneID, surface: surface, direction: direction))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishSurfaceMoved(workspace: workspace, surface: surface, targetPane: paneID)
     }
 
     public func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -496,6 +574,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishSurfaceClosed(workspace: workspace, surface: surface)
     }
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -506,6 +585,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
            ws.focusedPaneID == paneID,
            ws.layout.find(paneID: paneID)?.selectedSurfaceID == surface {
             windowController?.focusSurface(surface)
+            publishSurfaceFocused(workspace: workspace, surface: surface)
             return
         }
         try context?.apply(.focusSurface(workspace, surface))
@@ -515,6 +595,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         windowController?.focusSurface(surface)
+        publishSurfaceFocused(workspace: workspace, surface: surface)
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
@@ -656,6 +737,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
         let desc = try makeSSHSurface(profile: resolved, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
         try ctx.apply(.addSurface(workspace, paneID: paneID, descriptor: desc))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspace, surface: desc)
+        if shouldPublishLayoutEvents {
+            EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+                "surface_id": .string(desc.id.value.uuidString),
+                "status": .string(desc.metadata["ssh_status"] ?? "connected"),
+                "destination": .string(desc.metadata["ssh_destination"] ?? "")
+            ]))
+        }
         return desc
     }
 
@@ -1830,6 +1920,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
                 "kind": .string("pane"),
                 "id": .string(pid.value.uuidString),
                 "surface_count": .number(Double(count)),
+                "surface_ids": .array((pane?.surfaces ?? []).map { .string($0.id.value.uuidString) }),
                 "selected_surface_id": pane?.selectedSurfaceID.map { .string($0.value.uuidString) } ?? .null,
                 "mobile_group": .number(Double(mobileGroupByPane[pid] ?? 0))
             ]
@@ -1883,18 +1974,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting {
     public func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {
         try context?.apply(.resizeSplit(workspace, splitID: splitID, ratios: ratios))
         windowController?.refreshFromState()
+        publishPaneResized(workspace: workspace, splitID: splitID)
     }
 
     public func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws {
         try context?.apply(.moveSurfaceToPane(workspace, surface: surface, targetPane: targetPane))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishSurfaceMoved(workspace: workspace, surface: surface, targetPane: targetPane)
     }
 
     public func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws {
         try context?.apply(.reorderSurface(workspace, surface: surface, toPane: toPane, position: position))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishSurfaceReordered(workspace: workspace, surface: surface, targetPane: toPane, position: position)
     }
 
     public func openWorkspaceInNewWindow(_ workspace: WorkspaceID) {

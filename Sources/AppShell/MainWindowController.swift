@@ -193,6 +193,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var sidebarWidth: CGFloat = MainWindowController.defaultSidebarWidth
     private var didApplyInitialSidebarWidth = false
     private var isApplyingInitialSidebarWidth = false
+    private var lastSplitBoundsWidth: CGFloat?
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -371,6 +372,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         let maxAllowed = max(220, split.bounds.width - 520)
         let applied = min(sidebarWidth, maxAllowed)
         split.setPosition(applied, ofDividerAt: 0)
+        lastSplitBoundsWidth = split.bounds.width
         isApplyingInitialSidebarWidth = false
     }
 
@@ -980,6 +982,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             return
         }
         guard !isApplyingInitialSidebarWidth, !sidebarCollapsed else { return }
+        let currentSplitWidth = splitView.bounds.width
+        let sidebarFrameWidth = sidebar.view.frame.width
+        if let lastSplitBoundsWidth,
+           abs(lastSplitBoundsWidth - currentSplitWidth) > 0.5,
+           abs(sidebarFrameWidth - sidebarWidth) > 0.5 {
+            isApplyingInitialSidebarWidth = true
+            let maxAllowed = max(220, currentSplitWidth - 520)
+            split.setPosition(min(sidebarWidth, maxAllowed), ofDividerAt: 0)
+            self.lastSplitBoundsWidth = currentSplitWidth
+            isApplyingInitialSidebarWidth = false
+            return
+        }
+        lastSplitBoundsWidth = currentSplitWidth
         sidebarWidth = sidebar.view.frame.width
         try? context?.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(sidebarWidth))")
     }

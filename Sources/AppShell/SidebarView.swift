@@ -587,11 +587,14 @@ public struct SidebarRootView: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 12, weight: .regular))
                 .foregroundColor(DS.Palette.textTertiary)
-            TextField("Filter workspaces", text: $vm.filterText)
-                .textFieldStyle(.plain)
-                .font(DS.Font.body)
-                .foregroundColor(DS.Palette.text)
-                .accessibilityIdentifier("sidebar.workspaceFilter")
+            NonAutoFocusTextField(
+                placeholder: "Filter workspaces",
+                text: $vm.filterText,
+                accessibilityIdentifier: "sidebar.workspaceFilter"
+            )
+            .font(DS.Font.body)
+            .foregroundColor(DS.Palette.text)
+            .frame(maxWidth: .infinity, alignment: .leading)
             if !vm.filterText.isEmpty {
                 Button { vm.filterText = "" } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -1007,6 +1010,75 @@ private struct WorkspaceDropDelegate: DropDelegate {
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         DropProposal(operation: .move)
+    }
+}
+
+private struct NonAutoFocusTextField: NSViewRepresentable {
+    let placeholder: String
+    @Binding var text: String
+    let accessibilityIdentifier: String
+
+    func makeNSView(context: Context) -> ManualFocusTextField {
+        let field = ManualFocusTextField()
+        field.placeholderString = placeholder
+        field.stringValue = text
+        field.delegate = context.coordinator
+        field.isBordered = false
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        field.textColor = NSColor(DS.Palette.text)
+        field.placeholderAttributedString = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: NSColor(DS.Palette.textTertiary)]
+        )
+        field.setAccessibilityIdentifier(accessibilityIdentifier)
+        return field
+    }
+
+    func updateNSView(_ field: ManualFocusTextField, context: Context) {
+        context.coordinator.text = $text
+        field.placeholderString = placeholder
+        field.setAccessibilityIdentifier(accessibilityIdentifier)
+        if field.stringValue != text {
+            field.stringValue = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) {
+            self.text = text
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            text.wrappedValue = field.stringValue
+        }
+    }
+
+    final class ManualFocusTextField: NSTextField {
+        private var allowManualFocus = false
+
+        override var acceptsFirstResponder: Bool {
+            allowManualFocus
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            allowManualFocus = true
+            super.mouseDown(with: event)
+        }
+
+        override func resignFirstResponder() -> Bool {
+            allowManualFocus = false
+            return super.resignFirstResponder()
+        }
     }
 }
 

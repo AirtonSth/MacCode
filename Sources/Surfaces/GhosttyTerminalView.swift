@@ -401,6 +401,7 @@ final class GhosttyTerminalView: NSView {
     override func accessibilityValue() -> Any? { readViewportText() }
 
     override func makeBackingLayer() -> CALayer {
+        guard Self.nativeRendererEnabled else { return CALayer() }
         let metalLayer = CAMetalLayer()
         metalLayer.pixelFormat = .bgra8Unorm
         metalLayer.isOpaque = false
@@ -602,6 +603,7 @@ final class GhosttyTerminalView: NSView {
     }
 
     private func ensureSurface() {
+        guard Self.nativeRendererEnabled else { return }
         guard surfaceSlot.liveSurface() == nil else { return }
         guard window != nil else { return }
         guard bounds.width > 0, bounds.height > 0 else { return }
@@ -658,6 +660,12 @@ final class GhosttyTerminalView: NSView {
     private static func hasActiveDisplay() -> Bool {
         var count: UInt32 = 0
         return CGGetActiveDisplayList(0, nil, &count) == .success && count > 0
+    }
+
+    private static var nativeRendererEnabled: Bool {
+        let env = ProcessInfo.processInfo.environment
+        guard env["RC2_ENABLE_GHOSTTY_IN_TESTS"] != "1" else { return true }
+        return env["XCTestConfigurationFilePath"] == nil
     }
 
     private func updateFocus() {

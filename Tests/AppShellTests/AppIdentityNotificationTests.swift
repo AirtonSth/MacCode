@@ -291,7 +291,9 @@ final class AppIdentityNotificationTests: XCTestCase {
         let startSeq = EventBus.shared.snapshot().lastSeq
         var events: [EventBus.Event] = []
         let token = EventBus.shared.subscribe(since: startSeq) { event in
-            if event.kind.hasPrefix("agent.run.") { events.append(event) }
+            guard event.kind.hasPrefix("agent.run."),
+                  event.payload.objectValue?["thread_id"]?.stringValue == thread.id.value.uuidString else { return }
+            events.append(event)
         }
         defer { EventBus.shared.unsubscribe(token) }
 
@@ -302,8 +304,9 @@ final class AppIdentityNotificationTests: XCTestCase {
             cwd: dir,
             prompt: "fail once"
         ))
-        await waitAsync("fake failure finishes") {
-            events.contains { $0.kind == "agent.run.finished" }
+        await waitAsync("fake failure emits one failed event and finishes") {
+            events.contains { $0.kind == "agent.run.failed" }
+                && events.contains { $0.kind == "agent.run.finished" }
         }
 
         XCTAssertEqual(events.filter { $0.kind == "agent.run.failed" }.count, 1,
