@@ -25,11 +25,15 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         super.init()
     }
 
+    private static var canUseNotificationCenter: Bool {
+        Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
+    }
+
     public func bootstrap() {
         // UNUserNotificationCenter requires the process to be a real
         // bundled .app. Running from `swift run` produces a binary
-        // without a bundle identifier and would crash on .current().
-        guard Bundle.main.bundleIdentifier != nil else { return }
+        // without an app bundle and would crash on .current().
+        guard Self.canUseNotificationCenter else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.setNotificationCategories([
@@ -52,7 +56,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     public func post(title: String, body: String?, category: String?) {
-        guard authorized, Bundle.main.bundleIdentifier != nil else { return }
+        guard authorized, Self.canUseNotificationCenter else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         if let b = body { content.body = b }
@@ -62,7 +66,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     public func post(_ content: RemoteCodeNotificationContent) {
-        guard authorized, Bundle.main.bundleIdentifier != nil else { return }
+        guard authorized, Self.canUseNotificationCenter else { return }
         UNUserNotificationCenter.current().add(content.makeRequest(), withCompletionHandler: nil)
     }
 
@@ -71,7 +75,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// Returns `.notDetermined` for non-bundled (`swift run`) processes where
     /// UNUserNotificationCenter is unavailable.
     public func authorizationStatus() async -> UNAuthorizationStatus {
-        guard Bundle.main.bundleIdentifier != nil else { return .notDetermined }
+        guard Self.canUseNotificationCenter else { return .notDetermined }
         return await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
     }
 
@@ -79,7 +83,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// button. Re-requests authorization when still undetermined so the first
     /// press also triggers the OS prompt.
     public func postTestNotification() {
-        guard Bundle.main.bundleIdentifier != nil else { return }
+        guard Self.canUseNotificationCenter else { return }
         let center = UNUserNotificationCenter.current()
         let deliver = {
             let content = UNMutableNotificationContent()
