@@ -970,6 +970,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         disableInsomniaForAppClose()
     }
 
+    public func windowShouldClose(_ sender: NSWindow) -> Bool {
+        context?.saveSnapshot()
+        sender.orderOut(nil)
+        router?.reconcileSurfaceVisibility()
+        return false
+    }
+
     public func windowDidBecomeKey(_ notification: Notification) {
         repairSelectedTerminalFocus(reason: "main_window_key")
     }

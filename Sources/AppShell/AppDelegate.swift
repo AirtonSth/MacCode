@@ -305,7 +305,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         return fresh
     }
 
-    public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     private func installMainMenu() {
         let mainMenu = NSMenu()
