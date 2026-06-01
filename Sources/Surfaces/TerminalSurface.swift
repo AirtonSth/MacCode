@@ -330,18 +330,29 @@ public final class TerminalSurface: NSObject, Surface {
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
     private var focusRepairGeneration = 0
+    private var busyStatePollActive = false
+    private var busyStateProbeUntil = Date.distantPast
+    private var lastPublishedBusyState = false
     private var didBeepForDeadInput = false
-    private var bellFlashGeneration = 0
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
-    private static let bellFlashDuration: TimeInterval = 0.18
+    private static let busyStateProbeDuration: TimeInterval = 2.0
+    private static let busyStatePollInterval: TimeInterval = 0.10
     private static let outputTelemetryByteInterval = 8 * 1024 * 1024
     private static let outputTelemetryTimeInterval: TimeInterval = 60
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
 
     public var viewportSize: TerminalViewportSize {
         terminalSize
+    }
+
+    public var isBusy: Bool {
+        Self.isTerminalJobBusy(
+            processAlive: processAlive,
+            shellPID: childPID,
+            foregroundProcessGroup: foregroundProcessGroup()
+        )
     }
 
     var ownsTerminalFocusForTesting: Bool {
@@ -610,8 +621,9 @@ public final class TerminalSurface: NSObject, Surface {
         autoSubmitSavedSSHPasswordIfNeeded(from: data)
         lastOutputAt = Date()
         descriptor.hasUnreadActivity = true
-        // BEL (0x07): visual flash so background-tab completion is noticeable;
-        // the unread badge above already covers the tab indicator (IMP-011).
+        // BEL (0x07): keep activity feedback non-visual. Some long-running CLIs
+        // emit repeated bells, and repainting the terminal background reads as
+        // pane flicker.
         if data.contains(0x07) { handleBell() }
         // HC-1: stream raw PTY output to the mirror in real time.
         outputBus.emit(descriptor.id, data)
@@ -625,6 +637,7 @@ public final class TerminalSurface: NSObject, Surface {
             continueHiddenBacklogDrainIfNeeded()
             ghosttyView.processOutput(data, render: false)
         }
+        scheduleBusyStateRefresh()
     }
 
     private func appendString(_ raw: String) {
@@ -688,6 +701,9 @@ public final class TerminalSurface: NSObject, Surface {
         guard processAlive, masterFD >= 0, terminalDeadReason == nil else { return .processExited }
         guard let inputPump else { return .writeFailed }
         let status = inputPump.enqueue(data)
+        if status == .accepted {
+            scheduleBusyStateRefresh()
+        }
         if status != .accepted {
             terminalLog.error("terminal.input_rejected surface=\(self.descriptor.id.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) pid=\(self.childPID, privacy: .public)")
             publishRuntimeHealth()
@@ -744,6 +760,25 @@ public final class TerminalSurface: NSObject, Surface {
             cols: terminalSize.cols,
             renderDiagnostics: renderDiagnostics()
         )
+    }
+
+    static func isTerminalJobBusy(
+        processAlive: Bool,
+        shellPID: Int32,
+        foregroundProcessGroup: Int32?
+    ) -> Bool {
+        guard processAlive, shellPID > 0, let foregroundProcessGroup else { return false }
+        return foregroundProcessGroup != shellPID
+    }
+
+    static func shouldContinueBusyStatePolling(isBusy: Bool, now: Date, probeUntil: Date) -> Bool {
+        isBusy || now < probeUntil
+    }
+
+    private func foregroundProcessGroup() -> Int32? {
+        guard masterFD >= 0 else { return nil }
+        let group = tcgetpgrp(masterFD)
+        return group > 0 ? group : nil
     }
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
@@ -832,6 +867,34 @@ public final class TerminalSurface: NSObject, Surface {
         SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
     }
 
+    private func scheduleBusyStateRefresh() {
+        busyStateProbeUntil = max(busyStateProbeUntil, Date().addingTimeInterval(Self.busyStateProbeDuration))
+        guard !busyStatePollActive else { return }
+        busyStatePollActive = true
+        pollBusyState()
+    }
+
+    private func pollBusyState() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.busyStatePollInterval) { [weak self] in
+            guard let self, !self.isClosing else { return }
+            let busy = self.isBusy
+            if busy != self.lastPublishedBusyState {
+                self.lastPublishedBusyState = busy
+                self.publishRuntimeHealth()
+            }
+            let now = Date()
+            guard Self.shouldContinueBusyStatePolling(
+                isBusy: busy,
+                now: now,
+                probeUntil: self.busyStateProbeUntil
+            ) else {
+                self.busyStatePollActive = false
+                return
+            }
+            self.pollBusyState()
+        }
+    }
+
     private func recordOutputTelemetry(bytes: Int) {
         guard bytes > 0 else { return }
         totalOutputBytes += bytes
@@ -845,25 +908,8 @@ public final class TerminalSurface: NSObject, Surface {
         terminalLog.info("terminal.output_health surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public) canRender=\(diagnostics.canRender, privacy: .public) blocked=\(diagnostics.blockedReason ?? "none", privacy: .public)")
     }
 
-    /// Brief background flash on terminal bell so completion in a background
-    /// tab is noticeable; the unread badge is already set by the caller (IMP-011).
-    private func handleBell() {
-        guard isVisible, !isClosing, let layer = view.layer else { return }
-        bellFlashGeneration &+= 1
-        let generation = bellFlashGeneration
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.backgroundColor = DS.NS.terminalFG.withAlphaComponent(0.18).cgColor
-        CATransaction.commit()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.bellFlashDuration) { [weak self] in
-            guard let self,
-                  self.bellFlashGeneration == generation,
-                  let layer = self.view.layer else { return }
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            layer.backgroundColor = DS.NS.terminalBG.cgColor
-            CATransaction.commit()
-        }
+    func handleBell() {
+        descriptor.hasUnreadActivity = true
     }
 
     private func markTerminalDead(reason: String, exitStatus: Int32?) {

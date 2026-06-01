@@ -6,6 +6,7 @@ import CoreModel
 public protocol Surface: AnyObject {
     var descriptor: SurfaceDescriptor { get }
     var view: NSView { get }
+    var isBusy: Bool { get }
     func focus()
     func unfocus()
     func didBecomeVisible()

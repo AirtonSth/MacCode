@@ -198,7 +198,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             _ = try? self?.createSurface(workspace: wid, type: .rightSidebarTool, paneID: nil, title: "Git")
                         }
                         agent.viewModel.onRunStateChange = { [weak self] in
-                            self?.windowController?.refreshFromState()
+                            guard let self else { return }
+                            if !self.promoteWorkspaceIfBusy(wid) {
+                                self.windowController?.refreshSurfaceRuntimeState()
+                            }
                         }
                         agent.viewModel.onRunCompleted = { [weak self] in
                             self?.promoteWorkspaceAfterCompletedRun(wid)
@@ -300,16 +303,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { return [] }
         return ctx.state.window.workspaces.compactMap { id in
             guard var ws = ctx.state.workspaces[id] else { return nil }
-            let surfaceBusy = ws.layout.paneIDs().contains { pid in
-                (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
-                    SurfaceRegistry.shared.surface($0.id)?.isBusy == true
-                }
-            }
-            let threadBusy = ((try? ctx.threadRepo.list(workspaceId: id)) ?? []).contains { $0.status == .running }
-            let busy = surfaceBusy || threadBusy
+            let busy = isWorkspaceBusy(id)
             if busy { ws.metadata["busy"] = "true" }
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws
+        }
+    }
+
+    public func isWorkspaceBusy(_ id: WorkspaceID) -> Bool {
+        guard let ctx = context,
+              let ws = ctx.state.workspaces[id] else { return false }
+        let surfaceBusy = ws.layout.paneIDs().contains { pid in
+            (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
+                isWorkspaceActivitySurface($0)
+            }
+        }
+        let threadBusy = ((try? ctx.threadRepo.list(workspaceId: id)) ?? []).contains { $0.status == .running }
+        return surfaceBusy || threadBusy
+    }
+
+    private func isWorkspaceActivitySurface(_ descriptor: SurfaceDescriptor) -> Bool {
+        guard SurfaceRegistry.shared.surface(descriptor.id)?.isBusy == true else { return false }
+        switch descriptor.type {
+        case .terminal, .agentApp:
+            return true
+        case .ssh, .browser, .files, .markdown, .filePreview, .rightSidebarTool:
+            return false
         }
     }
 
@@ -2229,7 +2248,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
                 }
                 agent.viewModel.onRunStateChange = { [weak self] in
-                    self?.windowController?.refreshFromState()
+                    guard let self else { return }
+                    if !self.promoteWorkspaceIfBusy(workspace) {
+                        self.windowController?.refreshSurfaceRuntimeState()
+                    }
                 }
                 agent.viewModel.onRunCompleted = { [weak self] in
                     self?.promoteWorkspaceAfterCompletedRun(workspace)
@@ -2773,17 +2795,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ]))
     }
 
-    public func promoteWorkspaceAfterCompletedRun(_ id: WorkspaceID) {
-        guard let ctx = context else { return }
+    @discardableResult
+    public func promoteWorkspaceIfBusy(_ id: WorkspaceID) -> Bool {
+        guard isWorkspaceBusy(id) else { return false }
+        return promoteWorkspaceForActivity(id)
+    }
+
+    @discardableResult
+    public func promoteWorkspaceContainingBusySurface(_ surfaceID: SurfaceID) -> Bool {
+        guard let located = try? locateSurface(surfaceID),
+              isWorkspaceActivitySurface(located.descriptor) else {
+            return false
+        }
+        return promoteWorkspaceForActivity(located.workspaceID)
+    }
+
+    @discardableResult
+    public func promoteWorkspaceAfterCompletedRun(_ id: WorkspaceID) -> Bool {
+        promoteWorkspaceForActivity(id)
+    }
+
+    @discardableResult
+    private func promoteWorkspaceForActivity(_ id: WorkspaceID) -> Bool {
+        guard let ctx = context else { return false }
         let before = ctx.state.window.workspaces
         try? ctx.apply(.promoteWorkspace(id))
         let order = ctx.state.window.workspaces
-        guard order != before else { return }
+        guard order != before else { return false }
         EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
             "workspace_id": .string(id.value.uuidString),
             "order": .array(order.map { .string($0.value.uuidString) })
         ]))
         windowController?.refreshFromState()
+        return true
     }
 }
 

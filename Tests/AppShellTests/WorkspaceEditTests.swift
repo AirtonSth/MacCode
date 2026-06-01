@@ -79,6 +79,84 @@ final class WorkspaceEditTests: XCTestCase {
                        "dragging a workspace row must update the host window order while preserving pinned-first sorting")
     }
 
+    func test_busyThreadPromotionPersistsWindowOrderWithinPinnedAndUnpinnedGroups() throws {
+        let (ctx, router) = try make()
+        let pinnedIdle = try router.createWorkspace(name: "pinned-idle", cwd: "/tmp")
+        let pinnedBusy = try router.createWorkspace(name: "pinned-busy", cwd: "/tmp")
+        let idle = try router.createWorkspace(name: "idle", cwd: "/tmp")
+        let busy = try router.createWorkspace(name: "busy", cwd: "/tmp")
+        try router.setWorkspacePinned(pinnedIdle.id, true)
+        try router.setWorkspacePinned(pinnedBusy.id, true)
+        var pinnedThread = AgentThread(workspaceId: pinnedBusy.id, title: "Pinned running", provider: .codex, model: "gpt-5.5")
+        pinnedThread.status = .running
+        try ctx.threadRepo.upsert(pinnedThread)
+        var unpinnedThread = AgentThread(workspaceId: busy.id, title: "Running", provider: .claude, model: "claude-opus-4-7")
+        unpinnedThread.status = .running
+        try ctx.threadRepo.upsert(unpinnedThread)
+
+        XCTAssertTrue(router.promoteWorkspaceIfBusy(pinnedBusy.id))
+        XCTAssertTrue(router.promoteWorkspaceIfBusy(busy.id))
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.reload()
+
+        XCTAssertEqual(ctx.state.window.workspaces, [pinnedBusy.id, pinnedIdle.id, busy.id, idle.id],
+                       "a running agent thread must persist the promoted workspace order, with pinned workspaces always ahead of unpinned workspaces")
+        XCTAssertEqual(vm.workspaces.map(\.id), [pinnedBusy.id, pinnedIdle.id, busy.id, idle.id],
+                       "the sidebar must render the persisted order instead of applying a temporary spinner-only sort")
+    }
+
+    func test_busySurfacePromotionPersistsWindowOrderUntilRestart() throws {
+        let (ctx, router) = try make()
+        let idle = try router.createWorkspace(name: "idle", cwd: "/tmp")
+        let busy = try router.createWorkspace(name: "busy", cwd: "/tmp")
+        let later = try router.createWorkspace(name: "later", cwd: "/tmp")
+        let descriptor = SurfaceDescriptor(
+            type: .terminal,
+            title: "terminal",
+            iconName: "terminal",
+            metadata: ["workspace": busy.id.value.uuidString]
+        )
+        let surface = WorkspaceBusyTestSurface(descriptor: descriptor)
+        surface.isBusy = true
+        SurfaceRegistry.shared.register(surface)
+        try ctx.apply(.addSurface(busy.id, paneID: nil, descriptor: descriptor))
+
+        XCTAssertTrue(router.promoteWorkspaceContainingBusySurface(descriptor.id))
+        XCTAssertEqual(ctx.state.window.workspaces, [busy.id, idle.id, later.id],
+                       "a terminal foreground job must persistently promote its workspace instead of only moving the visible row")
+
+        surface.isBusy = false
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.reload()
+
+        XCTAssertEqual(vm.workspaces.map(\.id), [busy.id, idle.id, later.id],
+                       "clearing the spinner must not undo the user's new persisted workspace order")
+    }
+
+    func test_browserLoadingDoesNotCreateWorkspaceSpinnerOrPromotion() throws {
+        let (ctx, router) = try make()
+        let idle = try router.createWorkspace(name: "idle", cwd: "/tmp")
+        let browserWorkspace = try router.createWorkspace(name: "browser-loading", cwd: "/tmp")
+        let descriptor = SurfaceDescriptor(
+            type: .browser,
+            title: "Loading",
+            iconName: "globe",
+            metadata: ["workspace": browserWorkspace.id.value.uuidString]
+        )
+        let surface = WorkspaceBusyTestSurface(descriptor: descriptor)
+        surface.isBusy = true
+        SurfaceRegistry.shared.register(surface)
+        try ctx.apply(.addSurface(browserWorkspace.id, paneID: nil, descriptor: descriptor))
+
+        XCTAssertFalse(router.isWorkspaceBusy(browserWorkspace.id),
+                       "browser loading may show a tab-level progress state, but it must not create the workspace spinner")
+        XCTAssertNil(try router.listWorkspaces().first(where: { $0.id == browserWorkspace.id })?.metadata["busy"],
+                     "workspace busy metadata is reserved for terminal jobs and agent runs")
+        XCTAssertFalse(router.promoteWorkspaceContainingBusySurface(descriptor.id),
+                       "browser loading must not reorder the workspace list")
+        XCTAssertEqual(ctx.state.window.workspaces, [idle.id, browserWorkspace.id])
+    }
+
     func test_remove_dropsWorkspace() throws {
         let (ctx, router) = try make()
         let ws = try router.createWorkspace(name: "w", cwd: "/tmp")
@@ -205,4 +283,22 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertEqual(w?.name, "renamed")
         XCTAssertEqual(w?.metadata["description"], "notes here")
     }
+}
+
+@MainActor
+private final class WorkspaceBusyTestSurface: Surface {
+    var descriptor: SurfaceDescriptor
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+    var isBusy = false
+
+    init(descriptor: SurfaceDescriptor) {
+        self.descriptor = descriptor
+    }
+
+    func focus() {}
+    func unfocus() {}
+    func close() {}
+    func sendText(_ text: String) {}
+    func readText() -> String { "" }
+    func snapshot() -> [String: String] { [:] }
 }

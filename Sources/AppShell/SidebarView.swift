@@ -103,7 +103,8 @@ public final class SidebarViewModel: ObservableObject {
 
     public func reload() {
         guard let ctx = context else { return }
-        workspaces = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
+        let loaded = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
+        workspaces = loaded
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
         reloadPrivateAccount()
@@ -440,9 +441,16 @@ public final class SidebarViewModel: ObservableObject {
 
     private func computeWorkspaceBusy(_ ws: Workspace) -> Bool {
         if ws.metadata["busy"] == "true" { return true }
+        if let router { return router.isWorkspaceBusy(ws.id) }
         return ws.layout.paneIDs().contains { pid in
             (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
-                SurfaceRegistry.shared.surface($0.id)?.isBusy == true
+                guard SurfaceRegistry.shared.surface($0.id)?.isBusy == true else { return false }
+                switch $0.type {
+                case .terminal, .agentApp:
+                    return true
+                case .ssh, .browser, .files, .markdown, .filePreview, .rightSidebarTool:
+                    return false
+                }
             }
         }
     }

@@ -52,6 +52,67 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
                        "surface.read_text must stay partial when render is suppressed by stale visibility truth")
     }
 
+    func test_terminalBellMarksActivityWithoutFlashingVisibleBackground() throws {
+        let surface = try TerminalSurface(
+            workspaceID: WorkspaceID(),
+            title: "terminal",
+            launch: .sshPlaceholder(cwd: NSTemporaryDirectory())
+        )
+        defer { surface.close() }
+        let originalBackground = surface.view.layer?.backgroundColor
+
+        surface.handleBell()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.20))
+
+        XCTAssertTrue(surface.descriptor.hasUnreadActivity,
+                      "terminal BEL output must still mark activity for tabs and mirrors")
+        XCTAssertCGColorEqual(surface.view.layer?.backgroundColor, originalBackground,
+                             "visible terminal BEL output must not repaint the pane background because repeated CLI bells read as flicker")
+    }
+
+    func test_terminalBusyStateTracksForegroundProcessGroupNotShellLiveness() {
+        XCTAssertFalse(TerminalSurface.isTerminalJobBusy(
+            processAlive: true,
+            shellPID: 100,
+            foregroundProcessGroup: 100
+        ), "an idle shell at a prompt is alive, but must not show tab or workspace spinners")
+        XCTAssertTrue(TerminalSurface.isTerminalJobBusy(
+            processAlive: true,
+            shellPID: 100,
+            foregroundProcessGroup: 200
+        ), "a foreground command owns the terminal process group while it runs, so the spinner must show")
+        XCTAssertFalse(TerminalSurface.isTerminalJobBusy(
+            processAlive: false,
+            shellPID: 100,
+            foregroundProcessGroup: 200
+        ), "a dead terminal must not keep stale spinners")
+        XCTAssertFalse(TerminalSurface.isTerminalJobBusy(
+            processAlive: true,
+            shellPID: 100,
+            foregroundProcessGroup: nil
+        ), "unknown foreground process-group state must fail closed so idle prompts do not spin forever")
+    }
+
+    func test_terminalBusyStatePollingCoversDelayedStartAndLongRunningCommands() {
+        let now = Date()
+
+        XCTAssertTrue(TerminalSurface.shouldContinueBusyStatePolling(
+            isBusy: false,
+            now: now,
+            probeUntil: now.addingTimeInterval(1)
+        ), "after sending terminal input, polling must keep probing briefly because shell job-control can flip after the first refresh")
+        XCTAssertTrue(TerminalSurface.shouldContinueBusyStatePolling(
+            isBusy: true,
+            now: now,
+            probeUntil: now.addingTimeInterval(-1)
+        ), "while a foreground command or Claude/Codex TUI owns the terminal, polling must continue until the spinner can clear")
+        XCTAssertFalse(TerminalSurface.shouldContinueBusyStatePolling(
+            isBusy: false,
+            now: now,
+            probeUntil: now.addingTimeInterval(-1)
+        ), "after the prompt is idle past the probe window, polling must stop so the terminal does not refresh forever")
+    }
+
     func test_focusRepairRetriesAfterTerminalViewAttachesToWindow() throws {
         let surface = try TerminalSurface(
             workspaceID: WorkspaceID(),
@@ -87,5 +148,22 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
 
         XCTAssertTrue(surface.ownsTerminalFocusForTesting,
                       "bounded delayed repair must focus the terminal once AppKit attaches and lays out the view")
+    }
+
+    private func XCTAssertCGColorEqual(
+        _ actual: CGColor?,
+        _ expected: CGColor?,
+        _ message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        switch (actual, expected) {
+        case (.none, .none):
+            return
+        case let (.some(actual), .some(expected)):
+            XCTAssertTrue(CFEqual(actual, expected), message, file: file, line: line)
+        default:
+            XCTFail(message, file: file, line: line)
+        }
     }
 }

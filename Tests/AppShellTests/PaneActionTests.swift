@@ -243,6 +243,72 @@ final class PaneActionTests: XCTestCase {
                       "tab rendering must show a spinner when any thread in that Agent App workspace is running, even if the live surface VM has stale thread state")
     }
 
+    func test_terminalBusySurfaceRollsUpToTabAndWorkspaceBusyState() throws {
+        let (ctx, router) = try makeContext()
+        try ctx.apply(.createWorkspace(name: "terminal-busy", cwd: NSTemporaryDirectory(), initial: nil))
+        let workspaceID = try XCTUnwrap(ctx.state.window.selectedWorkspaceID)
+        let descriptor = SurfaceDescriptor(
+            type: .terminal,
+            title: "terminal",
+            iconName: "terminal",
+            metadata: ["workspace": workspaceID.value.uuidString]
+        )
+        let surface = TestBusySurface(descriptor: descriptor)
+        SurfaceRegistry.shared.register(surface)
+        try ctx.apply(.addSurface(workspaceID, paneID: nil, descriptor: descriptor))
+
+        XCTAssertFalse(PaneTabsView.isSurfaceBusy(descriptor, router: router),
+                       "an idle terminal prompt must not show a tab spinner")
+        XCTAssertNil(try router.listWorkspaces().first(where: { $0.id == workspaceID })?.metadata["busy"],
+                     "an idle terminal prompt must not show a workspace spinner")
+
+        surface.isBusy = true
+
+        XCTAssertTrue(PaneTabsView.isSurfaceBusy(descriptor, router: router),
+                      "tab rendering must show a spinner while the terminal surface reports a foreground job")
+        XCTAssertEqual(try router.listWorkspaces().first(where: { $0.id == workspaceID })?.metadata["busy"], "true",
+                       "workspace rows must show the same spinner while any terminal in the workspace has a foreground job")
+
+        surface.isBusy = false
+
+        XCTAssertFalse(PaneTabsView.isSurfaceBusy(descriptor, router: router),
+                       "tab rendering must clear the spinner after the terminal returns to the prompt")
+        XCTAssertNil(try router.listWorkspaces().first(where: { $0.id == workspaceID })?.metadata["busy"],
+                     "workspace rows must drop the spinner after the terminal returns to the prompt")
+    }
+
+    func test_terminalBusyRuntimeRefreshUpdatesTabSpinnerWithoutRebuildingPane() throws {
+        let (ctx, router) = try makeContext()
+        try ctx.apply(.createWorkspace(name: "terminal-tab-busy", cwd: NSTemporaryDirectory(), initial: nil))
+        let workspaceID = try XCTUnwrap(ctx.state.window.selectedWorkspaceID)
+        let descriptor = SurfaceDescriptor(
+            type: .terminal,
+            title: "terminal",
+            iconName: "terminal",
+            metadata: ["workspace": workspaceID.value.uuidString]
+        )
+        let surface = TestBusySurface(descriptor: descriptor)
+        SurfaceRegistry.shared.register(surface)
+        try ctx.apply(.addSurface(workspaceID, paneID: nil, descriptor: descriptor))
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        let rootBefore = try XCTUnwrap(allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView })
+
+        XCTAssertTrue(tabProgressIndicators(in: controller, surfaceID: descriptor.id).isEmpty,
+                      "idle terminal tabs must render the normal terminal icon instead of a spinner")
+
+        surface.isBusy = true
+        controller.refreshSurfaceRuntimeState()
+        controller.window.contentView?.layoutSubtreeIfNeeded()
+        let rootAfter = try XCTUnwrap(allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView })
+
+        XCTAssertFalse(tabProgressIndicators(in: controller, surfaceID: descriptor.id).isEmpty,
+                       "a terminal busy-state change must update the existing tab header without waiting for a layout rebuild")
+        XCTAssertTrue(rootBefore === rootAfter,
+                      "runtime spinner updates must not rebuild the terminal pane because reattaching the terminal view can make input and Ctrl-C unreliable")
+    }
+
     func test_splitHorizontal_and_splitVertical_orientations() throws {
         let (ctx, router) = try makeContext()
         // Horizontal split → side-by-side (orientation .horizontal)
@@ -1083,6 +1149,13 @@ final class PaneActionTests: XCTestCase {
         }
         return true
     }
+
+    private func tabProgressIndicators(in controller: MainWindowController, surfaceID: SurfaceID) -> [NSProgressIndicator] {
+        guard let tab = allSubviews(of: controller.window.contentView ?? NSView()).first(where: {
+            $0.accessibilityIdentifier() == "pane.tab.\(surfaceID.value.uuidString)"
+        }) else { return [] }
+        return allSubviews(of: tab).compactMap { $0 as? NSProgressIndicator }
+    }
 }
 
 @MainActor
@@ -1102,4 +1175,22 @@ private final class RecordingAppUpdateChecker: AppUpdateChecking {
         checks += 1
         availability = .checking
     }
+}
+
+@MainActor
+private final class TestBusySurface: Surface {
+    var descriptor: SurfaceDescriptor
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: 100, height: 40))
+    var isBusy = false
+
+    init(descriptor: SurfaceDescriptor) {
+        self.descriptor = descriptor
+    }
+
+    func focus() {}
+    func unfocus() {}
+    func close() {}
+    func sendText(_ text: String) {}
+    func readText() -> String { "" }
+    func snapshot() -> [String: String] { [:] }
 }

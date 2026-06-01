@@ -400,6 +400,12 @@ public final class PaneTabsView: NSObject {
         tab.setDirty(values.contains { $0.stringValue != nil })
     }
 
+    func refreshBusyStates() {
+        for desc in pane.surfaces {
+            tabButtons[desc.id]?.setBusy(Self.isSurfaceBusy(desc, router: router))
+        }
+    }
+
     static func symbol(for type: SurfaceType) -> String {
         switch type {
         case .terminal: return "terminal"
@@ -675,11 +681,13 @@ final class PaneTabButton: NSView {
     private let onSetColor: ((String) -> Void)?
     private let onDropSurface: ((SurfaceID) -> Bool)?
     private let onSplitSurface: ((SurfaceID, PaneID, SplitDirection) -> Bool)?
+    private let iconContainer = NSView()
     private let dropIndicator = NSView()
     private var hovering = false
     private var dragStarted = false
     private var mouseDownLocation: NSPoint?
     private let selected: Bool
+    private var busy = false
     private static let dragActivationDistance: CGFloat = 8
 
     init(surfaceID: SurfaceID, title: String, symbol: String, selected: Bool, busy: Bool = false,
@@ -712,24 +720,10 @@ final class PaneTabButton: NSView {
         // QA-MAC_SHELL_WINDOW-001: addressable tab for UI automation.
         setAccessibilityIdentifier("pane.tab.\(surfaceID.value.uuidString)")
 
-        // A3: a busy surface shows a spinner where its icon would be.
-        let icon: NSView
-        if busy {
-            let spin = NSProgressIndicator()
-            spin.style = .spinning
-            spin.controlSize = .small
-            spin.isIndeterminate = true
-            spin.startAnimation(nil)
-            icon = spin
-        } else {
-            let iv = NSImageView()
-            iv.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-            iv.symbolConfiguration = .init(pointSize: 11, weight: .regular)
-            iv.contentTintColor = selected ? DS.NS.text : DS.NS.textTertiary
-            icon = iv
-        }
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.setContentHuggingPriority(.required, for: .horizontal)
+        iconContainer.translatesAutoresizingMaskIntoConstraints = false
+        iconContainer.setContentHuggingPriority(.required, for: .horizontal)
+        self.busy = busy
+        installIcon(busy: busy)
 
         let label = NSTextField(labelWithString: title)
         label.font = NSFont.systemFont(ofSize: 12, weight: selected ? .medium : .regular)
@@ -760,17 +754,18 @@ final class PaneTabButton: NSView {
         close.toolTip = "Close tab"
         close.setAccessibilityIdentifier("pane.tab.\(surfaceID.value.uuidString).close")
 
-        addSubview(icon); addSubview(label); addSubview(dirtyBadge); addSubview(close)
+        addSubview(iconContainer); addSubview(label); addSubview(dirtyBadge); addSubview(close)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 34),
             widthAnchor.constraint(greaterThanOrEqualToConstant: 130),
             widthAnchor.constraint(lessThanOrEqualToConstant: 240),
 
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 14),
+            iconContainer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            iconContainer.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconContainer.widthAnchor.constraint(equalToConstant: 14),
+            iconContainer.heightAnchor.constraint(equalToConstant: 14),
 
-            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
+            label.leadingAnchor.constraint(equalTo: iconContainer.trailingAnchor, constant: 7),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             dirtyBadge.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 7),
@@ -843,6 +838,39 @@ final class PaneTabButton: NSView {
                                       owner: self, userInfo: nil)
         addTrackingArea(tracking)
         registerForDraggedTypes([Self.pasteboardType])
+    }
+
+    func setBusy(_ busy: Bool) {
+        guard self.busy != busy else { return }
+        self.busy = busy
+        installIcon(busy: busy)
+    }
+
+    private func installIcon(busy: Bool) {
+        iconContainer.subviews.forEach { $0.removeFromSuperview() }
+        let icon: NSView
+        if busy {
+            let spin = NSProgressIndicator()
+            spin.style = .spinning
+            spin.controlSize = .small
+            spin.isIndeterminate = true
+            spin.startAnimation(nil)
+            icon = spin
+        } else {
+            let image = NSImageView()
+            image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            image.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+            image.contentTintColor = selected ? DS.NS.text : DS.NS.textTertiary
+            icon = image
+        }
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        iconContainer.addSubview(icon)
+        NSLayoutConstraint.activate([
+            icon.centerXAnchor.constraint(equalTo: iconContainer.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: iconContainer.centerYAnchor),
+            icon.widthAnchor.constraint(lessThanOrEqualTo: iconContainer.widthAnchor),
+            icon.heightAnchor.constraint(lessThanOrEqualTo: iconContainer.heightAnchor)
+        ])
     }
 
     override func rightMouseDown(with event: NSEvent) {

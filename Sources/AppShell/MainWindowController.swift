@@ -562,6 +562,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         restoreProtectedFocus(focusedInput)
     }
 
+    public func refreshSurfaceRuntimeState() {
+        sidebar.refresh()
+        for controller in paneControllers {
+            controller.refreshBusyStates()
+        }
+        for controller in workspaceWindows.values {
+            controller.refreshSurfaceRuntimeState()
+        }
+    }
+
     /// UX-MAC_SHELL_WINDOW-014: called once restored surfaces have been
     /// reinstantiated so subsequent empty states render as the normal
     /// no-workspace view rather than the restoring affordance.
@@ -1083,6 +1093,12 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
         workspaceContent.addSubview(layout)
         if let split = layout as? RatioSplitView {
             split.relayoutNow()
+        }
+    }
+
+    func refreshSurfaceRuntimeState() {
+        for controller in paneControllers {
+            controller.refreshBusyStates()
         }
     }
 

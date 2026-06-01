@@ -135,4 +135,15 @@ final class ProviderProcessSweeperTests: XCTestCase {
         XCTAssertEqual(providerProcesses.map(\.pid), [201, 202],
                        "heartbeat provider RSS must include the spawned Claude child without counting the app or user terminal Claude")
     }
+
+    func test_currentProviderProcessesDoesNotBlockOnLargeProcessLists() {
+        let finished = expectation(description: "provider process scan returned")
+
+        DispatchQueue.global(qos: .utility).async {
+            _ = ProviderProcessSweeper.currentProviderProcesses()
+            finished.fulfill()
+        }
+
+        wait(for: [finished], timeout: 2.0)
+    }
 }

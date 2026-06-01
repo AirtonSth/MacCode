@@ -261,6 +261,11 @@ public final class AppContext {
             EventBus.shared.publish(kind: "surface.output", payload: .object(payload))
         }
         SurfaceRuntimeBus.shared.sink = { sid, health in
+            Task { @MainActor [weak self] in
+                if self?.router?.promoteWorkspaceContainingBusySurface(sid) != true {
+                    self?.router?.windowController?.refreshSurfaceRuntimeState()
+                }
+            }
             EventBus.shared.publish(kind: "surface.health", payload: .object([
                 "surface_id": .string(sid.value.uuidString),
                 "alive": .bool(health.alive),

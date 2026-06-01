@@ -132,11 +132,11 @@ public enum ProviderProcessSweeper {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return []
         }
         let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         let text = String(data: data, encoding: .utf8) ?? ""
         return text
             .split(whereSeparator: \.isNewline)
