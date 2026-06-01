@@ -32,6 +32,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let dbOverride: String?
     private var providerSessionReaperTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
+    private var lifecycleRecorder: AppLifecycleRecorder?
 
     public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
         self.channel = channel
@@ -51,6 +52,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        installLifecycleRecorder()
         terminateOrphanedProviderRuntimes(reason: "launch")
         router = AppCommandRouter(context: context)
         context.router = router
@@ -142,6 +144,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     public func applicationWillTerminate(_ notification: Notification) {
         appLifecycleLog.info("app.will_terminate pid=\(ProcessInfo.processInfo.processIdentifier, privacy: .public)")
+        lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
         disableInsomniaForAppClose()
         persistRestorableStateBeforeUpdate()
@@ -190,6 +193,29 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0
         )
+    }
+
+    private func installLifecycleRecorder() {
+        let directory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
+            .appendingPathComponent("diagnostics", isDirectory: true)
+        let recorder = AppLifecycleRecorder(directory: directory)
+        if let stale = recorder.consumeStaleRunMarker() {
+            // The previous run never reached applicationWillTerminate: it was
+            // killed (SIGTERM/SIGKILL) or died abruptly with no crash report.
+            // This is the on-disk evidence for the "app silently vanished" report.
+            appLifecycleLog.fault("app.previous_run_unclean \(stale, privacy: .public)")
+            recorder.record("previous_run_ended_uncleanly \(stale)")
+        }
+        recorder.beginRun()
+        recorder.installSignalHandlers { [weak self] in
+            // Delivered on the main queue by the dispatch signal source, so it is
+            // safe to drive an AppKit shutdown. NSApp.terminate flows through
+            // applicationWillTerminate, which clears the run marker → the kill is
+            // recorded as a clean, attributable exit rather than a silent death.
+            self?.lifecycleRecorder?.record("terminate_via_signal")
+            NSApp.terminate(nil)
+        }
+        lifecycleRecorder = recorder
     }
 
     private func terminateOrphanedProviderRuntimes(reason: String) {

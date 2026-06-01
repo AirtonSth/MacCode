@@ -30,6 +30,13 @@ exit(found ? 0 : 1)
 SWIFT
 }
 
+if [[ -n "${RC2_SURFACE_ID:-}" ]]; then
+  echo "[run] refusing to relaunch: this shell is running INSIDE RemoteCode's embedded terminal (RC2_SURFACE_ID is set)." >&2
+  echo "[run] 'pkill -x ${APP_NAME}' here would kill the very app hosting this session — the window would vanish mid-task." >&2
+  echo "[run] Run scripts/run-app.sh from an external terminal (Terminal.app/iTerm) instead." >&2
+  exit 1
+fi
+
 pkill -x "$APP_NAME" 2>/dev/null || true
 RC2_REPLACE_RUNNING_APP=1 RC2_CONFIG=debug ./scripts/package-app.sh
 /usr/bin/open -n "$APP_BUNDLE"
