@@ -58,15 +58,15 @@ final class AppLifecycleRecorderTests: XCTestCase {
         XCTAssertTrue(AppLifecycleRecorder.shouldTerminate(onSignal: SIGINT))
     }
 
-    func test_handleSignalRunsTerminateOnlyForTerminatingSignals() {
-        let (recorder, _) = makeRecorder()
-        var sighupTerminated = false
-        recorder.handleSignal(SIGHUP) { sighupTerminated = true }
-        XCTAssertFalse(sighupTerminated, "SIGHUP must be recorded but must not trigger app termination")
+    func test_heartbeatAppendsSequencedLivenessSampleToDisk() throws {
+        let (recorder, dir) = makeRecorder()
+        recorder.recordHeartbeat(reason: "periodic")
+        recorder.recordHeartbeat(reason: "periodic")
 
-        var sigtermTerminated = false
-        recorder.handleSignal(SIGTERM) { sigtermTerminated = true }
-        XCTAssertTrue(sigtermTerminated, "SIGTERM must drive the graceful termination closure")
+        let log = try String(contentsOf: dir.appendingPathComponent("lifecycle.log"), encoding: .utf8)
+        XCTAssertTrue(log.contains("heartbeat seq=1"), "first heartbeat must be recorded so the last-alive time before a silent death is known")
+        XCTAssertTrue(log.contains("heartbeat seq=2"), "heartbeats must be sequenced so a gap before an unclean exit reveals a main-thread hang")
+        XCTAssertTrue(log.contains("rssKB="), "heartbeats must carry memory footprint so an out-of-memory kill is distinguishable from other deaths")
     }
 
     func test_recordWritesForensicLineToDisk() throws {

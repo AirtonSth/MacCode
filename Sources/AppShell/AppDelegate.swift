@@ -193,6 +193,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0
         )
+        lifecycleRecorder?.recordHeartbeat(reason: reason)
     }
 
     private func installLifecycleRecorder() {
@@ -207,14 +208,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             recorder.record("previous_run_ended_uncleanly \(stale)")
         }
         recorder.beginRun()
-        recorder.installSignalHandlers { [weak self] in
-            // Delivered on the main queue by the dispatch signal source, so it is
-            // safe to drive an AppKit shutdown. NSApp.terminate flows through
-            // applicationWillTerminate, which clears the run marker → the kill is
-            // recorded as a clean, attributable exit rather than a silent death.
-            self?.lifecycleRecorder?.record("terminate_via_signal")
-            NSApp.terminate(nil)
-        }
+        recorder.installSignalHandlers()
+        recorder.installExitHandler()
         lifecycleRecorder = recorder
     }
 
@@ -264,6 +259,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationDidBecomeActive(_ notification: Notification) {
+        // Timestamps the reveal (deminiaturize/refocus) AND samples memory at
+        // that instant, so the lifecycle log shows the app was alive at the
+        // moment focus returned — the gesture the silent-vanish report is tied
+        // to — and whether memory spiked on reveal (out-of-memory kill).
+        lifecycleRecorder?.recordHeartbeat(reason: "did_become_active")
         router?.reconcileSurfaceVisibility()
         windowController?.repairSelectedTerminalFocus(reason: "app_active")
     }

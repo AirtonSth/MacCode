@@ -386,6 +386,8 @@ final class GhosttyTerminalView: NSView {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(
+            self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
         if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
         }
@@ -421,9 +423,27 @@ final class GhosttyTerminalView: NSView {
         if window == nil {
             renderGeneration &+= 1
         }
+        observeWindowOcclusion(window)
         ensureSurface()
         updateGhosttySize(force: true)
         updateFocus()
+    }
+
+    /// Rendering is gated off while the window is off screen (see `isRenderable`),
+    /// so when it returns to screen we must redraw the current state — otherwise
+    /// the terminal would show a stale frame until the next output or focus event.
+    private func observeWindowOcclusion(_ window: NSWindow?) {
+        NotificationCenter.default.removeObserver(
+            self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        guard let window else { return }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowOcclusionDidChange),
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
+    }
+
+    @objc private func windowOcclusionDidChange() {
+        guard isRenderable else { return }
+        refreshSurfaceOnly()
     }
 
     override func viewDidChangeBackingProperties() {
@@ -654,7 +674,36 @@ final class GhosttyTerminalView: NSView {
     }
 
     private var isRenderable: Bool {
-        visibleInUI && window != nil && bounds.width > 0 && bounds.height > 0 && !isHidden
+        Self.canRender(
+            visibleInUI: visibleInUI,
+            isHidden: isHidden,
+            hasNonEmptyBounds: bounds.width > 0 && bounds.height > 0,
+            windowPresent: window != nil,
+            windowVisible: window?.isVisible ?? false,
+            windowMiniaturized: window?.isMiniaturized ?? false,
+            windowOnScreen: window?.occlusionState.contains(.visible) ?? false
+        )
+    }
+
+    /// Whether it is safe to render the Metal surface. A minimized or ordered-out
+    /// window keeps a non-nil `window`, but its CAMetalLayer has no valid
+    /// drawable; rendering into it (`render_now`) dereferences a freed
+    /// framebuffer texture and traps inside the GPU driver (EXC_BREAKPOINT in AGX
+    /// `renderCommandEncoderWithDescriptor:`), which Ghostty's embedded crash
+    /// reporter turns into a silent `_exit`. `occlusionState` is the signal
+    /// AppKit guarantees for "the window's content is actually on screen". Pure
+    /// so the off-screen invariant can be tested without a window server.
+    nonisolated static func canRender(
+        visibleInUI: Bool,
+        isHidden: Bool,
+        hasNonEmptyBounds: Bool,
+        windowPresent: Bool,
+        windowVisible: Bool,
+        windowMiniaturized: Bool,
+        windowOnScreen: Bool
+    ) -> Bool {
+        guard visibleInUI, !isHidden, hasNonEmptyBounds, windowPresent else { return false }
+        return windowVisible && !windowMiniaturized && windowOnScreen
     }
 
     private static func hasActiveDisplay() -> Bool {
