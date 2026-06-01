@@ -198,6 +198,53 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(s.contextCompactionSummary, "older messages compacted")
     }
 
+    func test_liveTimelineCapsRequestAndPlanDiagnosticsForLongAgentSessions() {
+        var s = AssistantTimelineState()
+
+        for i in 0..<(AssistantTimelineState.pendingRequestLimit + 40) {
+            s.apply(.requestOpened(AssistantPendingRequest(
+                id: "approval-\(i)",
+                turnId: "turn-\(i)",
+                kind: .commandExecution,
+                title: "Run \(i)",
+                detail: String(repeating: "x", count: 1_000),
+                createdAtMs: Int64(i)
+            )))
+            s.apply(.requestResolved(requestId: "approval-\(i)", state: .approved))
+            s.apply(.userInputRequested(AssistantUserInputRequest(
+                id: "question-\(i)",
+                turnId: "turn-\(i)",
+                prompt: "Question \(i)",
+                createdAtMs: Int64(i)
+            )))
+            s.apply(.userInputResolved(requestId: "question-\(i)", answer: "Answer \(i)"))
+        }
+        for i in 0..<(AssistantTimelineState.proposedPlanLimit + 20) {
+            s.apply(.proposedPlan(AssistantProposedPlan(
+                id: "plan-\(i)",
+                turnId: "turn-\(i)",
+                markdown: "Plan \(i)"
+            )))
+        }
+
+        XCTAssertLessThanOrEqual(s.pendingRequests.count, AssistantTimelineState.pendingRequestLimit,
+                                 "resolved approval diagnostics must be bounded so a 24h Agent App run cannot retain every callback card")
+        XCTAssertFalse(s.pendingRequests.contains { $0.id == "approval-0" },
+                       "bounded approval diagnostics must evict the oldest resolved callbacks first")
+        XCTAssertEqual(s.pendingRequests.last?.id, "approval-\(AssistantTimelineState.pendingRequestLimit + 39)",
+                       "bounded approval diagnostics must keep the newest callback visible")
+        XCTAssertLessThanOrEqual(s.pendingUserInputs.count, AssistantTimelineState.pendingRequestLimit,
+                                 "resolved user-input diagnostics must be bounded for long provider sessions")
+        XCTAssertFalse(s.pendingUserInputs.contains { $0.id == "question-0" },
+                       "bounded question diagnostics must evict the oldest resolved callbacks first")
+        XCTAssertEqual(s.pendingUserInputs.last?.id, "question-\(AssistantTimelineState.pendingRequestLimit + 39)")
+        XCTAssertLessThanOrEqual(s.proposedPlans.count, AssistantTimelineState.proposedPlanLimit,
+                                 "proposed plans must not accumulate forever in the live Agent App timeline")
+        XCTAssertFalse(s.proposedPlans.contains { $0.id == "plan-0" },
+                       "bounded plan diagnostics must evict oldest plan artifacts first")
+        XCTAssertEqual(s.proposedPlans.last?.id, "plan-\(AssistantTimelineState.proposedPlanLimit + 19)")
+    }
+
     func test_activePlanTracksStepStateSeparatelyFromProposedPlan() {
         var s = AssistantTimelineState()
         s.apply(.proposedPlan(AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")))

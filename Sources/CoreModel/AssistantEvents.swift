@@ -416,6 +416,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public static let liveTurnLimit = 80
     public static let providerRuntimeEventLimit = 500
     public static let workActivityLimit = 120
+    public static let pendingRequestLimit = 200
+    public static let proposedPlanLimit = 50
 
     public var threadId: String?
     public var providerThreadId: String?
@@ -545,11 +547,15 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .proposedPlan(let plan):
             proposedPlans.removeAll { $0.id == plan.id }
             proposedPlans.append(plan)
+            if proposedPlans.count > Self.proposedPlanLimit {
+                proposedPlans.removeFirst(proposedPlans.count - Self.proposedPlanLimit)
+            }
         case .activePlanUpdated(let plan):
             activePlan = plan
         case .requestOpened(let request):
             pendingRequests.removeAll { $0.id == request.id }
             pendingRequests.append(request)
+            trimPendingRequests()
             recordActivity(AssistantWorkActivity(
                 id: "request:\(request.id)",
                 kind: .request,
@@ -572,9 +578,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     createdAtMs: request.resolvedAtMs ?? request.createdAtMs
                 ))
             }
+            trimPendingRequests()
         case .userInputRequested(let request):
             pendingUserInputs.removeAll { $0.id == request.id }
             pendingUserInputs.append(request)
+            trimPendingUserInputs()
             recordActivity(AssistantWorkActivity(
                 id: "user_input:\(request.id)",
                 kind: .userInput,
@@ -598,6 +606,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     createdAtMs: request.resolvedAtMs ?? request.createdAtMs
                 ))
             }
+            trimPendingUserInputs()
         case .tokenUsage(let usage):
             tokenUsage = usage
         case .contextCompaction(let summary):
@@ -638,6 +647,16 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     private mutating func trimTurns() {
         guard turns.count > Self.liveTurnLimit else { return }
         turns = Array(turns.suffix(Self.liveTurnLimit))
+    }
+
+    private mutating func trimPendingRequests() {
+        guard pendingRequests.count > Self.pendingRequestLimit else { return }
+        pendingRequests = Array(pendingRequests.suffix(Self.pendingRequestLimit))
+    }
+
+    private mutating func trimPendingUserInputs() {
+        guard pendingUserInputs.count > Self.pendingRequestLimit else { return }
+        pendingUserInputs = Array(pendingUserInputs.suffix(Self.pendingRequestLimit))
     }
 
     @discardableResult

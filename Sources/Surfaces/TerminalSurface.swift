@@ -6,6 +6,9 @@ import CoreModel
 import Persistence
 import CSystem
 import DesignSystemKit
+import os
+
+private let terminalLog = Logger(subsystem: "io.remotecode.surfaces", category: "terminal")
 
 /// An NSTextView that behaves like a real terminal: every keystroke is
 /// translated to bytes and written straight to the pty (via `onKey`),
@@ -320,6 +323,9 @@ public final class TerminalSurface: NSObject, Surface {
     private var historyWriteFailures = 0
     private var outputPartial = false
     private var outputPendingBytes = 0
+    private var totalOutputBytes = 0
+    private var outputBytesAtLastTelemetry = 0
+    private var lastOutputTelemetryAt = Date.distantPast
     private var readerAllowsRender = true
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
@@ -330,6 +336,8 @@ public final class TerminalSurface: NSObject, Surface {
     private var parkingConstraints: [NSLayoutConstraint] = []
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     private static let bellFlashDuration: TimeInterval = 0.18
+    private static let outputTelemetryByteInterval = 8 * 1024 * 1024
+    private static let outputTelemetryTimeInterval: TimeInterval = 60
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
 
     public var viewportSize: TerminalViewportSize {
@@ -467,6 +475,7 @@ public final class TerminalSurface: NSObject, Surface {
         if pid < 0 {
             appendString("[forkpty failed: \(String(cString: strerror(errno)))]\n")
             terminalDeadReason = "fork_failed"
+            terminalLog.error("terminal.spawn_failed surface=\(self.descriptor.id.value.uuidString, privacy: .public) errno=\(errno, privacy: .public)")
             publishRuntimeHealth()
             return
         }
@@ -509,6 +518,7 @@ public final class TerminalSurface: NSObject, Surface {
         configureInputPump(fd: amaster)
         applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
+        terminalLog.info("terminal.spawned surface=\(self.descriptor.id.value.uuidString, privacy: .public) type=\(self.descriptor.type.rawValue, privacy: .public) pid=\(pid, privacy: .public) rows=\(self.terminalSize.rows, privacy: .public) cols=\(self.terminalSize.cols, privacy: .public)")
         if case .ssh(let profile, _) = launch {
             awaitingSSHFirstOutput = true
             let host = profile.label.isEmpty ? profile.destination : profile.label
@@ -568,6 +578,7 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func handlePTYEOF() {
+        terminalLog.info("terminal.pty_eof surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public)")
         readSource?.cancel()
         readSource = nil
         if masterFD >= 0 {
@@ -591,6 +602,7 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
         enqueueHistory(data)
+        recordOutputTelemetry(bytes: data.count)
         if awaitingSSHFirstOutput {
             awaitingSSHFirstOutput = false
             descriptor.metadata["ssh_status"] = "connected"
@@ -618,6 +630,7 @@ public final class TerminalSurface: NSObject, Surface {
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
         enqueueHistory(data)
+        recordOutputTelemetry(bytes: data.count)
         renderer.feed(data)
         lastOutputAt = Date()
         outputBus.emit(descriptor.id, data)
@@ -676,6 +689,7 @@ public final class TerminalSurface: NSObject, Surface {
         guard let inputPump else { return .writeFailed }
         let status = inputPump.enqueue(data)
         if status != .accepted {
+            terminalLog.error("terminal.input_rejected surface=\(self.descriptor.id.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) pid=\(self.childPID, privacy: .public)")
             publishRuntimeHealth()
         }
         return status
@@ -694,6 +708,9 @@ public final class TerminalSurface: NSObject, Surface {
         })
         pump.onTerminalFailure = { [weak self] status in
             DispatchQueue.main.async {
+                if let self {
+                    terminalLog.error("terminal.input_failed surface=\(self.descriptor.id.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) pid=\(self.childPID, privacy: .public)")
+                }
                 self?.markTerminalDead(reason: status.rawValue, exitStatus: nil)
             }
         }
@@ -815,6 +832,19 @@ public final class TerminalSurface: NSObject, Surface {
         SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
     }
 
+    private func recordOutputTelemetry(bytes: Int) {
+        guard bytes > 0 else { return }
+        totalOutputBytes += bytes
+        let now = Date()
+        let byteDelta = totalOutputBytes - outputBytesAtLastTelemetry
+        guard byteDelta >= Self.outputTelemetryByteInterval ||
+                now.timeIntervalSince(lastOutputTelemetryAt) >= Self.outputTelemetryTimeInterval else { return }
+        outputBytesAtLastTelemetry = totalOutputBytes
+        lastOutputTelemetryAt = now
+        let diagnostics = renderDiagnostics()
+        terminalLog.info("terminal.output_health surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public) canRender=\(diagnostics.canRender, privacy: .public) blocked=\(diagnostics.blockedReason ?? "none", privacy: .public)")
+    }
+
     /// Brief background flash on terminal bell so completion in a background
     /// tab is noticeable; the unread badge is already set by the caller (IMP-011).
     private func handleBell() {
@@ -841,8 +871,12 @@ public final class TerminalSurface: NSObject, Surface {
         let wasAlive = processAlive
         processAlive = false
         self.exitStatus = exitStatus ?? self.exitStatus
+        if let rawStatus = self.exitStatus, (rawStatus & 0x7F) != 0 {
+            terminationSignal = rawStatus & 0x7F
+        }
         terminalDeadReason = reason
         inputPump?.stop(reason: .processExited)
+        terminalLog.info("terminal.dead surface=\(self.descriptor.id.value.uuidString, privacy: .public) reason=\(reason, privacy: .public) rawStatus=\(self.exitStatus ?? -1, privacy: .public) signal=\(self.terminationSignal ?? -1, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public)")
         if wasAlive, !isClosing {
             appendString("\r\n" + Self.processExitedBanner(rawStatus: exitStatus) + "\r\n")
         }
@@ -1020,6 +1054,7 @@ public final class TerminalSurface: NSObject, Surface {
             childPID = -1
             processAlive = false
             terminalDeadReason = terminalDeadReason ?? "closed"
+            terminalLog.info("terminal.close surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(pid, privacy: .public)")
             kill(pid, SIGHUP)
             DispatchQueue.global(qos: .utility).async {
                 var status: Int32 = 0

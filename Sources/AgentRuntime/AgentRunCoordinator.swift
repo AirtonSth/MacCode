@@ -423,6 +423,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return Set(activeThreads.keys)
     }
 
+    public func stopAllProviderSessions() {
+        lock.lock()
+        let adapters = Array(providers.values)
+        lock.unlock()
+        adapters.forEach { $0.stopAll() }
+    }
+
     private func adapterForThread(_ threadId: AgentThreadID) throws -> AgentProviderAdapter {
         guard let thread = try threadRepo.get(id: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)

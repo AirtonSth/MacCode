@@ -5,6 +5,9 @@ import Persistence
 import AgentRuntime
 import SocketServer
 import Surfaces
+import os
+
+private let appLifecycleLog = Logger(subsystem: "io.remotecode.app", category: "lifecycle")
 
 @MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -28,6 +31,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let appSupportOverride: String?
     private let dbOverride: String?
     private var providerSessionReaperTimer: Timer?
+    private var diagnosticsHeartbeatTimer: Timer?
 
     public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
         self.channel = channel
@@ -47,6 +51,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        terminateOrphanedProviderRuntimes(reason: "launch")
         router = AppCommandRouter(context: context)
         context.router = router
 
@@ -126,6 +131,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         installMainMenu()
         windowController.show()
+        startDiagnosticsHeartbeat()
+        logDiagnosticsHeartbeat(reason: "launch")
         checkForUpdatesAfterOpeningApp()
     }
 
@@ -134,12 +141,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
+        appLifecycleLog.info("app.will_terminate pid=\(ProcessInfo.processInfo.processIdentifier, privacy: .public)")
+        logDiagnosticsHeartbeat(reason: "will_terminate")
         disableInsomniaForAppClose()
         persistRestorableStateBeforeUpdate()
+        stopLiveRuntimesForAppTermination()
         socketServer?.stop()
         httpServer?.stop()
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
+        diagnosticsHeartbeatTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -155,6 +166,36 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         for surface in SurfaceRegistry.shared.all() {
             (surface as? TerminalSurface)?.flushPersistedHistory()
         }
+    }
+
+    private func stopLiveRuntimesForAppTermination() {
+        context?.coordinator.stopAllProviderSessions()
+        for surface in SurfaceRegistry.shared.all() {
+            surface.close()
+        }
+    }
+
+    private func startDiagnosticsHeartbeat() {
+        diagnosticsHeartbeatTimer?.invalidate()
+        diagnosticsHeartbeatTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.logDiagnosticsHeartbeat(reason: "periodic")
+            }
+        }
+    }
+
+    private func logDiagnosticsHeartbeat(reason: String) {
+        AppDiagnostics.heartbeat(
+            reason: reason,
+            activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0
+        )
+    }
+
+    private func terminateOrphanedProviderRuntimes(reason: String) {
+        let result = ProviderProcessSweeper.terminateOrphanedProviderRuntimes()
+        guard !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty else { return }
+        appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

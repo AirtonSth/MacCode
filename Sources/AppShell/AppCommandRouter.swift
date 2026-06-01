@@ -2815,6 +2815,7 @@ private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
         "output_partial": .bool(health.outputPartial),
         "output_pending_bytes": .number(Double(health.outputPendingBytes)),
         "history_write_failures": .number(Double(health.historyWriteFailures)),
+        "dropped_output_bytes": .number(Double(health.droppedOutputBytes)),
         "rows": .number(Double(health.rows)),
         "cols": .number(Double(health.cols)),
         "render_diagnostics": health.renderDiagnostics.map(terminalRenderDiagnosticsJSON) ?? .null

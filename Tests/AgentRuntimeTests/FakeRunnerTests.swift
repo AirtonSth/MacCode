@@ -1251,6 +1251,26 @@ final class FakeRunnerTests: XCTestCase {
         }
     }
 
+    func test_stopAllProviderSessionsStopsEveryAdapterForAppShutdown() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-stop-all-providers-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let codex = SpyProviderAdapter(provider: .codex)
+        let claude = SpyProviderAdapter(provider: .claude)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: AgentThreadRepository(db: db),
+            providerAdapters: [.codex: codex, .claude: claude]
+        )
+
+        coordinator.stopAllProviderSessions()
+
+        XCTAssertTrue(codex.stopAllCalled,
+                      "app shutdown must terminate Codex provider runtimes instead of leaving orphan app-server processes")
+        XCTAssertTrue(claude.stopAllCalled,
+                      "app shutdown must terminate Claude provider runtimes instead of leaving orphan bridge processes")
+    }
+
     func test_claudeCliAdapterKeepsReadableThreadHistoryAndRollsBackLocalSnapshot() async throws {
         let adapter = ClaudeCLIAdapter(runner: ScriptedClaudeRunner())
         let threadId = AgentThreadID()
