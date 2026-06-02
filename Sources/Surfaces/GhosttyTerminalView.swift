@@ -364,7 +364,16 @@ final class GhosttyTerminalView: NSView {
     private var lastScale = NSSize(width: 0, height: 0)
     private var renderGeneration = 0
     private var visibleInUI = true
+    /// Latched true by closeSurface() so a queued AppKit pass (layout/backing/move)
+    /// cannot resurrect a freed surface via ensureSurface() on a view that is being
+    /// torn down — that would bind a fresh ghostty surface (renderer + IO threads)
+    /// to a dying view (use-after-free). Cleared only by the explicit reuse path
+    /// resetSurfaceOutput().
+    private var surfaceClosed = false
     private var dropHighlightLayer: CALayer?
+    private var mouseTrackingArea: NSTrackingArea?
+    /// In-progress IME composition (marked text). Empty when not composing.
+    private var markedText = ""
     /// Count of bytes discarded from the front of `pendingOutput` on overflow
     /// while truly unrenderable (no live surface). Should stay 0 in normal
     /// operation; exposed via runtime health so tests/telemetry catch the drop
@@ -386,8 +395,7 @@ final class GhosttyTerminalView: NSView {
     }
 
     deinit {
-        NotificationCenter.default.removeObserver(
-            self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        NotificationCenter.default.removeObserver(self)
         if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
         }
@@ -415,6 +423,13 @@ final class GhosttyTerminalView: NSView {
         wantsLayer = true
         layer?.masksToBounds = true
         ioContext.view = self
+        // Ghostty's IO thread may invoke io_write_cb (which dereferences this
+        // ioContext via its raw userdata pointer) at any time, including around
+        // surface free / view dealloc with no quiescence guarantee. Pin the tiny
+        // context for the process lifetime so that pointer can never dangle into
+        // freed memory (use-after-free on a ghostty thread). The weak `view`
+        // inside it goes nil on dealloc, so the callback safely no-ops.
+        _ = Unmanaged.passRetained(ioContext)
         registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
     }
 
@@ -429,21 +444,31 @@ final class GhosttyTerminalView: NSView {
         updateFocus()
     }
 
-    /// Rendering is gated off while the window is off screen (see `isRenderable`),
-    /// so when it returns to screen we must redraw the current state — otherwise
-    /// the terminal would show a stale frame until the next output or focus event.
+    /// Observe per-window notifications. Occlusion: rendering is gated off while
+    /// the window is off screen (see `isRenderable`), so on return to screen we
+    /// redraw the current state (else a stale frame shows). Screen change: the
+    /// surface's display id must follow the window across monitors, otherwise
+    /// Ghostty renders against the wrong display's refresh/color profile.
     private func observeWindowOcclusion(_ window: NSWindow?) {
-        NotificationCenter.default.removeObserver(
-            self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        let center = NotificationCenter.default
+        center.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        center.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
         guard let window else { return }
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(windowOcclusionDidChange),
-            name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        center.addObserver(self, selector: #selector(windowOcclusionDidChange),
+                           name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        center.addObserver(self, selector: #selector(windowDidChangeScreen),
+                           name: NSWindow.didChangeScreenNotification, object: window)
     }
 
     @objc private func windowOcclusionDidChange() {
         guard isRenderable else { return }
         refreshSurfaceOnly()
+    }
+
+    @objc private func windowDidChangeScreen() {
+        guard let surface = surfaceSlot.liveSurface(),
+              let displayID = window?.screen?.displayID, displayID != 0 else { return }
+        ghostty_surface_set_display_id(surface, displayID)
     }
 
     override func viewDidChangeBackingProperties() {
@@ -456,8 +481,26 @@ final class GhosttyTerminalView: NSView {
         updateGhosttySize(force: false)
     }
 
+    // Without a .mouseMoved tracking area, AppKit never delivers mouseMoved:, so
+    // bare hover-motion reporting (DECSET 1003) never reaches TUIs (vim/htop/etc.).
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let mouseTrackingArea {
+            removeTrackingArea(mouseTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        mouseTrackingArea = area
+    }
+
     func closeSurface() {
         renderGeneration &+= 1
+        surfaceClosed = true
         if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
         }
@@ -467,6 +510,8 @@ final class GhosttyTerminalView: NSView {
 
     func resetSurfaceOutput(_ data: Data) {
         closeSurface()
+        // Intentional re-creation: allow ensureSurface() to build a fresh surface.
+        surfaceClosed = false
         processOutput(data)
     }
 
@@ -629,6 +674,7 @@ final class GhosttyTerminalView: NSView {
 
     private func ensureSurface() {
         guard Self.nativeRendererEnabled else { return }
+        guard !surfaceClosed else { return }
         guard surfaceSlot.liveSurface() == nil else { return }
         guard window != nil else { return }
         guard bounds.width > 0, bounds.height > 0 else { return }
@@ -827,19 +873,6 @@ final class GhosttyTerminalView: NSView {
         var key = ghosttyKeyEvent(for: event, action: GHOSTTY_ACTION_RELEASE)
         key.text = nil
         _ = ghostty_surface_key(surface, key)
-    }
-
-    override func insertText(_ insertString: Any) {
-        let text: String?
-        if let string = insertString as? String {
-            text = string
-        } else if let attributed = insertString as? NSAttributedString {
-            text = attributed.string
-        } else {
-            text = nil
-        }
-        guard let surface = surfaceForInput(), let text else { return }
-        sendText(text, to: surface)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1063,8 +1096,15 @@ final class GhosttyTerminalView: NSView {
     }
 
     private func sendText(_ text: String, to surface: ghostty_surface_t) {
-        text.withCString { ptr in
-            ghostty_surface_text(surface, ptr, UInt(strlen(ptr)))
+        // Use the true UTF-8 byte length, not strlen — strlen stops at the first
+        // embedded NUL, truncating pasted/bracketed content that contains \0.
+        let bytes = Array(text.utf8)
+        guard !bytes.isEmpty else { return }
+        bytes.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
+                ghostty_surface_text(surface, ptr, UInt(buf.count))
+            }
         }
     }
 
@@ -1170,5 +1210,74 @@ final class GhosttyTerminalView: NSView {
 private extension NSScreen {
     var displayID: UInt32? {
         deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32
+    }
+}
+
+// IME / dead-key / CJK composition. Without NSTextInputClient conformance,
+// interpretKeyEvents (called from keyDown) cannot drive marked-text composition,
+// so multi-stage input (Pinyin, Kana, dead keys) was broken. The cmux GhosttyKit
+// fork exposes ghostty_surface_preedit so the engine can render the in-progress
+// composition; committed text flows through the existing typed-text path.
+extension GhosttyTerminalView: NSTextInputClient {
+    private static func plainString(from any: Any) -> String? {
+        if let s = any as? String { return s }
+        if let a = any as? NSAttributedString { return a.string }
+        return nil
+    }
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        setPreedit("")
+        guard let text = Self.plainString(from: string), !text.isEmpty,
+              let surface = surfaceForInput() else { return }
+        sendText(text, to: surface)
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        setPreedit(Self.plainString(from: string) ?? "")
+    }
+
+    func unmarkText() {
+        setPreedit("")
+    }
+
+    /// Push the marked (composing) text to Ghostty so it renders the preedit
+    /// overlay. Empty string clears it. Keeps `markedText` in sync for AppKit.
+    private func setPreedit(_ text: String) {
+        markedText = text
+        guard let surface = surfaceForInput() else { return }
+        let bytes = Array(text.utf8)
+        if bytes.isEmpty {
+            ghostty_surface_preedit(surface, nil, 0)
+            return
+        }
+        bytes.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
+                ghostty_surface_preedit(surface, ptr, UInt(buf.count))
+            }
+        }
+    }
+
+    func hasMarkedText() -> Bool { !markedText.isEmpty }
+
+    func markedRange() -> NSRange {
+        markedText.isEmpty
+            ? NSRange(location: NSNotFound, length: 0)
+            : NSRange(location: 0, length: (markedText as NSString).length)
+    }
+
+    func selectedRange() -> NSRange { NSRange(location: NSNotFound, length: 0) }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? { nil }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+
+    func characterIndex(for point: NSPoint) -> Int { NSNotFound }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        // Anchor the IME candidate window to the view; ghostty does not expose a
+        // per-glyph caret rect to embedders, so use the view rect in screen space.
+        guard let window else { return .zero }
+        return window.convertToScreen(convert(bounds, to: nil))
     }
 }

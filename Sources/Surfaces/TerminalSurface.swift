@@ -548,8 +548,14 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func startReader() {
-        let src = DispatchSource.makeReadSource(fileDescriptor: masterFD, queue: .global())
+        let fd = masterFD
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global())
         readSource = src
+        // The read source owns the fd. It is closed here — on the source's own
+        // queue, after the final event handler returns — so the main thread never
+        // closes masterFD out from under an in-flight background read() (data race
+        // + closed-fd / fd-reuse hazard). close()/handlePTYEOF only cancel().
+        src.setCancelHandler { Darwin.close(fd) }
         var buf = [UInt8](repeating: 0, count: 4096)
         src.setEventHandler { [weak self] in
             guard let self else { return }
@@ -557,7 +563,7 @@ public final class TerminalSurface: NSObject, Surface {
             var shouldClose = false
 
             while true {
-                let n = read(self.masterFD, &buf, buf.count)
+                let n = read(fd, &buf, buf.count)
                 if n > 0 {
                     output.append(contentsOf: buf[0..<Int(n)])
                     continue
@@ -578,8 +584,9 @@ public final class TerminalSurface: NSObject, Surface {
 
             if !output.isEmpty {
                 let data = output
-                let renderAllowedAtRead = self.readerAllowsRender
-                DispatchQueue.main.async { self.appendDataAsync(data, renderAllowedAtRead: renderAllowedAtRead) }
+                // Read readerAllowsRender on main (where it is written); sampling it
+                // on this background queue is a data race.
+                DispatchQueue.main.async { self.appendDataAsync(data, renderAllowedAtRead: self.readerAllowsRender) }
             }
             if shouldClose {
                 DispatchQueue.main.async { self.handlePTYEOF() }
@@ -590,12 +597,9 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func handlePTYEOF() {
         terminalLog.info("terminal.pty_eof surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public)")
-        readSource?.cancel()
+        readSource?.cancel()   // cancel handler closes the fd on the source's queue
         readSource = nil
-        if masterFD >= 0 {
-            Darwin.close(masterFD)
-            masterFD = -1
-        }
+        masterFD = -1
         let status = reapChildIfExited()
         markTerminalDead(reason: "process_exited", exitStatus: status)
     }
@@ -1107,10 +1111,9 @@ public final class TerminalSurface: NSObject, Surface {
                 _ = waitpid(pid, &status, 0)
             }
         }
-        if masterFD >= 0 {
-            Darwin.close(masterFD)
-            masterFD = -1
-        }
+        // fd is closed by the read source's cancel handler (see startReader),
+        // after the last in-flight read completes — not directly on main.
+        masterFD = -1
         ghosttyView.closeSurface()
         publishRuntimeHealth()
     }
