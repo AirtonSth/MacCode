@@ -543,7 +543,12 @@ final class GhosttyTerminalView: NSView {
             )
         }
         guard render, isRenderable else { return }
-        ghostty_surface_render_now(surface)
+        // Do NOT render synchronously on the main thread. ghostty_surface_render_now
+        // makes the main thread a second renderer running concurrently with Ghostty's
+        // own renderer thread and its cf_release thread, which races the CoreText
+        // shaper's deferred-CFRelease pool (use-after-free, EXC_BAD_ACCESS in
+        // cf_release_thread). Only post an async refresh so Ghostty's single
+        // renderer thread draws.
         ghostty_surface_refresh(surface)
     }
 
@@ -557,7 +562,7 @@ final class GhosttyTerminalView: NSView {
         updateGhosttySize(force: true)
         flushPendingOutput()
         if let surface = surfaceSlot.liveSurface() {
-            ghostty_surface_render_now(surface)
+            // Async refresh only — never render on the main thread (see processOutputImmediately).
             ghostty_surface_refresh(surface)
         }
     }
@@ -946,7 +951,7 @@ final class GhosttyTerminalView: NSView {
             _ = ghostty_surface_binding_action(surface, ptr, UInt(strlen(ptr)))
         }
         if isRenderable {
-            ghostty_surface_render_now(surface)
+            // Async refresh only — never render on the main thread (see processOutputImmediately).
             ghostty_surface_refresh(surface)
         }
     }
@@ -996,7 +1001,7 @@ final class GhosttyTerminalView: NSView {
         }
         mods |= mouseMomentum(from: event) << 1
         ghostty_surface_mouse_scroll(surface, x, y, ghostty_input_scroll_mods_t(mods))
-        ghostty_surface_render_now(surface)
+        // Async refresh only — never render on the main thread (see processOutputImmediately).
         ghostty_surface_refresh(surface)
     }
 
