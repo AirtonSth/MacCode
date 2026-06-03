@@ -433,6 +433,22 @@ final class GhosttyTerminalView: NSView {
         registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
     }
 
+    /// AppKit calls this *before* our `window` actually changes. A terminal moved
+    /// to a split pane or a new window is transiently windowless during the AppKit
+    /// reparent (the workspace rebuild removes the subtree from its window before
+    /// re-adding it): the CAMetalLayer loses its drawable while Ghostty's renderer
+    /// (an internal display link) keeps running. Drawing into a windowless layer
+    /// starves `nextDrawable` — the terminal "stops updating", and the held GPU
+    /// drawable can stall the WindowServer (whole-system freeze). Suspend Ghostty's
+    /// renderer here, *before* the window is torn away; `syncOcclusion()` re-enables
+    /// it once the view is reattached to an on-screen window. Mirrors cmux, which
+    /// sets occlusion off before reparenting a surface.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        guard newWindow == nil, let surface = surfaceSlot.liveSurface() else { return }
+        ghostty_surface_set_occlusion(surface, false)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil {
@@ -442,6 +458,10 @@ final class GhosttyTerminalView: NSView {
         ensureSurface()
         updateGhosttySize(force: true)
         updateFocus()
+        // Re-evaluate whether Ghostty may render now that the window changed: on
+        // reattach to an on-screen window this resumes the renderer; on detach it
+        // keeps it suspended (complements viewWillMove).
+        syncOcclusion()
     }
 
     /// Observe per-window notifications. Occlusion: rendering is gated off while
@@ -461,6 +481,11 @@ final class GhosttyTerminalView: NSView {
     }
 
     @objc private func windowOcclusionDidChange() {
+        // The window went on/off screen — fold that into Ghostty's occlusion so
+        // its renderer suspends off screen and resumes on screen. This is also the
+        // event that re-enables rendering after a move into a *new* window, once
+        // that window is ordered front.
+        syncOcclusion()
         guard isRenderable else { return }
         refreshSurfaceOnly()
     }
@@ -604,6 +629,9 @@ final class GhosttyTerminalView: NSView {
     func forceRefresh() {
         guard isRenderable else { return }
         ensureSurface()
+        // Renderable again (e.g. reattached to an on-screen window after a move) —
+        // make sure Ghostty's renderer is resumed before we ask it to draw.
+        syncOcclusion()
         updateGhosttySize(force: true)
         flushPendingOutput()
         if let surface = surfaceSlot.liveSurface() {
@@ -615,6 +643,10 @@ final class GhosttyTerminalView: NSView {
     func refreshSurfaceOnly() {
         guard isRenderable else { return }
         ensureSurface()
+        // Resume the renderer on reattach/relayout while renderable. This is the
+        // reliable resume path after a move to a new window (driven by the
+        // container's layout/window-change), independent of occlusion notifications.
+        syncOcclusion()
         let refreshedByResize = updateGhosttySize(force: true)
         guard !refreshedByResize else { return }
         if let surface = surfaceSlot.liveSurface() {
@@ -628,8 +660,21 @@ final class GhosttyTerminalView: NSView {
             renderGeneration &+= 1
             pendingOutput.removeAll(keepingCapacity: false)
         }
+        // Drive Ghostty's occlusion from the *full* render gate, not raw tab
+        // visibility: a selected tab whose window is off screen or mid-move must
+        // still keep the renderer suspended. The next on-screen event resumes it.
+        syncOcclusion()
+    }
+
+    /// Single source of truth for Ghostty's occlusion: the renderer may run only
+    /// when the surface is actually renderable (selected tab AND an on-screen,
+    /// sized, non-minimized window). Suspending it whenever that is false is what
+    /// stops it from drawing into a windowless/off-screen CAMetalLayer
+    /// (`nextDrawable` starvation → freeze, or an AGX trap). Cheap, idempotent,
+    /// main-thread-only flag set.
+    private func syncOcclusion() {
         guard let surface = surfaceSlot.liveSurface() else { return }
-        ghostty_surface_set_occlusion(surface, visible)
+        ghostty_surface_set_occlusion(surface, isRenderable)
     }
 
     func readViewportText() -> String? {
@@ -719,7 +764,12 @@ final class GhosttyTerminalView: NSView {
         updateGhosttySize(force: true)
         updateFocus()
         flushPendingOutput(to: created, render: isRenderable)
-        if visibleInUI {
+        // A freshly created surface inherits the current render gate: only run its
+        // renderer (and ask for a first frame) when actually on screen — not merely
+        // when the tab is selected (the window may be off screen / not yet ordered
+        // front during a move).
+        syncOcclusion()
+        if isRenderable {
             ghostty_surface_refresh(created)
         }
     }
@@ -807,7 +857,11 @@ final class GhosttyTerminalView: NSView {
         let rows = max(1, Int(size.rows))
         let cols = max(1, Int(size.columns))
         onTerminalSizeChange?(TerminalViewportSize(rows: rows, cols: cols))
-        if visibleInUI {
+        // Gate the post-resize redraw on the *full* render gate, not raw tab
+        // visibility. `viewDidMoveToWindow` calls this with `force: true` even when
+        // the view is transiently windowless mid-move; refreshing then would drive
+        // Ghostty into a windowless drawable and freeze (this was the bug).
+        if isRenderable {
             ghostty_surface_refresh(surface)
         }
         return true

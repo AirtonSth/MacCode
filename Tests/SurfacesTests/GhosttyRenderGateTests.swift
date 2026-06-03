@@ -60,6 +60,56 @@ final class GhosttyRenderGateTests: XCTestCase {
         )
     }
 
+    // MARK: - Split / move freeze regression
+    //
+    // Moving a terminal to a split pane or a new window reparents its NSView: the
+    // workspace rebuild removes the view subtree from its window before re-adding
+    // it, so the view is *transiently windowless* while the tab is still the
+    // selected one (visibleInUI stays true). The pre-fix code gated the
+    // post-resize/create refresh AND Ghostty's occlusion on `visibleInUI` alone,
+    // so it kept driving the renderer into a windowless / not-yet-on-screen
+    // CAMetalLayer → `nextDrawable` starvation → the terminal "stops updating" and
+    // the held GPU drawable can stall the WindowServer (whole-system freeze). The
+    // render/occlusion decision must use the full on-screen gate (`canRender`), of
+    // which `visibleInUI` is only one input — never `visibleInUI` by itself.
+
+    func test_selectedTerminalMidMoveBetweenWindowsIsNotRenderable() {
+        // visibleInUI == true (tab still selected) but the view lost its window
+        // during the reparent. canRender must say NO so the renderer stays
+        // suspended and no refresh is emitted into a windowless drawable.
+        XCTAssertFalse(
+            GhosttyTerminalView.canRender(
+                visibleInUI: true, isHidden: false, hasNonEmptyBounds: true,
+                windowPresent: false, windowVisible: false,
+                windowMiniaturized: false, windowOnScreen: false),
+            "a selected terminal whose view is mid-move (windowless) must not render — keying on visibleInUI alone freezes on nextDrawable")
+    }
+
+    func test_selectedTerminalInNotYetOnScreenNewWindowIsNotRenderable() {
+        // Reattached to a new window that has not been ordered front yet: window
+        // present but not visible / not on screen. Still must not render.
+        XCTAssertFalse(
+            GhosttyTerminalView.canRender(
+                visibleInUI: true, isHidden: false, hasNonEmptyBounds: true,
+                windowPresent: true, windowVisible: false,
+                windowMiniaturized: false, windowOnScreen: false),
+            "a selected terminal in a new window that is not yet on screen must not render")
+    }
+
+    func test_renderGateIsNotMereTabVisibility() {
+        // The defect was keying the renderer on tab-selection (visibleInUI). Prove
+        // the gate diverges from visibleInUI exactly in the freeze states: tab is
+        // selected, yet the surface must NOT render.
+        let visibleInUI = true
+        let renderable = GhosttyTerminalView.canRender(
+            visibleInUI: visibleInUI, isHidden: false, hasNonEmptyBounds: true,
+            windowPresent: false, windowVisible: false,
+            windowMiniaturized: false, windowOnScreen: false)
+        XCTAssertTrue(visibleInUI, "precondition: the moved tab is still logically selected")
+        XCTAssertNotEqual(renderable, visibleInUI,
+            "render decision must NOT equal visibleInUI in the windowless mid-move state — that equality was the freeze bug")
+    }
+
     func test_doesNotRenderWhenUnselectedOrHiddenEvenIfWindowOnScreen() {
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
