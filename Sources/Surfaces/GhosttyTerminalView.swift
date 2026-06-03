@@ -903,10 +903,18 @@ final class GhosttyTerminalView: NSView {
             }
         }
         if TerminalKeyboardInput.shouldUseTextInput(for: event) {
-            if let text = TerminalKeyboardInput.literalShellText(for: event) {
-                sendText(text, to: surface)
-                return
-            }
+            // Route printable input through AppKit's text-input system so the
+            // active keyboard layout owns composition. Dead keys (´ ` ^ ~ ¨ on
+            // ABNT2 / US-International / Portuguese etc.) compose accented glyphs
+            // — ~ then a → ã, ' then e → é — via our NSTextInputClient
+            // (setMarkedText → ghostty_surface_preedit, then insertText commits
+            // the composed text). Non-dead-key layouts commit the literal char
+            // directly (~/`/'/" on a plain US layout), exactly like Terminal.app.
+            //
+            // We deliberately do NOT short-circuit ~/`/'/" to literal bytes here:
+            // that older workaround (added before this view had NSTextInputClient
+            // conformance) force-translated every dead key to its spacing glyph,
+            // so ã/õ/á/é never composed — the user saw "~a" instead of "ã".
             interpretKeyEvents([event])
             return
         }
