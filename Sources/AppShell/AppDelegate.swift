@@ -613,7 +613,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let txt: [String: Data] = [
             "server_id": Data(serverId.utf8),
             "app": Data("remotecode".utf8),
-            "version": Data("0.1.0".utf8),
+            "version": Data("2.0.37".utf8),
             "api": Data("2".utf8)
         ]
         svc.setTXTRecord(NetService.data(fromTXTRecord: txt))

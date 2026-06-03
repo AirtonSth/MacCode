@@ -9,7 +9,7 @@ CONFIG="${RC2_CONFIG:-release}"
 DIST="dist"
 BUNDLE="RemoteCode.app"
 BUNDLE_ID="${RC2_BUNDLE_ID:-io.remotecode.desktop}"
-VERSION="${RC2_VERSION:-0.1.0}"
+VERSION="${RC2_VERSION:-2.0.37}"
 SPARKLE_FEED_URL="${RC2_SPARKLE_FEED_URL:-https://github.com/samuelfaj/remotecode.io/releases/latest/download/appcast.xml}"
 SPARKLE_PUBLIC_ED_KEY="${RC2_SPARKLE_PUBLIC_ED_KEY:-}"
 

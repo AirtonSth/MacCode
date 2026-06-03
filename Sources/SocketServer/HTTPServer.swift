@@ -390,7 +390,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let body: [String: Any] = [
                 "server_id": serverId,                                  // GAP-2: stable, persisted
                 "app": "remotecode",
-                "version": "0.1.0",
+                "version": "2.0.37",
                 "api_version": "2",
                 "capabilities_version": "1",
                 "auth_mode": bindLoopbackOnly ? "loopback-anonymous" : "token-required",
