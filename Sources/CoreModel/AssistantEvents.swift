@@ -155,6 +155,31 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     }
 }
 
+public struct AssistantAccountUsage: Codable, Sendable, Equatable {
+    public let provider: AgentProvider
+    public let weeklyUsedPercent: Double
+    public let weeklyWindowDurationMinutes: Int?
+    public let weeklyResetsAtMs: Int64?
+    public let currentSessionUsedPercent: Double?
+    public let currentSessionResetsAtMs: Int64?
+
+    public init(
+        provider: AgentProvider,
+        weeklyUsedPercent: Double,
+        weeklyWindowDurationMinutes: Int? = nil,
+        weeklyResetsAtMs: Int64? = nil,
+        currentSessionUsedPercent: Double? = nil,
+        currentSessionResetsAtMs: Int64? = nil
+    ) {
+        self.provider = provider
+        self.weeklyUsedPercent = min(max(weeklyUsedPercent, 0), 100)
+        self.weeklyWindowDurationMinutes = weeklyWindowDurationMinutes
+        self.weeklyResetsAtMs = weeklyResetsAtMs
+        self.currentSessionUsedPercent = currentSessionUsedPercent.map { min(max($0, 0), 100) }
+        self.currentSessionResetsAtMs = currentSessionResetsAtMs
+    }
+}
+
 public struct AssistantProposedPlan: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let turnId: String?
@@ -371,6 +396,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
     case userInputRequested(AssistantUserInputRequest)
     case userInputResolved(requestId: String, answer: String?)
     case tokenUsage(AssistantTokenUsage)
+    case accountUsage(AssistantAccountUsage)
     case contextCompaction(summary: String?)
     case providerRuntime(ProviderRuntimeEvent)
     case error(message: String, recoverable: Bool)
@@ -392,6 +418,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
         case .userInputRequested(let r): return "userInputRequested(\(r.id))"
         case .userInputResolved(let r, _): return "userInputResolved(\(r))"
         case .tokenUsage(let u): return "tokenUsage(\(u.totalTokens))"
+        case .accountUsage(let u): return "accountUsage(\(u.provider.rawValue) \(Int(u.weeklyUsedPercent.rounded()))%)"
         case .contextCompaction: return "contextCompaction"
         case .providerRuntime(let e): return "providerRuntime(\(e.provider.rawValue) \(e.method))"
         case .error(let m, _): return "error(\(m))"
@@ -609,6 +636,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             trimPendingUserInputs()
         case .tokenUsage(let usage):
             tokenUsage = usage
+        case .accountUsage:
+            break
         case .contextCompaction(let summary):
             contextCompactionSummary = summary
         case .providerRuntime(let event):

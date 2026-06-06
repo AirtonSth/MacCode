@@ -21,6 +21,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(d.insomniaAllowDisplaySleep)
         XCTAssertFalse(d.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(d.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
+        XCTAssertFalse(d.tokenSaverEnabled)
     }
 
     func test_saveThenLoadRoundTrips() throws {
@@ -32,7 +33,8 @@ final class SettingsStoreTests: XCTestCase {
             insomniaEnabled: true,
             insomniaAllowDisplaySleep: false,
             insomniaAllowSystemSleepWhenDisplayClosed: true,
-            insomniaAllowScreenSaverAfter45MinutesOfInactivity: false
+            insomniaAllowScreenSaverAfter45MinutesOfInactivity: false,
+            tokenSaverEnabled: true
         ))
         let r = s.load()
         XCTAssertTrue(r.diffWordWrap && r.diffIgnoreWhitespace)
@@ -41,16 +43,18 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(r.insomniaAllowDisplaySleep)
         XCTAssertTrue(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertFalse(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
+        XCTAssertTrue(r.tokenSaverEnabled)
     }
 
     func test_updatePreservesOtherFields() throws {
         let (s, _) = try store()
-        s.save(AppSettings(diffWordWrap: true, diffIgnoreWhitespace: false, sidebarSort: "created"))
+        s.save(AppSettings(diffWordWrap: true, diffIgnoreWhitespace: false, sidebarSort: "created", tokenSaverEnabled: true))
         s.update { $0.diffIgnoreWhitespace = true }
         let r = s.load()
         XCTAssertTrue(r.diffIgnoreWhitespace, "the updated field changes")
         XCTAssertTrue(r.diffWordWrap, "siblings must survive a partial update")
         XCTAssertEqual(r.sidebarSort, "created")
+        XCTAssertTrue(r.tokenSaverEnabled, "Token Saver enablement must survive unrelated settings updates")
     }
 
     func test_olderBlobWithoutInsomniaFieldsKeepsExistingSettings() throws {
@@ -63,6 +67,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(r.insomniaAllowDisplaySleep)
         XCTAssertFalse(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
+        XCTAssertFalse(r.tokenSaverEnabled)
     }
 
     func test_corruptBlobDegradesToDefaults() throws {

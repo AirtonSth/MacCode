@@ -33,6 +33,10 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(script.contains("<string>public.folder</string>"),
                       "dragging a Finder folder onto the Dock app icon must route that folder to NSApplication open-file handling")
         XCTAssertTrue(script.contains("AppIcon.icns"))
+        XCTAssertTrue(script.contains("DISTILL_SERVICE=\"$BIN_DIR/RemoteCodeDistillService\""),
+                      "packaging must require the Token Saver sidecar executable")
+        XCTAssertTrue(script.contains("Contents/MacOS/RemoteCodeDistillService"),
+                      "RemoteCode.app must contain the sidecar so Bundle.main can resolve it without global installs")
         XCTAssertTrue(script.contains("<key>SUFeedURL</key><string>${SPARKLE_FEED_URL}</string>"),
                       "release bundles must point Sparkle at the stable appcast feed")
         XCTAssertTrue(script.contains("<key>SUPublicEDKey</key><string>${SPARKLE_PUBLIC_ED_KEY}</string>"),

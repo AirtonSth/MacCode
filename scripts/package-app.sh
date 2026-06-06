@@ -50,8 +50,13 @@ BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
 BIN="$BIN_DIR/RemoteCode"
 CLI="$BIN_DIR/rc2"
+DISTILL_SERVICE="$BIN_DIR/RemoteCodeDistillService"
+MLX_METALLIB="$BIN_DIR/mlx.metallib"
 SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
+if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
+scripts/build-mlx-metallib.sh "$MLX_METALLIB"
+if [ ! -f "$MLX_METALLIB" ]; then echo "missing $MLX_METALLIB"; exit 1; fi
 
 APP_PATH="${RC2_PACKAGE_APP_OUTPUT:-$DIST/$BUNDLE}"
 APP_EXECUTABLE="$APP_PATH/Contents/MacOS/RemoteCode"
@@ -93,6 +98,8 @@ mkdir -p "$STAGING_APP/Contents/Resources"
 mkdir -p "$STAGING_APP/Contents/Frameworks"
 
 cp "$BIN" "$STAGING_APP/Contents/MacOS/RemoteCode"
+cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
+cp "$MLX_METALLIB" "$STAGING_APP/Contents/MacOS/mlx.metallib"
 if [ -x "$CLI" ]; then
   cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
 fi
@@ -138,7 +145,7 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
   <key>SUPublicEDKey</key><string>${SPARKLE_PUBLIC_ED_KEY}</string>
   <key>SUEnableAutomaticChecks</key><true/>
   <key>SUAutomaticallyUpdate</key><false/>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>

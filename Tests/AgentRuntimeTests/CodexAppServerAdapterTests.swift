@@ -1488,7 +1488,27 @@ final class CodexAppServerAdapterTests: XCTestCase {
             "rateLimits": [
                 "limitName": "primary",
                 "rateLimitReachedType": "hard",
-                "primary": ["resetsAt": "2026-05-23T12:00:00Z"]
+                "primary": [
+                    "usedPercent": 5,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": "2026-05-23T12:00:00Z"
+                ]
+            ],
+            "rateLimitsByLimitId": [
+                "codex": [
+                    "primary": [
+                        "usedPercent": 33,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": "2026-05-23T12:00:00Z"
+                    ]
+                ],
+                "other": [
+                    "primary": [
+                        "usedPercent": 91,
+                        "windowDurationMins": 10_080,
+                        "resetsAt": "2026-05-23T12:00:00Z"
+                    ]
+                ]
             ]
         ])
         client.notificationHandler?("mcpServer/startupStatus/updated", [
@@ -1551,6 +1571,8 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "old flag" && item.output == "use new flag" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Codex rate limit" && item.output?.contains("hard") == true && item.output?.contains("primary") == true } else { return false } },
                       "rate-limit notifications should become visible diagnostics before a long run appears frozen without marking a successful turn as failed")
+        XCTAssertTrue(events.contains { if case .accountUsage(let usage) = $0 { return usage.provider == .codex && usage.weeklyUsedPercent == 33 && usage.weeklyWindowDurationMinutes == 10_080 } else { return false } },
+                      "Codex account/rateLimits/updated must feed Token Saver weekly account usage instead of showing fake 100% remaining")
         XCTAssertFalse(events.contains { if case .error(let message, _) = $0 { return message.contains("config warning") || message.contains("risky command") || message.contains("bad config") || message.contains("old flag") || message.contains("primary") } else { return false } },
                        "recoverable Codex warnings must not publish agent.run.error when the turn can still succeed")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Thread status changed" && item.output?.contains("waitingOnApproval") == true } else { return false } })

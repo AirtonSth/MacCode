@@ -735,6 +735,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             ].compactMap { $0 }.joined(separator: "\n")
             events.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .completed, summary: "Account updated", output: detail.nilIfEmpty, startedAtMs: now, finishedAtMs: now)))
         case "account/rateLimits/updated", "account.rateLimits.updated":
+            if let usage = Self.accountUsage(from: payload) {
+                events.append(.accountUsage(usage))
+            }
             if let warning = Self.rateLimitWarning(from: payload) {
                 appendCompletedTool(summary: "Codex rate limit", output: warning)
             }
@@ -1771,6 +1774,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         if let limitName { message += " (\(limitName))" }
         if let reset { message += " resets \(reset)" }
         return message
+    }
+
+    private static func accountUsage(from payload: [String: Any]) -> AssistantAccountUsage? {
+        AssistantAccountUsageParser.codex(from: payload)
     }
 
     private static func threadStatusDetail(from payload: [String: Any]) -> String {

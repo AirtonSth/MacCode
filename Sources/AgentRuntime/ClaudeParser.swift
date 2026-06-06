@@ -398,13 +398,21 @@ public final class ClaudeParser {
             ?? [stringValue(obj["limit_type"]) ?? stringValue(obj["limitType"]) ?? "rate limit", reset.map { "reset \($0)" }]
                 .compactMap { $0 }
                 .joined(separator: " ")
-        return completedRuntimeItem(
+        var events = completedRuntimeItem(
             id: stringValue(obj["id"]) ?? "claude-rate-limit-\(now)",
             type: .tool,
             summary: "Claude rate limit",
             body: message,
             now: now
         )
+        if let usage = accountUsage(from: obj) {
+            events.append(.accountUsage(usage))
+        }
+        return events
+    }
+
+    private func accountUsage(from obj: [String: Any]) -> AssistantAccountUsage? {
+        AssistantAccountUsageParser.claude(from: obj)
     }
 
     private func tokenUsage(from obj: [String: Any]) -> AssistantTokenUsage? {
@@ -603,6 +611,32 @@ public final class ClaudeParser {
         default:
             return nil
         }
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        switch value {
+        case let double as Double:
+            return double
+        case let int as Int:
+            return Double(int)
+        case let number as NSNumber:
+            return number.doubleValue
+        case let string as String:
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            return nil
+        }
+    }
+
+    private func resetMilliseconds(from value: Any?) -> Int64? {
+        if let int = intValue(value) {
+            return Int64(int)
+        }
+        guard let string = stringValue(value) else { return nil }
+        if let int = Int64(string) {
+            return int
+        }
+        return ISO8601DateFormatter().date(from: string).map { Int64($0.timeIntervalSince1970 * 1000) }
     }
 
     private func jsonString(_ value: Any?) -> String? {

@@ -12,3 +12,4 @@ DerivedData/
 .vscode/
 fixtures.sqlite*
 *.log
+default.metallib

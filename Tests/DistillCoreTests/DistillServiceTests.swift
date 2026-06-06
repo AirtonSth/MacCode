@@ -1,0 +1,120 @@
+import XCTest
+@testable import DistillCore
+
+final class DistillServiceTests: XCTestCase {
+    func test_mlxRuntimeRequiresRealLocalModelFiles() async {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2MissingMLXModel-\(UUID().uuidString)", isDirectory: true)
+
+        do {
+            _ = try await MLXDistillRuntime(modelDirectory: dir)
+            XCTFail("production MLX runtime must fail loud when the verified local model directory is absent")
+        } catch {
+            XCTAssertFalse(String(describing: error).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    func test_configurationRequiresApprovedMLXModelAndLocalhost() throws {
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            host: "0.0.0.0",
+            authToken: "token",
+            appSupportDirectory: "/tmp/remote-code"
+        )) { error in
+            XCTAssertEqual(error as? DistillServiceError, .unsupportedHost("0.0.0.0"))
+        }
+
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "token",
+            appSupportDirectory: "/tmp/remote-code",
+            runtime: "llama.cpp"
+        )) { error in
+            XCTAssertEqual(error as? DistillServiceError, .unsupportedRuntime("llama.cpp"))
+        }
+
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "token",
+            appSupportDirectory: "/tmp/remote-code",
+            modelID: "other/model",
+            modelURL: "https://example.invalid/model"
+        )) { error in
+            XCTAssertEqual(
+                error as? DistillServiceError,
+                .unsupportedModel(modelID: "other/model", modelURL: "https://example.invalid/model")
+            )
+        }
+    }
+
+    func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "secret-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        XCTAssertEqual(ready.event, "ready")
+        XCTAssertEqual(ready.modelID, DistillApprovedModel.id)
+        XCTAssertEqual(ready.runtime, DistillApprovedModel.runtime)
+        XCTAssertGreaterThan(ready.port, 0)
+
+        let unauth = try await response(baseURL: ready.baseURL, path: "/readyz")
+        XCTAssertEqual(unauth.status, 401,
+                       "sidecar endpoints that expose run data must reject missing bearer tokens")
+
+        let request = DistillRequest(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            mode: .commandOutput,
+            input: "build passed",
+            maxOutputCharacters: 200
+        )
+        let body = try JSONEncoder().encode(request)
+        let distill = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "secret-token",
+            body: body
+        )
+        XCTAssertEqual(distill.status, 200)
+        let decoded = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(decoded.output, "O build passed")
+        XCTAssertEqual(decoded.requestID, request.id)
+
+        let metrics = try await response(
+            baseURL: ready.baseURL,
+            path: "/metrics",
+            token: "secret-token"
+        )
+        XCTAssertEqual(metrics.status, 200)
+        let snapshot = try JSONDecoder().decode(DistillServiceMetrics.self, from: metrics.data)
+        XCTAssertEqual(snapshot.totalRequests, 1)
+        XCTAssertEqual(snapshot.successfulRequests, 1)
+        XCTAssertEqual(snapshot.failedRequests, 0)
+    }
+
+    private func response(
+        baseURL: String,
+        path: String,
+        method: String = "GET",
+        token: String? = nil,
+        body: Data? = nil
+    ) async throws -> (status: Int, data: Data) {
+        var request = URLRequest(url: URL(string: baseURL + path)!)
+        request.httpMethod = method
+        request.timeoutInterval = 3
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        return (http.statusCode, data)
+    }
+}

@@ -4,20 +4,25 @@ import PackageDescription
 let package = Package(
     name: "RemoteCode",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "RemoteCode", targets: ["AppShell"]),
+        .executable(name: "RemoteCodeDistillService", targets: ["RemoteCodeDistillService"]),
         .executable(name: "rc2", targets: ["RC2CLI"]),
         .library(name: "CoreModel", targets: ["CoreModel"]),
         .library(name: "Persistence", targets: ["Persistence"]),
         .library(name: "AgentRuntime", targets: ["AgentRuntime"]),
+        .library(name: "DistillCore", targets: ["DistillCore"]),
         .library(name: "SocketServer", targets: ["SocketServer"]),
         .library(name: "Surfaces", targets: ["Surfaces"]),
         .library(name: "DesignSystemKit", targets: ["DesignSystemKit"])
     ],
     dependencies: [
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0")
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0")
     ],
     targets: [
         .binaryTarget(
@@ -25,7 +30,7 @@ let package = Package(
             path: "Vendor/GhosttyKit.xcframework"
         ),
         .target(
-            name: "CSystem",
+            name: "RemoteCodeCSystem",
             path: "Sources/CSystem",
             publicHeadersPath: "include"
         ),
@@ -43,8 +48,24 @@ let package = Package(
         ),
         .target(
             name: "AgentRuntime",
-            dependencies: ["CoreModel", "Persistence"],
+            dependencies: ["CoreModel", "Persistence", "RemoteCodeCSystem"],
             path: "Sources/AgentRuntime"
+        ),
+        .target(
+            name: "DistillCore",
+            dependencies: [
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers")
+            ],
+            path: "Sources/DistillCore"
+        ),
+        .executableTarget(
+            name: "RemoteCodeDistillService",
+            dependencies: ["DistillCore", "AgentRuntime"],
+            path: "Sources/RemoteCodeDistillService"
         ),
         .target(
             name: "SocketServer",
@@ -57,7 +78,7 @@ let package = Package(
         ),
         .target(
             name: "Surfaces",
-            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "CSystem", "DesignSystemKit", "GhosttyKit"],
+            dependencies: ["CoreModel", "AgentRuntime", "Persistence", "RemoteCodeCSystem", "DesignSystemKit", "GhosttyKit"],
             path: "Sources/Surfaces",
             resources: [
                 .copy("Resources/ghostty")
@@ -78,6 +99,7 @@ let package = Package(
                 "CoreModel",
                 "Persistence",
                 "AgentRuntime",
+                "DistillCore",
                 "SocketServer",
                 "Surfaces",
                 "DesignSystemKit",
@@ -107,6 +129,11 @@ let package = Package(
             name: "AgentRuntimeTests",
             dependencies: ["AgentRuntime", "CoreModel"],
             path: "Tests/AgentRuntimeTests"
+        ),
+        .testTarget(
+            name: "DistillCoreTests",
+            dependencies: ["DistillCore", "AgentRuntime"],
+            path: "Tests/DistillCoreTests"
         ),
         .testTarget(
             name: "SocketServerTests",

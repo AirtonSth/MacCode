@@ -4,8 +4,13 @@ import SwiftUI
 import UniformTypeIdentifiers
 import CoreModel
 import Persistence
+import AgentRuntime
 import Surfaces
 import DesignSystemKit
+
+public extension Notification.Name {
+    static let rc2TokenSaverUsageChanged = Notification.Name("rc2TokenSaverUsageChanged")
+}
 
 @MainActor
 public final class SidebarViewModel: ObservableObject {
@@ -15,6 +20,10 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public typealias InsomniaBatteryPrompt = @MainActor () -> InsomniaBatteryDecision
+    public typealias TokenSaverModelValidationProvider = @MainActor () -> TokenSaverModelValidation
+    public typealias TokenSaverModelDownloadHandler = @MainActor (
+        _ progress: @escaping @MainActor (TokenSaverModelDownloadState) -> Void
+    ) async throws -> TokenSaverModelManifest
 
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
@@ -41,19 +50,27 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowDisplaySleep: Bool = true
     @Published public private(set) var insomniaAllowSystemSleepWhenDisplayClosed: Bool = false
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
+    @Published public private(set) var tokenSaverEnabled: Bool = false
+    @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
+    @Published public var showsTokenSaverModelDownload = false
+    @Published public private(set) var tokenSaverModelDownloadState: TokenSaverModelDownloadState = .idle
     public var draggingWorkspaceID: WorkspaceID?
     /// UX-MAC_SHELL_WINDOW-012: the row the drag is currently hovering,
     /// so the list can draw an insertion line instead of reordering live.
     @Published public var dropTargetWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
     private var privateAccountObserver: NSObjectProtocol?
+    private var tokenSaverUsageObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
     private let powerMonitor: ExternalPowerMonitoring
     private let insomniaBatteryPrompt: InsomniaBatteryPrompt
+    private let tokenSaverModelValidationProvider: TokenSaverModelValidationProvider?
+    private let tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler?
     private var lastPowerState: ExternalPowerState
     private var showingInsomniaBatteryPrompt = false
+    private var tokenSaverModelDownloadTask: Task<TokenSaverModelManifest, Error>?
 
     public init(
         context: AppContext,
@@ -63,7 +80,9 @@ public final class SidebarViewModel: ObservableObject {
         powerMonitor: ExternalPowerMonitoring = MacOSExternalPowerMonitor(),
         insomniaBatteryPrompt: @escaping InsomniaBatteryPrompt = {
             SidebarViewModel.defaultInsomniaBatteryPrompt()
-        }
+        },
+        tokenSaverModelValidationProvider: TokenSaverModelValidationProvider? = nil,
+        tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler? = nil
     ) {
         self.context = context
         self.router = router
@@ -73,6 +92,8 @@ public final class SidebarViewModel: ObservableObject {
         self.insomniaPower = insomniaPower
         self.powerMonitor = powerMonitor
         self.insomniaBatteryPrompt = insomniaBatteryPrompt
+        self.tokenSaverModelValidationProvider = tokenSaverModelValidationProvider
+        self.tokenSaverModelDownloadHandler = tokenSaverModelDownloadHandler
         self.lastPowerState = powerMonitor.currentPowerState
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
@@ -81,6 +102,14 @@ public final class SidebarViewModel: ObservableObject {
         ) { [weak self] _ in
             guard let viewModel = self else { return }
             Task { @MainActor in viewModel.reloadPrivateAccount() }
+        }
+        self.tokenSaverUsageObserver = NotificationCenter.default.addObserver(
+            forName: .rc2TokenSaverUsageChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let viewModel = self else { return }
+            Task { @MainActor in viewModel.reloadTokenSaver() }
         }
         self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
             self?.updateAvailability = availability
@@ -91,12 +120,17 @@ public final class SidebarViewModel: ObservableObject {
         self.powerMonitor.start()
         reload()
         reloadInsomnia()
+        reloadTokenSaver()
     }
 
     deinit {
         if let privateAccountObserver {
             NotificationCenter.default.removeObserver(privateAccountObserver)
         }
+        if let tokenSaverUsageObserver {
+            NotificationCenter.default.removeObserver(tokenSaverUsageObserver)
+        }
+        tokenSaverModelDownloadTask?.cancel()
         powerMonitor.stop()
         insomniaPower.releaseProcessAssertions()
     }
@@ -122,6 +156,22 @@ public final class SidebarViewModel: ObservableObject {
         insomniaAllowSystemSleepWhenDisplayClosed = settings.insomniaAllowSystemSleepWhenDisplayClosed
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = settings.insomniaAllowScreenSaverAfter45MinutesOfInactivity
         applyInsomniaPower()
+    }
+
+    private func reloadTokenSaver() {
+        let settings = settingsStore.load()
+        tokenSaverEnabled = settings.tokenSaverEnabled
+        if let context {
+            tokenSaverUsageSnapshot = TokenSaverUsageStore(
+                appSupportDirectory: context.appSupportDirectory
+            ).load()
+        } else {
+            tokenSaverUsageSnapshot = .empty()
+        }
+    }
+
+    public func refreshTokenSaverAccountUsageForDetails() {
+        context?.refreshTokenSaverAccountUsage(reason: "details")
     }
 
     public func setInsomniaEnabled(_ enabled: Bool) {
@@ -152,6 +202,142 @@ public final class SidebarViewModel: ObservableObject {
 
     public func disableInsomniaForAppClose() {
         finishInsomniaSession()
+    }
+
+    public func setTokenSaverEnabled(_ enabled: Bool) {
+        guard privateAccountUser?.subscribed == true else { return }
+        if !enabled {
+            tokenSaverEnabled = false
+            settingsStore.update {
+                $0.tokenSaverEnabled = false
+            }
+            context?.tokenSaverDistillServiceController.stop()
+            return
+        }
+        let validation = validateTokenSaverModel()
+        guard validation.state == .installed else {
+            beginTokenSaverModelDownload(reason: validation.reason)
+            return
+        }
+        tokenSaverEnabled = true
+        settingsStore.update {
+            $0.tokenSaverEnabled = true
+        }
+        refreshTokenSaverDistillService(modelValidation: validation)
+    }
+
+    public func dismissTokenSaverModelDownload() {
+        showsTokenSaverModelDownload = false
+    }
+
+    public func cancelTokenSaverModelDownload() {
+        tokenSaverModelDownloadTask?.cancel()
+        tokenSaverModelDownloadTask = nil
+        tokenSaverModelDownloadState = TokenSaverModelDownloadState(
+            phase: .paused,
+            downloadedBytes: tokenSaverModelDownloadState.downloadedBytes,
+            expectedBytes: tokenSaverModelDownloadState.expectedBytes,
+            statusText: "Download paused"
+        )
+        showsTokenSaverModelDownload = false
+    }
+
+    public func setTokenSaverModelDownloadStateForTesting(_ state: TokenSaverModelDownloadState) {
+        tokenSaverModelDownloadState = state
+    }
+
+    public func markTokenSaverModelInstalledForTesting() {
+        tokenSaverModelDownloadState = .ready
+        showsTokenSaverModelDownload = false
+        tokenSaverEnabled = true
+        settingsStore.update {
+            $0.tokenSaverEnabled = true
+        }
+        refreshTokenSaverDistillService(modelValidation: .installed)
+    }
+
+    private func validateTokenSaverModel() -> TokenSaverModelValidation {
+        if let tokenSaverModelValidationProvider {
+            return tokenSaverModelValidationProvider()
+        }
+        guard let context else {
+            return TokenSaverModelValidation(state: .missing, reason: "app support unavailable")
+        }
+        return TokenSaverModelInstaller(appSupportDirectory: context.appSupportDirectory).validateInstalledModel()
+    }
+
+    private func beginTokenSaverModelDownload(reason: String?) {
+        tokenSaverModelDownloadTask?.cancel()
+        tokenSaverModelDownloadState = .required(reason: reason)
+        showsTokenSaverModelDownload = true
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            do {
+                let manifest = try await self.downloadTokenSaverModel { [weak self] state in
+                    self?.tokenSaverModelDownloadState = state
+                }
+                let validation = self.validateTokenSaverModel()
+                guard validation.state == .installed else {
+                    throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+                }
+                self.tokenSaverModelDownloadState = .ready
+                self.showsTokenSaverModelDownload = false
+                self.tokenSaverEnabled = true
+                self.settingsStore.update {
+                    $0.tokenSaverEnabled = true
+                }
+                self.refreshTokenSaverDistillService(modelValidation: validation)
+                return manifest
+            } catch is CancellationError {
+                self.tokenSaverModelDownloadState = TokenSaverModelDownloadState(
+                    phase: .paused,
+                    downloadedBytes: self.tokenSaverModelDownloadState.downloadedBytes,
+                    expectedBytes: self.tokenSaverModelDownloadState.expectedBytes,
+                    statusText: "Download paused"
+                )
+                throw CancellationError()
+            } catch {
+                self.tokenSaverModelDownloadState = TokenSaverModelDownloadState(
+                    phase: .failed,
+                    downloadedBytes: self.tokenSaverModelDownloadState.downloadedBytes,
+                    expectedBytes: self.tokenSaverModelDownloadState.expectedBytes,
+                    statusText: "Download failed",
+                    errorMessage: String(describing: error)
+                )
+                self.showsTokenSaverModelDownload = true
+                throw error
+            }
+        }
+        tokenSaverModelDownloadTask = task
+    }
+
+    private func downloadTokenSaverModel(
+        progress: @escaping @MainActor (TokenSaverModelDownloadState) -> Void
+    ) async throws -> TokenSaverModelManifest {
+        if let tokenSaverModelDownloadHandler {
+            return try await tokenSaverModelDownloadHandler(progress)
+        }
+        guard let context else {
+            throw TokenSaverModelDownloadError.validationFailed("app support unavailable")
+        }
+        let downloader = TokenSaverModelDownloader(
+            installer: TokenSaverModelInstaller(appSupportDirectory: context.appSupportDirectory)
+        )
+        return try await downloader.downloadApprovedModel { state in
+            Task { @MainActor in
+                progress(state)
+            }
+        }
+    }
+
+    private func refreshTokenSaverDistillService(modelValidation: TokenSaverModelValidation) {
+        guard let context else { return }
+        context.tokenSaverDistillServiceController.startIfEligible(
+            session: PrivateAccountSessionStore(repo: context.settingsRepo).load(),
+            settings: settingsStore.load(),
+            modelValidation: modelValidation
+        )
     }
 
     public static func defaultInsomniaBatteryPrompt() -> InsomniaBatteryDecision {
@@ -495,8 +681,15 @@ public final class SidebarViewModel: ObservableObject {
 }
 
 public struct SidebarRootView: View {
+    private enum TokenSaverUsageScope: String, CaseIterable {
+        case currentSession
+        case week
+    }
+
     @ObservedObject var vm: SidebarViewModel
     @State private var showsInsomniaOptions = false
+    @State private var showsTokenSaverDetails = false
+    @State private var tokenSaverDetailsScope: TokenSaverUsageScope = .week
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
 
@@ -642,6 +835,12 @@ public struct SidebarRootView: View {
         // The sidebar material reaches the top edge; only its controls
         // start below the traffic-light band.
         .ignoresSafeArea(.container, edges: .top)
+        .sheet(isPresented: $vm.showsTokenSaverModelDownload) {
+            TokenSaverModelDownloadModal(
+                state: vm.tokenSaverModelDownloadState,
+                onCancel: { vm.cancelTokenSaverModelDownload() }
+            )
+        }
     }
 
     private var workspaceFilterField: some View {
@@ -767,12 +966,677 @@ public struct SidebarRootView: View {
                     .padding(.vertical, DS.Space.sm)
             }
 
-            insomniaControl
-                .padding(.horizontal, DS.Space.md)
-                .padding(.top, vm.privateAccountUser == nil ? 0 : DS.Space.md)
-                .padding(.bottom, DS.Space.lg)
+            footerUtilityControls
         }
         .background(Color.white.opacity(0.025))
+    }
+
+    private var footerUtilityControls: some View {
+        Group {
+            if tokenSaverShowsCompactFooterControl {
+                HStack(alignment: .center, spacing: DS.Space.sm) {
+                    insomniaControl
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    tokenSaverCompactControl
+                }
+                .padding(.horizontal, DS.Space.md)
+                .padding(.top, DS.Space.md)
+                .padding(.bottom, DS.Space.lg)
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    tokenSaverControl
+                        .padding(.horizontal, DS.Space.md)
+                        .padding(.top, vm.privateAccountUser == nil ? 0 : DS.Space.md)
+
+                    insomniaControl
+                        .padding(.horizontal, DS.Space.md)
+                        .padding(.top, DS.Space.sm)
+                        .padding(.bottom, DS.Space.lg)
+                }
+            }
+        }
+    }
+
+    private var tokenSaverControl: some View {
+        Button {
+            tokenSaverAction()
+        } label: {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "leaf.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(DS.Palette.success)
+                        .frame(width: 18, height: 18)
+                    Text("Token Saver")
+                        .font(DS.Font.bodyStrong)
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    Text(tokenSaverPillText)
+                        .font(DS.Font.captionStrong)
+                        .foregroundColor(tokenSaverPillForeground)
+                        .padding(.horizontal, DS.Space.sm)
+                        .frame(minHeight: 20)
+                        .background(
+                            Capsule()
+                                .fill(tokenSaverPillBackground)
+                        )
+                }
+
+                Text(tokenSaverHeadline)
+                    .font(DS.Font.monoStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .monospacedDigit()
+
+                Text(tokenSaverSubtitle)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(tokenSaverSubtitleForeground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.vertical, DS.Space.md)
+            .frame(minHeight: 70, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                    .fill(tokenSaverPanelBackground)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                            .stroke(DS.Palette.success.opacity(vm.tokenSaverEnabled ? 0.42 : 0.18),
+                                    lineWidth: DS.Border.hairline)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .help(tokenSaverHelpText)
+        .popover(isPresented: $showsTokenSaverDetails, arrowEdge: .trailing) {
+            tokenSaverDetailsPopover
+        }
+        .accessibilityLabel("Token Saver")
+        .accessibilityValue(tokenSaverAccessibilityValue)
+        .accessibilityHint(tokenSaverHelpText)
+        .accessibilityIdentifier("sidebar.tokenSaver")
+    }
+
+    private var tokenSaverCompactControl: some View {
+        Button {
+            toggleTokenSaverDetails(refreshWhenOpening: true)
+        } label: {
+            TokenSaverActivityRings(values: tokenSaverActivityRingValues)
+                .frame(width: 34, height: 34)
+                .frame(width: 48, height: 40)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(tokenSaverHelpText)
+        .popover(isPresented: $showsTokenSaverDetails, arrowEdge: .trailing) {
+            tokenSaverDetailsPopover
+        }
+        .accessibilityLabel("Token Saver")
+        .accessibilityValue(tokenSaverActivityAccessibilityValue)
+        .accessibilityHint("Open Token Saver details")
+        .accessibilityIdentifier("sidebar.tokenSaver.compact")
+    }
+
+    private func tokenSaverAction() {
+        guard let user = vm.privateAccountUser else {
+            onOpenAccount()
+            return
+        }
+        guard user.subscribed else {
+            onOpenAccount()
+            return
+        }
+        if vm.tokenSaverEnabled {
+            toggleTokenSaverDetails(refreshWhenOpening: true)
+            return
+        }
+        withAnimation(DS.Motion.micro) {
+            vm.setTokenSaverEnabled(true)
+        }
+    }
+
+    private func toggleTokenSaverDetails(refreshWhenOpening: Bool) {
+        let willOpen = !showsTokenSaverDetails
+        if willOpen && refreshWhenOpening {
+            vm.refreshTokenSaverAccountUsageForDetails()
+        }
+        showsTokenSaverDetails = willOpen
+    }
+
+    private var tokenSaverPillText: String {
+        guard let user = vm.privateAccountUser else { return "Sign in" }
+        guard user.subscribed else { return "Upgrade" }
+        return vm.tokenSaverEnabled ? "Details" : "Enable"
+    }
+
+    private var tokenSaverHeadline: String {
+        guard let user = vm.privateAccountUser else { return "Track Claude + Codex savings" }
+        let used = vm.tokenSaverUsageSnapshot.usedTokens
+        if user.subscribed {
+            if vm.tokenSaverEnabled {
+                let saved = vm.tokenSaverUsageSnapshot.measuredSavedTokens
+                return saved > 0 ? "Saved \(Self.formatTokenCount(saved)) tokens" : "Tracking after next run"
+            }
+            return "Enable savings"
+        }
+        let potential = TokenSaverUsageStore.estimatePotentialSavings(usedTokens: used)
+        return potential > 0 ? "Save ~\(Self.formatTokenCount(potential)) tokens" : "Savings estimate ready"
+    }
+
+    private var tokenSaverSubtitle: String {
+        guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
+        let used = vm.tokenSaverUsageSnapshot.usedTokens
+        if user.subscribed {
+            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Local MLX model first enable"
+        }
+        return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Subscribe to activate local savings"
+    }
+
+    private var tokenSaverHelpText: String {
+        "Token Saver shows Claude and Codex usage plus saved or potential tokens. Paid users can enable the local MLX model."
+    }
+
+    private var tokenSaverAccessibilityValue: String {
+        "\(tokenSaverPillText), \(tokenSaverHeadline), \(tokenSaverSubtitle)"
+    }
+
+    private var tokenSaverPillForeground: Color {
+        vm.privateAccountUser?.subscribed == true ? DS.Palette.onAccent : DS.Palette.text
+    }
+
+    private var tokenSaverPillBackground: Color {
+        vm.privateAccountUser?.subscribed == true ? DS.Palette.success : DS.Palette.surfaceRaised
+    }
+
+    private var tokenSaverPanelBackground: Color {
+        vm.tokenSaverEnabled ? DS.Palette.success.opacity(0.08) : DS.Palette.surfaceRaised.opacity(0.82)
+    }
+
+    private var tokenSaverSubtitleForeground: Color {
+        vm.tokenSaverEnabled ? DS.Palette.textSecondary : DS.Palette.textTertiary
+    }
+
+    private var tokenSaverShowsCompactFooterControl: Bool {
+        vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
+    }
+
+    private var tokenSaverActivityRingValues: TokenSaverActivityRings.Values {
+        tokenSaverActivityRingValues(for: vm.tokenSaverUsageSnapshot, scope: .week)
+    }
+
+    private func tokenSaverActivityRingValues(
+        for snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> TokenSaverActivityRings.Values {
+        let claude = tokenSaverProviderUsage(.claude, in: snapshot)
+        let codex = tokenSaverProviderUsage(.codex, in: snapshot)
+        return TokenSaverActivityRings.Values(
+            tokenSaverProgress: tokenSaverSavingsProgress(for: snapshot, scope: scope),
+            claudeUsedProgress: tokenSaverUsedLimitProgress(for: claude, provider: .claude, scope: scope) ?? 0,
+            codexUsedProgress: tokenSaverUsedLimitProgress(for: codex, provider: .codex, scope: scope) ?? 0
+        )
+    }
+
+    private var tokenSaverActivityAccessibilityValue: String {
+        let snapshot = vm.tokenSaverUsageSnapshot
+        let claude = tokenSaverProviderUsage(.claude, in: snapshot)
+        let codex = tokenSaverProviderUsage(.codex, in: snapshot)
+        return [
+            tokenSaverSavingsSummary(for: snapshot, scope: .week),
+            "\(tokenSaverLimitScopeTitle(for: .week))",
+            "Claude Code used \(tokenSaverUsedLimitText(for: claude, provider: .claude, scope: .week))",
+            "Codex used \(tokenSaverUsedLimitText(for: codex, provider: .codex, scope: .week))"
+        ].joined(separator: ", ")
+    }
+
+    private func tokenSaverLimitScopeTitle(for scope: TokenSaverUsageScope) -> String {
+        switch scope {
+        case .currentSession: return "current session"
+        case .week: return "week"
+        }
+    }
+
+    private func tokenSaverScopeTitle(_ scope: TokenSaverUsageScope) -> String {
+        switch scope {
+        case .currentSession: return "Current Session"
+        case .week: return "Week"
+        }
+    }
+
+    private func tokenSaverScopeUsedTokens(in snapshot: TokenSaverUsageSnapshot, scope: TokenSaverUsageScope) -> Int {
+        switch scope {
+        case .currentSession:
+            return snapshot.providers.reduce(0) { $0 + $1.currentSessionTokens }
+        case .week:
+            return snapshot.usedTokens
+        }
+    }
+
+    private func tokenSaverProviderUsage(
+        _ provider: AgentProvider,
+        in snapshot: TokenSaverUsageSnapshot
+    ) -> TokenSaverProviderUsage {
+        snapshot.providers.first { $0.provider == provider } ?? TokenSaverProviderUsage(provider: provider)
+    }
+
+    private func tokenSaverSavingsProgress(
+        for snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> Double {
+        let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
+        let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
+        return tokenSaverRingProgress(numerator: saved, denominator: max(used + saved, 1))
+    }
+
+    private func tokenSaverSavedOrPotential(
+        in snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> Int {
+        if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
+            switch scope {
+            case .currentSession:
+                return 0
+            case .week:
+                return snapshot.measuredSavedTokens
+            }
+        }
+        return TokenSaverUsageStore.estimatePotentialSavings(
+            usedTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
+        )
+    }
+
+    private func tokenSaverSavingsSummary(
+        for snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> String {
+        let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Saved" : "Could save"
+        return "\(prefix) \(Self.formatTokenCount(tokenSaverSavedOrPotential(in: snapshot, scope: scope)))"
+    }
+
+    private func tokenSaverUsedLimitProgress(
+        for usage: TokenSaverProviderUsage,
+        provider: AgentProvider,
+        scope: TokenSaverUsageScope
+    ) -> Double? {
+        switch scope {
+        case .currentSession:
+            if let currentSessionUsedPercent = usage.currentSessionUsedPercent {
+                return min(max(currentSessionUsedPercent / 100.0, 0), 1)
+            }
+            guard usage.currentSessionLimitTokens > 0 else { return nil }
+            return tokenSaverRingProgress(
+                numerator: usage.currentSessionTokens,
+                denominator: usage.currentSessionLimitTokens
+            )
+        case .week:
+            if let weeklyUsedPercent = usage.weeklyUsedPercent {
+                return min(max(weeklyUsedPercent / 100.0, 0), 1)
+            }
+        }
+        guard usage.actualProviderTokens > 0 else { return nil }
+        let denominator = max(usage.estimatedRawTokens, tokenSaverDefaultWeeklyLimitTokens(for: provider), 1)
+        return tokenSaverRingProgress(numerator: usage.actualProviderTokens, denominator: denominator)
+    }
+
+    private func tokenSaverUsedLimitText(
+        for usage: TokenSaverProviderUsage,
+        provider: AgentProvider,
+        scope: TokenSaverUsageScope
+    ) -> String {
+        tokenSaverUsedLimitProgress(
+            for: usage,
+            provider: provider,
+            scope: scope
+        ).map(Self.formatPercent) ?? "No data"
+    }
+
+    private func tokenSaverProviderUsageCaption(
+        for usage: TokenSaverProviderUsage,
+        provider: AgentProvider,
+        scope: TokenSaverUsageScope
+    ) -> String {
+        switch scope {
+        case .currentSession:
+            if let currentSessionUsedPercent = usage.currentSessionUsedPercent {
+                return "Session used \(Self.formatPercent(currentSessionUsedPercent / 100.0))"
+            }
+            guard usage.currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
+            let usedProgress = tokenSaverRingProgress(
+                numerator: usage.currentSessionTokens,
+                denominator: usage.currentSessionLimitTokens
+            )
+            return "Session used \(Self.formatPercent(usedProgress))"
+        case .week:
+            if let weeklyUsedPercent = usage.weeklyUsedPercent {
+                return "Weekly used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
+            }
+            let weeklyLimit = max(usage.estimatedRawTokens, tokenSaverDefaultWeeklyLimitTokens(for: provider), 1)
+            guard usage.actualProviderTokens > 0 else { return "Weekly usage not loaded" }
+            return "Weekly used \(Self.formatTokenCount(usage.actualProviderTokens)) / \(Self.formatTokenCount(weeklyLimit))"
+        }
+    }
+
+    private func tokenSaverDefaultWeeklyLimitTokens(for provider: AgentProvider) -> Int {
+        switch provider {
+        case .claude:
+            return 1_000_000
+        case .codex:
+            return 1_000_000
+        }
+    }
+
+    private func tokenSaverRingProgress(numerator: Int, denominator: Int) -> Double {
+        guard numerator > 0, denominator > 0 else { return 0 }
+        return min(max(Double(numerator) / Double(denominator), 0), 1)
+    }
+
+    private var tokenSaverDetailsPopover: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(alignment: .center, spacing: DS.Space.sm) {
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(DS.Palette.success)
+                    .frame(width: 22, height: 22)
+                Text("Token Saver")
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Toggle("", isOn: Binding(
+                    get: { vm.tokenSaverEnabled },
+                    set: { enabled in
+                        guard vm.privateAccountUser?.subscribed == true else {
+                            onOpenAccount()
+                            return
+                        }
+                        vm.setTokenSaverEnabled(enabled)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+                .accessibilityLabel("Token Saver")
+                .accessibilityIdentifier("sidebar.tokenSaver.toggle")
+            }
+
+            Picker("Usage scope", selection: $tokenSaverDetailsScope) {
+                ForEach(TokenSaverUsageScope.allCases, id: \.self) { scope in
+                    Text(tokenSaverScopeTitle(scope)).tag(scope)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .accessibilityIdentifier("sidebar.tokenSaver.period")
+
+            tokenSaverDetailsActivityChart
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                tokenSaverProviderRow(provider: .claude)
+                tokenSaverProviderRow(provider: .codex)
+            }
+
+            Text(tokenSaverPlanValueText)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(DS.Space.md)
+        .frame(width: 350, alignment: .leading)
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier("sidebar.tokenSaver.details")
+    }
+
+    private var tokenSaverDetailsActivityChart: some View {
+        let snapshot = tokenSaverDetailsSnapshot
+        return HStack(alignment: .center, spacing: DS.Space.lg) {
+            TokenSaverActivityRings(values: tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope))
+                .frame(width: 104, height: 104)
+                .accessibilityLabel("Token Saver usage rings")
+                .accessibilityValue(tokenSaverDetailsChartAccessibilityValue(for: snapshot))
+
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                tokenSaverRingLegendRow(
+                    color: DS.Palette.success,
+                    label: "Token Saver",
+                    value: tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
+                )
+                tokenSaverRingLegendRow(
+                    color: DS.Palette.textSecondary,
+                    label: "Used",
+                    value: Self.formatTokenCount(tokenSaverScopeUsedTokens(in: snapshot, scope: tokenSaverDetailsScope))
+                )
+                tokenSaverRingLegendRow(
+                    color: tokenSaverProviderColor(.claude),
+                    label: tokenSaverProviderTitle(.claude),
+                    value: tokenSaverLimitSummary(provider: .claude, in: snapshot, scope: tokenSaverDetailsScope)
+                )
+                tokenSaverRingLegendRow(
+                    color: tokenSaverProviderColor(.codex),
+                    label: tokenSaverProviderTitle(.codex),
+                    value: tokenSaverLimitSummary(provider: .codex, in: snapshot, scope: tokenSaverDetailsScope)
+                )
+                Text("Showing \(tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope))")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var tokenSaverDetailsSnapshot: TokenSaverUsageSnapshot {
+        if vm.tokenSaverUsageSnapshot.period == .sevenDays {
+            return vm.tokenSaverUsageSnapshot
+        }
+        guard let context = vm.context else { return .empty() }
+        return TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+    }
+
+    private var tokenSaverDetailsSavedOrPotential: Int {
+        tokenSaverSavedOrPotential(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope)
+    }
+
+    private var tokenSaverPlanValueText: String {
+        guard let user = vm.privateAccountUser else {
+            return "Sign in to track Claude and Codex usage before enabling Token Saver."
+        }
+        guard user.subscribed else {
+            return "Subscribe to start saving these tokens automatically."
+        }
+        if vm.tokenSaverEnabled {
+            return "Your plan has already reduced provider usage by \(Self.formatTokenCount(tokenSaverDetailsSavedOrPotential)) tokens."
+        }
+        return "Enable Token Saver to run the approved local MLX model and start reducing provider usage."
+    }
+
+    private func tokenSaverProviderRow(provider: AgentProvider) -> some View {
+        let snapshot = tokenSaverDetailsSnapshot
+        let usage = tokenSaverProviderUsage(provider, in: snapshot)
+        let value = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
+            ? usage.measuredSavedTokens
+            : TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usage.actualProviderTokens)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                Text(tokenSaverProviderTitle(provider))
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Text("Used \(tokenSaverUsedLimitText(for: usage, provider: provider, scope: tokenSaverDetailsScope))")
+                    .font(DS.Font.caption)
+                    .foregroundColor(tokenSaverProviderColor(provider))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                Text(tokenSaverProviderUsageCaption(for: usage, provider: provider, scope: tokenSaverDetailsScope))
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Saved " : "Could save ") + Self.formatTokenCount(value))
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.success)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 1)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func tokenSaverRingLegendRow(color: Color, label: String, value: String) -> some View {
+        HStack(alignment: .center, spacing: DS.Space.xs) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+            Text(label)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            Text(value)
+                .font(DS.Font.captionStrong)
+                .foregroundColor(DS.Palette.text)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+    }
+
+    private func tokenSaverLimitSummary(
+        provider: AgentProvider,
+        in snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> String {
+        let usage = tokenSaverProviderUsage(provider, in: snapshot)
+        let used = tokenSaverUsedLimitProgress(
+            for: usage,
+            provider: provider,
+            scope: scope
+        )
+        return used.map { "\(Self.formatPercent($0)) used" } ?? "No data"
+    }
+
+    private func tokenSaverDetailsChartAccessibilityValue(for snapshot: TokenSaverUsageSnapshot) -> String {
+        [
+            tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope),
+            "Used \(Self.formatTokenCount(tokenSaverScopeUsedTokens(in: snapshot, scope: tokenSaverDetailsScope)))",
+            "\(tokenSaverProviderTitle(.claude)) \(tokenSaverLimitSummary(provider: .claude, in: snapshot, scope: tokenSaverDetailsScope))",
+            "\(tokenSaverProviderTitle(.codex)) \(tokenSaverLimitSummary(provider: .codex, in: snapshot, scope: tokenSaverDetailsScope))",
+            "Showing \(tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope))"
+        ].joined(separator: ", ")
+    }
+
+    private func tokenSaverProviderColor(_ provider: AgentProvider) -> Color {
+        switch provider {
+        case .claude:
+            return Color(nsColor: .systemOrange)
+        case .codex:
+            return Color(nsColor: .systemBlue)
+        }
+    }
+
+    private func tokenSaverProviderTitle(_ provider: AgentProvider) -> String {
+        switch provider {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+
+    private static func formatTokenCount(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            let whole = Double(value) / 1_000_000.0
+            return String(format: whole >= 10 ? "%.0fM" : "%.1fM", whole)
+        }
+        if value >= 1_000 {
+            let whole = Double(value) / 1_000.0
+            return String(format: whole >= 10 ? "%.0fK" : "%.1fK", whole)
+        }
+        return "\(value)"
+    }
+
+    private static func formatPercent(_ progress: Double) -> String {
+        "\(Int((min(max(progress, 0), 1) * 100).rounded()))%"
+    }
+
+    struct TokenSaverActivityRings: View {
+        struct Values: Equatable {
+            let tokenSaverProgress: Double
+            let claudeUsedProgress: Double
+            let codexUsedProgress: Double
+        }
+
+        let values: Values
+
+        var body: some View {
+            GeometryReader { proxy in
+                let side = max(min(proxy.size.width, proxy.size.height), 1)
+                scaledContent(side: side)
+                    .frame(width: side, height: side)
+                    .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+            }
+            .aspectRatio(1, contentMode: .fit)
+            .accessibilityHidden(true)
+        }
+
+        private func scaledContent(side: CGFloat) -> some View {
+            let scale = max(side / 34.0, 0.1)
+            return ZStack {
+                TokenSaverActivityRing(progress: values.tokenSaverProgress, color: DS.Palette.success, inset: 2 * scale, lineWidth: 4.0 * scale)
+                TokenSaverActivityRing(progress: values.claudeUsedProgress, color: Color(nsColor: .systemOrange), inset: 8.2 * scale, lineWidth: 3.2 * scale)
+                TokenSaverActivityRing(progress: values.codexUsedProgress, color: Color(nsColor: .systemBlue), inset: 13.8 * scale, lineWidth: 2.0 * scale)
+            }
+        }
+    }
+
+    private struct TokenSaverActivityRing: View {
+        let progress: Double
+        let color: Color
+        let inset: CGFloat
+        let lineWidth: CGFloat
+
+        var body: some View {
+            ZStack {
+                TokenSaverActivityRingShape(progress: 1)
+                    .stroke(
+                        color.opacity(0.18),
+                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+                    )
+                TokenSaverActivityRingShape(progress: progress)
+                    .stroke(
+                        color,
+                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+                    )
+            }
+            .padding(inset)
+        }
+    }
+
+    private struct TokenSaverActivityRingShape: Shape {
+        let progress: Double
+
+        func path(in rect: CGRect) -> Path {
+            var path = Path()
+            let bounded = min(max(progress, 0), 1)
+            guard bounded > 0 else { return path }
+            path.addArc(
+                center: CGPoint(x: rect.midX, y: rect.midY),
+                radius: min(rect.width, rect.height) / 2,
+                startAngle: .degrees(-88),
+                endAngle: .degrees((360 * bounded) - 88),
+                clockwise: false
+            )
+            return path
+        }
     }
 
     private var insomniaHelpText: String {
@@ -881,6 +1745,106 @@ public struct SidebarRootView: View {
         .font(DS.Font.body)
         .foregroundColor(DS.Palette.text)
         .padding(DS.Space.md)
+    }
+
+    private struct TokenSaverModelDownloadModal: View {
+        let state: TokenSaverModelDownloadState
+        let onCancel: () -> Void
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: DS.Space.lg) {
+                HStack(alignment: .top, spacing: DS.Space.md) {
+                    Image(systemName: "leaf.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(DS.Palette.success)
+                        .frame(width: 28, height: 28)
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        Text("Download Token Saver model")
+                            .font(DS.Font.title3)
+                            .foregroundColor(DS.Palette.text)
+                        Text(TokenSaverModelManifest.approvedModelID)
+                            .font(DS.Font.monoSmall)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .textSelection(.enabled)
+                    }
+                    Spacer(minLength: 0)
+                }
+
+                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                    infoRow("Source", "huggingface.co/samuelfaj/distill-1.7B-4bit-MLX")
+                    infoRow("Status", state.statusText)
+                    infoRow("Progress", progressText)
+                    if let error = state.errorMessage, !error.isEmpty {
+                        Text(error)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                progressView
+                    .accessibilityLabel("Token Saver model download progress")
+                    .accessibilityValue(progressText)
+
+                HStack {
+                    Spacer()
+                    Button("Cancel") {
+                        onCancel()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .frame(minWidth: 88, minHeight: 44)
+                }
+            }
+            .padding(DS.Space.xxl)
+            .frame(width: 460)
+            .background(DS.Palette.surface)
+        }
+
+        private var progressView: some View {
+            Group {
+                if let fraction = state.fractionCompleted {
+                    ProgressView(value: fraction)
+                } else {
+                    ProgressView()
+                }
+            }
+            .tint(DS.Palette.success)
+        }
+
+        private var progressText: String {
+            let downloaded = Self.formatBytes(state.downloadedBytes)
+            guard let expected = state.expectedBytes else { return downloaded }
+            let percent = Int(((state.fractionCompleted ?? 0) * 100).rounded())
+            return "\(downloaded) / \(Self.formatBytes(expected)) (\(percent)%)"
+        }
+
+        private func infoRow(_ label: String, _ value: String) -> some View {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
+                Text(label)
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .frame(width: 72, alignment: .leading)
+                Text(value)
+                    .font(label == "Source" ? DS.Font.monoSmall : DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.82)
+                    .textSelection(.enabled)
+                Spacer(minLength: 0)
+            }
+        }
+
+        private static func formatBytes(_ bytes: Int64) -> String {
+            guard bytes > 0 else { return "0 B" }
+            let units = ["B", "KB", "MB", "GB"]
+            var value = Double(bytes)
+            var index = 0
+            while value >= 1024, index < units.count - 1 {
+                value /= 1024
+                index += 1
+            }
+            return String(format: value >= 10 || index == 0 ? "%.0f %@" : "%.1f %@", value, units[index])
+        }
     }
 
     private var accountAvatar: some View {

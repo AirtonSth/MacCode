@@ -14,6 +14,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var insomniaAllowDisplaySleep: Bool
     public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
     public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
+    public var tokenSaverEnabled: Bool
 
     public init(diffWordWrap: Bool = false,
                 diffIgnoreWhitespace: Bool = false,
@@ -21,7 +22,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaEnabled: Bool = false,
                 insomniaAllowDisplaySleep: Bool = true,
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
-                insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true) {
+                insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
+                tokenSaverEnabled: Bool = false) {
         self.diffWordWrap = diffWordWrap
         self.diffIgnoreWhitespace = diffIgnoreWhitespace
         self.sidebarSort = sidebarSort
@@ -29,6 +31,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowDisplaySleep = insomniaAllowDisplaySleep
         self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
+        self.tokenSaverEnabled = tokenSaverEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -39,6 +42,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowDisplaySleep
         case insomniaAllowSystemSleepWhenDisplayClosed
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
+        case tokenSaverEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -50,6 +54,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowDisplaySleep = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowDisplaySleep) ?? true
         insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
+        tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
     }
 }
 

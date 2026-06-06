@@ -101,13 +101,31 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func surfaceHealthDetails(surface: SurfaceID) -> JSONValue { terminalHealth }
     func surfaceClearHistory(surface: SurfaceID) {}
     var sshHostsByWorkspace: [WorkspaceID: [SSHHostProfile]] = [:]
-    func sshHostList(workspace: WorkspaceID) throws -> [SSHHostProfile] { sshHostsByWorkspace[workspace, default: []] }
+    func sshHostList(workspace: WorkspaceID) throws -> [SSHHostProfile] {
+        sshHostsByWorkspace[workspace, default: []].map { host in
+            var copy = host
+            copy.hasSavedPassword = copy.hasSavedPassword || (copy.password?.isEmpty == false)
+            copy.password = nil
+            return copy
+        }
+    }
     func sshHostUpsert(_ profile: SSHHostProfile, workspace: WorkspaceID) throws -> SSHHostProfile {
         var hosts = sshHostsByWorkspace[workspace, default: []]
-        if let idx = hosts.firstIndex(where: { $0.id == profile.id }) { hosts[idx] = profile }
-        else { hosts.append(profile) }
+        var saved = profile
+        if let idx = hosts.firstIndex(where: { $0.id == profile.id }) {
+            if saved.password?.isEmpty == false {
+                saved.hasSavedPassword = true
+            } else {
+                saved.password = hosts[idx].password
+                saved.hasSavedPassword = hosts[idx].hasSavedPassword || (hosts[idx].password?.isEmpty == false)
+            }
+            hosts[idx] = saved
+        } else {
+            saved.hasSavedPassword = saved.hasSavedPassword || (saved.password?.isEmpty == false)
+            hosts.append(saved)
+        }
         sshHostsByWorkspace[workspace] = hosts
-        return profile
+        return saved
     }
     func sshHostDelete(_ id: SSHHostID, workspace: WorkspaceID) throws { sshHostsByWorkspace[workspace, default: []].removeAll { $0.id == id } }
     func sshConnect(workspace: WorkspaceID, profileID: SSHHostID?, profile: SSHHostProfile?, title: String?, paneID: PaneID?) throws -> SurfaceDescriptor {
@@ -754,8 +772,10 @@ final class DispatcherTests: XCTestCase {
         guard case .array(let hosts)? = list.result else { return XCTFail("ssh.host.list must return saved hosts") }
         XCTAssertEqual(hosts.count, 1, "saving a host must make it available for reconnect")
         guard case .object(let listedHost)? = hosts.first else { return XCTFail("ssh.host.list must return host objects") }
-        XCTAssertEqual(listedHost["password"], .string("saved-test-password"),
-                       "a saved password must stay on the saved host so reconnect can answer the SSH prompt without asking again")
+        XCTAssertNil(listedHost["password"],
+                     "ssh.host.list must not expose saved passwords because opening the app should not trigger a Keychain prompt or leak a secret to clients")
+        XCTAssertEqual(listedHost["hasSavedPassword"], .bool(true),
+                       "the host list still needs metadata so the UI knows one-tap reconnect has a stored credential")
 
         let connected = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "ssh.connect", params: [
             "workspace_id": .string(wid),

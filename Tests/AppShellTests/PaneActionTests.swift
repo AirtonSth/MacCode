@@ -7,6 +7,28 @@ import SocketServer
 
 @MainActor
 final class PaneActionTests: XCTestCase {
+    private final class FakeSSHPasswordStore: SSHPasswordStoring {
+        var values: [String: String] = [:]
+        var savedAccounts: [String] = []
+        var loadedAccounts: [String] = []
+        var deletedAccounts: [String] = []
+
+        func save(account: String, password: String) {
+            savedAccounts.append(account)
+            values[account] = password
+        }
+
+        func load(account: String) -> String? {
+            loadedAccounts.append(account)
+            return values[account]
+        }
+
+        func delete(account: String) {
+            deletedAccounts.append(account)
+            values.removeValue(forKey: account)
+        }
+    }
+
     private func closeAndUnregisterAllSurfaces() {
         let surfaces = SurfaceRegistry.shared.all()
         surfaces.forEach { $0.close() }
@@ -34,10 +56,10 @@ final class PaneActionTests: XCTestCase {
         super.tearDown()
     }
 
-    private func makeContext() throws -> (AppContext, AppCommandRouter) {
+    private func makeContext(sshPasswordStore: SSHPasswordStoring = KeychainSSHPasswordStore()) throws -> (AppContext, AppCommandRouter) {
         let tmp = NSTemporaryDirectory() + "RC2PaneTest-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)
-        let router = AppCommandRouter(context: ctx)
+        let router = AppCommandRouter(context: ctx, sshPasswordStore: sshPasswordStore)
         ctx.router = router
         return (ctx, router)
     }
@@ -190,6 +212,74 @@ final class PaneActionTests: XCTestCase {
                        "workspace A must keep the SSH host it saved for one-tap reconnect")
         XCTAssertTrue(try router.sshHostList(workspace: second.id).isEmpty,
                       "workspace B must not inherit SSH hosts saved in another workspace")
+    }
+
+    func test_sshHostListDoesNotReadSavedPasswordStorageOnOpen() throws {
+        let store = FakeSSHPasswordStore()
+        let (_, router) = try makeContext(sshPasswordStore: store)
+        let workspace = try router.createWorkspace(name: "ssh-keychain-open", cwd: NSTemporaryDirectory())
+
+        let saved = try router.sshHostUpsert(SSHHostProfile(label: "Prompt Once",
+                                                            destination: "prompt.example.invalid",
+                                                            password: "saved-secret"),
+                                             workspace: workspace.id)
+        XCTAssertEqual(store.savedAccounts, [saved.id.value.uuidString],
+                       "saving the host must store the password once in secure storage")
+
+        store.loadedAccounts = []
+        let listed = try router.sshHostList(workspace: workspace.id)
+
+        XCTAssertTrue(store.loadedAccounts.isEmpty,
+                      "opening RemoteCode or listing SSH hosts must not read the saved password because that triggers the macOS Keychain prompt")
+        XCTAssertNil(listed.first?.password,
+                     "the host list should carry metadata only; the secret is needed when connecting, not when drawing the saved-host sidebar")
+    }
+
+    func test_sshHostForConnectionLoadsSavedPasswordOnlyWhenConnecting() throws {
+        let store = FakeSSHPasswordStore()
+        let (_, router) = try makeContext(sshPasswordStore: store)
+        let workspace = try router.createWorkspace(name: "ssh-keychain-connect", cwd: NSTemporaryDirectory())
+
+        let saved = try router.sshHostUpsert(SSHHostProfile(label: "Connect Once",
+                                                            destination: "connect.example.invalid",
+                                                            password: "saved-secret"),
+                                             workspace: workspace.id)
+        store.loadedAccounts = []
+        let listed = try router.sshHostList(workspace: workspace.id)
+        let listedHost = try XCTUnwrap(listed.first)
+
+        let resolved = try router.sshHostForConnection(listedHost, workspace: workspace.id)
+
+        XCTAssertEqual(store.loadedAccounts, [saved.id.value.uuidString],
+                       "the saved password should be read exactly when the user connects, not while opening the app")
+        XCTAssertEqual(resolved.password, "saved-secret",
+                       "one-tap reconnect must still answer the SSH password prompt after list/open stops reading Keychain")
+        XCTAssertTrue(resolved.hasSavedPassword)
+    }
+
+    func test_legacySSHHostWithoutSavedPasswordMetadataStillLoadsPasswordOnConnect() throws {
+        let store = FakeSSHPasswordStore()
+        let (ctx, router) = try makeContext(sshPasswordStore: store)
+        let workspace = try router.createWorkspace(name: "ssh-legacy-keychain", cwd: NSTemporaryDirectory())
+        let legacyID = SSHHostID()
+        try ctx.settingsRepo.set("ssh.hosts.\(workspace.id.value.uuidString)", """
+        [{"id":{"value":"\(legacyID.value.uuidString)"},"label":"Legacy SSH","destination":"legacy.example.invalid"}]
+        """)
+        store.values[legacyID.value.uuidString] = "legacy-secret"
+
+        let listed = try router.sshHostList(workspace: workspace.id)
+        let listedHost = try XCTUnwrap(listed.first)
+
+        XCTAssertTrue(store.loadedAccounts.isEmpty,
+                      "reading older saved-host settings must not probe Keychain during app open")
+        XCTAssertNil(listedHost.password)
+        XCTAssertTrue(listedHost.hasSavedPassword,
+                      "older saved-host rows predate the metadata flag, so they must stay eligible for connect-time Keychain loading")
+
+        let resolved = try router.sshHostForConnection(listedHost, workspace: workspace.id)
+
+        XCTAssertEqual(store.loadedAccounts, [legacyID.value.uuidString])
+        XCTAssertEqual(resolved.password, "legacy-secret")
     }
 
     func test_sshOpenNewConnectionUsesCurrentSurfaceThenCreatesNewTabWhenActive() throws {

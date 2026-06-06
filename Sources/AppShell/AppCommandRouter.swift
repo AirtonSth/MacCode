@@ -50,13 +50,19 @@ private struct ProviderProbeCapabilities {
 public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting {
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
+    private let sshPasswordStore: SSHPasswordStoring
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
     private var suppressedLayoutEventDepth = 0
 
-    public init(context: AppContext) {
+    public convenience init(context: AppContext) {
+        self.init(context: context, sshPasswordStore: KeychainSSHPasswordStore())
+    }
+
+    init(context: AppContext, sshPasswordStore: SSHPasswordStoring) {
         self.context = context
+        self.sshPasswordStore = sshPasswordStore
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
@@ -725,12 +731,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         saved.updatedAt = Date()
         if let index = hosts.firstIndex(where: { $0.id == saved.id }) {
             saved.createdAt = hosts[index].createdAt
+            if saved.password?.isEmpty == false {
+                saved.hasSavedPassword = true
+            } else {
+                saved.password = nil
+                saved.hasSavedPassword = hosts[index].hasSavedPassword
+            }
             hosts[index] = saved
         } else {
+            saved.hasSavedPassword = saved.password?.isEmpty == false
             hosts.append(saved)
         }
         try writeSSHHosts(hosts, workspace: workspace, to: ctx.settingsRepo)
         return saved
+    }
+
+    func sshHostForConnection(_ profile: SSHHostProfile, workspace: WorkspaceID) throws -> SSHHostProfile {
+        let saved = try sshHostUpsert(profile, workspace: workspace)
+        return sshHostWithPasswordForConnection(saved)
     }
 
     public func sshHostDelete(_ id: SSHHostID, workspace: WorkspaceID) throws {
@@ -738,6 +756,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try requireWorkspace(workspace, in: ctx)
         var hosts = try readSSHHosts(workspace: workspace, from: ctx.settingsRepo)
         hosts.removeAll { $0.id == id }
+        sshPasswordStore.delete(account: id.value.uuidString)
         try writeSSHHosts(hosts, workspace: workspace, to: ctx.settingsRepo)
     }
 
@@ -747,9 +766,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let hosts = try readSSHHosts(workspace: workspace, from: ctx.settingsRepo)
         let resolved: SSHHostProfile
         if let profileID, let found = hosts.first(where: { $0.id == profileID }) {
-            resolved = found
+            resolved = sshHostWithPasswordForConnection(found)
         } else if let profile {
-            resolved = try sshHostUpsert(profile, workspace: workspace)
+            resolved = try sshHostForConnection(profile, workspace: workspace)
         } else {
             throw LayoutError.surfaceNotFound
         }
@@ -2335,16 +2354,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func readSSHHosts(workspace: WorkspaceID, from repo: SettingsRepository) throws -> [SSHHostProfile] {
         guard let raw = try repo.get(sshHostsKey(workspace: workspace)),
               let data = raw.data(using: .utf8) else { return [] }
-        let hosts = (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
-        // Passwords are never stored in the on-disk JSON (UX-MAC_SSH-002b);
-        // rehydrate them from the Keychain for the in-memory profile.
-        return hosts.map { host in
-            var h = host
-            if h.password == nil || h.password?.isEmpty == true {
-                h.password = SSHKeychainStore.load(account: host.id.value.uuidString)
-            }
-            return h
-        }
+        return (try? JSONDecoder().decode([SSHHostProfile].self, from: data)) ?? []
     }
 
     private func writeSSHHosts(_ hosts: [SSHHostProfile], workspace: WorkspaceID, to repo: SettingsRepository) throws {
@@ -2352,15 +2362,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let stripped: [SSHHostProfile] = hosts.map { host in
             var h = host
             if let pw = host.password, !pw.isEmpty {
-                SSHKeychainStore.save(account: host.id.value.uuidString, password: pw)
+                sshPasswordStore.save(account: host.id.value.uuidString, password: pw)
+                h.hasSavedPassword = true
+            } else if !host.hasSavedPassword {
+                sshPasswordStore.delete(account: host.id.value.uuidString)
             } else {
-                SSHKeychainStore.delete(account: host.id.value.uuidString)
+                h.hasSavedPassword = true
             }
             h.password = nil
             return h
         }
         let data = try JSONEncoder().encode(stripped)
         try repo.set(sshHostsKey(workspace: workspace), String(data: data, encoding: .utf8) ?? "[]")
+    }
+
+    private func sshHostWithPasswordForConnection(_ host: SSHHostProfile) -> SSHHostProfile {
+        var resolved = host
+        if (resolved.password == nil || resolved.password?.isEmpty == true), host.hasSavedPassword {
+            resolved.password = sshPasswordStore.load(account: host.id.value.uuidString)
+        }
+        resolved.hasSavedPassword = resolved.hasSavedPassword || (resolved.password?.isEmpty == false)
+        return resolved
     }
 
     private func runSSHTransfer(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) throws -> JSONValue {
@@ -2900,7 +2922,13 @@ private func terminalRenderDiagnosticsJSON(_ diagnostics: TerminalRenderDiagnost
 /// plaintext in the settings JSON (UX-MAC_SSH-002b). Generic-password items
 /// keyed by host profile id. Failures are non-fatal: the in-memory session
 /// still works; only durable persistence of the secret is lost.
-enum SSHKeychainStore {
+protocol SSHPasswordStoring {
+    func save(account: String, password: String)
+    func load(account: String) -> String?
+    func delete(account: String)
+}
+
+struct KeychainSSHPasswordStore: SSHPasswordStoring {
     private static let service = "com.remotecode.ssh.password"
 
     private static func baseQuery(account: String) -> [String: Any] {
@@ -2911,17 +2939,17 @@ enum SSHKeychainStore {
         ]
     }
 
-    static func save(account: String, password: String) {
+    func save(account: String, password: String) {
         let data = Data(password.utf8)
-        SecItemDelete(baseQuery(account: account) as CFDictionary)
-        var add = baseQuery(account: account)
+        SecItemDelete(Self.baseQuery(account: account) as CFDictionary)
+        var add = Self.baseQuery(account: account)
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemAdd(add as CFDictionary, nil)
     }
 
-    static func load(account: String) -> String? {
-        var query = baseQuery(account: account)
+    func load(account: String) -> String? {
+        var query = Self.baseQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
@@ -2931,7 +2959,7 @@ enum SSHKeychainStore {
         return value
     }
 
-    static func delete(account: String) {
-        SecItemDelete(baseQuery(account: account) as CFDictionary)
+    func delete(account: String) {
+        SecItemDelete(Self.baseQuery(account: account) as CFDictionary)
     }
 }

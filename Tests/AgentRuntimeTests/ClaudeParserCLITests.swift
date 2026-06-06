@@ -177,7 +177,7 @@ final class ClaudeParserCLITests: XCTestCase {
             #"{"type":"system","subtype":"files_persisted","files":["a.swift","b.swift"]}"#,
             #"{"type":"system","subtype":"compact_boundary","summary":"older Claude turns summarized"}"#,
             #"{"type":"auth_status","status":"expired","authenticated":false,"message":"Claude login expired"}"#,
-            #"{"type":"rate_limit_event","limit_type":"requests","reset_at":"2026-05-23T12:00:00Z"}"#
+            #"{"type":"rate_limit_event","limit_type":"requests","reset_at":"2026-05-23T12:00:00Z","rate_limit_info":{"primary":{"usedPercent":57,"windowDurationMins":10080,"resetsAt":"2026-05-23T12:00:00Z"}}}"#
         ])
 
         XCTAssertTrue(evs.contains {
@@ -222,6 +222,12 @@ final class ClaudeParserCLITests: XCTestCase {
             }
             return false
         }, "Claude rate_limit_event must be visible before the user assumes the app hung")
+        XCTAssertTrue(evs.contains {
+            if case .accountUsage(let usage) = $0 {
+                return usage.provider == .claude && usage.weeklyUsedPercent == 57 && usage.weeklyWindowDurationMinutes == 10_080
+            }
+            return false
+        }, "Claude rate_limit_info must feed Token Saver weekly account usage instead of leaving the rings at fake 100%")
         XCTAssertFalse(evs.contains {
             if case .error(let message, _) = $0 {
                 return message.contains("requests")

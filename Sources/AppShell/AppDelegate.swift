@@ -32,7 +32,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let dbOverride: String?
     private var providerSessionReaperTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
+    private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
+    public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 5 * 60
 
     public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
         self.channel = channel
@@ -133,6 +135,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
         installMainMenu()
         windowController.show()
+        refreshTokenSaverAccountUsageOnLaunch()
+        startTokenSaverAccountUsageRefreshLoop()
         startDiagnosticsHeartbeat()
         logDiagnosticsHeartbeat(reason: "launch")
         checkForUpdatesAfterOpeningApp()
@@ -154,6 +158,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
+        tokenSaverAccountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -184,6 +189,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             Task { @MainActor in
                 self.logDiagnosticsHeartbeat(reason: "periodic")
+            }
+        }
+    }
+
+    private func refreshTokenSaverAccountUsageOnLaunch() {
+        context?.refreshTokenSaverAccountUsage(reason: "launch")
+    }
+
+    private func startTokenSaverAccountUsageRefreshLoop() {
+        tokenSaverAccountUsageRefreshTimer?.invalidate()
+        tokenSaverAccountUsageRefreshTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.tokenSaverAccountUsageRefreshInterval,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.context?.refreshTokenSaverAccountUsage(reason: "periodic")
             }
         }
     }

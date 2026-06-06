@@ -281,6 +281,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             port: draft.parsedPort,
             identityFile: draft.parsedIdentityFile,
             password: draft.parsedPassword,
+            hasSavedPassword: draft.hasSavedPassword && draft.parsedPassword == nil,
             options: draft.options
         )
         do {
@@ -327,7 +328,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private func performConnect(_ host: SSHHostProfile) {
         sshLog.info("ssh connect start: \(host.destination, privacy: .private)")
         do {
-            let saved = try router?.sshHostUpsert(host, workspace: workspaceID) ?? host
+            let saved = try router?.sshHostForConnection(host, workspace: workspaceID) ?? host
             terminal?.close()
             let next = try TerminalSurface(workspaceID: workspaceID, title: saved.label, launch: .ssh(profile: saved, cwd: cwd))
             terminal = next
@@ -409,14 +410,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     private func refreshRemoteFiles() {
         guard descriptor.metadata["ssh_status"] == "connected" else { return }
-        do {
-            let listing = try router?.sshFilesRemoteList(surface: descriptor.id, path: viewModel.remoteSitePath)
-            viewModel.applyRemoteListing(listing?.objectValue ?? [:])
-        } catch {
-            viewModel.transferStatus = "Remote list failed"
-            viewModel.remoteListError = error.localizedDescription
-            viewModel.addTransferLog("Remote: \(error.localizedDescription)")
-            sshLog.error("ssh remote list failed: \(error.localizedDescription, privacy: .public)")
+        Task { [weak self] in
+            await self?.refreshRemoteFilesAsync()
         }
     }
 
@@ -997,6 +992,7 @@ struct SSHHostDraft {
     var portText = ""
     var identityFileText = ""
     var passwordText = ""
+    var hasSavedPassword = false
     var optionLines = ""
 
     var resolvedLabel: String {
@@ -1032,6 +1028,7 @@ struct SSHHostDraft {
         portText = host.port.map(String.init) ?? ""
         identityFileText = host.identityFile ?? ""
         passwordText = host.password ?? ""
+        hasSavedPassword = host.hasSavedPassword || (host.password?.isEmpty == false)
         optionLines = host.options.joined(separator: "\n")
     }
 }

@@ -10,6 +10,7 @@ public final class AppContext {
     public let channel: ReleaseChannel
     public let db: SQLiteDB
     public let bootstrapReport: BootstrapReport
+    public let appSupportDirectory: URL
     public let projectRepo: ProjectRepository
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
@@ -25,6 +26,9 @@ public final class AppContext {
     public let proposedPlanRepo: AgentProposedPlanRepository
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let privateNotificationBridge: PrivateNotificationBridge
+    public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
+    public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
+    public private(set) var tokenSaverAccountUsageRefreshCount = 0
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()
@@ -32,12 +36,21 @@ public final class AppContext {
     public let coordinator: AgentRunCoordinator
     public var router: AppCommandRouter!
     public var socketServer: UnixSocketServer?
+    private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
+    private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
 
-    public init(channel: ReleaseChannel = .debug, dbPathOverride: String? = nil, appSupportOverride: String? = nil) throws {
+    public init(
+        channel: ReleaseChannel = .debug,
+        dbPathOverride: String? = nil,
+        appSupportOverride: String? = nil,
+        tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing = TokenSaverAccountUsageRefresher()
+    ) throws {
         self.channel = channel
+        self.tokenSaverAccountUsageRefresher = tokenSaverAccountUsageRefresher
         let bs = Bootstrap(channel: channel, dbPathOverride: dbPathOverride, appSupportOverride: appSupportOverride)
         let (rep, db) = try bs.run()
         self.bootstrapReport = rep
+        self.appSupportDirectory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
         self.db = db
         self.projectRepo = ProjectRepository(db: db)
         self.threadRepo = AgentThreadRepository(db: db)
@@ -57,6 +70,9 @@ public final class AppContext {
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
             pushTargetStore: PrivatePushTargetStore(repo: self.settingsRepo)
         )
+        self.tokenSaverDistillServiceController = TokenSaverDistillServiceController(
+            appSupportDirectory: self.appSupportDirectory
+        )
         let codex = CodexAppServerAdapter(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
         let claude: AgentProviderAdapter = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0"
             ? ClaudeStreamingCLIAdapter(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
@@ -71,6 +87,8 @@ public final class AppContext {
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
+        installManagedDistillSkills()
+        startTokenSaverDistillServiceIfEligible()
 
         // GAP-7: stream agent run lifecycle + timeline to the network
         // event bus so the iOS mirror renders agent output in real time
@@ -113,7 +131,7 @@ public final class AppContext {
         coordinator.onMessageAppended = { message in
             EventBus.shared.publish(kind: "agent.message.appended", payload: messageJSON(message))
         }
-        coordinator.onAssistantEvent = { ev, tid, _ in
+        coordinator.onAssistantEvent = { ev, tid, runId in
             let t = tid.value.uuidString
             switch ev {
             case .threadStarted:
@@ -201,6 +219,7 @@ public final class AppContext {
                     "answer": answer.map(JSONValue.string) ?? .null
                 ]))
             case .tokenUsage(let usage):
+                self.recordTokenSaverUsage(usage, runId: runId)
                 var p: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "input_tokens": .number(Double(usage.inputTokens)),
@@ -212,6 +231,17 @@ public final class AppContext {
                     p["compacts_automatically"] = .bool(compactsAutomatically)
                 }
                 EventBus.shared.publish(kind: "agent.thread.token_usage", payload: .object(p))
+            case .accountUsage(let usage):
+                self.recordTokenSaverAccountUsage(usage)
+                EventBus.shared.publish(kind: "agent.account.usage", payload: .object([
+                    "thread_id": .string(t),
+                    "provider": .string(usage.provider.rawValue),
+                    "weekly_used_percent": .number(usage.weeklyUsedPercent),
+                    "weekly_window_duration_minutes": usage.weeklyWindowDurationMinutes.map { .number(Double($0)) } ?? .null,
+                    "weekly_resets_at_ms": usage.weeklyResetsAtMs.map { .number(Double($0)) } ?? .null,
+                    "current_session_used_percent": usage.currentSessionUsedPercent.map { .number($0) } ?? .null,
+                    "current_session_resets_at_ms": usage.currentSessionResetsAtMs.map { .number(Double($0)) } ?? .null
+                ]))
             case .contextCompaction(let summary):
                 EventBus.shared.publish(kind: "agent.context.compaction", payload: .object([
                     "thread_id": .string(t),
@@ -289,6 +319,173 @@ public final class AppContext {
         // restore last snapshot if any
         if let snap = try snapshotRepo.latest() {
             self.state = snap.layout
+        }
+    }
+
+    private func installManagedDistillSkills() {
+        let installer = AgentSkillInstaller(appSupportDirectory: appSupportDirectory)
+        do {
+            managedDistillSkillInstallResults = [
+                try installer.installDistillSkill(for: .codex, sourceRevision: "github-main-remote-code-template-v1"),
+                try installer.installDistillSkill(for: .claude, sourceRevision: "github-main-remote-code-template-v1")
+            ]
+        } catch {
+            NSLog("RemoteCode managed Distill skill install failed: \(error)")
+            managedDistillSkillInstallResults = []
+        }
+    }
+
+    private func startTokenSaverDistillServiceIfEligible() {
+        let settings = SettingsStore(db: db).load()
+        let session = PrivateAccountSessionStore(repo: settingsRepo).load()
+        let modelValidation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+            .validateInstalledModel()
+        tokenSaverDistillServiceController.startIfEligible(
+            session: session,
+            settings: settings,
+            modelValidation: modelValidation
+        )
+    }
+
+    private func recordTokenSaverAccountUsage(_ usage: AssistantAccountUsage) {
+        do {
+            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).recordAccountUsage(
+                provider: usage.provider,
+                weeklyUsedPercent: usage.weeklyUsedPercent,
+                weeklyWindowDurationMinutes: usage.weeklyWindowDurationMinutes,
+                weeklyResetsAt: usage.weeklyResetsAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+                currentSessionUsedPercent: usage.currentSessionUsedPercent,
+                currentSessionResetsAt: usage.currentSessionResetsAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+            )
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        } catch {
+            NSLog("RemoteCode Token Saver account usage record failed: \(error)")
+        }
+    }
+
+    public func refreshTokenSaverAccountUsage(reason: String) {
+        guard PrivateAccountSessionStore(repo: settingsRepo).load() != nil else {
+            publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "signed_out")
+            return
+        }
+        guard tokenSaverAccountUsageRefreshTask == nil else {
+            publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "busy")
+            return
+        }
+        tokenSaverAccountUsageRefreshCount += 1
+        publishTokenSaverAccountUsageRefresh(state: "started", reason: reason, detail: nil)
+
+        let codexBinary = (try? settingsRepo.get("cli.codex.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let claudeBinary = (try? settingsRepo.get("cli.claude.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = TokenSaverAccountUsageRefreshRequest(
+            codexBinary: codexBinary?.isEmpty == false ? codexBinary! : "codex",
+            claudeBinary: claudeBinary?.isEmpty == false ? claudeBinary! : "claude",
+            cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
+            environment: [:]
+        )
+        let refresher = tokenSaverAccountUsageRefresher
+
+        tokenSaverAccountUsageRefreshTask = Task { [weak self] in
+            let usages = await Self.refreshAccountUsageWithTimeout(refresher: refresher, request: request)
+            await MainActor.run {
+                guard let self else { return }
+                for usage in usages {
+                    self.recordTokenSaverAccountUsage(usage)
+                    EventBus.shared.publish(kind: "agent.account.usage", payload: .object([
+                        "provider": .string(usage.provider.rawValue),
+                        "reason": .string(reason),
+                        "weekly_used_percent": .number(usage.weeklyUsedPercent),
+                        "weekly_window_duration_minutes": usage.weeklyWindowDurationMinutes.map { .number(Double($0)) } ?? .null,
+                        "weekly_resets_at_ms": usage.weeklyResetsAtMs.map { .number(Double($0)) } ?? .null,
+                        "current_session_used_percent": usage.currentSessionUsedPercent.map { .number($0) } ?? .null,
+                        "current_session_resets_at_ms": usage.currentSessionResetsAtMs.map { .number(Double($0)) } ?? .null
+                    ]))
+                }
+                self.publishTokenSaverAccountUsageRefresh(
+                    state: "finished",
+                    reason: reason,
+                    detail: usages.isEmpty ? "empty" : nil,
+                    providers: usages.map(\.provider.rawValue)
+                )
+                self.tokenSaverAccountUsageRefreshTask = nil
+            }
+        }
+    }
+
+    private static func refreshAccountUsageWithTimeout(
+        refresher: TokenSaverAccountUsageRefreshing,
+        request: TokenSaverAccountUsageRefreshRequest
+    ) async -> [AssistantAccountUsage] {
+        await withCheckedContinuation { continuation in
+            let lock = NSLock()
+            var resumed = false
+            func resume(_ usages: [AssistantAccountUsage]) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: usages)
+            }
+
+            let work = Task.detached {
+                let usages = await refresher.refreshAccountUsage(request)
+                resume(usages)
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                work.cancel()
+                resume([])
+            }
+        }
+    }
+
+    private func publishTokenSaverAccountUsageRefresh(
+        state: String,
+        reason: String,
+        detail: String?,
+        providers: [String] = []
+    ) {
+        var payload: [String: JSONValue] = [
+            "state": .string(state),
+            "reason": .string(reason),
+            "refresh_count": .number(Double(tokenSaverAccountUsageRefreshCount))
+        ]
+        if let detail {
+            payload["detail"] = .string(detail)
+        }
+        if !providers.isEmpty {
+            payload["providers"] = .array(providers.map { .string($0) })
+        }
+        EventBus.shared.publish(kind: "agent.account.usage.refresh", payload: .object(payload))
+    }
+
+    private func recordTokenSaverUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
+        guard usage.totalTokens > 0,
+              let run = try? runRepo.get(id: runId) else {
+            return
+        }
+        let settings = SettingsStore(db: db).load()
+        let rawEstimate: Int
+        let eligibleRuns: Int
+        if settings.tokenSaverEnabled {
+            rawEstimate = max(usage.totalTokens, Int((Double(usage.totalTokens) / 0.42).rounded()))
+            eligibleRuns = 1
+        } else {
+            rawEstimate = usage.totalTokens
+            eligibleRuns = 0
+        }
+        do {
+            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).record(
+                provider: run.provider,
+                actualProviderTokens: usage.totalTokens,
+                estimatedRawTokens: rawEstimate,
+                eligibleRuns: eligibleRuns,
+                currentSessionTokens: usage.totalTokens,
+                currentSessionLimitTokens: usage.contextWindow
+            )
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        } catch {
+            NSLog("RemoteCode Token Saver usage record failed: \(error)")
         }
     }
 

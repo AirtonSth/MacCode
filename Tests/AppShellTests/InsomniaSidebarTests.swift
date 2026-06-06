@@ -1,5 +1,9 @@
 import XCTest
+import AppKit
+import SwiftUI
 @testable import AppShell
+import AgentRuntime
+import CoreModel
 import Persistence
 
 @MainActor
@@ -53,7 +57,9 @@ final class InsomniaSidebarTests: XCTestCase {
         seedSettings: AppSettings? = nil,
         power: FakeInsomniaPowerManager = FakeInsomniaPowerManager(),
         powerMonitor: ExternalPowerMonitoring = FakeExternalPowerMonitor(),
-        insomniaBatteryPrompt: @escaping SidebarViewModel.InsomniaBatteryPrompt = { .keepEnabled }
+        insomniaBatteryPrompt: @escaping SidebarViewModel.InsomniaBatteryPrompt = { .keepEnabled },
+        tokenSaverModelValidationProvider: SidebarViewModel.TokenSaverModelValidationProvider? = nil,
+        tokenSaverModelDownloadHandler: SidebarViewModel.TokenSaverModelDownloadHandler? = nil
     ) throws -> (AppContext, AppCommandRouter, SidebarViewModel, FakeInsomniaPowerManager) {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
@@ -66,19 +72,302 @@ final class InsomniaSidebarTests: XCTestCase {
             router: router,
             insomniaPower: power,
             powerMonitor: powerMonitor,
-            insomniaBatteryPrompt: insomniaBatteryPrompt
+            insomniaBatteryPrompt: insomniaBatteryPrompt,
+            tokenSaverModelValidationProvider: tokenSaverModelValidationProvider,
+            tokenSaverModelDownloadHandler: tokenSaverModelDownloadHandler
         )
         return (ctx, router, vm, power)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    private func writeTinyTokenSaverModel(
+        installer: TokenSaverModelInstaller,
+        revision: String = "ui-rev-test"
+    ) throws -> TokenSaverModelManifest {
+        let fileURL = installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = Data("mlx-ui-weights".utf8)
+        try data.write(to: fileURL)
+        let relativePath = [
+            "Models",
+            TokenSaverModelInstaller.safePathComponent(TokenSaverModelManifest.approvedModelID),
+            revision,
+            "model.safetensors"
+        ].joined(separator: "/")
+        let manifest = TokenSaverModelManifest(
+            revision: revision,
+            files: [
+                TokenSaverModelFile(
+                    relativePath: relativePath,
+                    sha256: try TokenSaverModelInstaller.sha256Hex(url: fileURL),
+                    sizeBytes: Int64(data.count)
+                )
+            ]
+        )
+        try installer.writeManifest(manifest)
+        return manifest
+    }
+
+    private func savePrivateSession(in ctx: AppContext, subscribed: Bool) {
+        let user = PrivateAccountUser(
+            daysRemaing: nil,
+            daysRemaining: 30,
+            email: subscribed ? "paid@example.com" : "unpaid@example.com",
+            id: subscribed ? "paid-user" : "unpaid-user",
+            subscribed: subscribed
+        )
+        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(PrivateAccountSession(
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            user: user
+        ))
     }
 
     func test_defaultInactiveWhenUserHasNotChangedToggle() throws {
         let (ctx, _, vm, power) = try make()
 
         XCTAssertFalse(vm.insomniaEnabled)
+        XCTAssertFalse(vm.tokenSaverEnabled)
         XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaEnabled,
                        "a user with no saved Insomnia choice must launch macOS without asking for an admin password")
         XCTAssertTrue(power.activateReasons.isEmpty,
                       "default inactive Insomnia must not acquire macOS keep-awake assertions on launch")
+    }
+
+    func test_tokenSaverEnableRequiresSubscribedAccount() throws {
+        let (ctx, _, vm, _) = try make(seedSettings: AppSettings(tokenSaverEnabled: false))
+
+        vm.setTokenSaverEnabled(true)
+        XCTAssertFalse(vm.tokenSaverEnabled,
+                       "Token Saver must not enable while no paid account is loaded")
+
+        savePrivateSession(in: ctx, subscribed: false)
+        vm.reload()
+        vm.setTokenSaverEnabled(true)
+        XCTAssertFalse(vm.tokenSaverEnabled,
+                       "unpaid accounts can see potential savings but must not enable the paid local service")
+    }
+
+    func test_tokenSaverPaidEnablePersistsAndReloads() throws {
+        let dir = NSTemporaryDirectory() + "RC2TokenSaverOn-" + UUID().uuidString
+        let installed: SidebarViewModel.TokenSaverModelValidationProvider = { .installed }
+        let (ctx, _, vm, _) = try make(
+            dir: dir,
+            seedSettings: AppSettings(tokenSaverEnabled: false),
+            tokenSaverModelValidationProvider: installed
+        )
+        savePrivateSession(in: ctx, subscribed: true)
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+
+        XCTAssertTrue(vm.tokenSaverEnabled)
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
+                      "paid Token Saver enablement must persist so later launches can start from the verified model")
+
+        let (reloadedCtx, _, reloaded, _) = try make(
+            dir: dir,
+            tokenSaverModelValidationProvider: installed
+        )
+        savePrivateSession(in: reloadedCtx, subscribed: true)
+        reloaded.reload()
+        XCTAssertTrue(reloaded.tokenSaverEnabled)
+    }
+
+    func test_tokenSaverPaidEnableOpensModelDownloadWhenManifestMissing() throws {
+        let missing: SidebarViewModel.TokenSaverModelValidationProvider = {
+            TokenSaverModelValidation(state: .missing, reason: "manifest missing")
+        }
+        let waitingDownload: SidebarViewModel.TokenSaverModelDownloadHandler = { progress in
+            progress(TokenSaverModelDownloadState(
+                phase: .downloading,
+                downloadedBytes: 0,
+                expectedBytes: 10,
+                statusText: "Waiting"
+            ))
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            throw CancellationError()
+        }
+        let (ctx, _, vm, _) = try make(
+            seedSettings: AppSettings(tokenSaverEnabled: false),
+            tokenSaverModelValidationProvider: missing,
+            tokenSaverModelDownloadHandler: waitingDownload
+        )
+        savePrivateSession(in: ctx, subscribed: true)
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+
+        XCTAssertFalse(vm.tokenSaverEnabled,
+                       "paid Token Saver must not persist enabled until the approved MLX model verifies")
+        XCTAssertTrue(vm.showsTokenSaverModelDownload,
+                      "clicking Enable Token Saver with a missing model must open the download modal")
+        XCTAssertEqual(vm.tokenSaverModelDownloadState.phase, .preparing)
+        XCTAssertEqual(vm.tokenSaverModelDownloadState.errorMessage, "manifest missing")
+    }
+
+    func test_tokenSaverPaidEnableDownloadsMissingModelThenPersists() async throws {
+        let dir = NSTemporaryDirectory() + "RC2TokenSaverDownload-" + UUID().uuidString
+        let installer = TokenSaverModelInstaller(appSupportDirectory: URL(fileURLWithPath: dir, isDirectory: true))
+        let handler: SidebarViewModel.TokenSaverModelDownloadHandler = { progress in
+            progress(TokenSaverModelDownloadState(
+                phase: .downloading,
+                downloadedBytes: 4,
+                expectedBytes: 14,
+                statusText: "Downloading model.safetensors"
+            ))
+            progress(TokenSaverModelDownloadState(
+                phase: .verifying,
+                downloadedBytes: 14,
+                expectedBytes: 14,
+                statusText: "Verifying downloaded model"
+            ))
+            let manifest = try self.writeTinyTokenSaverModel(installer: installer)
+            progress(.ready)
+            return manifest
+        }
+        let (ctx, _, vm, _) = try make(
+            dir: dir,
+            seedSettings: AppSettings(tokenSaverEnabled: false),
+            tokenSaverModelValidationProvider: { installer.validateInstalledModel() },
+            tokenSaverModelDownloadHandler: handler
+        )
+        savePrivateSession(in: ctx, subscribed: true)
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+
+        let didEnable = await waitUntil { vm.tokenSaverEnabled }
+        XCTAssertTrue(didEnable,
+                      "paid Token Saver enablement should complete only after the clicked download writes and verifies the approved model manifest")
+        XCTAssertFalse(vm.showsTokenSaverModelDownload)
+        XCTAssertEqual(vm.tokenSaverModelDownloadState.phase, .ready)
+        XCTAssertEqual(installer.validateInstalledModel(), .installed)
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
+                      "verified first-use model download must persist Token Saver on for future launches")
+    }
+
+    func test_tokenSaverModelDownloadCancelPausesAndDoesNotPersistEnabled() async throws {
+        let handler: SidebarViewModel.TokenSaverModelDownloadHandler = { progress in
+            progress(TokenSaverModelDownloadState(
+                phase: .downloading,
+                downloadedBytes: 5,
+                expectedBytes: 20,
+                statusText: "Downloading model.safetensors"
+            ))
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            throw CancellationError()
+        }
+        let (ctx, _, vm, _) = try make(
+            seedSettings: AppSettings(tokenSaverEnabled: false),
+            tokenSaverModelValidationProvider: {
+                TokenSaverModelValidation(state: .missing, reason: "manifest missing")
+            },
+            tokenSaverModelDownloadHandler: handler
+        )
+        savePrivateSession(in: ctx, subscribed: true)
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+        let didStartDownload = await waitUntil { vm.tokenSaverModelDownloadState.phase == .downloading }
+        XCTAssertTrue(didStartDownload,
+                      "download progress should become visible before a user can pause it")
+        vm.cancelTokenSaverModelDownload()
+
+        XCTAssertFalse(vm.tokenSaverEnabled)
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().tokenSaverEnabled)
+        XCTAssertFalse(vm.showsTokenSaverModelDownload)
+        XCTAssertEqual(vm.tokenSaverModelDownloadState.phase, .paused)
+    }
+
+    func test_tokenSaverUsageRefreshesFromProviderTokenUsageEvents() async throws {
+        let (ctx, router, vm, _) = try make(seedSettings: AppSettings(tokenSaverEnabled: true))
+        let workspaceDir = NSTemporaryDirectory() + "RC2TokenSaverUsageWorkspace-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: workspaceDir, withIntermediateDirectories: true)
+        let workspace = try router.createWorkspace(name: "usage", cwd: workspaceDir)
+        let thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "usage",
+            provider: .codex,
+            model: "gpt-test"
+        )
+        try ctx.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-test",
+            status: .running,
+            startedAt: Date()
+        )
+        try ctx.runRepo.upsert(run)
+
+        ctx.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(inputTokens: 120, outputTokens: 80, totalTokens: 200)),
+            thread.id,
+            run.id
+        )
+
+        let refreshed = await waitUntil { vm.tokenSaverUsageSnapshot.usedTokens == 200 }
+        XCTAssertTrue(refreshed,
+                      "sidebar Token Saver indicator must refresh when Claude/Codex provider usage is recorded")
+        XCTAssertEqual(vm.tokenSaverUsageSnapshot.measuredSavedTokens, 276)
+        XCTAssertEqual(vm.tokenSaverUsageSnapshot.eligibleRuns, 1)
+    }
+
+    func test_tokenSaverActivityRingsRenderCodexUsedProgress() throws {
+        let oneThirdBluePixels = try renderedBluePixelCount(codexUsedProgress: 0.33)
+        let twoThirdsBluePixels = try renderedBluePixelCount(codexUsedProgress: 0.66)
+
+        XCTAssertGreaterThan(oneThirdBluePixels, 80,
+                             "Codex used percentage has data, so the Token Saver chart must render a visible blue used arc")
+        XCTAssertGreaterThan(twoThirdsBluePixels, oneThirdBluePixels + 120,
+                             "Codex ring must fill from used percentage; 66% used should visibly render more blue arc than 33% used")
+    }
+
+    private func renderedBluePixelCount(codexUsedProgress: Double) throws -> Int {
+        let view = SidebarRootView.TokenSaverActivityRings(values: .init(
+            tokenSaverProgress: 0.2,
+            claudeUsedProgress: 0.42,
+            codexUsedProgress: codexUsedProgress
+        ))
+            .frame(width: 104, height: 104)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 1
+        guard let image = renderer.nsImage,
+              let data = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: data)
+        else {
+            throw XCTSkip("Token Saver activity rings could not render into an image for visual verification")
+        }
+
+        var bluePixels = 0
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                if color.alphaComponent > 0.6,
+                   color.blueComponent > 0.65,
+                   color.blueComponent > color.redComponent + 0.28,
+                   color.blueComponent > color.greenComponent + 0.12 {
+                    bluePixels += 1
+                }
+            }
+        }
+        return bluePixels
     }
 
     func test_toggleOffPersistsAndReloadsOff() throws {
