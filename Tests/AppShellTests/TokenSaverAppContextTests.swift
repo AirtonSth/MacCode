@@ -174,6 +174,65 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(AppDelegate.tokenSaverAccountUsageRefreshInterval, 300)
     }
 
+    func test_tokenSaverCompressionCompressesPromptAndRecordsMeasuredSavingsToDB() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverCompress-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        // Real in-process distill service (LocalDistillRuntime, no MLX needed).
+        let configuration = try DistillServiceConfiguration(
+            authToken: "test-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "test-token")
+
+        let bigPrompt = (1...40)
+            .map { "line \($0): a verbose instruction line that the distiller will compress away" }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(bigPrompt.count, 600)
+
+        let compressed = await context.tokenSaverCompress(prompt: bigPrompt, provider: .claude)
+
+        XCTAssertNotEqual(compressed, bigPrompt, "an enabled Token Saver with a reachable model must compress a large prompt")
+        XCTAssertLessThan(compressed.count, bigPrompt.count, "compressed prompt must be smaller than the original")
+
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        let claude = try XCTUnwrap(summary.savings(for: "claude"),
+                                   "a measured savings row must be persisted to the local DB for the compressed run")
+        XCTAssertGreaterThan(claude.savedTokens, 0)
+        XCTAssertEqual(claude.runs, 1)
+        XCTAssertGreaterThan(summary.averageSavedPerRun, 0, "the per-run average (média) must be computable from real data")
+    }
+
+    func test_tokenSaverCompressionIsNoOpWhenDisabledOrTooShort() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverNoop-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+
+        let configuration = try DistillServiceConfiguration(authToken: "t", appSupportDirectory: appSupport)
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "t")
+
+        let bigPrompt = String(repeating: "verbose line to compress here\n", count: 40)
+
+        // Disabled → verbatim passthrough, no DB rows.
+        let disabled = await context.tokenSaverCompress(prompt: bigPrompt, provider: .claude)
+        XCTAssertEqual(disabled, bigPrompt)
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
+
+        // Enabled but tiny prompt → below threshold, passthrough, no DB rows.
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        let tiny = await context.tokenSaverCompress(prompt: "fix typo", provider: .claude)
+        XCTAssertEqual(tiny, "fix typo")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
+    }
+
     func test_tokenSaverDistillServiceControllerStartsInjectedSidecarForPaidEnabledInstalledModel() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2PaidTokenSaverLaunch-\(UUID().uuidString)", isDirectory: true)

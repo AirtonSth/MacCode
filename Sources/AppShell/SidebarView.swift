@@ -52,6 +52,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     @Published public private(set) var tokenSaverEnabled: Bool = false
     @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
+    /// Real, measured compression savings from the local DB (7-day window).
+    @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
     @Published public var showsTokenSaverModelDownload = false
     @Published public private(set) var tokenSaverModelDownloadState: TokenSaverModelDownloadState = .idle
     public var draggingWorkspaceID: WorkspaceID?
@@ -165,8 +167,10 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverUsageSnapshot = TokenSaverUsageStore(
                 appSupportDirectory: context.appSupportDirectory
             ).load()
+            tokenSaverSavingsSummary = (try? context.tokenSaverSavingsRepo.summary()) ?? .empty
         } else {
             tokenSaverUsageSnapshot = .empty()
+            tokenSaverSavingsSummary = .empty
         }
     }
 
@@ -1119,7 +1123,7 @@ public struct SidebarRootView: View {
         let used = vm.tokenSaverUsageSnapshot.usedTokens
         if user.subscribed {
             if vm.tokenSaverEnabled {
-                let saved = vm.tokenSaverUsageSnapshot.measuredSavedTokens
+                let saved = vm.tokenSaverSavingsSummary.totalSavedTokens
                 return saved > 0 ? "Saved \(Self.formatTokenCount(saved)) tokens" : "Tracking after next run"
             }
             return "Enable savings"
@@ -1238,16 +1242,29 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Int {
         if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
-            switch scope {
-            case .currentSession:
-                return 0
-            case .week:
-                return snapshot.measuredSavedTokens
-            }
+            return tokenSaverMeasuredSaved(scope: scope)
         }
         return TokenSaverUsageStore.estimatePotentialSavings(
             usedTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
         )
+    }
+
+    /// Real measured savings from the DB ledger. Week = full 7-day window;
+    /// Current Session = today's (UTC) buckets, matching the ledger's bucketing.
+    private func tokenSaverMeasuredSaved(scope: TokenSaverUsageScope) -> Int {
+        let summary = vm.tokenSaverSavingsSummary
+        switch scope {
+        case .week:
+            return summary.totalSavedTokens
+        case .currentSession:
+            let todayStartMs = Int64(Date().timeIntervalSince1970 * 1000) / 86_400_000 * 86_400_000
+            return summary.daily.filter { $0.dayStartMs >= todayStartMs }.reduce(0) { $0 + $1.savedTokens }
+        }
+    }
+
+    /// Mean tokens saved per compressed run over the 7-day window.
+    private var tokenSaverAverageSavedPerRun: Int {
+        vm.tokenSaverSavingsSummary.averageSavedPerRun
     }
 
     private func tokenSaverSavingsSummary(
@@ -1452,7 +1469,12 @@ public struct SidebarRootView: View {
             return "Subscribe to start saving these tokens automatically."
         }
         if vm.tokenSaverEnabled {
-            return "Your plan has already reduced provider usage by \(Self.formatTokenCount(tokenSaverDetailsSavedOrPotential)) tokens."
+            let saved = vm.tokenSaverSavingsSummary.totalSavedTokens
+            guard saved > 0 else {
+                return "Token Saver is on. Measured savings appear after your next large prompt is compressed."
+            }
+            let runs = vm.tokenSaverSavingsSummary.totalRuns
+            return "Token Saver measured \(Self.formatTokenCount(saved)) tokens saved across \(runs) compression\(runs == 1 ? "" : "s") (avg \(Self.formatTokenCount(tokenSaverAverageSavedPerRun))/run, last 7 days)."
         }
         return "Enable Token Saver to run the approved local MLX model and start reducing provider usage."
     }
@@ -1461,7 +1483,7 @@ public struct SidebarRootView: View {
         let snapshot = tokenSaverDetailsSnapshot
         let usage = tokenSaverProviderUsage(provider, in: snapshot)
         let value = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
-            ? usage.measuredSavedTokens
+            ? (vm.tokenSaverSavingsSummary.savings(for: provider.rawValue)?.savedTokens ?? 0)
             : TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usage.actualProviderTokens)
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {

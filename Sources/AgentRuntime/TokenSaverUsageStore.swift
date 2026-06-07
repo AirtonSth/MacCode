@@ -163,6 +163,11 @@ public struct TokenSaverUsageSnapshot: Codable, Sendable, Equatable {
 }
 
 public final class TokenSaverUsageStore: @unchecked Sendable {
+    // Callers construct a fresh store per write (AppContext does this from the
+    // provider stream thread AND from MainActor), so a per-instance lock would
+    // not serialize anything. This process-wide lock makes every
+    // read-modify-write atomic against all other writers of usage.json.
+    private static let ioLock = NSLock()
     private let url: URL
     private let fileManager: FileManager
     private let calendar: Calendar
@@ -209,6 +214,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         currentSessionLimitTokens: Int? = nil,
         period: TokenSaverPeriod = .sevenDays
     ) throws -> TokenSaverUsageSnapshot {
+        Self.ioLock.lock()
+        defer { Self.ioLock.unlock() }
         let snapshot = load(period: period)
         var providers = snapshot.providers
         let delta = TokenSaverProviderUsage(
@@ -257,6 +264,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         currentSessionResetsAt: Date? = nil,
         period: TokenSaverPeriod = .sevenDays
     ) throws -> TokenSaverUsageSnapshot {
+        Self.ioLock.lock()
+        defer { Self.ioLock.unlock() }
         let snapshot = load(period: period)
         var providers = snapshot.providers
         if let index = providers.firstIndex(where: { $0.provider == provider }) {

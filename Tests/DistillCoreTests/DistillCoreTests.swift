@@ -119,6 +119,36 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(response.inputCharacters, 26)
     }
 
+    func test_schedulerReportsMeasuredTokenSavingsFromRealCompression() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        // 60 verbose lines; LocalDistillRuntime keeps only the first 12, so the
+        // distilled output is materially smaller and savings must be positive.
+        let verbose = (1...60).map { "line \($0): verbose command output that the model removes" }.joined(separator: "\n")
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .commandOutput,
+            input: verbose,
+            maxOutputCharacters: 4000
+        ))
+
+        XCTAssertGreaterThan(response.inputTokens, 0)
+        XCTAssertGreaterThan(response.outputTokens, 0)
+        XCTAssertGreaterThan(response.savedTokens, 0,
+                             "compressing 60 lines down to 12 must report measured tokens saved, not zero")
+        XCTAssertEqual(response.savedTokens, max(response.inputTokens - response.outputTokens, 0),
+                       "savedTokens must equal the measured input/output delta — never a synthetic ratio")
+        XCTAssertLessThan(response.outputTokens, response.inputTokens)
+    }
+
+    func test_tokenEstimatorIsZeroForEmptyAndGrowsWithText() {
+        XCTAssertEqual(TokenEstimator.estimate(""), 0)
+        XCTAssertGreaterThan(TokenEstimator.estimate("hello world this is a sentence"), 0)
+        XCTAssertGreaterThan(
+            TokenEstimator.estimate(String(repeating: "token ", count: 100)),
+            TokenEstimator.estimate("token token token"),
+            "more text must estimate to more tokens so the saved delta is meaningful"
+        )
+    }
+
     func test_mlxOutputCleanupRejectsHiddenThinkingAndPrefixDictionary() {
         let cleaned = MLXDistillRuntime.cleanOutput("<think>\nprivate\n</think>\nS=state, C=context")
 

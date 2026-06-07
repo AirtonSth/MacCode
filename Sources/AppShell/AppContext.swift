@@ -4,6 +4,7 @@ import Persistence
 import AgentRuntime
 import SocketServer
 import Surfaces
+import DistillCore
 
 @MainActor
 public final class AppContext {
@@ -25,6 +26,7 @@ public final class AppContext {
     public let providerPendingCallbackRepo: ProviderPendingCallbackRepository
     public let proposedPlanRepo: AgentProposedPlanRepository
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
+    public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let privateNotificationBridge: PrivateNotificationBridge
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
     public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
@@ -38,6 +40,14 @@ public final class AppContext {
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
+    private var cachedDistillClientKey: String?
+    private var cachedDistillClient: DistillServiceClient?
+    /// Test seam: when set, used instead of resolving a client from the live
+    /// sidecar status. Production code never sets this.
+    var distillClientOverrideForTesting: DistillServiceClient?
+    /// Prompts shorter than this are sent verbatim: distillation overhead/latency
+    /// isn't worth it and tiny instructions have nothing to compress.
+    private static let tokenSaverMinCompressChars = 600
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -66,6 +76,7 @@ public final class AppContext {
         self.providerPendingCallbackRepo = ProviderPendingCallbackRepository(db: db)
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
+        self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
         self.privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
             pushTargetStore: PrivatePushTargetStore(repo: self.settingsRepo)
@@ -84,6 +95,11 @@ public final class AppContext {
             providerAdapters: [.codex: codex, .claude: claude]
         )
         try coordinator.reconcileOnLaunch()
+        try? tokenSaverSavingsRepo.prune()
+        self.coordinator.promptCompressor = { [weak self] prompt, provider in
+            guard let self else { return prompt }
+            return await self.tokenSaverCompress(prompt: prompt, provider: provider)
+        }
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
@@ -459,26 +475,87 @@ public final class AppContext {
         EventBus.shared.publish(kind: "agent.account.usage.refresh", payload: .object(payload))
     }
 
+    /// Reuse one client per live sidecar (base URL + bearer token). Rebuilds
+    /// only when the service (re)starts with a new endpoint or token.
+    private func currentDistillClient() -> DistillServiceClient? {
+        if let distillClientOverrideForTesting { return distillClientOverrideForTesting }
+        guard case .running(let ready) = tokenSaverDistillServiceController.status,
+              let token = tokenSaverDistillServiceController.bearerToken else {
+            cachedDistillClientKey = nil
+            cachedDistillClient = nil
+            return nil
+        }
+        let key = "\(ready.baseURL)#\(token)"
+        if cachedDistillClientKey == key, let client = cachedDistillClient {
+            return client
+        }
+        guard let client = DistillServiceClient(ready: ready, authToken: token) else {
+            return nil
+        }
+        cachedDistillClientKey = key
+        cachedDistillClient = client
+        return client
+    }
+
+    /// Token Saver prompt compression. Returns the distilled text to send to the
+    /// provider, or the original prompt unchanged when Token Saver is off, the
+    /// prompt is too small, the sidecar is unavailable, compression doesn't
+    /// help, or anything fails. Every real compression is measured and written
+    /// to the local savings ledger. Fail-open by contract.
+    func tokenSaverCompress(prompt: String, provider: AgentProvider) async -> String {
+        guard SettingsStore(db: db).load().tokenSaverEnabled else { return prompt }
+        guard prompt.count >= Self.tokenSaverMinCompressChars else { return prompt }
+        guard let client = currentDistillClient() else { return prompt }
+
+        let request = DistillRequest(
+            mode: .longText,
+            priority: .interactive,
+            input: prompt,
+            maxOutputCharacters: max(512, prompt.count)
+        )
+        do {
+            let response = try await client.distill(request)
+            let compressed = response.output
+            // Only adopt the compressed text when it is non-empty and actually
+            // smaller in tokens; otherwise send the original untouched.
+            guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  response.savedTokens > 0,
+                  compressed.count < prompt.count else {
+                return prompt
+            }
+            do {
+                _ = try tokenSaverSavingsRepo.record(
+                    provider: provider.rawValue,
+                    mode: request.mode.rawValue,
+                    inputTokens: response.inputTokens,
+                    outputTokens: response.outputTokens
+                )
+                NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            } catch {
+                NSLog("RemoteCode Token Saver savings persist failed: \(error)")
+            }
+            return compressed
+        } catch {
+            NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
+            return prompt
+        }
+    }
+
     private func recordTokenSaverUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
         guard usage.totalTokens > 0,
               let run = try? runRepo.get(id: runId) else {
             return
         }
         let settings = SettingsStore(db: db).load()
-        let rawEstimate: Int
-        let eligibleRuns: Int
-        if settings.tokenSaverEnabled {
-            rawEstimate = max(usage.totalTokens, Int((Double(usage.totalTokens) / 0.42).rounded()))
-            eligibleRuns = 1
-        } else {
-            rawEstimate = usage.totalTokens
-            eligibleRuns = 0
-        }
+        // Record only the real provider-billed token count. Savings are no
+        // longer synthesised here from an assumed ratio — they are measured at
+        // compression time and persisted to the token_saver_savings ledger.
+        let eligibleRuns = settings.tokenSaverEnabled ? 1 : 0
         do {
             _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).record(
                 provider: run.provider,
                 actualProviderTokens: usage.totalTokens,
-                estimatedRawTokens: rawEstimate,
+                estimatedRawTokens: usage.totalTokens,
                 eligibleRuns: eligibleRuns,
                 currentSessionTokens: usage.totalTokens,
                 currentSessionLimitTokens: usage.contextWindow

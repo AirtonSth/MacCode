@@ -95,6 +95,36 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.failedRequests, 0)
     }
 
+    func test_clientCompressesViaServerAndReportsMeasuredSavings() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "client-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 4
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let client = try XCTUnwrap(DistillServiceClient(ready: ready, authToken: "client-token"))
+        let healthy = await client.isHealthy()
+        XCTAssertTrue(healthy, "client must reach the unauthenticated health endpoint")
+
+        let verbose = (1...40).map { "line \($0): verbose output to compress" }.joined(separator: "\n")
+        let response = try await client.distill(DistillRequest(mode: .commandOutput, input: verbose, maxOutputCharacters: 4000))
+        XCTAssertGreaterThan(response.savedTokens, 0, "the real client+server round-trip must yield measured savings")
+        XCTAssertEqual(response.savedTokens, max(response.inputTokens - response.outputTokens, 0))
+
+        // Wrong bearer token must surface as a loud, typed error (not silent).
+        let badClient = DistillServiceClient(baseURL: URL(string: ready.baseURL)!, authToken: "wrong")
+        do {
+            _ = try await badClient.distill(DistillRequest(mode: .longText, input: "x"))
+            XCTFail("client must throw on a rejected bearer token")
+        } catch let DistillClientError.badStatus(code, _) {
+            XCTAssertEqual(code, 401)
+        }
+    }
+
     private func response(
         baseURL: String,
         path: String,

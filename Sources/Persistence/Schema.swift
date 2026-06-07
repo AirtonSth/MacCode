@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 24
+    public static let currentVersion: Int = 25
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -349,6 +349,19 @@ public enum Schema {
             FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_agent_queued_messages_thread ON agent_queued_messages(thread_id, position, created_at);
+        """),
+        SchemaStep(25, """
+        CREATE TABLE IF NOT EXISTS token_saver_savings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            saved_tokens INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_savings_time ON token_saver_savings(created_at_ms);
         """)
     ]
 

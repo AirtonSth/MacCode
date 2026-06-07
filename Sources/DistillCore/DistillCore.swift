@@ -48,12 +48,38 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     public let output: String
     public let inputCharacters: Int
     public let outputCharacters: Int
+    public let inputTokens: Int
+    public let outputTokens: Int
 
-    public init(requestID: UUID, output: String, inputCharacters: Int) {
+    public init(requestID: UUID, output: String, inputCharacters: Int, inputTokens: Int = 0, outputTokens: Int = 0) {
         self.requestID = requestID
         self.output = output
         self.inputCharacters = inputCharacters
         self.outputCharacters = output.count
+        self.inputTokens = max(0, inputTokens)
+        self.outputTokens = max(0, outputTokens)
+    }
+
+    /// Tokens removed by compression. Never negative: a longer "compressed"
+    /// output (rare model misbehavior) reports zero savings, not negative.
+    public var savedTokens: Int { max(inputTokens - outputTokens, 0) }
+}
+
+/// Deterministic, model-agnostic token estimator. The distilled output is only
+/// ever sent to the provider in compressed form, so the *raw* token cost is
+/// never observed from the provider — it must be estimated. The same estimator
+/// is applied to input and output, so the delta is an honest, consistent
+/// measure of how much compression removed (an estimate, not a billed count).
+public enum TokenEstimator {
+    public static func estimate(_ text: String) -> Int {
+        let chars = text.count
+        guard chars > 0 else { return 0 }
+        // OpenAI's published rule of thumb (~4 chars/token for English) blended
+        // with a word-count floor so short, word-dense lines aren't undercounted.
+        let byChars = Int((Double(chars) / 4.0).rounded())
+        let words = text.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" }).count
+        let byWords = Int((Double(words) * 1.3).rounded())
+        return max(1, max(byChars, byWords))
     }
 }
 
@@ -100,7 +126,13 @@ public actor DistillScheduler {
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DistillError.invalidOutput
         }
-        return DistillResponse(requestID: request.id, output: output, inputCharacters: request.input.count)
+        return DistillResponse(
+            requestID: request.id,
+            output: output,
+            inputCharacters: request.input.count,
+            inputTokens: TokenEstimator.estimate(request.input),
+            outputTokens: TokenEstimator.estimate(output)
+        )
     }
 
     private func acquireSlot() async throws {

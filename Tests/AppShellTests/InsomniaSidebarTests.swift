@@ -325,7 +325,12 @@ final class InsomniaSidebarTests: XCTestCase {
         let refreshed = await waitUntil { vm.tokenSaverUsageSnapshot.usedTokens == 200 }
         XCTAssertTrue(refreshed,
                       "sidebar Token Saver indicator must refresh when Claude/Codex provider usage is recorded")
-        XCTAssertEqual(vm.tokenSaverUsageSnapshot.measuredSavedTokens, 276)
+        // Provider token-usage events record REAL provider spend only. Savings
+        // are measured at compression time and live in the DB ledger — they are
+        // never synthesised here from a fixed ratio (the old behavior reported a
+        // fabricated 276). usage.json must therefore show zero "saved".
+        XCTAssertEqual(vm.tokenSaverUsageSnapshot.measuredSavedTokens, 0,
+                       "token-usage events must not fabricate savings from an assumed compression ratio")
         XCTAssertEqual(vm.tokenSaverUsageSnapshot.eligibleRuns, 1)
     }
 

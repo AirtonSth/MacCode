@@ -59,6 +59,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onMessageAppended: ((AgentMessage) -> Void)?
     public var onPersistenceIssue: ((String, AgentThreadID, AgentRunID) -> Void)?
 
+    /// Token Saver hook: async transform applied to the outbound provider
+    /// prompt only. The original text is always preserved as the displayed
+    /// user message. Must be fail-open — return the input unchanged on any
+    /// error or when Token Saver is disabled.
+    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider) async -> String)?
+
     public init(
         runRepo: AgentRunRepository,
         messageRepo: AgentMessageRepository,
@@ -138,6 +144,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func startRun(_ request: AgentRunRequest) async throws -> AgentRunID {
         let recoveryContext = request.providerThreadId == nil ? try recoverableResumeContext(for: request) : nil
         let resumeCursor = request.providerThreadId ?? recoveryContext?.resumeCursor
+        // Token Saver: compress only the text sent to the provider; the
+        // original prompt is preserved verbatim as the displayed user message.
+        let preservedUserContent = request.userMessageContent ?? request.prompt
+        var outboundPrompt = request.prompt
+        if let promptCompressor {
+            outboundPrompt = await promptCompressor(request.prompt, request.provider)
+        }
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
@@ -145,8 +158,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerInstanceId: request.providerInstanceId,
             model: request.model,
             cwd: request.cwd,
-            prompt: request.prompt,
-            userMessageContent: request.userMessageContent,
+            prompt: outboundPrompt,
+            userMessageContent: preservedUserContent,
             attachments: request.attachments,
             providerThreadId: resumeCursor,
             permissionMode: recoveryContext?.runtimeMode ?? request.permissionMode,
