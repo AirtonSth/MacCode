@@ -104,40 +104,97 @@ final class TokenSaverInstallTests: XCTestCase {
         return URLSession(configuration: config)
     }
 
-    func test_agentSkillInstallerWritesClaudeAndCodexSkillsOnlyUnderAppSupport() throws {
-        let appSupport = tempDir()
-        let installer = AgentSkillInstaller(appSupportDirectory: appSupport)
+    func test_agentSkillInstallerWritesIntoProviderSkillDirectoriesTheAgentsActuallyScan() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
         let date = Date(timeIntervalSince1970: 1_783_000_000)
+        // Where the Claude Agent SDK (`user` setting source) and Codex ($CODEX_HOME/skills)
+        // actually look, NOT RemoteCode's private app-support, where nothing scanned before.
+        let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
+        let claudeSkill = home.appendingPathComponent(".claude/skills/distill/SKILL.md")
 
         let codex = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a", installedAt: date)
         let claude = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a", installedAt: date)
 
         XCTAssertEqual(codex.action, .installed)
         XCTAssertEqual(claude.action, .installed)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appSupport.appendingPathComponent("AgentSkills/codex/distill/SKILL.md").path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: appSupport.appendingPathComponent("AgentSkills/claude/distill/SKILL.md").path))
-        XCTAssertTrue(codex.manifest.installPath.hasPrefix(appSupport.path),
-                      "managed skills must stay scoped to RemoteCode app support instead of provider global config")
-        XCTAssertTrue(claude.manifest.installPath.hasPrefix(appSupport.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path),
+                      "Codex only loads skills from $CODEX_HOME/skills")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: claudeSkill.path),
+                      "the Claude Agent SDK only loads skills from ~/.claude/skills")
+        XCTAssertEqual(codex.manifest.installPath, codexSkill.path)
+        XCTAssertEqual(claude.manifest.installPath, claudeSkill.path)
         XCTAssertEqual(codex.manifest.sourceURL, AgentSkillInstaller.distillSourceURL)
         XCTAssertEqual(claude.manifest.sourceRevision, "rev-a")
 
         let codexText = try String(contentsOf: URL(fileURLWithPath: codex.manifest.installPath))
         XCTAssertTrue(codexText.contains("/distill"))
         XCTAssertTrue(codexText.contains("S=state"))
-        XCTAssertFalse(codex.manifest.installPath.contains(".codex"))
-        XCTAssertFalse(claude.manifest.installPath.contains(".claude"))
     }
 
     func test_agentSkillInstallerIsIdempotentForSameRevisionAndChecksum() throws {
-        let appSupport = tempDir()
-        let installer = AgentSkillInstaller(appSupportDirectory: appSupport)
+        let installer = AgentSkillInstaller(homeDirectory: tempDir())
 
         _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
         let second = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
 
         XCTAssertEqual(second.action, .skipped,
                        "relaunch should not rewrite managed skill files when version and checksum are unchanged")
+    }
+
+    func test_agentSkillInstallerUninstallRemovesDistillSkillForEachProvider() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
+        let claudeSkill = home.appendingPathComponent(".claude/skills/distill/SKILL.md")
+
+        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: claudeSkill.path))
+
+        XCTAssertEqual(try installer.uninstallDistillSkill(for: .codex), .removed,
+                       "disabling Token Saver must remove the managed /distill skill")
+        XCTAssertEqual(try installer.uninstallDistillSkill(for: .claude), .removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path))
+    }
+
+    func test_agentSkillInstallerUninstallIsNoOpWhenSkillNotPresent() throws {
+        let installer = AgentSkillInstaller(homeDirectory: tempDir())
+
+        XCTAssertEqual(try installer.uninstallDistillSkill(for: .codex), .notPresent,
+                       "uninstalling a skill that was never installed must not throw")
+    }
+
+    func test_agentSkillInstallerUninstallLeavesAUserAuthoredSkillOfTheSameNameUntouched() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        // A user-authored `distill` skill that RemoteCode did NOT install (no manifest.json).
+        let userSkillDir = home.appendingPathComponent(".claude/skills/distill", isDirectory: true)
+        try FileManager.default.createDirectory(at: userSkillDir, withIntermediateDirectories: true)
+        let userSkill = userSkillDir.appendingPathComponent("SKILL.md")
+        try Data("user's own distill".utf8).write(to: userSkill)
+
+        XCTAssertEqual(try installer.uninstallDistillSkill(for: .claude), .notPresent,
+                       "uninstall must only remove skill dirs RemoteCode owns (proven by its manifest)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: userSkill.path),
+                      "a user-authored skill of the same name must survive a Token Saver disable")
+    }
+
+    func test_agentSkillInstallerReinstallsAfterUninstall() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
+
+        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        XCTAssertEqual(try installer.uninstallDistillSkill(for: .codex), .removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
+
+        let reinstalled = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        XCTAssertEqual(reinstalled.action, .installed,
+                       "re-enabling Token Saver after a disable must write the skill back to disk")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
     }
 
     func test_modelInstallerRequiresApprovedManifestAndChecksums() throws {

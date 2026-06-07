@@ -216,6 +216,7 @@ public final class SidebarViewModel: ObservableObject {
                 $0.tokenSaverEnabled = false
             }
             context?.tokenSaverDistillServiceController.stop()
+            context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
             return
         }
         let validation = validateTokenSaverModel()
@@ -337,6 +338,7 @@ public final class SidebarViewModel: ObservableObject {
 
     private func refreshTokenSaverDistillService(modelValidation: TokenSaverModelValidation) {
         guard let context else { return }
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: settingsStore.load().tokenSaverEnabled)
         context.tokenSaverDistillServiceController.startIfEligible(
             session: PrivateAccountSessionStore(repo: context.settingsRepo).load(),
             settings: settingsStore.load(),

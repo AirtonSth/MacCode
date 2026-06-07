@@ -43,6 +43,11 @@ public struct AgentSkillInstallResult: Sendable, Equatable {
     public let manifest: AgentSkillManifest
 }
 
+public enum AgentSkillUninstallResult: String, Sendable, Equatable {
+    case removed
+    case notPresent
+}
+
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
@@ -86,17 +91,48 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md
     """
 
-    private let appSupportDirectory: URL
+    private let claudeSkillsRoot: URL
+    private let codexSkillsRoot: URL
     private let fileManager: FileManager
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    public init(appSupportDirectory: URL, fileManager: FileManager = .default) {
-        self.appSupportDirectory = appSupportDirectory
+    /// Skills must live where each agent actually scans for them, not in RemoteCode's
+    /// private app-support: the Claude Agent SDK reads `~/.claude/skills` (via the
+    /// `user` setting source) and Codex reads `$CODEX_HOME/skills` (default `~/.codex/skills`).
+    public init(
+        claudeSkillsRoot: URL = AgentSkillInstaller.defaultClaudeSkillsRoot(),
+        codexSkillsRoot: URL = AgentSkillInstaller.defaultCodexSkillsRoot(),
+        fileManager: FileManager = .default
+    ) {
+        self.claudeSkillsRoot = claudeSkillsRoot
+        self.codexSkillsRoot = codexSkillsRoot
         self.fileManager = fileManager
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
+    }
+
+    /// Test seam: derive both provider skill roots from a sandboxed home directory so
+    /// unit tests never write into the developer's real `~/.claude` / `~/.codex`.
+    public convenience init(homeDirectory: URL, fileManager: FileManager = .default) {
+        self.init(
+            claudeSkillsRoot: homeDirectory.appendingPathComponent(".claude/skills", isDirectory: true),
+            codexSkillsRoot: homeDirectory.appendingPathComponent(".codex/skills", isDirectory: true),
+            fileManager: fileManager
+        )
+    }
+
+    public static func defaultClaudeSkillsRoot() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/skills", isDirectory: true)
+    }
+
+    public static func defaultCodexSkillsRoot() -> URL {
+        if let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !codexHome.isEmpty {
+            return URL(fileURLWithPath: codexHome, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/skills", isDirectory: true)
     }
 
     public func installDistillSkill(
@@ -156,11 +192,32 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return AgentSkillInstallResult(action: .installed, manifest: manifest)
     }
 
+    public func uninstallDistillSkill(for provider: AgentProvider) throws -> AgentSkillUninstallResult {
+        try uninstallSkill(provider: provider, skillID: Self.distillSkillID)
+    }
+
+    public func uninstallSkill(provider: AgentProvider, skillID: String) throws -> AgentSkillUninstallResult {
+        let directory = skillDirectory(provider: provider, skillID: skillID)
+        // Only remove a skill directory we own. The presence of our manifest.json proves
+        // RemoteCode installed it, so we never delete a user-authored skill that happens to
+        // share the same name in the shared `~/.claude/skills` / `~/.codex/skills` roots.
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        guard fileManager.fileExists(atPath: manifestURL.path) else {
+            return .notPresent
+        }
+        try fileManager.removeItem(at: directory)
+        return .removed
+    }
+
     public func skillDirectory(provider: AgentProvider, skillID: String) -> URL {
-        appSupportDirectory
-            .appendingPathComponent("AgentSkills", isDirectory: true)
-            .appendingPathComponent(provider.rawValue, isDirectory: true)
-            .appendingPathComponent(skillID, isDirectory: true)
+        skillsRoot(for: provider).appendingPathComponent(skillID, isDirectory: true)
+    }
+
+    private func skillsRoot(for provider: AgentProvider) -> URL {
+        switch provider {
+        case .claude: return claudeSkillsRoot
+        case .codex: return codexSkillsRoot
+        }
     }
 
     public static func sha256Hex(_ data: Data) -> String {

@@ -98,9 +98,8 @@ public enum ProviderProcessSweeper {
     ) -> Bool {
         guard process.pid != currentPID else { return false }
         let command = process.command
-        return command.contains("/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/")
-            || command.contains("ClaudeAgentSDKBridge.mjs")
-            || command.contains("codex app-server")
+        return isRemoteCodeClaudeRuntime(command)
+            || isCodexAppServerRuntime(command)
     }
 
     private static func isOrphanRoot(
@@ -109,18 +108,39 @@ public enum ProviderProcessSweeper {
     ) -> Bool {
         guard process.ppid == 1 else { return false }
         guard isRemoteCodeProviderRuntime(process, currentPID: currentPID) else { return false }
-        return process.command.contains("ClaudeAgentSDKBridge.mjs")
+        return isRemoteCodeClaudeRuntime(process.command)
             || process.command.contains("/claude ")
             || process.command.hasSuffix("/claude")
-            || process.command.contains("codex app-server")
+            || isCodexAppServerRuntime(process.command)
     }
 
     private static func descendants(
         of pid: Int32,
         in processes: [ProviderRuntimeProcess]
     ) -> [Int32] {
-        let children = processes.filter { $0.ppid == pid }.map(\.pid)
-        return children + children.flatMap { descendants(of: $0, in: processes) }
+        var pending = processes.filter { $0.ppid == pid }.map(\.pid)
+        var seen = Set<Int32>()
+        var result: [Int32] = []
+
+        while let child = pending.popLast() {
+            guard seen.insert(child).inserted else { continue }
+            result.append(child)
+            pending.append(contentsOf: processes.filter { $0.ppid == child }.map(\.pid))
+        }
+
+        return result
+    }
+
+    private static func isRemoteCodeClaudeRuntime(_ command: String) -> Bool {
+        command.contains("/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/")
+    }
+
+    private static func isCodexAppServerRuntime(_ command: String) -> Bool {
+        let parts = command.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+        guard parts.count >= 2 else { return false }
+        let executable = String(parts[0])
+        return (executable == "codex" || executable.hasSuffix("/codex"))
+            && parts[1] == "app-server"
     }
 
     private static func psRows() -> [ProviderRuntimeProcess] {

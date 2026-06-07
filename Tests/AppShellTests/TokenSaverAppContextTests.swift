@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import CoreModel
 import AgentRuntime
 import DistillCore
@@ -47,25 +48,123 @@ final class TokenSaverAppContextTests: XCTestCase {
         ))
     }
 
-    func test_appContextInstallsManagedDistillSkillsWithoutProviderGlobalConfigWrites() throws {
+    private func managedDistillSkillURLs(home: URL) -> (codex: URL, claude: URL) {
+        (
+            codex: home.appendingPathComponent(".codex/skills/distill/SKILL.md"),
+            claude: home.appendingPathComponent(".claude/skills/distill/SKILL.md")
+        )
+    }
+
+    func test_appContextReconcilesManagedDistillSkillsWithTokenSaverToggle() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkills-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedSkillsHome-" + UUID().uuidString, isDirectory: true)
 
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        // Sandbox the install roots so the test writes into a temp home, not the
+        // developer's real ~/.claude / ~/.codex.
+        context.agentSkillsHomeOverrideForTesting = home
 
+        // The provider skill dirs the agents actually scan.
+        let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
+        let claudeSkill = home.appendingPathComponent(".claude/skills/distill/SKILL.md")
+
+        // Token Saver disabled (the default) must NOT leave the managed /distill skill on disk.
+        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0,
+                       "the managed /distill skill must only exist while Token Saver is enabled")
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path))
+
+        // Enabling Token Saver installs the /distill skill into each provider's real skill dir.
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         XCTAssertEqual(context.managedDistillSkillInstallResults.count, 2)
-        let codexSkill = URL(fileURLWithPath: appSupport)
-            .appendingPathComponent("AgentSkills/codex/distill/SKILL.md")
-        let claudeSkill = URL(fileURLWithPath: appSupport)
-            .appendingPathComponent("AgentSkills/claude/distill/SKILL.md")
         XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: claudeSkill.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: appSupport).appendingPathComponent(".codex").path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: URL(fileURLWithPath: appSupport).appendingPathComponent(".claude").path))
 
-        let skillText = try String(contentsOf: codexSkill)
+        let skillText = try String(contentsOf: claudeSkill)
         XCTAssertTrue(skillText.contains("source: https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"))
         XCTAssertTrue(skillText.contains("S=state"))
         XCTAssertTrue(skillText.contains("P=proof"))
+
+        // Disabling Token Saver removes the managed skill again for both providers.
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path))
+    }
+
+    func test_appContextLaunchInstallsManagedDistillSkillsWhenPersistedTokenSaverEnabled() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOn-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedSkillsLaunchHome-" + UUID().uuidString, isDirectory: true)
+        let skillURLs = managedDistillSkillURLs(home: home)
+
+        let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: true))
+
+        let launchedContext = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            agentSkillsHomeOverrideForTesting: home
+        )
+
+        XCTAssertEqual(launchedContext.managedDistillSkillInstallResults.count, 2,
+                       "opening the app with Token Saver already enabled must install /distill before provider runs")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path),
+                      "Codex must see the managed /distill skill from its provider skill root on launch")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path),
+                      "Claude must see the managed /distill skill from its provider skill root on launch")
+    }
+
+    func test_appContextLaunchRemovesManagedDistillSkillsWhenPersistedTokenSaverDisabled() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOff-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedSkillsLaunchOffHome-" + UUID().uuidString, isDirectory: true)
+        let skillURLs = managedDistillSkillURLs(home: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
+        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+
+        let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: false))
+
+        let launchedContext = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            agentSkillsHomeOverrideForTesting: home
+        )
+
+        XCTAssertEqual(launchedContext.managedDistillSkillInstallResults.count, 0,
+                       "opening the app with Token Saver disabled must not keep stale managed skills active")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+    }
+
+    func test_applicationWillTerminateRemovesManagedDistillSkills() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsClose-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedSkillsCloseHome-" + UUID().uuidString, isDirectory: true)
+        let skillURLs = managedDistillSkillURLs(home: home)
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            agentSkillsHomeOverrideForTesting: home
+        )
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+
+        let delegate = AppDelegate()
+        delegate.context = context
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path),
+                       "closing RemoteCode must remove the managed Codex /distill skill")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path),
+                       "closing RemoteCode must remove the managed Claude /distill skill")
     }
 
     func test_tokenSaverDistillLaunchPlannerOnlyStartsForPaidEnabledInstalledModel() {

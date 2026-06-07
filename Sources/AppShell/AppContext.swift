@@ -45,6 +45,10 @@ public final class AppContext {
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
+    /// Test seam: sandboxes the managed-skill install roots under a temp home so
+    /// tests never write the /distill skill into the developer's real ~/.claude or
+    /// ~/.codex. Production code never sets this (installs to the real provider dirs).
+    var agentSkillsHomeOverrideForTesting: URL?
     /// Prompts shorter than this are sent verbatim: distillation overhead/latency
     /// isn't worth it and tiny instructions have nothing to compress.
     private static let tokenSaverMinCompressChars = 600
@@ -53,10 +57,12 @@ public final class AppContext {
         channel: ReleaseChannel = .debug,
         dbPathOverride: String? = nil,
         appSupportOverride: String? = nil,
-        tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing = TokenSaverAccountUsageRefresher()
+        tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing = TokenSaverAccountUsageRefresher(),
+        agentSkillsHomeOverrideForTesting: URL? = nil
     ) throws {
         self.channel = channel
         self.tokenSaverAccountUsageRefresher = tokenSaverAccountUsageRefresher
+        self.agentSkillsHomeOverrideForTesting = agentSkillsHomeOverrideForTesting
         let bs = Bootstrap(channel: channel, dbPathOverride: dbPathOverride, appSupportOverride: appSupportOverride)
         let (rep, db) = try bs.run()
         self.bootstrapReport = rep
@@ -103,7 +109,12 @@ public final class AppContext {
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
-        installManagedDistillSkills()
+        // Managed skills install into the real ~/.claude / ~/.codex skill dirs. Skip the
+        // open-trigger reconcile under XCTest so the suite never mutates the developer's
+        // real home; AppContext tests drive reconcile explicitly with a sandboxed home.
+        if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
+            reconcileManagedDistillSkills(tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled)
+        }
         startTokenSaverDistillServiceIfEligible()
 
         // GAP-7: stream agent run lifecycle + timeline to the network
@@ -338,15 +349,31 @@ public final class AppContext {
         }
     }
 
-    private func installManagedDistillSkills() {
-        let installer = AgentSkillInstaller(appSupportDirectory: appSupportDirectory)
+    /// The managed `/distill` skill is only useful while Token Saver is on, so its
+    /// install lifecycle tracks the Token Saver toggle: present when enabled, removed
+    /// when disabled. Driven from every Token Saver trigger: app open/close and the
+    /// enable/disable toggle, so the skill never lingers once Token Saver is off.
+    static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
+            NSClassFromString("XCTestCase") != nil
+    }
+
+    public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
+        let installer = agentSkillsHomeOverrideForTesting.map { AgentSkillInstaller(homeDirectory: $0) }
+            ?? AgentSkillInstaller()
         do {
-            managedDistillSkillInstallResults = [
-                try installer.installDistillSkill(for: .codex, sourceRevision: "github-main-remote-code-template-v1"),
-                try installer.installDistillSkill(for: .claude, sourceRevision: "github-main-remote-code-template-v1")
-            ]
+            if tokenSaverEnabled {
+                managedDistillSkillInstallResults = [
+                    try installer.installDistillSkill(for: .codex, sourceRevision: "github-main-remote-code-template-v1"),
+                    try installer.installDistillSkill(for: .claude, sourceRevision: "github-main-remote-code-template-v1")
+                ]
+            } else {
+                _ = try installer.uninstallDistillSkill(for: .codex)
+                _ = try installer.uninstallDistillSkill(for: .claude)
+                managedDistillSkillInstallResults = []
+            }
         } catch {
-            NSLog("RemoteCode managed Distill skill install failed: \(error)")
+            NSLog("RemoteCode managed Distill skill reconcile failed: \(error)")
             managedDistillSkillInstallResults = []
         }
     }

@@ -46,7 +46,7 @@ final class ProviderProcessSweeperTests: XCTestCase {
                 pid: 301,
                 ppid: 1,
                 rssKB: 45_000,
-                command: "node /opt/homebrew/bin/codex app-server"
+                command: "/opt/homebrew/bin/codex app-server"
             ),
             ProviderRuntimeProcess(
                 pid: 401,
@@ -75,6 +75,53 @@ final class ProviderProcessSweeperTests: XCTestCase {
                        "current app child Claude process must survive the orphan sweep")
         XCTAssertFalse(terminated.contains(401),
                        "user-owned terminal Claude commands must not be killed just because their parent is launchd")
+    }
+
+    func test_providerRuntimeDetectionIgnoresPromptTranscriptFalsePositives() {
+        let currentPID: Int32 = 500
+        let unrelatedComputerUseProcess = ProviderRuntimeProcess(
+            pid: 600,
+            ppid: 1,
+            rssKB: 45_000,
+            command: "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient prompt mentions codex app-server and ClaudeAgentSDKBridge.mjs"
+        )
+
+        XCTAssertFalse(
+            ProviderProcessSweeper.isRemoteCodeProviderRuntime(unrelatedComputerUseProcess, currentPID: currentPID),
+            "provider cleanup must not match arbitrary prompt text embedded in another process command line"
+        )
+    }
+
+    func test_currentProviderProcessesHandlesCyclicProcessSnapshots() {
+        let currentPID: Int32 = 500
+        let processes = [
+            ProviderRuntimeProcess(
+                pid: 201,
+                ppid: currentPID,
+                rssKB: 25_000,
+                command: "/opt/homebrew/bin/codex app-server"
+            ),
+            ProviderRuntimeProcess(
+                pid: 202,
+                ppid: 201,
+                rssKB: 25_000,
+                command: "child"
+            ),
+            ProviderRuntimeProcess(
+                pid: 201,
+                ppid: 202,
+                rssKB: 25_000,
+                command: "/opt/homebrew/bin/codex app-server"
+            )
+        ]
+
+        let providerProcesses = ProviderProcessSweeper.currentProviderProcesses(
+            processes: processes,
+            currentPID: currentPID
+        )
+
+        XCTAssertEqual(providerProcesses.map(\.pid), [201, 201, 202],
+                       "telemetry must return bounded results even if a mocked process snapshot contains a cycle")
     }
 
     func test_currentProviderFilterIncludesCurrentRuntimeButExcludesSelf() {

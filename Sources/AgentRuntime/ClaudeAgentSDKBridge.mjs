@@ -156,6 +156,11 @@ function ensureQuery() {
       tools: { type: 'preset', preset: 'claude_code' },
       mcpServers,
       settings: current.settings,
+      // Load filesystem settings so the SDK discovers Agent Skills (e.g. the managed
+      // /distill skill in ~/.claude/skills and project .claude/skills). Without this the
+      // SDK can run in isolation mode and load no skills at all. Trade-off: this also
+      // loads the user's CLAUDE.md, settings.json, and hooks into the session.
+      settingSources: ['user', 'project'],
       allowDangerouslySkipPermissions: current.permissionMode === 'bypassPermissions',
       env: current.env,
       // Partial assistant snapshots can contain evolving thinking blocks. Replaying

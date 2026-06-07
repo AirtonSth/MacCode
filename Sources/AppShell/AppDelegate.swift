@@ -151,6 +151,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
         disableInsomniaForAppClose()
+        context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         persistRestorableStateBeforeUpdate()
         stopLiveRuntimesForAppTermination()
         socketServer?.stop()
