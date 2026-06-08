@@ -556,6 +556,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             reasoningEffort: thread.reasoningEffort,
             serviceTier: session.serviceTier,
             interactionMode: .default,
+            // Tag the recovered session's environment with the provider so `| distill`
+            // tool calls attribute Token Saver savings correctly (not "unknown").
+            environment: ["REMOTE_CODE_AGENT_PROVIDER": thread.provider.rawValue],
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? []
         )
         try adapter.recoverSession(request) { _ in }

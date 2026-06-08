@@ -1518,7 +1518,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     accentColor: instance.accentColor,
                     enabled: instance.enabled ?? true,
                     homePath: instance.homePath,
-                    environmentKeys: Array(env.keys).sorted()
+                    // This snapshot surfaces per-instance ISOLATION keys (HOME/CODEX_HOME/
+                    // REMOTE_CODE_INSTANCE). REMOTE_CODE_AGENT_PROVIDER is a constant attribution
+                    // tag (same for every instance of a provider), not isolation — exclude it
+                    // from the snapshot while it remains in the actual run environment.
+                    environmentKeys: env.keys.filter { $0 != "REMOTE_CODE_AGENT_PROVIDER" }.sorted()
                 ))
             }
             return snapshots
@@ -1694,10 +1698,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return configuredProviderBinary(provider)
     }
 
-    private func providerEnvironment(provider: AgentProvider, instanceId: String?) -> [String: String] {
-        guard let instance = providerInstanceConfig(id: instanceId, provider: provider) else { return [:] }
-        var env = instance.env ?? [:]
-        let home = instance.homePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    func providerEnvironment(provider: AgentProvider, instanceId: String?) -> [String: String] {
+        let instance = providerInstanceConfig(id: instanceId, provider: provider)
+        var env = instance?.env ?? [:]
+        let home = instance?.homePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !home.isEmpty {
             switch provider {
             case .codex:
@@ -1706,6 +1710,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["HOME"] = env["HOME"] ?? home
             }
         }
+        // VITAL for the savings report: tag the agent's environment with the provider so the
+        // local `distill` CLI attributes Token Saver command-output savings to claude/codex
+        // instead of "unknown". This env flows into request.environment, which every adapter
+        // (streaming CLI, SDK-bridge tool-exec env, session) uses for the agent's bash tools
+        // that spawn `cmd | distill`. Set unconditionally — even with no instance config.
+        env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         return env
     }
 
