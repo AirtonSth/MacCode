@@ -47,4 +47,15 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(p.verb, "Ran")
         XCTAssertEqual(p.label, "Bash")
     }
+
+    func test_cappedDetailStripsANSIEscapeCodes() {
+        let ansi = "\u{001B}[32mPASS\u{001B}[0m all tests \u{001B}[1;31mFAIL\u{001B}[0m none"
+        let clean = AgentTimelineItemPresentation.cappedDetail(ansi)
+        XCTAssertEqual(clean, "PASS all tests FAIL none", "ANSI color codes must be stripped, not shown literally")
+        XCTAssertFalse(clean.contains("\u{001B}"))
+    }
+
+    func test_stripANSILeavesPlainTextUntouched() {
+        XCTAssertEqual(AgentTimelineItemPresentation.stripANSI("no escapes here"), "no escapes here")
+    }
 }

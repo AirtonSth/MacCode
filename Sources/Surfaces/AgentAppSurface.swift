@@ -1908,13 +1908,25 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return body
     }
 
-    /// Cap inline tool/skill output so one noisy command can't blow up the transcript.
-    /// The full text remains available via text selection / the stored event.
+    /// Sanitize + cap inline tool/skill output: strip ANSI escape codes (Bash output is full
+    /// of them and they render as literal garbage in a Text view) and cap length so one noisy
+    /// command can't blow up the transcript. Full text remains selectable / in the stored event.
     static func cappedDetail(_ text: String, limit: Int = 6_000) -> String {
-        guard text.count > limit else { return text }
-        let head = text.prefix(limit)
-        let dropped = text.count - head.count
+        let clean = stripANSI(text)
+        guard clean.count > limit else { return clean }
+        let head = clean.prefix(limit)
+        let dropped = clean.count - head.count
         return "\(head)\n… \(dropped) more characters truncated in view …"
+    }
+
+    /// Remove ANSI/VT control sequences (SGR colors, cursor moves, OSC) so command output is
+    /// readable instead of showing literal escape codes. Cheap fast-path when none present.
+    static func stripANSI(_ text: String) -> String {
+        guard text.contains("\u{001B}") else { return text }
+        return text
+            .replacingOccurrences(of: "\u{001B}\\[[0-9;?]*[ -/]*[@-~]", with: "", options: .regularExpression) // CSI (incl. SGR)
+            .replacingOccurrences(of: "\u{001B}\\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\\\)", with: "", options: .regularExpression) // OSC
+            .replacingOccurrences(of: "\u{001B}[@-Z\\\\-_]", with: "", options: .regularExpression) // lone escapes
     }
 
     private static func verb(for item: AssistantItem) -> String {
