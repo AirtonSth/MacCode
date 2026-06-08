@@ -67,6 +67,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
     public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
+    /// P3: optionally compact large tool output in a persisted stream-event payload before it
+    /// is written (CCR-backed, structure-preserving). nil => payloads stored verbatim.
+    public var streamPayloadCompactor: (@Sendable (_ payloadJSON: String) -> String)?
 
     /// Token Saver /distill hook: async transform applied to provider text
     /// detected as SR1 compressed language. The returned value is what gets
@@ -723,7 +726,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.unlock()
             if let data, let json = String(data: data, encoding: .utf8) {
                 do {
-                    try runRepo.appendStreamEvent(runId: runId, seq: s, kind: ev.debugDescription, payloadJSON: json)
+                    let payloadJSON = streamPayloadCompactor?(json) ?? json
+                    try runRepo.appendStreamEvent(runId: runId, seq: s, kind: ev.debugDescription, payloadJSON: payloadJSON)
                     if case .providerRuntime(let runtimeEvent) = ev {
                         try runRepo.appendProviderEventLog(threadId: threadId, runId: runId, event: runtimeEvent)
                     }

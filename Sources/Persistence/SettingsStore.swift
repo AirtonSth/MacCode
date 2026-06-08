@@ -18,6 +18,9 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// P5 SessionLearn: mine a correction rule from failed/expensive runs into the managed
     /// instructions region. Off by default — opt-in, since it writes to CLAUDE.md/AGENTS.md.
     public var sessionLearnEnabled: Bool
+    /// P3: compact large tool output in persisted stream events (CCR-backed, structure-
+    /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
+    public var historyCompactionEnabled: Bool
 
     public init(diffWordWrap: Bool = false,
                 diffIgnoreWhitespace: Bool = false,
@@ -27,7 +30,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
                 insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
                 tokenSaverEnabled: Bool = false,
-                sessionLearnEnabled: Bool = false) {
+                sessionLearnEnabled: Bool = false,
+                historyCompactionEnabled: Bool = false) {
         self.diffWordWrap = diffWordWrap
         self.diffIgnoreWhitespace = diffIgnoreWhitespace
         self.sidebarSort = sidebarSort
@@ -37,6 +41,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
         self.tokenSaverEnabled = tokenSaverEnabled
         self.sessionLearnEnabled = sessionLearnEnabled
+        self.historyCompactionEnabled = historyCompactionEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -49,6 +54,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
         case tokenSaverEnabled
         case sessionLearnEnabled
+        case historyCompactionEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -62,6 +68,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
         tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
+        historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false
     }
 }
 

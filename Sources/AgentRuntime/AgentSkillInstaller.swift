@@ -56,6 +56,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
     public static let distillCLIEndMarker = "# RemoteCode managed distill CLI: end"
+    public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
+    public static let mcpEndMarker = "# RemoteCode managed MCP: end"
+    public static let retrieveMCPName = "remotecode-distill-retrieve"
 
     public static let distillSkillTemplate = """
     ---
@@ -269,6 +272,98 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             return .removed
         }
         return .notPresent
+    }
+
+    private func claudeSettingsURL() -> URL {
+        claudeInstructionsURL.deletingLastPathComponent().appendingPathComponent("settings.json")
+    }
+
+    private func codexConfigURL() -> URL {
+        codexInstructionsURL.deletingLastPathComponent().appendingPathComponent("config.toml")
+    }
+
+    /// Install the RETRIEVE-ONLY MCP server (rc_retrieve) into Claude settings.json and
+    /// Codex config.toml. Idempotent; preserves any user-authored entries. The server is the
+    /// native RemoteCodeDistillService binary in `mcp` mode (no Python — N1).
+    public func installRetrieveMCP(serviceBinaryURL: URL? = nil) throws {
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try installClaudeRetrieveMCP(binary: binary)
+        try installCodexRetrieveMCP(binary: binary)
+    }
+
+    public func uninstallRetrieveMCP() throws {
+        // Claude: drop only our server key, keep the rest of settings.json.
+        let claude = claudeSettingsURL()
+        if let data = try? Data(contentsOf: claude),
+           var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           var servers = root["mcpServers"] as? [String: Any] {
+            servers.removeValue(forKey: Self.retrieveMCPName)
+            root["mcpServers"] = servers
+            if let out = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]) {
+                try? out.write(to: claude, options: .atomic)
+            }
+        }
+        // Codex: remove our marker block, keep the rest of config.toml.
+        let codex = codexConfigURL()
+        if let text = try? String(contentsOf: codex, encoding: .utf8) {
+            let stripped = Self.removingMarkerBlock(text, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker)
+            try? Data(stripped.utf8).write(to: codex, options: .atomic)
+        }
+    }
+
+    private func installClaudeRetrieveMCP(binary: URL) throws {
+        let url = claudeSettingsURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = obj
+        }
+        var servers = root["mcpServers"] as? [String: Any] ?? [:]
+        servers[Self.retrieveMCPName] = ["command": binary.path, "args": ["mcp"]]
+        root["mcpServers"] = servers
+        let out = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try out.write(to: url, options: .atomic)
+    }
+
+    private func installCodexRetrieveMCP(binary: URL) throws {
+        let url = codexConfigURL()
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let block = """
+        \(Self.mcpBeginMarker)
+        [mcp_servers.\(Self.retrieveMCPName)]
+        command = \(Self.tomlString(binary.path))
+        args = ["mcp"]
+        \(Self.mcpEndMarker)
+        """
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let next = Self.upsertMarkerBlock(existing, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker, block: block)
+        try Data(next.utf8).write(to: url, options: .atomic)
+    }
+
+    private static func tomlString(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    static func removingMarkerBlock(_ text: String, begin: String, end: String) -> String {
+        guard let b = text.range(of: begin), let e = text.range(of: end), b.lowerBound <= e.upperBound else {
+            return text
+        }
+        var result = text
+        result.removeSubrange(b.lowerBound..<e.upperBound)
+        return result.replacingOccurrences(of: "\n\n\n", with: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+    }
+
+    static func upsertMarkerBlock(_ text: String, begin: String, end: String, block: String) -> String {
+        if text.range(of: begin) != nil, text.range(of: end) != nil {
+            let stripped = removingMarkerBlock(text, begin: begin, end: end)
+            let base = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+            return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
+        }
+        let base = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
     }
 
     /// Resolve the RemoteCodeDistillService binary (which also serves CLI mode) the same

@@ -116,6 +116,16 @@ public final class AppContext {
             guard let self else { return response }
             return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
         }
+        // P3 (opt-in, default OFF): compact large tool output in persisted stream events,
+        // CCR-backed and structure-preserving, so replay still decodes. Our-storage saving.
+        if SettingsStore(db: db).load().historyCompactionEnabled {
+            let historyStore = ReversibleContentStore(db: db)
+            self.coordinator.streamPayloadCompactor = { payload in
+                ReversiblePayloadCompactor.compact(payload) { original in
+                    try? historyStore.store(Data(original.utf8))
+                }
+            }
+        }
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
@@ -386,6 +396,7 @@ public final class AppContext {
                 try installer.installDistillInstructions(for: .codex)
                 try installer.installDistillInstructions(for: .claude)
                 _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
+                try? installer.installRetrieveMCP() // retrieve-only MCP (best-effort; needs the bundled binary)
                 managedDistillSkillInstallResults = [codex, claude]
             } else {
                 _ = try installer.uninstallDistillSkill(for: .codex)
@@ -393,6 +404,7 @@ public final class AppContext {
                 _ = try installer.uninstallDistillInstructions(for: .codex)
                 _ = try installer.uninstallDistillInstructions(for: .claude)
                 _ = try installer.uninstallDistillCLI()
+                try? installer.uninstallRetrieveMCP()
                 managedDistillSkillInstallResults = []
             }
         } catch {

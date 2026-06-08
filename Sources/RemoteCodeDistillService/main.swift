@@ -19,6 +19,10 @@ struct RemoteCodeDistillServiceMain {
             await runCLI(arguments: Array(rawArgs.dropFirst(2)))
             return
         }
+        if programName == "rc-retrieve-mcp" || rawArgs.dropFirst().first == "mcp" {
+            await runMCP()
+            return
+        }
 
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
@@ -106,6 +110,30 @@ struct RemoteCodeDistillServiceMain {
         let (out, code) = await cli.run()
         FileHandle.standardOutput.write(out)
         Darwin.exit(code)
+    }
+
+    /// Retrieve-only MCP server (P3-T5): newline-delimited JSON-RPC 2.0 over stdio. Exposes
+    /// rc_retrieve, backed by the sidecar's GET /v1/retrieve. Fail-soft: an unavailable
+    /// service yields a "not found" tool result, never a crash.
+    private static func runMCP() async {
+        let state = loadCLIState()
+        let server = ManagedRetrieveMCP { handle in
+            guard let state, let url = URL(string: state.baseURL + "/v1/retrieve/\(handle)") else { return nil }
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (obj["found"] as? Bool) == true else {
+                return nil
+            }
+            return obj["original"] as? String
+        }
+        while let line = readLine(strippingNewline: true) {
+            if let response = await server.handle(line) {
+                FileHandle.standardOutput.write(Data((response + "\n").utf8))
+            }
+        }
     }
 
     private static func loadCLIState() -> ManagedDistillCLI.State? {
