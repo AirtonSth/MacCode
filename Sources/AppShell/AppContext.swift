@@ -51,7 +51,9 @@ public final class AppContext {
     var agentSkillsHomeOverrideForTesting: URL?
     /// Prompts shorter than this are sent verbatim: distillation overhead/latency
     /// isn't worth it and tiny instructions have nothing to compress.
-    private static let tokenSaverMinCompressChars = 600
+    // Raised from 600: below ~2k chars a model round-trip on the awaited prompt path
+    // rarely nets out positive once MLX latency is counted (NetPositiveGate floor, G3).
+    private static let tokenSaverMinCompressChars = 2_000
     private static let tokenSaverDistillStartupPolls = 300
 
     public init(
@@ -103,9 +105,9 @@ public final class AppContext {
         )
         try coordinator.reconcileOnLaunch()
         try? tokenSaverSavingsRepo.prune()
-        self.coordinator.promptCompressor = { [weak self] prompt, provider in
+        self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId in
             guard let self else { return prompt }
-            return await self.tokenSaverCompress(prompt: prompt, provider: provider)
+            return await self.tokenSaverCompress(prompt: prompt, provider: provider, threadId: threadId)
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
@@ -546,37 +548,68 @@ public final class AppContext {
     /// prompt is too small, the sidecar is unavailable, compression doesn't
     /// help, or anything fails. Every real compression is measured and written
     /// to the local savings ledger. Fail-open by contract.
-    func tokenSaverCompress(prompt: String, provider: AgentProvider) async -> String {
+    /// Seconds since this thread's last provider turn, from provider_session_runtime
+    /// staleness (a heuristic — that table has no billed-cache columns). nil when there
+    /// is no prior turn, which the gate treats as COLD (never wrongly skip a fresh prompt).
+    private func secondsSinceLastTurn(threadId: AgentThreadID) -> Double? {
+        guard let runtime = try? providerSessionRuntimeRepo.get(threadId: threadId) else { return nil }
+        return max(0, Date().timeIntervalSince(runtime.updatedAt))
+    }
+
+    func tokenSaverCompress(prompt: String, provider: AgentProvider, threadId: AgentThreadID) async -> String {
         guard SettingsStore(db: db).load().tokenSaverEnabled else { return prompt }
-        guard prompt.count >= Self.tokenSaverMinCompressChars else { return prompt }
-        guard let client = currentDistillClient() else { return prompt }
+        // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
+        // the full wrapped prompt), so this is a numeric decision — compress the new-turn
+        // argv only when it is large enough AND the session is not a warm follow-up.
+        let gate = NetPositiveGate(floorCharacters: Self.tokenSaverMinCompressChars, warmResumeTTLSeconds: 300)
+        let secondsSinceLastTurn = secondsSinceLastTurn(threadId: threadId)
+        guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
+            return prompt
+        }
+        // Non-lossy dedup pre-pass (P4): collapse exact-duplicate large blocks within the
+        // prompt to a model-readable "identical to block above" pointer. The model keeps
+        // full information (content once + a pointer it understands), so this is safe to
+        // send AND a win even if the model compression step is unavailable.
+        let deduped = DistillBlockDeduper.dedupe(prompt).output
+
+        // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
+        // savings (original -> final), tagged cache_state=prompt.
+        func adopt(_ candidate: String) -> String {
+            guard candidate.count < prompt.count else { return prompt }
+            let inputTokens = TokenEstimator.estimate(prompt)
+            let outputTokens = TokenEstimator.estimate(candidate)
+            recordTokenSaverSidecarSavings(
+                provider: provider,
+                mode: DistillMode.longText.rawValue,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                savedTokens: max(inputTokens - outputTokens, 0),
+                cacheState: "prompt"
+            )
+            return candidate
+        }
+
+        guard let client = currentDistillClient() else {
+            // No model service: the deterministic dedup is still a safe, non-lossy win.
+            return deduped.count < prompt.count ? adopt(deduped) : prompt
+        }
 
         let request = DistillRequest(
             mode: .longText,
             priority: .interactive,
-            input: prompt,
-            maxOutputCharacters: max(512, prompt.count)
+            input: deduped,
+            maxOutputCharacters: max(512, deduped.count)
         )
         do {
             let response = try await client.distill(request)
-            let compressed = response.output
-            recordTokenSaverSidecarSavings(
-                provider: provider,
-                mode: request.mode.rawValue,
-                inputTokens: response.inputTokens,
-                outputTokens: response.outputTokens,
-                savedTokens: response.savedTokens
-            )
-            // Only adopt the compressed text when it is non-empty and actually
-            // smaller in tokens; otherwise send the original untouched.
-            guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  compressed.count < prompt.count else {
-                return prompt
-            }
-            return compressed
+            let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deduped : response.output
+            // Pick the smaller of {model output, deduped}, then adopt only if it beats the original.
+            let best = modelOutput.count < deduped.count ? modelOutput : deduped
+            return adopt(best)
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
-            return prompt
+            // Fail-open to the deterministic dedup if it helped, else the original.
+            return deduped.count < prompt.count ? adopt(deduped) : prompt
         }
     }
 
@@ -779,7 +812,8 @@ public final class AppContext {
         mode: String,
         inputTokens: Int,
         outputTokens: Int,
-        savedTokens: Int
+        savedTokens: Int,
+        cacheState: String = "unknown"
     ) {
         guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
         do {
@@ -788,7 +822,8 @@ public final class AppContext {
                 mode: mode,
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
-                savedTokens: savedTokens
+                savedTokens: savedTokens,
+                cacheState: cacheState
             )
             NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
         } catch {

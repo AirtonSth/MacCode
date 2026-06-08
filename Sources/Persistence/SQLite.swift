@@ -42,6 +42,11 @@ public final class SQLiteDB {
         try execute("PRAGMA journal_mode=WAL;")
         try execute("PRAGMA foreign_keys=ON;")
         try execute("PRAGMA synchronous=NORMAL;")
+        // WAL gives one writer + many readers across processes. The Token Saver
+        // sidecar and the app open this same file concurrently (CCR store writes
+        // in the sidecar, history/dedup writes in the app), so a writer can briefly
+        // hold the lock. Wait instead of failing fast with SQLITE_BUSY.
+        try execute("PRAGMA busy_timeout=5000;")
     }
 
     deinit {

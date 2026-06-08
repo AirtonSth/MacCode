@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 26
+    public static let currentVersion: Int = 28
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -391,6 +391,23 @@ public enum Schema {
             saved_tokens = token_saver_savings_totals.saved_tokens + excluded.saved_tokens,
             runs = token_saver_savings_totals.runs + excluded.runs,
             updated_at = excluded.updated_at;
+        """),
+        SchemaStep(27, """
+        CREATE TABLE IF NOT EXISTS rc_reversible_content (
+            handle TEXT PRIMARY KEY,
+            original BLOB NOT NULL,
+            sha256 TEXT NOT NULL,
+            byte_count INTEGER NOT NULL,
+            ref_count INTEGER NOT NULL DEFAULT 0,
+            created_at_ms INTEGER NOT NULL,
+            last_access_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rc_reversible_content_access ON rc_reversible_content(last_access_ms);
+        """),
+        SchemaStep(28, """
+        ALTER TABLE token_saver_savings ADD COLUMN content_type TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE token_saver_savings ADD COLUMN engine TEXT NOT NULL DEFAULT 'unknown';
+        ALTER TABLE token_saver_savings ADD COLUMN cache_state TEXT NOT NULL DEFAULT 'unknown';
         """)
     ]
 

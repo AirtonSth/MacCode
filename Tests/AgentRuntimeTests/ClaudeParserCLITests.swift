@@ -84,6 +84,16 @@ final class ClaudeParserCLITests: XCTestCase {
         XCTAssertEqual(usage?.totalTokens, 46_168)
         XCTAssertEqual(usage?.contextWindow, 200_000,
                        "Claude SDK bridge result.modelUsage must feed Token Saver and context pressure; otherwise /distill responses complete but Saved stays 0")
+        // G3: the three cache buckets are recorded SEPARATELY (not folded), so net
+        // dollars are computable. uncached(510+6) + creation(0+22947) + read(0+22517) = 45980.
+        XCTAssertEqual(usage?.uncachedInputTokens, 516)
+        XCTAssertEqual(usage?.cacheCreationInputTokens, 22_947)
+        XCTAssertEqual(usage?.cacheReadInputTokens, 22_517)
+        XCTAssertEqual(
+            (usage?.uncachedInputTokens ?? 0) + (usage?.cacheCreationInputTokens ?? 0) + (usage?.cacheReadInputTokens ?? 0),
+            usage?.inputTokens,
+            "the split must sum to the billed input total (back-compat preserved)"
+        )
     }
 
     func test_errorResult_isLoud() {

@@ -90,6 +90,24 @@ final class CodexParserTests: XCTestCase {
         XCTAssertEqual(state.tokenUsage?.totalTokens, 15)
         XCTAssertEqual(state.tokenUsage?.compactsAutomatically, true)
         XCTAssertEqual(state.contextCompactionSummary, "older messages compacted")
+        // P2-T2: no cached portion => whole input is uncached, read/creation zero.
+        XCTAssertEqual(state.tokenUsage?.uncachedInputTokens, 10)
+        XCTAssertEqual(state.tokenUsage?.cacheReadInputTokens, 0)
+        XCTAssertEqual(state.tokenUsage?.cacheCreationInputTokens, 0)
+    }
+
+    func test_codexTokenUsageSplitsCachedInput() {
+        let p = CodexParser()
+        let events = p.parseLine(#"{"type":"thread.token_usage","input_tokens":1000,"output_tokens":50,"total_tokens":1050,"cached_input_tokens":800}"#)
+        let usage = events.compactMap { event -> AssistantTokenUsage? in
+            if case .tokenUsage(let u) = event { return u }
+            return nil
+        }.last
+        // G3: inputTokens stays the billed total; the split breaks out the cached read.
+        XCTAssertEqual(usage?.inputTokens, 1000, "billed total preserved (back-compat)")
+        XCTAssertEqual(usage?.cacheReadInputTokens, 800, "cached portion is a cache read (~0.1x cost)")
+        XCTAssertEqual(usage?.uncachedInputTokens, 200, "uncached = input - cached")
+        XCTAssertEqual(usage?.cacheCreationInputTokens, 0, "Codex has no separate creation bucket")
     }
 
     func test_codexPlanUpdateTracksActiveStepState() {

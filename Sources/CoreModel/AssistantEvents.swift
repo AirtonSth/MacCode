@@ -145,13 +145,33 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     public var totalTokens: Int
     public var contextWindow: Int?
     public var compactsAutomatically: Bool?
+    /// Cache-token split (G3). `inputTokens` stays the billed total
+    /// (uncached + creation + read) for back-compat; these break it out so net
+    /// dollars are computable (a cache read is ~0.1x an uncached token). nil when
+    /// the provider does not report a breakdown. Optional => decode tolerates older
+    /// rows/payloads that omit the keys (version-skew safe).
+    public var uncachedInputTokens: Int?
+    public var cacheCreationInputTokens: Int?
+    public var cacheReadInputTokens: Int?
 
-    public init(inputTokens: Int = 0, outputTokens: Int = 0, totalTokens: Int = 0, contextWindow: Int? = nil, compactsAutomatically: Bool? = nil) {
+    public init(
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        totalTokens: Int = 0,
+        contextWindow: Int? = nil,
+        compactsAutomatically: Bool? = nil,
+        uncachedInputTokens: Int? = nil,
+        cacheCreationInputTokens: Int? = nil,
+        cacheReadInputTokens: Int? = nil
+    ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.totalTokens = totalTokens
         self.contextWindow = contextWindow
         self.compactsAutomatically = compactsAutomatically
+        self.uncachedInputTokens = uncachedInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
+        self.cacheReadInputTokens = cacheReadInputTokens
     }
 }
 

@@ -177,7 +177,7 @@ final class TokenSaverCompressionTests: XCTestCase {
 
     func test_promptCompressorTransformsOutboundButPreservesDisplayedMessage() async throws {
         let (coordinator, messageRepo, thread, tmp, runner) = try makeCoordinator()
-        coordinator.promptCompressor = { prompt, _ in "COMPRESSED::" + prompt.uppercased() }
+        coordinator.promptCompressor = { prompt, _, _ in "COMPRESSED::" + prompt.uppercased() }
 
         let original = "Please refactor the widget renderer in file Foo.swift, keep ID abc-123"
         _ = try await coordinator.startRun(AgentRunRequest(
@@ -209,7 +209,7 @@ final class TokenSaverCompressionTests: XCTestCase {
     func test_failOpenCompressorReturningInputLeavesPromptIntact() async throws {
         let (coordinator, messageRepo, thread, tmp, runner) = try makeCoordinator()
         // Fail-open contract: compressor returns its input on any failure.
-        coordinator.promptCompressor = { prompt, _ in prompt }
+        coordinator.promptCompressor = { prompt, _, _ in prompt }
         let original = "explain this stack trace and fix the crash"
         _ = try await coordinator.startRun(AgentRunRequest(
             threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: original

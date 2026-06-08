@@ -144,7 +144,20 @@ public final class CodexParser {
             let total = obj["total_tokens"] as? Int ?? (input + output)
             let window = obj["context_window"] as? Int
             let compactsAutomatically = obj["compacts_automatically"] as? Bool ?? obj["compactsAutomatically"] as? Bool
-            return [.tokenUsage(AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: total, contextWindow: window, compactsAutomatically: compactsAutomatically))]
+            // Codex reports a single input total plus an optional cached portion (no
+            // separate cache-creation bucket). Split it (G3): uncached = input - cached,
+            // read = cached, creation = 0. inputTokens stays the billed total (back-compat).
+            let cachedInput = obj["cached_input_tokens"] as? Int ?? obj["cachedInputTokens"] as? Int ?? 0
+            return [.tokenUsage(AssistantTokenUsage(
+                inputTokens: input,
+                outputTokens: output,
+                totalTokens: total,
+                contextWindow: window,
+                compactsAutomatically: compactsAutomatically,
+                uncachedInputTokens: max(0, input - cachedInput),
+                cacheCreationInputTokens: 0,
+                cacheReadInputTokens: cachedInput
+            ))]
         case "context.compaction", "context_compaction":
             return [.contextCompaction(summary: obj["summary"] as? String)]
         case "turn.failed":

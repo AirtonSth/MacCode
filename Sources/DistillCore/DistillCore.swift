@@ -61,19 +61,44 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     public let outputCharacters: Int
     public let inputTokens: Int
     public let outputTokens: Int
+    /// CCR handle to the byte-exact original, set by the sidecar when it stored
+    /// the input before compression (store-before-loss, N5). nil when not stored
+    /// (small/lossless). Optional + synthesized Codable => decode tolerates older
+    /// payloads that omit the key (version-skew safe).
+    public let originalHandle: String?
 
-    public init(requestID: UUID, output: String, inputCharacters: Int, inputTokens: Int = 0, outputTokens: Int = 0) {
+    public init(
+        requestID: UUID,
+        output: String,
+        inputCharacters: Int,
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        originalHandle: String? = nil
+    ) {
         self.requestID = requestID
         self.output = output
         self.inputCharacters = inputCharacters
         self.outputCharacters = output.count
         self.inputTokens = max(0, inputTokens)
         self.outputTokens = max(0, outputTokens)
+        self.originalHandle = originalHandle
     }
 
     /// Tokens removed by compression. Never negative: a longer "compressed"
     /// output (rare model misbehavior) reports zero savings, not negative.
     public var savedTokens: Int { max(inputTokens - outputTokens, 0) }
+
+    /// Copy carrying the CCR handle to the stored original.
+    public func withOriginalHandle(_ handle: String?) -> DistillResponse {
+        DistillResponse(
+            requestID: requestID,
+            output: output,
+            inputCharacters: inputCharacters,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            originalHandle: handle
+        )
+    }
 }
 
 /// Deterministic, model-agnostic token estimator. The distilled output is only
@@ -100,13 +125,18 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     public let inputTokens: Int
     public let outputTokens: Int
     public let savedTokens: Int
+    /// Cache relevance of this saving (G3): `tool_output_oneshot` is consumed once and
+    /// never re-sent (char-delta is honest/cache-neutral); `prompt` is cache-relevant;
+    /// `sr1_humanize`/`watch` are response-side. Lets the headline keep only honest rows.
+    public let cacheState: String
 
-    public init(provider: String, mode: String, inputTokens: Int, outputTokens: Int, savedTokens: Int) {
+    public init(provider: String, mode: String, inputTokens: Int, outputTokens: Int, savedTokens: Int, cacheState: String = "unknown") {
         self.provider = provider
         self.mode = mode
         self.inputTokens = max(0, inputTokens)
         self.outputTokens = max(0, outputTokens)
         self.savedTokens = max(0, savedTokens)
+        self.cacheState = cacheState
     }
 }
 
@@ -128,7 +158,8 @@ public enum DistillSavingsCalculator {
                 mode: "command-output",
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
-                savedTokens: response.savedTokens
+                savedTokens: response.savedTokens,
+                cacheState: "tool_output_oneshot"
             )
         case .sr1Humanize:
             // The agent emitted the compressed SR1 response instead of the full
@@ -142,7 +173,8 @@ public enum DistillSavingsCalculator {
                 mode: "sr1-humanize",
                 inputTokens: input,
                 outputTokens: output,
-                savedTokens: max(input - output, 0)
+                savedTokens: max(input - output, 0),
+                cacheState: "sr1_humanize"
             )
         case .longText, .watchSummary:
             return DistillSavingsRecord(
@@ -150,7 +182,8 @@ public enum DistillSavingsCalculator {
                 mode: request.mode.rawValue,
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
-                savedTokens: response.savedTokens
+                savedTokens: response.savedTokens,
+                cacheState: request.mode == .longText ? "prompt" : "watch"
             )
         }
     }
@@ -177,11 +210,17 @@ public protocol DistillRuntime: Sendable {
     /// a GPU buffer cache (MLX) return it to the OS here so a long-lived warm server
     /// idles near its model's resident size instead of accumulating across requests.
     func reclaimIdleMemory()
+
+    /// Pay any one-time cold-start cost (model load, Metal kernel JIT) up front so
+    /// the first real request never blocks on it on a live agent turn. Default no-op.
+    func warmup() async
 }
 
 public extension DistillRuntime {
     /// Runtimes without a reclaimable cache (deterministic/local) need do nothing.
     func reclaimIdleMemory() {}
+    /// Runtimes with no cold-start cost need do nothing.
+    func warmup() async {}
 }
 
 private enum SR1LineParser {
@@ -438,9 +477,19 @@ public actor DistillScheduler {
 }
 
 public struct LocalDistillRuntime: DistillRuntime {
+    static let contentRouter = DistillContentRouter()
+
     public init() {}
 
     public func distill(_ request: DistillRequest) async throws -> String {
+        // Deterministic content routing (G4): lossless structural compression of
+        // JSON/log payloads on the pure "compress this" modes, before any heuristic
+        // summarization. Skipped for .commandOutput (it must answer the contract
+        // question, not blind-minify) and .sr1Humanize (a translation task).
+        if request.mode == .longText || request.mode == .watchSummary,
+           let routed = Self.contentRouter.route(request.input) {
+            return routed.output
+        }
         if request.mode == .commandOutput {
             return Self.commandOutputFallback(
                 input: request.input,
@@ -632,6 +681,14 @@ public struct MLXDistillRuntime: DistillRuntime {
     /// the process blow past it on a 16GB machine. malloc waits on scheduled work when hit.
     static let gpuMemoryLimitBytes = 6 * 1024 * 1024 * 1024
 
+    /// Deterministic-first content router (G4): structured payloads are compressed
+    /// losslessly on the CPU and never reach the model.
+    static let contentRouter = DistillContentRouter()
+
+    /// Serializes GPU generation to one job at a time (under the scheduler's
+    /// admission gate). Protects against Metal memory pressure and renderer contention.
+    private let lane = MLXGenerationLane()
+
     public init(modelDirectory: URL) async throws {
         MLX.Memory.memoryLimit = Self.gpuMemoryLimitBytes
         MLX.Memory.cacheLimit = Self.gpuCacheLimitBytes
@@ -647,9 +704,35 @@ public struct MLXDistillRuntime: DistillRuntime {
         MLX.Memory.clearCache()
     }
 
+    /// Pay the cold-start cost (Metal kernel JIT, first allocation) before the
+    /// server accepts requests, so no live agent turn ever awaits a cold model.
+    public func warmup() async {
+        let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
+        let session = ChatSession(
+            modelContainer,
+            instructions: "warmup",
+            generateParameters: parameters,
+            additionalContext: ["enable_thinking": false]
+        )
+        await lane.acquire()
+        _ = try? await session.respond(to: "ok")
+        await lane.release()
+        reclaimIdleMemory()
+        NSLog("RemoteCodeDistillService MLX warmup complete")
+    }
+
     public func distill(_ request: DistillRequest) async throws -> String {
         if let deterministic = Self.deterministicCommandOutput(for: request) {
             return deterministic
+        }
+
+        // Deterministic content routing (G4): lossless structural compression of
+        // JSON/log on the pure "compress this" modes, before the model is invoked.
+        // Covers the .longText prompt-compression path. .commandOutput is excluded
+        // (honors its contract question above) and .sr1Humanize is a translation.
+        if request.mode == .longText || request.mode == .watchSummary,
+           let routed = Self.contentRouter.route(request.input) {
+            return routed.output
         }
 
         let parameters = GenerateParameters(
@@ -664,7 +747,15 @@ public struct MLXDistillRuntime: DistillRuntime {
             generateParameters: parameters,
             additionalContext: ["enable_thinking": false]
         )
-        let raw = try await session.respond(to: Self.prompt(for: request))
+        await lane.acquire()
+        let raw: String
+        do {
+            raw = try await session.respond(to: Self.prompt(for: request))
+        } catch {
+            await lane.release()
+            throw error
+        }
+        await lane.release()
         let output = Self.cleanOutput(raw)
         let normalizedOutput = request.mode == .commandOutput
             ? Self.collapseDuplicatedCommandOutput(output)
@@ -672,7 +763,21 @@ public struct MLXDistillRuntime: DistillRuntime {
         guard Self.isUsefulOutput(normalizedOutput, mode: request.mode) else {
             return Self.fallbackOutput(for: request)
         }
-        return normalizedOutput
+        return Self.guardLossyProseOutput(normalizedOutput, request: request)
+    }
+
+    /// N5 guard for the lossy prose modes (.longText/.watchSummary): if the model's
+    /// compression dropped a load-bearing literal (file:line, UUID, hash, long number,
+    /// diff change line) present in the input, reject it and return the input verbatim.
+    /// .commandOutput is exempt — it is contract extraction, not literal-preserving
+    /// compression — and .sr1Humanize is a translation.
+    static func guardLossyProseOutput(_ output: String, request: DistillRequest) -> String {
+        switch request.mode {
+        case .longText, .watchSummary:
+            return LiteralPreservation.guarded(original: request.input, compressed: output).output
+        case .commandOutput, .sr1Humanize:
+            return output
+        }
     }
 
     static func deterministicCommandOutput(for request: DistillRequest) -> String? {
@@ -710,7 +815,7 @@ public struct MLXDistillRuntime: DistillRuntime {
             Write concise natural language in the requested language or locale.
             Return only the translation. No preamble. No markdown.
             """
-        case .commandOutput, .longText, .watchSummary:
+        case .commandOutput:
             return """
             You compress shell or command output for another model that will act on your answer.
             Output ONLY the requested format. No preamble. No "Here is". No explanation unless the question asks for one.
@@ -723,6 +828,14 @@ public struct MLXDistillRuntime: DistillRuntime {
             If the source is already shorter than your answer would be, reuse the source wording.
             Keep prose answers to one sentence, max three short lines. Structured answers may be longer when the format requires it.
             Never ask for more input.
+            """
+        case .longText, .watchSummary:
+            return """
+            You compress long text into /distill compressed language for another AI model that already understands it.
+            Use Military English with fixed prefixes, one item per line: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
+            Preserve every exact command, file path, file:line, error string, number, ID, status, and proof verbatim.
+            Drop filler, repetition, hedging, and politeness. Never invent facts. No preamble, no explanation, no markdown.
+            Output only the compressed S/C/D/R/O/N/P lines. If the source is already shorter than your answer would be, reuse the source wording.
             """
         }
     }
@@ -741,18 +854,22 @@ public struct MLXDistillRuntime: DistillRuntime {
         case .longText:
             return """
             /no_think
-            Command output:
+            Compress the following into /distill compressed language (S/C/D/R/O/N/P lines).
+            Preserve exact commands, paths, file:line, errors, numbers, IDs, and status verbatim.
+
             \(fitInput(request.input))
 
-            Question: Compress this long text. Return only the useful signal.
+            OUTPUT:
             """
         case .watchSummary:
             return """
             /no_think
-            Command output:
+            Summarize the relevant change into /distill compressed language (S/C/D/R/O/N/P lines).
+            Preserve exact commands, paths, file:line, errors, numbers, IDs verbatim.
+
             \(fitInput(request.input))
 
-            Question: Summarize the relevant change. Return only the useful signal.
+            OUTPUT:
             """
         case .sr1Humanize:
             return """
@@ -848,7 +965,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         isUsefulOutput(output, mode: .longText)
     }
 
-    static func fallbackOutput(for request: DistillRequest) -> String {
+    public static func fallbackOutput(for request: DistillRequest) -> String {
         let prefix: String
         switch request.mode {
         case .commandOutput:

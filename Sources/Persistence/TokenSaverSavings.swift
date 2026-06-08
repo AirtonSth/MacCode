@@ -90,6 +90,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         mode: String,
         inputTokens: Int,
         outputTokens: Int,
+        cacheState: String = "unknown",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(inputTokens - outputTokens, 0)
@@ -99,6 +100,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             inputTokens: inputTokens,
             outputTokens: outputTokens,
             savedTokens: saved,
+            cacheState: cacheState,
             at: date
         )
     }
@@ -113,6 +115,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         inputTokens: Int,
         outputTokens: Int,
         savedTokens: Int,
+        cacheState: String = "unknown",
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(savedTokens, 0)
@@ -122,8 +125,8 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
         try db.performSync { database in
             let insert = try database.prepare("""
                 INSERT INTO token_saver_savings
-                    (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?);
+                    (provider, mode, input_tokens, output_tokens, saved_tokens, created_at, created_at_ms, cache_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
             """)
             defer { insert.reset() }
             try insert.bind(1, provider)
@@ -133,6 +136,7 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
             try insert.bind(5, saved)
             try insert.bind(6, iso)
             try insert.bind(7, ms)
+            try insert.bind(8, cacheState)
             _ = try insert.step()
 
             let total = try database.prepare("""

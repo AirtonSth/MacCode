@@ -66,7 +66,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// prompt only. The original text is always preserved as the displayed
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
-    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider) async -> String)?
+    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
 
     /// Token Saver /distill hook: async transform applied to provider text
     /// detected as SR1 compressed language. The returned value is what gets
@@ -158,7 +158,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let preservedUserContent = request.userMessageContent ?? request.prompt
         var outboundPrompt = request.prompt
         if let promptCompressor {
-            outboundPrompt = await promptCompressor(request.prompt, request.provider)
+            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId)
         }
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,

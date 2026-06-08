@@ -124,6 +124,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."
     git diff | distill "What changed? Return only files changed and one-line summary for each."
     terraform plan 2>&1 | distill "Is this safe? Return SAFE, REVIEW, or UNSAFE, followed by risky changes."
+    Hard rule: ALWAYS pipe the output of build, test, lint, install, git, grep, find, cat, and curl commands through `distill` whenever the raw output exceeds ~30 lines or ~2KB. Only the distilled result needs to enter the conversation; the raw bytes are wasted tokens.
+    The distilled result may append a `[[rc:<handle>]]` marker. If you later need an exact detail the summary dropped (a precise line, error string, number, or path), recover the byte-exact original with `distill retrieve <handle>`. You MAY retrieve at any time; nothing is lost.
     Wait for `distill` to finish before continuing.
     <!-- distill skill: end -->
     """
@@ -232,17 +234,20 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         try upsertDistillInstructions(at: instructionsURL(for: provider))
     }
 
-    public func installDistillCLI(appSupportDirectory: URL) throws -> URL {
+    /// Install the managed `distill` CLI as a SYMLINK to the native RemoteCodeDistillService
+    /// binary, which runs in CLI mode when invoked via the "distill" basename. A Mach-O
+    /// symlink — not a shebang script — so there is no Python dependency (N1) and the CLI
+    /// is fail-open (writes raw stdin back on any error; see ManagedDistillCLI).
+    /// `serviceBinaryURL` is resolved automatically when not provided (tests inject it).
+    @discardableResult
+    public func installDistillCLI(appSupportDirectory: URL, serviceBinaryURL: URL? = nil) throws -> URL {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
         let url = distillCLIURL()
-        let script = Self.distillCLIScript(
-            statePath: appSupportDirectory
-                .appendingPathComponent("Distill", isDirectory: true)
-                .appendingPathComponent("DistillCLIState.json")
-                .path
-        )
-        try Data(script.utf8).write(to: url, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        try? fileManager.removeItem(at: url) // replace any prior symlink or legacy script
+        try fileManager.createSymbolicLink(at: url, withDestinationURL: binary)
         linkManagedDistillOntoPath(target: url)
         return url
     }
@@ -250,16 +255,42 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public func uninstallDistillCLI() throws -> AgentSkillUninstallResult {
         let url = distillCLIURL()
         unlinkManagedDistillFromPath(target: url)
-        guard fileManager.fileExists(atPath: url.path) else {
-            return .notPresent
+        // The managed CLI is our symlink in our managed bin dir — remove it.
+        if (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil {
+            try fileManager.removeItem(at: url)
+            return .removed
         }
-        let text = try String(contentsOf: url, encoding: .utf8)
-        guard text.contains(Self.distillCLIBeginMarker),
-              text.contains(Self.distillCLIEndMarker) else {
-            return .notPresent
+        // Legacy: a pre-native Python script carrying our markers — clean it up too.
+        if fileManager.fileExists(atPath: url.path),
+           let text = try? String(contentsOf: url, encoding: .utf8),
+           text.contains(Self.distillCLIBeginMarker),
+           text.contains(Self.distillCLIEndMarker) {
+            try fileManager.removeItem(at: url)
+            return .removed
         }
-        try fileManager.removeItem(at: url)
-        return .removed
+        return .notPresent
+    }
+
+    /// Resolve the RemoteCodeDistillService binary (which also serves CLI mode) the same
+    /// way the service controller does: bundled aux executable, then a sibling of the
+    /// current executable, then the SPM debug build (for dev/tests).
+    public static func resolveServiceBinary(fileManager: FileManager = .default) -> URL? {
+        if let bundled = Bundle.main.url(forAuxiliaryExecutable: "RemoteCodeDistillService"),
+           fileManager.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+        let sibling = URL(fileURLWithPath: CommandLine.arguments[0])
+            .deletingLastPathComponent()
+            .appendingPathComponent("RemoteCodeDistillService")
+        if fileManager.isExecutableFile(atPath: sibling.path) {
+            return sibling
+        }
+        let debugBuild = URL(fileURLWithPath: fileManager.currentDirectoryPath)
+            .appendingPathComponent(".build/debug/RemoteCodeDistillService")
+        if fileManager.isExecutableFile(atPath: debugBuild.path) {
+            return debugBuild
+        }
+        return nil
     }
 
     /// Bridge the managed CLI onto the user's `$PATH` (`~/.local/bin/distill`) so `distill`
@@ -444,92 +475,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         "(?:\\n{0,2})?\(Self.distillInstructionsBeginMarker)[\\s\\S]*?\(Self.distillInstructionsEndMarker)(?:\\n{0,2})?"
     }
 
-    private static func distillCLIScript(statePath: String) -> String {
-        """
-        #!/usr/bin/env python3
-        \(Self.distillCLIBeginMarker)
-        import json
-        import os
-        import sys
-        import time
-        import urllib.error
-        import urllib.request
-        import uuid
+}
 
-        STATE_PATH = \(String(reflecting: statePath))
-        WAIT_SECONDS = float(os.environ.get("REMOTE_CODE_DISTILL_CLI_WAIT_SECONDS", "30"))
-
-        def fail(message, code=127):
-            sys.stderr.write("RemoteCode local distill unavailable: " + message + "\\n")
-            sys.exit(code)
-
-        def load_state():
-            deadline = time.time() + WAIT_SECONDS
-            last_error = None
-            while True:
-                try:
-                    with open(STATE_PATH, "r", encoding="utf-8") as handle:
-                        return json.load(handle)
-                except Exception as exc:
-                    last_error = exc
-                    if time.time() >= deadline:
-                        fail("state file missing or unreadable: " + str(last_error))
-                    time.sleep(0.25)
-
-        prompt = " ".join(sys.argv[1:]).strip()
-        stdin_text = sys.stdin.read()
-        input_text = stdin_text.strip()
-        if not input_text:
-            fail("empty input", 2)
-
-        state = load_state()
-        base_url = str(state.get("base_url", "")).rstrip("/")
-        auth_token = str(state.get("auth_token", ""))
-        if not base_url or not auth_token:
-            fail("state file missing base_url or auth_token")
-
-        max_chars = int(os.environ.get("REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS", "4000"))
-        provider = os.environ.get("REMOTE_CODE_AGENT_PROVIDER", "").strip()
-        payload = {
-            "id": str(uuid.uuid4()),
-            "mode": "commandOutput",
-            "priority": 1,
-            "input": input_text,
-            "question": prompt,
-            "recordSavings": True,
-            "maxOutputCharacters": max_chars,
-        }
-        if provider:
-            payload["provider"] = provider
-        request = urllib.request.Request(
-            base_url + "/v1/distill",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": "Bearer " + auth_token,
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=WAIT_SECONDS) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            fail("service returned HTTP " + str(exc.code) + ": " + detail, 3)
-        except Exception as exc:
-            fail("request failed: " + str(exc), 3)
-
-        try:
-            output = json.loads(body).get("output", "")
-        except Exception as exc:
-            fail("response decode failed: " + str(exc), 3)
-        output = str(output).strip()
-        if not output:
-            fail("service returned empty output", 3)
-        sys.stdout.write(output + "\\n")
-        \(Self.distillCLIEndMarker)
-        """
-    }
+/// Errors surfaced by the managed-CLI install path.
+public enum AgentSkillCLIError: Error, Sendable, Equatable {
+    /// The native RemoteCodeDistillService binary (which also serves CLI mode) could
+    /// not be located, so the managed `distill` symlink cannot be installed.
+    case serviceBinaryUnavailable
 }
 
 private extension String {

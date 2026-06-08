@@ -420,23 +420,37 @@ public final class ClaudeParser {
 
     private func tokenUsage(from obj: [String: Any]) -> AssistantTokenUsage? {
         if let modelUsage = obj["modelUsage"] as? [String: Any] ?? obj["model_usage"] as? [String: Any] {
-            var input = 0
+            var uncached = 0
+            var creation = 0
+            var read = 0
             var output = 0
             var window: Int?
             for value in modelUsage.values {
                 guard let usage = value as? [String: Any] else { continue }
-                let directInput = intValue(usage["inputTokens"]) ?? intValue(usage["input_tokens"]) ?? 0
-                let cacheCreation = intValue(usage["cacheCreationInputTokens"]) ?? intValue(usage["cache_creation_input_tokens"]) ?? 0
-                let cacheRead = intValue(usage["cacheReadInputTokens"]) ?? intValue(usage["cache_read_input_tokens"]) ?? 0
-                input += directInput + cacheCreation + cacheRead
+                // Record the three cache buckets SEPARATELY (G3): folding them into one
+                // number made net dollars uncomputable (a cache read is ~0.1x an uncached
+                // token). inputTokens below stays the billed total for back-compat.
+                uncached += intValue(usage["inputTokens"]) ?? intValue(usage["input_tokens"]) ?? 0
+                creation += intValue(usage["cacheCreationInputTokens"]) ?? intValue(usage["cache_creation_input_tokens"]) ?? 0
+                read += intValue(usage["cacheReadInputTokens"]) ?? intValue(usage["cache_read_input_tokens"]) ?? 0
                 output += intValue(usage["outputTokens"]) ?? intValue(usage["output_tokens"]) ?? 0
                 if let contextWindow = intValue(usage["contextWindow"]) ?? intValue(usage["context_window"]) {
                     window = max(window ?? 0, contextWindow)
                 }
             }
+            let input = uncached + creation + read
             let total = input + output
             guard total > 0 || window != nil else { return nil }
-            return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: total, contextWindow: window, compactsAutomatically: nil)
+            return AssistantTokenUsage(
+                inputTokens: input,
+                outputTokens: output,
+                totalTokens: total,
+                contextWindow: window,
+                compactsAutomatically: nil,
+                uncachedInputTokens: uncached,
+                cacheCreationInputTokens: creation,
+                cacheReadInputTokens: read
+            )
         }
         let usage = obj["usage"] as? [String: Any] ?? obj["token_usage"] as? [String: Any] ?? obj
         let input = intValue(usage["input_tokens"]) ?? intValue(usage["inputTokens"]) ?? 0
@@ -445,7 +459,14 @@ public final class ClaudeParser {
         let window = intValue(usage["context_window"]) ?? intValue(usage["contextWindow"])
         guard input > 0 || output > 0 || total > 0 || window != nil else { return nil }
         let compactsAutomatically = usage["compacts_automatically"] as? Bool ?? usage["compactsAutomatically"] as? Bool
-        return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: total, contextWindow: window, compactsAutomatically: compactsAutomatically)
+        return AssistantTokenUsage(
+            inputTokens: input,
+            outputTokens: output,
+            totalTokens: total,
+            contextWindow: window,
+            compactsAutomatically: compactsAutomatically,
+            uncachedInputTokens: input
+        )
     }
 
     private func permissionRequest(from obj: [String: Any], now: Int64) -> AssistantPendingRequest? {

@@ -1,6 +1,16 @@
 import Foundation
 import Network
 
+/// Abstraction over the CCR reversible store, injected into the HTTP layer so
+/// DistillCore stays free of a Persistence dependency. The sidecar's main()
+/// adapts the Persistence `ReversibleContentStore` to this protocol.
+public protocol ReversibleStoring: Sendable {
+    /// Persist the original bytes and return a stable content handle.
+    func storeOriginal(_ data: Data) throws -> String
+    /// Recover the original bytes for a handle, or nil if unavailable.
+    func retrieveOriginal(_ handle: String) throws -> Data?
+}
+
 public enum DistillApprovedModel {
     public static let id = "samuelfaj/distill-1.7B-4bit-MLX"
     public static let url = "https://huggingface.co/samuelfaj/distill-1.7B-4bit-MLX"
@@ -47,6 +57,9 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
     public let maxConcurrentRequests: Int
     public let maxQueueDepth: Int
     public let idleTimeoutMS: Int
+    /// Per-call wall-clock deadline for a single distill generation. On exceed, the
+    /// runtime fails open to the deterministic fallback so the agent never stalls.
+    public let mlxCallDeadlineMS: Int
 
     public init(
         host: String = "127.0.0.1",
@@ -58,7 +71,8 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         modelURL: String = DistillApprovedModel.url,
         maxConcurrentRequests: Int = 8,
         maxQueueDepth: Int = 64,
-        idleTimeoutMS: Int = 300_000
+        idleTimeoutMS: Int = 300_000,
+        mlxCallDeadlineMS: Int = 20_000
     ) throws {
         guard host == "127.0.0.1" || host == "localhost" else {
             throw DistillServiceError.unsupportedHost(host)
@@ -86,6 +100,7 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.maxQueueDepth = max(0, maxQueueDepth)
         self.idleTimeoutMS = max(1_000, idleTimeoutMS)
+        self.mlxCallDeadlineMS = max(1_000, mlxCallDeadlineMS)
     }
 
     public static func parse(arguments: [String]) throws -> DistillServiceConfiguration {
@@ -126,7 +141,8 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
             modelURL: values["model-url"] ?? DistillApprovedModel.url,
             maxConcurrentRequests: try intValue("max-concurrent-requests", default: 8),
             maxQueueDepth: try intValue("max-queue-depth", default: 64),
-            idleTimeoutMS: try intValue("idle-timeout-ms", default: 300_000)
+            idleTimeoutMS: try intValue("idle-timeout-ms", default: 300_000),
+            mlxCallDeadlineMS: try intValue("mlx-call-deadline-ms", default: 20_000)
         )
     }
 }
@@ -218,6 +234,12 @@ public final class DistillHTTPServer: @unchecked Sendable {
         let message: String
     }
 
+    private struct RetrieveResponse: Codable {
+        let handle: String
+        let found: Bool
+        let original: String?
+    }
+
     private final class ResumeGate: @unchecked Sendable {
         private let lock = NSLock()
         private var didResume = false
@@ -238,13 +260,37 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let onSuccess: SuccessHandler?
+    private let reversibleStore: ReversibleStoring?
+    private let reversibleStoreMinBytes: Int
     private var listener: NWListener?
     private var actualPort: UInt16 = 0
+    private let readyLock = NSLock()
+    private var _ready: Bool
 
-    public init(configuration: DistillServiceConfiguration, scheduler: DistillScheduler, onSuccess: SuccessHandler? = nil) {
+    public init(
+        configuration: DistillServiceConfiguration,
+        scheduler: DistillScheduler,
+        reversibleStore: ReversibleStoring? = nil,
+        reversibleStoreMinBytes: Int = 8_192,
+        startsReady: Bool = true,
+        onSuccess: SuccessHandler? = nil
+    ) {
         self.configuration = configuration
         self.scheduler = scheduler
+        self.reversibleStore = reversibleStore
+        self.reversibleStoreMinBytes = max(1, reversibleStoreMinBytes)
+        self._ready = startsReady
         self.onSuccess = onSuccess
+    }
+
+    /// Flip readiness on once the runtime is warm. Until then /readyz returns 503
+    /// so callers never route a request to a cold model (P1-T1).
+    public func markReady() {
+        readyLock.lock(); _ready = true; readyLock.unlock()
+    }
+
+    private var isReady: Bool {
+        readyLock.lock(); defer { readyLock.unlock() }; return _ready
     }
 
     public func start() async throws -> DistillServiceReadyEvent {
@@ -359,7 +405,11 @@ public final class DistillHTTPServer: @unchecked Sendable {
 
         switch (request.method, request.path) {
         case ("GET", "/readyz"):
-            send(status: 200, body: readyEvent(), connection: connection)
+            if isReady {
+                send(status: 200, body: readyEvent(), connection: connection)
+            } else {
+                send(status: 503, body: ErrorBody(error: "not_ready", message: "model warming up"), connection: connection)
+            }
         case ("GET", "/metrics"):
             let active = await scheduler.activeRequestCount
             let snapshot = await metrics.snapshot(
@@ -371,8 +421,27 @@ public final class DistillHTTPServer: @unchecked Sendable {
             await handleDistill(request: request, connection: connection)
         case (_, "/v1/distill"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
+        case ("GET", let path) where path.hasPrefix("/v1/retrieve/"):
+            handleRetrieve(path: path, connection: connection)
         default:
             send(status: 404, body: ErrorBody(error: "not_found", message: request.path), connection: connection)
+        }
+    }
+
+    /// Recover a byte-exact original previously stored via store-before-loss (N5).
+    /// Returns 200 {found:true, original} when present, 404 {found:false} otherwise
+    /// — never empty/hang (a typed "original unavailable").
+    private func handleRetrieve(path: String, connection: NWConnection) {
+        let handle = String(path.dropFirst("/v1/retrieve/".count))
+        guard let reversibleStore, !handle.isEmpty else {
+            send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
+            return
+        }
+        let data = (try? reversibleStore.retrieveOriginal(handle)) ?? nil
+        if let data {
+            send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: String(data: data, encoding: .utf8)), connection: connection)
+        } else {
+            send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
         }
     }
 
@@ -380,7 +449,18 @@ public final class DistillHTTPServer: @unchecked Sendable {
         await metrics.recordRequest()
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
-            let response = try await scheduler.submit(distillRequest)
+            // Store-before-loss (N5): persist the original BEFORE the runtime can
+            // truncate (fitInput >24k) or lossily compress it, so it is always
+            // recoverable via /v1/retrieve. Only inputs large enough to be worth
+            // recovering are stored. Failure to store never blocks the response.
+            var originalHandle: String?
+            if let reversibleStore {
+                let bytes = Data(distillRequest.input.utf8)
+                if bytes.count >= reversibleStoreMinBytes {
+                    originalHandle = try? reversibleStore.storeOriginal(bytes)
+                }
+            }
+            let response = try await scheduler.submit(distillRequest).withOriginalHandle(originalHandle)
             if let onSuccess {
                 await onSuccess(distillRequest, response)
             }
@@ -446,6 +526,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         case 405: phrase = "Method Not Allowed"
         case 429: phrase = "Too Many Requests"
         case 502: phrase = "Bad Gateway"
+        case 503: phrase = "Service Unavailable"
         default: phrase = "Error"
         }
         var data = Data("HTTP/1.1 \(status) \(phrase)\r\n".utf8)

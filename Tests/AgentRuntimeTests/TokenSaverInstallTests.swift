@@ -159,7 +159,6 @@ final class TokenSaverInstallTests: XCTestCase {
         let installer = AgentSkillInstaller(homeDirectory: home)
 
         let cli = try installer.installDistillCLI(appSupportDirectory: appSupport)
-        let text = try String(contentsOf: cli)
 
         XCTAssertEqual(cli.path, home.appendingPathComponent(".remote-code/bin/distill").path)
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: cli.path))
@@ -170,20 +169,15 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), cli.path,
                        "the managed CLI must be symlinked onto PATH (~/.local/bin/distill) -> ~/.remote-code/bin/distill")
 
-        XCTAssertTrue(text.contains(AgentSkillInstaller.distillCLIBeginMarker))
-        XCTAssertTrue(text.contains("RemoteCode local distill unavailable"))
-        XCTAssertTrue(text.contains("/v1/distill"))
-        XCTAssertTrue(text.contains("\"question\": prompt"))
-        XCTAssertTrue(text.contains("\"recordSavings\": True"))
-        XCTAssertTrue(text.contains("REMOTE_CODE_AGENT_PROVIDER"))
-        XCTAssertTrue(text.contains("payload[\"provider\"] = provider"))
-        XCTAssertTrue(text.contains("DistillCLIState.json"))
-        XCTAssertFalse(text.contains("PROMPT:\\\\n"),
-                       "the managed CLI must send the prompt as request metadata, not inject it into command output")
-        XCTAssertFalse(text.contains("INPUT:\\\\n"),
-                       "the managed CLI must not teach the local model to echo INPUT wrappers")
-        XCTAssertFalse(text.contains("dev/distill/src/cli.ts"),
-                       "the managed CLI must proxy to RemoteCodeDistillService instead of a local TypeScript checkout")
+        // Native CLI (N1): `distill` is a symlink to the RemoteCodeDistillService binary
+        // (which runs in CLI mode via its basename), not a Python/TypeScript script.
+        let dest = try FileManager.default.destinationOfSymbolicLink(atPath: cli.path)
+        XCTAssertTrue(dest.hasSuffix("RemoteCodeDistillService"),
+                      "managed CLI symlinks to the native service binary")
+        XCTAssertFalse(dest.contains("dev/distill/src/cli.ts"),
+                       "must proxy to RemoteCodeDistillService, not a local TypeScript checkout")
+        let head = try FileHandle(forReadingFrom: cli).readData(ofLength: 2)
+        XCTAssertNotEqual(head, Data("#!".utf8), "native Mach-O binary, not a shebang script (no Python)")
 
         XCTAssertEqual(try installer.uninstallDistillCLI(), .removed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: cli.path))

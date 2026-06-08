@@ -129,10 +129,11 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertTrue(codexConfigText.contains("RemoteCode-managed `distill` CLI"))
         XCTAssertTrue(claudeConfigText.contains("RemoteCodeDistillService"))
         XCTAssertFalse(codexConfigText.contains("dev/distill/src/cli.ts"))
-        let cliText = try String(contentsOf: cliURL)
-        XCTAssertTrue(cliText.contains("RemoteCode local distill unavailable"))
-        XCTAssertTrue(cliText.contains("DistillCLIState.json"))
-        XCTAssertFalse(cliText.contains("dev/distill/src/cli.ts"))
+        // Native CLI (N1): the managed `distill` is a symlink to the RemoteCodeDistillService
+        // binary (CLI mode), not a Python/TypeScript script.
+        let cliDest = try FileManager.default.destinationOfSymbolicLink(atPath: cliURL.path)
+        XCTAssertTrue(cliDest.hasSuffix("RemoteCodeDistillService"), "managed CLI is a native symlink, not a script")
+        XCTAssertFalse(cliDest.contains("dev/distill/src/cli.ts"))
 
         // Disabling Token Saver removes managed skill and config again for both providers.
         context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
@@ -421,11 +422,12 @@ final class TokenSaverAppContextTests: XCTestCase {
         let bigPrompt = (1...40)
             .map { "line \($0): a verbose instruction line that the distiller will compress away" }
             .joined(separator: "\n")
-        XCTAssertGreaterThan(bigPrompt.count, 600)
+        XCTAssertGreaterThan(bigPrompt.count, 2_000, "must clear the raised NetPositiveGate floor")
 
-        let compressed = await context.tokenSaverCompress(prompt: bigPrompt, provider: .claude)
+        // Fresh thread => no prior turn => gate treats it as COLD => compresses (N5).
+        let compressed = await context.tokenSaverCompress(prompt: bigPrompt, provider: .claude, threadId: AgentThreadID())
 
-        XCTAssertNotEqual(compressed, bigPrompt, "an enabled Token Saver with a reachable model must compress a large prompt")
+        XCTAssertNotEqual(compressed, bigPrompt, "an enabled Token Saver with a reachable model must compress a large cold prompt")
         XCTAssertLessThan(compressed.count, bigPrompt.count, "compressed prompt must be smaller than the original")
 
         let summary = try context.tokenSaverSavingsRepo.summary()
@@ -438,6 +440,38 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(claude.savedTokens, max(TokenEstimator.estimate(bigPrompt) - TokenEstimator.estimate(compressed), 0))
         XCTAssertEqual(claude.runs, 1)
         XCTAssertGreaterThan(summary.averageSavedPerRun, 0, "the per-run average (média) must be computable from real data")
+    }
+
+    func test_tokenSaverGateSkipsBelowFloorPrompt() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2GateFloor-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        // Under the NetPositiveGate floor (~2k) the gate must skip BEFORE any distill
+        // call — a model round-trip on a tiny prompt is not net-positive (G3).
+        let small = "tiny prompt well under the compression floor"
+        XCTAssertLessThan(small.count, 2_000)
+        let out = await context.tokenSaverCompress(prompt: small, provider: .claude, threadId: AgentThreadID())
+        XCTAssertEqual(out, small, "below floor => returned verbatim, no compression")
+    }
+
+    func test_tokenSaverDedupsRepeatedBlockEvenWithoutModelService() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2Dedup-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+        // No distill client override and no sidecar → the model step is unavailable; the
+        // deterministic, non-lossy dedup must still apply (P4) and fail open to it.
+
+        let block = String(repeating: "The renderer validates each config field before drawing the widget. ", count: 10)
+        let padding = String(repeating: "padding sentence to clear the floor. ", count: 30)
+        let prompt = "Task intro. \(padding)\n\n\(block)\n\nMiddle note.\n\n\(block)\n\nEnd."
+        XCTAssertGreaterThan(prompt.count, 2_000)
+
+        let out = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: AgentThreadID())
+        XCTAssertLessThan(out.count, prompt.count, "the duplicate block is collapsed even with no model service")
+        XCTAssertTrue(out.contains("⟪identical to block #"), "model-readable dedup pointer present (non-lossy)")
+        XCTAssertTrue(out.contains(block), "the first occurrence stays inline — no information lost")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 1, "the dedup saving is recorded")
     }
 
     func test_tokenSaverHumanizesSR1FinalResponseThroughDistillClientInUserLanguage() async throws {
@@ -727,13 +761,13 @@ final class TokenSaverAppContextTests: XCTestCase {
         let bigPrompt = String(repeating: "verbose line to compress here\n", count: 40)
 
         // Disabled → verbatim passthrough, no DB rows.
-        let disabled = await context.tokenSaverCompress(prompt: bigPrompt, provider: .claude)
+        let disabled = await context.tokenSaverCompress(prompt: bigPrompt, provider: .claude, threadId: AgentThreadID())
         XCTAssertEqual(disabled, bigPrompt)
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
 
         // Enabled but tiny prompt → below threshold, passthrough, no DB rows.
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        let tiny = await context.tokenSaverCompress(prompt: "fix typo", provider: .claude)
+        let tiny = await context.tokenSaverCompress(prompt: "fix typo", provider: .claude, threadId: AgentThreadID())
         XCTAssertEqual(tiny, "fix typo")
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0)
     }
