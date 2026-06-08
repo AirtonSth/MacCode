@@ -474,6 +474,46 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 1, "the dedup saving is recorded")
     }
 
+    func test_sessionLearnMinesFailedRunIntoRegionWhenEnabled() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2SessionLearn-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.sessionLearnEnabled = true }
+        let learnFile = URL(fileURLWithPath: appSupport).appendingPathComponent("AGENTS.md")
+        context.sessionLearnInstructionFilesOverrideForTesting = [learnFile]
+
+        let thread = AgentThread(title: "t", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m", status: .failed,
+                           errorMessage: "build error: cannot find symbol Foo in scope")
+        try context.runRepo.upsert(run)
+
+        context.recordSessionLearnFromRun(runId: run.id, status: .failed)
+
+        let rules = try SessionLearnRegion(fileURL: learnFile).rules()
+        XCTAssertEqual(rules.count, 1, "a failed run mines exactly one correction rule")
+        XCTAssertTrue(rules[0].contains("cannot find symbol Foo in scope"), "the rule captures the failure cause")
+    }
+
+    func test_sessionLearnNoOpWhenDisabledOrCompleted() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2SessionLearn2-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let learnFile = URL(fileURLWithPath: appSupport).appendingPathComponent("AGENTS.md")
+        context.sessionLearnInstructionFilesOverrideForTesting = [learnFile]
+        let thread = AgentThread(title: "t", provider: .codex, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "m", status: .failed, errorMessage: "err")
+        try context.runRepo.upsert(run)
+
+        // Disabled => no-op (default off).
+        context.recordSessionLearnFromRun(runId: run.id, status: .failed)
+        XCTAssertEqual(try SessionLearnRegion(fileURL: learnFile).rules().count, 0)
+
+        // Enabled but completed (not failed/expensive) => no-op.
+        SettingsStore(db: context.db).update { $0.sessionLearnEnabled = true }
+        context.recordSessionLearnFromRun(runId: run.id, status: .completed)
+        XCTAssertEqual(try SessionLearnRegion(fileURL: learnFile).rules().count, 0)
+    }
+
     func test_tokenSaverHumanizesSR1FinalResponseThroughDistillClientInUserLanguage() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizeSR1-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)

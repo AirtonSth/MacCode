@@ -15,6 +15,9 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
     public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
     public var tokenSaverEnabled: Bool
+    /// P5 SessionLearn: mine a correction rule from failed/expensive runs into the managed
+    /// instructions region. Off by default — opt-in, since it writes to CLAUDE.md/AGENTS.md.
+    public var sessionLearnEnabled: Bool
 
     public init(diffWordWrap: Bool = false,
                 diffIgnoreWhitespace: Bool = false,
@@ -23,7 +26,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaAllowDisplaySleep: Bool = true,
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
                 insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
-                tokenSaverEnabled: Bool = false) {
+                tokenSaverEnabled: Bool = false,
+                sessionLearnEnabled: Bool = false) {
         self.diffWordWrap = diffWordWrap
         self.diffIgnoreWhitespace = diffIgnoreWhitespace
         self.sidebarSort = sidebarSort
@@ -32,6 +36,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
         self.tokenSaverEnabled = tokenSaverEnabled
+        self.sessionLearnEnabled = sessionLearnEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -43,6 +48,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowSystemSleepWhenDisplayClosed
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
         case tokenSaverEnabled
+        case sessionLearnEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -55,6 +61,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
         tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
+        sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
     }
 }
 

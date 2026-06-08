@@ -45,6 +45,9 @@ public final class AppContext {
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
+    /// Test seam: sandbox the SessionLearn target instruction files so tests never write
+    /// into the developer's real ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md.
+    var sessionLearnInstructionFilesOverrideForTesting: [URL]?
     /// Test seam: sandboxes the managed-skill/config install roots under a temp home so
     /// tests never write /distill state into the developer's real ~/.claude or
     /// ~/.codex. Production code never sets this (installs to the real provider dirs).
@@ -287,10 +290,11 @@ public final class AppContext {
                 EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid))
             }
         }
-        coordinator.onRunFinished = { tid, _, status in
+        coordinator.onRunFinished = { tid, rid, status in
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
             EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, status: status))
             EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, status: status))
+            self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
             if status == .completed || status == .cancelled {
                 Task { @MainActor in
                     try? await self.router?.drainNextQueuedAgentMessage(thread: tid)
@@ -610,6 +614,24 @@ public final class AppContext {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
             // Fail-open to the deterministic dedup if it helped, else the original.
             return deduped.count < prompt.count ? adopt(deduped) : prompt
+        }
+    }
+
+    /// P5 SessionLearn: on a failed run, mine a deterministic correction rule from the
+    /// run's error into the managed instructions region (FIFO-capped, appended at the file
+    /// bottom so the upper instruction prefix stays byte-stable). Off by default; best-effort.
+    func recordSessionLearnFromRun(runId: AgentRunID, status: AgentRunStatus) {
+        guard SettingsStore(db: db).load().sessionLearnEnabled else { return }
+        guard SessionLearnRegion.shouldMine(runFailed: status == .failed, inputTokens: 0) else { return }
+        guard let run = try? runRepo.get(id: runId) else { return }
+        let error = (run.errorMessage ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !error.isEmpty else { return }
+        let firstLine = error.split(whereSeparator: \.isNewline).first.map(String.init) ?? error
+        let rule = "Avoid repeating the approach that failed with: \(String(firstLine.prefix(160))). Verify preconditions before retrying."
+        let files = sessionLearnInstructionFilesOverrideForTesting
+            ?? [AgentSkillInstaller.defaultClaudeInstructionsURL(), AgentSkillInstaller.defaultCodexInstructionsURL()]
+        for url in files {
+            try? SessionLearnRegion(fileURL: url).append(rule)
         }
     }
 
