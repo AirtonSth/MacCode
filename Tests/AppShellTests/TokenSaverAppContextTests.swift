@@ -8,6 +8,16 @@ import Persistence
 
 @MainActor
 final class TokenSaverAppContextTests: XCTestCase {
+    private struct PartialSR1HumanizeRuntime: DistillRuntime {
+        func distill(_ request: DistillRequest) async throws -> String {
+            """
+            Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
+            Estado: starting
+            Acao: create #g1
+            """
+        }
+    }
+
     private actor FakeTokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
         let response: [AssistantAccountUsage]
         private(set) var requests: [TokenSaverAccountUsageRefreshRequest] = []
@@ -55,7 +65,22 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
     }
 
-    func test_appContextReconcilesManagedDistillSkillsWithTokenSaverToggle() throws {
+    private func managedDistillConfigURLs(home: URL) -> (codex: URL, claude: URL) {
+        (
+            codex: home.appendingPathComponent(".codex/AGENTS.md"),
+            claude: home.appendingPathComponent(".claude/CLAUDE.md")
+        )
+    }
+
+    private func managedDistillCLIURL(home: URL) -> URL {
+        home.appendingPathComponent(".remote-code/bin/distill")
+    }
+
+    private func managedDistillPathLinkURL(home: URL) -> URL {
+        home.appendingPathComponent(".local/bin/distill")
+    }
+
+    func test_appContextReconcilesManagedDistillStateWithTokenSaverToggle() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkills-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsHome-" + UUID().uuidString, isDirectory: true)
@@ -68,37 +93,123 @@ final class TokenSaverAppContextTests: XCTestCase {
         // The provider skill dirs the agents actually scan.
         let codexSkill = home.appendingPathComponent(".codex/skills/distill/SKILL.md")
         let claudeSkill = home.appendingPathComponent(".claude/skills/distill/SKILL.md")
+        let configURLs = managedDistillConfigURLs(home: home)
+        let cliURL = managedDistillCLIURL(home: home)
+        let pathLink = managedDistillPathLinkURL(home: home)
 
-        // Token Saver disabled (the default) must NOT leave the managed /distill skill on disk.
+        // Token Saver disabled (the default) must NOT leave managed /distill state on disk.
         XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0,
-                       "the managed /distill skill must only exist while Token Saver is enabled")
+                       "managed /distill state must only exist while Token Saver is enabled")
         context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cliURL.path))
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: pathLink.path))
 
-        // Enabling Token Saver installs the /distill skill into each provider's real skill dir.
+        // Enabling Token Saver installs /distill skill and config into each provider's real roots.
         context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         XCTAssertEqual(context.managedDistillSkillInstallResults.count, 2)
         XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: claudeSkill.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.claude.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cliURL.path))
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: pathLink.path), cliURL.path,
+                       "enabling Token Saver must bridge the managed CLI onto PATH (~/.local/bin/distill)")
 
         let skillText = try String(contentsOf: claudeSkill)
         XCTAssertTrue(skillText.contains("source: https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"))
         XCTAssertTrue(skillText.contains("S=state"))
         XCTAssertTrue(skillText.contains("P=proof"))
+        let codexConfigText = try String(contentsOf: configURLs.codex)
+        let claudeConfigText = try String(contentsOf: configURLs.claude)
+        XCTAssertTrue(codexConfigText.contains("Use `/distill` every time"))
+        XCTAssertTrue(codexConfigText.contains("RemoteCode-managed `distill` CLI"))
+        XCTAssertTrue(claudeConfigText.contains("RemoteCodeDistillService"))
+        XCTAssertFalse(codexConfigText.contains("dev/distill/src/cli.ts"))
+        let cliText = try String(contentsOf: cliURL)
+        XCTAssertTrue(cliText.contains("RemoteCode local distill unavailable"))
+        XCTAssertTrue(cliText.contains("DistillCLIState.json"))
+        XCTAssertFalse(cliText.contains("dev/distill/src/cli.ts"))
 
-        // Disabling Token Saver removes the managed skill again for both providers.
+        // Disabling Token Saver removes managed skill and config again for both providers.
         context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         XCTAssertEqual(context.managedDistillSkillInstallResults.count, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: codexSkill.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: claudeSkill.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cliURL.path))
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: pathLink.path),
+                     "disabling Token Saver must remove the PATH symlink too")
     }
 
-    func test_appContextLaunchInstallsManagedDistillSkillsWhenPersistedTokenSaverEnabled() throws {
+    func test_managedDistillCLIUsesLocalMacDistillService() async throws {
+        let appSupportURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedDistillCLI-\(UUID().uuidString)", isDirectory: true)
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2ManagedDistillCLIHome-\(UUID().uuidString)", isDirectory: true)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let cliURL = try installer.installDistillCLI(appSupportDirectory: appSupportURL)
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "cli-token",
+            appSupportDirectory: appSupportURL.path
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let stateURL = appSupportURL
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        try FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("""
+        {
+          "base_url": "\(ready.baseURL)",
+          "auth_token": "cli-token",
+          "pid": \(ready.pid),
+          "runtime": "\(ready.runtime)",
+          "model_id": "\(ready.modelID)"
+        }
+        """.utf8).write(to: stateURL)
+
+        let process = Process()
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = cliURL
+        process.arguments = ["Return PASS or FAIL only, then one proof line."]
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        process.environment = CodexRunner.processEnvironment(overrides: [:])
+
+        try process.run()
+        stdin.fileHandleForWriting.write(Data("unit tests passed\nno failures\n".utf8))
+        stdin.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+
+        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let error = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, error)
+        XCTAssertEqual(output.trimmingCharacters(in: .whitespacesAndNewlines), "PASS",
+                       "the managed distill command must return only the format requested by the agent")
+        XCTAssertFalse(output.contains("PROMPT:"))
+        XCTAssertFalse(output.contains("INPUT:"))
+        XCTAssertFalse(error.contains("dev/distill/src/cli.ts"),
+                       "the provider-visible CLI path must never hit the old TypeScript checkout")
+    }
+
+    func test_appContextLaunchInstallsManagedDistillStateWhenPersistedTokenSaverEnabled() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOn-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsLaunchHome-" + UUID().uuidString, isDirectory: true)
         let skillURLs = managedDistillSkillURLs(home: home)
+        let configURLs = managedDistillConfigURLs(home: home)
 
         let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: true))
@@ -115,18 +226,27 @@ final class TokenSaverAppContextTests: XCTestCase {
                       "Codex must see the managed /distill skill from its provider skill root on launch")
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path),
                       "Claude must see the managed /distill skill from its provider skill root on launch")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.codex.path),
+                      "Codex must receive the managed AGENTS.md distill instructions on launch")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.claude.path),
+                      "Claude must receive the managed CLAUDE.md distill instructions on launch")
     }
 
-    func test_appContextLaunchRemovesManagedDistillSkillsWhenPersistedTokenSaverDisabled() throws {
+    func test_appContextLaunchRemovesManagedDistillStateWhenPersistedTokenSaverDisabled() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsLaunchOff-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsLaunchOffHome-" + UUID().uuidString, isDirectory: true)
         let skillURLs = managedDistillSkillURLs(home: home)
+        let configURLs = managedDistillConfigURLs(home: home)
         let installer = AgentSkillInstaller(homeDirectory: home)
         _ = try installer.installDistillSkill(for: .codex, sourceRevision: "rev-a")
         _ = try installer.installDistillSkill(for: .claude, sourceRevision: "rev-a")
+        try installer.installDistillInstructions(for: .codex)
+        try installer.installDistillInstructions(for: .claude)
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.claude.path))
 
         let seedContext = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: seedContext.db).save(AppSettings(tokenSaverEnabled: false))
@@ -138,16 +258,19 @@ final class TokenSaverAppContextTests: XCTestCase {
         )
 
         XCTAssertEqual(launchedContext.managedDistillSkillInstallResults.count, 0,
-                       "opening the app with Token Saver disabled must not keep stale managed skills active")
+                       "opening the app with Token Saver disabled must not keep stale managed distill state active")
         XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.codex.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path))
     }
 
-    func test_applicationWillTerminateRemovesManagedDistillSkills() throws {
+    func test_applicationWillTerminateRemovesManagedDistillState() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ManagedSkillsClose-" + UUID().uuidString
         let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedSkillsCloseHome-" + UUID().uuidString, isDirectory: true)
         let skillURLs = managedDistillSkillURLs(home: home)
+        let configURLs = managedDistillConfigURLs(home: home)
         let context = try AppContext(
             channel: .debug,
             appSupportOverride: appSupport,
@@ -156,6 +279,8 @@ final class TokenSaverAppContextTests: XCTestCase {
         context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.codex.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: skillURLs.claude.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.codex.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configURLs.claude.path))
 
         let delegate = AppDelegate()
         delegate.context = context
@@ -165,6 +290,10 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "closing RemoteCode must remove the managed Codex /distill skill")
         XCTAssertFalse(FileManager.default.fileExists(atPath: skillURLs.claude.path),
                        "closing RemoteCode must remove the managed Claude /distill skill")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.codex.path),
+                       "closing RemoteCode must remove managed Codex distill instructions")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configURLs.claude.path),
+                       "closing RemoteCode must remove managed Claude distill instructions")
     }
 
     func test_tokenSaverDistillLaunchPlannerOnlyStartsForPaidEnabledInstalledModel() {
@@ -302,9 +431,286 @@ final class TokenSaverAppContextTests: XCTestCase {
         let summary = try context.tokenSaverSavingsRepo.summary()
         let claude = try XCTUnwrap(summary.savings(for: "claude"),
                                    "a measured savings row must be persisted to the local DB for the compressed run")
-        XCTAssertGreaterThan(claude.savedTokens, 0)
+        XCTAssertEqual(claude.inputTokens, TokenEstimator.estimate(bigPrompt),
+                       "savings are recorded in estimated tokens, not characters")
+        XCTAssertEqual(claude.outputTokens, TokenEstimator.estimate(compressed),
+                       "savings are recorded in estimated tokens, not characters")
+        XCTAssertEqual(claude.savedTokens, max(TokenEstimator.estimate(bigPrompt) - TokenEstimator.estimate(compressed), 0))
         XCTAssertEqual(claude.runs, 1)
         XCTAssertGreaterThan(summary.averageSavedPerRun, 0, "the per-run average (média) must be computable from real data")
+    }
+
+    func test_tokenSaverHumanizesSR1FinalResponseThroughDistillClientInUserLanguage() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizeSR1-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "humanize-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "humanize-token")
+
+        let thread = AgentThread(title: "sr1", provider: .codex, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill Responda em portugues o resultado dos testes."
+        ))
+        let sr1 = """
+        SR1
+        S: tests green
+        C: user asked in Portuguese
+        O: saved counter updated
+        P: macOS suite passed
+        """
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id)
+
+        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized),
+                       "the Agent App must store the human-language answer, not another SR1 block")
+        XCTAssertTrue(humanized.contains("Estado: tests green"),
+                      "the distill humanize request must target the user's Portuguese language even when the user types portugues without an accent")
+        XCTAssertTrue(humanized.contains("Prova: macOS suite passed"))
+    }
+
+    func test_tokenSaverHumanizesSpaceDelimitedDistillResponseThroughDistillClient() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizeSR1Space-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "humanize-space-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "humanize-space-token")
+
+        let thread = AgentThread(title: "sr1 space", provider: .claude, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill crie o snage game em html"
+        ))
+        let sr1 = """
+        O Snake game criado.
+        O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
+        O feat: canvas 20x20 grid, score, wall+self collision, food respawn, game-over restart
+        O ctrl: setas ou WASD; ESPACO reinicia
+        P open: abrir snake.html no browser -> jogo roda
+        """
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .claude, threadId: thread.id)
+
+        XCTAssertFalse(SR1ResponseDetector.isSR1(humanized),
+                       "humanized output must not still look like SR1")
+        XCTAssertFalse(humanized.contains("O file:"))
+        XCTAssertTrue(humanized.contains("Resultado: Snake game criado."))
+        XCTAssertTrue(humanized.contains("Prova: open: abrir snake.html no browser -> jogo roda"))
+    }
+
+    func test_tokenSaverHumanizeFallsBackWhenLocalLLMLeavesSR1Dictionary() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverHumanizePartialSR1-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "partial-humanize-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: PartialSR1HumanizeRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "partial-humanize-token")
+
+        let thread = AgentThread(title: "sr1 partial", provider: .codex, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill crie o snage game em html"
+        ))
+        let sr1 = """
+        Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof #g1=Snake HTML game
+        S starting. D load /distill rules, inspect /tmp, then create #g1.
+        """
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id)
+
+        XCTAssertFalse(humanized.contains("Dict:"),
+                       "the Agent App must not display a local-LLM partial translation that still contains the SR1 dictionary")
+        XCTAssertTrue(humanized.contains("Estado: starting"))
+        XCTAssertFalse(humanized.contains("#g1"),
+                       "SR1 variables are for provider compression only and must be expanded before the user sees the answer")
+        XCTAssertTrue(humanized.contains("Acao: load /distill rules, inspect /tmp, then create Snake HTML game"))
+    }
+
+    func test_tokenSaverHumanizedSR1ResponseRecordsEstimatedTokensOfHumanVersusSR1() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR1OutputSavings-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "sr1-output-savings-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "sr1-output-savings-token")
+
+        let thread = AgentThread(title: "sr1 output savings", provider: .codex, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill crie o snage game em html"
+        ))
+        let sr1 = """
+        S ok.
+        O /tmp/index.html.
+        P pass.
+        """
+        let runId = AgentRunID()
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id, runId: runId)
+        _ = await context.tokenSaverHumanizeSR1Response(sr1, provider: .codex, threadId: thread.id, runId: runId)
+
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        let codex = try XCTUnwrap(summary.savings(for: "codex"))
+        let perInput = TokenEstimator.estimate(humanized)
+        let perOutput = TokenEstimator.estimate(sr1)
+        let expectedInput = perInput * 2
+        let expectedOutput = perOutput * 2
+        let expectedSaved = max(perInput - perOutput, 0) * 2
+        XCTAssertEqual(codex.inputTokens, expectedInput,
+                       "SR1 humanization savings use the estimated tokens of the avoided human answer as the baseline")
+        XCTAssertEqual(codex.outputTokens, expectedOutput,
+                       "SR1 humanization savings use the estimated tokens of the emitted compressed SR1 response")
+        XCTAssertEqual(codex.savedTokens, expectedSaved,
+                       "saved = estimate(human) - estimate(SR1) for every sidecar call")
+        XCTAssertEqual(codex.runs, 2,
+                       "every successful local sidecar humanization call must update Token Saver reports")
+    }
+
+    func test_tokenSaverUsageForDistillSkillRunDoesNotRecordSavingsWithoutSidecarCall() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillSavings-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(
+            title: "distill skill",
+            provider: .codex,
+            model: "gpt-test"
+        )
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill"
+        ))
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-test",
+            status: .running,
+            startedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(inputTokens: 120, outputTokens: 80, totalTokens: 200)),
+            thread.id,
+            run.id
+        )
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(inputTokens: 120, outputTokens: 80, totalTokens: 200)),
+            thread.id,
+            run.id
+        )
+
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        XCTAssertEqual(summary.totalRuns, 0,
+                       "provider token-usage events do not know the original command output or humanized SR1 length; savings are recorded only by local sidecar calls")
+    }
+
+    func test_tokenSaverUsageForDistillSkillRunWithTotalOnlyUsageDoesNotFabricateSavings() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillTotalOnlySavings-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(
+            title: "distill skill total only",
+            provider: .codex,
+            model: "gpt-test"
+        )
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill Responda usando SR1."
+        ))
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-test",
+            status: .running,
+            startedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(inputTokens: 0, outputTokens: 0, totalTokens: 200)),
+            thread.id,
+            run.id
+        )
+
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        XCTAssertEqual(summary.totalRuns, 0,
+                       "total-only provider usage must not invent Token Saver savings; command-output and SR1 savings are measured by the sidecar")
+    }
+
+    func test_tokenSaverUsageForInputOnlyDistillEventDoesNotFabricateSavedTokens() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillInputOnlyNoSavings-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(
+            title: "distill input only",
+            provider: .claude,
+            model: "claude-test"
+        )
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "/distill"
+        ))
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "claude-test",
+            status: .running,
+            startedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(inputTokens: 200, outputTokens: 0, totalTokens: 200)),
+            thread.id,
+            run.id
+        )
+
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0,
+                       "input-only token usage is not compressed output and must not inflate Saved")
     }
 
     func test_tokenSaverCompressionIsNoOpWhenDisabledOrTooShort() async throws {
@@ -381,7 +787,115 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(event.modelID, DistillApprovedModel.id)
         XCTAssertEqual(event.maxConcurrentRequests, 8)
         XCTAssertEqual(event.maxQueueDepth, 64)
-        XCTAssertNotNil(controller.bearerToken)
+        let token = try XCTUnwrap(controller.bearerToken)
+        let stateURL = appSupport
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+        let state = try String(contentsOf: stateURL)
+        XCTAssertTrue(state.contains("\"base_url\":\"http:\\/\\/127.0.0.1:18181\"") ||
+                      state.contains("\"base_url\":\"http://127.0.0.1:18181\""))
+        XCTAssertTrue(state.contains(token),
+                      "the managed distill CLI needs the live sidecar bearer token, not an external TypeScript CLI")
+
+        controller.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateURL.path))
+    }
+
+    func test_tokenSaverDistillServiceControllerReadsReadyBeforeSidecarClosesStdout() async throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2PaidTokenSaverOpenStdout-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        let executable = appSupport.appendingPathComponent("FakeRemoteCodeDistillService")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18182","host":"127.0.0.1","port":18182,"pid":12346,"protocol":1,"runtime":"mlx","model_id":"samuelfaj/distill-1.7B-4bit-MLX","max_concurrent_requests":8,"max_queue_depth":64}'
+        sleep 20
+        """
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: appSupport,
+            executableURLResolver: { executable }
+        )
+        let session = PrivateAccountSession(
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        )
+
+        controller.startIfEligible(
+            session: session,
+            settings: AppSettings(tokenSaverEnabled: true),
+            modelValidation: .installed
+        )
+
+        let ready = await waitUntil {
+            if case .running = controller.status { return true }
+            return false
+        }
+        XCTAssertTrue(ready,
+                      "the sidecar keeps stdout open after the ready line; waiting for EOF leaves Token Saver stuck in starting")
+
+        controller.stop()
+    }
+
+    func test_tokenSaverDistillServiceControllerPostsUsageChangedForSavingsEvents() async throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2PaidTokenSaverSavingsEvent-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        let executable = appSupport.appendingPathComponent("FakeRemoteCodeDistillService")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18183","host":"127.0.0.1","port":18183,"pid":12347,"protocol":1,"runtime":"mlx","model_id":"samuelfaj/distill-1.7B-4bit-MLX","max_concurrent_requests":8,"max_queue_depth":64}'
+        sleep 0.1
+        printf '%s\\n' '{"event":"savings_recorded","provider":"codex","mode":"command-output","input_tokens":30,"output_tokens":10,"saved_tokens":20}'
+        sleep 20
+        """
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        var didPostUsageChanged = false
+        let observer = NotificationCenter.default.addObserver(
+            forName: .rc2TokenSaverUsageChanged,
+            object: nil,
+            queue: .main
+        ) { _ in
+            didPostUsageChanged = true
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: appSupport,
+            executableURLResolver: { executable }
+        )
+        let session = PrivateAccountSession(
+            accessToken: "access-token",
+            refreshToken: "refresh-token",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        )
+
+        controller.startIfEligible(
+            session: session,
+            settings: AppSettings(tokenSaverEnabled: true),
+            modelValidation: .installed
+        )
+
+        let posted = await waitUntil { didPostUsageChanged }
+        XCTAssertTrue(posted,
+                      "sidecar savings events must refresh Token Saver chart/report state in the running app")
 
         controller.stop()
     }

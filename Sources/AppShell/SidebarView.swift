@@ -52,7 +52,7 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     @Published public private(set) var tokenSaverEnabled: Bool = false
     @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
-    /// Real, measured compression savings from the local DB (7-day window).
+    /// Saved-token totals from the local DB plus retained report/chart rows.
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
     @Published public var showsTokenSaverModelDownload = false
     @Published public private(set) var tokenSaverModelDownloadState: TokenSaverModelDownloadState = .idle
@@ -1251,8 +1251,8 @@ public struct SidebarRootView: View {
         )
     }
 
-    /// Real measured savings from the DB ledger. Week = full 7-day window;
-    /// Current Session = today's (UTC) buckets, matching the ledger's bucketing.
+    /// Saved-token totals from the DB ledger. Week shows the accumulated total
+    /// the user has saved; Current Session uses today's retained report bucket.
     private func tokenSaverMeasuredSaved(scope: TokenSaverUsageScope) -> Int {
         let summary = vm.tokenSaverSavingsSummary
         switch scope {
@@ -1264,7 +1264,7 @@ public struct SidebarRootView: View {
         }
     }
 
-    /// Mean tokens saved per compressed run over the 7-day window.
+    /// Mean tokens saved per recorded run over the accumulated saved total.
     private var tokenSaverAverageSavedPerRun: Int {
         vm.tokenSaverSavingsSummary.averageSavedPerRun
     }
@@ -1473,10 +1473,10 @@ public struct SidebarRootView: View {
         if vm.tokenSaverEnabled {
             let saved = vm.tokenSaverSavingsSummary.totalSavedTokens
             guard saved > 0 else {
-                return "Token Saver is on. Measured savings appear after your next large prompt is compressed."
+                return "Token Saver is on. Saved tokens appear after your next /distill turn or large prompt compression."
             }
             let runs = vm.tokenSaverSavingsSummary.totalRuns
-            return "Token Saver measured \(Self.formatTokenCount(saved)) tokens saved across \(runs) compression\(runs == 1 ? "" : "s") (avg \(Self.formatTokenCount(tokenSaverAverageSavedPerRun))/run, last 7 days)."
+            return "Token Saver saved \(Self.formatTokenCount(saved)) tokens across \(runs) recorded run\(runs == 1 ? "" : "s") (avg \(Self.formatTokenCount(tokenSaverAverageSavedPerRun))/run). Reports and charts keep at least 7 days of event history."
         }
         return "Enable Token Saver to run the approved local MLX model and start reducing provider usage."
     }
@@ -1827,7 +1827,7 @@ public struct SidebarRootView: View {
         private var progressView: some View {
             Group {
                 if let fraction = state.fractionCompleted {
-                    ProgressView(value: fraction)
+                    ProgressView(value: fraction, total: 1)
                 } else {
                     ProgressView()
                 }
@@ -1951,7 +1951,10 @@ public struct SidebarRootView: View {
                 }
                 Spacer(minLength: 0)
                 if busy {
-                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityLabel("Workspace busy")
                 }
                 if ws.notificationsUnread > 0 {
                     DSPill("\(ws.notificationsUnread)", tone: .accent)

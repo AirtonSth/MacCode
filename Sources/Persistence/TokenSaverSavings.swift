@@ -1,6 +1,8 @@
 import Foundation
 
-/// Measured Token Saver savings for one provider over the retention window.
+/// Token Saver saved-token totals for one provider across the permanent
+/// accumulator. Event rows may be pruned, but this aggregate keeps growing so
+/// the user can see all tokens Token Saver has saved for them.
 public struct TokenSaverProviderSavings: Sendable, Equatable {
     public let provider: String
     public let savedTokens: Int
@@ -17,7 +19,7 @@ public struct TokenSaverProviderSavings: Sendable, Equatable {
     }
 }
 
-/// One UTC day bucket of measured savings, for the 7-day history chart.
+/// One UTC day bucket of saved tokens, for the 7-day history chart.
 public struct TokenSaverDailySavings: Sendable, Equatable {
     public let dayStartMs: Int64
     public let savedTokens: Int
@@ -30,8 +32,9 @@ public struct TokenSaverDailySavings: Sendable, Equatable {
     }
 }
 
-/// Aggregated measured savings over the retention window. This is the source of
-/// the honest "tokens saved" totals and the per-run average shown in the UI.
+/// Aggregated saved tokens. Provider totals come from the permanent accumulator
+/// so the UI can show all tokens saved for the user. Daily buckets come from the
+/// retained event rows and feed the short-term reports/chart.
 public struct TokenSaverSavingsSummary: Sendable, Equatable {
     public let providers: [TokenSaverProviderSavings]
     public let daily: [TokenSaverDailySavings]
@@ -58,26 +61,29 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
     public static let empty = TokenSaverSavingsSummary(providers: [], daily: [])
 }
 
-/// Persists every real, measured Token Saver compression event to the local
-/// SQLite database and keeps only the trailing retention window (7 days).
-/// Each `record` is atomic insert-then-prune on the DB serial queue, so
+/// Persists Token Saver savings events to the local SQLite database, keeps event
+/// rows for at least one week for reports/charts, and updates a permanent
+/// accumulator so total saved tokens keep adding up for the user.
+/// Each `record` is atomic insert-update-prune on the DB serial queue, so
 /// concurrent agent runs cannot lose or corrupt rows.
-public final class TokenSaverSavingsRepository {
+public final class TokenSaverSavingsRepository: @unchecked Sendable {
     private let db: SQLiteDB
     private let retentionDays: Int
     private static let isoFormatter = ISO8601DateFormatter()
 
     public init(db: SQLiteDB, retentionDays: Int = 7) {
         self.db = db
-        self.retentionDays = max(1, retentionDays)
+        self.retentionDays = max(7, retentionDays)
     }
 
     private var retentionMs: Int64 { Int64(retentionDays) * 86_400_000 }
 
-    /// Record one compression event. `inputTokens`/`outputTokens` are the
-    /// measured raw vs distilled token counts; saved = max(input-output, 0).
-    /// Returns the saved tokens persisted. Old rows beyond the window are
-    /// pruned in the same transaction so history never exceeds `retentionDays`.
+    /// Record one savings event. The column names are historical; sidecar
+    /// command-output rows store original/distilled character lengths, while
+    /// SR1 humanization rows store the explicit mode-specific accounting.
+    /// saved = max(input-output, 0).
+    /// Returns the saved tokens persisted. Old event rows beyond the window are
+    /// pruned in the same transaction, but the permanent total is not pruned.
     @discardableResult
     public func record(
         provider: String,
@@ -87,6 +93,29 @@ public final class TokenSaverSavingsRepository {
         at date: Date = Date()
     ) throws -> Int {
         let saved = max(inputTokens - outputTokens, 0)
+        return try record(
+            provider: provider,
+            mode: mode,
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            savedTokens: saved,
+            at: date
+        )
+    }
+
+    /// Record one savings event with an explicit saved value. This is used for
+    /// sidecar modes whose accounting is not simply `input - output` in the
+    /// stored units, such as SR1 humanization.
+    @discardableResult
+    public func record(
+        provider: String,
+        mode: String,
+        inputTokens: Int,
+        outputTokens: Int,
+        savedTokens: Int,
+        at date: Date = Date()
+    ) throws -> Int {
+        let saved = max(savedTokens, 0)
         let ms = Int64(date.timeIntervalSince1970 * 1000)
         let iso = Self.isoFormatter.string(from: date)
         let cutoff = ms - retentionMs
@@ -105,6 +134,26 @@ public final class TokenSaverSavingsRepository {
             try insert.bind(6, iso)
             try insert.bind(7, ms)
             _ = try insert.step()
+
+            let total = try database.prepare("""
+                INSERT INTO token_saver_savings_totals
+                    (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(provider, mode) DO UPDATE SET
+                    input_tokens = token_saver_savings_totals.input_tokens + excluded.input_tokens,
+                    output_tokens = token_saver_savings_totals.output_tokens + excluded.output_tokens,
+                    saved_tokens = token_saver_savings_totals.saved_tokens + excluded.saved_tokens,
+                    runs = token_saver_savings_totals.runs + excluded.runs,
+                    updated_at = excluded.updated_at;
+            """)
+            defer { total.reset() }
+            try total.bind(1, provider)
+            try total.bind(2, mode)
+            try total.bind(3, max(0, inputTokens))
+            try total.bind(4, max(0, outputTokens))
+            try total.bind(5, saved)
+            try total.bind(6, iso)
+            _ = try total.step()
 
             let prune = try database.prepare("DELETE FROM token_saver_savings WHERE created_at_ms < ?;")
             defer { prune.reset() }
@@ -125,7 +174,8 @@ public final class TokenSaverSavingsRepository {
         }
     }
 
-    /// Aggregate measured savings over the trailing retention window.
+    /// Aggregate measured savings. Provider totals are all-time accumulated
+    /// values; daily buckets cover the retained report window.
     public func summary(now: Date = Date()) throws -> TokenSaverSavingsSummary {
         let cutoff = Int64(now.timeIntervalSince1970 * 1000) - retentionMs
         return try db.performSync { database in
@@ -135,13 +185,11 @@ public final class TokenSaverSavingsRepository {
                        COALESCE(SUM(saved_tokens), 0),
                        COALESCE(SUM(input_tokens), 0),
                        COALESCE(SUM(output_tokens), 0),
-                       COUNT(*)
-                FROM token_saver_savings
-                WHERE created_at_ms >= ?
+                       COALESCE(SUM(runs), 0)
+                FROM token_saver_savings_totals
                 GROUP BY provider;
             """)
             defer { perProvider.reset() }
-            try perProvider.bind(1, cutoff)
             while try perProvider.step() {
                 providers.append(TokenSaverProviderSavings(
                     provider: perProvider.columnText(0) ?? "unknown",

@@ -815,7 +815,8 @@ final class GhosttyTerminalView: NSView {
     private static var nativeRendererEnabled: Bool {
         let env = ProcessInfo.processInfo.environment
         guard env["RC2_ENABLE_GHOSTTY_IN_TESTS"] != "1" else { return true }
-        return env["XCTestConfigurationFilePath"] == nil
+        guard env["XCTestConfigurationFilePath"] == nil else { return false }
+        return ProcessInfo.processInfo.processName != "xctest"
     }
 
     private func updateFocus() {

@@ -40,7 +40,9 @@ public struct TokenSaverModelDownloadState: Codable, Sendable, Equatable {
 
     public var fractionCompleted: Double? {
         guard let expectedBytes, expectedBytes > 0 else { return nil }
-        return min(1.0, Double(downloadedBytes) / Double(expectedBytes))
+        let fraction = Double(downloadedBytes) / Double(expectedBytes)
+        guard fraction.isFinite else { return nil }
+        return min(max(fraction, 0), 1)
     }
 
     public static let idle = TokenSaverModelDownloadState(phase: .idle, statusText: "Not started")

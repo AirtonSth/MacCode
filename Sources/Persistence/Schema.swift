@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 25
+    public static let currentVersion: Int = 26
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -362,6 +362,35 @@ public enum Schema {
             created_at_ms INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_token_saver_savings_time ON token_saver_savings(created_at_ms);
+        """),
+        SchemaStep(26, """
+        CREATE TABLE IF NOT EXISTS token_saver_savings_totals (
+            provider TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            saved_tokens INTEGER NOT NULL,
+            runs INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(provider, mode)
+        );
+        INSERT INTO token_saver_savings_totals
+            (provider, mode, input_tokens, output_tokens, saved_tokens, runs, updated_at)
+        SELECT provider,
+               mode,
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(saved_tokens), 0),
+               COUNT(*),
+               COALESCE(MAX(created_at), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        FROM token_saver_savings
+        GROUP BY provider, mode
+        ON CONFLICT(provider, mode) DO UPDATE SET
+            input_tokens = token_saver_savings_totals.input_tokens + excluded.input_tokens,
+            output_tokens = token_saver_savings_totals.output_tokens + excluded.output_tokens,
+            saved_tokens = token_saver_savings_totals.saved_tokens + excluded.saved_tokens,
+            runs = token_saver_savings_totals.runs + excluded.runs,
+            updated_at = excluded.updated_at;
         """)
     ]
 

@@ -261,7 +261,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ClaudeRunner.buildStreamingArgs(request)
         process.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: request.environment)
+        process.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

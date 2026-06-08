@@ -204,6 +204,8 @@ public actor DistillServiceMetricsRecorder {
 }
 
 public final class DistillHTTPServer: @unchecked Sendable {
+    public typealias SuccessHandler = @Sendable (DistillRequest, DistillResponse) async -> Void
+
     private struct HTTPRequest {
         let method: String
         let path: String
@@ -235,12 +237,14 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "io.remotecode.distill.http", qos: .userInitiated)
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let onSuccess: SuccessHandler?
     private var listener: NWListener?
     private var actualPort: UInt16 = 0
 
-    public init(configuration: DistillServiceConfiguration, scheduler: DistillScheduler) {
+    public init(configuration: DistillServiceConfiguration, scheduler: DistillScheduler, onSuccess: SuccessHandler? = nil) {
         self.configuration = configuration
         self.scheduler = scheduler
+        self.onSuccess = onSuccess
     }
 
     public func start() async throws -> DistillServiceReadyEvent {
@@ -377,6 +381,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
             let response = try await scheduler.submit(distillRequest)
+            if let onSuccess {
+                await onSuccess(distillRequest, response)
+            }
             await metrics.recordSuccess()
             send(status: 200, body: response, connection: connection)
         } catch let error as DistillError {

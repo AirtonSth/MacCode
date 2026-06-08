@@ -21,6 +21,10 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+        // Direct dependency on mlx-swift (already resolved transitively by mlx-swift-lm)
+        // so DistillCore can `import MLX` to bound the Metal buffer cache. Constraint
+        // mirrors mlx-swift-lm's to keep resolution to the same revision.
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0")
     ],
@@ -54,6 +58,7 @@ let package = Package(
         .target(
             name: "DistillCore",
             dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
@@ -64,7 +69,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "RemoteCodeDistillService",
-            dependencies: ["DistillCore", "AgentRuntime"],
+            dependencies: ["DistillCore", "AgentRuntime", "Persistence"],
             path: "Sources/RemoteCodeDistillService"
         ),
         .target(

@@ -107,6 +107,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
+    private var timelineUpdateTickTask: Task<Void, Never>?
 
     public init(
         workspaceID: WorkspaceID,
@@ -262,7 +263,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         rehydratePendingCallbacks(threadId: id)
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
-        timelineUpdateTick = 0
+        resetTimelineUpdateTick()
         // UX-MAC_AGENT-001: route first-responder to the composer on every
         // open/switch so the user can type without a manual click.
         focusTick &+= 1
@@ -726,7 +727,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Response-failure, not a prompt failure — no prompt Retry offered.
             lastErrorRecoverable = false
         }
-        timelineUpdateTick += 1
+        scheduleTimelineUpdateTick()
     }
 
     public func answerPendingUserInput(_ request: AssistantUserInputRequest, answer: String) {
@@ -747,7 +748,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Response-failure, not a prompt failure — no prompt Retry offered.
             lastErrorRecoverable = false
         }
-        timelineUpdateTick += 1
+        scheduleTimelineUpdateTick()
     }
 
     public func toggleUserInputOption(_ option: String, for request: AssistantUserInputRequest) {
@@ -812,18 +813,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             await MainActor.run {
                 self.providerSnapshotStatusMessage = nil
-                self.providerSnapshots = snapshots
-                if self.selectedProviderSnapshot == nil {
-                    self.providerInstanceId = snapshots.first(where: { $0.provider == self.provider })?.id ?? self.provider.rawValue
-                }
-                if let current = self.selectedProviderSnapshot {
-                    self.provider = current.provider
-                    self.availableModels = current.models
-                    if !self.modelSelectionIsValid(self.model, in: current.models) {
-                        self.model = current.models.first?.id ?? self.model
-                    }
-                    self.normalizeSelectedModelOptions()
-                }
+                self.applyProviderSnapshots(snapshots)
             }
         } catch {
             await MainActor.run {
@@ -832,8 +822,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    private func applyProviderSnapshots(_ snapshots: [AgentProviderSnapshot]) {
+        providerSnapshots = snapshots
+        if selectedProviderSnapshot == nil {
+            providerInstanceId = snapshots.first(where: { $0.provider == provider })?.id ?? provider.rawValue
+        }
+        if let current = selectedProviderSnapshot {
+            provider = current.provider
+            availableModels = current.models
+            if !modelSelectionIsValid(model, in: current.models) {
+                model = current.models.first?.id ?? model
+            }
+            normalizeSelectedModelOptions()
+        }
+    }
+
     public func refreshProviderSnapshotsInBackground() {
+        seedProviderSnapshotsForStartup()
         Task { await loadProviderSnapshots() }
+    }
+
+    private func seedProviderSnapshotsForStartup() {
+        guard providerSnapshots.isEmpty else { return }
+        Task {
+            let codexModels = await CodexRunner().listModels()
+            let fallback = [
+                AgentProviderSnapshotFactory.snapshot(provider: .codex, models: codexModels, binaryPath: ""),
+                AgentProviderSnapshotFactory.snapshot(provider: .claude, models: ClaudeRunner.listModels(installedVersion: nil), binaryPath: "")
+            ]
+            await MainActor.run {
+                guard self.providerSnapshots.isEmpty else { return }
+                self.applyProviderSnapshots(fallback)
+            }
+        }
     }
 
     public var selectedProviderSnapshot: AgentProviderSnapshot? {
@@ -1210,7 +1231,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectedThreadId = nil
         messages = []
         timeline = AssistantTimelineState()
-        timelineUpdateTick = 0
+        resetTimelineUpdateTick()
         }
         reloadThreads()
     }
@@ -1222,7 +1243,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.selectedThreadId = nil
         messages = []
         timeline = AssistantTimelineState()
-        timelineUpdateTick = 0
+        resetTimelineUpdateTick()
         }
         reloadThreads()
     }
@@ -1442,7 +1463,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         loadInitialMessagePage(tid)
         suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
-        timelineUpdateTick = 0
+        resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         let resolvedAttachments: [AgentAttachment]
         do {
@@ -1604,7 +1625,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             } else {
                 self.lastErrorRecoverable = false
             }
+            self.scheduleTimelineUpdateTick()
+        }
+    }
+
+    private func resetTimelineUpdateTick() {
+        timelineUpdateTickTask?.cancel()
+        timelineUpdateTickTask = nil
+        timelineUpdateTick = 0
+    }
+
+    private func scheduleTimelineUpdateTick() {
+        guard timelineUpdateTickTask == nil else { return }
+        timelineUpdateTickTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(16))
+            guard !Task.isCancelled else { return }
             self.timelineUpdateTick &+= 1
+            self.timelineUpdateTickTask = nil
         }
     }
 
@@ -1653,16 +1690,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             self.reloadThreads()
             if threadId == self.selectedThreadId {
-                self.status = status
                 if status == .running {
+                    self.status = status
                     self.terminalRunIds.remove(runId)
                     self.currentRunId = runId
                     if self.runStartedAt == nil { self.runStartedAt = Date() }
                 } else if Self.isTerminalRunStatus(status) {
-                    self.terminalRunIds.insert(runId)
-                    self.currentRunId = nil
-                    self.runStartedAt = nil
-                    self.runThreads[runId] = nil
+                    // Terminal provider status can arrive immediately before
+                    // `.finished`; keep the UI in running state until the
+                    // coordinator has released the active handle.
+                    if !self.coordinator.activeThreadIdsSnapshot().contains(threadId) {
+                        self.status = status
+                        self.terminalRunIds.insert(runId)
+                        self.currentRunId = nil
+                        self.runStartedAt = nil
+                        self.runThreads[runId] = nil
+                    }
+                } else {
+                    self.status = status
                 }
             }
             self.onRunStateChange?()
@@ -1866,6 +1911,11 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     }
 }
 
+private final class TimelineScrollScheduler {
+    var scheduled = false
+    var forcePending = false
+}
+
 public struct AgentAppView: View {
     private static let threadRailWidthRange: ClosedRange<CGFloat> = 180...360
     private static let threadRailIdealWidth: CGFloat = 220
@@ -1889,6 +1939,7 @@ public struct AgentAppView: View {
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
     @State private var pendingScrollDownReveal: Task<Void, Never>?
+    @State private var timelineScrollScheduler = TimelineScrollScheduler()
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @AppStorage("agent.planSidebar.intent.v1") private var planSidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
@@ -1917,7 +1968,11 @@ public struct AgentAppView: View {
     }
 
     static func shouldRenderAssistantItemBody(_ body: String, priorAssistantTexts: [String] = [], persistedAssistantTexts: [String] = []) -> Bool {
-        !body.isEmpty &&
+        if SR1ResponseDetector.isSR1(body),
+           persistedAssistantTexts.contains(where: { !$0.isEmpty && !SR1ResponseDetector.isSR1($0) }) {
+            return false
+        }
+        return !body.isEmpty &&
             !assistantText(body, equalsAny: priorAssistantTexts) &&
             !assistantText(body, equalsAny: persistedAssistantTexts)
     }
@@ -2195,8 +2250,9 @@ public struct AgentAppView: View {
             Button { selectThreadRow(t) } label: {
                 HStack(spacing: DS.Space.md) {
                     if running {
-                        // A3: spinner while this thread has a run in flight.
-                        ProgressView().controlSize(.small).scaleEffect(0.5)
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
                             .frame(width: 8, height: 8)
                             .accessibilityLabel("Running")
                             .accessibilityIdentifier("agent.thread.row.running.\(t.id.value.uuidString)")
@@ -2628,22 +2684,24 @@ public struct AgentAppView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.94)))
                 }
             }
-            .onAppear { scrollTimelineToBottom(proxy) }
-            .onChange(of: vm.focusTick) { _ in scrollTimelineToBottom(proxy, force: true) }
+            .onAppear { scheduleTimelineScrollToBottom(proxy) }
+            .onChange(of: vm.focusTick) { _ in scheduleTimelineScrollToBottom(proxy, force: true) }
             .onChange(of: vm.messages.count) { _ in
                 if !vm.consumeHistoryHydrationScrollSuppression() {
-                    scrollTimelineToBottom(proxy)
+                    scheduleTimelineScrollToBottom(proxy)
                 }
             }
             .onChange(of: vm.timeline.turns.count) { _ in
-                scrollTimelineToBottom(proxy)
+                scheduleTimelineScrollToBottom(proxy)
                 // PERF-MAC_AGENT-012: turns trim at 80; drop expansion ids for
                 // items that no longer exist so the sets don't leak over a long
                 // session. Runs only on a turn add/remove, not per text delta.
-                pruneExpandedItemIds()
+                DispatchQueue.main.async {
+                    pruneExpandedItemIds()
+                }
             }
-            .onChange(of: vm.timelineUpdateTick) { _ in scrollTimelineToBottom(proxy) }
-            .onChange(of: vm.status) { _ in scrollTimelineToBottom(proxy) }
+            .onChange(of: vm.timelineUpdateTick) { _ in scheduleTimelineScrollToBottom(proxy) }
+            .onChange(of: vm.status) { _ in scheduleTimelineScrollToBottom(proxy) }
         }
     }
 
@@ -2990,11 +3048,26 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.pendingUserInput.\(request.id)")
     }
 
+    private func scheduleTimelineScrollToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
+        let scheduler = timelineScrollScheduler
+        scheduler.forcePending = scheduler.forcePending || force
+        guard !scheduler.scheduled else { return }
+        scheduler.scheduled = true
+        DispatchQueue.main.async {
+            let shouldForce = scheduler.forcePending
+            scheduler.forcePending = false
+            scheduler.scheduled = false
+            scrollTimelineToBottom(proxy, force: shouldForce)
+        }
+    }
+
     private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
         guard force || timelineSticksToBottom else { return }
-        cancelPendingScrollDownReveal()
-        timelineSticksToBottom = true
-        showScrollDownButton = false
+        if force {
+            cancelPendingScrollDownReveal()
+            timelineSticksToBottom = true
+            showScrollDownButton = false
+        }
         // PERF-MAC_AGENT-003: the four onChange triggers all funnel here and
         // fire per streaming delta. Skip the per-token animation while running
         // (it caused a layout pass + animation churn on every delta); only
@@ -3058,7 +3131,10 @@ public struct AgentAppView: View {
             // every 5 seconds, so a long run doesn't force 600 re-evaluations.
             TimelineView(ElapsedTickSchedule(start: vm.runStartedAt ?? Date())) { _ in
                 HStack(spacing: DS.Space.sm) {
-                    ProgressView().controlSize(.small)
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityLabel("Running")
                     Text("Working for \(elapsedString)")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                     // UX-MAC_AGENT-008: inline Stop where the user looks when a
@@ -3664,7 +3740,10 @@ public struct AgentAppView: View {
             executionMenu
             Spacer(minLength: DS.Space.xs)
             if vm.status == .running {
-                ProgressView().controlSize(.small).scaleEffect(0.55)
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Running")
                 stopButton
                 // UX-MAC_AGENT-007: separate the red Stop circle from the accent
                 // Queue circle so the two adjacent buttons don't read as one

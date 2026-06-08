@@ -26,6 +26,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var activeRunMetadata: [AgentRunID: (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
+    private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
+    private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
+    private var activeDistillOutputRuns: Set<AgentRunID> = []
     private var pendingThreadStops: Set<AgentThreadID> = []
     private var seq: [AgentRunID: Int] = [:]
     // PERF-MAC_AGENT-005: reuse one encoder instead of allocating per stream
@@ -64,6 +67,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
     public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider) async -> String)?
+
+    /// Token Saver /distill hook: async transform applied to provider text
+    /// detected as SR1 compressed language. The returned value is what gets
+    /// persisted and shown to users. Must fail open by returning the input
+    /// unchanged on any error.
+    public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
 
     public init(
         runRepo: AgentRunRepository,
@@ -210,11 +219,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let runId = effectiveRequest.runId
         let coordinator = self
         let handle: AgentRunHandle
+        let expectsDistillOutput = Self.promptInvokesDistill(effectiveRequest.prompt) ||
+            Self.promptInvokesDistill(effectiveRequest.userMessageContent)
+        if expectsDistillOutput {
+            markDistillOutputMode(runId)
+        }
         do {
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }
         } catch {
+            clearDistillOutputMode(runId)
             markStartFailure(
                 error,
                 request: effectiveRequest,
@@ -228,6 +243,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             status == .running || status == .pending ? nil : status
         }
         if terminalStatus == .cancelled {
+            clearDistillOutputMode(runId)
             handle.cancel()
             return runId
         }
@@ -322,6 +338,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeRunMetadata.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
+            activeProviderTextItemTypes.removeValue(forKey: runId)
+            bufferedProviderTextItems.removeValue(forKey: runId)
+            activeDistillOutputRuns.remove(runId)
             seq.removeValue(forKey: runId)
             pendingThreadStops.remove(threadId)
         }
@@ -636,9 +655,62 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return message
     }
 
-    private func handle(event: AgentRunEvent, runId: AgentRunID, threadId: AgentThreadID) {
+    private func handle(
+        event: AgentRunEvent,
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        allowFinalResponseTranslation: Bool = true
+    ) {
         switch event {
         case .event(let ev):
+            if allowFinalResponseTranslation,
+               case .turnCompleted(let turnId, let finalMessage) = ev,
+               let finalMessage,
+               shouldTranslateFinalResponse(finalMessage) {
+                rememberCompletedTurn(turnId, runId: runId)
+                return
+            }
+            if let decision = interceptProviderTextEvent(ev, runId: runId, threadId: threadId) {
+                switch decision {
+                case .hold:
+                    return
+                case .emit(let events):
+                    for event in events {
+                        handle(
+                            event: .event(event),
+                            runId: runId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: false
+                        )
+                    }
+                    return
+                case .translate(let itemId, let text, let target, let finalState):
+                    Task { [weak self] in
+                        guard let self else { return }
+                        let translated = await self.translateSR1Response(text, runId: runId, threadId: threadId)
+                        let delta: AssistantEvent
+                        switch target {
+                        case .body:
+                            delta = .itemDelta(itemId: itemId, bodyAppend: translated, outputAppend: nil, summary: nil)
+                        case .output:
+                            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: translated, summary: nil)
+                        }
+                        self.handle(
+                            event: .event(delta),
+                            runId: runId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: false
+                        )
+                        self.handle(
+                            event: .event(.itemCompleted(itemId: itemId, finalState: finalState)),
+                            runId: runId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: false
+                        )
+                    }
+                    return
+                }
+            }
             lock.lock()
             let s = (seq[runId] ?? 0) + 1
             seq[runId] = s
@@ -720,6 +792,30 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
             }
         case .finished(let status, let finalMessage, let providerThreadId):
+            if allowFinalResponseTranslation,
+               status == .completed,
+               let finalMessage,
+               shouldTranslateFinalResponse(finalMessage) {
+                Task { [weak self] in
+                    guard let self else { return }
+                    let translated = await self.translateFinalResponse(finalMessage, runId: runId, threadId: threadId)
+                    if let completedTurnId = self.completedTurnId(runId: runId) {
+                        self.handle(
+                            event: .event(.turnCompleted(turnId: completedTurnId, finalMessage: translated)),
+                            runId: runId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: false
+                        )
+                    }
+                    self.handle(
+                        event: .finished(status, finalMessage: translated, providerThreadId: providerThreadId),
+                        runId: runId,
+                        threadId: threadId,
+                        allowFinalResponseTranslation: false
+                    )
+                }
+                return
+            }
             // persist final assistant message only on success
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
                 if let persisted = persistAssistantIfMissing(msg, threadId: threadId, runId: runId) {
@@ -809,6 +905,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeRunMetadata.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
+            activeProviderTextItemTypes.removeValue(forKey: runId)
+            bufferedProviderTextItems.removeValue(forKey: runId)
+            activeDistillOutputRuns.remove(runId)
             pendingThreadStops.remove(threadId)
             seq.removeValue(forKey: runId)
             // PERF-MAC_AGENT-005: flush a final prune at run end so events queued
@@ -839,6 +938,209 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             onAssistantEvent?(.error(message: m, recoverable: false), threadId, runId)
             try? providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: "error", lastErrorMessage: m)
         }
+    }
+
+    private func shouldTranslateFinalResponse(_ text: String) -> Bool {
+        finalResponseTranslator != nil && SR1ResponseDetector.isSR1(text)
+    }
+
+    private enum ProviderTextTarget {
+        case body
+        case output
+    }
+
+    private struct BufferedProviderTextItem {
+        var text: String
+        var target: ProviderTextTarget
+        var itemType: AssistantItemType
+    }
+
+    private enum ProviderTextDecision {
+        case hold
+        case emit([AssistantEvent])
+        case translate(itemId: String, text: String, target: ProviderTextTarget, finalState: AssistantItemState)
+    }
+
+    private func interceptProviderTextEvent(_ ev: AssistantEvent, runId: AgentRunID, threadId: AgentThreadID) -> ProviderTextDecision? {
+        guard finalResponseTranslator != nil else { return nil }
+        switch ev {
+        case .itemStarted(let item):
+            if isProviderTextItem(item.type) {
+                lock.lock()
+                var items = activeProviderTextItemTypes[runId] ?? [:]
+                items[item.id] = item.type
+                activeProviderTextItemTypes[runId] = items
+                lock.unlock()
+            }
+            return nil
+        case .itemDelta(let itemId, let bodyAppend, let outputAppend, _):
+            let itemType = providerTextItemType(runId: runId, itemId: itemId)
+            guard let itemType, isProviderTextItem(itemType) else { return nil }
+            let rawTarget: ProviderTextTarget?
+            let delta: String?
+            if let bodyAppend {
+                rawTarget = .body
+                delta = bodyAppend
+            } else if let outputAppend {
+                rawTarget = .output
+                delta = outputAppend
+            } else {
+                rawTarget = nil
+                delta = nil
+            }
+            guard let rawTarget, let delta, !delta.isEmpty else { return nil }
+            let target = itemType == .reasoning ? ProviderTextTarget.body : rawTarget
+
+            lock.lock()
+            var runBuffers = bufferedProviderTextItems[runId] ?? [:]
+            if var buffered = runBuffers[itemId] {
+                buffered.text = AssistantTimelineState.cappedText(buffered.text + delta)
+                runBuffers[itemId] = buffered
+                bufferedProviderTextItems[runId] = runBuffers
+                lock.unlock()
+                return .hold
+            }
+            let shouldBuffer = shouldBufferProviderTextPrefix(delta)
+            if shouldBuffer {
+                runBuffers[itemId] = BufferedProviderTextItem(
+                    text: AssistantTimelineState.cappedText(delta),
+                    target: target,
+                    itemType: itemType
+                )
+                bufferedProviderTextItems[runId] = runBuffers
+                lock.unlock()
+                return .hold
+            }
+            lock.unlock()
+            return nil
+        case .itemCompleted(let itemId, let finalState):
+            lock.lock()
+            var runBuffers = bufferedProviderTextItems[runId] ?? [:]
+            let buffered = runBuffers.removeValue(forKey: itemId)
+            if runBuffers.isEmpty {
+                bufferedProviderTextItems.removeValue(forKey: runId)
+            } else {
+                bufferedProviderTextItems[runId] = runBuffers
+            }
+            var itemTypes = activeProviderTextItemTypes[runId] ?? [:]
+            itemTypes.removeValue(forKey: itemId)
+            if itemTypes.isEmpty {
+                activeProviderTextItemTypes.removeValue(forKey: runId)
+            } else {
+                activeProviderTextItemTypes[runId] = itemTypes
+            }
+            lock.unlock()
+            guard let buffered else { return nil }
+            if shouldTranslateProviderText(buffered.text, runId: runId) {
+                let target = buffered.itemType == .reasoning ? ProviderTextTarget.body : buffered.target
+                return .translate(itemId: itemId, text: buffered.text, target: target, finalState: finalState)
+            }
+            let delta: AssistantEvent
+            switch buffered.target {
+            case .body:
+                delta = .itemDelta(itemId: itemId, bodyAppend: buffered.text, outputAppend: nil, summary: nil)
+            case .output:
+                delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: buffered.text, summary: nil)
+            }
+            return .emit([delta, .itemCompleted(itemId: itemId, finalState: finalState)])
+        default:
+            return nil
+        }
+    }
+
+    private func providerTextItemType(runId: AgentRunID, itemId: String) -> AssistantItemType? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeProviderTextItemTypes[runId]?[itemId]
+    }
+
+    private func isProviderTextItem(_ type: AssistantItemType) -> Bool {
+        type == .assistantMessage || type == .reasoning
+    }
+
+    private func shouldBufferProviderTextPrefix(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        if SR1ResponseDetector.isSR1(trimmed) { return true }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("sr1") || lower.hasPrefix("dict") { return true }
+        guard let first = trimmed.first?.uppercased().first,
+              "SCDRONP".contains(first) else {
+            return false
+        }
+        let rest = trimmed.dropFirst()
+        guard let delimiter = rest.first else { return true }
+        return delimiter == ":" || delimiter == "=" || delimiter == " " || delimiter == "\t"
+    }
+
+    private func shouldTranslateProviderText(_ text: String, runId: AgentRunID) -> Bool {
+        if SR1ResponseDetector.isSR1(text) {
+            markDistillOutputMode(runId)
+            return true
+        }
+        let allowOutcomeSpace = runUsesDistillOutputMode(runId)
+        if SR1ResponseDetector.isSingleSemanticLine(text, allowSpaceDelimitedOutcome: allowOutcomeSpace) {
+            markDistillOutputMode(runId)
+            return true
+        }
+        return false
+    }
+
+    private func markDistillOutputMode(_ runId: AgentRunID) {
+        lock.lock()
+        activeDistillOutputRuns.insert(runId)
+        lock.unlock()
+    }
+
+    private func clearDistillOutputMode(_ runId: AgentRunID) {
+        lock.lock()
+        activeDistillOutputRuns.remove(runId)
+        lock.unlock()
+    }
+
+    private func runUsesDistillOutputMode(_ runId: AgentRunID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeDistillOutputRuns.contains(runId)
+    }
+
+    private static func promptInvokesDistill(_ text: String?) -> Bool {
+        guard let text else { return false }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard trimmed.hasPrefix("/distill") else { return false }
+        guard trimmed.count > "/distill".count else { return true }
+        let boundary = trimmed.index(trimmed.startIndex, offsetBy: "/distill".count)
+        return trimmed[boundary].isWhitespace
+    }
+
+    private func rememberCompletedTurn(_ turnId: String, runId: AgentRunID) {
+        lock.lock()
+        activeTurnIds[runId] = turnId
+        lock.unlock()
+    }
+
+    private func completedTurnId(runId: AgentRunID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeTurnIds[runId]
+    }
+
+    private func translateFinalResponse(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
+        await translateSR1Response(response, runId: runId, threadId: threadId)
+    }
+
+    private func translateSR1Response(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
+        guard let finalResponseTranslator else { return response }
+        let provider: AgentProvider = {
+            lock.lock()
+            let activeProvider = activeRunMetadata[runId]?.provider
+            lock.unlock()
+            if let activeProvider { return activeProvider }
+            return (try? threadRepo.get(id: threadId)?.provider) ?? .codex
+        }()
+        let translated = await finalResponseTranslator(response, provider, threadId, runId)
+        let trimmed = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? response : trimmed
     }
 
     private func captureCheckpoint(

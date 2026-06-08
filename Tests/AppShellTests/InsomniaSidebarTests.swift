@@ -262,6 +262,26 @@ final class InsomniaSidebarTests: XCTestCase {
                       "verified first-use model download must persist Token Saver on for future launches")
     }
 
+    func test_tokenSaverModelDownloadProgressFractionIsSafeForSwiftUIProgressView() throws {
+        let complete = TokenSaverModelDownloadState(
+            phase: .downloading,
+            downloadedBytes: 24,
+            expectedBytes: 12,
+            statusText: "Downloading model.safetensors"
+        )
+        XCTAssertEqual(complete.fractionCompleted, 1,
+                       "download progress must be clamped before it is passed into SwiftUI ProgressView")
+
+        let missingTotal = TokenSaverModelDownloadState(
+            phase: .preparing,
+            downloadedBytes: 4,
+            expectedBytes: 0,
+            statusText: "Preparing model download"
+        )
+        XCTAssertNil(missingTotal.fractionCompleted,
+                     "unknown or zero download totals must use the indeterminate progress view instead of an invalid value")
+    }
+
     func test_tokenSaverModelDownloadCancelPausesAndDoesNotPersistEnabled() async throws {
         let handler: SidebarViewModel.TokenSaverModelDownloadHandler = { progress in
             progress(TokenSaverModelDownloadState(
@@ -331,6 +351,8 @@ final class InsomniaSidebarTests: XCTestCase {
         // fabricated 276). usage.json must therefore show zero "saved".
         XCTAssertEqual(vm.tokenSaverUsageSnapshot.measuredSavedTokens, 0,
                        "token-usage events must not fabricate savings from an assumed compression ratio")
+        XCTAssertEqual(try ctx.tokenSaverSavingsRepo.summary().totalRuns, 0,
+                       "normal provider usage must not create Saved rows unless the thread is in /distill mode or prompt compression actually ran")
         XCTAssertEqual(vm.tokenSaverUsageSnapshot.eligibleRuns, 1)
     }
 

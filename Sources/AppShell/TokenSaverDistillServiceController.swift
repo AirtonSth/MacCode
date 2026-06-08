@@ -54,6 +54,36 @@ public enum TokenSaverDistillServiceStatus: Sendable, Equatable {
     case failed(String)
 }
 
+private struct TokenSaverDistillCLIState: Codable {
+    let baseURL: String
+    let authToken: String
+    let pid: Int32
+    let runtime: String
+    let modelID: String
+
+    enum CodingKeys: String, CodingKey {
+        case baseURL = "base_url"
+        case authToken = "auth_token"
+        case pid
+        case runtime
+        case modelID = "model_id"
+    }
+}
+
+private struct TokenSaverDistillProcessEvent: Codable {
+    let event: String
+    let provider: String?
+    let mode: String?
+    let savedTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case event
+        case provider
+        case mode
+        case savedTokens = "saved_tokens"
+    }
+}
+
 @MainActor
 public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
@@ -64,6 +94,8 @@ public final class TokenSaverDistillServiceController {
     private let appSupportDirectory: URL
     private let executableURLResolver: ExecutableURLResolver
     private var process: Process?
+    private var readyOutputHandle: FileHandle?
+    private var readyOutputBuffer = Data()
 
     public init(
         appSupportDirectory: URL,
@@ -102,6 +134,10 @@ public final class TokenSaverDistillServiceController {
     }
 
     public func stop() {
+        readyOutputHandle?.readabilityHandler = nil
+        readyOutputHandle = nil
+        readyOutputBuffer.removeAll(keepingCapacity: false)
+        removeCLIState()
         if let process, process.isRunning {
             process.terminate()
         }
@@ -155,31 +191,86 @@ public final class TokenSaverDistillServiceController {
     }
 
     private func readReadyEvent(from handle: FileHandle, process: Process) {
-        Task.detached(priority: .userInitiated) {
-            let data = handle.readData(ofLength: 4096)
+        readyOutputHandle?.readabilityHandler = nil
+        readyOutputHandle = handle
+        readyOutputBuffer.removeAll(keepingCapacity: false)
+        handle.readabilityHandler = { [weak self, weak process] handle in
+            let data = handle.availableData
             guard !data.isEmpty else {
-                await MainActor.run {
-                    if process.isRunning {
+                Task { @MainActor [weak self, weak process] in
+                    guard let self, let process, self.process === process else { return }
+                    handle.readabilityHandler = nil
+                    self.readyOutputHandle = nil
+                    if process.isRunning, case .starting = self.status {
                         self.status = .failed("RemoteCodeDistillService ready event missing")
                     }
                 }
                 return
             }
-            let lineData: Data
-            if let newline = data.firstIndex(of: 10) {
-                lineData = data[..<newline]
-            } else {
-                lineData = data
-            }
-            let ready = try? JSONDecoder().decode(DistillServiceReadyEvent.self, from: lineData)
-            await MainActor.run {
-                guard self.process === process else { return }
-                if let ready {
-                    self.status = .running(ready)
-                } else {
-                    self.status = .failed("RemoteCodeDistillService ready event invalid")
+
+            Task { @MainActor [weak self, weak process] in
+                guard let self, let process, self.process === process else { return }
+                self.readyOutputBuffer.append(data)
+                while let newline = self.readyOutputBuffer.firstIndex(of: 10) {
+                    let lineData = Data(self.readyOutputBuffer[..<newline])
+                    self.readyOutputBuffer.removeSubrange(...newline)
+                    self.handleOutputLine(lineData)
                 }
             }
+        }
+    }
+
+    private func handleOutputLine(_ lineData: Data) {
+        if case .starting = status {
+            let ready = try? JSONDecoder().decode(DistillServiceReadyEvent.self, from: lineData)
+            if let ready {
+                writeCLIState(ready: ready)
+                status = .running(ready)
+            } else {
+                status = .failed("RemoteCodeDistillService ready event invalid")
+            }
+            return
+        }
+
+        guard let event = try? JSONDecoder().decode(TokenSaverDistillProcessEvent.self, from: lineData),
+              event.event == "savings_recorded" else {
+            return
+        }
+        NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+    }
+
+    private var cliStateURL: URL {
+        appSupportDirectory
+            .appendingPathComponent("Distill", isDirectory: true)
+            .appendingPathComponent("DistillCLIState.json")
+    }
+
+    private func writeCLIState(ready: DistillServiceReadyEvent) {
+        guard let bearerToken else { return }
+        let state = TokenSaverDistillCLIState(
+            baseURL: ready.baseURL,
+            authToken: bearerToken,
+            pid: ready.pid,
+            runtime: ready.runtime,
+            modelID: ready.modelID
+        )
+        do {
+            let url = cliStateURL
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(state).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            NSLog("RemoteCode Token Saver distill CLI state write failed: \(error)")
+        }
+    }
+
+    private func removeCLIState() {
+        let url = cliStateURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            NSLog("RemoteCode Token Saver distill CLI state remove failed: \(error)")
         }
     }
 

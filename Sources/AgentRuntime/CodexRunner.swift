@@ -43,6 +43,7 @@ public enum ProcessLocator {
         var paths = (environmentPath ?? "")
             .split(separator: ":")
             .map(String.init)
+        paths.insert("\(homeDirectory)/.remote-code/bin", at: 0)
         paths.append(contentsOf: [
             "/opt/homebrew/bin",
             "/usr/local/bin",
@@ -139,7 +140,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
         proc.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        proc.environment = Self.processEnvironment(overrides: request.environment)
+        proc.environment = Self.processEnvironment(overrides: request.environment, provider: .codex)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
@@ -227,10 +228,17 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         ProviderStderrClassifier.displayableStderr(raw, provider: .codex)
     }
 
-    public static func processEnvironment(overrides: [String: String], base: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+    public static func processEnvironment(
+        overrides: [String: String],
+        base: [String: String] = ProcessInfo.processInfo.environment,
+        provider: AgentProvider? = nil
+    ) -> [String: String] {
         var env = base.merging(overrides) { _, override in override }
         let home = env["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
         env["PATH"] = ProcessLocator.expandedPath(environmentPath: env["PATH"], homeDirectory: home)
+        if let provider {
+            env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
+        }
         return env
     }
 }

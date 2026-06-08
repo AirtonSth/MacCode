@@ -15,6 +15,13 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         return Int(stmt.columnInt64(0))
     }
 
+    private func rawTotalRuns(_ db: SQLiteDB) throws -> Int {
+        let stmt = try db.prepare("SELECT COALESCE(SUM(runs), 0) FROM token_saver_savings_totals;")
+        defer { stmt.reset() }
+        _ = try stmt.step()
+        return Int(stmt.columnInt64(0))
+    }
+
     func test_recordAndSummaryAggregatesTotalsPerProviderAndAverage() throws {
         let db = try makeDB()
         let repo = TokenSaverSavingsRepository(db: db, retentionDays: 7)
@@ -48,20 +55,57 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(try repo.summary().totalSavedTokens, 0)
     }
 
-    func test_retentionKeepsOnlySevenDaysAndPrunesPhysically() throws {
+    func test_explicitSavedTokensCanUseModeSpecificFormula() throws {
         let db = try makeDB()
-        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 7)
+        let repo = TokenSaverSavingsRepository(db: db)
+
+        XCTAssertEqual(
+            try repo.record(provider: "codex", mode: "sr1-humanize", inputTokens: 180, outputTokens: 60, savedTokens: 120),
+            120
+        )
+
+        let summary = try repo.summary()
+        let codex = try XCTUnwrap(summary.savings(for: "codex"))
+        XCTAssertEqual(codex.inputTokens, 180)
+        XCTAssertEqual(codex.outputTokens, 60)
+        XCTAssertEqual(codex.savedTokens, 120)
+    }
+
+    func test_retentionKeepsAtLeastSevenDaysAndPrunesOnlyEventRows() throws {
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 1)
         let now = Date(timeIntervalSince1970: 1_000_000_000)
 
+        // Caller-requested retention below one week must still keep a full week.
+        _ = try repo.record(provider: "claude", mode: "x", inputTokens: 50, outputTokens: 10, at: now.addingTimeInterval(-6 * 86_400))
         // An 8-day-old row (older than the window).
         _ = try repo.record(provider: "claude", mode: "x", inputTokens: 999, outputTokens: 0, at: now.addingTimeInterval(-8 * 86_400))
         // A fresh row at `now` — its insert prunes anything older than now-7d.
         _ = try repo.record(provider: "claude", mode: "x", inputTokens: 100, outputTokens: 10, at: now)
 
-        XCTAssertEqual(try rawCount(db), 1, "history older than 7 days must be physically deleted, not just hidden")
+        XCTAssertEqual(try rawCount(db), 2, "event history must keep at least the last 7 days, even if a caller requests less")
+        XCTAssertEqual(try rawTotalRuns(db), 3, "the permanent total must keep counting pruned events")
         let summary = try repo.summary(now: now)
-        XCTAssertEqual(summary.totalSavedTokens, 90)
-        XCTAssertEqual(summary.totalRuns, 1)
+        XCTAssertEqual(summary.totalSavedTokens, 1_129)
+        XCTAssertEqual(summary.totalRuns, 3)
+        XCTAssertEqual(summary.daily.map(\.savedTokens).reduce(0, +), 130, "daily report buckets stay limited to retained event rows")
+    }
+
+    func test_totalSavedTokensKeepAddingAfterReportWindowPrunes() throws {
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 7)
+        let now = Date(timeIntervalSince1970: 1_000_000_000)
+
+        _ = try repo.record(provider: "codex", mode: "command-output", inputTokens: 84, outputTokens: 51, savedTokens: 33, at: now.addingTimeInterval(-9 * 86_400))
+        _ = try repo.record(provider: "codex", mode: "sr1-humanize", inputTokens: 192, outputTokens: 132, savedTokens: 60, at: now)
+
+        XCTAssertEqual(try rawCount(db), 1)
+        let summary = try repo.summary(now: now)
+        XCTAssertEqual(summary.totalSavedTokens, 93, "user-visible savings must be all saved tokens, not only the unpruned report rows")
+        XCTAssertEqual(summary.totalRuns, 2)
+        let codex = try XCTUnwrap(summary.savings(for: "codex"))
+        XCTAssertEqual(codex.savedTokens, 93)
+        XCTAssertEqual(codex.runs, 2)
     }
 
     func test_dailyBucketsGroupByUTCDay() throws {

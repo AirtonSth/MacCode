@@ -1152,6 +1152,37 @@ final class AgentAppViewModelTests: XCTestCase {
         ), "live partial updates must stay visible even when an older persisted answer contains the same prefix")
     }
 
+    func test_turnViewHidesSR1ItemWhenHumanizedAnswerIsPersisted() {
+        let sr1 = """
+        SR1
+        S: tests green
+        C: user asked in Portuguese
+        O: saved counter updated
+        """
+        let humanized = "Os testes passaram, e o contador de tokens salvos foi atualizado."
+
+        XCTAssertFalse(AgentAppView.shouldRenderAssistantItemBody(
+            sr1,
+            persistedAssistantTexts: [humanized]
+        ), "once the SR1 final answer has been humanized and persisted, the raw compressed item must not render as a second assistant response")
+    }
+
+    func test_turnViewHidesSpaceDelimitedSR1ItemWhenHumanizedAnswerIsPersisted() {
+        let sr1 = """
+        O Snake game criado.
+        O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
+        O feat: canvas 20x20 grid, score, wall+self collision, food respawn, game-over restart
+        O ctrl: setas ou WASD; ESPACO reinicia
+        P open: abrir snake.html no browser -> jogo roda
+        """
+        let humanized = "O Snake game foi criado em /Users/samuelfajreldines/snake.html e pode ser aberto no navegador."
+
+        XCTAssertFalse(AgentAppView.shouldRenderAssistantItemBody(
+            sr1,
+            persistedAssistantTexts: [humanized]
+        ), "space-delimited /distill output must be treated as SR1 so the raw compact item does not remain visible")
+    }
+
     func test_turnViewHidesDuplicateAssistantItemBodiesWithinTurn() {
         let turn = AssistantTurnSnapshot(
             turnId: "turn-1",

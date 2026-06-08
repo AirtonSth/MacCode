@@ -67,6 +67,25 @@ final class ClaudeParserCLITests: XCTestCase {
                        "even with no assistant block, result must finalize the turn (not hang)")
     }
 
+    func test_resultModelUsageEmitsTokenUsageForClaudeSdkBridge() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"s-usage"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"S: ready"}]}}"#,
+            #"{"type":"result","subtype":"success","result":"S: ready","modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":510,"outputTokens":13,"cacheCreationInputTokens":0,"cacheReadInputTokens":0,"contextWindow":200000},"claude-sonnet-4-6":{"inputTokens":6,"outputTokens":175,"cacheCreationInputTokens":22947,"cacheReadInputTokens":22517,"contextWindow":200000}}}"#
+        ])
+
+        let usage = evs.compactMap { event -> AssistantTokenUsage? in
+            if case .tokenUsage(let usage) = event { return usage }
+            return nil
+        }.last
+
+        XCTAssertEqual(usage?.inputTokens, 45_980)
+        XCTAssertEqual(usage?.outputTokens, 188)
+        XCTAssertEqual(usage?.totalTokens, 46_168)
+        XCTAssertEqual(usage?.contextWindow, 200_000,
+                       "Claude SDK bridge result.modelUsage must feed Token Saver and context pressure; otherwise /distill responses complete but Saved stays 0")
+    }
+
     func test_errorResult_isLoud() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s3"}"#,

@@ -132,6 +132,132 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(codexText.contains("S=state"))
     }
 
+    func test_agentSkillInstallerWritesDistillInstructionsIntoProviderConfigFiles() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let codexInstructions = home.appendingPathComponent(".codex/AGENTS.md")
+        let claudeInstructions = home.appendingPathComponent(".claude/CLAUDE.md")
+
+        try installer.installDistillInstructions(for: .codex)
+        try installer.installDistillInstructions(for: .claude)
+
+        let codexText = try String(contentsOf: codexInstructions)
+        let claudeText = try String(contentsOf: claudeInstructions)
+        XCTAssertTrue(codexText.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
+        XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
+        XCTAssertTrue(codexText.contains("Always communicate with the user in `/distill` compressed language"))
+        XCTAssertTrue(codexText.contains("RemoteCode-managed `distill` CLI"))
+        XCTAssertTrue(codexText.contains("RemoteCodeDistillService"))
+        XCTAssertFalse(codexText.contains("dev/distill/src/cli.ts"),
+                       "providers must not be instructed to invoke the old TypeScript distill CLI")
+        XCTAssertTrue(claudeText.contains("git diff | distill"))
+    }
+
+    func test_agentSkillInstallerWritesManagedDistillCLIForLocalMacLLM() throws {
+        let home = tempDir()
+        let appSupport = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+
+        let cli = try installer.installDistillCLI(appSupportDirectory: appSupport)
+        let text = try String(contentsOf: cli)
+
+        XCTAssertEqual(cli.path, home.appendingPathComponent(".remote-code/bin/distill").path)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: cli.path))
+
+        // RemoteCode owns a PATH bridge so `distill` runs from any shell with no hand-made shim.
+        let link = installer.distillPathLinkURL()
+        XCTAssertEqual(link.path, home.appendingPathComponent(".local/bin/distill").path)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), cli.path,
+                       "the managed CLI must be symlinked onto PATH (~/.local/bin/distill) -> ~/.remote-code/bin/distill")
+
+        XCTAssertTrue(text.contains(AgentSkillInstaller.distillCLIBeginMarker))
+        XCTAssertTrue(text.contains("RemoteCode local distill unavailable"))
+        XCTAssertTrue(text.contains("/v1/distill"))
+        XCTAssertTrue(text.contains("\"question\": prompt"))
+        XCTAssertTrue(text.contains("\"recordSavings\": True"))
+        XCTAssertTrue(text.contains("REMOTE_CODE_AGENT_PROVIDER"))
+        XCTAssertTrue(text.contains("payload[\"provider\"] = provider"))
+        XCTAssertTrue(text.contains("DistillCLIState.json"))
+        XCTAssertFalse(text.contains("PROMPT:\\\\n"),
+                       "the managed CLI must send the prompt as request metadata, not inject it into command output")
+        XCTAssertFalse(text.contains("INPUT:\\\\n"),
+                       "the managed CLI must not teach the local model to echo INPUT wrappers")
+        XCTAssertFalse(text.contains("dev/distill/src/cli.ts"),
+                       "the managed CLI must proxy to RemoteCodeDistillService instead of a local TypeScript checkout")
+
+        XCTAssertEqual(try installer.uninstallDistillCLI(), .removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cli.path))
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: link.path),
+                     "disabling the managed CLI must also remove the PATH symlink it created")
+    }
+
+    func test_managedDistillPathBridgeReplacesStaleShimButKeepsUnrelatedUserFile() throws {
+        let home = tempDir()
+        let appSupport = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let link = installer.distillPathLinkURL()
+        try FileManager.default.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        // (a) An unrelated user `distill` on PATH must survive — RemoteCode never clobbers it.
+        let userScript = "#!/bin/sh\necho not-the-distill-you-are-looking-for\n"
+        try Data(userScript.utf8).write(to: link)
+        _ = try installer.installDistillCLI(appSupportDirectory: appSupport)
+        XCTAssertEqual(try String(contentsOf: link, encoding: .utf8), userScript,
+                       "an unrelated user file at ~/.local/bin/distill must be left untouched")
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: link.path))
+
+        // (b) A stale external node/bun source-checkout shim must be replaced by the managed symlink.
+        try FileManager.default.removeItem(at: link)
+        try Data("#!/usr/bin/env bash\nexec bun ~/dev/distill/src/cli.ts \"$@\"\n".utf8).write(to: link)
+        let cli = try installer.installDistillCLI(appSupportDirectory: appSupport)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), cli.path,
+                       "a stale external-checkout shim must be replaced by the RemoteCode-managed CLI symlink")
+    }
+
+    func test_agentSkillInstallerReplacesExistingDistillInstructionsBlockAndKeepsUserContent() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let codexInstructions = home.appendingPathComponent(".codex/AGENTS.md")
+        try FileManager.default.createDirectory(at: codexInstructions.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("""
+        Keep this user rule.
+
+        <!-- distill skill: begin -->
+        stale distill instructions
+        <!-- distill skill: end -->
+
+        Keep this trailing rule.
+        """.utf8).write(to: codexInstructions)
+
+        try installer.installDistillInstructions(for: .codex)
+
+        let text = try String(contentsOf: codexInstructions)
+        XCTAssertTrue(text.contains("Keep this user rule."))
+        XCTAssertTrue(text.contains("Keep this trailing rule."))
+        XCTAssertFalse(text.contains("stale distill instructions"))
+        XCTAssertEqual(text.components(separatedBy: AgentSkillInstaller.distillInstructionsBeginMarker).count - 1, 1)
+        XCTAssertTrue(text.contains("bun test 2>&1 | distill"))
+        XCTAssertTrue(text.contains("local macOS `RemoteCodeDistillService` MLX LLM"))
+    }
+
+    func test_agentSkillInstallerUninstallDistillInstructionsRemovesOnlyManagedBlock() throws {
+        let home = tempDir()
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let claudeInstructions = home.appendingPathComponent(".claude/CLAUDE.md")
+        try FileManager.default.createDirectory(at: claudeInstructions.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("Keep this user rule.\n".utf8).write(to: claudeInstructions)
+
+        try installer.installDistillInstructions(for: .claude)
+        XCTAssertTrue(try String(contentsOf: claudeInstructions).contains(AgentSkillInstaller.distillInstructionsBeginMarker))
+
+        XCTAssertEqual(try installer.uninstallDistillInstructions(for: .claude), .removed)
+
+        let text = try String(contentsOf: claudeInstructions)
+        XCTAssertTrue(text.contains("Keep this user rule."))
+        XCTAssertFalse(text.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
+        XCTAssertFalse(text.contains("Always communicate with the user in `/distill` compressed language"))
+    }
+
     func test_agentSkillInstallerIsIdempotentForSameRevisionAndChecksum() throws {
         let installer = AgentSkillInstaller(homeDirectory: tempDir())
 

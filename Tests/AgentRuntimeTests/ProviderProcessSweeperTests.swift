@@ -184,13 +184,40 @@ final class ProviderProcessSweeperTests: XCTestCase {
     }
 
     func test_currentProviderProcessesDoesNotBlockOnLargeProcessLists() {
-        let finished = expectation(description: "provider process scan returned")
-
-        DispatchQueue.global(qos: .utility).async {
-            _ = ProviderProcessSweeper.currentProviderProcesses()
-            finished.fulfill()
+        let currentPID: Int32 = 500
+        let processes = [
+            ProviderRuntimeProcess(
+                pid: currentPID,
+                ppid: 1,
+                rssKB: 200_000,
+                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode"
+            ),
+            ProviderRuntimeProcess(
+                pid: 201,
+                ppid: currentPID,
+                rssKB: 25_000,
+                command: "/opt/homebrew/bin/codex app-server"
+            ),
+            ProviderRuntimeProcess(
+                pid: 202,
+                ppid: 201,
+                rssKB: 20_000,
+                command: "codex child"
+            )
+        ] + (0..<5_000).map { index in
+            ProviderRuntimeProcess(
+                pid: Int32(10_000 + index),
+                ppid: 1,
+                rssKB: 1_000,
+                command: "unrelated-\(index)"
+            )
         }
 
-        wait(for: [finished], timeout: 2.0)
+        let providerProcesses = ProviderProcessSweeper.currentProviderProcesses(
+            processes: processes,
+            currentPID: currentPID
+        )
+
+        XCTAssertEqual(providerProcesses.map(\.pid), [201, 202])
     }
 }

@@ -7,6 +7,8 @@ import Persistence
 
 @MainActor
 final class SplitLayoutRuntimeTests: XCTestCase {
+    private static var retainedWindowControllers: [MainWindowController] = []
+
     private func closeAndUnregisterAllSurfaces() {
         let surfaces = SurfaceRegistry.shared.all()
         surfaces.forEach { $0.close() }
@@ -32,7 +34,23 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         ctx.router = router
         let wc = MainWindowController(context: ctx, router: router)
         router.windowController = wc
+        Self.retainedWindowControllers.append(wc)
         return (ctx, router, wc)
+    }
+
+    private func createWorkspaceWithoutTerminal(
+        in ctx: AppContext,
+        windowController: MainWindowController,
+        name: String = "w"
+    ) throws -> Workspace {
+        let descriptor = SurfaceDescriptor(type: .agentApp, title: "Agent App")
+        try ctx.apply(.createWorkspace(name: name, cwd: NSTemporaryDirectory(), initial: descriptor))
+        windowController.refreshFromState()
+        guard let id = ctx.state.window.selectedWorkspaceID,
+              let workspace = ctx.state.workspaces[id] else {
+            throw LayoutError.workspaceNotFound
+        }
+        return workspace
     }
 
     private func drainMainQueue() {
@@ -45,10 +63,10 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
 
-        let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
+        let ws = try createWorkspaceWithoutTerminal(in: ctx, windowController: wc)
         let pid = ws.layout.paneIDs().first!
         _ = try router.splitPane(workspace: ws.id, paneID: pid,
-                                 direction: .right, surfaceType: .terminal, title: "t")
+                                 direction: .right, surfaceType: .agentApp, title: "Agent App")
 
         wc.window.contentView?.layoutSubtreeIfNeeded()
         let split = try XCTUnwrap(findSplit(wc.window.contentView!), "RatioSplitView must exist")
@@ -66,10 +84,10 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         defer { closeAndUnregisterAllSurfaces() }
         wc.window.setContentSize(NSSize(width: 1200, height: 800))
 
-        let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
+        let ws = try createWorkspaceWithoutTerminal(in: ctx, windowController: wc)
         let pid = ws.layout.paneIDs().first!
         _ = try router.splitPane(workspace: ws.id, paneID: pid,
-                                 direction: .down, surfaceType: .terminal, title: "t")
+                                 direction: .down, surfaceType: .agentApp, title: "Agent App")
 
         wc.window.contentView?.layoutSubtreeIfNeeded()
         let split = try XCTUnwrap(findSplit(wc.window.contentView!))
@@ -115,8 +133,11 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        defer { closeAndUnregisterAllSurfaces() }
+        defer {
+            closeAndUnregisterAllSurfaces()
+        }
         let first = MainWindowController(context: ctx, router: router)
+        Self.retainedWindowControllers.append(first)
         first.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         let split = try XCTUnwrap(findRootSplit(first.window.contentView!))
@@ -124,6 +145,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         split.layoutSubtreeIfNeeded()
 
         let second = MainWindowController(context: ctx, router: router)
+        Self.retainedWindowControllers.append(second)
         second.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
         second.window.contentView?.layoutSubtreeIfNeeded()

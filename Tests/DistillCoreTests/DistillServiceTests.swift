@@ -2,6 +2,20 @@ import XCTest
 @testable import DistillCore
 
 final class DistillServiceTests: XCTestCase {
+    private actor RecordingSuccessHandler {
+        private var records: [DistillSavingsRecord] = []
+
+        func record(request: DistillRequest, response: DistillResponse) {
+            if let record = DistillSavingsCalculator.record(for: request, response: response) {
+                records.append(record)
+            }
+        }
+
+        func allRecords() -> [DistillSavingsRecord] {
+            records
+        }
+    }
+
     func test_mlxRuntimeRequiresRealLocalModelFiles() async {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2MissingMLXModel-\(UUID().uuidString)", isDirectory: true)
@@ -67,7 +81,8 @@ final class DistillServiceTests: XCTestCase {
         let request = DistillRequest(
             id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
             mode: .commandOutput,
-            input: "build passed",
+            input: "build passed\n0 failures",
+            question: "Did the build pass? Return PASS or FAIL only.",
             maxOutputCharacters: 200
         )
         let body = try JSONEncoder().encode(request)
@@ -80,7 +95,7 @@ final class DistillServiceTests: XCTestCase {
         )
         XCTAssertEqual(distill.status, 200)
         let decoded = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
-        XCTAssertEqual(decoded.output, "O build passed")
+        XCTAssertEqual(decoded.output, "PASS")
         XCTAssertEqual(decoded.requestID, request.id)
 
         let metrics = try await response(
@@ -93,6 +108,51 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.totalRequests, 1)
         XCTAssertEqual(snapshot.successfulRequests, 1)
         XCTAssertEqual(snapshot.failedRequests, 0)
+    }
+
+    func test_httpServerSuccessHookReceivesCommandOutputSavingsRecord() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "record-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let recorder = RecordingSuccessHandler()
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler) { request, response in
+            await recorder.record(request: request, response: response)
+        }
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "alpha.html\nnotes.txt\nbeta.html\n",
+            question: "List existing HTML files, or NONE. Keep paths only.",
+            provider: "codex",
+            recordSavings: true,
+            maxOutputCharacters: 200
+        )
+        let body = try JSONEncoder().encode(request)
+
+        let distill = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "record-token",
+            body: body
+        )
+
+        XCTAssertEqual(distill.status, 200)
+        let records = await recorder.allRecords()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.provider, "codex")
+        XCTAssertEqual(record.mode, "command-output")
+        XCTAssertEqual(record.inputTokens, TokenEstimator.estimate(request.input),
+                       "command-output savings record estimated tokens of the raw input, not its character length")
+        XCTAssertEqual(record.outputTokens, TokenEstimator.estimate("alpha.html\nbeta.html"),
+                       "command-output savings record estimated tokens of the distilled output, not its character length")
+        XCTAssertEqual(record.savedTokens, max(TokenEstimator.estimate(request.input) - TokenEstimator.estimate("alpha.html\nbeta.html"), 0))
+        XCTAssertNotEqual(record.inputTokens, request.input.count, "characters must never be recorded as tokens")
     }
 
     func test_clientCompressesViaServerAndReportsMeasuredSavings() async throws {

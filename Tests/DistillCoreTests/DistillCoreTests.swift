@@ -23,6 +23,56 @@ final class DistillCoreTests: XCTestCase {
         }
     }
 
+    /// Blocks every `distill` until released and counts `reclaimIdleMemory` calls, so a
+    /// test can prove the scheduler reclaims GPU memory exactly when it drains to idle.
+    private final class ReclaimTrackingRuntime: DistillRuntime, @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuations: [CheckedContinuation<Void, Never>] = []
+        private var reclaims = 0
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            await withCheckedContinuation { continuation in
+                lock.lock(); continuations.append(continuation); lock.unlock()
+            }
+            return "S \(request.input)"
+        }
+
+        func reclaimIdleMemory() {
+            lock.lock(); reclaims += 1; lock.unlock()
+        }
+
+        func releaseAll() {
+            lock.lock(); let pending = continuations; continuations.removeAll(); lock.unlock()
+            pending.forEach { $0.resume() }
+        }
+
+        var reclaimCount: Int { lock.lock(); defer { lock.unlock() }; return reclaims }
+    }
+
+    func test_schedulerReclaimsIdleMemoryOncePerDrainNotPerConcurrentRequest() async throws {
+        let runtime = ReclaimTrackingRuntime()
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 4, maxQueueDepth: 4)
+
+        let tasks = (0..<3).map { index in
+            Task { try await scheduler.submit(DistillRequest(mode: .commandOutput, input: "in-\(index)")) }
+        }
+        while await scheduler.activeRequestCount < 3 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertEqual(runtime.reclaimCount, 0,
+                       "memory must not be reclaimed while requests are still in flight — the cache stays warm during a burst")
+
+        runtime.releaseAll()
+        for task in tasks {
+            _ = try await task.value
+        }
+
+        let active = await scheduler.activeRequestCount
+        XCTAssertEqual(active, 0)
+        XCTAssertEqual(runtime.reclaimCount, 1,
+                       "the GPU cache is returned exactly once when the burst fully drains to idle, never per request")
+    }
+
     func test_schedulerRejectsEmptyInputBeforeRuntimeStarts() async throws {
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
 
@@ -106,17 +156,270 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(queued, 0)
     }
 
-    func test_runtimeProducesDistillPrefixedOutput() async throws {
+    func test_commandOutputRuntimeReturnsOnlyRequestedFormat() async throws {
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
         let response = try await scheduler.submit(DistillRequest(
             mode: .commandOutput,
-            input: "build passed\nwarnings zero",
+            input: "unit tests passed\n0 failures",
+            question: "Did the tests pass? Return only PASS or FAIL, followed by failing test names if any.",
             maxOutputCharacters: 200
         ))
 
-        XCTAssertEqual(response.output, "O build passed\nO warnings zero",
-                       "local runtime output should already follow the short distill line shape")
-        XCTAssertEqual(response.inputCharacters, 26)
+        XCTAssertEqual(response.output, "PASS",
+                       "command output compression must return exactly what the provider requested, not SR1/O-prefixed prose")
+        XCTAssertFalse(response.output.contains("PROMPT:"))
+        XCTAssertFalse(response.output.contains("INPUT:"))
+    }
+
+    func test_commandOutputRuntimeHandlesCwdOnlyQuestion() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .commandOutput,
+            input: "/tmp\n",
+            question: "Return cwd only. If distill service unavailable, preserve raw cwd.",
+            maxOutputCharacters: 200
+        ))
+
+        XCTAssertEqual(response.output, "/tmp")
+    }
+
+    func test_commandOutputRuntimeFiltersHTMLPathsWhenRequested() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .commandOutput,
+            input: "foo.html\nbar.txt\nsite/index.html\n",
+            question: "List existing HTML files, or NONE. Keep paths only.",
+            maxOutputCharacters: 200
+        ))
+
+        XCTAssertEqual(response.output, "foo.html\nsite/index.html")
+    }
+
+    func test_commandOutputRuntimeHandlesCwdAndFilesFormat() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .commandOutput,
+            input: "/tmp\nindex.html\nnotes.txt\n",
+            question: "Return cwd and visible files. Format: CWD=<path>; FILES=<comma list or EMPTY>.",
+            maxOutputCharacters: 200
+        ))
+
+        XCTAssertEqual(response.output, "CWD=/tmp; FILES=index.html, notes.txt")
+    }
+
+    func test_mlxRuntimeBypassesModelForExactCommandOutputContracts() throws {
+        let cwd = DistillRequest(
+            mode: .commandOutput,
+            input: "/tmp\n",
+            question: "Return cwd only. If distill service unavailable, preserve raw cwd.",
+            maxOutputCharacters: 200
+        )
+        let htmlPaths = DistillRequest(
+            mode: .commandOutput,
+            input: "foo.html\nbar.txt\nsite/index.html\n",
+            question: "List existing HTML files, or NONE. Keep paths only.",
+            maxOutputCharacters: 200
+        )
+        let cwdAndFiles = DistillRequest(
+            mode: .commandOutput,
+            input: "/tmp\nindex.html\nnotes.txt\n",
+            question: "Return cwd and visible files. Format: CWD=<path>; FILES=<comma list or EMPTY>.",
+            maxOutputCharacters: 200
+        )
+
+        XCTAssertEqual(MLXDistillRuntime.deterministicCommandOutput(for: cwd), "/tmp")
+        XCTAssertEqual(MLXDistillRuntime.deterministicCommandOutput(for: htmlPaths), "foo.html\nsite/index.html")
+        XCTAssertEqual(MLXDistillRuntime.deterministicCommandOutput(for: cwdAndFiles), "CWD=/tmp; FILES=index.html, notes.txt")
+    }
+
+    func test_commandOutputSavingsUseEstimatedTokensNotCharacterLength() {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "line one\nline two\nline three\n",
+            question: "Keep paths only.",
+            provider: "claude",
+            recordSavings: true,
+            maxOutputCharacters: 200
+        )
+        // Token estimates deliberately diverge from the character lengths so a
+        // regression back to `.count` (characters) would fail this test.
+        let response = DistillResponse(
+            requestID: request.id,
+            output: "line one\n",
+            inputCharacters: request.input.count,
+            inputTokens: 999,
+            outputTokens: 1
+        )
+
+        let record = DistillSavingsCalculator.record(for: request, response: response)
+
+        XCTAssertEqual(record?.provider, "claude")
+        XCTAssertEqual(record?.mode, "command-output")
+        XCTAssertEqual(record?.inputTokens, 999, "saved-token accounting must use the measured token estimate, not input.count")
+        XCTAssertEqual(record?.outputTokens, 1, "saved-token accounting must use the measured token estimate, not output.count")
+        XCTAssertEqual(record?.savedTokens, 998)
+        XCTAssertNotEqual(record?.inputTokens, request.input.count, "characters must never stand in for tokens")
+    }
+
+    /// Reproduces the published `distill` token report (github.com/samuelfaj/distill):
+    /// a 30592-char command output (≈7648 tokens) compressed to 396 chars (≈99
+    /// tokens) must record ≈7549 saved tokens — not ≈30196 saved characters.
+    func test_commandOutputSavingsMatchPublishedTokenReport() {
+        let rawOutput = String(repeating: "a", count: 30_592)
+        let distilled = String(repeating: "b", count: 396)
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: rawOutput,
+            question: "Compress.",
+            provider: "claude",
+            recordSavings: true,
+            maxOutputCharacters: 4_000
+        )
+        let response = DistillResponse(
+            requestID: request.id,
+            output: distilled,
+            inputCharacters: rawOutput.count,
+            inputTokens: TokenEstimator.estimate(rawOutput),
+            outputTokens: TokenEstimator.estimate(distilled)
+        )
+
+        let record = DistillSavingsCalculator.record(for: request, response: response)
+
+        XCTAssertEqual(record?.inputTokens, 7648)
+        XCTAssertEqual(record?.outputTokens, 99)
+        XCTAssertEqual(record?.savedTokens, 7549, "saved tokens must equal the published token delta, not the character delta")
+    }
+
+    func test_sr1HumanizeSavingsUseEstimatedTokensOfHumanVersusSR1() {
+        let sr1 = "S ok.\nO done."
+        let request = DistillRequest(
+            mode: .sr1Humanize,
+            input: """
+            TARGET_LANGUAGE: Portuguese (Brazil)
+
+            SR1_RESPONSE:
+            \(sr1)
+            """,
+            provider: "codex",
+            recordSavings: true,
+            maxOutputCharacters: 500
+        )
+        let human = "Estado: ok.\nResultado: done with human wording."
+        let response = DistillResponse(
+            requestID: request.id,
+            output: human,
+            inputCharacters: request.input.count,
+            inputTokens: 10,
+            outputTokens: 20
+        )
+
+        let record = DistillSavingsCalculator.record(for: request, response: response)
+
+        XCTAssertEqual(record?.provider, "codex")
+        XCTAssertEqual(record?.mode, "sr1-humanize")
+        XCTAssertEqual(record?.inputTokens, TokenEstimator.estimate(human),
+                       "the avoided human answer is measured in estimated tokens")
+        XCTAssertEqual(record?.outputTokens, TokenEstimator.estimate(sr1),
+                       "the emitted SR1 response is measured in estimated tokens")
+        XCTAssertEqual(record?.savedTokens, max(TokenEstimator.estimate(human) - TokenEstimator.estimate(sr1), 0))
+    }
+
+    func test_mlxCommandOutputCollapsesDuplicatedModelBlocks() throws {
+        XCTAssertEqual(
+            MLXDistillRuntime.collapseDuplicatedCommandOutput("PASS\nPASS"),
+            "PASS"
+        )
+        XCTAssertEqual(
+            MLXDistillRuntime.collapseDuplicatedCommandOutput("CWD=/tmp; FILES=index.html\nCWD=/tmp; FILES=index.html"),
+            "CWD=/tmp; FILES=index.html"
+        )
+    }
+
+    func test_commandOutputRuntimeDoesNotEchoLegacyPromptInputEnvelope() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .commandOutput,
+            input: """
+            PROMPT:
+            Return cwd only. If distill service unavailable, preserve raw cwd.
+
+            INPUT:
+            /tmp
+            """,
+            maxOutputCharacters: 200
+        ))
+
+        XCTAssertEqual(response.output, "/tmp")
+        XCTAssertFalse(response.output.contains("PROMPT:"))
+        XCTAssertFalse(response.output.contains("INPUT:"))
+    }
+
+    func test_sr1HumanizeFallbackExpandsSpaceDelimitedDistillLines() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .sr1Humanize,
+            input: """
+            TARGET_LANGUAGE: Portuguese (Brazil)
+
+            SR1_RESPONSE:
+            O Snake game criado.
+            O file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
+            P open: abrir snake.html no browser -> jogo roda
+            """,
+            maxOutputCharacters: 500
+        ))
+
+        XCTAssertEqual(
+            response.output,
+            """
+            Resultado: Snake game criado.
+            Resultado: file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
+            Prova: open: abrir snake.html no browser -> jogo roda
+            """
+        )
+    }
+
+    func test_sr1HumanizeFallbackExpandsInlineDistillClauses() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .sr1Humanize,
+            input: """
+            TARGET_LANGUAGE: Portuguese (Brazil)
+
+            SR1_RESPONSE:
+            S come. C cwd=/tmp. D load /distill rule, then create minimal HTML snake game.
+            """,
+            maxOutputCharacters: 500
+        ))
+
+        XCTAssertEqual(
+            response.output,
+            """
+            Estado: come
+            Contexto: cwd=/tmp
+            Acao: load /distill rule, then create minimal HTML snake game
+            """
+        )
+    }
+
+    func test_sr1HumanizeFallbackExpandsCompressedVariables() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .sr1Humanize,
+            input: """
+            TARGET_LANGUAGE: Portuguese (Brazil)
+
+            SR1_RESPONSE:
+            Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof #g1=Snake HTML game
+            S received. D create #g1 in one file. O #g1 ready.
+            """,
+            maxOutputCharacters: 500
+        ))
+
+        XCTAssertFalse(response.output.contains("#g1"),
+                       "SR1 aliases are a provider compression detail and must not be shown in the humanized answer")
+        XCTAssertTrue(response.output.contains("Acao: create Snake HTML game in one file"))
+        XCTAssertTrue(response.output.contains("Resultado: Snake HTML game ready"))
     }
 
     func test_schedulerReportsMeasuredTokenSavingsFromRealCompression() async throws {
@@ -156,6 +459,40 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertFalse(
             MLXDistillRuntime.isUsefulDistillOutput(cleaned),
             "MLX output must not expose hidden thinking or a prefix dictionary instead of compressed content"
+        )
+    }
+
+    func test_mlxSR1HumanizeRejectsPartialDictionaryOutput() {
+        let output = """
+        Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof
+        Estado: starting
+        Acao: create file
+        """
+
+        XCTAssertFalse(
+            MLXDistillRuntime.isUsefulOutput(output, mode: .sr1Humanize),
+            "SR1 humanization must reject partial translations that still expose the SR1 dictionary"
+        )
+    }
+
+    func test_mlxSR1HumanizeRejectsMixedCompressedAndHumanOutput() {
+        let output = """
+        S done.
+        O created /tmp/index.html: self-contained Snake game.
+        P verified:
+        PASS inline JS parses.
+        PASS HTTP smoke: 200, title present, canvas present.
+        C controls:
+        Arrow keys / WASD move.
+        Space pauses.
+        Enter restarts after game over.
+        Touch buttons included.
+        O criado /tmp/index.html: jogo Snake self-contained.
+        """
+
+        XCTAssertFalse(
+            MLXDistillRuntime.isUsefulOutput(output, mode: .sr1Humanize),
+            "SR1 humanization must reject model output that preserves compressed S/O/P/C lines before a human-language sentence"
         )
     }
 

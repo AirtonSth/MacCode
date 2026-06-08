@@ -266,7 +266,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = [bridgeScriptPath] + request.extraArgs
         process.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: request.environment)
+        process.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

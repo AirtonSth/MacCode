@@ -1341,8 +1341,12 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertEqual(usage.contextWindow, 258400)
         XCTAssertEqual(usage.compactsAutomatically, true,
                        "Codex app-server context windows auto-compact; RemoteCode must preserve that capability in the same context status surface as T3Code")
-        _ = try await waitForContextCompaction(in: sink)
-        let events = await sink.snapshot()
+        let events = try await waitForEvents(in: sink) { events in
+            events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Context compacted" } else { return false } }
+                && events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Context compaction" } else { return false } }
+                && events.contains { if case .itemStarted(let item) = $0 { return item.type == .contextCompaction && item.summary == "Context compacted" } else { return false } }
+                && events.contains { if case .itemStarted(let item) = $0 { return item.id == "native-context-compaction" && item.type == .contextCompaction && item.summary == "Context compaction" } else { return false } }
+        }
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Context compacted" } else { return false } })
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Context compaction" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.type == .contextCompaction && item.summary == "Context compacted" } else { return false } })
@@ -1850,6 +1854,18 @@ private func waitForContextCompaction(in sink: EventSink) async throws -> String
         try await Task.sleep(nanoseconds: 20_000_000)
     }
     throw XCTSkip("Timed out waiting for context compaction")
+}
+
+private func waitForEvents(in sink: EventSink, matching predicate: @escaping ([AssistantEvent]) -> Bool) async throws -> [AssistantEvent] {
+    let deadline = Date().addingTimeInterval(3)
+    while Date() < deadline {
+        let events = await sink.snapshot()
+        if predicate(events) {
+            return events
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    throw XCTSkip("Timed out waiting for expected events")
 }
 
 private func waitForItemCompleted(in sink: EventSink, itemId: String) async throws -> AssistantItemState {

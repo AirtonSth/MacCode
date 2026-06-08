@@ -45,13 +45,14 @@ public final class AppContext {
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
-    /// Test seam: sandboxes the managed-skill install roots under a temp home so
-    /// tests never write the /distill skill into the developer's real ~/.claude or
+    /// Test seam: sandboxes the managed-skill/config install roots under a temp home so
+    /// tests never write /distill state into the developer's real ~/.claude or
     /// ~/.codex. Production code never sets this (installs to the real provider dirs).
     var agentSkillsHomeOverrideForTesting: URL?
     /// Prompts shorter than this are sent verbatim: distillation overhead/latency
     /// isn't worth it and tiny instructions have nothing to compress.
     private static let tokenSaverMinCompressChars = 600
+    private static let tokenSaverDistillStartupPolls = 300
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -105,6 +106,10 @@ public final class AppContext {
         self.coordinator.promptCompressor = { [weak self] prompt, provider in
             guard let self else { return prompt }
             return await self.tokenSaverCompress(prompt: prompt, provider: provider)
+        }
+        self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
+            guard let self else { return response }
+            return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
         }
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
@@ -349,10 +354,11 @@ public final class AppContext {
         }
     }
 
-    /// The managed `/distill` skill is only useful while Token Saver is on, so its
-    /// install lifecycle tracks the Token Saver toggle: present when enabled, removed
-    /// when disabled. Driven from every Token Saver trigger: app open/close and the
-    /// enable/disable toggle, so the skill never lingers once Token Saver is off.
+    /// Managed `/distill` state is only useful while Token Saver is on, so the skill
+    /// and provider config lifecycle tracks the Token Saver toggle: present when
+    /// enabled, removed when disabled. Driven from every Token Saver trigger:
+    /// app open/close and the enable/disable toggle, so it never lingers once
+    /// Token Saver is off.
     static var isRunningUnitTests: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
             NSClassFromString("XCTestCase") != nil
@@ -363,13 +369,24 @@ public final class AppContext {
             ?? AgentSkillInstaller()
         do {
             if tokenSaverEnabled {
-                managedDistillSkillInstallResults = [
-                    try installer.installDistillSkill(for: .codex, sourceRevision: "github-main-remote-code-template-v1"),
-                    try installer.installDistillSkill(for: .claude, sourceRevision: "github-main-remote-code-template-v1")
-                ]
+                let codex = try installer.installDistillSkill(
+                    for: .codex,
+                    sourceRevision: "github-main-remote-code-template-v1"
+                )
+                let claude = try installer.installDistillSkill(
+                    for: .claude,
+                    sourceRevision: "github-main-remote-code-template-v1"
+                )
+                try installer.installDistillInstructions(for: .codex)
+                try installer.installDistillInstructions(for: .claude)
+                _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
+                managedDistillSkillInstallResults = [codex, claude]
             } else {
                 _ = try installer.uninstallDistillSkill(for: .codex)
                 _ = try installer.uninstallDistillSkill(for: .claude)
+                _ = try installer.uninstallDistillInstructions(for: .codex)
+                _ = try installer.uninstallDistillInstructions(for: .claude)
+                _ = try installer.uninstallDistillCLI()
                 managedDistillSkillInstallResults = []
             }
         } catch {
@@ -543,23 +560,18 @@ public final class AppContext {
         do {
             let response = try await client.distill(request)
             let compressed = response.output
+            recordTokenSaverSidecarSavings(
+                provider: provider,
+                mode: request.mode.rawValue,
+                inputTokens: response.inputTokens,
+                outputTokens: response.outputTokens,
+                savedTokens: response.savedTokens
+            )
             // Only adopt the compressed text when it is non-empty and actually
             // smaller in tokens; otherwise send the original untouched.
             guard !compressed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  response.savedTokens > 0,
                   compressed.count < prompt.count else {
                 return prompt
-            }
-            do {
-                _ = try tokenSaverSavingsRepo.record(
-                    provider: provider.rawValue,
-                    mode: request.mode.rawValue,
-                    inputTokens: response.inputTokens,
-                    outputTokens: response.outputTokens
-                )
-                NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
-            } catch {
-                NSLog("RemoteCode Token Saver savings persist failed: \(error)")
             }
             return compressed
         } catch {
@@ -568,15 +580,184 @@ public final class AppContext {
         }
     }
 
+    func tokenSaverHumanizeSR1Response(_ response: String, provider: AgentProvider, threadId: AgentThreadID, runId: AgentRunID? = nil) async -> String {
+        guard SR1ResponseDetector.isSR1(response) else { return response }
+
+        let targetLanguage = inferredUserLanguage(threadId: threadId)
+        let fallback = Self.fallbackHumanizeSR1(response, targetLanguage: targetLanguage)
+        guard let client = await currentDistillClientWaitingForStartup() else {
+            NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
+            return fallback
+        }
+
+        let input = """
+        TARGET_LANGUAGE: \(targetLanguage)
+        USER_FACING_RULES:
+        Expand any SR1 variables such as #g1 using their definitions from SR1_RESPONSE before answering.
+        Never show unresolved # variables to the user.
+
+        SR1_RESPONSE:
+        \(response)
+        """
+        let request = DistillRequest(
+            mode: .sr1Humanize,
+            priority: .interactive,
+            input: input,
+            maxOutputCharacters: max(1_200, min(12_000, response.count * 4))
+        )
+        do {
+            let translated = try await client.distill(request).output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let expanded = SR1ResponseDetector.expandVariables(in: translated, from: response)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let humanized: String
+            if !expanded.isEmpty, !SR1ResponseDetector.isSR1(expanded) {
+                humanized = expanded
+            } else {
+                humanized = fallback
+            }
+            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: humanized, provider: provider)
+            return humanized
+        } catch {
+            NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): \(error)")
+            return fallback
+        }
+    }
+
+    private func currentDistillClientWaitingForStartup() async -> DistillServiceClient? {
+        if let client = currentDistillClient() {
+            return client
+        }
+        guard SettingsStore(db: db).load().tokenSaverEnabled else {
+            return nil
+        }
+
+        startTokenSaverDistillServiceIfEligible()
+        for _ in 0..<Self.tokenSaverDistillStartupPolls {
+            if let client = currentDistillClient() {
+                return client
+            }
+            if case .blocked = tokenSaverDistillServiceController.status {
+                break
+            }
+            if case .failed = tokenSaverDistillServiceController.status {
+                break
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return currentDistillClient()
+    }
+
+    private static func describe(_ status: TokenSaverDistillServiceStatus) -> String {
+        switch status {
+        case .notStarted:
+            return "notStarted"
+        case .blocked(let reason):
+            return "blocked:\(reason)"
+        case .starting:
+            return "starting"
+        case .running(let ready):
+            return "running:\(ready.runtime):\(ready.port)"
+        case .failed(let reason):
+            return "failed:\(reason)"
+        }
+    }
+
+    private func inferredUserLanguage(threadId: AgentThreadID) -> String {
+        let recent = (try? messageRepo.listRecent(threadId: threadId, limit: 20)) ?? []
+        let latestUserText = recent.last(where: { $0.role == .user })?.content ?? ""
+        if Self.looksPortuguese(latestUserText) {
+            return "Portuguese (Brazil)"
+        }
+        if Self.looksSpanish(latestUserText) {
+            return "Spanish"
+        }
+        if Locale.preferredLanguages.first?.lowercased().hasPrefix("pt") == true {
+            return "Portuguese (Brazil)"
+        }
+        return "English"
+    }
+
+    private static func looksPortuguese(_ text: String) -> Bool {
+        let lower = " " + text.lowercased() + " "
+        if lower.range(of: #"[áàâãçéêíóôõú]"#, options: .regularExpression) != nil {
+            return true
+        }
+        let markers = [
+            " voce ", " você ", " nao ", " não ", " corrija ", " teste ", " testes ",
+            " linguagem ", " usuario ", " usuário ", " tokens salvos ", " esta ", " está ",
+            " portugues ", " português ", " responda ", " explique ", " crie ", " criar ",
+            " jogo ", " pt-br ", " brasil "
+        ]
+        return markers.contains { lower.contains($0) }
+    }
+
+    private static func looksSpanish(_ text: String) -> Bool {
+        let lower = " " + text.lowercased() + " "
+        if lower.range(of: #"[¿¡ñ]"#, options: .regularExpression) != nil {
+            return true
+        }
+        let markers = [" por favor ", " gracias ", " respuesta ", " usuario ", " prueba "]
+        return markers.contains { lower.contains($0) }
+    }
+
+    private static func fallbackHumanizeSR1(_ response: String, targetLanguage: String) -> String {
+        let portuguese = targetLanguage.localizedCaseInsensitiveContains("Portuguese")
+        let spanish = targetLanguage.localizedCaseInsensitiveContains("Spanish")
+        let labels: [Character: String]
+        if portuguese {
+            labels = ["S": "Estado", "C": "Contexto", "D": "Acao", "R": "Risco", "O": "Resultado", "N": "Nao fazer", "P": "Prova"]
+        } else if spanish {
+            labels = ["S": "Estado", "C": "Contexto", "D": "Accion", "R": "Riesgo", "O": "Resultado", "N": "No hacer", "P": "Prueba"]
+        } else {
+            labels = ["S": "State", "C": "Context", "D": "Action", "R": "Risk", "O": "Outcome", "N": "Do not do", "P": "Proof"]
+        }
+
+        let lines = response
+            .split(whereSeparator: \.isNewline)
+            .flatMap { raw -> [String] in
+                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { return [] }
+                let lower = line.lowercased()
+                guard lower != "sr1",
+                      lower != "dict",
+                      lower != "dict:",
+                      !lower.hasPrefix("dict:"),
+                      !lower.hasPrefix("s=state"),
+                      !lower.hasPrefix("c=context"),
+                      !lower.hasPrefix("d=action"),
+                      !lower.hasPrefix("r=risk"),
+                      !lower.hasPrefix("o=outcome"),
+                      !lower.hasPrefix("n=no-go"),
+                      !lower.hasPrefix("p=proof") else {
+                    return []
+                }
+                let segments = SR1ResponseDetector.parseSemanticSegments(line)
+                guard !segments.isEmpty else {
+                    return [line]
+                }
+                return segments.map { parsed in
+                    guard let label = labels[parsed.prefix] else { return parsed.content }
+                    return "\(label): \(parsed.content)"
+                }
+            }
+        if lines.isEmpty {
+            if portuguese { return "Nao consegui expandir a resposta comprimida." }
+            if spanish { return "No pude expandir la respuesta comprimida." }
+            return "I could not expand the compressed response."
+        }
+        return SR1ResponseDetector.expandVariables(in: lines.joined(separator: "\n"), from: response)
+    }
+
     private func recordTokenSaverUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
         guard usage.totalTokens > 0,
               let run = try? runRepo.get(id: runId) else {
             return
         }
         let settings = SettingsStore(db: db).load()
-        // Record only the real provider-billed token count. Savings are no
-        // longer synthesised here from an assumed ratio — they are measured at
-        // compression time and persisted to the token_saver_savings ledger.
+        // Record only the real provider-billed token count. Savings are now
+        // measured at the local sidecar call sites (`| distill` command-output
+        // compression and SR1 humanization), never synthesized from provider
+        // token-usage events.
         let eligibleRuns = settings.tokenSaverEnabled ? 1 : 0
         do {
             _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).record(
@@ -591,6 +772,43 @@ public final class AppContext {
         } catch {
             NSLog("RemoteCode Token Saver usage record failed: \(error)")
         }
+    }
+
+    private func recordTokenSaverSidecarSavings(
+        provider: AgentProvider,
+        mode: String,
+        inputTokens: Int,
+        outputTokens: Int,
+        savedTokens: Int
+    ) {
+        guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
+        do {
+            _ = try tokenSaverSavingsRepo.record(
+                provider: provider.rawValue,
+                mode: mode,
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                savedTokens: savedTokens
+            )
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        } catch {
+            NSLog("RemoteCode Token Saver sidecar savings persist failed: \(error)")
+        }
+    }
+
+    private func recordTokenSaverSR1HumanizeSavings(sr1: String, humanized: String, provider: AgentProvider) {
+        // Honest token accounting: the agent emitted compressed SR1 instead of
+        // the full human answer, so savings = estimate(human) - estimate(SR1).
+        let inputTokens = TokenEstimator.estimate(humanized)
+        let outputTokens = TokenEstimator.estimate(sr1)
+        let savedTokens = max(inputTokens - outputTokens, 0)
+        recordTokenSaverSidecarSavings(
+            provider: provider,
+            mode: "sr1-humanize",
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            savedTokens: savedTokens
+        )
     }
 
     private var pendingSave: DispatchWorkItem?

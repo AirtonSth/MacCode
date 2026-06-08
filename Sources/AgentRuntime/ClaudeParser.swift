@@ -209,6 +209,9 @@ public final class ClaudeParser {
             // Authoritative final answer is the top-level `result` string.
             let isError = (obj["is_error"] as? Bool) ?? ((obj["subtype"] as? String).map { $0 != "success" } ?? false)
             let resultText = obj["result"] as? String
+            if let usage = tokenUsage(from: obj) {
+                out.append(.tokenUsage(usage))
+            }
             if isError {
                 let msg = resultText
                     ?? (obj["error"] as? [String: Any])?["message"] as? String
@@ -416,6 +419,25 @@ public final class ClaudeParser {
     }
 
     private func tokenUsage(from obj: [String: Any]) -> AssistantTokenUsage? {
+        if let modelUsage = obj["modelUsage"] as? [String: Any] ?? obj["model_usage"] as? [String: Any] {
+            var input = 0
+            var output = 0
+            var window: Int?
+            for value in modelUsage.values {
+                guard let usage = value as? [String: Any] else { continue }
+                let directInput = intValue(usage["inputTokens"]) ?? intValue(usage["input_tokens"]) ?? 0
+                let cacheCreation = intValue(usage["cacheCreationInputTokens"]) ?? intValue(usage["cache_creation_input_tokens"]) ?? 0
+                let cacheRead = intValue(usage["cacheReadInputTokens"]) ?? intValue(usage["cache_read_input_tokens"]) ?? 0
+                input += directInput + cacheCreation + cacheRead
+                output += intValue(usage["outputTokens"]) ?? intValue(usage["output_tokens"]) ?? 0
+                if let contextWindow = intValue(usage["contextWindow"]) ?? intValue(usage["context_window"]) {
+                    window = max(window ?? 0, contextWindow)
+                }
+            }
+            let total = input + output
+            guard total > 0 || window != nil else { return nil }
+            return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: total, contextWindow: window, compactsAutomatically: nil)
+        }
         let usage = obj["usage"] as? [String: Any] ?? obj["token_usage"] as? [String: Any] ?? obj
         let input = intValue(usage["input_tokens"]) ?? intValue(usage["inputTokens"]) ?? 0
         let output = intValue(usage["output_tokens"]) ?? intValue(usage["outputTokens"]) ?? 0

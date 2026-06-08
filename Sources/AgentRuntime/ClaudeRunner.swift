@@ -98,7 +98,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
         proc.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        proc.environment = CodexRunner.processEnvironment(overrides: request.environment)
+        proc.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe
