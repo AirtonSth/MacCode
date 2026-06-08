@@ -6,7 +6,8 @@ struct AgentMessageMarkdownBlock: Equatable {
     enum Kind: Equatable {
         case paragraph
         case heading(Int)
-        case bullet
+        case bullet(indent: Int)
+        case numbered(number: Int, indent: Int)
         case code(language: String)
     }
 
@@ -64,9 +65,14 @@ enum AgentMessageMarkdown {
                 continue
             }
 
-            if let bullet = bulletText(from: trimmed) {
+            if let list = listItem(from: rawLine) {
                 flushParagraph()
-                blocks.append(AgentMessageMarkdownBlock(kind: .bullet, text: bullet))
+                switch list.marker {
+                case .bullet:
+                    blocks.append(AgentMessageMarkdownBlock(kind: .bullet(indent: list.indent), text: list.text))
+                case .numbered(let number):
+                    blocks.append(AgentMessageMarkdownBlock(kind: .numbered(number: number, indent: list.indent), text: list.text))
+                }
                 continue
             }
 
@@ -115,10 +121,35 @@ enum AgentMessageMarkdown {
         return text.isEmpty ? nil : (level, text)
     }
 
-    private static func bulletText(from line: String) -> String? {
-        guard line.hasPrefix("- ") || line.hasPrefix("* ") else { return nil }
-        let text = line.dropFirst(2).trimmingCharacters(in: .whitespaces)
-        return text.isEmpty ? nil : String(text)
+    enum ListMarker: Equatable { case bullet, numbered(Int) }
+
+    /// Detect bullet (`- ` / `* ` / `+ `) or ordered (`1. ` / `1) `) list items, capturing
+    /// the indentation level so nested lists render with hanging indent. Ordered lists were
+    /// previously rendered as run-on paragraphs ("malformatted") — this fixes that.
+    static func listItem(from rawLine: String) -> (indent: Int, marker: ListMarker, text: String)? {
+        let leadingSpaces = rawLine.prefix { $0 == " " }.count
+        let indent = min(leadingSpaces / 2, 4)
+        let line = rawLine.trimmingCharacters(in: .whitespaces)
+        // Bullet
+        if line.hasPrefix("- ") || line.hasPrefix("* ") || line.hasPrefix("+ ") {
+            let text = line.dropFirst(2).trimmingCharacters(in: .whitespaces)
+            return text.isEmpty ? nil : (indent, .bullet, String(text))
+        }
+        // Ordered: digits then '.' or ')' then a space.
+        let digits = line.prefix { $0.isNumber }
+        if !digits.isEmpty, digits.count <= 3 {
+            let afterDigits = line.dropFirst(digits.count)
+            if let sep = afterDigits.first, sep == "." || sep == ")" {
+                let rest = afterDigits.dropFirst()
+                if rest.first == " " {
+                    let text = rest.trimmingCharacters(in: .whitespaces)
+                    if !text.isEmpty, let number = Int(digits) {
+                        return (indent, .numbered(number), String(text))
+                    }
+                }
+            }
+        }
+        return nil
     }
 }
 
@@ -146,15 +177,29 @@ struct AgentMessageMarkdownView: View {
             Text(AgentMessageMarkdown.attributedInline(block.text))
                 .font(headingFont(level))
                 .padding(.top, compact ? 0 : DS.Space.xs)
-        case .bullet:
+        case .bullet(let indent):
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
                 Image(systemName: "circle.fill")
                     .font(.system(size: 4, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
+                    .padding(.top, 6)
                 Text(AgentMessageMarkdown.attributedInline(block.text))
                     .font(DS.Font.body)
                     .lineSpacing(compact ? 3 : 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .padding(.leading, CGFloat(indent) * 16)
+        case .numbered(let number, let indent):
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                Text("\(number).")
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.textSecondary)
+                Text(AgentMessageMarkdown.attributedInline(block.text))
+                    .font(DS.Font.body)
+                    .lineSpacing(compact ? 3 : 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, CGFloat(indent) * 16)
         case .code:
             Text(block.text.isEmpty ? " " : block.text)
                 .font(DS.Font.monoSmall)

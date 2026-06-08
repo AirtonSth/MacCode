@@ -1876,6 +1876,47 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return item.output?.isEmpty == false ? item.output : nil
     }
 
+    /// The command / input that a tool actually ran, extracted from `item.body`.
+    /// The parser stores a tool_use's input there as JSON (e.g. {"command":"…"} for Bash,
+    /// {"file_path":"…"} for Read/Edit). The transcript previously showed only "Ran Bash"
+    /// with no command — this surfaces the actual command so the run is legible.
+    static func toolCommandPreview(for item: AssistantItem) -> String? {
+        switch item.type {
+        case .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall, .commandExecution:
+            break
+        default:
+            return nil
+        }
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        if let data = body.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            // Most-informative field per tool family, in priority order.
+            for key in ["command", "cmd", "script", "query", "pattern", "skill", "file_path", "path", "url", "prompt", "name"] {
+                if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                    return value
+                }
+            }
+            // Unknown shape: a compact one-line key=value digest, no value dumps.
+            let digest = obj.keys.sorted().prefix(4).compactMap { key -> String? in
+                guard let value = obj[key] else { return nil }
+                return "\(key): \(String(describing: value).prefix(80))"
+            }.joined(separator: "  ")
+            return digest.isEmpty ? nil : digest
+        }
+        // Non-JSON body is already a human-readable input/description.
+        return body
+    }
+
+    /// Cap inline tool/skill output so one noisy command can't blow up the transcript.
+    /// The full text remains available via text selection / the stored event.
+    static func cappedDetail(_ text: String, limit: Int = 6_000) -> String {
+        guard text.count > limit else { return text }
+        let head = text.prefix(limit)
+        let dropped = text.count - head.count
+        return "\(head)\n… \(dropped) more characters truncated in view …"
+    }
+
     private static func verb(for item: AssistantItem) -> String {
         switch item.state {
         case .streaming: return "Running"
@@ -1936,6 +1977,12 @@ public struct AgentAppView: View {
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
     @State private var userIsDraggingTimeline = false
+    // UX-MAC_AGENT-020: when WE programmatically follow new content to the bottom, the
+    // bottom preference momentarily reports "not at bottom" during the layout/scroll pass.
+    // That transient must NOT un-stick the view (which froze auto-follow during streaming).
+    // We only un-stick on a genuine user scroll-up, i.e. a not-at-bottom report that is
+    // NOT within this guard window after a follow-scroll.
+    @State private var lastProgrammaticBottomScroll: Date = .distantPast
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
     @State private var pendingScrollDownReveal: Task<Void, Never>?
@@ -3072,6 +3119,9 @@ public struct AgentAppView: View {
         // fire per streaming delta. Skip the per-token animation while running
         // (it caused a layout pass + animation churn on every delta); only
         // animate on settle (idle, or an explicit forced scroll).
+        // UX-MAC_AGENT-020: mark the follow so the bottom-preference's transient
+        // "not at bottom" (content just grew below the fold) does not un-stick us.
+        lastProgrammaticBottomScroll = Date()
         if vm.status == .running && !force {
             proxy.scrollTo("BOTTOM", anchor: .bottom)
         } else {
@@ -3098,10 +3148,15 @@ public struct AgentAppView: View {
             return
         }
 
-        // UX-MAC_AGENT-015: reveal immediately on a user-initiated scroll-away.
-        // The 180ms debounce only guards against flicker while the run is
-        // streaming and growing content programmatically; when idle there is no
-        // programmatic growth to debounce against, so show the button at once.
+        // UX-MAC_AGENT-020: a "not at bottom" report right after our own follow-scroll
+        // is just the content growing below the fold mid-stream — NOT the user leaving
+        // the bottom. Ignore it so auto-follow keeps pinning to the newest message.
+        if Date().timeIntervalSince(lastProgrammaticBottomScroll) < 0.4 {
+            return
+        }
+
+        // A genuine user scroll-away: a drag, or any not-at-bottom report outside the
+        // follow-scroll guard window. Reveal the jump-to-latest button and stop following.
         if userIsDraggingTimeline || vm.status != .running {
             cancelPendingScrollDownReveal()
             timelineSticksToBottom = false
@@ -3468,11 +3523,15 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func toolRow(_ item: AssistantItem) -> some View {
         let presentation = AgentTimelineItemPresentation.make(for: item)
-        let hasOutput = (presentation.detail?.isEmpty == false)
+        let command = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        let output = presentation.detail
+        let hasOutput = (output?.isEmpty == false)
+        // A long command is also worth expanding even when there's no output yet.
+        let canExpand = hasOutput || (command.map { $0.count > 160 || $0.contains("\n") } ?? false)
         let expanded = expandedTools.contains(item.id)
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
             Button {
-                guard hasOutput else { return }
+                guard canExpand else { return }
                 if expanded { expandedTools.remove(item.id) } else { expandedTools.insert(item.id) }
             } label: {
                 HStack(spacing: DS.Space.sm) {
@@ -3481,10 +3540,10 @@ public struct AgentAppView: View {
                     (Text("\(presentation.verb) ")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                      + Text(presentation.label)
-                        .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary))
+                        .font(DS.Font.mono).foregroundColor(DS.Palette.text))
                     .lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 0)
-                    if hasOutput {
+                    if canExpand {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8)).foregroundColor(DS.Palette.textTertiary)
                     }
@@ -3492,9 +3551,26 @@ public struct AgentAppView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(hasOutput ? (expanded ? "Hide tool output" : "Show tool output") : "Tool output unavailable")
-            if expanded, let o = presentation.detail, !o.isEmpty {
-                Text(o)
+            .help(canExpand ? (expanded ? "Hide details" : "Show command and output") : "No further detail")
+
+            // The command / input that ran (e.g. the bash command) — the key context that
+            // was missing. Always visible (truncated when collapsed); full when expanded.
+            if let command, !command.isEmpty {
+                Text(command)
+                    .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
+                    .textSelection(.enabled)
+                    .lineLimit(expanded ? nil : 3)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DS.Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+
+            // Output, collapsed by default and capped so a noisy command (or a Skill dump)
+            // can't blow up the transcript. Full text stays selectable.
+            if expanded, let o = output, !o.isEmpty {
+                Text(AgentTimelineItemPresentation.cappedDetail(o))
                     .font(DS.Font.mono).foregroundColor(DS.Palette.textSecondary)
                     .textSelection(.enabled)
                     .padding(DS.Space.md)
