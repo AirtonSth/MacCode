@@ -716,6 +716,25 @@ public final class AgentRunRepository {
         return events
     }
 
+    public func pruneProviderEventLogs(threadId: AgentThreadID, keepLatest limit: Int = 10_000) throws {
+        guard limit > 0 else { return }
+        let st = try db.prepare("""
+            DELETE FROM agent_provider_event_logs
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id
+                    FROM agent_provider_event_logs
+                    WHERE thread_id = ?
+                    ORDER BY id DESC
+                    LIMIT -1 OFFSET ?
+                )
+            );
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, Int64(limit))
+        _ = try st.step()
+    }
+
     public func pruneStreamEvents(threadId: AgentThreadID, keepLatest limit: Int = 5_000) throws {
         guard limit > 0 else { return }
         let st = try db.prepare("""
@@ -1495,6 +1514,34 @@ public final class TerminalOutputRepository {
             hasMoreOlder: hasMoreOlder || hasOlder(surfaceID: surfaceID, before: chunks.first?.id),
             nextBeforeChunkID: chunks.first?.id
         )
+    }
+
+    /// Prune oldest chunks for `surfaceID` so total stored bytes ≤ `maxBytes`.
+    /// Deletes rows with the smallest `id` values (oldest) until the byte sum fits.
+    public func pruneByteCap(surfaceID: String, maxBytes: Int) throws {
+        guard maxBytes > 0 else { return }
+        // Walk oldest-first, accumulate bytes, delete rows that exceed the cap.
+        let st = try db.prepare("""
+            DELETE FROM terminal_output_chunks
+            WHERE surface_id = ? AND id NOT IN (
+                SELECT id FROM (
+                    SELECT id, SUM(byte_count) OVER (ORDER BY id DESC) AS running
+                    FROM terminal_output_chunks
+                    WHERE surface_id = ?
+                )
+                WHERE running <= ?
+            );
+        """)
+        try st.bind(1, surfaceID)
+        try st.bind(2, surfaceID)
+        try st.bind(3, Int64(maxBytes))
+        _ = try st.step()
+    }
+
+    public func totalBytes(surfaceID: String) throws -> Int {
+        let st = try db.prepare("SELECT COALESCE(SUM(byte_count), 0) FROM terminal_output_chunks WHERE surface_id = ?;")
+        try st.bind(1, surfaceID)
+        return (try st.step()) ? Int(st.columnInt64(0)) : 0
     }
 
     public func delete(surfaceID: String) throws {
