@@ -94,6 +94,34 @@ private func ghosttyRuntimeReadClipboardCallback(
     return false
 }
 
+// MARK: - Action effect mapper
+
+/// The side-effect a Ghostty surface action should produce in the host app.
+/// Pure value type: no @MainActor, no AppKit imports needed to construct it.
+enum GhosttyActionEffect {
+    /// OSC 2 / escape-set title — update the tab label.
+    case setTitle(String)
+    /// CSS cursor name from the terminal program — update the system cursor shape.
+    case mouseShape(ghostty_action_mouse_shape_e)
+}
+
+/// Pure mapper from a raw Ghostty action struct to an optional host effect.
+/// `nonisolated` so it can be called from the runtime action_cb off main.
+/// Returns `nil` for actions the host does not need to handle.
+enum GhosttyActionMapper {
+    nonisolated static func map(_ action: ghostty_action_s) -> GhosttyActionEffect? {
+        switch action.tag {
+        case GHOSTTY_ACTION_SET_TITLE, GHOSTTY_ACTION_SET_TAB_TITLE:
+            let title = action.action.set_title.title.map { String(cString: $0) } ?? ""
+            return .setTitle(title)
+        case GHOSTTY_ACTION_MOUSE_SHAPE:
+            return .mouseShape(action.action.mouse_shape)
+        default:
+            return nil
+        }
+    }
+}
+
 /// Pure search/match layer for the terminal find bar (Cmd+F). Operates on a
 /// plain-text snapshot of the terminal scrollback (read via GHOSTTY_POINT_SCREEN)
 /// so the logic is testable without a live Ghostty surface or window server.
@@ -215,7 +243,19 @@ private final class RemoteCodeGhosttyRuntime {
         runtimeConfig.wakeup_cb = { _ in
             RemoteCodeGhosttyRuntime.shared.scheduleTick()
         }
-        runtimeConfig.action_cb = { _, _, _ in
+        runtimeConfig.action_cb = { _, target, action in
+            // Resolve the view from the surface's userdata. The view is retained
+            // by the window hierarchy for its lifetime; the unretained cast is safe
+            // because surfaceClosed prevents action delivery after free.
+            guard target.tag == GHOSTTY_TARGET_SURFACE,
+                  let ud = ghostty_surface_userdata(target.target.surface),
+                  let effect = GhosttyActionMapper.map(action) else {
+                return true
+            }
+            let view = Unmanaged<GhosttyTerminalView>.fromOpaque(ud).takeUnretainedValue()
+            DispatchQueue.main.async {
+                view.applyActionEffect(effect)
+            }
             return true
         }
         runtimeConfig.read_clipboard_cb = ghosttyRuntimeReadClipboardCallback
@@ -398,6 +438,8 @@ private final class RemoteCodeGhosttyRuntime {
 final class GhosttyTerminalView: NSView {
     var onInputData: ((Data) -> Void)?
     var onTerminalSizeChange: ((TerminalViewportSize) -> Void)?
+    /// Called on the main thread when the terminal program changes its title (OSC 2).
+    var onTitleChange: ((String) -> Void)?
 
     private let surfaceSlot = GhosttySurfaceSlot()
     private let ioContext = RemoteCodeGhosttyIOContext()
@@ -674,6 +716,57 @@ final class GhosttyTerminalView: NSView {
         // cf_release_thread). Only post an async refresh so Ghostty's single
         // renderer thread draws.
         ghostty_surface_refresh(surface)
+    }
+
+    /// Apply an effect produced by the Ghostty runtime action callback.
+    /// Called on the main thread (dispatched from action_cb).
+    func applyActionEffect(_ effect: GhosttyActionEffect) {
+        switch effect {
+        case .setTitle(let title):
+            onTitleChange?(title)
+        case .mouseShape(let shape):
+            NSCursor.pop()
+            if let cursor = Self.cursor(for: shape) {
+                cursor.push()
+            }
+        }
+    }
+
+    /// Map a Ghostty mouse-shape enum value to the closest AppKit NSCursor.
+    /// Returns nil for the default cursor (pop-only, no push).
+    nonisolated static func cursor(for shape: ghostty_action_mouse_shape_e) -> NSCursor? {
+        switch shape {
+        case GHOSTTY_MOUSE_SHAPE_DEFAULT:
+            return nil
+        case GHOSTTY_MOUSE_SHAPE_POINTER:
+            return .pointingHand
+        case GHOSTTY_MOUSE_SHAPE_TEXT:
+            return .iBeam
+        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT:
+            return .iBeamCursorForVerticalLayout
+        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR:
+            return .crosshair
+        case GHOSTTY_MOUSE_SHAPE_GRAB, GHOSTTY_MOUSE_SHAPE_GRABBING:
+            return .closedHand
+        case GHOSTTY_MOUSE_SHAPE_MOVE:
+            return .openHand
+        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED, GHOSTTY_MOUSE_SHAPE_NO_DROP:
+            return .operationNotAllowed
+        case GHOSTTY_MOUSE_SHAPE_COPY:
+            return .dragCopy
+        case GHOSTTY_MOUSE_SHAPE_ALIAS:
+            return .dragLink
+        case GHOSTTY_MOUSE_SHAPE_COL_RESIZE, GHOSTTY_MOUSE_SHAPE_EW_RESIZE,
+             GHOSTTY_MOUSE_SHAPE_E_RESIZE, GHOSTTY_MOUSE_SHAPE_W_RESIZE:
+            return .resizeLeftRight
+        case GHOSTTY_MOUSE_SHAPE_ROW_RESIZE, GHOSTTY_MOUSE_SHAPE_NS_RESIZE,
+             GHOSTTY_MOUSE_SHAPE_N_RESIZE, GHOSTTY_MOUSE_SHAPE_S_RESIZE:
+            return .resizeUpDown
+        case GHOSTTY_MOUSE_SHAPE_WAIT, GHOSTTY_MOUSE_SHAPE_PROGRESS:
+            return .arrow
+        default:
+            return .arrow
+        }
     }
 
     func writeInputData(_ data: Data) {
