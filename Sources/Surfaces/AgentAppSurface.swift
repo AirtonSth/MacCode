@@ -1980,6 +1980,11 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 private final class TimelineScrollScheduler {
     var scheduled = false
     var forcePending = false
+    // UX-MAC_AGENT-020: timestamp of the last programmatic follow-scroll. Lives on this
+    // reference type (NOT @State) so writing it on every streaming delta does NOT invalidate
+    // the AgentAppView body — a @State write here re-laid-out the whole transcript per delta
+    // and pegged the main thread at 100% (UI freeze).
+    var lastBottomScroll: Date = .distantPast
 }
 
 public struct AgentAppView: View {
@@ -2002,12 +2007,6 @@ public struct AgentAppView: View {
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
     @State private var userIsDraggingTimeline = false
-    // UX-MAC_AGENT-020: when WE programmatically follow new content to the bottom, the
-    // bottom preference momentarily reports "not at bottom" during the layout/scroll pass.
-    // That transient must NOT un-stick the view (which froze auto-follow during streaming).
-    // We only un-stick on a genuine user scroll-up, i.e. a not-at-bottom report that is
-    // NOT within this guard window after a follow-scroll.
-    @State private var lastProgrammaticBottomScroll: Date = .distantPast
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
     @State private var pendingScrollDownReveal: Task<Void, Never>?
@@ -3146,7 +3145,9 @@ public struct AgentAppView: View {
         // animate on settle (idle, or an explicit forced scroll).
         // UX-MAC_AGENT-020: mark the follow so the bottom-preference's transient
         // "not at bottom" (content just grew below the fold) does not un-stick us.
-        lastProgrammaticBottomScroll = Date()
+        // Written on the scheduler (a reference type), NOT @State, so this per-delta
+        // write never invalidates the body / re-lays-out the transcript.
+        timelineScrollScheduler.lastBottomScroll = Date()
         if vm.status == .running && !force {
             proxy.scrollTo("BOTTOM", anchor: .bottom)
         } else {
@@ -3176,7 +3177,7 @@ public struct AgentAppView: View {
         // UX-MAC_AGENT-020: a "not at bottom" report right after our own follow-scroll
         // is just the content growing below the fold mid-stream — NOT the user leaving
         // the bottom. Ignore it so auto-follow keeps pinning to the newest message.
-        if Date().timeIntervalSince(lastProgrammaticBottomScroll) < 0.4 {
+        if Date().timeIntervalSince(timelineScrollScheduler.lastBottomScroll) < 0.4 {
             return
         }
 
