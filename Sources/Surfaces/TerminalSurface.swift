@@ -280,6 +280,25 @@ private final class TerminalDropContainerView: NSView {
     }
 }
 
+// MARK: - Restart decision helper (pure, non-MainActor, testable)
+
+/// Captures the minimal information needed to decide whether and how to
+/// restart a dead terminal, and to produce the parameters for the new spawn.
+/// Keeping this pure (no AppKit, no actor) lets unit tests cover the logic
+/// without a live UI.
+public enum TerminalRestartDecision {
+    /// Returns `(cwd, title)` if `descriptor` represents a restartable local
+    /// shell (type `.terminal`, non-empty cwd). Returns `nil` for SSH surfaces
+    /// and placeholders — those have their own reconnect flow.
+    public static func spawnRequest(from descriptor: SurfaceDescriptor) -> (cwd: String, title: String)? {
+        guard descriptor.type == .terminal,
+              let cwd = descriptor.metadata["cwd"], !cwd.isEmpty else { return nil }
+        return (cwd, descriptor.title)
+    }
+}
+
+// MARK: - TerminalSurface
+
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
 /// and renders its output through `ANSIRenderer`. The terminal view is
 /// directly interactive — no separate input field (cmux model).
@@ -337,6 +356,12 @@ public final class TerminalSurface: NSObject, Surface {
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private var needsHistoryReplay = false
+    private var restartBannerButton: NSButton?
+
+    /// Called on the main actor when the user taps "Restart shell" on the
+    /// dead-terminal banner. The caller (AppCommandRouter) replaces this
+    /// surface with a fresh one in the same pane and cwd.
+    public var onRestartRequested: (() -> Void)?
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     private static let busyStateProbeDuration: TimeInterval = 2.0
     private static let busyStatePollInterval: TimeInterval = 0.10
@@ -961,6 +986,7 @@ public final class TerminalSurface: NSObject, Surface {
         terminalLog.info("terminal.dead surface=\(self.descriptor.id.value.uuidString, privacy: .public) reason=\(reason, privacy: .public) rawStatus=\(self.exitStatus ?? -1, privacy: .public) signal=\(self.terminationSignal ?? -1, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public)")
         if wasAlive, !isClosing {
             appendString("\r\n" + Self.processExitedBanner(rawStatus: exitStatus) + "\r\n")
+            showRestartBannerIfEligible()
         }
         publishRuntimeHealth()
     }
@@ -971,6 +997,42 @@ public final class TerminalSurface: NSObject, Surface {
             return "[process terminated (signal \(rawStatus & 0x7F))]"
         }
         return "[process exited (code \((rawStatus >> 8) & 0xFF))]"
+    }
+
+    // MARK: - Restart shell banner button
+
+    private func showRestartBannerIfEligible() {
+        // Only local shell terminals can be restarted inline; SSH has its own
+        // reconnect flow. Also skip if the caller hasn't wired onRestartRequested
+        // (e.g. unit-test stubs that don't go through AppCommandRouter).
+        guard TerminalRestartDecision.spawnRequest(from: descriptor) != nil,
+              onRestartRequested != nil,
+              restartBannerButton == nil else { return }
+
+        let btn = NSButton()
+        btn.title = "Restart shell"
+        btn.bezelStyle = .rounded
+        btn.isBordered = true
+        btn.target = self
+        btn.action = #selector(restartBannerTapped)
+        btn.setAccessibilityIdentifier("terminal.restart-shell-button")
+        btn.setAccessibilityLabel("Restart shell")
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(btn)
+        NSLayoutConstraint.activate([
+            btn.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            btn.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -16)
+        ])
+        restartBannerButton = btn
+    }
+
+    @objc private func restartBannerTapped() {
+        onRestartRequested?()
+    }
+
+    private func removeRestartBanner() {
+        restartBannerButton?.removeFromSuperview()
+        restartBannerButton = nil
     }
 
     public func readText() -> String {
@@ -1126,6 +1188,7 @@ public final class TerminalSurface: NSObject, Surface {
     public func close() {
         guard !isClosing else { return }
         isClosing = true
+        removeRestartBanner()
         closeParkingWindowIfNeeded()
         flushHistory(wait: true)
         readSource?.cancel()

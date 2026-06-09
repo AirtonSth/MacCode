@@ -602,6 +602,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         publishSurfaceClosed(workspace: workspace, surface: surface)
     }
 
+    /// Replaces a dead terminal surface with a fresh shell in the same pane
+    /// and the same working directory. No-ops if the surface is not a
+    /// restartable local terminal (SSH, wrong type, cwd missing).
+    public func restartSurface(_ surfaceID: SurfaceID) {
+        guard let ctx = context,
+              let located = try? locateSurface(surfaceID),
+              let (cwd, title) = TerminalRestartDecision.spawnRequest(from: located.descriptor) else { return }
+        let workspaceID = located.workspaceID
+        let paneID = ctx.state.workspaces[workspaceID]
+            .flatMap { paneIDContaining(surface: surfaceID, in: $0.layout) }
+        // Close the old surface first so its PTY/FD is cleaned up before the
+        // new one is spawned (avoids a brief double-ownership window).
+        try? closeSurface(workspace: workspaceID, surface: surfaceID)
+        let newDesc = makeSurface(type: .terminal, title: title, workspace: workspaceID, cwd: cwd)
+        try? ctx.apply(.addSurface(workspaceID, paneID: paneID, descriptor: newDesc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspaceID, surface: newDesc)
+    }
+
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
         if let ws = context?.state.workspaces[workspace],
            let paneID = ws.layout.paneIDs().first(where: { paneID in
@@ -2236,7 +2256,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let surface: Surface
             switch type {
             case .terminal:
-                surface = try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo)
+                let terminal = try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo)
+                terminal.onRestartRequested = { [weak self, weak terminal] in
+                    guard let self, let terminal else { return }
+                    self.restartSurface(terminal.descriptor.id)
+                }
+                surface = terminal
             case .ssh:
                 surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self)
             case .browser:
