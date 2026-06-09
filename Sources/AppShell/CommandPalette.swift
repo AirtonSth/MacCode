@@ -475,6 +475,18 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
     }
 
+    // MARK: NSWindowDelegate — resign-key dismissal
+
+    /// UX-015: floating panels must dismiss when the app loses key focus so the
+    /// palette never stays orphaned over Spotlight, Raycast, or any other overlay.
+    /// Exposed as `internal static` so unit tests can assert the policy without
+    /// instantiating a full `CommandPalette` (which requires a live AppCommandRouter).
+    static func shouldDismissOnResignKey() -> Bool { true }
+
+    public func windowDidResignKey(_ notification: Notification) {
+        if CommandPalette.shouldDismissOnResignKey() { hide() }
+    }
+
     // MARK: NSTextFieldDelegate
 
     public func controlTextDidChange(_ obj: Notification) {
