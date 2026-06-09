@@ -1918,9 +1918,10 @@ public struct SidebarRootView: View {
                 }
                 Spacer(minLength: 0)
                 if busy {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                        .frame(width: 16, height: 16)
                         .accessibilityLabel("Workspace busy")
                 }
                 if ws.notificationsUnread > 0 {

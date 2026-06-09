@@ -3106,9 +3106,8 @@ public struct AgentAppView: View {
             // every 5 seconds, so a long run doesn't force 600 re-evaluations.
             TimelineView(ElapsedTickSchedule(start: vm.runStartedAt ?? Date())) { _ in
                 HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
+                    ProgressView()
+                        .controlSize(.small)
                         .accessibilityLabel("Running")
                     Text("Working for \(elapsedString)")
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
