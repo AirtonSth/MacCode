@@ -2691,17 +2691,15 @@ public struct AgentAppView: View {
                                     }
                                     .accessibilityIdentifier("agent.history.bottom-sentinel")
                             }
+                            // Scroll-to target only. Bottom detection is handled by the
+                            // AppKit TimelineScrollPositionObserver above — NOT by a per-layout
+                            // GeometryReader preference, which fed onPreferenceChange -> @State
+                            // writes -> body invalidation -> re-layout -> new maxY ... a
+                            // self-sustaining layout loop that froze the UI on scroll
+                            // (PERF-MAC_AGENT-021).
                             Color.clear
                                 .frame(height: 1)
                                 .id("BOTTOM")
-                                .background(
-                                    GeometryReader { marker in
-                                        Color.clear.preference(
-                                            key: TimelineBottomPreferenceKey.self,
-                                            value: marker.frame(in: .named("agentTimeline")).maxY
-                                        )
-                                    }
-                                )
                         }
                         .padding(.horizontal, 22)
                         .padding(.vertical, 32)
@@ -2723,9 +2721,6 @@ public struct AgentAppView: View {
                                 .padding(DS.Space.sm)
                                 .allowsHitTesting(false)
                         }
-                    }
-                    .onPreferenceChange(TimelineBottomPreferenceKey.self) { bottomY in
-                        updateTimelineBottomVisibility(bottomY: bottomY, viewportHeight: viewport.size.height)
                     }
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 4)
@@ -3153,11 +3148,6 @@ public struct AgentAppView: View {
         } else {
             withAnimation(DS.Motion.micro) { proxy.scrollTo("BOTTOM", anchor: .bottom) }
         }
-    }
-
-    private func updateTimelineBottomVisibility(bottomY: CGFloat, viewportHeight: CGFloat) {
-        let atBottom = bottomY <= viewportHeight + Self.timelineBottomRevealSlack
-        updateTimelineBottomState(isAtBottom: atBottom)
     }
 
     private func updateTimelineBottomState(isAtBottom: Bool) {
@@ -5049,13 +5039,6 @@ private struct PromptComposerEditor: NSViewRepresentable {
                 }
             }
         }
-    }
-}
-
-private struct TimelineBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
     }
 }
 
