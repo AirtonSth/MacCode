@@ -265,6 +265,51 @@ public enum GitDiff {
         return run(args, cwd: cwd).stdout
     }
 
+    /// Synthesizes a unified-diff–style all-addition patch for an untracked
+    /// file given its raw text content. No git I/O — pure and unit-testable.
+    ///
+    /// Returns `""` for binary content (contains a NUL byte) or files that
+    /// exceed `maxLines` (default 10 000) so the caller can show the same
+    /// "binary" / truncation treatment as the tracked-file path.
+    ///
+    /// Output shape matches what `git diff --no-index /dev/null <path>`
+    /// produces so `DiffLineKind.classify` colorizes it correctly:
+    /// ```
+    /// diff --git a/<path> b/<path>
+    /// --- /dev/null
+    /// +++ b/<path>
+    /// @@ -0,0 +1,N @@
+    /// +<line1>
+    /// +<line2>
+    /// …
+    /// ```
+    public static func synthesizeUntrackedDiff(content: String, path: String, maxLines: Int = 10_000) -> String {
+        // Binary guard: a NUL byte anywhere means we can't render as text.
+        guard !content.contains("\0") else { return "" }
+        let lines = content.components(separatedBy: "\n")
+        // Drop a trailing empty element that `components(separatedBy:)` adds
+        // for content that ends with a newline, so line-count matches reality.
+        let contentLines: [String]
+        if lines.last == "" {
+            contentLines = Array(lines.dropLast())
+        } else {
+            contentLines = lines
+        }
+        // Large-file guard: rendering many thousands of '+' lines in TextKit
+        // is as expensive as for tracked files; apply the same cap philosophy.
+        guard contentLines.count <= maxLines else { return "" }
+        let n = contentLines.count
+        var out = ""
+        out += "diff --git a/\(path) b/\(path)\n"
+        out += "--- /dev/null\n"
+        out += "+++ b/\(path)\n"
+        out += "@@ -0,0 +1,\(n) @@\n"
+        for line in contentLines {
+            out += "+\(line)\n"
+        }
+        return out
+    }
+
     // MARK: branch / commit / history
 
     public static func branches(in cwd: String) -> GitBranches {

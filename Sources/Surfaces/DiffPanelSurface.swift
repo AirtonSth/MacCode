@@ -203,13 +203,28 @@ public final class DiffPanelViewModel: ObservableObject {
         let path = self.selectedPath
         let commit = self.selectedCommit
         guard path != nil || commit != nil else { rawDiff = ""; isLoading = false; return }
+        // Snapshot untracked status before leaving the main actor so the
+        // background closure can make a decision without touching @Published.
+        let isUntracked: Bool = {
+            guard let p = path else { return false }
+            return summary.files.first { $0.path == p }?.status == .untracked
+        }()
         diffGeneration &+= 1
         let gen = diffGeneration
         isLoading = true
         DispatchQueue.global().async { [weak self] in
             let d: String
             if let p = path {
-                d = GitDiff.diff(in: cwd, path: p, ignoreWhitespace: ws)
+                if isUntracked {
+                    // For untracked files git has no index entry, so
+                    // `git diff HEAD` produces nothing. Synthesize an
+                    // all-addition patch by reading the file content directly.
+                    let fullPath = (cwd as NSString).appendingPathComponent(p)
+                    let content = (try? String(contentsOfFile: fullPath, encoding: .utf8)) ?? ""
+                    d = GitDiff.synthesizeUntrackedDiff(content: content, path: p)
+                } else {
+                    d = GitDiff.diff(in: cwd, path: p, ignoreWhitespace: ws)
+                }
             } else if let h = commit {
                 d = GitDiff.commitDiff(in: cwd, hash: h, ignoreWhitespace: ws)
             } else {
