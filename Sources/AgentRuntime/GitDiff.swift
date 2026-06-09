@@ -432,6 +432,18 @@ public enum GitDiff {
         return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
     }
 
+    /// Stages only the specified `paths` (`git add <paths…>`) then commits.
+    /// Use this for per-file commit: the caller is responsible for passing a
+    /// non-empty, validated list (see `StagingHelper.pathArgs`).
+    public static func commitPaths(in cwd: String, message: String, paths: [String]) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        guard !paths.isEmpty else { return GitActionResult(ok: false, message: "No paths specified.") }
+        let add = run(["add", "--"] + paths, cwd: cwd)
+        guard add.exit == 0 else { return GitActionResult(ok: false, message: actionMessage(add)) }
+        let r = run(["commit", "-m", message], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
     public static func log(in cwd: String, limit: Int = 100) -> [GitCommit] {
         guard isGit(cwd) else { return [] }
         let fmt = "%H%x1f%h%x1f%an%x1f%ad%x1f%s"

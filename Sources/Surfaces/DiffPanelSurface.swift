@@ -41,6 +41,10 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var commits: [GitCommit] = []
     @Published public var commitMessage: String = ""
     @Published public var mode: GitPanelMode = .changes
+    /// Paths the user has explicitly checked for per-file commit.
+    /// Empty means "commit all" (existing behaviour); non-empty means
+    /// only those paths are staged+committed.
+    @Published public var selectedFiles: Set<String> = []
     @Published public var selectedCommit: String?
     /// UX-015: `lastError` is friendly/humanized copy shown in the banner;
     /// `lastErrorRaw` keeps the original git stderr for the "Copy details"
@@ -268,6 +272,28 @@ public final class DiffPanelViewModel: ObservableObject {
                   successMessage: "Committed all changes (\(n) file\(n == 1 ? "" : "s"))") {
             GitDiff.commit(in: $0, message: msg)
         }
+        selectedPath = nil
+        selectedCommit = nil
+        rawDiff = ""
+    }
+
+    /// Stages and commits only the files in `selectedFiles`.
+    /// Falls back to committing all when `selectedFiles` is empty.
+    /// No-op when the commit message is blank.
+    public func commitSelected() {
+        let msg = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty else { return }
+        let allPaths = summary.files.map(\.path)
+        guard let paths = StagingHelper.pathArgs(selected: selectedFiles, all: allPaths) else {
+            // Empty / invalid selection: fall back to committing all.
+            commit(); return
+        }
+        let n = paths.count
+        runAction(clearMessageOnOK: true,
+                  successMessage: "Committed \(n) selected file\(n == 1 ? "" : "s")") {
+            GitDiff.commitPaths(in: $0, message: msg, paths: paths)
+        }
+        selectedFiles = []
         selectedPath = nil
         selectedCommit = nil
         rawDiff = ""
@@ -712,11 +738,29 @@ public struct DiffPanelView: View {
 
     private func fileRow(_ f: GitFileEntry) -> some View {
         let selected = vm.selectedPath == f.path
+        let staged = vm.selectedFiles.contains(f.path)
         let comps = f.path.split(separator: "/").map(String.init)
         let file = comps.last ?? f.path
         let dir = comps.dropLast().joined(separator: "/")
         return Button { vm.selectFile(f.path) } label: {
             HStack(spacing: DS.Space.md) {
+                // Per-file staging checkbox. Tap toggles inclusion without
+                // changing the diff-pane selection.
+                Button {
+                    if vm.selectedFiles.contains(f.path) {
+                        vm.selectedFiles.remove(f.path)
+                    } else {
+                        vm.selectedFiles.insert(f.path)
+                    }
+                } label: {
+                    Image(systemName: staged ? "checkmark.square.fill" : "square")
+                        .font(.system(size: 12))
+                        .foregroundColor(staged ? DS.Palette.accent : DS.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .help(staged ? "Remove from commit" : "Include in commit")
+                .accessibilityLabel(staged ? "Deselect \(f.path)" : "Select \(f.path)")
+                .accessibilityIdentifier("diff.file.stage.\(f.path)")
                 statusBadge(f.status)
                 HStack(spacing: 0) {
                     if !dir.isEmpty {
@@ -870,7 +914,7 @@ public struct DiffPanelView: View {
                     withAnimation(DS.Motion.micro) { vm.actionSuccess = nil }
                 }
             }
-            Button(action: vm.commit) {
+            Button(action: vm.commitSelected) {
                 HStack(spacing: DS.Space.sm) {
                     if vm.isBusy {
                         ProgressView().controlSize(.small).scaleEffect(0.6)
@@ -919,10 +963,13 @@ public struct DiffPanelView: View {
     }
 
     private var commitButtonTitle: String {
-        // `git add -A` stages everything, so the label must say "all"
-        // rather than implying the per-file selection is committed (UX-005).
-        let n = vm.summary.files.count
-        return n == 0 ? "Commit" : "Commit all \(n) file\(n == 1 ? "" : "s")"
+        let allCount = vm.summary.files.count
+        let selCount = vm.selectedFiles.count
+        if allCount == 0 { return "Commit" }
+        if selCount > 0 {
+            return "Commit \(selCount) selected file\(selCount == 1 ? "" : "s")"
+        }
+        return "Commit all \(allCount) file\(allCount == 1 ? "" : "s")"
     }
 
     private var commitDisabled: Bool {
@@ -932,7 +979,8 @@ public struct DiffPanelView: View {
 
     private var commitHint: String {
         if vm.summary.files.isEmpty { return "Nothing to commit — working tree is clean." }
-        return "Enter a message to commit all changes."
+        if vm.selectedFiles.isEmpty { return "Enter a message to commit all changes." }
+        return "Enter a message to commit the selected files."
     }
 
     // MARK: History
