@@ -94,6 +94,49 @@ private func ghosttyRuntimeReadClipboardCallback(
     return false
 }
 
+/// Pure search/match layer for the terminal find bar (Cmd+F). Operates on a
+/// plain-text snapshot of the terminal scrollback (read via GHOSTTY_POINT_SCREEN)
+/// so the logic is testable without a live Ghostty surface or window server.
+/// GhosttyKit exposes no `set_selection`/`scroll_to_point` API to embedders, so
+/// the find bar drives match *location + navigation* over this snapshot (match
+/// count and a current index that wraps); it cannot paint an in-terminal
+/// highlight. Keeping the matching here keeps that boundary explicit and tested.
+enum TerminalScrollbackSearch {
+    /// All match ranges of `query` in `text`, case-insensitive, in document
+    /// order, non-overlapping. Empty query returns no matches.
+    static func matchRanges(in text: String, query: String) -> [Range<String.Index>] {
+        guard !query.isEmpty, !text.isEmpty else { return [] }
+        var ranges: [Range<String.Index>] = []
+        var searchStart = text.startIndex
+        while searchStart < text.endIndex,
+              let found = text.range(of: query, options: .caseInsensitive, range: searchStart..<text.endIndex) {
+            ranges.append(found)
+            // Advance by at least one character so overlapping/zero-width cases
+            // cannot loop forever; `found.lowerBound < found.upperBound` always
+            // holds for a non-empty query, so we move past the start of the match.
+            searchStart = found.upperBound > found.lowerBound ? found.upperBound : text.index(after: found.lowerBound)
+        }
+        return ranges
+    }
+
+    /// Next match index for prev/next navigation. `current == nil` means no match
+    /// is selected yet: forward starts at 0, backward starts at the last match.
+    /// With `wrap` true, stepping past either end wraps around. Returns nil when
+    /// there are no matches.
+    static func nextIndex(current: Int?, count: Int, forward: Bool, wrap: Bool) -> Int? {
+        guard count > 0 else { return nil }
+        guard let current else { return forward ? 0 : count - 1 }
+        let candidate = forward ? current + 1 : current - 1
+        if candidate < 0 {
+            return wrap ? count - 1 : 0
+        }
+        if candidate >= count {
+            return wrap ? 0 : count - 1
+        }
+        return candidate
+    }
+}
+
 enum GhosttyTerminalKeyInput {
     static func text(for event: NSEvent) -> String? {
         guard let text = event.characters, !text.isEmpty else { return nil }
@@ -379,6 +422,17 @@ final class GhosttyTerminalView: NSView {
     /// operation; exposed via runtime health so tests/telemetry catch the drop
     /// path being hit (QA-006, guards PERF-009).
     private(set) var droppedOutputBytes = 0
+
+    /// Find-in-scrollback (Cmd+F) overlay state. The bar is lazily built on first
+    /// open. `findMatchCount`/`findCurrentMatch` are the navigation cursor over
+    /// the last computed match set; they have no effect on rendering because
+    /// GhosttyKit exposes no selection-set/scroll-to API (see
+    /// `TerminalScrollbackSearch`).
+    private var findBar: NSView?
+    private var findField: NSTextField?
+    private var findCountLabel: NSTextField?
+    private var findMatchCount = 0
+    private var findCurrentMatch: Int?
 
     private static let immediateOutputFlushBytes = 64 * 1024
     private static let maxPendingOutputBytes = 1024 * 1024
@@ -681,6 +735,12 @@ final class GhosttyTerminalView: NSView {
         readText(pointTag: GHOSTTY_POINT_VIEWPORT)
     }
 
+    /// Full terminal screen text including scrollback (GHOSTTY_POINT_SCREEN),
+    /// used as the snapshot the find bar searches over.
+    func readScrollbackText() -> String? {
+        readText(pointTag: GHOSTTY_POINT_SCREEN)
+    }
+
     private func readText(pointTag: ghostty_point_tag_e) -> String? {
         ensureSurface()
         guard let surface = surfaceSlot.liveSurface() else { return nil }
@@ -899,9 +959,18 @@ final class GhosttyTerminalView: NSView {
             case "0": // Cmd-0 → reset zoom
                 changeFontSize("reset_font_size")
                 return
+            case "f": // Cmd-F → find in scrollback
+                openFindBar()
+                return
             default:
                 break
             }
+        }
+        // Esc closes the find bar when it is open, before the keystroke reaches
+        // the terminal program.
+        if findBar?.isHidden == false, event.keyCode == 53 {
+            closeFindBar()
+            return
         }
         if TerminalKeyboardInput.shouldUseTextInput(for: event) {
             // Route printable input through AppKit's text-input system so the
@@ -1058,6 +1127,138 @@ final class GhosttyTerminalView: NSView {
     private func changeFontSize(_ action: String) {
         performBindingAction(action)
         updateGhosttySize(force: true)
+    }
+
+    // MARK: - Find in scrollback (Cmd+F)
+
+    private func openFindBar() {
+        let bar = findBar ?? makeFindBar()
+        findBar = bar
+        bar.isHidden = false
+        if let field = findField {
+            window?.makeFirstResponder(field)
+        }
+        recomputeFindMatches(forward: true, advance: false)
+    }
+
+    private func closeFindBar() {
+        findBar?.isHidden = true
+        findMatchCount = 0
+        findCurrentMatch = nil
+        window?.makeFirstResponder(self)
+    }
+
+    private func makeFindBar() -> NSView {
+        let bar = NSView()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = DS.NS.surface.cgColor
+        bar.layer?.cornerRadius = 6
+        bar.setAccessibilityIdentifier("terminal.find-bar")
+        bar.translatesAutoresizingMaskIntoConstraints = false
+
+        let field = NSTextField()
+        field.placeholderString = "Find in terminal"
+        field.bezelStyle = .roundedBezel
+        field.focusRingType = .none
+        field.target = self
+        field.action = #selector(findFieldChanged(_:))
+        field.setAccessibilityIdentifier("terminal.find-field")
+        field.setAccessibilityLabel("Find in terminal")
+        field.translatesAutoresizingMaskIntoConstraints = false
+        findField = field
+
+        let count = NSTextField(labelWithString: "")
+        count.textColor = DS.NS.textSecondary
+        count.font = NSFont.systemFont(ofSize: 11)
+        count.setAccessibilityIdentifier("terminal.find-count")
+        count.translatesAutoresizingMaskIntoConstraints = false
+        findCountLabel = count
+
+        let prev = makeFindButton("chevron.up", help: "Previous match",
+                                  axID: "terminal.find-prev", action: #selector(findPrev(_:)))
+        let next = makeFindButton("chevron.down", help: "Next match",
+                                  axID: "terminal.find-next", action: #selector(findNext(_:)))
+        let close = makeFindButton("xmark", help: "Close find",
+                                   axID: "terminal.find-close", action: #selector(findClose(_:)))
+
+        let stack = NSStackView(views: [field, count, prev, next, close])
+        stack.orientation = .horizontal
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(stack)
+        addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            bar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            stack.topAnchor.constraint(equalTo: bar.topAnchor, constant: 6),
+            stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -6),
+            stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -8),
+            field.widthAnchor.constraint(equalToConstant: 180)
+        ])
+        return bar
+    }
+
+    private func makeFindButton(_ glyph: String, help: String, axID: String, action: Selector) -> NSButton {
+        let b = NSButton()
+        b.isBordered = false
+        b.bezelStyle = .inline
+        b.image = NSImage(systemSymbolName: glyph, accessibilityDescription: help)
+        b.contentTintColor = DS.NS.textSecondary
+        b.imageScaling = .scaleProportionallyDown
+        b.toolTip = help
+        b.target = self
+        b.action = action
+        b.setAccessibilityIdentifier(axID)
+        b.setAccessibilityLabel(help)
+        return b
+    }
+
+    @objc private func findFieldChanged(_ sender: Any?) {
+        recomputeFindMatches(forward: true, advance: false)
+    }
+
+    @objc private func findNext(_ sender: Any?) {
+        recomputeFindMatches(forward: true, advance: true)
+    }
+
+    @objc private func findPrev(_ sender: Any?) {
+        recomputeFindMatches(forward: false, advance: true)
+    }
+
+    @objc private func findClose(_ sender: Any?) {
+        closeFindBar()
+    }
+
+    /// Recompute matches for the current query against the live scrollback
+    /// snapshot, optionally advancing the navigation cursor, and refresh the
+    /// count label. No visible terminal highlight/scroll is possible because
+    /// GhosttyKit exposes no selection-set/scroll-to API to embedders.
+    private func recomputeFindMatches(forward: Bool, advance: Bool) {
+        let query = findField?.stringValue ?? ""
+        let snapshot = readScrollbackText() ?? ""
+        let ranges = TerminalScrollbackSearch.matchRanges(in: snapshot, query: query)
+        findMatchCount = ranges.count
+        if findMatchCount == 0 {
+            findCurrentMatch = nil
+        } else if advance {
+            findCurrentMatch = TerminalScrollbackSearch.nextIndex(
+                current: findCurrentMatch, count: findMatchCount, forward: forward, wrap: true)
+        } else if findCurrentMatch == nil || (findCurrentMatch ?? 0) >= findMatchCount {
+            findCurrentMatch = 0
+        }
+        updateFindCountLabel()
+    }
+
+    private func updateFindCountLabel() {
+        guard let label = findCountLabel else { return }
+        if (findField?.stringValue ?? "").isEmpty {
+            label.stringValue = ""
+        } else if findMatchCount == 0 {
+            label.stringValue = "0/0"
+        } else {
+            label.stringValue = "\((findCurrentMatch ?? 0) + 1)/\(findMatchCount)"
+        }
     }
 
     override func otherMouseDown(with event: NSEvent) {
