@@ -1346,6 +1346,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(tid)
         suppressPersistedFinalDuplicatedByTimeline()
+        timeline.clearActivePlan()
         prompt = ""
         resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
@@ -1362,6 +1363,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist).
         messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display)))
+        focusTick &+= 1
         persistThreadConfig()
         let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
         let req = AgentRunRequest(
@@ -1542,6 +1544,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if finishedTid == self.selectedThreadId {
                     self.loadAllMessages(finishedTid)
                     self.suppressPersistedFinalDuplicatedByTimeline()
+                    self.timeline.clearActivePlan()
+                    self.scheduleTimelineUpdateTick()
                 }
             }
             if status == .completed, var t = try? self.threadRepo.get(id: finishedTid) {
@@ -1778,7 +1782,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
             // Most-informative field per tool family, in priority order.
             for key in ["command", "cmd", "script", "query", "pattern", "skill", "file_path", "path", "url", "prompt", "name"] {
                 if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
-                    return value
+                    return AgentAppView.cappedVisibleText(value, limit: AgentAppView.commandPreviewCharacterLimit, truncatedLabel: "hidden from preview")
                 }
             }
             // Unknown shape: a clean one-line key: value digest. Scalars show their value;
@@ -1789,7 +1793,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
             return digest.isEmpty ? nil : digest
         }
         // Non-JSON body is already a human-readable input/description.
-        return body
+        return AgentAppView.cappedVisibleText(body, limit: AgentAppView.commandPreviewCharacterLimit, truncatedLabel: "hidden from preview")
     }
 
     /// A compact, human-readable rendering of a tool-input value for the one-line digest.
@@ -1897,6 +1901,7 @@ public struct AgentAppView: View {
     @State private var lastAutomaticPlanSidebarChange: TimeInterval?
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
+    @State private var expandedCompletedWorkTurns: Set<String> = []
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: AssistantPendingRequest?
     @State private var expandedRequestPreviews: Set<String> = []
@@ -1949,6 +1954,46 @@ public struct AgentAppView: View {
             }
             return shouldRender
         }
+    }
+
+    static func completedFinalAssistantItemIDs(in turn: AssistantTurnSnapshot,
+                                               renderableItems: [AssistantItem],
+                                               persistedAssistantTexts: [String] = []) -> Set<String> {
+        guard turn.finished else { return [] }
+        let assistantItems = renderableItems.filter { $0.type == .assistantMessage }
+        guard !assistantItems.isEmpty else { return [] }
+        if turn.finalAssistantMessage != nil,
+           !shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
+            return Set(assistantItems.map(\.id))
+        }
+        if turn.finalAssistantMessage == nil, let final = assistantItems.last {
+            return [final.id]
+        }
+        return []
+    }
+
+    static func completedWorkItems(in turn: AssistantTurnSnapshot,
+                                   renderableItems: [AssistantItem],
+                                   persistedAssistantTexts: [String] = []) -> [AssistantItem] {
+        guard turn.finished else { return renderableItems }
+        let finalIDs = completedFinalAssistantItemIDs(
+            in: turn,
+            renderableItems: renderableItems,
+            persistedAssistantTexts: persistedAssistantTexts
+        )
+        return renderableItems.filter { !finalIDs.contains($0.id) }
+    }
+
+    static func completedVisibleAssistantItems(in turn: AssistantTurnSnapshot,
+                                               renderableItems: [AssistantItem],
+                                               persistedAssistantTexts: [String] = []) -> [AssistantItem] {
+        guard turn.finished else { return renderableItems }
+        let finalIDs = completedFinalAssistantItemIDs(
+            in: turn,
+            renderableItems: renderableItems,
+            persistedAssistantTexts: persistedAssistantTexts
+        )
+        return renderableItems.filter { finalIDs.contains($0.id) }
     }
 
     // MARK: Tool-burst grouping
@@ -2066,13 +2111,34 @@ public struct AgentAppView: View {
     // instead of regex; these run for every assistant row on every render, and
     // regex over capped 80k-char bodies dominated the dedup cost. Results are
     // memoized so repeated comparisons of the same body don't re-scan.
-    private static let normalizedTextCache = NSCache<NSString, NSString>()
-    private static let compactTextCache = NSCache<NSString, NSString>()
+    private static let dedupeCacheCharacterLimit = 16_384
+    private static let normalizedTextCache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 512
+        cache.totalCostLimit = 8 * 1024 * 1024
+        return cache
+    }()
+    private static let compactTextCache: NSCache<NSString, NSString> = {
+        let cache = NSCache<NSString, NSString>()
+        cache.countLimit = 512
+        cache.totalCostLimit = 8 * 1024 * 1024
+        return cache
+    }()
 
     private static func normalizedAssistantText(_ text: String) -> String {
-        if let cached = normalizedTextCache.object(forKey: text as NSString) {
+        guard text.count <= dedupeCacheCharacterLimit else {
+            return makeNormalizedAssistantText(text)
+        }
+        let key = text as NSString
+        if let cached = normalizedTextCache.object(forKey: key) {
             return cached as String
         }
+        let out = makeNormalizedAssistantText(text)
+        normalizedTextCache.setObject(out as NSString, forKey: key, cost: out.utf8.count)
+        return out
+    }
+
+    private static func makeNormalizedAssistantText(_ text: String) -> String {
         var out = String()
         out.reserveCapacity(text.count)
         var pendingSpace = false
@@ -2085,21 +2151,107 @@ public struct AgentAppView: View {
                 out.unicodeScalars.append(scalar)
             }
         }
-        normalizedTextCache.setObject(out as NSString, forKey: text as NSString)
         return out
     }
 
     private static func compactAssistantText(_ text: String) -> String {
-        if let cached = compactTextCache.object(forKey: text as NSString) {
+        guard text.count <= dedupeCacheCharacterLimit else {
+            return makeCompactAssistantText(text)
+        }
+        let key = text as NSString
+        if let cached = compactTextCache.object(forKey: key) {
             return cached as String
         }
+        let out = makeCompactAssistantText(text)
+        compactTextCache.setObject(out as NSString, forKey: key, cost: out.utf8.count)
+        return out
+    }
+
+    private static func makeCompactAssistantText(_ text: String) -> String {
         var out = String()
         out.reserveCapacity(text.count)
         for scalar in text.unicodeScalars where !CharacterSet.whitespacesAndNewlines.contains(scalar) {
             out.unicodeScalars.append(scalar)
         }
-        compactTextCache.setObject(out as NSString, forKey: text as NSString)
         return out
+    }
+
+    private struct AssistantTextLookup {
+        var normalizedIds: [String: Set<AgentMessageID>] = [:]
+        var compactIds: [String: Set<AgentMessageID>] = [:]
+
+        init(messages: [AgentMessage]) {
+            for message in messages where message.role == .assistant && !message.content.isEmpty {
+                normalizedIds[normalizedAssistantText(message.content), default: []].insert(message.id)
+                compactIds[compactAssistantText(message.content), default: []].insert(message.id)
+            }
+        }
+
+        func ids(equalTo text: String) -> Set<AgentMessageID> {
+            guard !text.isEmpty else { return [] }
+            var ids = normalizedIds[normalizedAssistantText(text)] ?? []
+            ids.formUnion(compactIds[compactAssistantText(text)] ?? [])
+            return ids
+        }
+    }
+
+    static func hiddenPersistedAssistantMessageIDs(messages: [AgentMessage],
+                                                   timelineTurns: [AssistantTurnSnapshot],
+                                                   persistedAssistantTexts: [String]? = nil) -> Set<AgentMessageID> {
+        let assistantMessages = messages.filter { $0.role == .assistant && !$0.content.isEmpty }
+        guard !assistantMessages.isEmpty, !timelineTurns.isEmpty else { return [] }
+        let persistedTexts = persistedAssistantTexts ?? assistantMessages.map(\.content)
+        let lookup = AssistantTextLookup(messages: assistantMessages)
+        var hidden: Set<AgentMessageID> = []
+        for turn in timelineTurns {
+            let visibleAssistantText = renderableAssistantItemBodies(in: turn, persistedAssistantTexts: persistedTexts)
+                .joined(separator: "\n")
+            hidden.formUnion(lookup.ids(equalTo: visibleAssistantText))
+        }
+        return hidden
+    }
+
+    static let userMessagePreviewCharacterLimit = 1_200
+    static let runningTranscriptContextSlack: TimeInterval = 2
+    static let liveTurnRenderableItemLimit = 48
+    static let liveTurnBodyCharacterLimit = 2_000
+    static let liveTurnOutputCharacterLimit = 1_500
+    static let liveTurnSummaryCharacterLimit = 240
+    static let commandPreviewCharacterLimit = 1_200
+
+    static func userMessageDisplayText(_ text: String) -> String {
+        guard text.count > userMessagePreviewCharacterLimit else { return text }
+        let omitted = text.count - userMessagePreviewCharacterLimit
+        return "\(text.prefix(userMessagePreviewCharacterLimit))\n\n... \(omitted) more characters hidden. Use Copy message for the full prompt."
+    }
+
+    static func cappedVisibleText(_ text: String, limit: Int, truncatedLabel: String = "truncated in live view") -> String {
+        guard text.count > limit else { return text }
+        let head = text.prefix(limit)
+        let dropped = text.count - head.count
+        return "\(head)\n... \(dropped) more characters \(truncatedLabel) ..."
+    }
+
+    static func cappedOptionalVisibleText(_ text: String?, limit: Int, truncatedLabel: String = "truncated in live view") -> String? {
+        guard let text else { return nil }
+        return cappedVisibleText(text, limit: limit, truncatedLabel: truncatedLabel)
+    }
+
+    static func liveRenderableCopy(_ item: AssistantItem) -> AssistantItem {
+        var copy = item
+        copy.summary = cappedOptionalVisibleText(copy.summary, limit: liveTurnSummaryCharacterLimit)
+        copy.body = cappedVisibleText(copy.body, limit: liveTurnBodyCharacterLimit)
+        copy.output = cappedOptionalVisibleText(copy.output, limit: liveTurnOutputCharacterLimit)
+        return copy
+    }
+
+    static func toolCommandPreview(for item: AssistantItem) -> String? {
+        AgentTimelineItemPresentation.toolCommandPreview(for: item)
+    }
+
+    static func visibleLiveTurnItems(_ items: [AssistantItem], running: Bool) -> [AssistantItem] {
+        guard running else { return items }
+        return items.suffix(liveTurnRenderableItemLimit).map(liveRenderableCopy)
     }
 
     private enum TranscriptEntry: Identifiable {
@@ -2149,6 +2301,18 @@ public struct AgentAppView: View {
         return merged
     }
 
+    private var visibleTranscriptEntries: [TranscriptEntry] {
+        let entries = transcriptEntries
+        guard vm.status == .running,
+              let startedAt = vm.runStartedAt,
+              entries.count > 2 else {
+            return entries
+        }
+        let cutoff = startedAt.addingTimeInterval(-Self.runningTranscriptContextSlack).timeIntervalSince1970
+        let liveEntries = entries.filter { $0.sortTime >= cutoff }
+        return liveEntries.isEmpty ? Array(entries.suffix(2)) : liveEntries
+    }
+
     /// Cheap identity signature: changes only when a message/turn is added,
     /// removed, or reordered, not on streaming text deltas. O(turns), NOT O(messages):
     /// the full thread loads append-only (new sends land at the end), so the message
@@ -2175,6 +2339,12 @@ public struct AgentAppView: View {
     }
     private let assistantTextsCache = AssistantTextsCache()
 
+    private final class HiddenPersistedAssistantMessageCache {
+        var key: String?
+        var ids: Set<AgentMessageID> = []
+    }
+    private let hiddenPersistedAssistantMessageCache = HiddenPersistedAssistantMessageCache()
+
     private var persistedAssistantTexts: [String] {
         let key = "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")"
         if assistantTextsCache.key == key { return assistantTextsCache.texts }
@@ -2182,6 +2352,21 @@ public struct AgentAppView: View {
         assistantTextsCache.key = key
         assistantTextsCache.texts = texts
         return texts
+    }
+
+    private var hiddenPersistedAssistantMessageIDs: Set<AgentMessageID> {
+        let key = "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")|\(transcriptSignature)|u\(vm.timelineUpdateTick)"
+        if hiddenPersistedAssistantMessageCache.key == key {
+            return hiddenPersistedAssistantMessageCache.ids
+        }
+        let ids = Self.hiddenPersistedAssistantMessageIDs(
+            messages: vm.messages,
+            timelineTurns: vm.timeline.turns,
+            persistedAssistantTexts: persistedAssistantTexts
+        )
+        hiddenPersistedAssistantMessageCache.key = key
+        hiddenPersistedAssistantMessageCache.ids = ids
+        return ids
     }
 
     public var body: some View {
@@ -2608,7 +2793,13 @@ public struct AgentAppView: View {
             ZStack(alignment: .bottomTrailing) {
                 GeometryReader { viewport in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 32) {
+                        // PERF-MAC_AGENT-022: the live transcript is already bounded.
+                        // `LazyVStack` repeatedly hit SwiftUI LazyLayout placement loops
+                        // while rows streamed in/out, so use an eager stack for the small
+                        // visible window and keep full history in the model.
+                        VStack(alignment: .leading, spacing: 32) {
+                            let entries = visibleTranscriptEntries
+                            let hiddenEntryCount = transcriptEntries.count - entries.count
                             TimelineScrollFollower(
                                 slack: Self.timelineBottomRevealSlack,
                                 pinned: timelineSticksToBottom,
@@ -2619,8 +2810,11 @@ public struct AgentAppView: View {
                             .accessibilityHidden(true)
                             // Full thread is loaded up front (no infinite-scroll paging),
                             // so there are no top/bottom history sentinels and no per-row
-                            // body hydrate/evict — the LazyVStack realizes only visible rows.
-                            ForEach(transcriptEntries) { entry in
+                            // body hydrate/evict.
+                            if hiddenEntryCount > 0 {
+                                runningHiddenTranscriptRow(hiddenEntryCount)
+                            }
+                            ForEach(entries) { entry in
                                 switch entry {
                                 case .message(let message):
                                     messageRow(message)
@@ -2704,7 +2898,6 @@ public struct AgentAppView: View {
                     pruneExpandedItemIds()
                 }
             }
-            .onChange(of: vm.timelineUpdateTick) { _ in scheduleTimelineScrollToBottom(proxy) }
             .onChange(of: vm.status) { _ in scheduleTimelineScrollToBottom(proxy) }
         }
     }
@@ -2717,6 +2910,8 @@ public struct AgentAppView: View {
         if !expandedReasoning.isEmpty { expandedReasoning.formIntersection(liveItemIds) }
         let liveRequestIds = Set(vm.timeline.pendingRequests.map(\.id))
         if !expandedRequestPreviews.isEmpty { expandedRequestPreviews.formIntersection(liveRequestIds) }
+        let liveTurnIds = Set(vm.timeline.turns.map(\.turnId))
+        if !expandedCompletedWorkTurns.isEmpty { expandedCompletedWorkTurns.formIntersection(liveTurnIds) }
     }
 
     @ViewBuilder
@@ -3165,6 +3360,42 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private func runningHiddenTranscriptRow(_ count: Int) -> some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+            Text("\(count) earlier transcript items hidden while this run is active")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, 6)
+        .background(DS.Palette.surface.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .accessibilityIdentifier("agent.runningHiddenTranscript")
+    }
+
+    private func hiddenLiveTurnItemsRow(_ count: Int) -> some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+            Text("\(count) earlier live updates hidden while this run is active")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, 6)
+        .background(DS.Palette.surface.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .accessibilityIdentifier("agent.hiddenLiveTurnItems")
+    }
+
     // IMP-MAC_AGENT-007: tappable starter prompts on an empty thread reduce
     // blank-page friction and hint at what the agent can do.
     private static let emptyConversationStarters: [(icon: String, title: String, prompt: String)] = [
@@ -3301,17 +3532,27 @@ public struct AgentAppView: View {
         return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
     }
 
+    static func completedWorkLabel(_ turn: AssistantTurnSnapshot) -> String {
+        if let duration = turnDurationLabel(turn) {
+            return "Worked for \(duration)"
+        }
+        return "Worked"
+    }
+
     @ViewBuilder
     private func messageRow(_ msg: AgentMessage) -> some View {
         switch msg.role {
         case .user:
+            let displayText = Self.userMessageDisplayText(msg.content)
             HStack(spacing: 0) {
                 Spacer(minLength: 32)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    Text(msg.content)
+                    Text(displayText)
                         .font(DS.Font.body)
                         .foregroundColor(DS.Palette.text)
                         .textSelection(.enabled)
+                        .lineLimit(28)
+                        .truncationMode(.tail)
                         .padding(.horizontal, 22)
                         .padding(.vertical, 14)
                         .background(DS.Palette.surface)
@@ -3337,7 +3578,7 @@ public struct AgentAppView: View {
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
-            if Self.shouldRenderPersistedAssistantMessage(msg.content, timelineTurns: vm.timeline.turns) {
+            if !hiddenPersistedAssistantMessageIDs.contains(msg.id) {
                 assistantProse(msg.content)
             }
         case .system:
@@ -3355,16 +3596,46 @@ public struct AgentAppView: View {
         let turnPlans = proposedPlans(for: turn)
         let renderableItems = Self.renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
             .filter { !($0.type == .plan && !turnPlans.isEmpty) }
-        let blocks = Self.turnRenderBlocks(renderableItems)
+        let runningTurn = !turn.finished && vm.status == .running
+        let visibleRenderableItems = Self.visibleLiveTurnItems(renderableItems, running: runningTurn)
+        let hiddenLiveItemCount = renderableItems.count - visibleRenderableItems.count
+        let workItems = turn.finished ? Self.completedWorkItems(
+            in: turn,
+            renderableItems: renderableItems,
+            persistedAssistantTexts: persistedAssistantTexts
+        ) : []
+        let visibleAssistantItems = turn.finished ? Self.completedVisibleAssistantItems(
+            in: turn,
+            renderableItems: renderableItems,
+            persistedAssistantTexts: persistedAssistantTexts
+        ) : []
+        let blocks = Self.turnRenderBlocks(turn.finished ? visibleAssistantItems : visibleRenderableItems)
+        let completedWorkBlocks = Self.turnRenderBlocks(workItems)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            ForEach(blocks) { block in
-                switch block {
-                case .item(let item): itemRow(item)
-                case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+            if turn.finished, !completedWorkBlocks.isEmpty {
+                completedWorkDisclosure(turn: turn, blocks: completedWorkBlocks)
+            }
+            if !turn.finished {
+                if hiddenLiveItemCount > 0 {
+                    hiddenLiveTurnItemsRow(hiddenLiveItemCount)
+                }
+                ForEach(blocks) { block in
+                    switch block {
+                    case .item(let item): itemRow(item)
+                    case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                    }
                 }
             }
             ForEach(turnPlans) { plan in
                 proposedPlanRow(plan)
+            }
+            if turn.finished {
+                ForEach(blocks) { block in
+                    switch block {
+                    case .item(let item): itemRow(item)
+                    case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                    }
+                }
             }
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
@@ -3372,11 +3643,50 @@ public struct AgentAppView: View {
                Self.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
                 assistantProse(final)
             }
-            // UX-MAC_AGENT-017: per-turn duration once the turn has finished.
-            if turn.finished, let duration = Self.turnDurationLabel(turn) {
-                Text("Took \(duration)")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func completedWorkDisclosure(turn: AssistantTurnSnapshot, blocks: [TurnRenderBlock]) -> some View {
+        let expanded = expandedCompletedWorkTurns.contains(turn.turnId)
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if expanded {
+                        expandedCompletedWorkTurns.remove(turn.turnId)
+                    } else {
+                        expandedCompletedWorkTurns.insert(turn.turnId)
+                    }
+                }
+            } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Text(Self.completedWorkLabel(turn))
+                        .font(DS.Font.body.weight(.medium))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Hide work details" : "Show work details")
+            .accessibilityLabel(expanded ? "Hide work details" : "Show work details")
+            .accessibilityIdentifier("agent.completedWork.\(turn.turnId)")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: DS.Space.lg) {
+                    ForEach(blocks) { block in
+                        switch block {
+                        case .item(let item): itemRow(item)
+                        case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                        }
+                    }
+                }
+                .padding(.leading, DS.Space.md)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -5073,6 +5383,10 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         private var docObserver: NSObjectProtocol?
         private var lastOriginY: CGFloat = 0
         private var lastAtBottom: Bool?
+        private var pendingBottomSnap = false
+        private var pendingBottomSnapWorkItem: DispatchWorkItem?
+        private var lastBottomSnapAt: TimeInterval = 0
+        private let minimumBottomSnapInterval: TimeInterval = 0.15
 
         func configure(slack: CGFloat, pinned: Bool, onScrolledAway: @escaping () -> Void, onReturnedToBottom: @escaping () -> Void) {
             self.slack = slack
@@ -5091,6 +5405,7 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         deinit {
             if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
             if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
+            pendingBottomSnapWorkItem?.cancel()
         }
 
         func attach() {
@@ -5140,10 +5455,30 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         private func handleContentGrowth() {
             guard let g = geometry() else { return }
             if pinned, g.gap > slack {
-                scrollToBottom()
+                scheduleScrollToBottom()
             } else if g.atBottom {
                 report(atBottom: true)
             }
+        }
+
+        private func scheduleScrollToBottom() {
+            guard !pendingBottomSnap else { return }
+            pendingBottomSnap = true
+            let now = ProcessInfo.processInfo.systemUptime
+            let delay = max(0, minimumBottomSnapInterval - (now - lastBottomSnapAt))
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.pendingBottomSnap = false
+                self.pendingBottomSnapWorkItem = nil
+                guard self.pinned, let g = self.geometry() else { return }
+                if g.gap > self.slack {
+                    self.scrollToBottom()
+                } else if g.atBottom {
+                    self.report(atBottom: true)
+                }
+            }
+            pendingBottomSnapWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
         }
 
         private func scrollToBottom() {
@@ -5152,6 +5487,7 @@ private struct TimelineScrollFollower: NSViewRepresentable {
             scroll.contentView.scroll(to: NSPoint(x: 0, y: targetY))
             scroll.reflectScrolledClipView(scroll.contentView)
             lastOriginY = targetY
+            lastBottomSnapAt = ProcessInfo.processInfo.systemUptime
         }
 
         private func report(atBottom: Bool) {

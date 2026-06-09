@@ -933,6 +933,28 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the empty-thread send path must not render a queued-message row")
     }
 
+    func test_sendClearsStaleActivePlanAndRestoresBottomFollow() async throws {
+        let runner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "stale plan")
+        vm.timeline.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "Done checklist",
+            steps: [AssistantPlanStep(id: "step-1", title: "Report", status: .completed)],
+            updatedAtMs: 42
+        )))
+        let initialFocusTick = vm.focusTick
+
+        vm.prompt = "next message"
+        await vm.send()
+
+        XCTAssertNil(vm.activePlan,
+                     "sending the next user message must remove the previous turn's active plan so the transcript bottom is the new message")
+        XCTAssertGreaterThan(vm.focusTick, initialFocusTick,
+                             "a user send must re-pin the timeline to the bottom instead of relying on a pre-layout message-count change")
+        XCTAssertEqual(runner.prompts, ["next message"],
+                       "clearing stale plan state must not block the provider run")
+    }
+
     func test_send_runningThreadQueuesFollowupPrompt() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-running-queue-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -1020,6 +1042,25 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
+    func test_finishCallbackClearsActivePlanWhenFinalAssistantMessageArrives() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        let id = vm.selectedThreadId!
+        vm.timeline.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "Done checklist",
+            steps: [AssistantPlanStep(id: "step-1", title: "Report", status: .completed)],
+            updatedAtMs: 42
+        )))
+
+        vm.runCoordinator(vm.coordinator, didFinish: AgentRunID(), threadId: id, status: .completed,
+                          finalMessage: "O: completed", providerThreadId: nil)
+
+        await waitAsync("final assistant message clears stale active plan") {
+            vm.activePlan == nil &&
+            vm.messages.contains { $0.role == .assistant && $0.content == "O: completed" }
+        }
+    }
+
     func test_turnViewRendersFinalWhenAssistantItemHasNoBody() {
         let turn = AssistantTurnSnapshot(
             turnId: "turn-1",
@@ -1032,6 +1073,46 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertTrue(AgentAppView.shouldRenderFinalAssistantMessage(turn),
                       "an empty assistant item must not hide the completed final answer")
+    }
+
+    func test_completedTurnCollapsesWorkAndKeepsFinalAssistantItemVisible() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "reason", turnId: "turn-1", type: .reasoning, state: .completed, body: "thinking", startedAtMs: 1_000, finishedAtMs: 2_000),
+                AssistantItem(id: "tool", turnId: "turn-1", type: .tool, state: .completed, summary: "Bash", output: "ok", startedAtMs: 2_000, finishedAtMs: 3_000),
+                AssistantItem(id: "final", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Final answer", startedAtMs: 3_000, finishedAtMs: 4_000)
+            ],
+            finished: true
+        )
+        let renderable = AgentAppView.renderableItems(in: turn)
+
+        XCTAssertEqual(AgentAppView.completedVisibleAssistantItems(in: turn, renderableItems: renderable).map(\.id), ["final"],
+                       "when the provider has no separate final text, the last assistant message is the final answer and must stay outside the Worked disclosure")
+        XCTAssertEqual(AgentAppView.completedWorkItems(in: turn, renderableItems: renderable).map(\.id), ["reason", "tool"],
+                       "reasoning and tool rows from a completed turn must collapse into the Worked disclosure")
+        XCTAssertEqual(AgentAppView.completedWorkLabel(turn), "Worked for 3s",
+                       "completed work disclosure must show elapsed work time in the Codex-style label")
+    }
+
+    func test_completedTurnWithSeparateFinalCollapsesNonFinalAssistantDrafts() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "draft", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "I will inspect first.", startedAtMs: 1_000, finishedAtMs: 2_000),
+                AssistantItem(id: "tool", turnId: "turn-1", type: .commandExecution, state: .completed, summary: "swift test", output: "PASS", startedAtMs: 2_000, finishedAtMs: 4_000)
+            ],
+            finalAssistantMessage: "Final answer",
+            finished: true
+        )
+        let renderable = AgentAppView.renderableItems(in: turn)
+
+        XCTAssertTrue(AgentAppView.shouldRenderFinalAssistantMessage(turn),
+                      "the separate final assistant message must remain the visible completed answer")
+        XCTAssertTrue(AgentAppView.completedVisibleAssistantItems(in: turn, renderableItems: renderable).isEmpty,
+                      "non-final assistant drafts must not stay as visible transcript rows after the turn completes")
+        XCTAssertEqual(AgentAppView.completedWorkItems(in: turn, renderableItems: renderable).map(\.id), ["draft", "tool"],
+                       "everything that is not the final answer, including assistant drafts, must move into the Worked disclosure")
     }
 
     func test_turnViewRendersFinalWhenAssistantItemBodyIsOnlyPartial() {
@@ -1267,6 +1348,115 @@ final class AgentAppViewModelTests: XCTestCase {
             "S count: 1 2 3 4 5 6 7 8 9 10",
             timelineTurns: [turn]
         ), "if the live timeline has only a partial response, the persisted assistant answer must still render")
+    }
+
+    func test_hiddenPersistedAssistantMessageIDsHidesCombinedLiveAnswerOnce() {
+        let threadId = AgentThreadID()
+        let persisted = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "S start. D inspect. O done."
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "S start. D inspect.",
+                              startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage,
+                              body: "O done.",
+                              startedAtMs: 2)
+            ],
+            finished: true
+        )
+
+        XCTAssertEqual(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]),
+            [persisted.id],
+            "persisted assistant rows must be hidden when the live timeline already renders the same combined answer"
+        )
+    }
+
+    func test_hiddenPersistedAssistantMessageIDsKeepsPersistedAnswerWhenLiveDuplicateIsSuppressed() {
+        let threadId = AgentThreadID()
+        let persisted = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "1 2 3 4 5 6 7 8 9 10"
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage,
+                              body: "1 2 3 4 5 6 7 8 9 10",
+                              startedAtMs: 1)
+            ],
+            finalAssistantMessage: "1 2 3 4 5 6 7 8 9 10",
+            finished: true
+        )
+
+        XCTAssertTrue(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]).isEmpty,
+            "when the live assistant item is itself suppressed as a duplicate persisted final, the persisted answer must remain visible"
+        )
+    }
+
+    func test_userMessageDisplayTextCapsLongPromptsForLayout() {
+        let longPrompt = String(repeating: "a", count: AgentAppView.userMessagePreviewCharacterLimit + 50)
+        let display = AgentAppView.userMessageDisplayText(longPrompt)
+
+        XCTAssertLessThanOrEqual(display.count, AgentAppView.userMessagePreviewCharacterLimit + 160,
+                                 "long user prompts must render as a bounded preview so transcript layout and accessibility snapshots stay responsive")
+        XCTAssertTrue(display.contains("Copy message"),
+                      "the preview must tell users the full prompt is still available through the existing copy action")
+    }
+
+    func test_visibleLiveTurnItemsKeepsOnlyRecentUpdatesWhileRunning() {
+        let itemCount = 5_000
+        let items = (0..<itemCount).map { index in
+            AssistantItem(id: "item-\(index)", turnId: "turn-1", type: .assistantMessage, body: "\(index)", startedAtMs: Int64(index))
+        }
+        let visible = AgentAppView.visibleLiveTurnItems(items, running: true)
+
+        XCTAssertEqual(visible.count, AgentAppView.liveTurnRenderableItemLimit,
+                       "active turns must render a bounded tail so manual scrolling cannot force LazyVStack to place thousands of live rows")
+        XCTAssertEqual(visible.first?.id, "item-\(itemCount - AgentAppView.liveTurnRenderableItemLimit)",
+                       "the bounded tail must keep the newest live updates instead of the oldest ones")
+        XCTAssertEqual(AgentAppView.visibleLiveTurnItems(items, running: false).count, items.count,
+                       "completed or idle turns must retain full renderable history")
+    }
+
+    func test_visibleLiveTurnItemsCapsLargeLiveStringsOnlyForRendering() {
+        let hugeBody = String(repeating: "b", count: AgentAppView.liveTurnBodyCharacterLimit + 5_000)
+        let hugeOutput = String(repeating: "o", count: AgentAppView.liveTurnOutputCharacterLimit + 5_000)
+        let hugeSummary = String(repeating: "s", count: AgentAppView.liveTurnSummaryCharacterLimit + 5_000)
+        let item = AssistantItem(id: "huge", turnId: "turn-1", type: .commandExecution, summary: hugeSummary,
+                                 body: hugeBody, output: hugeOutput, startedAtMs: 1)
+
+        let visible = AgentAppView.visibleLiveTurnItems([item], running: true)
+
+        XCTAssertEqual(visible.count, 1)
+        XCTAssertLessThan(visible[0].body.count, hugeBody.count,
+                          "live rendering must not carry full command bodies through SwiftUI layout")
+        XCTAssertLessThan(visible[0].output?.count ?? 0, hugeOutput.count,
+                          "live rendering must not carry full command outputs through SwiftUI layout")
+        XCTAssertLessThan(visible[0].summary?.count ?? 0, hugeSummary.count,
+                          "live rendering must not carry full summaries through SwiftUI layout")
+        XCTAssertEqual(AgentAppView.visibleLiveTurnItems([item], running: false)[0].output, hugeOutput,
+                       "stored/completed data remains full; only active live UI copies are capped")
+    }
+
+    func test_toolCommandPreviewCapsLongCommandsForCollapsedRows() {
+        let command = "gh api graphql " + String(repeating: "x", count: AgentAppView.commandPreviewCharacterLimit + 200)
+        let body = #"{"command":"\#(command)"}"#
+        let item = AssistantItem(id: "cmd", turnId: "turn-1", type: .commandExecution, body: body, startedAtMs: 1)
+
+        let preview = AgentAppView.toolCommandPreview(for: item)
+
+        XCTAssertNotNil(preview)
+        XCTAssertLessThan(preview?.count ?? 0, command.count,
+                          "collapsed command rows should not feed huge command strings into SwiftUI text layout")
+        XCTAssertTrue(preview?.contains("hidden from preview") == true)
     }
 
     func test_finishCallback_marksCompletedThreadUnreadUntilOpened() async throws {

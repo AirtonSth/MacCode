@@ -40,6 +40,8 @@ public final class AppContext {
     public var socketServer: UnixSocketServer?
     private let tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
+    private var tokenSaverUsageNotificationTask: Task<Void, Never>?
+    private var tokenSaverLastUsageNotificationAt: Date = .distantPast
     private var cachedDistillClientKey: String?
     private var cachedDistillClient: DistillServiceClient?
     /// Test seam: when set, used instead of resolving a client from the live
@@ -58,6 +60,7 @@ public final class AppContext {
     // rarely nets out positive once MLX latency is counted (NetPositiveGate floor, G3).
     private static let tokenSaverMinCompressChars = 2_000
     private static let tokenSaverDistillStartupPolls = 300
+    private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -835,9 +838,31 @@ public final class AppContext {
                 currentSessionTokens: usage.totalTokens,
                 currentSessionLimitTokens: usage.contextWindow
             )
-            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            scheduleTokenSaverUsageChangedNotification()
         } catch {
             NSLog("RemoteCode Token Saver usage record failed: \(error)")
+        }
+    }
+
+    private func scheduleTokenSaverUsageChangedNotification(now: Date = Date()) {
+        let elapsed = now.timeIntervalSince(tokenSaverLastUsageNotificationAt)
+        guard elapsed < Self.tokenSaverUsageNotificationMinimumInterval else {
+            tokenSaverLastUsageNotificationAt = now
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            }
+            return
+        }
+        guard tokenSaverUsageNotificationTask == nil else { return }
+        let delay = Self.tokenSaverUsageNotificationMinimumInterval - elapsed
+        tokenSaverUsageNotificationTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            await MainActor.run {
+                guard let self else { return }
+                self.tokenSaverUsageNotificationTask = nil
+                self.tokenSaverLastUsageNotificationAt = Date()
+                NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+            }
         }
     }
 

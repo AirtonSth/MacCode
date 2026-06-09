@@ -269,6 +269,23 @@ final class AssistantTimelineTests: XCTestCase {
                        "active plan updates must preserve step state so long-running /goal work exposes current progress")
     }
 
+    func test_finalAssistantMessageClearsTransientActivePlanButKeepsProposedPlanArtifact() {
+        var s = AssistantTimelineState()
+        s.apply(.proposedPlan(AssistantProposedPlan(id: "plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")))
+        s.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "Executing plan",
+            steps: [AssistantPlanStep(id: "step-1", title: "Verify", status: .completed)],
+            updatedAtMs: 42
+        )))
+
+        s.apply(.turnCompleted(turnId: "turn-1", finalMessage: "Done."))
+
+        XCTAssertNil(s.activePlan,
+                     "once the assistant final message arrives, the active progress plan is stale and must leave the transcript bottom")
+        XCTAssertEqual(s.proposedPlans.first?.id, "plan-1",
+                       "clearing transient progress must not delete the durable proposed-plan artifact")
+    }
+
     func test_richItemTypesRemainDistinct() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "turn"))

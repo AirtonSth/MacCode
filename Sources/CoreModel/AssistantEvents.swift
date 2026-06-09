@@ -525,6 +525,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         }
     }
 
+    public mutating func clearActivePlan() {
+        activePlan = nil
+    }
+
     public mutating func apply(_ ev: AssistantEvent) {
         switch ev {
         case .threadStarted(let tid, let ptid):
@@ -595,6 +599,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
                 turns[idx].finalAssistantMessage = final.map { Self.cappedText($0, limit: Self.liveTextLimit) }
                 turns[idx].finished = true
+            }
+            if let final, !final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                clearActivePlan()
             }
         case .proposedPlan(let plan):
             proposedPlans.removeAll { $0.id == plan.id }
