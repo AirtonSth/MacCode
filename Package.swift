@@ -117,7 +117,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "RC2CLI",
-            dependencies: ["CoreModel"],
+            dependencies: ["CoreModel", "Persistence"],
             path: "Sources/RC2CLI"
         ),
         .testTarget(
