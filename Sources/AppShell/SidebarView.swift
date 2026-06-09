@@ -2112,10 +2112,12 @@ public final class SidebarView: NSObject {
     private let host: NSHostingView<SidebarRootView>
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
+    private let updater: AppUpdateChecking?
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
         self.router = router
+        self.updater = updater
         self.viewModel = SidebarViewModel(context: context, router: router, updateChecker: updater)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
@@ -2157,7 +2159,7 @@ public final class SidebarView: NSObject {
 
     @objc private func showSettings() {
         guard let context else { return }
-        let controller = settingsController ?? SettingsWindowController(context: context)
+        let controller = settingsController ?? SettingsWindowController(context: context, updater: updater)
         settingsController = controller
         if let window = view.window {
             controller.show(attachedTo: window)

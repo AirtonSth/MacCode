@@ -123,7 +123,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         configureDirectAccess()
 
         palette = CommandPalette(router: router)
-        settings = SettingsWindowController(context: context)
+        settings = SettingsWindowController(context: context, updater: updater)
         SystemNotifier.shared.bootstrap()
         reapIdleProviderSessions()
         providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
