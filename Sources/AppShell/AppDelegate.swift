@@ -5,6 +5,7 @@ import Persistence
 import AgentRuntime
 import SocketServer
 import Surfaces
+import UserNotifications
 import os
 
 private let appLifecycleLog = Logger(subsystem: "io.remotecode.app", category: "lifecycle")
@@ -125,6 +126,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         palette = CommandPalette(router: router)
         settings = SettingsWindowController(context: context, updater: updater)
         SystemNotifier.shared.bootstrap()
+        SystemNotifier.shared.onNotificationResponse = { [weak self] response in
+            self?.handleNotificationResponse(response)
+        }
         reapIdleProviderSessions()
         providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
             guard let delegate = self else { return }
@@ -627,6 +631,34 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var window: NSWindow? { windowController?.window }
 
+    // MARK: - Notification deep-link routing
+
+    private func handleNotificationResponse(_ response: UNNotificationResponse) {
+        let userInfo = response.notification.request.content.userInfo
+        let stringInfo = Dictionary(userInfo.compactMap { (k, v) -> (String, String)? in
+            guard let ks = k as? String, let vs = v as? String else { return nil }
+            return (ks, vs)
+        }, uniquingKeysWith: { a, _ in a })
+        guard let intent = Self.routeFromNotification(userInfo: stringInfo) else { return }
+        windowController?.show()
+        if let wid = intent.workspaceId {
+            try? router?.selectWorkspace(wid)
+        }
+        try? router?.selectAgentThread(thread: intent.threadId)
+    }
+
+    /// Pure mapper: notification userInfo -> RouteIntent.
+    /// Returns nil when `threadId` key is absent or not a valid UUID.
+    /// `workspaceId` is optional; absent or invalid value yields nil workspace.
+    public static func routeFromNotification(userInfo: [String: String]) -> NotificationRouteIntent? {
+        guard let raw = userInfo["threadId"],
+              let uuid = UUID(uuidString: raw) else { return nil }
+        let workspaceId = userInfo["workspaceId"]
+            .flatMap { UUID(uuidString: $0) }
+            .map { WorkspaceID($0) }
+        return NotificationRouteIntent(threadId: AgentThreadID(uuid), workspaceId: workspaceId)
+    }
+
     /// GAP-4: publish `_remotecode._tcp` so the iOS app can find this
     /// Mac on the LAN. TXT carries the stable identity + version so the
     /// client can show it before connecting.
@@ -655,6 +687,20 @@ final class BonjourDelegate: NSObject, NetServiceDelegate {
     }
     func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
         NSLog("Bonjour: FAILED to publish \(sender.name): \(errorDict)")
+    }
+}
+
+/// Decoded intent from a tapped notification. Carries the thread (and
+/// optionally the workspace) to navigate to. Workspace is absent when
+/// the notification payload does not carry `workspaceId` — the router
+/// can still find the thread by ID alone.
+public struct NotificationRouteIntent: Equatable {
+    public let threadId: AgentThreadID
+    public let workspaceId: WorkspaceID?
+
+    public init(threadId: AgentThreadID, workspaceId: WorkspaceID?) {
+        self.threadId = threadId
+        self.workspaceId = workspaceId
     }
 }
 

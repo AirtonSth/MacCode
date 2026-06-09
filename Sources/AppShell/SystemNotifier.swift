@@ -21,6 +21,10 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         set { authLock.lock(); _authorized = newValue; authLock.unlock() }
     }
 
+    /// Called on the main thread whenever the user taps a delivered
+    /// notification. Set by AppDelegate at launch to wire deep-linking.
+    public var onNotificationResponse: ((UNNotificationResponse) -> Void)?
+
     private override init() {
         super.init()
     }
@@ -128,6 +132,9 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self] in
+            self?.onNotificationResponse?(response)
+        }
         completionHandler()
     }
 
