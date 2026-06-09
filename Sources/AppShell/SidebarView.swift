@@ -1264,11 +1264,6 @@ public struct SidebarRootView: View {
         }
     }
 
-    /// Mean tokens saved per recorded run over the accumulated saved total.
-    private var tokenSaverAverageSavedPerRun: Int {
-        vm.tokenSaverSavingsSummary.averageSavedPerRun
-    }
-
     private func tokenSaverSavingsSummary(
         for snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
@@ -1400,11 +1395,6 @@ public struct SidebarRootView: View {
                 tokenSaverProviderRow(provider: .claude)
                 tokenSaverProviderRow(provider: .codex)
             }
-
-            Text(tokenSaverPlanValueText)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(DS.Space.md)
         .frame(width: 350, alignment: .leading)
@@ -1425,11 +1415,6 @@ public struct SidebarRootView: View {
                     color: DS.Palette.success,
                     label: "Token Saver",
                     value: tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
-                )
-                tokenSaverRingLegendRow(
-                    color: DS.Palette.textSecondary,
-                    label: "Used",
-                    value: Self.formatTokenCount(tokenSaverScopeUsedTokens(in: snapshot, scope: tokenSaverDetailsScope))
                 )
                 tokenSaverRingLegendRow(
                     color: tokenSaverProviderColor(.claude),
@@ -1461,24 +1446,6 @@ public struct SidebarRootView: View {
 
     private var tokenSaverDetailsSavedOrPotential: Int {
         tokenSaverSavedOrPotential(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope)
-    }
-
-    private var tokenSaverPlanValueText: String {
-        guard let user = vm.privateAccountUser else {
-            return "Sign in to track Claude and Codex usage before enabling Token Saver."
-        }
-        guard user.subscribed else {
-            return "Subscribe to start saving these tokens automatically."
-        }
-        if vm.tokenSaverEnabled {
-            let saved = vm.tokenSaverSavingsSummary.totalSavedTokens
-            guard saved > 0 else {
-                return "Token Saver is on. Saved tokens appear after your next /distill turn or large prompt compression."
-            }
-            let runs = vm.tokenSaverSavingsSummary.totalRuns
-            return "Token Saver saved \(Self.formatTokenCount(saved)) tokens across \(runs) recorded run\(runs == 1 ? "" : "s") (avg \(Self.formatTokenCount(tokenSaverAverageSavedPerRun))/run). Reports and charts keep at least 7 days of event history."
-        }
-        return "Enable Token Saver to run the approved local MLX model and start reducing provider usage."
     }
 
     private func tokenSaverProviderRow(provider: AgentProvider) -> some View {
