@@ -336,6 +336,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var didBeepForDeadInput = false
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
+    private var needsHistoryReplay = false
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     private static let busyStateProbeDuration: TimeInterval = 2.0
     private static let busyStatePollInterval: TimeInterval = 0.10
@@ -444,6 +445,7 @@ public final class TerminalSurface: NSObject, Surface {
         super.init()
         if let historyRepo {
             nextHistoryChunkIndex = (try? historyRepo.nextChunkIndex(surfaceID: descriptor.id.value.uuidString)) ?? 1
+            needsHistoryReplay = restoredSurfaceID != nil
         }
 
         terminalView.onInputData = { [weak self] data in
@@ -679,10 +681,40 @@ public final class TerminalSurface: NSObject, Surface {
             if isVisible {
                 ghosttyView.refreshSurfaceOnly()
             }
+            replayPersistedHistoryIfNeeded()
             return
         }
         guard window == nil else { return }
         scheduleParkingIfDetached()
+    }
+
+    /// Joins persisted history chunk payloads into a single contiguous byte
+    /// sequence ready for `resetSurfaceOutput`. Pure so it can be unit-tested
+    /// without AppKit or a live Ghostty surface.
+    nonisolated static func assembleReplayPayload(from chunkData: [Data]) -> Data {
+        chunkData.reduce(into: Data()) { $0.append($1) }
+    }
+
+    private func replayPersistedHistoryIfNeeded() {
+        guard needsHistoryReplay, let historyRepo else { return }
+        needsHistoryReplay = false
+        let surfaceID = descriptor.id.value.uuidString
+        historyQueue.async { [weak self] in
+            let window: TerminalOutputWindow?
+            do {
+                window = try historyRepo.readWindow(surfaceID: surfaceID)
+            } catch {
+                NSLog("RemoteCode terminal history restore failed surface=%@ error=%@", surfaceID, String(describing: error))
+                window = nil
+            }
+            guard let window, !window.chunks.isEmpty else { return }
+            let payload = TerminalSurface.assembleReplayPayload(from: window.chunks.map(\.data))
+            guard !payload.isEmpty else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.isClosing else { return }
+                self.ghosttyView.resetSurfaceOutput(payload)
+            }
+        }
     }
 
     public func appendSystemText(_ raw: String) {
