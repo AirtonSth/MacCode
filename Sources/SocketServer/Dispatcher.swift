@@ -163,10 +163,54 @@ public protocol LayoutEventSuppressionRouting: AnyObject {
     func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T
 }
 
+/// Bounded idempotency cache with insertion-order eviction (oldest-first) and TTL.
+/// - `cap`: maximum number of entries before the oldest is dropped.
+/// - `ttl`: seconds after insertion at or beyond which an entry is treated as
+///   absent (the retried command is allowed to re-execute). A `ttl` of 0 means
+///   entries are never considered fresh.
+struct BoundedReceiptCache {
+    struct Entry {
+        let value: JSONValue
+        let insertedAt: Date
+    }
+    private(set) var cap: Int
+    private(set) var ttl: TimeInterval
+    private var store: [String: Entry] = [:]
+    /// Insertion-ordered keys (oldest first).
+    private var order: [String] = []
+
+    init(cap: Int = 256, ttl: TimeInterval = 300) {
+        self.cap = cap
+        self.ttl = ttl
+    }
+
+    /// Returns the value for `key` if present AND within TTL; otherwise nil.
+    func value(for key: String) -> JSONValue? {
+        guard let entry = store[key] else { return nil }
+        guard Date().timeIntervalSince(entry.insertedAt) < ttl else { return nil }
+        return entry.value
+    }
+
+    /// Inserts `value` for `key`. Evicts oldest entry when at cap.
+    mutating func insert(key: String, value: JSONValue) {
+        if store[key] == nil {
+            // Evict oldest when at cap.
+            while order.count >= cap, !order.isEmpty {
+                let oldest = order.removeFirst()
+                store.removeValue(forKey: oldest)
+            }
+            order.append(key)
+        }
+        store[key] = Entry(value: value, insertedAt: Date())
+    }
+
+    var count: Int { store.count }
+}
+
 @MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
-    private var volatileCommandReceipts: [String: JSONValue] = [:]
+    private var volatileCommandReceipts = BoundedReceiptCache()
     public init(router: CommandRouting) { self.router = router }
 
     private func commandReceipt(method: String, params: [String: JSONValue]) -> (String, JSONValue)? {
@@ -174,7 +218,7 @@ public final class JSONRPCDispatcher {
         if let durable = router.commandReceipt(method: method, clientRequestId: receiptKey) {
             return (receiptKey, durable)
         }
-        if let cached = volatileCommandReceipts["\(method):\(receiptKey)"] {
+        if let cached = volatileCommandReceipts.value(for: "\(method):\(receiptKey)") {
             return (receiptKey, cached)
         }
         return nil
@@ -182,7 +226,7 @@ public final class JSONRPCDispatcher {
 
     private func recordCommandReceipt(method: String, clientRequestId: String?, result: JSONValue) {
         guard let clientRequestId else { return }
-        volatileCommandReceipts["\(method):\(clientRequestId)"] = result
+        volatileCommandReceipts.insert(key: "\(method):\(clientRequestId)", value: result)
         router.recordCommandReceipt(method: method, clientRequestId: clientRequestId, result: result)
     }
 
