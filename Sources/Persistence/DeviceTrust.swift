@@ -44,6 +44,116 @@ public struct PairingRequest: Codable, Sendable, Equatable {
     public var effectiveStatus: String { isExpired ? "expired" : status }
 }
 
+/// Decision returned by `PairingThrottle.check`.
+public enum PairingThrottleDecision: Sendable, Equatable {
+    case allowed
+    /// Peer is locked out; `retryAfter` seconds remain until the next attempt.
+    case denied(retryAfter: TimeInterval)
+}
+
+/// Thread-safe brute-force defense for the LAN pairing surface.
+///
+/// A 6-digit pairing code (10^6 space) with a 10-minute TTL is trivially
+/// brute-forceable over LAN if the redeem/request endpoints accept unlimited
+/// attempts. This component throttles by *peer* (source IP): each failed
+/// attempt grows an exponential backoff lockout, a success resets the peer,
+/// and the number of simultaneously-outstanding pairing requests per peer is
+/// capped so a single peer cannot flood the approve/deny queue.
+///
+/// Pure & deterministic given an injected `now`, so the backoff schedule is
+/// directly testable without sleeping. All mutating ops take the internal
+/// lock so it is safe to share across the server's per-connection threads.
+public final class PairingThrottle: @unchecked Sendable {
+    /// Failures before lockout begins. Below this, attempts are free so a
+    /// legitimate mistyped code is never punished with a wait.
+    public let freeAttempts: Int
+    /// Backoff base after the free attempts are exhausted (seconds). Doubles
+    /// per excess failure: base, 2·base, 4·base … capped at `maxBackoff`.
+    public let baseBackoff: TimeInterval
+    /// Upper bound on a single lockout window (seconds).
+    public let maxBackoff: TimeInterval
+    /// Max pairing requests a single peer may have outstanding at once.
+    public let maxOutstandingPerPeer: Int
+
+    private struct State {
+        var failures: Int = 0
+        var lockedUntil: Date?
+        var outstanding: Int = 0
+    }
+
+    private let lock = NSLock()
+    private var peers: [String: State] = [:]
+
+    public init(freeAttempts: Int = 3,
+                baseBackoff: TimeInterval = 2,
+                maxBackoff: TimeInterval = 300,
+                maxOutstandingPerPeer: Int = 5) {
+        self.freeAttempts = freeAttempts
+        self.baseBackoff = baseBackoff
+        self.maxBackoff = maxBackoff
+        self.maxOutstandingPerPeer = maxOutstandingPerPeer
+    }
+
+    /// Whether `peer` may attempt a redeem right now. Read-only: it never
+    /// mutates the failure count (call `recordFailure`/`recordSuccess` for
+    /// that) so a denied peer is not penalized merely for being checked.
+    public func check(peer: String, now: Date = Date()) -> PairingThrottleDecision {
+        lock.lock(); defer { lock.unlock() }
+        guard let until = peers[peer]?.lockedUntil, until > now else { return .allowed }
+        return .denied(retryAfter: until.timeIntervalSince(now))
+    }
+
+    /// Record a failed attempt and arm/extend the lockout. Returns the new
+    /// decision (always `.denied` once past the free attempts).
+    @discardableResult
+    public func recordFailure(peer: String, now: Date = Date()) -> PairingThrottleDecision {
+        lock.lock(); defer { lock.unlock() }
+        var st = peers[peer] ?? State()
+        st.failures += 1
+        let excess = st.failures - freeAttempts
+        if excess > 0 {
+            // base · 2^(excess-1), capped.
+            let raw = baseBackoff * pow(2, Double(excess - 1))
+            let window = min(raw, maxBackoff)
+            st.lockedUntil = now.addingTimeInterval(window)
+            peers[peer] = st
+            return .denied(retryAfter: window)
+        }
+        peers[peer] = st
+        return .allowed
+    }
+
+    /// Clear all penalty + lockout for `peer` after a successful pairing so a
+    /// device that finally pairs is not stuck behind a prior backoff. Keeps
+    /// any outstanding-request reservations intact.
+    public func recordSuccess(peer: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard var st = peers[peer] else { return }
+        st.failures = 0
+        st.lockedUntil = nil
+        peers[peer] = st
+    }
+
+    /// Reserve one outstanding-request slot for `peer`. Returns false (and
+    /// reserves nothing) when the peer is already at `maxOutstandingPerPeer`.
+    public func reserveOutstanding(peer: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        var st = peers[peer] ?? State()
+        guard st.outstanding < maxOutstandingPerPeer else { return false }
+        st.outstanding += 1
+        peers[peer] = st
+        return true
+    }
+
+    /// Release one previously-reserved outstanding-request slot (clamped at 0).
+    public func releaseOutstanding(peer: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard var st = peers[peer] else { return }
+        st.outstanding = max(0, st.outstanding - 1)
+        peers[peer] = st
+    }
+}
+
 public final class DeviceTrustRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }

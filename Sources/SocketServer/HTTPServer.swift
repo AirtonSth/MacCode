@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import CryptoKit
+import Persistence
 
 /// Minimal HTTP/1.1 + WebSocket-stub server used as the desktop-side
 /// foundation for a future direct-VPN/LAN mobile client. The intent is
@@ -52,6 +53,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// survive process restarts or every relaunch looks like a different
     /// Mac and forces a re-pair (GAP-2).
     public let serverId: String
+
+    /// Per-peer brute-force brake for the LAN pairing endpoints. The 6-digit
+    /// code is brute-forceable over LAN without this throttle.
+    let pairingThrottle = PairingThrottle()
 
     private var listenFD: Int32 = -1
     private var running = false
@@ -111,7 +116,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let fd = Darwin.accept(listenFD, &caddr, &clen)
             if fd < 0 { if !running { return }; continue }
             disableSIGPIPE(fd: fd)
-            DispatchQueue.global().async { [weak self] in self?.handle(fd: fd) }
+            let peer = Self.peerIP(caddr)
+            DispatchQueue.global().async { [weak self] in self?.handle(fd: fd, peer: peer) }
         }
     }
 
@@ -120,7 +126,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
     }
 
-    private func handle(fd: Int32) {
+    /// Numeric source IP of an accepted connection, used as the throttle key.
+    /// Falls back to "unknown" so a peer we can't parse still shares a single
+    /// throttle bucket rather than bypassing the limiter.
+    static func peerIP(_ addr: sockaddr) -> String {
+        var addr = addr
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let len = socklen_t(addr.sa_len)
+        let rc = withUnsafePointer(to: &addr) { ptr in
+            getnameinfo(ptr, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+        }
+        return rc == 0 ? String(cString: host) : "unknown"
+    }
+
+    private func handle(fd: Int32, peer: String) {
         var subID: UUID?
         defer {
             if let s = subID { EventBus.shared.unsubscribe(s) }
@@ -343,10 +362,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
             guard let auth = auth else {
                 send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
             }
+            // Cap simultaneously-outstanding requests per peer so one device
+            // cannot flood the approve/deny queue.
+            guard pairingThrottle.reserveOutstanding(peer: peer) else {
+                send(fd: fd, status: 429, contentType: "text/plain", body: "too many outstanding pairing requests\n".data(using: .utf8)!); return
+            }
             let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any]
             let deviceName = (obj?["device_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Unnamed device"
             let privateAccountAccessToken = (obj?["private_account_access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             guard let r = auth.createPairingRequest(deviceName: deviceName, privateAccountAccessToken: privateAccountAccessToken) else {
+                pairingThrottle.releaseOutstanding(peer: peer)
                 send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
             }
             sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300], acceptEncoding: headers["accept-encoding"])
@@ -370,9 +395,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                   let name = obj["device_name"] as? String else {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
+            // Brute-force brake: refuse while the peer is locked out, count
+            // wrong codes toward an exponential backoff, and reset on success.
+            if case .denied(let retryAfter) = pairingThrottle.check(peer: peer) {
+                let secs = Int(retryAfter.rounded(.up))
+                send(fd: fd, status: 429, contentType: "text/plain",
+                     body: "too many attempts, retry in \(secs)s\n".data(using: .utf8)!)
+                return
+            }
             if let (deviceId, token) = auth.redeemPairingCode(code, deviceName: name) {
+                pairingThrottle.recordSuccess(peer: peer)
+                pairingThrottle.releaseOutstanding(peer: peer)
                 sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token], acceptEncoding: headers["accept-encoding"])
             } else {
+                pairingThrottle.recordFailure(peer: peer)
                 send(fd: fd, status: 410, contentType: "text/plain", body: "code expired or already redeemed\n".data(using: .utf8)!)
             }
         case ("GET", "/v1/devices"):
