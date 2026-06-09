@@ -135,6 +135,104 @@ private struct FileEntry: Identifiable, Equatable {
     }
 }
 
+// MARK: - Lazy file tree model
+//
+// The sidebar renders a hierarchical tree (P1): directory rows are expandable and their children
+// are fetched lazily the first time the row is expanded, instead of re-listing the whole directory
+// on navigation. The nesting/lazy-fetch logic is isolated here, generic over a minimal item
+// protocol and a child-lister closure, so it can be unit-tested without AppKit/WebKit or the real
+// filesystem (the production lister is `router.fsWorkspaceList`; tests inject a stub).
+
+/// Minimal shape a row needs to participate in the lazy tree. `FileEntry` conforms in production;
+/// tests supply a lightweight stub so the nesting/lazy-fetch logic can be exercised in isolation.
+protocol FileTreeItem: Identifiable, Equatable where ID == String {
+    var name: String { get }
+    var relativePath: String { get }
+    var isDirectory: Bool { get }
+}
+
+/// A node in the lazy tree. `children == nil` means "directory not expanded yet / children not
+/// fetched"; an empty array means "expanded and confirmed empty". Leaves keep `children == nil`
+/// permanently since they are never expanded.
+final class FileTreeNode<Item: FileTreeItem>: Identifiable {
+    let item: Item
+    var children: [FileTreeNode<Item>]?
+    var isExpanded: Bool
+
+    var id: String { item.id }
+
+    init(item: Item, children: [FileTreeNode<Item>]? = nil, isExpanded: Bool = false) {
+        self.item = item
+        self.children = children
+        self.isExpanded = isExpanded
+    }
+}
+
+/// Builds a node tree from flat per-directory listings and fetches each directory's children lazily
+/// on first expand. Owns no IO itself: the `lister` closure (path -> entries) is injected, so the
+/// real fetch path (security-scoped `fsWorkspaceList`) is unchanged and the logic stays testable.
+final class FileTreeStore<Item: FileTreeItem> {
+    /// path (relative; "" = directory whose children these are) -> entries directly under it.
+    private let lister: (String) throws -> [Item]
+    private(set) var roots: [FileTreeNode<Item>] = []
+    /// Path-keyed cache of fetched children, shared with the node API so the SwiftUI tree (which
+    /// renders by path) and the node-based contract both consult one fetch + one cache.
+    private var childCache: [String: [Item]] = [:]
+
+    init(lister: @escaping (String) throws -> [Item]) {
+        self.lister = lister
+    }
+
+    /// Seed the top level from an already-fetched flat listing (the directory currently shown),
+    /// so the first paint costs nothing extra over the old flat list. Clears any cached subtree
+    /// since a new top level invalidates the previous tree.
+    func setRoots(_ items: [Item]) {
+        roots = items.map { FileTreeNode(item: $0) }
+        childCache = [:]
+    }
+
+    /// Expand a directory node, fetching its children the first time only. A node already carrying
+    /// `children` is not re-fetched (`force` re-lists, e.g. after a mutation in that directory).
+    /// Returns false and stays collapsed if the lazy fetch throws, so a failed listing doesn't
+    /// leave the row in a lying "expanded but empty" state.
+    @discardableResult
+    func expand(_ node: FileTreeNode<Item>, force: Bool = false) -> Bool {
+        guard node.item.isDirectory else { return false }
+        if node.children == nil || force {
+            do {
+                let fetched = try fetch(node.item.relativePath, force: force)
+                node.children = fetched.map { FileTreeNode(item: $0) }
+            } catch {
+                node.children = nil
+                node.isExpanded = false
+                return false
+            }
+        }
+        node.isExpanded = true
+        return true
+    }
+
+    func collapse(_ node: FileTreeNode<Item>) {
+        node.isExpanded = false
+    }
+
+    /// Children directly under `path`, fetched lazily on first request and cached. Used by the
+    /// path-addressed SwiftUI tree; shares the cache and lister with the node API. A failed fetch
+    /// yields `[]` without caching, so the row can retry instead of sticking as empty.
+    func children(at path: String) -> [Item] {
+        (try? fetch(path, force: false)) ?? []
+    }
+
+    private func fetch(_ path: String, force: Bool) throws -> [Item] {
+        if !force, let cached = childCache[path] { return cached }
+        let fetched = try lister(path)
+        childCache[path] = fetched
+        return fetched
+    }
+}
+
+extension FileEntry: FileTreeItem {}
+
 private struct FileTabDragModifier: ViewModifier {
     let payload: String?
 
@@ -166,6 +264,14 @@ private final class FilesViewModel: ObservableObject {
     @Published var isDirty = false
     @Published var dirtyPaths: Set<String> = []
     @Published var readerMode = "source"
+    // Lazy tree state: which directory rows are currently expanded. The actual per-directory child
+    // listings live in `treeStore`, which fetches them on first expand and caches them. Reset
+    // whenever the displayed directory changes (P1). `expandedPaths` is the @Published trigger that
+    // makes SwiftUI re-render the affected subtree.
+    @Published var expandedPaths: Set<String> = []
+    private lazy var treeStore = FileTreeStore<FileEntry>(lister: { [weak self] path in
+        try self?.listEntries(at: path) ?? []
+    })
     @Published var previewURL: URL?
     @Published var syncLabel = "Up to date"
     @Published var syncDetail = ""
@@ -246,15 +352,12 @@ private final class FilesViewModel: ObservableObject {
         errorText = nil
         do {
             let result = try router?.fsWorkspaceList(workspace: workspaceID, path: relativePath)
-            let values = result?.objectValue?["entries"]?.arrayValue ?? []
-            entries = values.compactMap(FileEntry.init(value:)).map { entry in
-                var entry = entry
-                if !entry.isDirectory {
-                    entry.dragPayload = FileTabDragPayload.encode(workspaceID: workspaceID, sourceSurfaceID: surfaceID, path: entry.relativePath)
-                }
-                return entry
-            }
+            entries = mapEntries(result)
             currentDirectory = result?.objectValue?["relative_path"]?.stringValue ?? relativePath
+            // Reset the lazy subtree state on navigation: the new directory's children become the
+            // top level, and any previously expanded subtree no longer applies (P1).
+            expandedPaths = []
+            treeStore.setRoots(entries)
             isLoading = false
             _ = try? router?.filesStateUpdate(surface: surfaceID, patch: [
                 "current_directory": .string(currentDirectory)
@@ -262,6 +365,51 @@ private final class FilesViewModel: ObservableObject {
         } catch {
             isLoading = false
             errorText = String(describing: error)
+        }
+    }
+
+    /// Map a `fsWorkspaceList` result's entries into `FileEntry` rows, attaching drag payloads to
+    /// files. Shared by the top-level directory load and the lazy subtree fetch so both produce
+    /// identical rows. This keeps the existing security-scoped `fsWorkspaceList` IO unchanged —
+    /// only the surrounding tree structure is new (P1).
+    private func mapEntries(_ result: JSONValue?) -> [FileEntry] {
+        let values = result?.objectValue?["entries"]?.arrayValue ?? []
+        return values.compactMap(FileEntry.init(value:)).map { entry in
+            var entry = entry
+            if !entry.isDirectory {
+                entry.dragPayload = FileTabDragPayload.encode(workspaceID: workspaceID, sourceSurfaceID: surfaceID, path: entry.relativePath)
+            }
+            return entry
+        }
+    }
+
+    /// Fetch the entries directly under `relativePath` (security-scoped `fsWorkspaceList`), mapped
+    /// to rows. Used by the lazy subtree fetch.
+    private func listEntries(at relativePath: String) throws -> [FileEntry] {
+        mapEntries(try router?.fsWorkspaceList(workspace: workspaceID, path: relativePath))
+    }
+
+    /// Children of an expanded directory row, fetched lazily the first time the row is expanded and
+    /// cached thereafter by `treeStore`; an empty/failed fetch yields `[]` so the row doesn't keep
+    /// retrying every redraw (P1).
+    func childEntries(for directory: FileEntry) -> [FileEntry] {
+        treeStore.children(at: directory.relativePath)
+    }
+
+    func isExpanded(_ directory: FileEntry) -> Bool {
+        expandedPaths.contains(directory.relativePath)
+    }
+
+    /// Toggle a directory row's disclosure. Expanding triggers the lazy child fetch (and caches it);
+    /// collapsing only hides the already-fetched subtree. Independent of selection so the triangle
+    /// behaves like NSOutlineView disclosure, while row selection still navigates/opens (P1).
+    func toggleExpand(_ directory: FileEntry) {
+        guard directory.isDirectory else { return }
+        if expandedPaths.contains(directory.relativePath) {
+            expandedPaths.remove(directory.relativePath)
+        } else {
+            _ = childEntries(for: directory)
+            expandedPaths.insert(directory.relativePath)
         }
     }
 
@@ -756,16 +904,7 @@ private struct FilesSurfaceRoot: View {
                     .help("Go to parent folder (⌘↑)")
                     .accessibilityIdentifier("files.parent.button")
                 }
-                ForEach(visibleEntries) { entry in
-                    row(icon: entry.icon, name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath), dirtyPath: entry.relativePath)
-                        .tag(entry.id)
-                        .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
-                        .listRowBackground(Color.clear)
-                        .contextMenu { fileContextMenu(for: entry) }
-                        .fileTabDragPayload(entry.dragPayload)
-                        .help(entry.relativePath.isEmpty ? entry.name : entry.relativePath)
-                        .accessibilityIdentifier("files.row.\(entry.relativePath)")
-                }
+                treeRows(visibleEntries, depth: 0)
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
@@ -787,6 +926,58 @@ private struct FilesSurfaceRoot: View {
     // Dotfiles are hidden unless the user opts in via the sidebar toggle (IMP-MAC_FILES-014).
     private var visibleEntries: [FileEntry] {
         showHidden ? model.entries : model.entries.filter { !$0.isHidden }
+    }
+
+    private func visibleChildren(of directory: FileEntry) -> [FileEntry] {
+        let children = model.childEntries(for: directory)
+        return showHidden ? children : children.filter { !$0.isHidden }
+    }
+
+    // Recursive tree renderer (P1): each row gets a disclosure triangle when it is a directory, and
+    // its children are emitted indented and lazily — `model.childEntries` only fetches on first
+    // expand. Selection/open/drag/dirty affordances are unchanged from the old flat row; only the
+    // leading disclosure control and indentation are new.
+    // Returns AnyView to break the self-referential opaque return type a directly recursive
+    // @ViewBuilder would otherwise produce.
+    private func treeRows(_ entries: [FileEntry], depth: Int) -> some View {
+        ForEach(entries) { entry in
+            entryRow(entry, depth: depth)
+            if entry.isDirectory && model.isExpanded(entry) {
+                AnyView(treeRows(visibleChildren(of: entry), depth: depth + 1))
+            }
+        }
+    }
+
+    private func entryRow(_ entry: FileEntry, depth: Int) -> some View {
+        HStack(spacing: 0) {
+            if depth > 0 {
+                Spacer().frame(width: CGFloat(depth) * 14)
+            }
+            if entry.isDirectory {
+                Button {
+                    model.toggleExpand(entry)
+                } label: {
+                    Image(systemName: model.isExpanded(entry) ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(DS.Palette.textTertiary)
+                        .frame(width: 14, height: 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(model.isExpanded(entry) ? "Collapse folder" : "Expand folder")
+                .accessibilityIdentifier("files.disclosure.\(entry.relativePath)")
+            } else {
+                Spacer().frame(width: 14)
+            }
+            row(icon: entry.icon, name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath), dirtyPath: entry.relativePath)
+        }
+        .tag(entry.id)
+        .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
+        .listRowBackground(Color.clear)
+        .contextMenu { fileContextMenu(for: entry) }
+        .fileTabDragPayload(entry.dragPayload)
+        .help(entry.relativePath.isEmpty ? entry.name : entry.relativePath)
+        .accessibilityIdentifier("files.row.\(entry.relativePath)")
     }
 
     // Language badge, size, and modified-ago for the selected text file so users get context
