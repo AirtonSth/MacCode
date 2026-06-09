@@ -308,6 +308,79 @@ case "events":
     let sub = restArgs[0]
     switch sub {
     case "recent": emit(rpc.call("events.recent", params: [:]))
+    case "stream":
+        let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
+        let afterSeq = Int(flags["after-seq"] ?? "0") ?? 0
+        // Open a dedicated socket and enter long-lived NDJSON follow mode.
+        // Each server-pushed JSONRPCResponse arrives as one '\n'-terminated
+        // JSON line; we forward it verbatim to stdout so callers can pipe
+        // through `jq` or any NDJSON consumer.
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 {
+            FileHandle.standardError.write(Data("error: socket(): \(String(cString: strerror(errno)))\n".utf8))
+            Darwin.exit(1)
+        }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let spBytes = socketPath.utf8CString
+        let maxPath = MemoryLayout.size(ofValue: addr.sun_path)
+        if spBytes.count > maxPath {
+            FileHandle.standardError.write(Data("error: socket path too long\n".utf8))
+            Darwin.exit(1)
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { tp in
+            tp.withMemoryRebound(to: CChar.self, capacity: maxPath) { base in
+                spBytes.withUnsafeBufferPointer { src in
+                    for i in 0..<src.count { base[i] = src[i] }
+                }
+            }
+        }
+        let connResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if connResult < 0 {
+            let msg = String(cString: strerror(errno))
+            FileHandle.standardError.write(Data("error: connect(\(socketPath)): \(msg). Is the RemoteCode app running?\n".utf8))
+            Darwin.close(fd)
+            Darwin.exit(1)
+        }
+        // Send events.stream request.
+        let streamReqDict: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": "events.stream",
+            "method": "events.stream",
+            "params": ["after_seq": afterSeq]
+        ]
+        guard var reqData = try? JSONSerialization.data(withJSONObject: streamReqDict, options: []) else {
+            Darwin.close(fd); Darwin.exit(1)
+        }
+        reqData.append(0x0A)
+        reqData.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            while written < reqData.count {
+                let n = Darwin.write(fd, base.advanced(by: written), reqData.count - written)
+                if n <= 0 { return }
+                written += n
+            }
+        }
+        // Read NDJSON lines forever; SIGINT / pipe-close terminates the loop.
+        var lineBuf = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = Darwin.read(fd, &chunk, chunk.count)
+            if n <= 0 { break }
+            lineBuf.append(chunk, count: n)
+            while let nlIdx = lineBuf.firstIndex(of: 0x0A) {
+                let line = lineBuf.subdata(in: lineBuf.startIndex..<lineBuf.index(after: nlIdx)) // includes \n
+                lineBuf.removeSubrange(lineBuf.startIndex...nlIdx)
+                FileHandle.standardOutput.write(line)
+            }
+        }
+        Darwin.close(fd)
+        Darwin.exit(0)
     default: usage(RC2ExitCode.usageError)
     }
 case "notification":
