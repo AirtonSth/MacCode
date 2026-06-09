@@ -460,7 +460,12 @@ public struct AssistantTurnSnapshot: Codable, Sendable, Equatable {
 public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public static let liveTextLimit = 80_000
     public static let liveOutputLimit = 120_000
-    public static let liveTurnLimit = 80
+    // Memory ceiling, NOT a display window. Sized at/above the DB's per-thread stream-event
+    // prune cap (~5000) so turns can never be the truncation point — reopening a long thread
+    // shows 100% of its turns. The bound still exists as a pathological-OOM backstop; total
+    // in-memory text stays bounded because the DB itself prunes events to ~5000 per thread,
+    // and the LazyVStack only realizes on-screen rows.
+    public static let liveTurnLimit = 5_000
     public static let providerRuntimeEventLimit = 500
     public static let workActivityLimit = 120
     public static let pendingRequestLimit = 200

@@ -85,9 +85,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
     @Published public var runStartedAt: Date?
-    @Published public private(set) var retainedTranscriptBodyCount: Int = 0
-    @Published public private(set) var visibleTranscriptRowCount: Int = 0
-    @Published public private(set) var hydrationDirection: String?
     /// UX-MAC_AGENT-009: true while the last surfaced error is recoverable, so
     /// the transcript can offer a Retry of the last prompt instead of forcing a
     /// retype. Cleared when a run starts or any non-error event arrives.
@@ -205,12 +202,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var composerDraftsByThread: [AgentThreadID: String] = [:]
 
     public func selectThread(_ id: AgentThreadID) {
-        // PERF-MAC_AGENT-007: a different thread's bodies are irrelevant; free
-        // the LRU cache so it stays bounded as the user moves between threads.
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
-            bodyCache.removeAll()
-            bodyCacheOrder.removeAll()
             // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
             // then restore the opened thread's draft (an in-progress prompt on a
             // re-select of the same thread is left untouched).
@@ -250,12 +243,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let idx = threads.firstIndex(where: { $0.id == id }), threads[idx].hasUnread {
             threads[idx].hasUnread = false
         }
-        loadInitialMessagePage(id)
+        loadAllMessages(id)
         timeline = AssistantTimelineState()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
-        let replayEvents = providerThreadSnapshotEvents(threadId: id).map {
-            mergePersistedContextTelemetry(snapshot: $0, persisted: persistedEvents)
-        } ?? persistedEvents
+        let replayEvents = Self.chooseReplayEvents(
+            persisted: persistedEvents,
+            snapshot: providerThreadSnapshotEvents(threadId: id).map {
+                mergePersistedContextTelemetry(snapshot: $0, persisted: persistedEvents)
+            }
+        )
         for event in replayEvents {
             timeline.apply(event)
         }
@@ -410,7 +406,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // PERF-MAC_AGENT-006: revert deleted assistant rows — drop the cache.
             lastPersistedAssistantContentByThread.removeValue(forKey: selectedThreadId)
             checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
-            loadInitialMessagePage(selectedThreadId)
+            loadAllMessages(selectedThreadId)
             reloadCheckpoints()
             reloadThreads()
         } catch {
@@ -444,6 +440,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return merged
     }
 
+    /// Pick the replay source that reconstructs MORE of the thread. The provider snapshot
+    /// (Codex `thread/read`) is context-compacted: once the model auto-compacts, it drops the
+    /// older turns and returns only the recent tail — so for a long thread it shows the thread
+    /// "cortado". Our persisted stream events are the full local record (pruned only at ~5000).
+    /// Displaying whichever is fuller means reopening a compacted thread shows 100% of its
+    /// turns, while threads imported from an external provider session (no/thin persisted
+    /// history) still fall back to the snapshot.
+    nonisolated static func chooseReplayEvents(persisted: [AssistantEvent], snapshot: [AssistantEvent]?) -> [AssistantEvent] {
+        guard let snapshot else { return persisted }
+        return renderableItemCount(persisted) > renderableItemCount(snapshot) ? persisted : snapshot
+    }
+
+    nonisolated static func renderableItemCount(_ events: [AssistantEvent]) -> Int {
+        events.reduce(0) { count, event in
+            if case .itemStarted = event { return count + 1 }
+            return count
+        }
+    }
+
     private func rehydrateProposedPlans(threadId: AgentThreadID) {
         guard let proposedPlanRepo,
               let records = try? proposedPlanRepo.list(threadId: threadId) else { return }
@@ -473,28 +488,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    // MARK: B4 — viewport-bound message history
+    // MARK: Full-thread message history
+    //
+    // The transcript loads EVERY message in the thread up front — no infinite-scroll
+    // paging, no off-screen body eviction. The old viewport window paged 30 rows at a
+    // time and evicted off-screen bodies on scroll; hydrate/evict flips a row's height
+    // mid-scroll, which is exactly what made auto-scroll jump around (the reported bug).
+    // Render/CPU stays bounded because the LazyVStack only realizes on-screen rows, the
+    // transcript signature is O(turns) (not O(messages)), and a memory safety-valve
+    // blanks the oldest bodies on a pathological thread so a full load can't blow up RAM.
+    nonisolated static let fullLoadBodyBudgetBytes = 24 * 1024 * 1024  // ~24 MB of transcript text
 
-    static let viewportMessagePageSize = 30
-    static let maximumMessageMetadataRows = 160
-    private var oldestLoadedCursor: AgentMessageCursor?
-    private var newestLoadedCursor: AgentMessageCursor?
-    private var visibleMessageIds = Set<AgentMessageID>()
-    private var suppressNextMessageAutoScroll = false
-    @Published public var hasMoreOlder: Bool = false
-    @Published public var hasMoreNewer: Bool = false
+    private func loadAllMessages(_ id: AgentThreadID) {
+        let all = ((try? messageRepo.list(threadId: id)) ?? []).map(Self.displayMessage)
+        let (rows, blanked) = Self.applyBodyBudget(all)
+        if blanked > 0 {
+            // Fail loud: a thread big enough to trip the budget loses its oldest bodies.
+            NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(all.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
+        }
+        messages = rows
+    }
 
-    private func loadInitialMessagePage(_ id: AgentThreadID) {
-        let page = (try? messageRepo.listPage(threadId: id, limit: Self.viewportMessagePageSize, before: nil, after: nil))
-            ?? AgentMessagePage(messages: [], hasMoreOlder: false, nextBefore: nil)
-        messages = page.messages.map(Self.displayMessage)
-        hasMoreOlder = page.hasMoreOlder
-        hasMoreNewer = page.hasMoreNewer
-        oldestLoadedCursor = page.nextBefore
-        newestLoadedCursor = page.nextAfter ?? messages.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
-        hydrationDirection = nil
-        visibleMessageIds = Set(messages.map(\.id))
-        refreshTranscriptBodyMetrics()
+    /// Safety valve for a pathological thread: keep the NEWEST bodies in full and blank
+    /// the oldest (content -> "") until total text is under `budget`. Returns the rows and
+    /// how many were blanked. Pure + testable. For a normal thread nothing is blanked.
+    nonisolated static func applyBodyBudget(_ rows: [AgentMessage], budget: Int = fullLoadBodyBudgetBytes) -> (rows: [AgentMessage], blanked: Int) {
+        var total = 0
+        for r in rows { total += r.content.utf8.count }
+        guard total > budget else { return (rows, 0) }
+        var result = rows
+        var running = total
+        var blanked = 0
+        var i = 0
+        while running > budget && i < result.count {
+            let bytes = result[i].content.utf8.count
+            if bytes > 0 {
+                result[i].content = ""
+                running -= bytes
+                blanked += 1
+            }
+            i += 1
+        }
+        return (result, blanked)
     }
 
     private static func displayMessage(_ message: AgentMessage) -> AgentMessage {
@@ -503,161 +538,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return m
     }
 
-    private static func metadataOnly(_ message: AgentMessage) -> AgentMessage {
-        var m = message
-        m.content = ""
-        return m
-    }
-
     private func suppressPersistedFinalDuplicatedByTimeline() {
         // Persisted assistant rows are the durable completed answer. The view
         // suppresses matching live timeline text instead so partial replay
         // cannot hide the final response.
-    }
-
-    @discardableResult
-    public func loadOlderMessagesIfNeeded(anchorMessageId: AgentMessageID?) -> AgentMessageID? {
-        guard let id = selectedThreadId, hasMoreOlder, let cursor = oldestLoadedCursor else { return nil }
-        guard let page = try? messageRepo.listPage(threadId: id, limit: Self.viewportMessagePageSize, before: cursor, after: nil),
-              !page.messages.isEmpty else {
-            hasMoreOlder = false
-            return nil
-        }
-        hydrationDirection = "older"
-        suppressNextMessageAutoScroll = true
-        mergeLoadedMessages(page.messages, retainingBodiesFor: Set(page.messages.map(\.id)).union(anchorMessageId.map { [$0] } ?? []))
-        hasMoreOlder = page.hasMoreOlder
-        hasMoreNewer = true
-        oldestLoadedCursor = page.nextBefore ?? oldestLoadedCursor
-        newestLoadedCursor = messages.last.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
-        return anchorMessageId
-    }
-
-    @discardableResult
-    public func loadNewerMessagesIfNeeded(anchorMessageId: AgentMessageID?) -> AgentMessageID? {
-        guard let id = selectedThreadId, hasMoreNewer, let cursor = newestLoadedCursor else { return nil }
-        guard let page = try? messageRepo.listPage(threadId: id, limit: Self.viewportMessagePageSize, before: nil, after: cursor),
-              !page.messages.isEmpty else {
-            hasMoreNewer = false
-            return nil
-        }
-        hydrationDirection = "newer"
-        suppressNextMessageAutoScroll = true
-        mergeLoadedMessages(page.messages, retainingBodiesFor: Set(page.messages.map(\.id)).union(anchorMessageId.map { [$0] } ?? []))
-        hasMoreOlder = true
-        hasMoreNewer = page.hasMoreNewer
-        oldestLoadedCursor = messages.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
-        newestLoadedCursor = page.nextAfter ?? newestLoadedCursor
-        return anchorMessageId
-    }
-
-    public func markMessageVisible(_ id: AgentMessageID) {
-        visibleMessageIds.insert(id)
-        hydrateMessageBody(id)
-        refreshTranscriptBodyMetrics()
-    }
-
-    public func markMessageHidden(_ id: AgentMessageID) {
-        visibleMessageIds.remove(id)
-        evictMessageBody(id)
-        refreshTranscriptBodyMetrics()
-    }
-
-    public func setVisibleMessageIdsForTesting(_ ids: Set<AgentMessageID>) {
-        visibleMessageIds = ids
-        for message in messages {
-            if ids.contains(message.id) {
-                hydrateMessageBody(message.id)
-            } else {
-                evictMessageBody(message.id)
-            }
-        }
-        refreshTranscriptBodyMetrics()
-    }
-
-    public func consumeHistoryHydrationScrollSuppression() -> Bool {
-        guard suppressNextMessageAutoScroll else { return false }
-        suppressNextMessageAutoScroll = false
-        return true
-    }
-
-    private func mergeLoadedMessages(_ loaded: [AgentMessage], retainingBodiesFor retained: Set<AgentMessageID>) {
-        var byId = Dictionary(uniqueKeysWithValues: messages.map { ($0.id, $0) })
-        for message in loaded {
-            byId[message.id] = Self.displayMessage(message)
-        }
-        let sorted = byId.values.sorted {
-            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
-            return $0.id.value.uuidString < $1.id.value.uuidString
-        }
-        let anchorIds = retained.union(visibleMessageIds)
-        let capped = capMetadataRows(sorted, keeping: anchorIds)
-        messages = capped.map { anchorIds.contains($0.id) ? Self.displayMessage($0) : Self.metadataOnly($0) }
-        visibleMessageIds = anchorIds.intersection(Set(messages.map(\.id)))
-        refreshTranscriptBodyMetrics()
-    }
-
-    private func capMetadataRows(_ rows: [AgentMessage], keeping keepIds: Set<AgentMessageID>) -> [AgentMessage] {
-        guard rows.count > Self.maximumMessageMetadataRows else { return rows }
-        var kept = rows.filter { keepIds.contains($0.id) }
-        let keepSet = Set(kept.map(\.id))
-        let newest = rows.reversed().filter { !keepSet.contains($0.id) }
-        for row in newest where kept.count < Self.maximumMessageMetadataRows {
-            kept.append(row)
-        }
-        return kept.sorted {
-            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
-            return $0.id.value.uuidString < $1.id.value.uuidString
-        }
-    }
-
-    // PERF-MAC_AGENT-007: small LRU cache of hydrated bodies so a row that
-    // scrolls back into view doesn't re-hit the DB. Capped so memory stays
-    // bounded during long fast scrolls.
-    private var bodyCache: [AgentMessageID: String] = [:]
-    private var bodyCacheOrder: [AgentMessageID] = []
-    private static let bodyCacheLimit = 60
-
-    private func cacheBody(_ body: String, for id: AgentMessageID) {
-        if bodyCache[id] == nil {
-            bodyCacheOrder.append(id)
-            if bodyCacheOrder.count > Self.bodyCacheLimit {
-                let evicted = bodyCacheOrder.removeFirst()
-                bodyCache.removeValue(forKey: evicted)
-            }
-        }
-        bodyCache[id] = body
-    }
-
-    private func hydrateMessageBody(_ id: AgentMessageID) {
-        guard let index = messages.firstIndex(where: { $0.id == id }),
-              messages[index].content.isEmpty else { return }
-        // Re-appearing rows resolve from the in-memory cache without a DB read.
-        if let cached = bodyCache[id] {
-            messages[index].content = cached
-            return
-        }
-        guard let persisted = try? messageRepo.get(id: id) else { return }
-        let body = Self.displayMessage(persisted).content
-        messages[index].content = body
-        cacheBody(body, for: id)
-    }
-
-    private func evictMessageBody(_ id: AgentMessageID) {
-        guard let index = messages.firstIndex(where: { $0.id == id }),
-              !messages[index].content.isEmpty else { return }
-        // Keep the body in the cache (so it can re-hydrate without a DB read)
-        // only when it is actually persisted; otherwise don't drop in-memory-only
-        // content we can't restore.
-        if bodyCache[id] != nil || (try? messageRepo.get(id: id)) != nil {
-            cacheBody(messages[index].content, for: id)
-            messages[index].content = ""
-        }
-    }
-
-    private func refreshTranscriptBodyMetrics() {
-        retainedTranscriptBodyCount = messages.filter { !$0.content.isEmpty }.count
-        visibleTranscriptRowCount = visibleMessageIds.count
     }
 
     /// B7: count of threads with an in-flight run, for the rail header.
@@ -1460,7 +1344,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
            ((try? messageRepo.list(threadId: tid))?.isEmpty ?? true) {
             renameThread(tid, to: Self.deriveTitle(from: text))
         }
-        loadInitialMessagePage(tid)
+        loadAllMessages(tid)
         suppressPersistedFinalDuplicatedByTimeline()
         prompt = ""
         resetTimelineUpdateTick()
@@ -1656,7 +1540,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // a background handler. Keep the restart contract here too.
                 self.persistFinalAssistantIfMissing(msg, threadId: finishedTid)
                 if finishedTid == self.selectedThreadId {
-                    self.loadInitialMessagePage(finishedTid)
+                    self.loadAllMessages(finishedTid)
                     self.suppressPersistedFinalDuplicatedByTimeline()
                 }
             }
@@ -1980,11 +1864,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 private final class TimelineScrollScheduler {
     var scheduled = false
     var forcePending = false
-    // UX-MAC_AGENT-020: timestamp of the last programmatic follow-scroll. Lives on this
-    // reference type (NOT @State) so writing it on every streaming delta does NOT invalidate
-    // the AgentAppView body — a @State write here re-laid-out the whole transcript per delta
-    // and pegged the main thread at 100% (UI freeze).
-    var lastBottomScroll: Date = .distantPast
 }
 
 public struct AgentAppView: View {
@@ -1998,6 +1877,7 @@ public struct AgentAppView: View {
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
+    @State private var expandedToolGroups: Set<String> = []
     // UX-MAC_AGENT-010: reasoning rows collapse to "Thought" by default once
     // completed; ids here are the ones the user explicitly expanded.
     @State private var expandedReasoning: Set<String> = []
@@ -2006,10 +1886,8 @@ public struct AgentAppView: View {
     @State private var draggingThreadId: AgentThreadID?
     @State private var timelineSticksToBottom = true
     @State private var showScrollDownButton = false
-    @State private var userIsDraggingTimeline = false
     // IMP-MAC_AGENT-010: highlights the transcript while a file drag hovers it.
     @State private var timelineDropTargeted = false
-    @State private var pendingScrollDownReveal: Task<Void, Never>?
     @State private var timelineScrollScheduler = TimelineScrollScheduler()
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
@@ -2070,6 +1948,82 @@ public struct AgentAppView: View {
                 priorAssistantTexts.append(item.body)
             }
             return shouldRender
+        }
+    }
+
+    // MARK: Tool-burst grouping
+    //
+    // A run of >=2 consecutive tool-style items (e.g. a flurry of MCP status polls or
+    // file reads) collapses into one "Ran N commands" row the user can expand — instead
+    // of flooding the transcript with identical "Ran …" lines. A lone tool call renders
+    // inline as before. Non-tool items (assistant text, reasoning, plan, errors) always
+    // break a run, so the answer prose is never swallowed into a group.
+    enum TurnRenderBlock: Identifiable {
+        case item(AssistantItem)
+        case toolGroup(id: String, items: [AssistantItem])
+
+        var id: String {
+            switch self {
+            case .item(let item): return "block-item-\(item.id)"
+            case .toolGroup(let id, _): return "block-group-\(id)"
+            }
+        }
+    }
+
+    /// Tool-call kinds that are safe to fold into a count. `error`/`review`/`contextCompaction`
+    /// are deliberately excluded — they're noteworthy and must stay visible standalone.
+    static func isGroupableTool(_ type: AssistantItemType) -> Bool {
+        switch type {
+        case .tool, .commandExecution, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .fileChange:
+            return true
+        case .reasoning, .plan, .assistantMessage, .review, .contextCompaction, .error:
+            return false
+        }
+    }
+
+    static func turnRenderBlocks(_ items: [AssistantItem], groupThreshold: Int = 2) -> [TurnRenderBlock] {
+        var blocks: [TurnRenderBlock] = []
+        var run: [AssistantItem] = []
+        func flushRun() {
+            guard !run.isEmpty else { return }
+            if run.count >= groupThreshold {
+                blocks.append(.toolGroup(id: run[0].id, items: run))
+            } else {
+                blocks.append(contentsOf: run.map { .item($0) })
+            }
+            run.removeAll(keepingCapacity: true)
+        }
+        for item in items {
+            if isGroupableTool(item.type) {
+                run.append(item)
+            } else {
+                flushRun()
+                blocks.append(.item(item))
+            }
+        }
+        flushRun()
+        return blocks
+    }
+
+    /// Collapsed-group header text: count-aware verb + noun, e.g. "Ran 4 commands",
+    /// "Changed 3 files", or "Running 2 commands…" while any member is still streaming.
+    static func toolGroupSummary(_ items: [AssistantItem]) -> String {
+        let noun = toolGroupNoun(items)
+        if items.contains(where: { $0.state == .streaming }) {
+            return "Running \(items.count) \(noun)…"
+        }
+        let verbs = Set(items.map { AgentTimelineItemPresentation.make(for: $0).verb })
+        let verb = verbs.count == 1 ? (verbs.first ?? "Ran") : "Ran"
+        return "\(verb) \(items.count) \(noun)"
+    }
+
+    static func toolGroupNoun(_ items: [AssistantItem]) -> String {
+        let plural = items.count != 1
+        switch Set(items.map(\.type)) {
+        case [.fileChange]: return plural ? "files" : "file"
+        case [.webSearch]: return plural ? "searches" : "search"
+        case [.imageView]: return plural ? "images" : "image"
+        default: return plural ? "commands" : "command"
         }
     }
 
@@ -2196,27 +2150,38 @@ public struct AgentAppView: View {
     }
 
     /// Cheap identity signature: changes only when a message/turn is added,
-    /// removed, or reordered (id list), not on streaming text deltas.
+    /// removed, or reordered, not on streaming text deltas. O(turns), NOT O(messages):
+    /// the full thread loads append-only (new sends land at the end), so the message
+    /// side collapses to count + first/last id — capturing every add/remove/revert
+    /// without walking all N messages on every body eval (critical now that N is the
+    /// whole thread, not a 30-row window).
     private var transcriptSignature: String {
-        var sig = String()
-        sig.reserveCapacity((vm.messages.count + vm.timeline.turns.count) * 8)
-        for message in vm.messages {
-            sig += "m"
-            sig += message.id.value.uuidString
-        }
+        var sig = "m\(vm.messages.count)|\(vm.messages.first?.id.value.uuidString ?? "-")|\(vm.messages.last?.id.value.uuidString ?? "-")|t\(vm.timeline.turns.count)|"
         for turn in vm.timeline.turns {
-            sig += "t"
             sig += turn.turnId
-            // A turn's sortTime derives from its items' min startedAtMs, which
-            // is set when its first item appears; fold item count in so the
-            // sort refreshes on item add (not on pure text deltas).
+            // A turn's sortTime derives from its items' min startedAtMs; fold item count
+            // in so the sort refreshes on item add (not on pure text deltas).
             sig += "#\(turn.items.count)"
         }
         return sig
     }
 
+    // Memoized on a message-only key so it recomputes only when a message is
+    // appended/removed (human-paced) — NOT on every streaming tool call, and NOT
+    // O(messages) per visible turn render.
+    private final class AssistantTextsCache {
+        var key: String?
+        var texts: [String] = []
+    }
+    private let assistantTextsCache = AssistantTextsCache()
+
     private var persistedAssistantTexts: [String] {
-        vm.messages.compactMap { $0.role == .assistant ? $0.content : nil }
+        let key = "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")"
+        if assistantTextsCache.key == key { return assistantTextsCache.texts }
+        let texts = vm.messages.compactMap { $0.role == .assistant ? $0.content : nil }
+        assistantTextsCache.key = key
+        assistantTextsCache.texts = texts
+        return texts
     }
 
     public var body: some View {
@@ -2644,31 +2609,21 @@ public struct AgentAppView: View {
                 GeometryReader { viewport in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 32) {
-                            TimelineScrollPositionObserver(slack: Self.timelineBottomRevealSlack) { isAtBottom in
-                                updateTimelineBottomState(isAtBottom: isAtBottom)
-                            }
+                            TimelineScrollFollower(
+                                slack: Self.timelineBottomRevealSlack,
+                                pinned: timelineSticksToBottom,
+                                onScrolledAway: { onTimelineScrolledAway() },
+                                onReturnedToBottom: { onTimelineReturnedToBottom() }
+                            )
                             .frame(width: 0, height: 0)
                             .accessibilityHidden(true)
-                            if vm.hasMoreOlder, !vm.messages.isEmpty {
-                                Color.clear
-                                    .frame(height: 1)
-                                    .id("agent-history-top-sentinel")
-                                    .onAppear {
-                                        let anchor = vm.messages.first?.id
-                                        if let restored = vm.loadOlderMessagesIfNeeded(anchorMessageId: anchor) {
-                                            withAnimation(nil) {
-                                                proxy.scrollTo("message-\(restored.value.uuidString)", anchor: .top)
-                                            }
-                                        }
-                                    }
-                                    .accessibilityIdentifier("agent.history.top-sentinel")
-                            }
+                            // Full thread is loaded up front (no infinite-scroll paging),
+                            // so there are no top/bottom history sentinels and no per-row
+                            // body hydrate/evict — the LazyVStack realizes only visible rows.
                             ForEach(transcriptEntries) { entry in
                                 switch entry {
                                 case .message(let message):
                                     messageRow(message)
-                                        .onAppear { vm.markMessageVisible(message.id) }
-                                        .onDisappear { vm.markMessageHidden(message.id) }
                                 case .turn(let turn):
                                     turnView(turn)
                                 }
@@ -2681,18 +2636,8 @@ public struct AgentAppView: View {
                             }
                             if vm.status == .running { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
-                            if vm.hasMoreNewer, !vm.messages.isEmpty {
-                                Color.clear
-                                    .frame(height: 1)
-                                    .id("agent-history-bottom-sentinel")
-                                    .onAppear {
-                                        let anchor = vm.messages.last?.id
-                                        _ = vm.loadNewerMessagesIfNeeded(anchorMessageId: anchor)
-                                    }
-                                    .accessibilityIdentifier("agent.history.bottom-sentinel")
-                            }
                             // Scroll-to target only. Bottom detection is handled by the
-                            // AppKit TimelineScrollPositionObserver above — NOT by a per-layout
+                            // AppKit TimelineScrollFollower above — NOT by a per-layout
                             // GeometryReader preference, which fed onPreferenceChange -> @State
                             // writes -> body invalidation -> re-layout -> new maxY ... a
                             // self-sustaining layout loop that froze the UI on scroll
@@ -2722,11 +2667,6 @@ public struct AgentAppView: View {
                                 .allowsHitTesting(false)
                         }
                     }
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 4)
-                            .onChanged { _ in userIsDraggingTimeline = true }
-                            .onEnded { _ in userIsDraggingTimeline = false }
-                    )
                 }
                 if showScrollDownButton {
                     Button {
@@ -2753,9 +2693,7 @@ public struct AgentAppView: View {
             .onAppear { scheduleTimelineScrollToBottom(proxy) }
             .onChange(of: vm.focusTick) { _ in scheduleTimelineScrollToBottom(proxy, force: true) }
             .onChange(of: vm.messages.count) { _ in
-                if !vm.consumeHistoryHydrationScrollSuppression() {
-                    scheduleTimelineScrollToBottom(proxy)
-                }
+                scheduleTimelineScrollToBottom(proxy)
             }
             .onChange(of: vm.timeline.turns.count) { _ in
                 scheduleTimelineScrollToBottom(proxy)
@@ -2774,6 +2712,8 @@ public struct AgentAppView: View {
     private func pruneExpandedItemIds() {
         let liveItemIds = Set(vm.timeline.turns.flatMap { $0.items.map(\.id) })
         if !expandedTools.isEmpty { expandedTools.formIntersection(liveItemIds) }
+        // A tool group is keyed by its first item's id, so it lives in the same id space.
+        if !expandedToolGroups.isEmpty { expandedToolGroups.formIntersection(liveItemIds) }
         if !expandedReasoning.isEmpty { expandedReasoning.formIntersection(liveItemIds) }
         let liveRequestIds = Set(vm.timeline.pendingRequests.map(\.id))
         if !expandedRequestPreviews.isEmpty { expandedRequestPreviews.formIntersection(liveRequestIds) }
@@ -3130,19 +3070,14 @@ public struct AgentAppView: View {
     private func scrollTimelineToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {
         guard force || timelineSticksToBottom else { return }
         if force {
-            cancelPendingScrollDownReveal()
             timelineSticksToBottom = true
             showScrollDownButton = false
         }
-        // PERF-MAC_AGENT-003: the four onChange triggers all funnel here and
-        // fire per streaming delta. Skip the per-token animation while running
-        // (it caused a layout pass + animation churn on every delta); only
-        // animate on settle (idle, or an explicit forced scroll).
-        // UX-MAC_AGENT-020: mark the follow so the bottom-preference's transient
-        // "not at bottom" (content just grew below the fold) does not un-stick us.
-        // Written on the scheduler (a reference type), NOT @State, so this per-delta
-        // write never invalidates the body / re-lays-out the transcript.
-        timelineScrollScheduler.lastBottomScroll = Date()
+        // PERF-MAC_AGENT-003: the onChange triggers all funnel here and fire per
+        // streaming delta. Skip the per-token animation while running (it caused a
+        // layout pass + animation churn on every delta); only animate on settle
+        // (idle, or an explicit forced scroll). TimelineScrollFollower re-pins to the
+        // exact post-layout bottom on its own; this is the discrete-event re-assert.
         if vm.status == .running && !force {
             proxy.scrollTo("BOTTOM", anchor: .bottom)
         } else {
@@ -3150,49 +3085,18 @@ public struct AgentAppView: View {
         }
     }
 
-    private func updateTimelineBottomState(isAtBottom: Bool) {
-        if isAtBottom {
-            // PERF-MAC_AGENT-013: the preference key fires every scroll frame.
-            // Only mutate state when actually crossing back to the bottom, not on
-            // every Y change, to avoid per-frame state writes.
-            if timelineSticksToBottom, !showScrollDownButton, pendingScrollDownReveal == nil {
-                return
-            }
-            cancelPendingScrollDownReveal()
-            timelineSticksToBottom = true
-            showScrollDownButton = false
-            return
-        }
-
-        // UX-MAC_AGENT-020: a "not at bottom" report right after our own follow-scroll
-        // is just the content growing below the fold mid-stream — NOT the user leaving
-        // the bottom. Ignore it so auto-follow keeps pinning to the newest message.
-        if Date().timeIntervalSince(timelineScrollScheduler.lastBottomScroll) < 0.4 {
-            return
-        }
-
-        // A genuine user scroll-away: a drag, or any not-at-bottom report outside the
-        // follow-scroll guard window. Reveal the jump-to-latest button and stop following.
-        if userIsDraggingTimeline || vm.status != .running {
-            cancelPendingScrollDownReveal()
-            timelineSticksToBottom = false
-            showScrollDownButton = true
-            return
-        }
-
-        guard pendingScrollDownReveal == nil else { return }
-        pendingScrollDownReveal = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled else { return }
-            timelineSticksToBottom = false
-            showScrollDownButton = true
-            pendingScrollDownReveal = nil
-        }
+    // TimelineScrollFollower reports pin transitions from real AppKit geometry — these
+    // only flip @State when actually crossing, so they never churn the body per frame.
+    private func onTimelineReturnedToBottom() {
+        guard !timelineSticksToBottom || showScrollDownButton else { return }
+        timelineSticksToBottom = true
+        showScrollDownButton = false
     }
 
-    private func cancelPendingScrollDownReveal() {
-        pendingScrollDownReveal?.cancel()
-        pendingScrollDownReveal = nil
+    private func onTimelineScrolledAway() {
+        guard timelineSticksToBottom || !showScrollDownButton else { return }
+        timelineSticksToBottom = false
+        showScrollDownButton = true
     }
 
     // "Working for 2m 21s" + hairline, while a run is in flight.
@@ -3451,8 +3355,15 @@ public struct AgentAppView: View {
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
         let turnPlans = proposedPlans(for: turn)
         let renderableItems = Self.renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
+            .filter { !($0.type == .plan && !turnPlans.isEmpty) }
+        let blocks = Self.turnRenderBlocks(renderableItems)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            ForEach(renderableItems.filter { !($0.type == .plan && !turnPlans.isEmpty) }, id: \.id) { item in itemRow(item) }
+            ForEach(blocks) { block in
+                switch block {
+                case .item(let item): itemRow(item)
+                case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
+                }
+            }
             ForEach(turnPlans) { plan in
                 proposedPlanRow(plan)
             }
@@ -3596,6 +3507,82 @@ public struct AgentAppView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // A collapsed burst of consecutive tool calls: "Ran N commands" with a count chip,
+    // expandable to the individual tool rows (each still independently expandable for
+    // output). While any member streams, the header goes live ("Running N…") and a muted
+    // subtitle shows the most-recent command so progress stays legible without expanding.
+    @ViewBuilder
+    private func toolGroupRow(id: String, items: [AssistantItem]) -> some View {
+        let streaming = items.contains { $0.state == .streaming }
+        let failed = items.contains { $0.state == .failed }
+        let expanded = expandedToolGroups.contains(id)
+        let headerIcon = streaming ? "circle.dotted" : (failed ? "exclamationmark.triangle" : "terminal")
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if expanded { expandedToolGroups.remove(id) } else { expandedToolGroups.insert(id) }
+                }
+            } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .frame(width: 10)
+                    Image(systemName: headerIcon)
+                        .font(.system(size: 11))
+                        .foregroundColor(failed ? DS.Palette.danger : DS.Palette.textSecondary)
+                    Text(Self.toolGroupSummary(items))
+                        .font(DS.Font.body.weight(.medium))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if !expanded {
+                        Text("\(items.count)")
+                            .font(DS.Font.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 1)
+                            .background(DS.Palette.surface)
+                            .clipShape(Capsule())
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(expanded ? "Collapse commands" : "Expand \(items.count) commands")
+
+            // Live peek at the current command without forcing the group open.
+            if streaming, !expanded, let latest = items.last {
+                let preview = AgentTimelineItemPresentation.toolCommandPreview(for: latest)
+                    ?? AgentTimelineItemPresentation.make(for: latest).label
+                if !preview.isEmpty {
+                    Text(preview)
+                        .font(DS.Font.monoSmall)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.leading, 20)
+                }
+            }
+
+            if expanded {
+                HStack(alignment: .top, spacing: DS.Space.sm) {
+                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                        .fill(DS.Palette.line)
+                        .frame(width: 1.5)
+                        .padding(.leading, 4)
+                    VStack(alignment: .leading, spacing: DS.Space.md) {
+                        ForEach(items, id: \.id) { item in toolRow(item) }
+                    }
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("agent.toolGroup.\(id)")
     }
 
     // MARK: Composer
@@ -5042,76 +5029,137 @@ private struct PromptComposerEditor: NSViewRepresentable {
     }
 }
 
-private struct TimelineScrollPositionObserver: NSViewRepresentable {
+/// Auto-follow + pin/unpin for the timeline, driven from the AppKit layer where the
+/// real post-layout geometry lives. This replaced a timer-based SwiftUI heuristic
+/// (a 0.4s guard window + a 180ms reveal Task + a DragGesture) that was both racy and
+/// blind to trackpad/wheel scrolls — it only watched DragGesture, so a two-finger
+/// scroll-up during a fast stream was silently ignored, and the 0.4s guard could
+/// swallow a genuine scroll-away. Two AppKit facts make this version deterministic:
+///
+///   • A user scroll-up is the ONLY thing that DECREASES the clip view's origin.y;
+///     content growing at the bottom never moves the origin. So origin.y dropping
+///     while we're away from the bottom is an unambiguous "user left the bottom".
+///   • When pinned, we re-scroll the clip to the document's true bottom on every
+///     content-growth notification (i.e. AFTER layout), so a stream always lands
+///     exactly at the bottom instead of a frame short.
+///
+/// Crucially this writes SwiftUI @State only on an actual pin<->unpin transition
+/// (never per streaming delta), so it cannot reintroduce the layout-storm freeze
+/// (PERF-MAC_AGENT-021).
+private struct TimelineScrollFollower: NSViewRepresentable {
     let slack: CGFloat
-    let onChange: (Bool) -> Void
+    let pinned: Bool
+    let onScrolledAway: () -> Void
+    let onReturnedToBottom: () -> Void
 
-    func makeNSView(context: Context) -> ObserverView {
-        let view = ObserverView()
-        view.slack = slack
-        view.onChange = onChange
+    func makeNSView(context: Context) -> FollowerView {
+        let view = FollowerView()
+        view.configure(slack: slack, pinned: pinned, onScrolledAway: onScrolledAway, onReturnedToBottom: onReturnedToBottom)
         return view
     }
 
-    func updateNSView(_ view: ObserverView, context: Context) {
-        view.slack = slack
-        view.onChange = onChange
-        view.report()
+    func updateNSView(_ view: FollowerView, context: Context) {
+        view.configure(slack: slack, pinned: pinned, onScrolledAway: onScrolledAway, onReturnedToBottom: onReturnedToBottom)
+        view.attach()
     }
 
-    final class ObserverView: NSView {
-        var slack: CGFloat = 0
-        var onChange: ((Bool) -> Void)?
-        private weak var observedScrollView: NSScrollView?
-        private var observer: NSObjectProtocol?
-        private var lastIsAtBottom: Bool?
+    final class FollowerView: NSView {
+        private var slack: CGFloat = 4
+        private var pinned: Bool = true
+        private var onScrolledAway: (() -> Void)?
+        private var onReturnedToBottom: (() -> Void)?
+
+        private weak var scrollView: NSScrollView?
+        private var clipObserver: NSObjectProtocol?
+        private var docObserver: NSObjectProtocol?
+        private var lastOriginY: CGFloat = 0
+        private var lastAtBottom: Bool?
+
+        func configure(slack: CGFloat, pinned: Bool, onScrolledAway: @escaping () -> Void, onReturnedToBottom: @escaping () -> Void) {
+            self.slack = slack
+            // SwiftUI @State is the source of truth; mirror it locally so a content-growth
+            // notification arriving before the next updateNSView still makes the right call.
+            self.pinned = pinned
+            self.onScrolledAway = onScrolledAway
+            self.onReturnedToBottom = onReturnedToBottom
+        }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+            DispatchQueue.main.async { [weak self] in self?.attach() }
         }
 
         deinit {
-            if let observer {
-                NotificationCenter.default.removeObserver(observer)
+            if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
+            if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
+        }
+
+        func attach() {
+            guard let scroll = enclosingScrollView else { return }
+            guard scroll !== scrollView else { return }
+            if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
+            if let docObserver { NotificationCenter.default.removeObserver(docObserver) }
+            scrollView = scroll
+            let clip = scroll.contentView
+            clip.postsBoundsChangedNotifications = true
+            clipObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification, object: clip, queue: .main
+            ) { [weak self] _ in self?.handleScroll() }
+            if let doc = scroll.documentView {
+                doc.postsFrameChangedNotifications = true
+                docObserver = NotificationCenter.default.addObserver(
+                    forName: NSView.frameDidChangeNotification, object: doc, queue: .main
+                ) { [weak self] _ in self?.handleContentGrowth() }
+            }
+            lastOriginY = clip.bounds.origin.y
+            handleScroll()
+        }
+
+        private func geometry() -> (origin: CGFloat, gap: CGFloat, atBottom: Bool)? {
+            guard let scroll = scrollView, let doc = scroll.documentView else { return nil }
+            let origin = scroll.contentView.bounds.origin.y
+            let visible = scroll.contentView.bounds.height
+            let content = doc.bounds.height
+            let gap = content - (origin + visible)
+            return (origin, gap, gap <= slack)
+        }
+
+        // The clip view moved. Reaching the bottom re-pins; origin dropping while still
+        // away from the bottom is a genuine user scroll-up (content growth never lowers it).
+        private func handleScroll() {
+            guard let g = geometry() else { return }
+            defer { lastOriginY = g.origin }
+            if g.atBottom {
+                report(atBottom: true)
+            } else if g.origin < lastOriginY - 0.5 {
+                report(atBottom: false)
             }
         }
 
-        func report() {
-            DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+        // The document grew/shrank (a streaming delta, a new row). While pinned, snap the
+        // clip back to the true bottom now that layout has settled.
+        private func handleContentGrowth() {
+            guard let g = geometry() else { return }
+            if pinned, g.gap > slack {
+                scrollToBottom()
+            } else if g.atBottom {
+                report(atBottom: true)
+            }
         }
 
-        private func attachIfNeeded() {
-            guard let scroll = enclosingScrollView, scroll !== observedScrollView else {
-                reportCurrentPosition()
-                return
-            }
-            if let observer {
-                NotificationCenter.default.removeObserver(observer)
-            }
-            observedScrollView = scroll
-            scroll.contentView.postsBoundsChangedNotifications = true
-            observer = NotificationCenter.default.addObserver(
-                forName: NSView.boundsDidChangeNotification,
-                object: scroll.contentView,
-                queue: .main
-            ) { [weak self] _ in
-                self?.reportCurrentPosition()
-            }
-            reportCurrentPosition()
+        private func scrollToBottom() {
+            guard let scroll = scrollView, let doc = scroll.documentView else { return }
+            let targetY = max(0, doc.bounds.height - scroll.contentView.bounds.height)
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: targetY))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            lastOriginY = targetY
         }
 
-        private func reportCurrentPosition() {
-            guard let scroll = observedScrollView ?? enclosingScrollView,
-                  let documentView = scroll.documentView else { return }
-            let contentHeight = documentView.bounds.height
-            let visibleHeight = scroll.contentView.bounds.height
-            let scrollerValue = scroll.verticalScroller?.doubleValue ?? 1
-            let isAtBottom = contentHeight <= visibleHeight + slack
-                || scrollerValue >= 0.999
-            guard isAtBottom != lastIsAtBottom else { return }
-            lastIsAtBottom = isAtBottom
-            onChange?(isAtBottom)
+        private func report(atBottom: Bool) {
+            guard atBottom != lastAtBottom else { return }
+            lastAtBottom = atBottom
+            pinned = atBottom
+            if atBottom { onReturnedToBottom?() } else { onScrolledAway?() }
         }
     }
 }

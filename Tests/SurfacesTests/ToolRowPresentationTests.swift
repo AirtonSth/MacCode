@@ -74,4 +74,65 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentTimelineItemPresentation.shortValue("hello"), "hello")
         XCTAssertEqual(AgentTimelineItemPresentation.shortValue(NSNull()), "—")
     }
+
+    // MARK: Tool-burst grouping
+
+    private func item(_ type: AssistantItemType, id: String = "x", state: AssistantItemState = .completed) -> AssistantItem {
+        AssistantItem(id: id, turnId: "t", type: type, state: state, summary: nil, body: "", startedAtMs: 0)
+    }
+
+    private func isGroup(_ block: AgentAppView.TurnRenderBlock) -> Bool {
+        if case .toolGroup = block { return true }
+        return false
+    }
+
+    func test_threeConsecutiveToolsCollapseIntoOneGroup() {
+        let items = (0..<3).map { item(.mcpToolCall, id: "m\($0)") }
+        let blocks = AgentAppView.turnRenderBlocks(items)
+        XCTAssertEqual(blocks.count, 1, "a burst of identical tool calls must fold into a single group, not flood the transcript")
+        guard case .toolGroup(_, let grouped) = blocks[0] else { return XCTFail("expected a toolGroup") }
+        XCTAssertEqual(grouped.count, 3)
+    }
+
+    func test_loneToolStaysInline() {
+        let blocks = AgentAppView.turnRenderBlocks([item(.tool)])
+        XCTAssertEqual(blocks.count, 1)
+        XCTAssertFalse(isGroup(blocks[0]), "a single tool call must NOT be hidden behind a group header")
+    }
+
+    func test_assistantMessageBreaksTheRun() {
+        // tool, tool | message | tool, tool  ->  group, item, group (not one big group)
+        let items = [
+            item(.tool, id: "a"), item(.tool, id: "b"),
+            item(.assistantMessage, id: "msg"),
+            item(.tool, id: "c"), item(.tool, id: "d"),
+        ]
+        let blocks = AgentAppView.turnRenderBlocks(items)
+        XCTAssertEqual(blocks.count, 3)
+        XCTAssertTrue(isGroup(blocks[0]))
+        XCTAssertFalse(isGroup(blocks[1]), "the answer prose must never be swallowed into a tool group")
+        XCTAssertTrue(isGroup(blocks[2]))
+    }
+
+    func test_errorIsNeverGrouped() {
+        // An error between two tools breaks the run and stays standalone (must remain visible).
+        let items = [item(.tool, id: "a"), item(.error, id: "e"), item(.tool, id: "b")]
+        let blocks = AgentAppView.turnRenderBlocks(items)
+        XCTAssertEqual(blocks.count, 3)
+        XCTAssertTrue(blocks.allSatisfy { !isGroup($0) }, "errors must not be folded away into a count")
+    }
+
+    func test_summaryUsesCountVerbAndNoun() {
+        let commands = (0..<4).map { item(.commandExecution, id: "c\($0)") }
+        XCTAssertEqual(AgentAppView.toolGroupSummary(commands), "Ran 4 commands")
+
+        let files = (0..<2).map { item(.fileChange, id: "f\($0)") }
+        XCTAssertEqual(AgentAppView.toolGroupSummary(files), "Changed 2 files")
+    }
+
+    func test_summaryGoesLiveWhileStreaming() {
+        let items = [item(.tool, id: "a"), item(.tool, id: "b", state: .streaming)]
+        XCTAssertEqual(AgentAppView.toolGroupSummary(items), "Running 2 commands…",
+                       "a still-running burst must read as live, not as a finished count")
+    }
 }

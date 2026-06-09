@@ -2014,9 +2014,9 @@ final class AgentAppViewModelTests: XCTestCase {
                        "custom model IDs must persist until the user edits or removes them in Settings")
     }
 
-    // MARK: B4 — bounded message window
+    // MARK: Full-thread message history (replaces the old viewport window)
 
-    func test_viewportHistoryHydratesOlderAndNewerPagesWithBodyEviction() throws {
+    func test_selectingThreadLoadsEntireThreadWithBodiesRetained() throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "long")
         let tid = vm.selectedThreadId!
@@ -2026,32 +2026,65 @@ final class AgentAppViewModelTests: XCTestCase {
                 content: "m\(i)", createdAt: base.addingTimeInterval(Double(i))))
         }
         vm.selectThread(tid)
-        XCTAssertEqual(vm.messages.count, AgentAppViewModel.viewportMessagePageSize,
-                       "initial Agent history must load only one viewport-sized page")
-        XCTAssertEqual(vm.messages.last?.content, "m99", "newest message must be in the initial viewport")
-        XCTAssertEqual(vm.messages.first?.content, "m70", "initial viewport is the latest page in display order")
-        XCTAssertTrue(vm.hasMoreOlder, "older DB pages must remain available")
+        // The fix: the entire thread loads at once — no infinite-scroll paging and no
+        // off-screen body eviction. Paging + evict flipped row heights mid-scroll, which
+        // is what made auto-scroll jump. Full load makes every row's height stable.
+        XCTAssertEqual(vm.messages.count, 100,
+                       "the whole thread must load up front, not a 30-row viewport window")
+        XCTAssertEqual(vm.messages.first?.content, "m0", "oldest message present and ordered first")
+        XCTAssertEqual(vm.messages.last?.content, "m99", "newest message present and ordered last")
+        XCTAssertTrue(vm.messages.allSatisfy { !$0.content.isEmpty },
+                      "every body stays hydrated — no eviction that would change a row's height on scroll")
+    }
 
-        let initialFirst = vm.messages.first!.id
-        vm.setVisibleMessageIdsForTesting([initialFirst])
-        XCTAssertEqual(vm.visibleTranscriptRowCount, 1)
-        XCTAssertEqual(vm.retainedTranscriptBodyCount, 1,
-                       "offscreen Agent message bodies must be evicted from display memory")
+    func test_applyBodyBudgetBlanksOldestBodiesOnPathologicalThread() {
+        let tid = AgentThreadID()
+        let base = Date(timeIntervalSince1970: 1)
+        let rows = (0..<5).map { i in
+            AgentMessage(threadId: tid, role: .user,
+                         content: String(repeating: "x", count: 10),
+                         createdAt: base.addingTimeInterval(Double(i)))
+        }
+        // 5 x 10 bytes = 50 > budget 25 -> blank oldest until <= 25 (blank 3 -> 20 bytes).
+        let (out, blanked) = AgentAppViewModel.applyBodyBudget(rows, budget: 25)
+        XCTAssertEqual(blanked, 3, "memory safety-valve blanks oldest bodies until total <= budget")
+        XCTAssertEqual(out.prefix(3).map(\.content), ["", "", ""], "oldest bodies blanked first")
+        XCTAssertEqual(out.suffix(2).map(\.content).filter { $0.count == 10 }.count, 2,
+                       "newest bodies are retained in full — the user lands at the bottom")
+    }
 
-        vm.loadOlderMessagesIfNeeded(anchorMessageId: initialFirst)
-        XCTAssertTrue(vm.messages.contains { $0.content == "m40" },
-                      "scrolling upward must hydrate an older page from the DB")
-        XCTAssertTrue(vm.hasMoreNewer, "after moving into older history, newer DB pages must be available")
+    func test_applyBodyBudgetKeepsEverythingForANormalThread() {
+        let tid = AgentThreadID()
+        let rows = (0..<3).map { _ in AgentMessage(threadId: tid, role: .user, content: "hi") }
+        let (out, blanked) = AgentAppViewModel.applyBodyBudget(rows, budget: 1_000_000)
+        XCTAssertEqual(blanked, 0, "a normal thread loads in full with nothing blanked")
+        XCTAssertEqual(out.map(\.content), ["hi", "hi", "hi"])
+    }
 
-        let olderVisible = Set(vm.messages.prefix(3).map(\.id))
-        vm.setVisibleMessageIdsForTesting(olderVisible)
-        XCTAssertEqual(vm.retainedTranscriptBodyCount, olderVisible.count,
-                       "only the simulated visible rows may retain message bodies")
+    private func startedItems(_ n: Int) -> [AssistantEvent] {
+        (0..<n).map { .itemStarted(item: AssistantItem(id: "i\($0)", turnId: "t\($0)", type: .tool, startedAtMs: Int64($0))) }
+    }
 
-        let newestId = vm.messages.last!.id
-        vm.setVisibleMessageIdsForTesting([newestId])
-        XCTAssertTrue(vm.messages.contains { $0.content == "m99" },
-                      "scrolling back down to an evicted row must hydrate its body from the DB")
+    func test_chooseReplayPrefersFullPersistedOverCompactedProviderSnapshot() {
+        // The reported "thread cortado": the provider (Codex) thread/read is context-compacted
+        // and returns only the recent tail; our persisted stream events are the full record.
+        let persisted = startedItems(83)
+        let compactedSnapshot = startedItems(20)
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: compactedSnapshot)
+        XCTAssertEqual(AgentAppViewModel.renderableItemCount(chosen), 83,
+                       "a context-compacted snapshot must not truncate the reopened thread — show 100% of persisted history")
+    }
+
+    func test_chooseReplayUsesSnapshotWhenPersistedIsThinner() {
+        // Imported-from-external-session thread: persisted history is thin, the provider has it all.
+        let chosen = AgentAppViewModel.chooseReplayEvents(persisted: startedItems(2), snapshot: startedItems(40))
+        XCTAssertEqual(AgentAppViewModel.renderableItemCount(chosen), 40,
+                       "when persisted history is thinner, the provider snapshot fills it in")
+    }
+
+    func test_chooseReplayFallsBackToPersistedWhenNoSnapshot() {
+        let persisted = startedItems(5)
+        XCTAssertEqual(AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: nil).count, 5)
     }
 
     func test_loadWindowClipsHugePersistedMessagesBeforeRendering() throws {
@@ -2092,11 +2125,13 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.coordinator.activeThreadIdsSnapshot().isEmpty,
                       "the coordinator must release active thread handles after a long Agent App run")
         XCTAssertLessThanOrEqual(vm.timeline.turns.count, AssistantTimelineState.liveTurnLimit,
-                                 "long streams must keep only the bounded live turn window")
+                                 "turns stay under the memory-ceiling backstop")
         XCTAssertEqual(vm.timeline.turns.last?.turnId, "long-turn-89",
-                       "bounded trimming must keep the newest long-run turn visible")
-        XCTAssertFalse(vm.timeline.turns.contains { $0.turnId == "long-turn-0" },
-                       "old long-run turns must be trimmed before SwiftUI renders unbounded history")
+                       "the newest long-run turn stays visible")
+        XCTAssertTrue(vm.timeline.turns.contains { $0.turnId == "long-turn-0" },
+                      "the WHOLE run is retained now (90 turns < 5000 ceiling) — no mid-thread truncation")
+        XCTAssertEqual(vm.timeline.turns.count, 90,
+                       "all 90 turns of the long run are kept (full thread, 100%)")
         XCTAssertLessThanOrEqual(vm.timeline.providerRuntimeEvents.count, AssistantTimelineState.providerRuntimeEventLimit,
                                  "raw provider runtime events must stay capped during long runs")
         XCTAssertLessThanOrEqual(vm.timeline.workActivities.count, AssistantTimelineState.workActivityLimit,
@@ -2104,10 +2139,17 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.contextHealthMessage?.contains("compacted") ?? false,
                       "the Agent App must expose context compaction during long runs")
 
+        // Reopen from a COLD state (fresh VM has no live timeline) — this exercises the
+        // replay-from-persisted-events path, which used to cap at the last 500 events.
         vm.selectThread(threadId)
-        XCTAssertLessThanOrEqual(vm.messages.count, AgentAppViewModel.maximumMessageMetadataRows,
-                                 "reopening a long thread must render only the bounded message window")
+        let persistedCount = (try? vm.messageRepo.list(threadId: threadId).count) ?? -1
+        XCTAssertEqual(vm.messages.count, persistedCount,
+                       "reopening a long thread loads the ENTIRE thread (no infinite-scroll window)")
+        XCTAssertGreaterThan(vm.timeline.turns.count, 80,
+                             "reopen replays the WHOLE persisted thread (>500-event window, >80-turn cap) — the long run's turns must come back, not just the last few")
 
+        // The full load must still stay bounded: the LazyVStack only realizes visible rows
+        // and the turn ceiling/event-prune keep it bounded, so footprint can't balloon.
         if beforeKB >= 0 && afterKB >= 0 {
             XCTAssertLessThan(afterKB - beforeKB, 250_000,
                               "macOS Agent App long-run stress must not grow process footprint by more than 250 MB")

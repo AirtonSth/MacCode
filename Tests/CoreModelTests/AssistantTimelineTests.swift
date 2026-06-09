@@ -142,9 +142,12 @@ final class AssistantTimelineTests: XCTestCase {
                                  "terminal live text must also stay bounded before it is moved into persisted history")
     }
 
-    func test_liveTimelineKeepsOnlyRecentTurnsForLongAgentSessions() {
+    func test_timelineRetainsFullTurnHistoryForLongSessions() {
         var s = AssistantTimelineState()
 
+        // A long-but-realistic session (140 turns) must be retained IN FULL — reopening a
+        // thread used to truncate to the last 80 turns ("thread cortado"); the cap is now a
+        // pathological-OOM ceiling (>= the ~5000 DB event-prune cap), not a display window.
         for i in 0..<140 {
             let turn = "turn-\(i)"
             let item = "item-\(i)"
@@ -154,12 +157,14 @@ final class AssistantTimelineTests: XCTestCase {
             s.apply(.turnCompleted(turnId: turn, finalMessage: "answer \(i)"))
         }
 
-        XCTAssertLessThanOrEqual(s.turns.count, AssistantTimelineState.liveTurnLimit,
-                                 "macOS Agent App must not retain every rendered turn forever during long-running sessions")
-        XCTAssertEqual(s.turns.first?.turnId, "turn-60",
-                       "bounded visible history must drop the oldest turns first while persisted DB history remains authoritative")
+        XCTAssertEqual(s.turns.count, 140,
+                       "every turn of a long session must be retained — no 80-turn truncation of the reopened thread")
+        XCTAssertEqual(s.turns.first?.turnId, "turn-0",
+                       "the OLDEST turn must still be present (the thread is shown 100%, not from the middle)")
         XCTAssertEqual(s.latestAssistantMessage, "answer 139",
-                       "bounded visible history must keep the newest agent output visible")
+                       "the newest agent output stays visible")
+        XCTAssertLessThanOrEqual(s.turns.count, AssistantTimelineState.liveTurnLimit,
+                                 "the memory-ceiling backstop still bounds turns")
     }
 
     func test_timelineTracksApprovalsUserInputPlansAndTokenUsage() {

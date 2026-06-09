@@ -449,8 +449,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return checkpoint
     }
 
+    /// Replay the ENTIRE persisted thread, not just the last 500 events. The DB is already
+    /// pruned to ~5000 events/thread (pruneStreamEvents), so this is bounded; capping the
+    /// replay at 500 here was truncating the reopened transcript to its last few turns.
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
-        (try? runRepo.listLatestStreamEvents(threadId: threadId)) ?? []
+        (try? runRepo.listLatestStreamEvents(threadId: threadId, limit: .max)) ?? []
     }
 
     public func activeThreadIdsSnapshot() -> Set<AgentThreadID> {
