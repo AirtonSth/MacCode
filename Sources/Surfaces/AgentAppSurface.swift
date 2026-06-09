@@ -1897,15 +1897,28 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
                     return value
                 }
             }
-            // Unknown shape: a compact one-line key=value digest, no value dumps.
-            let digest = obj.keys.sorted().prefix(4).compactMap { key -> String? in
-                guard let value = obj[key] else { return nil }
-                return "\(key): \(String(describing: value).prefix(80))"
-            }.joined(separator: "  ")
+            // Unknown shape: a clean one-line key: value digest. Scalars show their value;
+            // arrays/objects show a compact shape hint (not Swift's brace-y debug description).
+            let digest = obj.keys.sorted().prefix(4).map { key -> String in
+                "\(key): \(Self.shortValue(obj[key]))"
+            }.joined(separator: "   ")
             return digest.isEmpty ? nil : digest
         }
         // Non-JSON body is already a human-readable input/description.
         return body
+    }
+
+    /// A compact, human-readable rendering of a tool-input value for the one-line digest.
+    /// Scalars print their value; arrays/objects print a shape hint instead of raw braces.
+    static func shortValue(_ value: Any?) -> String {
+        switch value {
+        case let s as String: return String(s.prefix(80))
+        case let n as NSNumber: return n.stringValue
+        case let a as [Any]: return "[\(a.count)]"
+        case let d as [String: Any]: return "{\(d.keys.sorted().prefix(3).joined(separator: ","))}"
+        case is NSNull, nil: return "—"
+        default: return String(String(describing: value ?? "").prefix(40))
+        }
     }
 
     /// Sanitize + cap inline tool/skill output: strip ANSI escape codes (Bash output is full

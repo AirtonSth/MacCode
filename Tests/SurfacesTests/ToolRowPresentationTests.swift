@@ -58,4 +58,20 @@ final class ToolRowPresentationTests: XCTestCase {
     func test_stripANSILeavesPlainTextUntouched() {
         XCTAssertEqual(AgentTimelineItemPresentation.stripANSI("no escapes here"), "no escapes here")
     }
+
+    func test_structuredInputDigestIsCleanNotRawBraces() {
+        // AskUserQuestion-shaped input: no priority key matches, so the digest is used.
+        let item = toolItem(body: #"{"questions":[{"header":"Route guard"},{"header":"X"}],"mode":"single"}"#, summary: "AskUserQuestion")
+        let preview = AgentTimelineItemPresentation.toolCommandPreview(for: item)
+        XCTAssertEqual(preview, "mode: single   questions: [2]",
+                       "structured inputs show a clean shape hint, not Swift's brace-y debug description")
+        XCTAssertFalse(preview?.contains("{ {") ?? false)
+    }
+
+    func test_shortValueShapeHints() {
+        XCTAssertEqual(AgentTimelineItemPresentation.shortValue(["a", "b", "c"]), "[3]")
+        XCTAssertEqual(AgentTimelineItemPresentation.shortValue(["k": 1]), "{k}")
+        XCTAssertEqual(AgentTimelineItemPresentation.shortValue("hello"), "hello")
+        XCTAssertEqual(AgentTimelineItemPresentation.shortValue(NSNull()), "—")
+    }
 }
