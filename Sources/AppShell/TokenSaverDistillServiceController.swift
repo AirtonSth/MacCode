@@ -54,6 +54,112 @@ public enum TokenSaverDistillServiceStatus: Sendable, Equatable {
     case failed(String)
 }
 
+/// Pure state-transition logic for the Token Saver sidecar supervisor.
+///
+/// Extracted so the health/restart/deadlock-recovery decisions are testable
+/// without launching a real `Process` (Rule 8). The controller owns the side
+/// effects (process launch, timers, status assignment); this struct owns the
+/// "given current status + event, what is the next status / should we restart /
+/// how long to back off" decision.
+public enum TokenSaverDistillSupervisor {
+    /// Lifecycle events the controller feeds to the supervisor.
+    public enum Event: Sendable, Equatable {
+        /// The sidecar process terminated. `wasUserStop` is true when `stop()`
+        /// initiated the termination (so we must NOT auto-restart).
+        case processExited(wasUserStop: Bool)
+        /// The startup stdout stream hit EOF while the process is no longer
+        /// running — the ready event will never arrive. Caps the startup wait.
+        case startupEOFWhileDead
+        /// An explicit user/eligibility stop. Resets to a clean idle status.
+        case stopRequested
+    }
+
+    public struct Decision: Sendable, Equatable {
+        public let nextStatus: TokenSaverDistillServiceStatus
+        public let shouldRestart: Bool
+
+        public init(nextStatus: TokenSaverDistillServiceStatus, shouldRestart: Bool) {
+            self.nextStatus = nextStatus
+            self.shouldRestart = shouldRestart
+        }
+    }
+
+    /// Restart backoff schedule. Exponential, capped, attempt-indexed.
+    public static let baseBackoffSeconds: Double = 1
+    public static let maxBackoffSeconds: Double = 30
+    /// After this many consecutive failed restarts, stop auto-restarting and
+    /// surface a terminal `.failed` so the popover/poll loop fail loud instead
+    /// of looping forever (Rule 6).
+    public static let maxRestartAttempts = 5
+
+    /// Exponential backoff for the Nth (0-indexed) restart attempt, capped.
+    public static func backoffSeconds(forAttempt attempt: Int) -> Double {
+        guard attempt > 0 else { return baseBackoffSeconds }
+        let raw = baseBackoffSeconds * pow(2, Double(attempt))
+        return min(raw, maxBackoffSeconds)
+    }
+
+    /// Decide the next status and whether to schedule an auto-restart.
+    ///
+    /// - Parameters:
+    ///   - status: current controller status.
+    ///   - event: the lifecycle event.
+    ///   - restartAttempts: how many consecutive auto-restarts have already
+    ///     been scheduled (used to cap retries).
+    public static func decide(
+        status: TokenSaverDistillServiceStatus,
+        event: Event,
+        restartAttempts: Int
+    ) -> Decision {
+        switch event {
+        case .stopRequested:
+            // A stop is authoritative from ANY state: reset to idle so a stuck
+            // `.starting`/`.failed`/`.running` never persists across restarts.
+            return Decision(nextStatus: .notStarted, shouldRestart: false)
+
+        case .processExited(let wasUserStop):
+            // User-initiated termination is handled by `stop()` directly.
+            if wasUserStop {
+                return Decision(nextStatus: .notStarted, shouldRestart: false)
+            }
+            // Unexpected exit while blocked means eligibility already gated it
+            // off — do not resurrect.
+            if case .blocked = status {
+                return Decision(nextStatus: status, shouldRestart: false)
+            }
+            if restartAttempts >= maxRestartAttempts {
+                return Decision(
+                    nextStatus: .failed("RemoteCodeDistillService exited; restart limit reached"),
+                    shouldRestart: false
+                )
+            }
+            // Downgrade out of `.running`/`.starting` and schedule a restart.
+            return Decision(
+                nextStatus: .failed("RemoteCodeDistillService exited; restarting"),
+                shouldRestart: true
+            )
+
+        case .startupEOFWhileDead:
+            // Caps the startup wait: a dead process that emitted no ready event
+            // must transition out of `.starting`, otherwise the consumer polls
+            // for the full 60s window.
+            guard case .starting = status else {
+                return Decision(nextStatus: status, shouldRestart: false)
+            }
+            if restartAttempts >= maxRestartAttempts {
+                return Decision(
+                    nextStatus: .failed("RemoteCodeDistillService exited during startup; restart limit reached"),
+                    shouldRestart: false
+                )
+            }
+            return Decision(
+                nextStatus: .failed("RemoteCodeDistillService exited during startup; restarting"),
+                shouldRestart: true
+            )
+        }
+    }
+}
+
 private struct TokenSaverDistillCLIState: Codable {
     let baseURL: String
     let authToken: String
@@ -96,6 +202,13 @@ public final class TokenSaverDistillServiceController {
     private var process: Process?
     private var readyOutputHandle: FileHandle?
     private var readyOutputBuffer = Data()
+    /// Set while `stop()` is tearing down so the termination handler does not
+    /// misinterpret an intentional terminate() as a crash and auto-restart.
+    private var isStopping = false
+    /// Consecutive auto-restart attempts; reset to 0 once the sidecar reports
+    /// ready. Caps retries (TokenSaverDistillSupervisor.maxRestartAttempts).
+    private var restartAttempts = 0
+    private var restartTask: Task<Void, Never>?
 
     public init(
         appSupportDirectory: URL,
@@ -134,17 +247,75 @@ public final class TokenSaverDistillServiceController {
     }
 
     public func stop() {
+        isStopping = true
+        restartTask?.cancel()
+        restartTask = nil
+        restartAttempts = 0
         readyOutputHandle?.readabilityHandler = nil
         readyOutputHandle = nil
         readyOutputBuffer.removeAll(keepingCapacity: false)
         removeCLIState()
-        if let process, process.isRunning {
-            process.terminate()
+        if let process {
+            process.terminationHandler = nil
+            if process.isRunning {
+                process.terminate()
+            }
         }
         process = nil
         bearerToken = nil
-        if case .running = status {
-            status = .notStarted
+        // Reset from EVERY state (.starting/.failed/.running) so a stuck status
+        // never survives a stop()/eligibility change.
+        let decision = TokenSaverDistillSupervisor.decide(
+            status: status,
+            event: .stopRequested,
+            restartAttempts: 0
+        )
+        status = decision.nextStatus
+        isStopping = false
+    }
+
+    /// Called from the process termination handler on the MainActor.
+    private func handleProcessExit() {
+        // Tear down the dead process' I/O handles so a relaunch starts clean.
+        readyOutputHandle?.readabilityHandler = nil
+        readyOutputHandle = nil
+        readyOutputBuffer.removeAll(keepingCapacity: false)
+        removeCLIState()
+        process = nil
+        bearerToken = nil
+        applySupervisorEvent(.processExited(wasUserStop: isStopping))
+    }
+
+    /// Feeds a lifecycle event through the pure supervisor, applies the next
+    /// status, and schedules a backed-off restart when the supervisor asks for
+    /// one. Idempotent for terminal/duplicate events (e.g. EOF then exit).
+    private func applySupervisorEvent(_ event: TokenSaverDistillSupervisor.Event) {
+        let decision = TokenSaverDistillSupervisor.decide(
+            status: status,
+            event: event,
+            restartAttempts: restartAttempts
+        )
+        status = decision.nextStatus
+        if decision.shouldRestart {
+            scheduleRestart()
+        }
+    }
+
+    private func scheduleRestart() {
+        // Coalesce: if a restart is already pending, keep it.
+        guard restartTask == nil else { return }
+        let delay = TokenSaverDistillSupervisor.backoffSeconds(forAttempt: restartAttempts)
+        restartAttempts += 1
+        restartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            self.restartTask = nil
+            // Only relaunch if we are still in a failed/restart-pending state;
+            // a stop() or eligibility change may have intervened.
+            if case .failed = self.status {
+                self.start()
+            }
         }
     }
 
@@ -152,6 +323,9 @@ public final class TokenSaverDistillServiceController {
         if let process, process.isRunning {
             return
         }
+        // A live launch supersedes any pending backoff retry.
+        restartTask?.cancel()
+        restartTask = nil
         guard let executableURL = executableURLResolver() else {
             status = .failed("RemoteCodeDistillService executable missing")
             return
@@ -182,6 +356,15 @@ public final class TokenSaverDistillServiceController {
             self.process = process
             self.bearerToken = token
             self.status = .starting
+            // Supervise: when the sidecar exits unexpectedly, downgrade status
+            // and schedule a backed-off auto-restart so a crashed sidecar does
+            // not silently fail-open (Rule 6).
+            process.terminationHandler = { [weak self, weak process] _ in
+                Task { @MainActor [weak self, weak process] in
+                    guard let self, let process, self.process === process else { return }
+                    self.handleProcessExit()
+                }
+            }
             // Drain stderr continuously so the pipe buffer never fills.
             // Without this handler the sidecar blocks on any stderr write once
             // the 64 KB kernel pipe buffer is full, producing a deadlock.
@@ -207,8 +390,17 @@ public final class TokenSaverDistillServiceController {
                     guard let self, let process, self.process === process else { return }
                     handle.readabilityHandler = nil
                     self.readyOutputHandle = nil
-                    if process.isRunning, case .starting = self.status {
+                    guard case .starting = self.status else { return }
+                    if process.isRunning {
+                        // Stream closed but process alive: ready event will never
+                        // arrive on this handle.
                         self.status = .failed("RemoteCodeDistillService ready event missing")
+                    } else {
+                        // Dead process + EOF: cap the startup wait so the consumer
+                        // poll loop does not spin for the full 60s window. The
+                        // terminationHandler also fires, but EOF can arrive first;
+                        // whichever runs first downgrades + schedules the restart.
+                        self.applySupervisorEvent(.startupEOFWhileDead)
                     }
                 }
                 return
@@ -231,6 +423,9 @@ public final class TokenSaverDistillServiceController {
             let ready = try? JSONDecoder().decode(DistillServiceReadyEvent.self, from: lineData)
             if let ready {
                 writeCLIState(ready: ready)
+                // Healthy startup clears the restart-attempt counter so the next
+                // crash gets a fresh backoff budget.
+                restartAttempts = 0
                 status = .running(ready)
             } else {
                 status = .failed("RemoteCodeDistillService ready event invalid")
