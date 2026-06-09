@@ -182,6 +182,12 @@ public final class TokenSaverDistillServiceController {
             self.process = process
             self.bearerToken = token
             self.status = .starting
+            // Drain stderr continuously so the pipe buffer never fills.
+            // Without this handler the sidecar blocks on any stderr write once
+            // the 64 KB kernel pipe buffer is full, producing a deadlock.
+            stderr.fileHandleForReading.readabilityHandler = { handle in
+                _ = handle.availableData   // discard; keeps the buffer empty
+            }
             readReadyEvent(from: stdout.fileHandleForReading, process: process)
         } catch {
             self.status = .failed("RemoteCodeDistillService launch failed")
