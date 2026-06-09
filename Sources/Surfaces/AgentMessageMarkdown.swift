@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 import DesignSystemKit
 
 struct AgentMessageMarkdownBlock: Equatable {
@@ -106,6 +107,15 @@ enum AgentMessageMarkdown {
         return attributed
     }
 
+    /// IMP-010: Copies `text` to the system general pasteboard.
+    /// Extracted as a static helper so it can be unit-tested independently of the SwiftUI view.
+    @MainActor
+    static func copyCodeToPasteboard(_ text: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+
     private static func heading(from line: String) -> (level: Int, text: String)? {
         var level = 0
         for character in line {
@@ -157,17 +167,23 @@ struct AgentMessageMarkdownView: View {
     let text: String
     var compact: Bool = false
 
+    /// IMP-010: tracks which code block (by enumeration offset) is hovered.
+    @State private var hoveredCode: Int? = nil
+    /// IMP-010: tracks which code block most recently had its copy action triggered,
+    /// so the button can show transient "Copied" feedback.
+    @State private var copiedCode: Int? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
-            ForEach(Array(AgentMessageMarkdown.blocks(from: text).enumerated()), id: \.offset) { _, block in
-                blockView(block)
+            ForEach(Array(AgentMessageMarkdown.blocks(from: text).enumerated()), id: \.offset) { index, block in
+                blockView(block, index: index)
             }
         }
         .textSelection(.enabled)
     }
 
     @ViewBuilder
-    private func blockView(_ block: AgentMessageMarkdownBlock) -> some View {
+    private func blockView(_ block: AgentMessageMarkdownBlock, index: Int) -> some View {
         switch block.kind {
         case .paragraph:
             Text(AgentMessageMarkdown.attributedInline(block.text))
@@ -201,16 +217,51 @@ struct AgentMessageMarkdownView: View {
             }
             .padding(.leading, CGFloat(indent) * 16)
         case .code:
-            Text(block.text.isEmpty ? " " : block.text)
-                .font(DS.Font.monoSmall)
-                .foregroundColor(DS.Palette.text)
-                .textSelection(.enabled)
-                .padding(DS.Space.md)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(DS.Palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+            // IMP-010: wrap code block in ZStack so a copy button can be
+            // overlaid in the top-right corner without altering layout.
+            ZStack(alignment: .topTrailing) {
+                Text(block.text.isEmpty ? " " : block.text)
+                    .font(DS.Font.monoSmall)
+                    .foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                    .padding(DS.Space.md)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DS.Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+
+                // IMP-010: copy button — visible when this code block is hovered.
+                if hoveredCode == index {
+                    Button(action: {
+                        AgentMessageMarkdown.copyCodeToPasteboard(block.text)
+                        copiedCode = index
+                        // Reset feedback after 1.2 s to match MarkdownSurface JS pattern.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                            if copiedCode == index { copiedCode = nil }
+                        }
+                    }) {
+                        Text(copiedCode == index ? "Copied" : "Copy")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .padding(.horizontal, DS.Space.sm)
+                            .padding(.vertical, DS.Space.xxs)
+                            .background(DS.Palette.surfaceRaised)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Copy code to clipboard")
+                    .padding(DS.Space.sm)
+                    .transition(.opacity)
+                }
+            }
+            .onHover { inside in
+                withAnimation(.easeInOut(duration: 0.12)) {
+                    hoveredCode = inside ? index : nil
+                }
+            }
         }
     }
 
