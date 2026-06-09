@@ -60,6 +60,15 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = Self.currentSafariUserAgent()
         wv.setAccessibilityIdentifier("browser.webview")
+        // Enable Safari Web Inspector attachment in debug builds (P1 dev-server
+        // preview use case). isInspectable is macOS 13.3+ API; guarded with
+        // both a compile-time DEBUG flag and a runtime availability check so
+        // release builds and older OS versions are unaffected.
+        #if DEBUG
+        if #available(macOS 13.3, *) {
+            wv.isInspectable = true
+        }
+        #endif
         self.webView = wv
 
         let tf = NSTextField()
@@ -310,6 +319,17 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
     private func hideError() {
         errorOverlay.isHidden = true
+    }
+
+    /// Returns true when `isInspectable` is enabled on the webView —
+    /// i.e. DEBUG build on macOS 13.3+. Tests use this to assert the
+    /// feature is active under the expected conditions without needing
+    /// to touch the live WKWebView instance.
+    static func isInspectableEnabled() -> Bool {
+        #if DEBUG
+        if #available(macOS 13.3, *) { return true }
+        #endif
+        return false
     }
 
     public static var defaultInitialURL: URL {
