@@ -1531,10 +1531,10 @@ public final class SessionSnapshotRepository {
     }
 
     public func latest() throws -> SessionSnapshot? {
-        let st = try db.prepare("SELECT payload_json FROM session_snapshots ORDER BY id DESC LIMIT 1;")
-        if try st.step() {
-            guard let json = st.columnText(0), let data = json.data(using: .utf8) else { return nil }
-            return try? JSONDecoder().decode(SessionSnapshot.self, from: data)
+        let st = try db.prepare("SELECT payload_json FROM session_snapshots ORDER BY id DESC LIMIT 20;")
+        while try st.step() {
+            guard let json = st.columnText(0), let data = json.data(using: .utf8) else { continue }
+            if let snap = try? JSONDecoder().decode(SessionSnapshot.self, from: data) { return snap }
         }
         return nil
     }
