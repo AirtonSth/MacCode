@@ -412,6 +412,16 @@ public enum Schema {
     ]
 
     public static func migrate(_ db: SQLiteDB) throws {
+        try migrateSteps(db, steps)
+    }
+
+    /// Applies the given steps transactionally and idempotently.
+    /// Each pending step (SQL + its `schema_meta` row) is wrapped in a single
+    /// `BEGIN IMMEDIATE ... COMMIT`, rolling back on any error so a step is
+    /// all-or-nothing: a step that throws mid-way leaves both the schema and
+    /// `schema_meta` unchanged. Already-applied steps (version <= current MAX)
+    /// are skipped, so re-running is a no-op.
+    static func migrateSteps(_ db: SQLiteDB, _ steps: [SchemaStep]) throws {
         try db.execute("""
             CREATE TABLE IF NOT EXISTS schema_meta (
                 version INTEGER PRIMARY KEY,
@@ -428,11 +438,13 @@ public enum Schema {
         }
         let pending = steps.filter { $0.version > current }
         for step in pending.sorted(by: { $0.version < $1.version }) {
-            try db.execute(step.sql)
-            let ins = try db.prepare("INSERT OR IGNORE INTO schema_meta(version, applied_at) VALUES(?, ?);")
-            try ins.bind(1, Int64(step.version))
-            try ins.bind(2, ISO8601DateFormatter().string(from: Date()))
-            _ = try ins.step()
+            try db.transaction {
+                try db.execute(step.sql)
+                let ins = try db.prepare("INSERT OR IGNORE INTO schema_meta(version, applied_at) VALUES(?, ?);")
+                try ins.bind(1, Int64(step.version))
+                try ins.bind(2, ISO8601DateFormatter().string(from: Date()))
+                _ = try ins.step()
+            }
         }
     }
 }
