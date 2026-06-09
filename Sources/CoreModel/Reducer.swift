@@ -435,15 +435,20 @@ public struct LayoutReducer {
             return .pane(p)
         case .split(var s):
             s.children = try s.children.map { try removeSurface(in: $0, surfaceID: surfaceID) }
-            // collapse empty panes inside splits
-            s.children = s.children.compactMap { child -> LayoutNode? in
-                if case .pane(let p) = child, p.surfaces.isEmpty { return nil }
-                return child
+            // Collapse empty panes, preserving survivor ratios proportionally.
+            // Pair each child with its old ratio before filtering.
+            let paired = zip(s.children, s.ratios).map { ($0, $1) }
+            let survivors = paired.filter { child, _ in
+                if case .pane(let p) = child, p.surfaces.isEmpty { return false }
+                return true
             }
-            // recompute ratios
-            if s.children.isEmpty { return .pane(PaneNode()) }
-            if s.children.count == 1 { return s.children[0] }
-            s.ratios = Array(repeating: 1.0 / Double(s.children.count), count: s.children.count)
+            if survivors.isEmpty { return .pane(PaneNode()) }
+            if survivors.count == 1 { return survivors[0].0 }
+            // Renormalize using only survivors' old ratios; this automatically
+            // redistributes removed shares proportionally (SplitNode.normalize
+            // divides each ratio by the sum of all survivors' ratios).
+            s.children = survivors.map { $0.0 }
+            s.ratios = SplitNode.normalize(survivors.map { $0.1 })
             return .split(s)
         }
     }
