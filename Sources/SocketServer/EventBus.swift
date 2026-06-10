@@ -31,6 +31,10 @@ public final class EventBus: @unchecked Sendable {
     private let recentLimit: Int
     private let recentByteLimit: Int
     private let encoder = JSONEncoder()
+    /// One-encode-per-event cache keyed by seq. Entries are evicted when the
+    /// corresponding event is removed from the recent ring, bounding memory to
+    /// at most recentLimit entries.
+    private var encodedCache: [Int64: Data] = [:]
 
     public var persister: ((Event) -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
@@ -151,6 +155,7 @@ public final class EventBus: @unchecked Sendable {
             }
             let removed = recent.removeFirst()
             recentBytes = max(0, recentBytes - encodedSize(removed))
+            encodedCache.removeValue(forKey: removed.seq)
         }
     }
 
@@ -158,8 +163,17 @@ public final class EventBus: @unchecked Sendable {
         recentBytes = recent.reduce(0) { $0 + encodedSize($1) }
     }
 
+    /// Returns the JSON-encoded bytes for `ev`, encoding at most once per event.
+    /// Callers inside the lock may call this freely; the cache is also lock-protected.
+    func encodedData(for ev: Event) -> Data {
+        if let cached = encodedCache[ev.seq] { return cached }
+        let data = (try? encoder.encode(ev)) ?? Data()
+        encodedCache[ev.seq] = data
+        return data
+    }
+
     private func encodedSize(_ ev: Event) -> Int {
-        (try? encoder.encode(ev).count) ?? 0
+        encodedData(for: ev).count
     }
 }
 
