@@ -351,6 +351,24 @@ public final class DiffPanelViewModel: ObservableObject {
         startFSWatcher()
     }
 
+    /// Resolves a relative changed-file path against the workspace root.
+    /// Pure, nonisolated so it is testable without @MainActor.
+    nonisolated static func absolutePathURL(cwd: String, relativePath: String) -> URL {
+        URL(fileURLWithPath: relativePath, relativeTo: URL(fileURLWithPath: cwd, isDirectory: true)).standardizedFileURL
+    }
+
+    /// Returns true when "Open in Files tab" applies to a changed-file entry.
+    /// Binary files are excluded: there is nothing to show in the text editor.
+    /// Pure, nonisolated so it is testable without @MainActor.
+    nonisolated static func isOpenInFilesTabApplicable(for entry: GitFileEntry) -> Bool {
+        !entry.binary
+    }
+
+    /// Optional closure injected by the host surface so non-binary rows can
+    /// open the file in the app's Files tab. `nil` when no router is available
+    /// (e.g. standalone usage, tests); the menu item is hidden in that case.
+    public var openInFilesTabAction: ((String) -> Void)?
+
     /// Minimum wall-clock interval between FSEvent-triggered auto-refreshes.
     /// Exposed as `nonisolated static` so it is testable without @MainActor.
     nonisolated static let fsDebounceInterval: TimeInterval = 2.0
@@ -886,10 +904,22 @@ public struct DiffPanelView: View {
         // UX-006: discard a file's working-tree edits without a terminal.
         // UX-017: binary files have no textual diff — give them an escape
         // hatch (Open / Reveal) instead of a dead-end "binary" label.
+        // P2: non-binary rows get "Open in Files tab" + "Reveal in Finder"
+        // so users can jump to the editor or Finder directly from the diff list.
         .contextMenu {
             if f.binary {
                 Button { openFile(f.path) } label: {
                     Label("Open in default app", systemImage: "arrow.up.forward.app")
+                }
+                Button { revealFile(f.path) } label: {
+                    Label("Reveal in Finder", systemImage: "folder")
+                }
+                Divider()
+            } else {
+                if let action = vm.openInFilesTabAction {
+                    Button { action(f.path) } label: {
+                        Label("Open in Files tab", systemImage: "doc.text")
+                    }
                 }
                 Button { revealFile(f.path) } label: {
                     Label("Reveal in Finder", systemImage: "folder")
@@ -905,7 +935,7 @@ public struct DiffPanelView: View {
     }
 
     private func absoluteURL(_ path: String) -> URL {
-        URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: vm.cwd)).standardizedFileURL
+        DiffPanelViewModel.absolutePathURL(cwd: vm.cwd, relativePath: path)
     }
     private func openFile(_ path: String) { NSWorkspace.shared.open(absoluteURL(path)) }
     private func revealFile(_ path: String) {
@@ -1322,10 +1352,13 @@ public final class DiffPanelSurface: NSObject, Surface {
     public let view: NSView
     public let viewModel: DiffPanelViewModel
 
-    public init(workspaceID: WorkspaceID, cwd: String, title: String = "Diff", settings: SettingsStore? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, title: String = "Diff",
+                settings: SettingsStore? = nil,
+                openInFilesTabAction: ((String) -> Void)? = nil) {
         self.descriptor = SurfaceDescriptor(type: .rightSidebarTool, title: title, iconName: "doc.text.magnifyingglass",
                                             metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd, "tool": "diff"])
         self.viewModel = DiffPanelViewModel(cwd: cwd, settings: settings)
+        self.viewModel.openInFilesTabAction = openInFilesTabAction
         let host = NSHostingView(rootView: DiffPanelView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()
