@@ -97,7 +97,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         )
 
         let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = WKWebsiteDataStore.default()
+        cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: Self.dataStoreIdentifier(for: workspaceID))
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = Self.currentSafariUserAgent()
         wv.setAccessibilityIdentifier("browser.webview")
@@ -382,6 +382,17 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         if #available(macOS 13.3, *) { return true }
         #endif
         return false
+    }
+
+    /// Maps a workspace id to a stable `WKWebsiteDataStore` identifier.
+    /// Using the workspace UUID directly ensures:
+    ///   - Same workspace -> same identifier (deterministic, no hash needed).
+    ///   - Distinct workspaces -> distinct identifiers (UUID collision probability negligible).
+    ///   - Identifier is a valid UUID, as required by `WKWebsiteDataStore(forIdentifier:)`.
+    ///
+    /// Marked `nonisolated` so tests can call it without a MainActor context.
+    nonisolated static func dataStoreIdentifier(for workspaceID: WorkspaceID) -> UUID {
+        workspaceID.value
     }
 
     public static var defaultInitialURL: URL {
