@@ -38,6 +38,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let streamEventEncoder = JSONEncoder()
     private var streamEventsSincePrune: [AgentThreadID: Int] = [:]
     private static let streamEventPruneInterval = 25
+    // PERF-MAC_AGENT-007: per-thread buffer of pending stream-event writes plus
+    // the timestamp of the last flush, so 2-3 writes/event collapse into batched
+    // flushes (see shouldFlushStreamBatch). All touched under `lock`.
+    private var pendingStreamWrites: [AgentThreadID: StreamWriteBatch] = [:]
+    private var lastStreamFlushMs: [AgentThreadID: Int64] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
     // turnCompleted/finished pair without reloading the whole thread history.
     private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
@@ -335,6 +340,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             try? threadRepo.upsert(thread)
         }
         try? providerSessionRepo?.markStopped(threadId: threadId)
+        // PERF-MAC_AGENT-007: drain buffered stream writes for the genuine active
+        // run before tearing it down, so a cancel does not drop the buffered tail.
+        // The seq attribution requires the real runId, so only the runId-bearing
+        // stop path flushes (the nil-runId paths had no live buffered events).
+        if let runId {
+            flushPendingStreamWrites(runId: runId, threadId: threadId)
+        }
         lock.lock()
         if let runId {
             active.removeValue(forKey: runId)
@@ -349,6 +361,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             pendingThreadStops.remove(threadId)
         }
         streamEventsSincePrune.removeValue(forKey: threadId)
+        pendingStreamWrites.removeValue(forKey: threadId)
+        lastStreamFlushMs.removeValue(forKey: threadId)
         lock.unlock()
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)
@@ -577,6 +591,62 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return "\(binaryName):unresolved"
     }
 
+    // PERF-MAC_AGENT-007: a drained batch of stream-event writes plus whether a
+    // prune is due, ready to be replayed against the repos outside `lock`.
+    private struct BatchFlush {
+        var items: [StreamWriteItem]
+        var pruneDue: Bool
+    }
+
+    /// Must be called with `lock` held. Drains the per-thread buffer and resets the
+    /// flush clock so the next event starts a fresh time budget.
+    private func takeStreamFlushLocked(threadId: AgentThreadID, pruneDue: Bool, nowMs: Int64) -> BatchFlush? {
+        guard var batch = pendingStreamWrites[threadId], !batch.isEmpty else {
+            if pruneDue { return BatchFlush(items: [], pruneDue: true) }
+            return nil
+        }
+        let items = batch.drain()
+        pendingStreamWrites[threadId] = batch
+        lastStreamFlushMs[threadId] = nowMs
+        return BatchFlush(items: items, pruneDue: pruneDue)
+    }
+
+    /// Replays a drained batch: inserts each stream event (and provider-event log)
+    /// in seq order, optionally prunes, then writes diagnostics ONCE using the last
+    /// event's kind. This preserves the persisted content/order of the old per-event
+    /// path while collapsing 2-3 writes/event into one batched flush.
+    private func flushStreamWrites(_ flush: BatchFlush, runId: AgentRunID, threadId: AgentThreadID) {
+        do {
+            for item in flush.items {
+                try runRepo.appendStreamEvent(runId: runId, seq: item.seq, kind: item.kind, payloadJSON: item.payloadJSON)
+                if let providerEvent = item.providerEvent {
+                    try runRepo.appendProviderEventLog(threadId: threadId, runId: runId, event: providerEvent)
+                }
+            }
+            if flush.pruneDue {
+                try runRepo.pruneStreamEvents(threadId: threadId)
+            }
+            if let lastKind = flush.items.last?.kind {
+                try providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: lastKind, lastErrorMessage: nil)
+            }
+        } catch {
+            emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
+        }
+    }
+
+    /// Drain and persist any buffered stream writes for a thread immediately. Used
+    /// on terminal/stop paths so the tail of a fast stream is never stranded in the
+    /// buffer once the run is no longer producing events.
+    private func flushPendingStreamWrites(runId: AgentRunID, threadId: AgentThreadID) {
+        lock.lock()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let flush = takeStreamFlushLocked(threadId: threadId, pruneDue: false, nowMs: nowMs)
+        lock.unlock()
+        if let flush, !flush.items.isEmpty {
+            flushStreamWrites(flush, runId: runId, threadId: threadId)
+        }
+    }
+
     private func updateProviderRuntimePayload(
         threadId: AgentThreadID,
         runId: AgentRunID,
@@ -725,25 +795,34 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let s = (seq[runId] ?? 0) + 1
             seq[runId] = s
             let data = try? streamEventEncoder.encode(ev)
-            // Prune at most once per `streamEventPruneInterval` events per thread
-            // instead of after every append; terminal events still flush below.
-            let pruneCount = (streamEventsSincePrune[threadId] ?? 0) + 1
-            let shouldPrune = pruneCount >= Self.streamEventPruneInterval
-            streamEventsSincePrune[threadId] = shouldPrune ? 0 : pruneCount
             lock.unlock()
+            // PERF-MAC_AGENT-007: buffer the per-event writes (stream event +
+            // optional provider-event log) and flush them in batches instead of
+            // 2-3 synchronous transactions per delta. Prune cadence and diagnostics
+            // are coalesced into the flush. The payload compactor runs outside the
+            // lock (as before) since it is an external, structure-preserving call.
             if let data, let json = String(data: data, encoding: .utf8) {
-                do {
-                    let payloadJSON = streamPayloadCompactor?(json) ?? json
-                    try runRepo.appendStreamEvent(runId: runId, seq: s, kind: ev.debugDescription, payloadJSON: payloadJSON)
-                    if case .providerRuntime(let runtimeEvent) = ev {
-                        try runRepo.appendProviderEventLog(threadId: threadId, runId: runId, event: runtimeEvent)
-                    }
-                    if shouldPrune {
-                        try runRepo.pruneStreamEvents(threadId: threadId)
-                    }
-                    try providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: ev.debugDescription, lastErrorMessage: nil)
-                } catch {
-                    emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
+                let payloadJSON = streamPayloadCompactor?(json) ?? json
+                let providerEvent: ProviderRuntimeEvent?
+                if case .providerRuntime(let runtimeEvent) = ev { providerEvent = runtimeEvent } else { providerEvent = nil }
+                lock.lock()
+                var batch = pendingStreamWrites[threadId] ?? StreamWriteBatch()
+                batch.append(StreamWriteItem(seq: s, kind: ev.debugDescription, payloadJSON: payloadJSON, providerEvent: providerEvent))
+                pendingStreamWrites[threadId] = batch
+                // Prune at most once per `streamEventPruneInterval` events per thread.
+                let pruneCount = (streamEventsSincePrune[threadId] ?? 0) + 1
+                let pruneDue = pruneCount >= Self.streamEventPruneInterval
+                streamEventsSincePrune[threadId] = pruneDue ? 0 : pruneCount
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                let lastMs = lastStreamFlushMs[threadId] ?? nowMs
+                lastStreamFlushMs[threadId] = lastStreamFlushMs[threadId] ?? nowMs
+                var flushNow: BatchFlush?
+                if Self.shouldFlushStreamBatch(pendingCount: batch.count, sinceLastFlushMs: nowMs - lastMs) || pruneDue {
+                    flushNow = takeStreamFlushLocked(threadId: threadId, pruneDue: pruneDue, nowMs: nowMs)
+                }
+                lock.unlock()
+                if let flushNow {
+                    flushStreamWrites(flushNow, runId: runId, threadId: threadId)
                 }
             }
             switch ev {
@@ -827,6 +906,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
                 return
             }
+            // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
+            // tears down, so the tail of a fast stream is durably persisted (and
+            // visible to latestStreamEvents/reload) once the run finishes.
+            flushPendingStreamWrites(runId: runId, threadId: threadId)
             // persist final assistant message only on success
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
                 if let persisted = persistAssistantIfMissing(msg, threadId: threadId, runId: runId) {
@@ -925,6 +1008,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // since the last cadence-prune don't linger unbounded.
             let pendingPrune = (streamEventsSincePrune[threadId] ?? 0) > 0
             streamEventsSincePrune.removeValue(forKey: threadId)
+            // PERF-MAC_AGENT-007: buffer was drained by flushPendingStreamWrites
+            // above; drop the per-thread batch + flush clock so they don't leak.
+            pendingStreamWrites.removeValue(forKey: threadId)
+            lastStreamFlushMs.removeValue(forKey: threadId)
             lock.unlock()
             if pendingPrune {
                 do {
@@ -1289,6 +1376,55 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     nonisolated static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    // PERF-MAC_AGENT-007: fast streaming was emitting 2-3 synchronous SQLite
+    // writes per stream event (appendStreamEvent + optional appendProviderEventLog
+    // + updateDiagnostics), each its own transaction. We now buffer those writes
+    // and flush them on a cadence. The buffer + the flush decision are pure and
+    // unit-testable so the batching latency/size bounds are pinned by tests.
+    struct StreamWriteItem {
+        var seq: Int
+        var kind: String
+        var payloadJSON: String
+        var providerEvent: ProviderRuntimeEvent?
+    }
+
+    struct StreamWriteBatch {
+        private var items: [StreamWriteItem] = []
+
+        var isEmpty: Bool { items.isEmpty }
+        var count: Int { items.count }
+
+        mutating func append(_ item: StreamWriteItem) {
+            items.append(item)
+        }
+
+        mutating func drain() -> [StreamWriteItem] {
+            let snapshot = items
+            items.removeAll(keepingCapacity: true)
+            return snapshot
+        }
+    }
+
+    /// How many buffered stream events force a flush. Bounds both the in-memory
+    /// buffer and the lock-held replay size on a single flush.
+    nonisolated static let streamFlushCountThreshold = 16
+    /// Max latency (ms) a buffered stream event may wait before being flushed,
+    /// so a slow trickle still reaches the DB (and survives reload/crash).
+    nonisolated static let streamFlushTimeThresholdMs: Int64 = 250
+
+    /// Pure flush-cadence decision: flush when there is pending work AND either the
+    /// count cap is reached or the time budget has elapsed. nonisolated so it is
+    /// directly unit-testable without standing up a coordinator.
+    nonisolated static func shouldFlushStreamBatch(
+        pendingCount: Int,
+        sinceLastFlushMs: Int64,
+        countThreshold: Int = streamFlushCountThreshold,
+        timeThresholdMs: Int64 = streamFlushTimeThresholdMs
+    ) -> Bool {
+        guard pendingCount > 0 else { return false }
+        return pendingCount >= countThreshold || sinceLastFlushMs >= timeThresholdMs
     }
 
     private func captureFileDiffs(files: [AgentTurnCheckpointFile], cwd: String) -> [AgentTurnCheckpointFileDiff] {
