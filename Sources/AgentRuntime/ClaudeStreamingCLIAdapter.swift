@@ -96,7 +96,35 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
-        try stopSession(threadId: threadId)
+        lock.lock()
+        let session = sessions[threadId]
+        lock.unlock()
+        guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
+        // Attempt graceful interrupt via stream-json control message first.
+        // This lets the Claude CLI finish writing and close cleanly, preserving
+        // the warm session for potential resumption. Fall back to process kill
+        // only if the stdin write fails (pipe closed, process already dead, etc.).
+        let line = Self.controlInterruptLine()
+        let didSend = session.writeQueue.sync {
+            (try? GuardedStdinWrite.write(line,
+                                          to: session.stdinPipe.fileHandleForWriting,
+                                          process: session.process,
+                                          notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })) != nil
+        }
+        if !didSend {
+            try stopSession(threadId: threadId)
+        }
+    }
+
+    /// Builds the newline-terminated stream-json control interrupt payload.
+    /// Pure builder — no I/O, no actor isolation. Extracted for unit testing.
+    nonisolated static func controlInterruptLine() -> Data {
+        // Claude CLI stream-json protocol: sending {"type":"control","action":"interrupt"}
+        // over stdin requests a clean turn abort without killing the process.
+        let payload: [String: Any] = ["type": "control", "action": "interrupt"]
+        var data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+        data.append(0x0A) // newline delimiter
+        return data
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
