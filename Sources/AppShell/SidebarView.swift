@@ -743,6 +743,37 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
+    /// Pure helper: determines whether a context-menu gesture on `clickedID`
+    /// should produce a multi-select menu or a single-row menu.
+    ///
+    /// Multi-select applies when the clicked row is already part of an explicit
+    /// multi-item selection (>= 2 IDs in `selectedIDs`).  In that case the
+    /// caller should show batch actions labelled with the returned count.
+    /// Otherwise it falls through to the normal single-row actions so that
+    /// right-clicking an unrelated row, or right-clicking when nothing is
+    /// multi-selected, still shows the familiar per-workspace menu.
+    ///
+    /// - Returns: `(isMulti: true, count: N)` when batch menu is appropriate;
+    ///            `(isMulti: false, count: 1)` otherwise.
+    nonisolated public static func sidebarContextMenuMode(
+        clickedID: WorkspaceID,
+        selectedIDs: Set<WorkspaceID>
+    ) -> (isMulti: Bool, count: Int) {
+        guard selectedIDs.count >= 2, selectedIDs.contains(clickedID) else {
+            return (isMulti: false, count: 1)
+        }
+        return (isMulti: true, count: selectedIDs.count)
+    }
+
+    public func pinSelectedWorkspaces(_ pinned: Bool) {
+        let ids = selectedWorkspaceIDs
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            try? router?.setWorkspacePinned(id, pinned)
+        }
+        reload()
+    }
+
     public func removeSelectedWorkspaces() {
         let ids = selectedWorkspaceIDs
         guard !ids.isEmpty else { return }
@@ -2195,29 +2226,48 @@ public struct SidebarRootView: View {
         }
         .onDrop(of: [.text], delegate: WorkspaceDropDelegate(vm: vm, target: ws))
         .contextMenu {
-            Button { vm.setWorkspacePinned(ws, !pinned) } label: {
-                Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
-            }
-            Divider()
-            Button { vm.openWorkspaceInNewWindow(ws) } label: {
-                Label("Open in New Window", systemImage: "macwindow")
-            }
-            Button { vm.openWorkspaceInFinder(ws) } label: {
-                Label("Open in Finder", systemImage: "folder")
-            }
-            Divider()
-            Button("Rename…") { vm.renameWorkspace(ws) }
-            Button("Edit description…") { vm.editDescription(ws) }
-            Menu("Color") {
-                Button("None") { vm.setWorkspaceColor(ws, "") }
-                ForEach(TabColor.allCases, id: \.self) { c in
-                    Button { vm.setWorkspaceColor(ws, c.rawValue) } label: {
-                        TabColorMenuLabel(c)
+            let mode = SidebarViewModel.sidebarContextMenuMode(
+                clickedID: ws.id,
+                selectedIDs: vm.selectedWorkspaceIDs
+            )
+            if mode.isMulti {
+                // Multi-select context menu: batch actions for all selected workspaces.
+                Button { vm.pinSelectedWorkspaces(true) } label: {
+                    Label("Pin \(mode.count) Workspaces", systemImage: "pin")
+                }
+                Button { vm.pinSelectedWorkspaces(false) } label: {
+                    Label("Unpin \(mode.count) Workspaces", systemImage: "pin.slash")
+                }
+                Divider()
+                Button("Remove \(mode.count) Workspaces\u{2026}", role: .destructive) {
+                    vm.removeSelectedWorkspaces()
+                }
+            } else {
+                // Single-row context menu: per-workspace actions.
+                Button { vm.setWorkspacePinned(ws, !pinned) } label: {
+                    Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
+                }
+                Divider()
+                Button { vm.openWorkspaceInNewWindow(ws) } label: {
+                    Label("Open in New Window", systemImage: "macwindow")
+                }
+                Button { vm.openWorkspaceInFinder(ws) } label: {
+                    Label("Open in Finder", systemImage: "folder")
+                }
+                Divider()
+                Button("Rename\u{2026}") { vm.renameWorkspace(ws) }
+                Button("Edit description\u{2026}") { vm.editDescription(ws) }
+                Menu("Color") {
+                    Button("None") { vm.setWorkspaceColor(ws, "") }
+                    ForEach(TabColor.allCases, id: \.self) { c in
+                        Button { vm.setWorkspaceColor(ws, c.rawValue) } label: {
+                            TabColorMenuLabel(c)
+                        }
                     }
                 }
+                Divider()
+                Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
             }
-            Divider()
-            Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
         }
     }
 }
