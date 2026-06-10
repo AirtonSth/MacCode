@@ -639,7 +639,7 @@ final class GhosttyTerminalView: NSView {
     /// while truly unrenderable (no live surface). Should stay 0 in normal
     /// operation; exposed via runtime health so tests/telemetry catch the drop
     /// path being hit (QA-006, guards PERF-009).
-    private(set) var droppedOutputBytes = 0
+    internal(set) var droppedOutputBytes = 0
 
     /// Find-in-scrollback (Cmd+F) overlay state. The bar is lazily built on first
     /// open. `findMatchCount`/`findCurrentMatch` are the navigation cursor over
