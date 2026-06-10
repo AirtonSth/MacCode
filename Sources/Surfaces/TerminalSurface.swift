@@ -396,6 +396,39 @@ public enum BellHandler {
     }
 }
 
+// MARK: - Export format helpers (pure, non-MainActor, testable)
+
+/// Supported export formats for terminal output.
+public enum TerminalExportFormat {
+    /// Plain UTF-8 text (ANSI escape sequences stripped by the caller).
+    case txt
+    /// Raw ANSI escape sequence text.
+    case ansi
+}
+
+/// Pure helpers for the "Save Output..." action.
+public enum TerminalExportHelpers {
+    /// Returns the file extension string for a given export format.
+    /// Used to derive the default filename presented to the user.
+    public nonisolated static func fileExtension(for format: TerminalExportFormat) -> String {
+        switch format {
+        case .txt:  return "txt"
+        case .ansi: return "ansi"
+        }
+    }
+}
+
+// MARK: - Copy-on-select decision (pure, non-MainActor, testable)
+
+/// Pure gate for the copy-on-select preference.
+public enum TerminalCopyOnSelect {
+    /// Returns `true` only when the preference is enabled AND a non-empty
+    /// selection exists. Either condition alone must not trigger a copy.
+    public nonisolated static func shouldCopy(prefEnabled: Bool, hasSelection: Bool) -> Bool {
+        prefEnabled && hasSelection
+    }
+}
+
 // MARK: - TerminalSurface
 
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
@@ -460,6 +493,11 @@ public final class TerminalSurface: NSObject, Surface {
     /// Bell preferences, configurable by the user. Defaults to silent (no sound,
     /// no flash) so new installs do not produce unexpected audio or visual output.
     public var bellPreferences = BellPreferences()
+
+    /// When `true`, any non-empty mouse selection is automatically copied to the
+    /// system pasteboard (copy-on-select). Defaults to `false` so existing
+    /// behavior is unchanged; the user must opt in via preferences.
+    public var copyOnSelectEnabled: Bool = false
 
     /// Called on the main actor when the user taps "Restart shell" on the
     /// dead-terminal banner. The caller (AppCommandRouter) replaces this
@@ -1449,6 +1487,21 @@ public final class TerminalSurface: NSObject, Surface {
         } else {
             historyQueue.async(execute: write)
         }
+    }
+
+    /// Exports the full scrollback (including ANSI sequences when format is
+    /// `.ansi`, or raw text when format is `.txt`) to `url`.
+    /// The caller is responsible for presenting the NSSavePanel and providing
+    /// the destination URL.
+    public func saveOutput(format: TerminalExportFormat, to url: URL) throws {
+        let content: String
+        switch format {
+        case .ansi:
+            content = renderer.ansiSnapshot(includeScrollback: true)
+        case .txt:
+            content = renderer.snapshot().string
+        }
+        try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
     public func snapshot() -> [String: String] {
