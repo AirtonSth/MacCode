@@ -723,9 +723,16 @@ public final class PaneTabsView: NSObject {
     public static func splitDropDirection(in bounds: NSRect, at point: NSPoint) -> SplitDirection? {
         guard bounds.contains(point) else { return nil }
         let rightIntent = point.x - bounds.midX
+        // downIntent positive when point is in the lower half (NSRect: y=0 at bottom).
         let downIntent = bounds.midY - point.y
-        guard rightIntent > 0 || downIntent > 0 else { return nil }
-        return rightIntent >= downIntent ? .right : .down
+        let absH = abs(rightIntent)
+        let absV = abs(downIntent)
+        guard absH > 0 || absV > 0 else { return nil }
+        if absH >= absV {
+            return rightIntent >= 0 ? .right : .left
+        } else {
+            return downIntent >= 0 ? .down : .up
+        }
     }
 
     @discardableResult

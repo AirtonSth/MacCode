@@ -64,8 +64,8 @@ final class TabDragTests: XCTestCase {
                        "dragging a tab toward the side of its pane should create a side-by-side split")
         XCTAssertEqual(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 120, y: 40)), .down,
                        "dragging a tab toward the bottom of its pane should create a stacked split")
-        XCTAssertNil(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 120, y: 240)),
-                     "the normal tab area must keep selecting/reordering instead of unexpectedly splitting")
+        XCTAssertNil(PaneTabsView.splitDropDirection(in: bounds, at: NSPoint(x: 200, y: 150)),
+                     "the exact center has zero displacement on both axes -- no direction, no split")
     }
 
     func test_splitDropPreview_usesCmuxBluePaneOverlay() {
