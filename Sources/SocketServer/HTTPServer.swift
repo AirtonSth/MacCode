@@ -662,7 +662,24 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     private struct WSFrame { let opcode: UInt8; let payload: Data }
 
-    private func parseClientFrame(_ buf: [UInt8], from start: Int) -> (WSFrame, Int)? {
+    /// Pure frame-header parse result. No I/O, no actor. `internal` for unit tests.
+    ///
+    /// - `shouldReject`: true when the frame is invalid regardless of masking
+    ///   (e.g. overflow length or oversized payload). The caller must close.
+    /// - `masked`: reflects the MASK bit; RFC6455 s5.3 requires clients to mask.
+    /// - `headerEnd`: offset from `start` to the end of length fields (before
+    ///   the 4-byte mask key). Only meaningful when `shouldReject` is false.
+    struct WSFrameHeader {
+        let opcode: UInt8
+        let masked: Bool
+        let payloadLen: Int
+        let headerEnd: Int
+        let shouldReject: Bool
+    }
+
+    /// Parses the two-byte fixed header plus extended-length fields from `buf`
+    /// starting at `start`. Returns nil when more bytes are needed.
+    static func wsFrameHeader(buf: [UInt8], from start: Int) -> WSFrameHeader? {
         let available = buf.count - start
         guard available >= 2 else { return nil }
         let b0 = buf[start]
@@ -682,35 +699,48 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 wideLen = (wideLen << 8) | UInt64(buf[start + 2 + i])
             }
             guard wideLen <= UInt64(Int.max) else {
-                return (WSFrame(opcode: 0x8, payload: Data()), 10)
+                return WSFrameHeader(opcode: opcode, masked: masked,
+                                     payloadLen: 0, headerEnd: 10, shouldReject: true)
             }
             len = Int(wideLen)
             idx = 10
         }
-        if len > Self.maxClientFramePayloadBytes {
-            return (WSFrame(opcode: 0x8, payload: Data()), idx)
+        if len > maxClientFramePayloadBytes {
+            return WSFrameHeader(opcode: opcode, masked: masked,
+                                 payloadLen: 0, headerEnd: idx, shouldReject: true)
         }
+        return WSFrameHeader(opcode: opcode, masked: masked,
+                             payloadLen: len, headerEnd: idx, shouldReject: false)
+    }
+
+    private func parseClientFrame(_ buf: [UInt8], from start: Int) -> (WSFrame, Int)? {
+        guard let hdr = Self.wsFrameHeader(buf: buf, from: start) else { return nil }
+
+        // Oversized / overflow -- close regardless of masking.
+        if hdr.shouldReject {
+            return (WSFrame(opcode: 0x8, payload: Data()), hdr.headerEnd)
+        }
+
+        // RFC6455 s5.3: clients MUST mask all frames sent to the server.
+        // An unmasked client frame is a protocol error; close with 1002.
+        guard hdr.masked else {
+            return (WSFrame(opcode: 0x8, payload: Data()), hdr.headerEnd)
+        }
+
+        var idx = hdr.headerEnd
+        let available = buf.count - start
         var maskKey: [UInt8] = [0, 0, 0, 0]
-        if masked {
-            guard available >= idx + 4 else { return nil }
-            for i in 0..<4 { maskKey[i] = buf[start + idx + i] }
-            idx += 4
-        }
-        guard available >= idx + len else { return nil }
+        guard available >= idx + 4 else { return nil }
+        for i in 0..<4 { maskKey[i] = buf[start + idx + i] }
+        idx += 4
+
+        guard available >= idx + hdr.payloadLen else { return nil }
         let payloadStart = start + idx
-        var payload = [UInt8](repeating: 0, count: len)
-        if masked {
-            for i in 0..<len {
-                payload[i] = buf[payloadStart + i] ^ maskKey[i & 3]
-            }
-        } else if len > 0 {
-            buf.withUnsafeBufferPointer { src in
-                payload.withUnsafeMutableBufferPointer { dst in
-                    dst.baseAddress!.update(from: src.baseAddress!.advanced(by: payloadStart), count: len)
-                }
-            }
+        var payload = [UInt8](repeating: 0, count: hdr.payloadLen)
+        for i in 0..<hdr.payloadLen {
+            payload[i] = buf[payloadStart + i] ^ maskKey[i & 3]
         }
-        return (WSFrame(opcode: opcode, payload: Data(payload)), idx + len)
+        return (WSFrame(opcode: hdr.opcode, payload: Data(payload)), idx + hdr.payloadLen)
     }
 
     private func sendPongFrame(fd: Int32, payload: Data) {
