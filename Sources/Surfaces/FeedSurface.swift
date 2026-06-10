@@ -41,6 +41,17 @@ public final class FeedPanelViewModel: ObservableObject {
     @Published public private(set) var filtered: [Item] = []
 
     private var pending: [Item] = []
+
+    /// Number of buffered events waiting to be flushed when the feed resumes.
+    public var pendingCount: Int { pending.count }
+
+    /// Pure helper: badge text to show on the pause control.
+    /// Returns nil when not paused or when there is nothing buffered.
+    nonisolated public static func pauseBadgeText(isPaused: Bool, pendingCount: Int) -> String? {
+        guard isPaused, pendingCount > 0 else { return nil }
+        return "\(pendingCount)"
+    }
+
     private static let cap = 200
     /// Trim only when crossing this slack threshold, not every event (PERF-003).
     private static let trimAt = 256
@@ -133,10 +144,24 @@ public struct FeedPanelView: View {
                 }
                 Spacer()
                 // UX-008: pause freezes the stream while reading; clear resets it.
-                DSIconButton(vm.paused ? "play.fill" : "pause.fill",
-                             help: vm.paused ? "Resume feed" : "Pause feed") { vm.paused.toggle() }
-                    .accessibilityLabel(vm.paused ? "Resume feed" : "Pause feed")
-                    .accessibilityIdentifier("feed.pause")
+                HStack(spacing: DS.Space.xs) {
+                    DSIconButton(vm.paused ? "play.fill" : "pause.fill",
+                                 help: vm.paused ? "Resume feed" : "Pause feed") { vm.paused.toggle() }
+                        .accessibilityLabel(vm.paused ? "Resume feed" : "Pause feed")
+                        .accessibilityIdentifier("feed.pause")
+                    if let badge = FeedPanelViewModel.pauseBadgeText(isPaused: vm.paused,
+                                                                      pendingCount: vm.pendingCount) {
+                        Text(badge)
+                            .font(DS.Font.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, DS.Space.xs)
+                            .padding(.vertical, 1)
+                            .background(DS.Palette.accent)
+                            .clipShape(Capsule())
+                            .accessibilityLabel("\(badge) buffered events")
+                            .accessibilityIdentifier("feed.pause.badge")
+                    }
+                }
                 DSIconButton("trash", help: "Clear feed") { vm.clear() }
                     .accessibilityLabel("Clear feed")
                     .accessibilityIdentifier("feed.clear")
