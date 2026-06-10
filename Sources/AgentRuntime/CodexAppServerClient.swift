@@ -31,6 +31,16 @@ public struct CodexAppServerInitializeResult: Equatable, Sendable {
 public struct CodexAppServerThreadOpenResult {
     public let providerThreadId: String
     public let response: CodexAppServerClient.JSONObject
+    /// True when `thread/resume` failed recoverably and the adapter fell back
+    /// to `thread/start`. Callers should notify the user that prior context
+    /// was not restored.
+    public let resumeFellBackToStart: Bool
+
+    public init(providerThreadId: String, response: CodexAppServerClient.JSONObject, resumeFellBackToStart: Bool = false) {
+        self.providerThreadId = providerThreadId
+        self.response = response
+        self.resumeFellBackToStart = resumeFellBackToStart
+    }
 }
 
 public enum CodexAppServerModelDiscovery {
@@ -206,6 +216,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
     public func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult {
         let params = Self.threadStartParams(for: request)
         let response: JSONObject
+        var resumeFellBack = false
         if let providerThreadId = request.providerThreadId, !providerThreadId.isEmpty {
             do {
                 var resumeParams = params
@@ -213,6 +224,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 response = try await requestJSONObject(method: "thread/resume", params: resumeParams)
             } catch {
                 guard Self.isRecoverableThreadResumeError(error) else { throw error }
+                resumeFellBack = true
                 response = try await requestJSONObject(method: "thread/start", params: params)
             }
         } else {
@@ -220,7 +232,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
         return CodexAppServerThreadOpenResult(
             providerThreadId: try Self.threadId(from: response),
-            response: response
+            response: response,
+            resumeFellBackToStart: resumeFellBack
         )
     }
 

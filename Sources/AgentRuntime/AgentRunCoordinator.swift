@@ -521,7 +521,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                thread.providerThreadId?.isEmpty != false {
                 return nil
             }
-            throw AgentProviderAdapterError.unsupported("Provider session for this thread is stopped; start a new thread or rerun from a valid checkpoint.")
+            throw AgentProviderAdapterError.unsupported("Session was stopped. Tap Continue to resume from the last checkpoint, or start a new thread.")
         case .unrecoverable(let reason):
             if let thread = try threadRepo.get(id: request.threadId), thread.providerThreadId?.isEmpty == false {
                 throw AgentProviderAdapterError.unsupported(reason)
@@ -1174,7 +1174,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func shouldBufferProviderTextPrefix(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
+        // Pure-whitespace deltas are not SR1 signals; stream them live so a
+        // normal reply whose first chunk is "\n" does not appear all-at-once.
+        guard !trimmed.isEmpty else { return false }
         if SR1ResponseDetector.isSR1(trimmed) { return true }
         let lower = trimmed.lowercased()
         if lower.hasPrefix("sr1") || lower.hasPrefix("dict") { return true }

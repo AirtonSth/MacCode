@@ -48,11 +48,11 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
-        throw AgentProviderAdapterError.unsupported("respondToRequest")
+        throw AgentProviderAdapterError.unsupported("Approvals are not available in one-shot CLI mode. Use supervised or streaming mode to approve tool requests.")
     }
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
-        throw AgentProviderAdapterError.unsupported("respondToUserInput")
+        throw AgentProviderAdapterError.unsupported("User input responses are not available in one-shot CLI mode. Use supervised or streaming mode.")
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
@@ -91,7 +91,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
         guard let index = stream.lastIndex(where: { $0.completedTurnId == toTurnId || $0.startedTurnId == toTurnId }) else {
-            throw AgentProviderAdapterError.unsupported("rollbackThread target not found")
+            throw AgentProviderAdapterError.unsupported("The rollback target was not found in the current session history. The session may have been reset or the checkpoint is no longer available.")
         }
         stream = Array(stream.prefix(through: index))
         events[threadId] = stream

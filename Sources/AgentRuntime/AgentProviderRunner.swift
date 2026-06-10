@@ -158,11 +158,11 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
-        throw AgentProviderAdapterError.unsupported("respondToRequest")
+        throw AgentProviderAdapterError.unsupported("Approvals are not available in one-shot CLI mode. Use supervised or streaming mode to approve tool requests.")
     }
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
-        throw AgentProviderAdapterError.unsupported("respondToUserInput")
+        throw AgentProviderAdapterError.unsupported("User input responses are not available in one-shot CLI mode. Use supervised or streaming mode.")
     }
 
     public func stopSession(threadId: AgentThreadID) throws {

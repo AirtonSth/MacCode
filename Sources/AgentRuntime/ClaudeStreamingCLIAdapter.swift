@@ -226,7 +226,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         guard let index = session.events.lastIndex(where: { Self.completedTurnId($0) == toTurnId || Self.startedTurnId($0) == toTurnId }) else {
             lock.unlock()
-            throw AgentProviderAdapterError.unsupported("rollbackThread target not found")
+            throw AgentProviderAdapterError.unsupported("The rollback target was not found in the current session history. The session may have been reset or the checkpoint is no longer available.")
         }
         session.events = Array(session.events.prefix(through: index))
         session.completedTurnIds = session.events.compactMap(Self.completedTurnId)

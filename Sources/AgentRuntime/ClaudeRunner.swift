@@ -84,10 +84,20 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         return args
     }
 
+    /// Human-readable error shown when the provider binary is absent from PATH.
+    /// Includes the most common install paths so users can diagnose the issue
+    /// without opening a terminal.
+    nonisolated static func missingBinaryMessage(_ binary: String) -> String {
+        "\(binary) not found in PATH. Install it with: npm install -g @anthropic-ai/claude-code  " +
+        "or: brew install claude-code  " +
+        "Searched: ~/.remote-code/bin, /opt/homebrew/bin, ~/.local/bin, ~/.npm-global/bin. " +
+        "Open Settings to set a custom path."
+    }
+
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
         let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? request.providerBinary! : (binaryNameOverride ?? "claude")
         guard let path = ProcessLocator.resolve(binary) else {
-            onEvent(.error("\(binary) not found in PATH"))
+            onEvent(.error(Self.missingBinaryMessage(binary)))
             onEvent(.finished(.failed, finalMessage: nil, providerThreadId: nil))
             throw AgentRunError.missingBinary(binary)
         }

@@ -171,6 +171,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
         onEvent(.status(.running))
         onEvent(.event(.threadStarted(threadId: opened.providerThreadId, providerThreadId: opened.providerThreadId)))
+        if opened.resumeFellBackToStart {
+            onEvent(.event(.error(message: "Previous session could not be resumed; starting a new session.", recoverable: true)))
+        }
 
         let turn = try await client.startTurn(providerThreadId: opened.providerThreadId, for: request)
         if let turnId = Self.turnId(from: turn), !turnId.isEmpty {
