@@ -79,6 +79,9 @@ public final class SidebarViewModel: ObservableObject {
     /// so the list can draw an insertion line instead of reordering live.
     @Published public var dropTargetWorkspaceID: WorkspaceID?
     private var selectionAnchorID: WorkspaceID?
+    /// Session-local undo stack for removed workspaces. Newest entry at end.
+    /// Not persisted; cleared on app quit.
+    private(set) var removedWorkspaceStack: [WorkspaceUndoEntry] = []
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
@@ -754,8 +757,12 @@ public final class SidebarViewModel: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
             do {
+                let entry = WorkspaceUndoEntry(name: ws.name, cwd: ws.cwd, metadata: ws.metadata)
+                removedWorkspaceStack = WorkspaceUndoStack.push(entry, onto: removedWorkspaceStack)
                 try router?.closeWorkspace(ws.id)
             } catch {
+                // Roll back the undo push if close failed.
+                removedWorkspaceStack = WorkspaceUndoStack.pop(from: removedWorkspaceStack)?.remaining ?? removedWorkspaceStack
                 showOperationError("Could not remove workspace", detail: error.localizedDescription)
             }
         }
@@ -847,6 +854,119 @@ public final class SidebarViewModel: ObservableObject {
         guard let wid = selectedWorkspaceID,
               let ws = workspaces.first(where: { $0.id == wid }) else { return }
         removeWorkspace(ws)
+    }
+
+    /// True when there is at least one removed workspace that can be undone.
+    public var canUndoRemoveWorkspace: Bool {
+        !removedWorkspaceStack.isEmpty
+    }
+
+    /// Recreates the most-recently-removed workspace (session-local undo).
+    /// No-op when the stack is empty.
+    public func undoRemoveWorkspace() {
+        guard let (entry, remaining) = WorkspaceUndoStack.pop(from: removedWorkspaceStack) else { return }
+        removedWorkspaceStack = remaining
+        do {
+            let restored = try router?.createWorkspace(name: entry.name, cwd: entry.cwd)
+            if let id = restored?.id {
+                if entry.metadata["pinned"] == "true" {
+                    try? router?.setWorkspacePinned(id, true)
+                }
+                if let color = entry.metadata["color"], !color.isEmpty {
+                    try? router?.setWorkspaceColor(id, color)
+                }
+                if let desc = entry.metadata["description"], !desc.isEmpty {
+                    try? router?.setWorkspaceDescription(id, desc)
+                }
+            }
+            reload()
+        } catch {
+            showOperationError("Could not restore workspace", detail: error.localizedDescription)
+        }
+    }
+}
+
+// MARK: - Workspace undo stack (pure; no AppKit/SwiftUI imports required for tests)
+
+/// A snapshot of a workspace captured just before removal, enabling session-local undo.
+public struct WorkspaceUndoEntry: Equatable, Sendable {
+    public let name: String
+    public let cwd: String
+    public let metadata: [String: String]
+
+    public init(name: String, cwd: String, metadata: [String: String]) {
+        self.name = name
+        self.cwd = cwd
+        self.metadata = metadata
+    }
+}
+
+/// Pure stack helpers for the removed-workspace undo feature.
+/// Operates on a plain `[WorkspaceUndoEntry]` array; callers own the storage.
+public enum WorkspaceUndoStack {
+    /// Push a new entry onto the stack (newest at end).
+    /// Returns the updated stack; entries beyond `maxDepth` are dropped from the front.
+    public static func push(
+        _ entry: WorkspaceUndoEntry,
+        onto stack: [WorkspaceUndoEntry],
+        maxDepth: Int = 10
+    ) -> [WorkspaceUndoEntry] {
+        var next = stack
+        next.append(entry)
+        if next.count > maxDepth {
+            next.removeFirst(next.count - maxDepth)
+        }
+        return next
+    }
+
+    /// Pop the most-recently-removed entry.
+    /// Returns `(entry, updatedStack)`, or `nil` when the stack is empty.
+    public static func pop(
+        from stack: [WorkspaceUndoEntry]
+    ) -> (entry: WorkspaceUndoEntry, remaining: [WorkspaceUndoEntry])? {
+        guard !stack.isEmpty else { return nil }
+        var next = stack
+        let entry = next.removeLast()
+        return (entry, next)
+    }
+}
+
+// MARK: - Selection highlight color resolver (pure; no AppKit/SwiftUI imports required for tests)
+
+/// Describes how the sidebar should color a row's selection highlight.
+public enum SidebarHighlightTone: Equatable {
+    /// Use the workspace's own color (hex swatch, e.g. 0x7CC7FF).
+    case workspaceColor(UInt32)
+    /// Fall back to the generic selection tint (no workspace color).
+    case selection
+    /// Multi-select checkmark tint.
+    case accent
+    /// Unselected — no highlight.
+    case none
+}
+
+/// Pure, nonisolated resolver: maps row state -> `SidebarHighlightTone`.
+///
+/// Priority: checked (multi-select) > workspace color when selected > generic selection > none.
+public struct SidebarSelectionHighlightResolver {
+    public init() {}
+
+    /// - Parameters:
+    ///   - colorKey: the workspace's "color" metadata value (empty / nil = no color).
+    ///   - isSelected: whether this row is the primary selected workspace.
+    ///   - isChecked: whether this row is part of a multi-selection.
+    public func resolve(colorKey: String?, isSelected: Bool, isChecked: Bool) -> SidebarHighlightTone {
+        if isChecked { return .accent }
+        guard isSelected else { return .none }
+        if let hex = TabColor.from(colorKey)?.hex {
+            return .workspaceColor(hex)
+        }
+        return .selection
+    }
+
+    /// Convenience: build from a `Workspace` and the current selection state.
+    public func resolve(workspace: Workspace, isSelected: Bool, isChecked: Bool) -> SidebarHighlightTone {
+        resolve(colorKey: workspace.metadata["color"], isSelected: isSelected, isChecked: isChecked)
     }
 }
 
@@ -2255,6 +2375,34 @@ public struct SidebarRootView: View {
         return prefix.isEmpty ? "RC" : String(prefix).uppercased()
     }
 
+    // MARK: Row highlight helpers
+
+    private func rowHighlightColor(for tone: SidebarHighlightTone) -> Color {
+        switch tone {
+        case .workspaceColor(let hex):
+            return Color(hex: hex).opacity(0.22)
+        case .accent:
+            return DS.Palette.accent.opacity(0.22)
+        case .selection:
+            return DS.Palette.selection.opacity(0.75)
+        case .none:
+            return Color.white.opacity(0.001)
+        }
+    }
+
+    private func rowEdgeBarColor(for tone: SidebarHighlightTone) -> Color {
+        switch tone {
+        case .workspaceColor(let hex):
+            return Color(hex: hex)
+        case .accent:
+            return DS.Palette.accent
+        case .selection:
+            return DS.Palette.accent
+        case .none:
+            return Color.clear
+        }
+    }
+
     @ViewBuilder
     private func workspaceRow(_ ws: Workspace) -> some View {
         let selected = vm.selectedWorkspaceID == ws.id
@@ -2262,6 +2410,7 @@ public struct SidebarRootView: View {
         let desc = ws.metadata["description"]
         let pinned = ws.metadata["pinned"] == "true"
         let busy = vm.isWorkspaceBusy(ws)
+        let highlightTone = SidebarSelectionHighlightResolver().resolve(workspace: ws, isSelected: selected, isChecked: checked)
         Button {
             let flags = NSEvent.modifierFlags
             vm.selectWorkspaceRow(
@@ -2306,10 +2455,21 @@ public struct SidebarRootView: View {
             .frame(height: 38)
             .background(
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(checked ? DS.Palette.accent.opacity(0.22)
-                          : selected ? DS.Palette.selection.opacity(0.75)
-                          : Color.white.opacity(0.001))
+                    .fill(rowHighlightColor(for: highlightTone))
             )
+            .overlay(alignment: .leading) {
+                // Left-edge bar: visible only when row is selected (single or checked).
+                // Uses workspace color when available, accent as fallback.
+                if highlightTone != .none {
+                    rowEdgeBarColor(for: highlightTone)
+                        .frame(width: 3)
+                        .clipShape(
+                            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        )
+                        .padding(.vertical, 5)
+                        .padding(.leading, DS.Space.sm)
+                }
+            }
             .contentShape(Rectangle())
             .overlay(alignment: .top) {
                 if vm.dropTargetWorkspaceID == ws.id {
