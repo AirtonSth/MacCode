@@ -21,12 +21,16 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var cwd: String
     @Published public var summary: GitSummary
     @Published public var selectedPath: String?
-    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiff() } }
+    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiffAsync() } }
     /// Styled diff rebuilt once when `rawDiff` changes, not on every body
     /// pass, so unrelated @Published changes (wrap toggle, error banner,
     /// summary refresh) don't re-parse the whole diff (PERF-005). Capped
     /// to avoid laying out a multi-MB attributed string at once (PERF-006).
     @Published public private(set) var styledDiff: AttributedString = AttributedString()
+    /// Monotonic token: each rebuildStyledDiffAsync bumps it; only the
+    /// matching completion may write styledDiff so a stale background task
+    /// can't overwrite the result of a newer rawDiff assignment (PERF-008).
+    private var styledDiffGen: Int = 0
     /// True when the rendered diff was clipped to `maxDiffRenderBytes`.
     @Published public private(set) var diffTruncated: Bool = false
     /// In-flight git work. `isLoading` gates the read-only refresh spinner
@@ -128,43 +132,79 @@ public final class DiffPanelViewModel: ObservableObject {
         }
     }
 
-    /// Build the +/−/@@/header-tinted AttributedString once per rawDiff
-    /// change (PERF-005). Clip overly large diffs so TextKit doesn't lay
-    /// out megabytes at once (PERF-006).
-    private func rebuildStyledDiff() {
-        // Cap by character count (always a valid index, unlike a raw UTF-8
-        // byte offset). maxDiffRenderBytes is a coarse safety valve.
-        let source: Substring
+    /// Async entry point called from `rawDiff.didSet`. Caps the source,
+    /// stamps a generation token, then builds segment descriptors off the
+    /// main thread. Only the matching generation writes `styledDiff` so a
+    /// stale task can never overwrite a newer result (PERF-008).
+    private func rebuildStyledDiffAsync() {
+        let source: String
+        let truncated: Bool
         if rawDiff.count > Self.maxDiffRenderChars {
-            source = rawDiff.prefix(Self.maxDiffRenderChars)
-            diffTruncated = true
+            source = String(rawDiff.prefix(Self.maxDiffRenderChars))
+            truncated = true
         } else {
-            source = rawDiff[...]
-            diffTruncated = false
+            source = rawDiff
+            truncated = false
         }
-        var out = AttributedString()
-        for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
-            var seg = AttributedString(String(line) + "\n")
-            // QA-007: classification lives in a pure, tested helper; the view
-            // only maps kind → color here.
-            switch DiffLineKind.classify(line) {
-            case .add:
-                seg.foregroundColor = DS.Palette.success
-                seg.backgroundColor = DS.Palette.success.opacity(0.08)
-            case .del:
-                seg.foregroundColor = DS.Palette.danger
-                seg.backgroundColor = DS.Palette.danger.opacity(0.08)
-            case .hunk:
-                seg.foregroundColor = DS.Palette.accent
-                seg.backgroundColor = DS.Palette.accent.opacity(0.08)
-            case .header:
-                seg.foregroundColor = DS.Palette.warning
-            case .context:
-                seg.foregroundColor = DS.Palette.textSecondary
+        // Update truncation flag immediately (cheap, stays on main).
+        diffTruncated = truncated
+        styledDiffGen &+= 1
+        let gen = styledDiffGen
+        Task.detached(priority: .userInitiated) { [weak self] in
+            // Pure work off the main thread: classify every line and build
+            // the descriptor list. AttributedString construction is deferred
+            // to the main-actor hop below so DS.Palette (main-actor-bound) is
+            // accessed safely.
+            let segments = DiffPanelViewModel.buildDiffSegments(source)
+            await MainActor.run {
+                guard let self, self.styledDiffGen == gen else { return }
+                var out = AttributedString()
+                for seg in segments {
+                    var a = AttributedString(seg.text)
+                    switch seg.kind {
+                    case .add:
+                        a.foregroundColor = DS.Palette.success
+                        a.backgroundColor = DS.Palette.success.opacity(0.08)
+                    case .del:
+                        a.foregroundColor = DS.Palette.danger
+                        a.backgroundColor = DS.Palette.danger.opacity(0.08)
+                    case .hunk:
+                        a.foregroundColor = DS.Palette.accent
+                        a.backgroundColor = DS.Palette.accent.opacity(0.08)
+                    case .header:
+                        a.foregroundColor = DS.Palette.warning
+                    case .context:
+                        a.foregroundColor = DS.Palette.textSecondary
+                    }
+                    out.append(a)
+                }
+                self.styledDiff = out
             }
-            out.append(seg)
         }
-        styledDiff = out
+    }
+
+    /// A single classified line ready for AttributedString assembly.
+    /// Sendable and pure so it can cross actor boundaries safely.
+    public struct DiffSegmentDescriptor: Sendable, Equatable {
+        public let kind: DiffLineKind
+        /// The line text including the trailing newline character.
+        public let text: String
+    }
+
+    /// Classify every line in `source` into `DiffSegmentDescriptor` values.
+    /// Pure and nonisolated: no I/O, no @MainActor state, safe to call on any
+    /// thread. Used by `rebuildStyledDiffAsync` off the main actor (PERF-008).
+    /// Empty input returns an empty array.
+    nonisolated public static func buildDiffSegments(_ source: String) -> [DiffSegmentDescriptor] {
+        guard !source.isEmpty else { return [] }
+        var result: [DiffSegmentDescriptor] = []
+        // split(separator:) on Substring is allocation-light; we promote to
+        // String only for the final stored text.
+        for line in source.split(separator: "\n", omittingEmptySubsequences: false) {
+            let kind = DiffLineKind.classify(line)
+            result.append(DiffSegmentDescriptor(kind: kind, text: String(line) + "\n"))
+        }
+        return result
     }
 
     public func refresh() {
