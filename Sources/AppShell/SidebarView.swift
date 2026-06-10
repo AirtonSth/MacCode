@@ -739,6 +739,56 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
+    // MARK: Busy tooltip
+
+    /// Pure helper: derives a human-readable busy tooltip string from raw title
+    /// lists. Thread-busy takes priority over surface-busy. Returns nil when
+    /// neither list has entries (idle).
+    ///
+    /// - Parameters:
+    ///   - runningThreadTitles: titles of agent threads whose status == .running
+    ///   - busySurfaceTitles: titles of terminal/agentApp surfaces that are busy
+    nonisolated public static func busyTooltip(
+        runningThreadTitles: [String],
+        busySurfaceTitles: [String]
+    ) -> String? {
+        if let first = runningThreadTitles.first {
+            let display = first.isEmpty ? "Untitled" : first
+            return "Agent run in thread \"\(display)\""
+        }
+        if let first = busySurfaceTitles.first {
+            let display = first.isEmpty ? "terminal" : first
+            return "Terminal job running in \"\(display)\""
+        }
+        return nil
+    }
+
+    /// Returns a tooltip string describing the active busy source for `ws`,
+    /// or nil when the workspace is idle.
+    public func busyTooltip(for ws: Workspace) -> String? {
+        let threadTitles: [String]
+        if let router, let ctx = context {
+            threadTitles = ((try? ctx.threadRepo.list(workspaceId: ws.id)) ?? [])
+                .filter { $0.status == .running }
+                .map(\.title)
+        } else {
+            threadTitles = []
+        }
+        let surfaceTitles: [String] = ws.layout.paneIDs().flatMap { pid -> [String] in
+            guard let pane = ws.layout.find(paneID: pid) else { return [] }
+            return pane.surfaces.compactMap { desc -> String? in
+                guard SurfaceRegistry.shared.surface(desc.id)?.isBusy == true else { return nil }
+                switch desc.type {
+                case .terminal, .agentApp:
+                    return desc.title
+                case .ssh, .browser, .files, .markdown, .filePreview, .rightSidebarTool:
+                    return nil
+                }
+            }
+        }
+        return Self.busyTooltip(runningThreadTitles: threadTitles, busySurfaceTitles: surfaceTitles)
+    }
+
     public func reorderWorkspace(_ dragged: WorkspaceID, before target: WorkspaceID) {
         guard dragged != target,
               let targetIndex = workspaces.firstIndex(where: { $0.id == target }) else { return }
