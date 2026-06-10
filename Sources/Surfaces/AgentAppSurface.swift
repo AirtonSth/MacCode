@@ -89,6 +89,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// the transcript can offer a Retry of the last prompt instead of forcing a
     /// retype. Cleared when a run starts or any non-error event arrives.
     @Published public private(set) var lastErrorRecoverable: Bool = false
+    /// P2: search/filter query for the thread rail. Empty = show all threads.
+    @Published public var threadSearchQuery: String = ""
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -546,6 +548,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// B7: count of threads with an in-flight run, for the rail header.
     public var activeThreadCount: Int { threads.filter { $0.status == .running }.count }
+
+    /// P2: threads visible in the rail after applying the search query.
+    /// Empty query returns all threads (no filtering).
+    public var filteredThreads: [AgentThread] {
+        AgentAppViewModel.filterThreads(threads, query: threadSearchQuery)
+    }
+
+    /// Pure helper: returns threads whose title or model contains `query`,
+    /// case-insensitively. Empty query keeps all threads.
+    nonisolated public static func filterThreads(_ threads: [AgentThread], query: String) -> [AgentThread] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return threads }
+        return threads.filter {
+            $0.title.localizedCaseInsensitiveContains(q) ||
+            $0.model.localizedCaseInsensitiveContains(q)
+        }
+    }
 
     /// C7: the most recent plan the agent proposed in this thread's
     /// timeline (t3code PlanSidebar — proposed-plan tracking).
@@ -2451,9 +2470,36 @@ public struct AgentAppView: View {
                              title: "No threads",
                              subtitle: "Send a prompt to start a Codex or Claude thread.")
             } else {
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    TextField("Search threads", text: $vm.threadSearchQuery)
+                        .textFieldStyle(.plain)
+                        .font(DS.Font.caption)
+                        .accessibilityIdentifier("agent.thread.search")
+                    if !vm.threadSearchQuery.isEmpty {
+                        Button { vm.threadSearchQuery = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
+                    }
+                }
+                .padding(.horizontal, DS.Space.md)
+                .padding(.vertical, DS.Space.xs)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        ForEach(vm.threads, id: \.id) { t in threadRow(t) }
+                        if vm.filteredThreads.isEmpty {
+                            Text("No threads match \"\(vm.threadSearchQuery)\"")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .padding(DS.Space.sm)
+                        } else {
+                            ForEach(vm.filteredThreads, id: \.id) { t in threadRow(t) }
+                        }
                     }.padding(DS.Space.sm)
                 }
                 .focusable()
