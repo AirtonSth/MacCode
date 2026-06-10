@@ -52,6 +52,15 @@ public final class DiffPanelViewModel: ObservableObject {
     /// expander so nothing is lost.
     @Published public var lastError: String?
     @Published public private(set) var lastErrorRaw: String?
+    /// History pagination: total number of commits requested from git log.
+    /// Starts at 100 and grows by `historyPageSize` on each "Load more".
+    @Published public private(set) var historyLoadLimit: Int = 100
+    /// Subject-line filter for the history list (case-insensitive contains).
+    @Published public var historyFilter: String = ""
+    /// When true the next commit action runs `git commit --amend` instead of
+    /// a fresh commit. Resets to false after a successful amend so the checkbox
+    /// does not silently amend again on the next commit.
+    @Published public var amendLastCommit: Bool = false
     private var historyLoaded = false
     /// Monotonic token: each reloadDiff bumps it; only the matching
     /// completion may write rawDiff so a slow earlier git process can't
@@ -164,9 +173,29 @@ public final class DiffPanelViewModel: ObservableObject {
         if historyLoaded && !force { return }
         historyLoaded = true
         let cwd = self.cwd
+        let limit = historyLoadLimit
         DispatchQueue.global().async { [weak self] in
-            let c = GitDiff.log(in: cwd)
+            let c = GitDiff.log(in: cwd, limit: limit)
             DispatchQueue.main.async { self?.commits = c }
+        }
+    }
+
+    /// Fetch the next page of history beyond the current `historyLoadLimit`.
+    /// The limit grows by `historyPageSize` on each call so subsequent calls
+    /// fetch successively larger windows. The UI shows "Load 100 more" to
+    /// communicate this contract clearly.
+    public func loadMoreHistory() {
+        historyLoadLimit = Self.historyNextLimit(loaded: historyLoadLimit)
+        let cwd = self.cwd
+        let limit = historyLoadLimit
+        isLoading = true
+        DispatchQueue.global().async { [weak self] in
+            let c = GitDiff.log(in: cwd, limit: limit)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.commits = c
+                self.isLoading = false
+            }
         }
     }
 
@@ -273,10 +302,13 @@ public final class DiffPanelViewModel: ObservableObject {
         // what actually happens (UX-005). Clear selection so the panel
         // doesn't keep showing a now-committed file's stale diff.
         let n = summary.files.count
-        runAction(clearMessageOnOK: true,
-                  successMessage: "Committed all changes (\(n) file\(n == 1 ? "" : "s"))") {
-            GitDiff.commit(in: $0, message: msg)
+        let amend = amendLastCommit
+        let argv = Self.commitArgv(message: msg, amend: amend)
+        let label = amend ? "Amended last commit" : "Committed all changes (\(n) file\(n == 1 ? "" : "s"))"
+        runAction(clearMessageOnOK: true, successMessage: label) { cwd in
+            Self.runGitCommit(cwd: cwd, argv: argv)
         }
+        if amend { amendLastCommit = false }
         selectedPath = nil
         selectedCommit = nil
         rawDiff = ""
@@ -285,9 +317,24 @@ public final class DiffPanelViewModel: ObservableObject {
     /// Stages and commits only the files in `selectedFiles`.
     /// Falls back to committing all when `selectedFiles` is empty.
     /// No-op when the commit message is blank.
+    /// When `amendLastCommit` is true, runs `--amend` regardless of selection.
     public func commitSelected() {
         let msg = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !msg.isEmpty else { return }
+        let amend = amendLastCommit
+        // Amend path: stage everything and amend.
+        if amend {
+            let argv = Self.commitArgv(message: msg, amend: true)
+            runAction(clearMessageOnOK: true, successMessage: "Amended last commit") { cwd in
+                Self.runGitCommit(cwd: cwd, argv: argv)
+            }
+            amendLastCommit = false
+            selectedFiles = []
+            selectedPath = nil
+            selectedCommit = nil
+            rawDiff = ""
+            return
+        }
         let allPaths = summary.files.map(\.path)
         guard let paths = StagingHelper.pathArgs(selected: selectedFiles, all: allPaths) else {
             // Empty / invalid selection: fall back to committing all.
@@ -368,6 +415,74 @@ public final class DiffPanelViewModel: ObservableObject {
     /// open the file in the app's Files tab. `nil` when no router is available
     /// (e.g. standalone usage, tests); the menu item is hidden in that case.
     public var openInFilesTabAction: ((String) -> Void)?
+
+    // MARK: - Pure helpers (nonisolated static — no @MainActor needed for tests)
+
+    /// The number of commits fetched per page when the user taps "Load more".
+    nonisolated static let historyPageSize: Int = 100
+
+    /// Returns the new total limit after one "Load more" tap.
+    /// Pure: `loaded` is current `historyLoadLimit`, result is passed back to
+    /// `git log -n <result>` so the next page is always a strict superset.
+    nonisolated static func historyNextLimit(loaded: Int, pageSize: Int = historyPageSize) -> Int {
+        loaded + pageSize
+    }
+
+    /// Returns true when `commit.subject` contains `query` (case-insensitive).
+    /// Empty `query` always matches — no filter active.
+    nonisolated static func commitMatchesFilter(_ commit: GitCommit, query: String) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return true }
+        return commit.subject.localizedCaseInsensitiveContains(q)
+    }
+
+    /// Builds the git commit argv fragment for the message + amend flag.
+    /// The returned array is the arguments passed to `git` after `["add", "-A"]`:
+    ///   normal:  ["commit", "-m", message]
+    ///   amend:   ["commit", "--amend", "-m", message]
+    /// Pure — no I/O; callers own staging and execution.
+    nonisolated static func commitArgv(message: String, amend: Bool) -> [String] {
+        var args = ["commit"]
+        if amend { args.append("--amend") }
+        args += ["-m", message]
+        return args
+    }
+
+    /// Commits in `cwd` with the given argv (as returned by `commitArgv`).
+    /// Runs `git add -A` first unless `skipStage` is true (amend with no changes).
+    /// Returns a `GitActionResult` compatible with `runAction`.
+    nonisolated static func runGitCommit(cwd: String, argv: [String], skipStage: Bool = false) -> GitActionResult {
+        func git(_ args: [String]) -> (exit: Int32, out: String) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = args
+            p.currentDirectoryURL = URL(fileURLWithPath: cwd)
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = pipe
+            do { try p.run() } catch { return (-1, error.localizedDescription) }
+            p.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return (p.terminationStatus, out)
+        }
+        if !skipStage {
+            let add = git(["add", "-A"])
+            if add.exit != 0 {
+                return GitActionResult(ok: false, message: add.out.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        let r = git(argv)
+        return GitActionResult(ok: r.exit == 0, message: r.out.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// The history list filtered by `historyFilter`. Computed so the view
+    /// derives its list without a separate @Published property that could
+    /// diverge from `commits`.
+    public var filteredCommits: [GitCommit] {
+        let q = historyFilter
+        guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return commits }
+        return commits.filter { Self.commitMatchesFilter($0, query: q) }
+    }
 
     /// Minimum wall-clock interval between FSEvent-triggered auto-refreshes.
     /// Exposed as `nonisolated static` so it is testable without @MainActor.
@@ -692,6 +807,42 @@ public struct DiffPanelView: View {
         .onChange(of: showNewBranchField) { shown in
             if shown { newBranchFocused = true }   // UX-013 backstop.
         }
+    }
+
+    /// History subject-line filter field. Shown above the commit list in
+    /// history mode. Clearing the field restores the full list.
+    private var historyFilterField: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Palette.textTertiary)
+            TextField("Filter by subject...", text: $vm.historyFilter)
+                .textFieldStyle(.plain)
+                .font(DS.Font.monoSmall)
+                .accessibilityIdentifier("diff.history.filter")
+            if !vm.historyFilter.isEmpty {
+                Button {
+                    vm.historyFilter = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear filter")
+                .accessibilityIdentifier("diff.history.filter.clear")
+            }
+        }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.bg)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.bottom, DS.Space.sm)
     }
 
     /// Token-styled segmented control — the native `.segmented` picker
@@ -1019,6 +1170,24 @@ public struct DiffPanelView: View {
                         .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
                 )
                 .accessibilityIdentifier("diff.commitMessage")
+            // Amend checkbox: rewrites the last commit instead of creating a
+            // new one. Useful in agent workflows where HEAD is a draft.
+            // Resets automatically after each successful amend.
+            Toggle(isOn: $vm.amendLastCommit) {
+                HStack(spacing: DS.Space.xs) {
+                    Text("Amend last commit")
+                        .font(DS.Font.caption2.weight(.medium))
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundColor(DS.Palette.warning)
+                        .opacity(vm.amendLastCommit ? 1 : 0)
+                }
+                .foregroundColor(vm.amendLastCommit ? DS.Palette.warning : DS.Palette.textSecondary)
+            }
+            .toggleStyle(.checkbox)
+            .controlSize(.small)
+            .help("Rewrite the last commit (git commit --amend). Cannot be undone.")
+            .accessibilityIdentifier("diff.amend.checkbox")
             if let ok = vm.actionSuccess {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "checkmark.circle.fill").font(.system(size: 11))
@@ -1105,6 +1274,7 @@ public struct DiffPanelView: View {
     }
 
     private var commitButtonTitle: String {
+        if vm.amendLastCommit { return "Amend Last Commit" }
         let allCount = vm.summary.files.count
         let selCount = vm.selectedFiles.count
         if allCount == 0 { return "Commit" }
@@ -1115,12 +1285,14 @@ public struct DiffPanelView: View {
     }
 
     private var commitDisabled: Bool {
-        vm.commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || vm.summary.files.isEmpty
+        let emptyMessage = vm.commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Amend only requires a non-empty message; the tree may be clean.
+        if vm.amendLastCommit { return emptyMessage }
+        return emptyMessage || vm.summary.files.isEmpty
     }
 
     private var commitHint: String {
-        if vm.summary.files.isEmpty { return "Nothing to commit — working tree is clean." }
+        if vm.summary.files.isEmpty && !vm.amendLastCommit { return "Nothing to commit — working tree is clean." }
         if vm.selectedFiles.isEmpty { return "Enter a message to commit all changes." }
         return "Enter a message to commit the selected files."
     }
@@ -1134,17 +1306,48 @@ public struct DiffPanelView: View {
                          subtitle: "No commits found for this repository.")
         } else {
             VStack(spacing: 0) {
-                DSSectionHeader("History · \(vm.commits.count)")
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 1) {
-                        // PERF-013: iterate over `indices` so we don't allocate
-                        // a fresh `Array(enumerated())` on every body pass.
-                        ForEach(vm.commits.indices, id: \.self) { idx in
-                            commitRow(vm.commits[idx], isFirst: idx == 0, isLast: idx == vm.commits.count - 1)
+                DSSectionHeader("History · \(vm.filteredCommits.count)\(vm.historyFilter.isEmpty ? "" : " (filtered)")")
+                historyFilterField
+                let displayed = vm.filteredCommits
+                if displayed.isEmpty {
+                    DSEmptyState(icon: "magnifyingglass", title: "No matches",
+                                 subtitle: "No commits match the current filter.")
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 1) {
+                            // PERF-013: iterate over `indices` so we don't allocate
+                            // a fresh `Array(enumerated())` on every body pass.
+                            ForEach(displayed.indices, id: \.self) { idx in
+                                commitRow(displayed[idx], isFirst: idx == 0, isLast: idx == displayed.count - 1)
+                            }
                         }
+                        .padding(.horizontal, DS.Space.sm)
+                        .padding(.bottom, DS.Space.xs)
+                        // "Load 100 more" footer — only when filter is off
+                        // (paging under a filter would be confusing) and when
+                        // we fetched a full page (fewer means we hit the end).
+                        if vm.historyFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            && vm.commits.count == vm.historyLoadLimit {
+                            Button {
+                                vm.loadMoreHistory()
+                            } label: {
+                                HStack(spacing: DS.Space.xs) {
+                                    Image(systemName: "ellipsis.circle")
+                                        .font(.system(size: 11))
+                                    Text("Load 100 more")
+                                }
+                                .font(DS.Font.caption.weight(.medium))
+                                .foregroundColor(DS.Palette.textSecondary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, DS.Space.md)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(vm.isLoading)
+                            .accessibilityIdentifier("diff.history.loadMore")
+                            .help("Load the next 100 commits")
+                        }
+                        Spacer(minLength: DS.Space.sm)
                     }
-                    .padding(.horizontal, DS.Space.sm)
-                    .padding(.bottom, DS.Space.sm)
                 }
             }
         }
