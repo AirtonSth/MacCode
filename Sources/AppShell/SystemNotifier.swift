@@ -25,6 +25,12 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// notification. Set by AppDelegate at launch to wire deep-linking.
     public var onNotificationResponse: ((UNNotificationResponse) -> Void)?
 
+    /// Called when a `post(_:)` is silently dropped because the user has
+    /// denied OS-level notification permission. Use this seam to surface
+    /// an in-app fallback (e.g. badge, feed entry, alert) so a finished
+    /// agent run is not invisible on a denied system (UX-MAC_APPSHELL-P2).
+    public var onDeniedPost: ((RemoteCodeNotificationContent) -> Void)?
+
     private override init() {
         super.init()
     }
@@ -70,7 +76,14 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     public func post(_ content: RemoteCodeNotificationContent) {
-        guard authorized, Self.canUseNotificationCenter else { return }
+        guard authorized, Self.canUseNotificationCenter else {
+            // Notify the caller so an in-app fallback can surface the result
+            // when OS-level delivery is blocked (permission denied).
+            DispatchQueue.main.async { [weak self] in
+                self?.onDeniedPost?(content)
+            }
+            return
+        }
         UNUserNotificationCenter.current().add(content.makeRequest(), withCompletionHandler: nil)
     }
 

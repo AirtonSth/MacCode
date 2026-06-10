@@ -37,6 +37,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var lifecycleRecorder: AppLifecycleRecorder?
     public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 5 * 60
 
+    /// Accumulates server startup failures so Settings can show a status
+    /// row rather than relying on NSLog alone (UX-MAC_SOCKET_SERVER-P1).
+    /// Populated at most once per server per launch; cleared on re-configure.
+    public private(set) var serverStartupFailures: [(server: String, reason: String)] = []
+
+    /// Notification name posted (on the main thread) when a server startup
+    /// failure is recorded. Observers receive the `serverStartupFailures` array
+    /// via `AppDelegate.shared?.serverStartupFailures` after the post.
+    public static let serverStartupFailureNotification = Notification.Name("io.remotecode.serverStartupFailure")
+
     public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
         self.channel = channel
         self.appSupportOverride = appSupportOverride
@@ -48,13 +58,56 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         do {
             context = try AppContext(channel: channel, dbPathOverride: dbOverride, appSupportOverride: appSupportOverride)
         } catch {
+            // UX-MAC_PERSISTENCE-P1: plain-language copy + recovery guidance.
+            // The most common causes are a permissions error on first launch
+            // or a half-written database after an abrupt kill. A fresh database
+            // is stored alongside the corrupt one (Bootstrap quarantines it),
+            // so the user can recover by deleting remotecode.sqlite and relaunching.
+            let supportDir = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride).path
             let alert = NSAlert()
-            alert.messageText = "Failed to bootstrap RemoteCode"
-            alert.informativeText = "\(error)"
-            alert.runModal()
+            alert.messageText = "RemoteCode could not open its database"
+            alert.informativeText = Self.dbOpenFailureInformativeText(
+                supportDir: supportDir,
+                errorDescription: error.localizedDescription
+            )
+            alert.addButton(withTitle: "Quit")
+            alert.addButton(withTitle: "Show in Finder")
+            let response = alert.runModal()
+            if response == .alertSecondButtonReturn {
+                NSWorkspace.shared.activateFileViewerSelecting(
+                    [URL(fileURLWithPath: supportDir, isDirectory: true)]
+                )
+            }
             NSApp.terminate(nil)
             return
         }
+
+        // UX-MAC_PERSISTENCE-P1: inform the user when a corrupt database was
+        // silently quarantined so they know prior data was preserved as a backup.
+        if context.bootstrapReport.recoveredFromCorruption {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Previous database was corrupt"
+                alert.informativeText = """
+                    RemoteCode found and quarantined a corrupt database, then started \
+                    fresh. Your previous data is preserved as a backup file (suffix \
+                    ".corrupt-<date>") in:
+
+                    \(self.context.bootstrapReport.path.components(separatedBy: "/").dropLast().joined(separator: "/"))
+
+                    Workspaces, settings, and history from this session will be saved normally.
+                    """
+                alert.addButton(withTitle: "OK")
+                alert.addButton(withTitle: "Show in Finder")
+                if alert.runModal() == .alertSecondButtonReturn {
+                    let dir = URL(fileURLWithPath: self.context.bootstrapReport.path)
+                        .deletingLastPathComponent()
+                    NSWorkspace.shared.activateFileViewerSelecting([dir])
+                }
+            }
+        }
+
         installLifecycleRecorder()
         // PERF (cold launch): the orphan provider sweep is a process scan and
         // the event-log decode + PTY restore are heavy. StartupPlan defers them
@@ -89,6 +142,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             socketServer = server
         } catch {
             NSLog("Failed to start socket server: \(error)")
+            recordServerStartupFailure("rc2 socket", reason: error.localizedDescription)
         }
 
         let trustRepo = DeviceTrustRepository(db: context.db)
@@ -336,11 +390,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
+    /// Records a server startup failure, appends to `serverStartupFailures`,
+    /// posts a notification, and logs via the lifecycle recorder.
+    /// The method is `nonisolated` in name only — callers on the main actor
+    /// call it synchronously; the notification is always posted on the main thread.
+    private func recordServerStartupFailure(_ server: String, reason: String) {
+        serverStartupFailures.append((server: server, reason: reason))
+        lifecycleRecorder?.record("server_startup_failure server=\(server) reason=\(reason)")
+        NotificationCenter.default.post(name: Self.serverStartupFailureNotification, object: self)
+    }
+
     private func configureDirectAccess() {
         httpServer?.stop()
         httpServer = nil
         bonjour?.stop()
         bonjour = nil
+        // Clear previous HTTP failure state so re-configure starts fresh.
+        serverStartupFailures.removeAll { $0.server == "HTTP server" }
 
         guard let context, let router, let auth = localAuth else { return }
         let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
@@ -355,6 +421,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
+            recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
         }
 
         if loopbackOnly {
@@ -433,6 +500,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let editMenuItem = NSMenuItem()
         mainMenu.addItem(editMenuItem)
         let editMenu = NSMenu(title: "Edit")
+        // UX-MAC_SHELL_WINDOW-008: Undo/Redo route through the responder chain
+        // to the first-responder's NSUndoManager (rename fields, description
+        // editors, prompt composer). Without these items ⌘Z produces no result.
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redoItem = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
         editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
         editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
         editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
@@ -615,11 +690,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         info.frame = NSRect(x: 20, y: 185, width: 360, height: 18)
         content.addSubview(info)
 
-        // Code display
+        // Code display — expose digits individually for VoiceOver so the user
+        // can verify each digit of the security code without mental grouping.
         let codeField = NSTextField(labelWithString: prompt.code)
         codeField.font = NSFont.monospacedDigitSystemFont(ofSize: 36, weight: .bold)
         codeField.alignment = .center
         codeField.frame = NSRect(x: 20, y: 125, width: 360, height: 50)
+        codeField.setAccessibilityLabel(Self.pairingCodeAccessibilityLabel(prompt.code))
         content.addSubview(codeField)
 
         // Created-at detail
@@ -735,6 +812,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     // MARK: - NSMenuItemValidation
 
+    /// Selectors that require at least one workspace to exist before they make
+    /// any sense. Without a workspace the actions either beep (runtime guard) or
+    /// crash; greying them out lets the responder chain give proper feedback and
+    /// VoiceOver say "dimmed" instead of silently doing nothing.
+    static let workspaceRequiredActions: Set<String> = [
+        NSStringFromSelector(#selector(AppDelegate.newTerminal)),
+        NSStringFromSelector(#selector(AppDelegate.newBrowser)),
+        NSStringFromSelector(#selector(AppDelegate.newAgentApp)),
+        NSStringFromSelector(#selector(AppDelegate.splitFocusedPaneRight)),
+        NSStringFromSelector(#selector(AppDelegate.splitFocusedPaneDown)),
+        NSStringFromSelector(#selector(AppDelegate.selectNextTab)),
+        NSStringFromSelector(#selector(AppDelegate.selectPreviousTab)),
+        NSStringFromSelector(#selector(AppDelegate.closeActiveTabOrWindow)),
+        NSStringFromSelector(#selector(AppDelegate.reopenClosedTab)),
+        NSStringFromSelector(#selector(AppDelegate.focusNextPane))
+    ]
+
     /// Pure helper: given a menu item action selector and whether an updater is
     /// configured, returns whether the item should be enabled.
     /// Extracted for unit-testing without any AppKit or @MainActor dependency.
@@ -746,9 +840,30 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         return true
     }
 
+    /// Extended helper: also accounts for workspace presence for surface/tab
+    /// actions. Kept separate so the existing `menuItemEnabled` signature is
+    /// preserved and existing tests continue to compile unchanged.
+    ///
+    /// WHY: without `hasWorkspace` checks the Surface/Tab menu items are always
+    /// active and produce a beep when no workspace is open — confusing for both
+    /// sighted users and VoiceOver (UX-MAC_SHELL_WINDOW-013).
+    public static func menuItemEnabled(
+        action: Selector,
+        updaterConfigured: Bool,
+        hasWorkspace: Bool
+    ) -> Bool {
+        if workspaceRequiredActions.contains(NSStringFromSelector(action)) {
+            return hasWorkspace
+        }
+        return menuItemEnabled(action: action, updaterConfigured: updaterConfigured)
+    }
+
     public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard let action = menuItem.action else { return true }
-        return Self.menuItemEnabled(action: action, updaterConfigured: updater != nil)
+        let hasWorkspace = context?.state.window.selectedWorkspaceID != nil
+        return Self.menuItemEnabled(action: action,
+                                    updaterConfigured: updater != nil,
+                                    hasWorkspace: hasWorkspace)
     }
 
     @objc private func newWorkspace() {
@@ -917,6 +1032,43 @@ public struct NotificationRouteIntent: Equatable {
     public init(threadId: AgentThreadID, workspaceId: WorkspaceID?) {
         self.threadId = threadId
         self.workspaceId = workspaceId
+    }
+}
+
+extension AppDelegate {
+    /// Pure helper: builds the informative text for the database-open failure
+    /// alert. Extracted for testability without any AppKit side-effects.
+    ///
+    /// WHY: The copy must tell the user *where* the database is and *how* to
+    /// recover — a raw Swift error string does neither. This helper pins the
+    /// contract so regression tests catch copy drift.
+    nonisolated public static func dbOpenFailureInformativeText(
+        supportDir: String,
+        errorDescription: String
+    ) -> String {
+        """
+        Your workspaces and settings are stored in:
+        \(supportDir)
+
+        To recover: quit RemoteCode, delete "remotecode.sqlite" from that folder, \
+        and relaunch. A backup of the previous database may be present with a \
+        ".corrupt-<date>" suffix.
+
+        Technical detail: \(errorDescription)
+        """
+    }
+
+    /// Pure helper: formats a pairing code for VoiceOver announcement.
+    ///
+    /// Each character is separated by a single space so VoiceOver reads them
+    /// individually ("3 4 2 7 8 1") rather than as a single number
+    /// ("three hundred forty-two thousand ..."). The prefix "Pairing code: "
+    /// identifies the field role before the digits are announced.
+    ///
+    /// WHY extracted: testable without any @MainActor or AppKit dependency.
+    nonisolated public static func pairingCodeAccessibilityLabel(_ code: String) -> String {
+        let spaced = code.map { String($0) }.joined(separator: " ")
+        return "Pairing code: \(spaced)"
     }
 }
 
