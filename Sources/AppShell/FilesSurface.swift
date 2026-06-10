@@ -2442,6 +2442,7 @@ private struct CodeTextEditor: NSViewRepresentable {
             // large files do not rebuild the whole attributed string (PERF-MAC_FILES-014).
             context.coordinator.applyHighlightIncremental(oldText: oldText, to: textView)
             textView.selectedRanges = selectedRanges
+            context.coordinator.lineNumberRuler?.invalidateLineStartCache()
             context.coordinator.lineNumberRuler?.needsDisplay = true
         }
         // When text is unchanged the edit originated from the text view itself and was
@@ -2468,6 +2469,7 @@ private struct CodeTextEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             onChange(textView.string)
             highlightEditedRange(in: textView)
+            lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
         }
 
@@ -2512,6 +2514,7 @@ private struct CodeTextEditor: NSViewRepresentable {
                 textView.enclosingScrollView?.contentView.scroll(to: scrollOrigin)
                 textView.enclosingScrollView?.reflectScrolledClipView(textView.enclosingScrollView!.contentView)
             }
+            lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
             applyingHighlight = false
         }
@@ -2547,9 +2550,58 @@ private struct CodeTextEditor: NSViewRepresentable {
                 }
             }
             storage.endEditing()
+            lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
         }
     }
+}
+
+// MARK: - Line-start index helpers (PERF-MAC_FILES-016)
+
+/// Build a sorted array of UTF-16 character offsets at which each line starts.
+///
+/// Entry 0 is always 0 (start of document = line 1).
+/// Each subsequent entry is the UTF-16 offset of the character immediately following a `\n`.
+/// Using NSString UTF-16 offsets keeps this consistent with NSLayoutManager character indices.
+///
+/// Complexity: O(n) in document length - called only when the document changes, not per paint.
+nonisolated func buildLineStartOffsets(text: String) -> [Int] {
+    let ns = text as NSString
+    let length = ns.length
+    var offsets = [0]
+    var i = 0
+    while i < length {
+        let c = ns.character(at: i)
+        i += 1
+        if c == 0x0A { // '\n'
+            offsets.append(i)
+        }
+    }
+    return offsets
+}
+
+/// Return the 0-based line index (line 0 = first line) for a UTF-16 character offset,
+/// using the prebuilt `offsets` array from `buildLineStartOffsets`.
+///
+/// Uses upper-bound binary search over the sorted offsets array: finds the last entry
+/// whose value is <= `charOffset`, which is the line that contains that offset.
+///
+/// Complexity: O(log n) in line count.
+nonisolated func lineIndex(forCharOffset charOffset: Int, in offsets: [Int]) -> Int {
+    guard !offsets.isEmpty else { return 0 }
+    var lo = 0
+    var hi = offsets.count // exclusive upper bound
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if offsets[mid] <= charOffset {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    // lo is now the first index where offsets[lo] > charOffset,
+    // so lo - 1 is the line that contains charOffset.
+    return max(0, lo - 1)
 }
 
 private final class CodeLineNumberRulerView: NSRulerView {
@@ -2559,6 +2611,11 @@ private final class CodeLineNumberRulerView: NSRulerView {
     var currentPalette: EditorColorPalette = EditorColorPalette.resolve(isDark: true) {
         didSet { needsDisplay = true }
     }
+    /// Cached line-start offsets (UTF-16) rebuilt whenever the document text changes.
+    /// Allows O(log n) first-visible-line lookup instead of O(document) substring+filter.
+    private var cachedLineStartOffsets: [Int] = []
+    private var cachedOffsetText: String = ""
+
     private var lineNumberAttributes: [NSAttributedString.Key: Any] {
         [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
          .foregroundColor: currentPalette.lineNumberText]
@@ -2571,6 +2628,8 @@ private final class CodeLineNumberRulerView: NSRulerView {
         ruleThickness = 46
         NotificationCenter.default.addObserver(self, selector: #selector(boundsChanged), name: NSView.boundsDidChangeNotification, object: textView.enclosingScrollView?.contentView)
         textView.enclosingScrollView?.contentView.postsBoundsChangedNotifications = true
+        // Build initial index so the first paint doesn't fall back to O(document) scan.
+        invalidateLineStartCache()
     }
 
     required init(coder: NSCoder) {
@@ -2579,6 +2638,16 @@ private final class CodeLineNumberRulerView: NSRulerView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Rebuild the line-start offset cache from the current textView string.
+    /// Must be called whenever the document text changes (keystroke, remote patch, file load).
+    /// O(n) rebuild cost is paid once per edit; subsequent scroll paints are O(log n).
+    func invalidateLineStartCache() {
+        let text = textView?.string ?? ""
+        guard text != cachedOffsetText else { return }
+        cachedLineStartOffsets = buildLineStartOffsets(text: text)
+        cachedOffsetText = text
     }
 
     // Coalesce scroll-driven redraws: only repaint when the set of visible lines actually changes,
@@ -2609,10 +2678,11 @@ private final class CodeLineNumberRulerView: NSRulerView {
         let visibleRect = clipView.bounds
         let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
         guard glyphRange.location < layoutManager.numberOfGlyphs else { return }
-        let text = textView.string as NSString
-        var lineNumber = text.substring(to: layoutManager.characterIndexForGlyph(at: glyphRange.location))
-            .filter { $0 == "\n" }
-            .count + 1
+        let firstCharIndex = layoutManager.characterIndexForGlyph(at: glyphRange.location)
+        // O(log n): binary-search the cached line-start offsets instead of scanning the document.
+        // Falls back to 0 (line 1) when the cache is empty (stale between init and first invalidation).
+        let offsets = cachedLineStartOffsets.isEmpty ? buildLineStartOffsets(text: textView.string) : cachedLineStartOffsets
+        var lineNumber = lineIndex(forCharOffset: firstCharIndex, in: offsets) + 1
         var glyphIndex = glyphRange.location
         while glyphIndex < NSMaxRange(glyphRange) {
             var lineRange = NSRange()
