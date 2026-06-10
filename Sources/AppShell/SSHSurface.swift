@@ -1003,6 +1003,47 @@ enum SSHLargeTreeConfirm {
     }
 }
 
+// Pure helpers for per-host path persistence (P3: SSH per-host recent paths).
+// Non-MainActor + pure so storage-key logic and the bounded-list algorithm can
+// be driven in tests without any UI or UserDefaults side-effects.
+//
+// storageKey:       UserDefaults key for the last local+remote path pair.
+// recentRemotePathsKey: UserDefaults key for the bounded most-recent-remote-paths list.
+// updatedRecentPaths:   Pure list update - moves the path to front, deduplicates,
+//                       and trims to `limit`. Isolated from UserDefaults so the
+//                       exact ordering contract is testable.
+enum SSHHostRecentPaths {
+    // The key that stores the last {"local": ..., "remote": ...} pair for a
+    // given profile.  Mirrors the legacy key format so existing persisted data
+    // is read back correctly.
+    static func storageKey(profileID: SSHHostID) -> String {
+        "ssh.transfer.lastpaths.\(profileID.value.uuidString)"
+    }
+
+    // The key that stores the ordered list of recent remote paths for a given
+    // profile (most-recent first, bounded to `recentPathsLimit` entries).
+    static func recentRemotePathsKey(profileID: SSHHostID) -> String {
+        "ssh.transfer.recentremote.\(profileID.value.uuidString)"
+    }
+
+    // Maximum number of entries kept in the recent-remote-paths list.
+    static let recentPathsLimit = 10
+
+    // Pure: returns the list after moving `path` to the front, deduplicating,
+    // and capping at `limit`. Callers pass their current stored list so this
+    // function is side-effect free and fully testable.
+    static func updatedRecentPaths(
+        _ current: [String],
+        adding path: String,
+        limit: Int = recentPathsLimit
+    ) -> [String] {
+        guard !path.isEmpty else { return current }
+        var result = current.filter { $0 != path }
+        result.insert(path, at: 0)
+        return limit > 0 ? Array(result.prefix(limit)) : result
+    }
+}
+
 // Pure parser for ~/.ssh/config files. Reads Host blocks and extracts
 // HostName (destination), User, Port, and IdentityFile per stanza.
 // Wildcard patterns ("*", "?", "!") and pattern-only hosts are skipped
@@ -1288,7 +1329,7 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
 
     private static func pathsDefaultsKey(host: SSHHostProfile?) -> String? {
         guard let host else { return nil }
-        return "ssh.transfer.lastpaths.\(host.id.value.uuidString)"
+        return SSHHostRecentPaths.storageKey(profileID: host.id)
     }
 
     private static func restorePaths(host: SSHHostProfile?) -> (local: String?, remote: String?) {
@@ -1330,6 +1371,14 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         transferStatus = "Remote listed"
         addTransferLog("Remote site: \(remoteSitePath)")
         persistLastPaths()
+        // Record this remote path in the bounded most-recent list for the profile
+        // so reconnects can restore it and the path picker can suggest history.
+        if let profile = selectedHost {
+            let key = SSHHostRecentPaths.recentRemotePathsKey(profileID: profile.id)
+            let current = UserDefaults.standard.stringArray(forKey: key) ?? []
+            let updated = SSHHostRecentPaths.updatedRecentPaths(current, adding: remoteSitePath)
+            UserDefaults.standard.set(updated, forKey: key)
+        }
     }
 
     func selectLocal(_ entry: SSHFileEntry, additive: Bool = false) {
