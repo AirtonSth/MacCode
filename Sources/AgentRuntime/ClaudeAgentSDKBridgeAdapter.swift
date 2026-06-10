@@ -76,7 +76,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        let session = try sessionFor(request)
+        let session = try sessionFor(request, provisioningCallback: onEvent)
         lock.lock()
         if session.inFlightRunId != nil {
             lock.unlock()
@@ -241,6 +241,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     private func sessionFor(_ request: AgentRunRequest) throws -> Session {
+        try sessionFor(request, provisioningCallback: nil)
+    }
+
+    private func sessionFor(_ request: AgentRunRequest,
+                            provisioningCallback: (@Sendable (AgentRunEvent) -> Void)?) throws -> Session {
         lock.lock()
         if let existing = sessions[request.threadId] {
             lock.unlock()
@@ -248,11 +253,12 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             return existing
         }
         lock.unlock()
-        return try startNewSession(request)
+        return try startNewSession(request, provisioningCallback: provisioningCallback)
     }
 
-    private func startNewSession(_ request: AgentRunRequest) throws -> Session {
-        let bridgeScriptPath = try resolvedBridgeScriptPath()
+    private func startNewSession(_ request: AgentRunRequest,
+                                 provisioningCallback: (@Sendable (AgentRunEvent) -> Void)? = nil) throws -> Session {
+        let bridgeScriptPath = try resolvedBridgeScriptPath(onProgress: provisioningCallback)
         guard FileManager.default.isReadableFile(atPath: bridgeScriptPath) else {
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK bridge script not found: \(bridgeScriptPath)")
         }
@@ -311,7 +317,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return session
     }
 
-    private func resolvedBridgeScriptPath() throws -> String {
+    private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) throws -> String {
         let url = URL(fileURLWithPath: bridgeScriptPath)
         guard FileManager.default.isReadableFile(atPath: url.path) else {
             return bridgeScriptPath
@@ -334,7 +340,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         let packageSpec = Self.sdkPackageSpec()
         if !Self.installedSDKPackage(at: cachedPackage, matches: packageSpec) {
-            try installSDKPackage(in: cache, packageSpec: packageSpec)
+            try installSDKPackage(in: cache, packageSpec: packageSpec, onProgress: onProgress)
         }
         return cachedBridge.path
     }
@@ -391,36 +397,82 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return cache
     }
 
-    private func installSDKPackage(in directory: URL, packageSpec: String) throws {
+    private func installSDKPackage(in directory: URL,
+                                   packageSpec: String,
+                                   onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) throws {
         guard let npm = ProcessLocator.resolve("npm") else {
             throw AgentRunError.missingBinary("npm")
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: npm)
-        process.arguments = ["install", "--silent", packageSpec]
+        process.arguments = ["install", "--no-fund", "--no-audit", packageSpec]
         process.currentDirectoryURL = directory
         process.environment = CodexRunner.processEnvironment(overrides: [:])
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        if let onProgress {
+            outputPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                for line in text.components(separatedBy: "\n") {
+                    guard let parsed = NpmInstallProgressParser.parse(line: line) else { continue }
+                    let payload = Self.provisioningPayload(stage: parsed.stage, progress: parsed.progress, packageSpec: packageSpec)
+                    onProgress(Self.provisioningEvent(payload: payload))
+                }
+            }
+            onProgress(Self.provisioningEvent(payload: Self.provisioningPayload(stage: "starting", progress: 0.0, packageSpec: packageSpec)))
+        }
+
         do {
             try process.run()
         } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
         let deadline = Date().addingTimeInterval(120)
         while process.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.1)
         }
+        outputPipe.fileHandleForReading.readabilityHandler = nil
         if process.isRunning {
             ProcessTerminator.terminateTree(process)
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK package install timed out")
         }
         if process.terminationStatus != 0 {
-            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
             let text = String(data: data, encoding: .utf8) ?? ""
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK package install failed: \(text)")
         }
+    }
+
+    private static func provisioningPayload(stage: String, progress: Double, packageSpec: String) -> [String: Any] {
+        [
+            "stage": stage,
+            "progress": progress,
+            "package": packageSpec
+        ]
+    }
+
+    private static func provisioningEvent(payload: [String: Any]) -> AgentRunEvent {
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let payloadJSON = String(data: data, encoding: .utf8) else {
+            return .event(.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.agent-sdk.provisioning",
+                method: "rc_provisioning",
+                payloadJSON: "{}",
+                receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            )))
+        }
+        return .event(.providerRuntime(ProviderRuntimeEvent(
+            provider: .claude,
+            source: "claude.agent-sdk.provisioning",
+            method: "rc_provisioning",
+            payloadJSON: payloadJSON,
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )))
     }
 
     private func applyRuntimeSwitchIfNeeded(_ session: Session, request: AgentRunRequest) throws {
