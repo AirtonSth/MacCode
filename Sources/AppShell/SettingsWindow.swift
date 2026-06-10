@@ -14,6 +14,27 @@ extension Notification.Name {
     static let rc2PrivateAccountChanged = Notification.Name("rc2PrivateAccountChanged")
 }
 
+/// Pure enumeration of every user-tunable AppSettings field key.
+/// Used by the Settings window to surface all fields and by tests to guard
+/// that no field is silently omitted from the UI.
+public struct AppSettingsKeys {
+    /// Stable string keys matching AppSettings property names. Extend this list
+    /// whenever a new field is added to AppSettings so the coverage test catches
+    /// any omission before the next release.
+    public static let userTunableKeys: [String] = [
+        "diffWordWrap",
+        "diffIgnoreWhitespace",
+        "sidebarSort",
+        "insomniaEnabled",
+        "insomniaAllowDisplaySleep",
+        "insomniaAllowSystemSleepWhenDisplayClosed",
+        "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
+        "tokenSaverEnabled",
+        "sessionLearnEnabled",
+        "historyCompactionEnabled",
+    ]
+}
+
 /// Pure, non-MainActor commit-policy helper for CLI path text fields.
 ///
 /// Business rule: a mid-edit draft must not trigger provider-adapter replacement
@@ -196,6 +217,47 @@ public final class SettingsViewModel: ObservableObject {
     public func setDiffIgnoreWhitespace(_ on: Bool) {
         appSettings.diffIgnoreWhitespace = on
         settingsStore.update { $0.diffIgnoreWhitespace = on }
+    }
+
+    /// "updated" | "created" | "manual"
+    public func setSidebarSort(_ value: String) {
+        appSettings.sidebarSort = value
+        settingsStore.update { $0.sidebarSort = value }
+    }
+
+    public func setInsomniaEnabled(_ on: Bool) {
+        appSettings.insomniaEnabled = on
+        settingsStore.update { $0.insomniaEnabled = on }
+    }
+
+    public func setInsomniaAllowDisplaySleep(_ on: Bool) {
+        appSettings.insomniaAllowDisplaySleep = on
+        settingsStore.update { $0.insomniaAllowDisplaySleep = on }
+    }
+
+    public func setInsomniaAllowSystemSleepWhenDisplayClosed(_ on: Bool) {
+        appSettings.insomniaAllowSystemSleepWhenDisplayClosed = on
+        settingsStore.update { $0.insomniaAllowSystemSleepWhenDisplayClosed = on }
+    }
+
+    public func setInsomniaAllowScreenSaverAfter45MinutesOfInactivity(_ on: Bool) {
+        appSettings.insomniaAllowScreenSaverAfter45MinutesOfInactivity = on
+        settingsStore.update { $0.insomniaAllowScreenSaverAfter45MinutesOfInactivity = on }
+    }
+
+    public func setTokenSaverEnabled(_ on: Bool) {
+        appSettings.tokenSaverEnabled = on
+        settingsStore.update { $0.tokenSaverEnabled = on }
+    }
+
+    public func setSessionLearnEnabled(_ on: Bool) {
+        appSettings.sessionLearnEnabled = on
+        settingsStore.update { $0.sessionLearnEnabled = on }
+    }
+
+    public func setHistoryCompactionEnabled(_ on: Bool) {
+        appSettings.historyCompactionEnabled = on
+        settingsStore.update { $0.historyCompactionEnabled = on }
     }
 
     /// Update the Codex CLI path draft. The UI passes `committed: false` on
@@ -451,6 +513,10 @@ public struct SettingsView: View {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     remoteAccessSection
                     diffDefaultsSection
+                    sidebarSection
+                    insomniaSection
+                    tokenSaverSection
+                    advancedSection
                     customModelsSection
                     trustedDevicesSection
                     diagnosticsSection
@@ -517,6 +583,114 @@ public struct SettingsView: View {
                 .accessibilityIdentifier("settings.diff.ignoreWhitespace.toggle")
             }
             Text("These defaults seed new Git diff surfaces and match the toolbar toggles in the diff panel.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var sidebarSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Sidebar")
+            settingRow("Workspace sort order") {
+                Picker("", selection: Binding(
+                    get: { vm.appSettings.sidebarSort },
+                    set: { vm.setSidebarSort($0) }
+                )) {
+                    Text("Last updated").tag("updated")
+                    Text("Date created").tag("created")
+                    Text("Manual").tag("manual")
+                }
+                .labelsHidden()
+                .frame(width: 140)
+                .accessibilityIdentifier("settings.sidebar.sortOrder.picker")
+            }
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var insomniaSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Insomnia")
+            settingRow("Keep Mac awake while agents run") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.insomniaEnabled },
+                    set: { vm.setInsomniaEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.insomnia.enabled.toggle")
+            }
+            if vm.appSettings.insomniaEnabled {
+                settingRow("Allow display to sleep") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.insomniaAllowDisplaySleep },
+                        set: { vm.setInsomniaAllowDisplaySleep($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.insomnia.allowDisplaySleep.toggle")
+                }
+                settingRow("Allow system sleep when lid closed") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.insomniaAllowSystemSleepWhenDisplayClosed },
+                        set: { vm.setInsomniaAllowSystemSleepWhenDisplayClosed($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.insomnia.allowSystemSleepWhenDisplayClosed.toggle")
+                }
+                settingRow("Allow screen saver after 45 min idle") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.insomniaAllowScreenSaverAfter45MinutesOfInactivity },
+                        set: { vm.setInsomniaAllowScreenSaverAfter45MinutesOfInactivity($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.insomnia.allowScreenSaverAfter45MinutesOfInactivity.toggle")
+                }
+            }
+            Text("Insomnia is also controllable from the sidebar. Changes here are reflected there immediately.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var tokenSaverSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Token Saver")
+            settingRow("Enable Token Saver (requires subscription)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.tokenSaverEnabled },
+                    set: { vm.setTokenSaverEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.tokenSaver.enabled.toggle")
+            }
+            Text("Compresses large tool output using the local MLX model so fewer tokens reach the remote provider. Activating from the sidebar is the primary path; this toggle reflects the persisted value.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var advancedSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeader("Advanced")
+            settingRow("Session Learn (writes to CLAUDE.md / AGENTS.md)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.sessionLearnEnabled },
+                    set: { vm.setSessionLearnEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.advanced.sessionLearn.toggle")
+            }
+            settingRow("History compaction (lossy-recoverable storage)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.historyCompactionEnabled },
+                    set: { vm.setHistoryCompactionEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.advanced.historyCompaction.toggle")
+            }
+            Text("Session Learn mines correction rules from failed runs into managed instructions. History Compaction stores large tool output in a structure-preserving compressed form. Both are off by default.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }

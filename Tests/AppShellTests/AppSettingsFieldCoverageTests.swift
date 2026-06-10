@@ -1,0 +1,143 @@
+import XCTest
+import Persistence
+@testable import AppShell
+
+/// Coverage guard: every user-tunable AppSettings field must appear in
+/// AppSettingsKeys.userTunableKeys so no field is silently omitted from
+/// the Settings window.
+///
+/// Business rule: when a developer adds a new field to AppSettings they
+/// must also add its key to AppSettingsKeys.userTunableKeys; this test
+/// fails at that boundary, not silently at runtime.
+///
+/// @MainActor is required because SettingsViewModel is a @MainActor class
+/// and the setter / reload tests call into it directly.
+@MainActor
+final class AppSettingsFieldCoverageTests: XCTestCase {
+
+    // MARK: - Coverage guard (pure key-list assertions; no AppContext needed)
+
+    /// Assert that every property declared on AppSettings has a matching
+    /// entry in AppSettingsKeys.userTunableKeys.
+    ///
+    /// WHY: If a developer adds a field to AppSettings without adding it to
+    /// the keys list, the Settings window will not surface the new field and
+    /// users will have no UI to control it.
+    func test_allAppSettingsFieldsCoveredByKeysList() {
+        let expected: Set<String> = [
+            "diffWordWrap",
+            "diffIgnoreWhitespace",
+            "sidebarSort",
+            "insomniaEnabled",
+            "insomniaAllowDisplaySleep",
+            "insomniaAllowSystemSleepWhenDisplayClosed",
+            "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
+            "tokenSaverEnabled",
+            "sessionLearnEnabled",
+            "historyCompactionEnabled",
+        ]
+        let actual = Set(AppSettingsKeys.userTunableKeys)
+        XCTAssertEqual(
+            actual, expected,
+            "AppSettingsKeys.userTunableKeys must list every user-tunable AppSettings field. " +
+            "Missing: \(expected.subtracting(actual)), extra: \(actual.subtracting(expected))"
+        )
+    }
+
+    /// Assert there are no duplicate keys (a duplicate signals a copy-paste error
+    /// and would make the coverage check misleading).
+    func test_userTunableKeysHasNoDuplicates() {
+        let keys = AppSettingsKeys.userTunableKeys
+        let unique = Set(keys)
+        XCTAssertEqual(
+            keys.count, unique.count,
+            "AppSettingsKeys.userTunableKeys must not contain duplicates - duplicates make the coverage count misleading"
+        )
+    }
+
+    // MARK: - SettingsViewModel setter round-trips (no AppContext / MainActor needed)
+
+    /// Each setter must both mutate appSettings in-memory and persist via
+    /// settingsStore.update so a subsequent reload() reflects the change.
+    ///
+    /// WHY: A setter that only updates the @Published property without calling
+    /// settingsStore.update would silently lose the value on the next reload.
+    func test_settersPersistToSettingsStore() throws {
+        let dir = NSTemporaryDirectory() + "RC2AppSettingsFieldCoverage-\(UUID().uuidString)"
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+
+        let vm = SettingsViewModel(context: ctx)
+
+        // Sidebar sort
+        vm.setSidebarSort("created")
+        XCTAssertEqual(vm.appSettings.sidebarSort, "created",
+                       "setSidebarSort must update appSettings immediately")
+        XCTAssertEqual(SettingsStore(db: ctx.db).load().sidebarSort, "created",
+                       "setSidebarSort must persist the value so reload() sees it")
+
+        // Session Learn
+        vm.setSessionLearnEnabled(true)
+        XCTAssertTrue(vm.appSettings.sessionLearnEnabled,
+                      "setSessionLearnEnabled(true) must update appSettings immediately")
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().sessionLearnEnabled,
+                      "setSessionLearnEnabled must persist so AppContext.runSessionLearn() can observe it")
+
+        // History compaction
+        vm.setHistoryCompactionEnabled(true)
+        XCTAssertTrue(vm.appSettings.historyCompactionEnabled,
+                      "setHistoryCompactionEnabled(true) must update appSettings immediately")
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().historyCompactionEnabled,
+                      "setHistoryCompactionEnabled must persist so AppContext uses the correct mode on launch")
+
+        // Token Saver flag (direct store write; sidebar has the full activation logic)
+        vm.setTokenSaverEnabled(false)
+        XCTAssertFalse(vm.appSettings.tokenSaverEnabled,
+                       "setTokenSaverEnabled(false) must update appSettings immediately")
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
+                       "setTokenSaverEnabled must persist the value")
+
+        // Insomnia enabled flag
+        vm.setInsomniaEnabled(true)
+        XCTAssertTrue(vm.appSettings.insomniaEnabled)
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().insomniaEnabled,
+                      "setInsomniaEnabled must persist so InsomniaPowerManager sees it on next launch")
+
+        // Insomnia sub-options
+        vm.setInsomniaAllowDisplaySleep(false)
+        XCTAssertFalse(vm.appSettings.insomniaAllowDisplaySleep)
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaAllowDisplaySleep)
+
+        vm.setInsomniaAllowSystemSleepWhenDisplayClosed(true)
+        XCTAssertTrue(vm.appSettings.insomniaAllowSystemSleepWhenDisplayClosed)
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().insomniaAllowSystemSleepWhenDisplayClosed)
+
+        vm.setInsomniaAllowScreenSaverAfter45MinutesOfInactivity(false)
+        XCTAssertFalse(vm.appSettings.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
+        XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaAllowScreenSaverAfter45MinutesOfInactivity)
+    }
+
+    /// reload() must reflect the last-persisted value, not a stale in-memory value.
+    ///
+    /// WHY: If setters persist correctly but reload() skips certain keys, the
+    /// Settings window would silently show the wrong toggle state after re-opening.
+    func test_reloadRestoresPersistedValues() throws {
+        let dir = NSTemporaryDirectory() + "RC2AppSettingsReload-\(UUID().uuidString)"
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let store = SettingsStore(db: ctx.db)
+        store.save(AppSettings(
+            sidebarSort: "manual",
+            sessionLearnEnabled: true,
+            historyCompactionEnabled: true
+        ))
+
+        let vm = SettingsViewModel(context: ctx)
+        vm.reload()
+
+        XCTAssertEqual(vm.appSettings.sidebarSort, "manual",
+                       "reload() must restore sidebarSort from the persisted store")
+        XCTAssertTrue(vm.appSettings.sessionLearnEnabled,
+                      "reload() must restore sessionLearnEnabled from the persisted store")
+        XCTAssertTrue(vm.appSettings.historyCompactionEnabled,
+                      "reload() must restore historyCompactionEnabled from the persisted store")
+    }
+}
