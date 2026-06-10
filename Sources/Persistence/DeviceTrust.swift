@@ -175,6 +175,25 @@ public final class DeviceTrustRepository {
 
     private let iso = ISO8601DateFormatter()
 
+    /// Pure predicate: returns `true` when the stored `last_seen_at` is old
+    /// enough that a new write is warranted, avoiding a WAL write on every
+    /// authenticated request when the stored value is already fresh.
+    ///
+    /// - `prev`: the last stored last_seen_at (nil = never seen -> always write)
+    /// - `now`: the current wall-clock time used for the comparison
+    /// - `threshold`: minimum elapsed seconds before a new write is issued
+    ///
+    /// Returns `false` when `prev` is within the threshold window (skip write).
+    /// Returns `true` when `prev` is nil or older than the threshold (do write).
+    public nonisolated static func shouldUpdateLastSeen(
+        prev: Date?,
+        now: Date,
+        threshold: TimeInterval
+    ) -> Bool {
+        guard let prev = prev else { return true }
+        return now.timeIntervalSince(prev) > threshold
+    }
+
     public static func hash(_ token: String) -> String {
         let d = SHA256.hash(data: Data(token.utf8))
         return d.map { String(format: "%02x", $0) }.joined()
@@ -186,9 +205,8 @@ public final class DeviceTrustRepository {
         return Data(b).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
     }
 
-    public func createPairingCode(ttlSeconds: TimeInterval = 600) throws -> PairingCode {
+    public func createPairingCode(ttlSeconds: TimeInterval = 600, at now: Date = Date()) throws -> PairingCode {
         let code = String(format: "%06d", Int.random(in: 0..<1_000_000))
-        let now = Date()
         let exp = now.addingTimeInterval(ttlSeconds)
         let st = try db.prepare("""
             INSERT INTO pairing_codes(code, created_at, expires_at) VALUES(?, ?, ?);
@@ -259,10 +277,9 @@ public final class DeviceTrustRepository {
     /// Create a pending request. The 6-digit code is shown on BOTH the
     /// Mac modal and the device so the user can visually confirm they
     /// match before approving (anti-MITM, like Bluetooth pairing).
-    public func createPairingRequest(deviceName: String, ttlSeconds: TimeInterval = 300) throws -> PairingRequest {
+    public func createPairingRequest(deviceName: String, ttlSeconds: TimeInterval = 300, at now: Date = Date()) throws -> PairingRequest {
         let id = UUID().uuidString
         let code = String(format: "%06d", Int.random(in: 0..<1_000_000))
-        let now = Date()
         let exp = now.addingTimeInterval(ttlSeconds)
         let st = try db.prepare("""
             INSERT INTO pairing_requests(id, code, device_name, created_at, expires_at, status)
@@ -352,24 +369,39 @@ public final class DeviceTrustRepository {
         _ = try st.step()
     }
 
-    public func verify(token: String) throws -> DeviceTrust? {
+    /// Verify `token` and conditionally update `last_seen_at`.
+    ///
+    /// The update is debounced: it is skipped when the stored `last_seen_at`
+    /// is within `threshold` seconds of `now`, avoiding a WAL write on every
+    /// authenticated HTTP request when the value is already fresh.
+    ///
+    /// Default `threshold` of 60 s means at most one write per minute per
+    /// device under sustained traffic, versus one write per request before.
+    public func verify(
+        token: String,
+        threshold: TimeInterval = 60,
+        now: Date = Date()
+    ) throws -> DeviceTrust? {
         let hash = DeviceTrustRepository.hash(token)
-        let st = try db.prepare("SELECT id, display_name, created_at, last_seen_at, revoked_at, capabilities FROM device_trust WHERE token_hash = ? AND revoked_at IS NULL;")
+        let st = try db.prepare(
+            "SELECT id, display_name, created_at, last_seen_at, revoked_at, capabilities FROM device_trust WHERE token_hash = ? AND revoked_at IS NULL;"
+        )
         try st.bind(1, hash)
-        if try st.step() {
-            let id = st.columnText(0) ?? ""
-            let name = st.columnText(1) ?? ""
-            let createdAt = iso.date(from: st.columnText(2) ?? "") ?? Date()
-            let lastSeen = (st.columnText(3)).flatMap { iso.date(from: $0) }
-            let revoked = (st.columnText(4)).flatMap { iso.date(from: $0) }
-            let caps = st.columnText(5) ?? "*"
-            // Touch last_seen_at
+        guard try st.step() else { return nil }
+        let id        = st.columnText(0) ?? ""
+        let name      = st.columnText(1) ?? ""
+        let createdAt = iso.date(from: st.columnText(2) ?? "") ?? Date()
+        let lastSeen  = (st.columnText(3)).flatMap { iso.date(from: $0) }
+        let revoked   = (st.columnText(4)).flatMap { iso.date(from: $0) }
+        let caps      = st.columnText(5) ?? "*"
+        if DeviceTrustRepository.shouldUpdateLastSeen(prev: lastSeen, now: now, threshold: threshold) {
             let touch = try db.prepare("UPDATE device_trust SET last_seen_at = ? WHERE id = ?;")
-            try touch.bind(1, iso.string(from: Date())); try touch.bind(2, id)
+            try touch.bind(1, iso.string(from: now)); try touch.bind(2, id)
             _ = try touch.step()
-            return DeviceTrust(id: id, displayName: name, tokenHash: hash, createdAt: createdAt, lastSeenAt: lastSeen, revokedAt: revoked, capabilities: caps)
         }
-        return nil
+        return DeviceTrust(id: id, displayName: name, tokenHash: hash,
+                           createdAt: createdAt, lastSeenAt: lastSeen,
+                           revokedAt: revoked, capabilities: caps)
     }
 
     public func list() throws -> [DeviceTrust] {
@@ -402,9 +434,9 @@ public final class DeviceTrustRepository {
         _ = try st.step()
     }
 
-    public func audit(actor: String?, action: String, detail: String?) throws {
+    public func audit(actor: String?, action: String, detail: String?, at now: Date = Date()) throws {
         let st = try db.prepare("INSERT INTO audit_log(ts, actor, action, detail) VALUES(?, ?, ?, ?);")
-        try st.bind(1, iso.string(from: Date()))
+        try st.bind(1, iso.string(from: now))
         try st.bind(2, actor)
         try st.bind(3, action)
         try st.bind(4, detail)
@@ -429,5 +461,98 @@ public final class DeviceTrustRepository {
             ))
         }
         return out
+    }
+
+    /// Prune unbounded device-trust tables so they cannot grow without limit
+    /// over long-lived server sessions.
+    ///
+    /// - `auditMaxAge`: remove audit_log rows whose `ts` is older than this
+    ///   interval before `now`. Pass 0 to skip age-based audit pruning.
+    /// - `auditMaxRows`: after age-pruning, trim the oldest rows until at most
+    ///   `auditMaxRows` remain.  Pass `Int.max` to skip row-cap pruning.
+    /// - `pairingMaxAge`: remove pairing_codes and decided (approved/denied)
+    ///   pairing_requests whose `created_at` is older than this interval before
+    ///   `now`. Pending requests are never pruned. Pass 0 to skip.
+    /// - `now`: wall-clock reference injected for deterministic testing.
+    ///
+    /// Returns the total number of rows deleted across all three tables.
+    @discardableResult
+    public func pruneDeviceTrustTables(
+        auditMaxAge: TimeInterval,
+        auditMaxRows: Int,
+        pairingMaxAge: TimeInterval,
+        now: Date = Date()
+    ) throws -> Int {
+        var removed = 0
+
+        // --- audit_log: age cutoff ---
+        if auditMaxAge > 0 {
+            let cutoff = now.addingTimeInterval(-auditMaxAge)
+            let cutoffStr = iso.string(from: cutoff)
+            removed += try countThenDelete(
+                count: "SELECT COUNT(*) FROM audit_log WHERE ts < ?;",
+                delete: "DELETE FROM audit_log WHERE ts < ?;",
+                binding: cutoffStr
+            )
+        }
+
+        // --- audit_log: row cap ---
+        if auditMaxRows < Int.max {
+            // Count current rows; only run the cap DELETE if over limit.
+            let cnt = try db.prepare("SELECT COUNT(*) FROM audit_log;")
+            _ = try cnt.step()
+            let total = Int(cnt.columnInt64(0))
+            if total > auditMaxRows {
+                // Keep the newest auditMaxRows rows by timestamp; delete the rest.
+                // Sort by ts DESC (ISO-8601 sorts lexicographically correctly for UTC)
+                // to find the boundary id, then delete rows older than that boundary.
+                let cap = try db.prepare("""
+                    DELETE FROM audit_log WHERE id NOT IN (
+                        SELECT id FROM audit_log ORDER BY ts DESC, id DESC LIMIT ?
+                    );
+                """)
+                try cap.bind(1, Int64(auditMaxRows))
+                _ = try cap.step()
+                removed += (total - auditMaxRows)
+            }
+        }
+
+        // --- pairing_codes: age cutoff ---
+        if pairingMaxAge > 0 {
+            let cutoff = now.addingTimeInterval(-pairingMaxAge)
+            let cutoffStr = iso.string(from: cutoff)
+            removed += try countThenDelete(
+                count: "SELECT COUNT(*) FROM pairing_codes WHERE created_at < ?;",
+                delete: "DELETE FROM pairing_codes WHERE created_at < ?;",
+                binding: cutoffStr
+            )
+        }
+
+        // --- pairing_requests: age cutoff, decided rows only ---
+        if pairingMaxAge > 0 {
+            let cutoff = now.addingTimeInterval(-pairingMaxAge)
+            let cutoffStr = iso.string(from: cutoff)
+            removed += try countThenDelete(
+                count: "SELECT COUNT(*) FROM pairing_requests WHERE created_at < ? AND status != 'pending';",
+                delete: "DELETE FROM pairing_requests WHERE created_at < ? AND status != 'pending';",
+                binding: cutoffStr
+            )
+        }
+
+        return removed
+    }
+
+    /// Run a COUNT then DELETE for a single-binding SQL pair, returning the count.
+    private func countThenDelete(count countSQL: String, delete deleteSQL: String, binding: String) throws -> Int {
+        let cnt = try db.prepare(countSQL)
+        try cnt.bind(1, binding)
+        _ = try cnt.step()
+        let n = Int(cnt.columnInt64(0))
+        if n > 0 {
+            let del = try db.prepare(deleteSQL)
+            try del.bind(1, binding)
+            _ = try del.step()
+        }
+        return n
     }
 }
