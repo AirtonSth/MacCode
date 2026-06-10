@@ -1608,4 +1608,27 @@ public final class SettingsRepository {
         try st.bind(3, iso.string(from: Date()))
         _ = try st.step()
     }
+
+    /// Delete a single settings row by exact key. No-op if absent.
+    public func delete(key: String) throws {
+        let st = try db.prepare("DELETE FROM settings WHERE key = ?;")
+        try st.bind(1, key)
+        _ = try st.step()
+    }
+
+    /// Delete every settings row whose key starts with `prefix`. Used to clean
+    /// up per-entity blobs (e.g. prompt-history, plan-notes) when the owning
+    /// entity is removed.
+    public func deleteByPrefix(_ prefix: String) throws {
+        // Use '!' as the LIKE escape character to avoid backslash quoting
+        // ambiguity.  Workspace UUIDs contain only hex digits and hyphens so
+        // the only characters that need escaping are '%' and '_'.
+        let st = try db.prepare("DELETE FROM settings WHERE key LIKE ? ESCAPE '!';")
+        let escaped = prefix
+            .replacingOccurrences(of: "!", with: "!!")
+            .replacingOccurrences(of: "%", with: "!%")
+            .replacingOccurrences(of: "_", with: "!_")
+        try st.bind(1, escaped + "%")
+        _ = try st.step()
+    }
 }

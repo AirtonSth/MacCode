@@ -26,6 +26,13 @@ public final class PromptHistoryStore {
         try? repo.set(key(for: workspaceID), json)
     }
 
+    /// Remove the prompt-history row for `workspaceID`. Called when a workspace
+    /// is deleted so user-typed prompts do not persist on disk indefinitely
+    /// (privacy + unbounded settings-table growth).
+    public func delete(workspaceID: WorkspaceID) throws {
+        try repo.delete(key: key(for: workspaceID))
+    }
+
     private func key(for workspaceID: WorkspaceID) -> String {
         "agent_prompt_history.\(workspaceID.value.uuidString)"
     }

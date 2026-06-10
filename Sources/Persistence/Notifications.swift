@@ -42,14 +42,19 @@ public final class NotificationRepository {
         _ = try st.step()
     }
 
-    public func list(workspaceId: WorkspaceID? = nil, unreadOnly: Bool = false) throws -> [AppNotification] {
+    /// Fetch non-dismissed notifications newest-first, bounded by `limit` to
+    /// prevent unbounded query cost on long-lived installs where dismissed rows
+    /// accumulate indefinitely (dismissed rows are excluded by the WHERE clause
+    /// but un-dismissed rows are not pruned elsewhere).
+    public func list(workspaceId: WorkspaceID? = nil, unreadOnly: Bool = false, limit: Int = 200) throws -> [AppNotification] {
         var sql = "SELECT id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at FROM notifications WHERE dismissed_at IS NULL"
-        if let _ = workspaceId { sql += " AND workspace_id = ?" }
+        if workspaceId != nil { sql += " AND workspace_id = ?" }
         if unreadOnly { sql += " AND read_at IS NULL" }
-        sql += " ORDER BY created_at DESC;"
+        sql += " ORDER BY created_at DESC LIMIT ?;"
         let st = try db.prepare(sql)
         var p: Int32 = 1
         if let wid = workspaceId { try st.bind(p, wid.value.uuidString); p += 1 }
+        try st.bind(p, Int64(max(1, limit)))
         var out: [AppNotification] = []
         while try st.step() {
             let wid = (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
