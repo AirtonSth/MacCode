@@ -352,6 +352,50 @@ public enum PasteGuard {
     }
 }
 
+// MARK: - Bell preferences (pure, non-MainActor, testable)
+
+/// User-configurable bell preferences.
+///
+/// Keeping this pure (no AppKit, no actor) lets unit tests cover the logic
+/// without a live UI. The surface reads this at bell time and passes it to
+/// `BellHandler.effects(prefs:)` to decide which side-effects to apply.
+public struct BellPreferences: Equatable {
+    /// Play the system beep (`NSSound.beep()`) when a bell is received.
+    public var sound: Bool
+    /// Show a brief visual flash on the terminal view when a bell is received.
+    public var flash: Bool
+
+    /// Default: silent — no sound, no flash. New installs must not produce
+    /// unexpected audio or visual disturbance without explicit user opt-in.
+    public init(sound: Bool = false, flash: Bool = false) {
+        self.sound = sound
+        self.flash = flash
+    }
+}
+
+/// The resolved set of side-effects to apply for a single bell event.
+public struct BellEffects: Equatable {
+    /// Whether to call `NSSound.beep()`.
+    public let playSound: Bool
+    /// Whether to trigger a visual flash on the terminal view.
+    public let flash: Bool
+    /// Whether to mark the surface as having unread activity (dot).
+    /// Always `true` — the dot is the lowest-distraction baseline feedback.
+    public let dot: Bool
+}
+
+/// Pure mapping from bell preferences to bell effects.
+///
+/// Keeping this non-MainActor lets unit tests cover the logic without AppKit.
+/// The surface is responsible for executing the returned effects on the main actor.
+public enum BellHandler {
+    /// Map `prefs` to the set of effects that should be applied on the next bell.
+    /// `dot` is always `true`; `playSound` and `flash` mirror the preference flags.
+    public nonisolated static func effects(prefs: BellPreferences) -> BellEffects {
+        BellEffects(playSound: prefs.sound, flash: prefs.flash, dot: true)
+    }
+}
+
 // MARK: - TerminalSurface
 
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
@@ -412,6 +456,10 @@ public final class TerminalSurface: NSObject, Surface {
     private var parkingConstraints: [NSLayoutConstraint] = []
     private var needsHistoryReplay = false
     private var restartBannerButton: NSButton?
+
+    /// Bell preferences, configurable by the user. Defaults to silent (no sound,
+    /// no flash) so new installs do not produce unexpected audio or visual output.
+    public var bellPreferences = BellPreferences()
 
     /// Called on the main actor when the user taps "Restart shell" on the
     /// dead-terminal banner. The caller (AppCommandRouter) replaces this
@@ -1025,7 +1073,33 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     func handleBell() {
-        descriptor.hasUnreadActivity = true
+        let fx = BellHandler.effects(prefs: bellPreferences)
+        if fx.dot { descriptor.hasUnreadActivity = true }
+        if fx.playSound { NSSound.beep() }
+        if fx.flash { flashTerminalView() }
+    }
+
+    /// Applies a brief white-flash overlay on the terminal container view to
+    /// provide a visual bell. The flash is implemented as a CABasicAnimation on
+    /// the container layer so it is non-blocking and does not interfere with
+    /// terminal rendering.
+    private func flashTerminalView() {
+        guard let layer = view.layer else { return }
+        let flash = CALayer()
+        flash.frame = layer.bounds
+        flash.backgroundColor = NSColor.white.withAlphaComponent(0.35).cgColor
+        flash.opacity = 0
+        layer.addSublayer(flash)
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { flash.removeFromSuperlayer() }
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = 0.35
+        anim.toValue = 0
+        anim.duration = 0.15
+        anim.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        flash.opacity = 0
+        flash.add(anim, forKey: "bell_flash")
+        CATransaction.commit()
     }
 
     private func markTerminalDead(reason: String, exitStatus: Int32?) {
