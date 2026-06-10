@@ -421,6 +421,77 @@ func filterFileEntries<T: FileNameFilterable>(_ entries: [T], query: String) -> 
     }
 }
 
+// MARK: - Incremental highlight range helper (no AppKit, no MainActor; tested in IncrementalHighlightRangesTests)
+
+/// Compute the UTF-16 NSRanges (over `newText`) of lines that differ between `oldText` and
+/// `newText`, so the code editor can re-highlight only the changed region instead of rebuilding
+/// the entire attributed string on every remote patch (PERF-MAC_FILES-014).
+///
+/// Algorithm:
+///  1. Split both strings into lines on "\n". NSString line enumeration is used for the final
+///     range computation so offsets are UTF-16 — matching NSTextStorage expectations — and the
+///     helper is safe for any Unicode content (no UTF-16 index arithmetic on grapheme clusters).
+///  2. Diff line arrays from both ends (common-prefix / common-suffix trim) to find the first
+///     and last changed line indices in `newText`.
+///  3. Return those lines' combined UTF-16 NSRange in `newText`, or an empty array when the
+///     texts are identical.
+///
+/// Returns at most one element (the union of all changed lines) to keep the call site simple.
+/// The caller highlights every line inside that range, which is safe for multi-line tokens.
+nonisolated func changedLineRanges(oldText: String, newText: String) -> [NSRange] {
+    guard oldText != newText else { return [] }
+    let oldLines = oldText.components(separatedBy: "\n")
+    let newLines = newText.components(separatedBy: "\n")
+    let oldCount = oldLines.count
+    let newCount = newLines.count
+    // Trim common prefix lines.
+    var prefixCount = 0
+    let maxPrefix = min(oldCount, newCount)
+    while prefixCount < maxPrefix && oldLines[prefixCount] == newLines[prefixCount] {
+        prefixCount += 1
+    }
+    // Trim common suffix lines (never overlap the already-trimmed prefix).
+    var suffixCount = 0
+    let maxSuffix = min(oldCount, newCount) - prefixCount
+    while suffixCount < maxSuffix
+            && oldLines[oldCount - 1 - suffixCount] == newLines[newCount - 1 - suffixCount] {
+        suffixCount += 1
+    }
+    // Changed line indices in newText: [firstChanged, lastChanged].
+    let firstChanged = prefixCount
+    let lastChanged = max(prefixCount, newCount - suffixCount - 1)
+    // Walk newText line-by-line using NSString enumeration so offsets are UTF-16 units,
+    // matching NSTextStorage expectations and staying safe for all Unicode content.
+    let nsNew = newText as NSString
+    var rangeStart = 0
+    var rangeEnd = nsNew.length
+    var currentLine = 0
+    var foundStart = false
+    var foundEnd = false
+    nsNew.enumerateSubstrings(
+        in: NSRange(location: 0, length: nsNew.length),
+        options: [.byLines, .substringNotRequired]
+    ) { _, lineRange, enclosingRange, stop in
+        if currentLine == firstChanged {
+            rangeStart = lineRange.location
+            foundStart = true
+        }
+        if currentLine == lastChanged {
+            rangeEnd = NSMaxRange(enclosingRange)
+            foundEnd = true
+            stop.pointee = true
+        }
+        currentLine += 1
+    }
+    // If firstChanged was never reached (e.g. newText is empty), return empty.
+    if !foundStart { return [] }
+    // If lastChanged was not reached (change extends to the last line with no trailing newline),
+    // rangeEnd stays at nsNew.length which is correct.
+    _ = foundEnd
+    let length = max(0, rangeEnd - rangeStart)
+    return [NSRange(location: rangeStart, length: length)]
+}
+
 // MARK: - Editor color palette (no AppKit environment needed; tested in EditorColorPaletteTests)
 
 /// Color set for the code editor and its line-number gutter. Chosen per appearance so the editor
@@ -2314,9 +2385,12 @@ private struct CodeTextEditor: NSViewRepresentable {
             return
         }
         if textView.string != text {
+            let oldText = textView.string
             let selectedRanges = textView.selectedRanges
             textView.string = text
-            context.coordinator.applyHighlight(to: textView)
+            // Incremental highlight: re-tokenize only the changed lines so remote patches on
+            // large files do not rebuild the whole attributed string (PERF-MAC_FILES-014).
+            context.coordinator.applyHighlightIncremental(oldText: oldText, to: textView)
             textView.selectedRanges = selectedRanges
             context.coordinator.lineNumberRuler?.needsDisplay = true
         }
@@ -2390,6 +2464,40 @@ private struct CodeTextEditor: NSViewRepresentable {
             }
             lineNumberRuler?.needsDisplay = true
             applyingHighlight = false
+        }
+
+        /// Re-highlight only the lines that changed between `oldText` and the current textView
+        /// content (PERF-MAC_FILES-014). Falls back to a full `applyHighlight` when the changed
+        /// range covers the whole document (e.g. file replaced entirely).
+        ///
+        /// Called from `updateNSView` after `textView.string` is set to the new remote content.
+        /// Never calls `setAttributedString` — mutates attributes in place — so cursor position,
+        /// scroll offset, and selection are undisturbed.
+        func applyHighlightIncremental(oldText: String, to textView: NSTextView) {
+            guard !applyingHighlight else { return }
+            let ranges = changedLineRanges(oldText: oldText, newText: textView.string)
+            // No changed lines (content identical) or entire document changed: use full highlight.
+            guard !ranges.isEmpty else { return }
+            let nsNew = textView.string as NSString
+            let fullRange = NSRange(location: 0, length: nsNew.length)
+            if NSEqualRanges(ranges[0], fullRange) {
+                applyHighlight(to: textView)
+                return
+            }
+            guard let storage = textView.textStorage else { return }
+            applyingHighlight = true
+            defer { applyingHighlight = false }
+            let baseAttrs = codeBaseAttributes(for: currentPalette)
+            storage.beginEditing()
+            for range in ranges {
+                storage.setAttributes(baseAttrs, range: range)
+                nsNew.enumerateSubstrings(in: range, options: [.byLines, .substringNotRequired]) { _, lineRange, _, _ in
+                    let lineText = nsNew.substring(with: lineRange)
+                    applyHighlightSpans(highlightCodeLine(lineText), lineRange: lineRange, to: storage)
+                }
+            }
+            storage.endEditing()
+            lineNumberRuler?.needsDisplay = true
         }
     }
 }
