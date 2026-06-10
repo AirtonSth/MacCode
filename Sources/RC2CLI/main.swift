@@ -6,6 +6,14 @@ import Persistence
 let args = CommandLine.arguments
 let prog = (args.first as NSString?)?.lastPathComponent ?? "remotecode"
 
+// Parse --timeout before the global flag loop so it is available when RPC is
+// constructed.  The parser strips the token(s) and returns the cleaned list.
+let _timeoutResult = RC2CLITimeoutParser.parse(Array(args.dropFirst()))
+var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS
+// Reconstructed args with --timeout removed; the loop below indexes from 1 so
+// we prepend a placeholder for the program name slot.
+let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
+
 func usage(_ exit: Int32 = 0) -> Never {
     let text = """
     Usage: \(prog) [--socket PATH] [--json] <command> [args...]
@@ -87,15 +95,15 @@ let subcommandHelp: [String: String] = [
 var rest: [String] = []
 var globalTerminated = false
 var i = 1
-while i < args.count {
-    let s = args[i]
+while i < _cleanedArgs.count {
+    let s = _cleanedArgs[i]
     if globalTerminated { rest.append(s); i += 1; continue }
     if s == "--" { globalTerminated = true; i += 1; continue }
     if s == "--version" {
         print(RC2CLIVersion.versionString())
         Darwin.exit(0)
     }
-    if s == "--socket", i + 1 < args.count { socketPath = args[i+1]; i += 2; continue }
+    if s == "--socket", i + 1 < _cleanedArgs.count { socketPath = _cleanedArgs[i+1]; i += 2; continue }
     if s == "--json" { jsonOutput = true; i += 1; continue }
     if s == "--help" || s == "-h" { usage(0) }
     rest.append(s); i += 1
@@ -113,6 +121,10 @@ if rest.isEmpty { usage(RC2ExitCode.usageError) }
 
 struct RPC {
     let socketPath: String
+    /// When non-nil, SO_RCVTIMEO is applied to the socket so a read cannot
+    /// block longer than this many milliseconds.
+    let receiveTimeoutMS: Int?
+
     func call(_ method: String, params: [String: Any]) -> [String: Any] {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         if fd < 0 { return ["error": ["code": -1, "message": "socket(): \(String(cString: strerror(errno)))"]] }
@@ -140,6 +152,13 @@ struct RPC {
             let msg = String(cString: strerror(errno))
             close(fd)
             return ["error": ["code": -1, "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?", "_connect_failure": true]]
+        }
+        // Apply receive timeout when requested via --timeout MS.
+        if let ms = receiveTimeoutMS {
+            let sec  = ms / 1000
+            let usec = (ms % 1000) * 1000
+            var tv = timeval(tv_sec: sec, tv_usec: Int32(usec))
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         }
         defer { close(fd) }
         let payload: [String: Any] = [
@@ -172,7 +191,7 @@ struct RPC {
     }
 }
 
-let rpc = RPC(socketPath: socketPath)
+let rpc = RPC(socketPath: socketPath, receiveTimeoutMS: receiveTimeoutMS)
 
 func emit(_ obj: Any) {
     if jsonOutput {
