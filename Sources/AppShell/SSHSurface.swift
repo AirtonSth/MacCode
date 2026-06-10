@@ -333,12 +333,16 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     private func connect(_ host: SSHHostProfile) {
-        // Surface an explicit "Connecting…" state before the session setup
-        // (UX-MAC_SSH-002). Kept synchronous so callers that immediately read
-        // the resulting connected state (Open New Connection) still observe it.
-        viewModel.status = "Connecting…"
+        // Phase 1 (.painting): update the label now so SwiftUI can commit the
+        // frame. Phase 2 (.connecting) runs after Task.yield() hands control back
+        // to the runloop, guaranteeing the "Connecting…" text paints before the
+        // keychain read + forkpty stall (PERF-SSH-001 / UX-MAC_SSH-002).
+        viewModel.status = "Connecting\u{2026}"  // U+2026 HORIZONTAL ELLIPSIS
         viewModel.error = nil
-        performConnect(host)
+        Task { @MainActor [weak self] in
+            await Task.yield()   // let SwiftUI paint the "Connecting…" label
+            self?.performConnect(host)
+        }
     }
 
     private func performConnect(_ host: SSHHostProfile) {
@@ -1255,6 +1259,28 @@ private struct SSHFileColumnWidths {
     var modified: CGFloat = 132
 
     var total: CGFloat { name + size + type + modified }
+}
+
+// Pure connect-phase state machine — no UI, no actor isolation.
+// Extracted so phase-transition invariants can be tested without touching
+// SSHSurface directly. Rule: .painting always precedes .connecting, and
+// .connecting must precede .connected/.failed.
+enum SSHConnectPhase: Equatable {
+    case painting     // status label set, waiting for next runloop pass
+    case connecting   // keychain read + TerminalSurface init in progress
+    case connected    // session live
+    case failed       // setup threw; error stored separately
+
+    // Returns valid next phases from the current one.
+    // Used by tests to assert the one-way ordering invariant.
+    nonisolated static func validTransitions(from phase: SSHConnectPhase) -> Set<SSHConnectPhase> {
+        switch phase {
+        case .painting:   return [.connecting]
+        case .connecting: return [.connected, .failed]
+        case .connected:  return []
+        case .failed:     return []
+        }
+    }
 }
 
 private struct SSHQueueColumnWidths {
