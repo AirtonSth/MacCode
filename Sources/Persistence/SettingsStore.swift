@@ -1,6 +1,32 @@
 import Foundation
 import CoreModel
 
+// MARK: - SettingsCache
+
+/// Thread-safe in-memory cache for one AppSettings value.
+/// get/set/invalidate are the only surface; no MainActor required.
+final class SettingsCache: @unchecked Sendable {
+    private var value: AppSettings?
+    private var lock = NSLock()
+
+    func get() -> AppSettings? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ v: AppSettings) {
+        lock.lock(); defer { lock.unlock() }
+        value = v
+    }
+
+    func invalidate() {
+        lock.lock(); defer { lock.unlock() }
+        value = nil
+    }
+}
+
+// MARK: - AppSettings
+
 /// User-tunable preferences (t3code client-settings parity). Persisted as
 /// one JSON blob in the `settings` kv table so adding a field never needs
 /// a migration. Defaults are the V1 behaviour, so an absent/garbled blob
@@ -84,6 +110,7 @@ extension SettingsRepository: SettingsWriteRepository {}
 public final class SettingsStore {
     private let repo: any SettingsWriteRepository
     private let key = "app_settings"
+    private let cache = SettingsCache()
     /// Called on the calling thread when a user-initiated write fails.
     /// Nil = silent (legacy behaviour, only use for non-user-initiated paths).
     public var onWriteError: ((Error) -> Void)?
@@ -94,10 +121,14 @@ public final class SettingsStore {
     init(repo: any SettingsWriteRepository) { self.repo = repo }
 
     public func load() -> AppSettings {
+        if let cached = cache.get() { return cached }
         guard let json = try? repo.get(key), let data = json.data(using: .utf8),
               let s = try? JSONDecoder().decode(AppSettings.self, from: data) else {
-            return AppSettings()
+            let defaults = AppSettings()
+            cache.set(defaults)
+            return defaults
         }
+        cache.set(s)
         return s
     }
 
@@ -106,6 +137,7 @@ public final class SettingsStore {
               let json = String(data: data, encoding: .utf8) else { return }
         do {
             try repo.set(key, json)
+            cache.invalidate()
         } catch {
             onWriteError?(error)
         }
