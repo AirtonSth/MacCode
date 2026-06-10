@@ -194,6 +194,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private var didApplyInitialSidebarWidth = false
     private var isApplyingInitialSidebarWidth = false
     private var lastSplitBoundsWidth: CGFloat?
+    /// PERF-MAC_SHELL_WINDOW-003: debounce sidebar.width DB writes.
+    /// One DispatchWorkItem replaces the previous on each tick; only the
+    /// item that survives the 0.3 s idle period actually calls settingsRepo.
+    private var sidebarWidthDebounceItem: DispatchWorkItem?
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -1051,7 +1055,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
         lastSplitBoundsWidth = currentSplitWidth
         sidebarWidth = sidebar.view.frame.width
-        try? context?.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(sidebarWidth))")
+        // PERF-MAC_SHELL_WINDOW-003: debounce — cancel any pending write and
+        // schedule a new one; only the item surviving the idle fires the DB write.
+        sidebarWidthDebounceItem?.cancel()
+        let capturedWidth = sidebarWidth
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, let ctx = self.context else { return }
+            try? ctx.settingsRepo.set(Self.sidebarWidthSettingsKey, "\(Double(capturedWidth))")
+        }
+        sidebarWidthDebounceItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
     }
 
     private static func storedSidebarWidth(context: AppContext) -> CGFloat {
@@ -1065,6 +1078,28 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private static func storedSidebarCollapsed(context: AppContext) -> Bool {
         ((try? context.settingsRepo.get(sidebarCollapsedSettingsKey)) ?? nil) == "1"
     }
+}
+
+// MARK: - Sidebar width debounce helper
+
+/// Returns true when a sidebar.width DB write should be issued.
+///
+/// Contract (enforced by SidebarWidthDebounceTests):
+///   - Returns false if a write occurred within `interval` seconds of `now`.
+///   - Returns true when no previous write exists (first drag).
+///   - Returns true when elapsed time exceeds `interval`.
+///
+/// Pure function — no side effects, no AppKit, no @MainActor needed.
+/// The MainWindowController uses this to gate settingsRepo.set calls so that
+/// live-dragging the sidebar divider produces one DB write (on idle) instead
+/// of one per resize tick (which was ~60 synchronous SQLite writes/second).
+nonisolated func sidebarWidthShouldWrite(
+    lastWriteAt: Date?,
+    now: Date,
+    interval: TimeInterval
+) -> Bool {
+    guard let last = lastWriteAt else { return true }
+    return now.timeIntervalSince(last) >= interval
 }
 
 // MARK: - Detached workspace frame autosave helper
