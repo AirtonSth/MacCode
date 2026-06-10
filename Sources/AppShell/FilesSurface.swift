@@ -353,6 +353,28 @@ func recycleURLs(forAbsolutePaths paths: [String]) -> [URL] {
     paths.map { URL(fileURLWithPath: $0) }
 }
 
+// MARK: - Pure drag-out helper (no AppKit, no MainActor; tested in FilesDragOutTests)
+
+/// Result of resolving a file-row drag that leaves the sidebar toward Finder or another app.
+/// Both fields are computed from the absolute `path` stored on `FileEntry`; no AppKit is needed.
+struct FileOutDragInfo: Equatable {
+    /// File URL passed to NSFilePromiseProvider / NSPasteboard so the drop target (Finder,
+    /// another app) can locate the actual file on disk.
+    let absoluteURL: URL
+    /// Suggested filename the receiving app shows when the promise is fulfilled.
+    /// Equals `URL(fileURLWithPath: absolutePath).lastPathComponent`, which is the `name`
+    /// field on `FileEntry` (guaranteed non-empty by the server API).
+    let promiseFilename: String
+}
+
+/// Compute the drag-out info for a single sidebar row. Pure: no AppKit, no MainActor.
+/// `absolutePath` is `FileEntry.path` (always an absolute filesystem path).
+/// Works identically for files and directories; directories can also be dragged to Finder.
+func fileOutDragInfo(absolutePath: String) -> FileOutDragInfo {
+    let url = URL(fileURLWithPath: absolutePath)
+    return FileOutDragInfo(absoluteURL: url, promiseFilename: url.lastPathComponent)
+}
+
 // MARK: - Pure name-filter helper (no AppKit, no MainActor; tested in FilesNameFilterTests)
 
 /// Minimal protocol surface that `filterFileEntries` requires, so the helper can be tested
