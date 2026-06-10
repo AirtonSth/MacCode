@@ -405,6 +405,7 @@ public final class SidebarViewModel: ObservableObject {
     public func select(_ wid: WorkspaceID) {
         selectedWorkspaceIDs.removeAll()
         selectionAnchorID = wid
+        selectedWorkspaceID = wid
         try? router?.selectWorkspace(wid)
     }
 
@@ -601,18 +602,26 @@ public final class SidebarViewModel: ObservableObject {
 
     public func renameWorkspace(_ ws: Workspace) {
         guard let name = prompt(title: "Rename workspace",
-                                message: "New name for “\(ws.name)”.",
+                                message: "New name for \"\(ws.name)\".",
                                 initial: ws.name), !name.isEmpty else { return }
-        try? router?.renameWorkspace(ws.id, name)
+        do {
+            try router?.renameWorkspace(ws.id, name)
+        } catch {
+            showOperationError("Could not rename workspace", detail: error.localizedDescription)
+        }
     }
 
     public func editDescription(_ ws: Workspace) {
         let current = ws.metadata["description"] ?? ""
         guard let text = prompt(title: "Workspace description",
-                                message: "Optional note for “\(ws.name)”.",
+                                message: "Optional note for \"\(ws.name)\".",
                                 initial: current,
                                 multiline: true) else { return }
-        try? router?.setWorkspaceDescription(ws.id, text)
+        do {
+            try router?.setWorkspaceDescription(ws.id, text)
+        } catch {
+            showOperationError("Could not update description", detail: error.localizedDescription)
+        }
     }
 
     public func setWorkspaceColor(_ ws: Workspace, _ color: String) {
@@ -659,12 +668,16 @@ public final class SidebarViewModel: ObservableObject {
     public func removeWorkspace(_ ws: Workspace) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Remove “\(ws.name)”?"
+        alert.messageText = "Remove \"\(ws.name)\"?"
         alert.informativeText = "This removes the workspace and its tabs from RemoteCode. Files on disk are not touched."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            try? router?.closeWorkspace(ws.id)
+            do {
+                try router?.closeWorkspace(ws.id)
+            } catch {
+                showOperationError("Could not remove workspace", detail: error.localizedDescription)
+            }
         }
     }
 
@@ -679,10 +692,116 @@ public final class SidebarViewModel: ObservableObject {
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        try? router?.closeWorkspaces(Array(ids))
+        do {
+            try router?.closeWorkspaces(Array(ids))
+        } catch {
+            showOperationError("Could not remove workspaces", detail: error.localizedDescription)
+            return
+        }
         selectedWorkspaceIDs.removeAll()
         selectionAnchorID = nil
         reload()
+    }
+
+    // MARK: Error surfacing
+
+    private func showOperationError(_ message: String, detail: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    // MARK: Keyboard navigation
+
+    /// Moves the selected workspace up or down by `delta` within `filteredWorkspaces`.
+    public func moveSelection(by delta: Int) {
+        let rows = filteredWorkspaces
+        guard !rows.isEmpty else { return }
+        let currentIndex = rows.firstIndex(where: { $0.id == selectedWorkspaceID }) ?? -1
+        let next = max(0, min(rows.count - 1, currentIndex + delta))
+        select(rows[next].id)
+    }
+
+    /// Opens the currently-selected workspace (no-op if none selected).
+    public func openSelectedWorkspace() {
+        guard let wid = selectedWorkspaceID else { return }
+        select(wid)
+    }
+
+    /// Removes the currently-selected workspace after confirmation.
+    public func removeSelectedWorkspace() {
+        guard let wid = selectedWorkspaceID,
+              let ws = workspaces.first(where: { $0.id == wid }) else { return }
+        removeWorkspace(ws)
+    }
+}
+
+// MARK: - Keyboard intent model (pure; no AppKit/SwiftUI import required for tests)
+
+/// The action the sidebar should perform in response to a key event.
+public enum SidebarAction: Equatable {
+    case moveUp
+    case moveDown
+    case openSelected
+    case removeSelected
+    case focusFilter
+    case clearFilter
+}
+
+/// Input descriptor for `SidebarKeyIntentMapper`.
+/// Uses plain Swift types so the mapper and its tests need no UI imports.
+public struct SidebarKeyInput: Equatable {
+    public let character: Character
+    public let commandDown: Bool
+    public let optionDown: Bool
+    public let shiftDown: Bool
+
+    public init(character: Character, commandDown: Bool = false, optionDown: Bool = false, shiftDown: Bool = false) {
+        self.character = character
+        self.commandDown = commandDown
+        self.optionDown = optionDown
+        self.shiftDown = shiftDown
+    }
+}
+
+/// Pure, nonisolated mapper from a key input to a `SidebarAction`.
+/// Bindings:
+///   ↑ / ↓          → moveUp / moveDown
+///   Return (↩)     → openSelected
+///   Cmd+Delete (⌫) → removeSelected
+///   Cmd+F          → focusFilter
+///   Escape         → clearFilter
+public struct SidebarKeyIntentMapper {
+    private static let upCharacter: Character = Character(UnicodeScalar(NSUpArrowFunctionKey)!)
+    private static let downCharacter: Character = Character(UnicodeScalar(NSDownArrowFunctionKey)!)
+    private static let returnCharacter: Character = "\r"
+    private static let deleteCharacter: Character = Character(UnicodeScalar(NSDeleteFunctionKey)!)
+    private static let backspaceCharacter: Character = "\u{7F}"
+    private static let escapeCharacter: Character = "\u{1B}"
+
+    public init() {}
+
+    public func action(for input: SidebarKeyInput) -> SidebarAction? {
+        switch (input.character, input.commandDown, input.optionDown, input.shiftDown) {
+        case (Self.upCharacter, false, false, false):
+            return .moveUp
+        case (Self.downCharacter, false, false, false):
+            return .moveDown
+        case (Self.returnCharacter, false, false, false):
+            return .openSelected
+        case (Self.deleteCharacter, true, false, false),
+             (Self.backspaceCharacter, true, false, false):
+            return .removeSelected
+        case ("f", true, false, false):
+            return .focusFilter
+        case (Self.escapeCharacter, false, false, false):
+            return .clearFilter
+        default:
+            return nil
+        }
     }
 }
 
@@ -696,8 +815,11 @@ public struct SidebarRootView: View {
     @State private var showsInsomniaOptions = false
     @State private var showsTokenSaverDetails = false
     @State private var tokenSaverDetailsScope: TokenSaverUsageScope = .week
+    /// Toggled to true to programmatically focus the filter field (Cmd+F).
+    @State private var filterFocusRequest: Bool = false
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
+    private let keyMapper = SidebarKeyIntentMapper()
 
     public init(
         vm: SidebarViewModel,
@@ -823,6 +945,10 @@ public struct SidebarRootView: View {
                 .padding(.horizontal, DS.Space.sm)
             }
             .frame(maxHeight: .infinity)
+            .focusable()
+            .onKeyPress(phases: .down) { press in
+                handleKeyPress(press)
+            }
 
             accountFooter
         }
@@ -849,6 +975,35 @@ public struct SidebarRootView: View {
         }
     }
 
+    // MARK: Keyboard handling
+
+    @discardableResult
+    private func handleKeyPress(_ press: KeyPress) -> KeyPress.Result {
+        let modifiers = press.modifiers
+        let input = SidebarKeyInput(
+            character: press.key.character,
+            commandDown: modifiers.contains(.command),
+            optionDown: modifiers.contains(.option),
+            shiftDown: modifiers.contains(.shift)
+        )
+        guard let action = keyMapper.action(for: input) else { return .ignored }
+        switch action {
+        case .moveUp:
+            vm.moveSelection(by: -1)
+        case .moveDown:
+            vm.moveSelection(by: 1)
+        case .openSelected:
+            vm.openSelectedWorkspace()
+        case .removeSelected:
+            vm.removeSelectedWorkspace()
+        case .focusFilter:
+            filterFocusRequest = true
+        case .clearFilter:
+            vm.filterText = ""
+        }
+        return .handled
+    }
+
     private var workspaceFilterField: some View {
         HStack(spacing: DS.Space.sm) {
             Image(systemName: "magnifyingglass")
@@ -857,6 +1012,7 @@ public struct SidebarRootView: View {
             NonAutoFocusTextField(
                 placeholder: "Filter workspaces",
                 text: $vm.filterText,
+                focusRequest: $filterFocusRequest,
                 accessibilityIdentifier: "sidebar.workspaceFilter"
             )
             .font(DS.Font.body)
@@ -2037,6 +2193,8 @@ private struct WorkspaceDropDelegate: DropDelegate {
 private struct NonAutoFocusTextField: NSViewRepresentable {
     let placeholder: String
     @Binding var text: String
+    /// Set to `true` to programmatically focus the field (e.g. Cmd+F); resets to `false` once handled.
+    @Binding var focusRequest: Bool
     let accessibilityIdentifier: String
 
     func makeNSView(context: Context) -> ManualFocusTextField {
@@ -2060,22 +2218,30 @@ private struct NonAutoFocusTextField: NSViewRepresentable {
 
     func updateNSView(_ field: ManualFocusTextField, context: Context) {
         context.coordinator.text = $text
+        context.coordinator.focusRequest = $focusRequest
         field.placeholderString = placeholder
         field.setAccessibilityIdentifier(accessibilityIdentifier)
         if field.stringValue != text {
             field.stringValue = text
         }
+        if focusRequest {
+            field.programmaticFocus()
+            let resetRequest = $focusRequest
+            DispatchQueue.main.async { resetRequest.wrappedValue = false }
+        }
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
+        Coordinator(text: $text, focusRequest: $focusRequest)
     }
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var text: Binding<String>
+        var focusRequest: Binding<Bool>
 
-        init(text: Binding<String>) {
+        init(text: Binding<String>, focusRequest: Binding<Bool>) {
             self.text = text
+            self.focusRequest = focusRequest
         }
 
         func controlTextDidChange(_ obj: Notification) {
@@ -2089,6 +2255,12 @@ private struct NonAutoFocusTextField: NSViewRepresentable {
 
         override var acceptsFirstResponder: Bool {
             allowManualFocus
+        }
+
+        /// Programmatically grant focus without a mouse event (e.g. Cmd+F keyboard shortcut).
+        func programmaticFocus() {
+            allowManualFocus = true
+            window?.makeFirstResponder(self)
         }
 
         override func mouseDown(with event: NSEvent) {
