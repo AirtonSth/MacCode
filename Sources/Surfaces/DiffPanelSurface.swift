@@ -73,15 +73,51 @@ public final class DiffPanelViewModel: ObservableObject {
     private var lastFSRefresh: Date = .distantPast
 
     /// C8: diff view prefs persist across launches via SettingsStore.
-    public init(cwd: String, settings: SettingsStore? = nil) {
+    /// When `asyncLoad` is false (default, used in tests) git is called
+    /// synchronously so the view model is fully populated right after init.
+    /// When `asyncLoad` is true the init returns instantly with a loading
+    /// placeholder; a Task fires the git calls on a background thread and
+    /// publishes the result on the main actor (PERF - surface appears fast).
+    public init(cwd: String, settings: SettingsStore? = nil, asyncLoad: Bool = false) {
         self.cwd = cwd
         self.settings = settings
-        self.summary = GitDiff.summary(in: cwd)
-        self.branches = GitDiff.branches(in: cwd)
+        if asyncLoad {
+            // Placeholder state: surface renders immediately while git runs.
+            self.summary = GitSummary(isGitRepo: false, branch: nil, dirty: false,
+                                      files: [], totalAdditions: 0, totalDeletions: 0)
+            self.branches = GitBranches(current: nil, locals: [])
+            self.isLoading = true
+        } else {
+            self.summary = GitDiff.summary(in: cwd)
+            self.branches = GitDiff.branches(in: cwd)
+        }
         if let s = settings?.load() {
             // Set within init → property observers don't fire (no echo write).
             self.wordWrap = s.diffWordWrap
             self.ignoreWhitespace = s.diffIgnoreWhitespace
+        }
+        if asyncLoad {
+            let cwdCopy = cwd
+            Task { [weak self] in
+                let (s, b) = await DiffPanelViewModel.performLoad(cwd: cwdCopy)
+                guard let self else { return }
+                self.summary = s
+                self.branches = b
+                self.isLoading = false
+            }
+        }
+    }
+
+    /// Loads summary and branches on a background thread, returns on any
+    /// actor. Pure coordination helper; exposed `internal` so the new test
+    /// can verify load state without hitting real git.
+    nonisolated static func performLoad(cwd: String) async -> (GitSummary, GitBranches) {
+        await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                let s = GitDiff.summary(in: cwd)
+                let b = GitDiff.branches(in: cwd)
+                cont.resume(returning: (s, b))
+            }
         }
     }
 
@@ -1560,7 +1596,7 @@ public final class DiffPanelSurface: NSObject, Surface {
                 openInFilesTabAction: ((String) -> Void)? = nil) {
         self.descriptor = SurfaceDescriptor(type: .rightSidebarTool, title: title, iconName: "doc.text.magnifyingglass",
                                             metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd, "tool": "diff"])
-        self.viewModel = DiffPanelViewModel(cwd: cwd, settings: settings)
+        self.viewModel = DiffPanelViewModel(cwd: cwd, settings: settings, asyncLoad: true)
         self.viewModel.openInFilesTabAction = openInFilesTabAction
         let host = NSHostingView(rootView: DiffPanelView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
