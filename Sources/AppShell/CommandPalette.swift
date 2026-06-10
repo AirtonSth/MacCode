@@ -7,6 +7,28 @@ import Surfaces
 import AgentRuntime
 import DesignSystemKit
 
+// MARK: - PalettePanel
+
+/// Private NSPanel subclass that intercepts Cmd+1..9 and forwards them to the
+/// owning CommandPalette as quick-run keystrokes.  The standard responder chain
+/// for an NSTextField never sees Cmd+digit (it's not a text editing command), so
+/// `performKeyEquivalent` is the correct hook point.
+private final class PalettePanel: NSPanel {
+    /// Set by CommandPalette after init.
+    var quickRunHandler: ((Int) -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.command),
+              event.type == .keyDown,
+              let char = event.charactersIgnoringModifiers,
+              char.count == 1,
+              let digit = Int(char), digit >= 1, digit <= 9
+        else { return super.performKeyEquivalent(with: event) }
+        quickRunHandler?(digit)
+        return true
+    }
+}
+
 // P2: thin wrapper so SettingsRepository (Persistence) satisfies
 // PaletteFrecencyRepository (AppShell) without a retroactive conformance.
 private struct SettingsRepoFrecencyAdapter: PaletteFrecencyRepository {
@@ -57,6 +79,8 @@ public struct PaletteCommand {
 public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     public let window: NSPanel
     private let searchField = NSTextField()
+    /// P2: footer hint shown below the list: "⌘1–⌘9 quick-run".
+    private let footerHint = NSTextField(labelWithString: "\u{2318}1\u{2013}\u{2318}9 quick-run visible rows")
     private let tableView = NSTableView()
     private let scroll = NSScrollView()
     private var all: [PaletteCommand] = []
@@ -104,7 +128,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
 
     public init(router: AppCommandRouter) {
         self.router = router
-        let panel = NSPanel(
+        let panel = PalettePanel(
             // UX-013: drop `.titled` so the HUD palette floats without a chrome
             // title bar (Spotlight/Raycast look); Esc still dismisses.
             contentRect: NSRect(x: 0, y: 0, width: 540, height: 360),
@@ -120,6 +144,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         self.window = panel
         super.init()
         panel.delegate = self
+        panel.quickRunHandler = { [weak self] digit in self?.runQuickRun(digit: digit) }
 
         // UX-012: hint that scripts/threads/workspaces are searchable too.
         searchField.placeholderString = "Search commands, scripts, threads, workspaces…"
@@ -154,6 +179,11 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
 
+        footerHint.font = .systemFont(ofSize: 10)
+        footerHint.textColor = DS.NS.textTertiary
+        footerHint.alignment = .center
+        footerHint.translatesAutoresizingMaskIntoConstraints = false
+
         let container = NSView()
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.surface.cgColor
@@ -167,6 +197,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         container.addSubview(searchField)
         container.addSubview(divider)
         container.addSubview(scroll)
+        container.addSubview(footerHint)
         NSLayoutConstraint.activate([
             searchField.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
             searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
@@ -176,9 +207,12 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             divider.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             divider.heightAnchor.constraint(equalToConstant: 1),
             scroll.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
             scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
-            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6)
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -6),
+            footerHint.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 4),
+            footerHint.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            footerHint.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            footerHint.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -4)
         ])
         panel.contentView = container
         panel.isOpaque = false
@@ -475,7 +509,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// list isn't mostly empty and a 40-result list scrolls within bounds.
     private func resizeToFit() {
         let rowH: CGFloat = 30
-        let chrome: CGFloat = 70   // search field + divider + paddings
+        let chrome: CGFloat = 90   // search field + divider + paddings + footer hint
         let rows = max(1, min(8, filtered.count))
         let target = chrome + CGFloat(rows) * rowH
         var frame = window.frame
@@ -599,6 +633,45 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         guard let idx = indices.first(where: { !nonRunnableRowIDs.contains(filtered[$0].id) }) else { return }
         tableView.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
         tableView.scrollRowToVisible(idx)
+    }
+
+    // MARK: Cmd+1..9 quick-run
+
+    /// P2: pure mapping from a 1-based digit + visible rows + non-runnable set
+    /// to the command that should run (or nil).
+    ///
+    /// - Parameters:
+    ///   - digit: 1..9 (1-based, matching the key label the user pressed)
+    ///   - visibleRows: the current `filtered` array
+    ///   - nonRunnableIDs: IDs of rows that must not be activated
+    /// - Returns: the Nth runnable row (1-indexed), or nil when out of range.
+    ///
+    /// WHY a static nonisolated helper: business logic is pure (no UI state),
+    /// so it can be tested without @MainActor and without instantiating a panel.
+    nonisolated static func commandForQuickRun(
+        digit: Int,
+        visibleRows: [PaletteCommand],
+        nonRunnableIDs: Set<String>
+    ) -> PaletteCommand? {
+        guard digit >= 1, digit <= 9 else { return nil }
+        let runnable = visibleRows.filter { !nonRunnableIDs.contains($0.id) }
+        guard digit <= runnable.count else { return nil }
+        return runnable[digit - 1]
+    }
+
+    /// Called by PalettePanel.performKeyEquivalent when Cmd+digit is pressed.
+    private func runQuickRun(digit: Int) {
+        guard let cmd = CommandPalette.commandForQuickRun(
+            digit: digit,
+            visibleRows: filtered,
+            nonRunnableIDs: nonRunnableRowIDs
+        ) else { return }
+        NSLog("CommandPalette: quick-run digit=%d id=%@", digit, cmd.id)
+        lastExecutedCommandID = cmd.id
+        recordRecent(cmd.id)
+        let action = cmd.action
+        hide()
+        action()
     }
 
     // MARK: NSTableViewDataSource
