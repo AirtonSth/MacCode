@@ -465,6 +465,13 @@ public final class SidebarViewModel: ObservableObject {
     @discardableResult
     public func createWorkspace(fromFolder url: URL) -> Bool {
         guard let router else { return false }
+        // DEDUP-P2: if a workspace with the same cwd already exists, flash
+        // to it instead of creating a duplicate (drag-drop / Open Recent /
+        // Cmd+N all call this path).
+        if let existing = Self.findExistingWorkspace(byCwd: url, in: workspaces) {
+            select(existing)
+            return true
+        }
         do {
             _ = try router.createWorkspace(fromFolder: url)
             // UX-MAC_SHELL_WINDOW-005: remember opened folders so they
@@ -475,6 +482,21 @@ public final class SidebarViewModel: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    /// Pure helper: returns the ID of the first workspace in `workspaces`
+    /// whose cwd resolves to the same standardized path as `url`, or nil if
+    /// no match exists.  Path-normalized comparison handles trailing slashes
+    /// and symlink-free canonicalization consistently with
+    /// `AppCommandRouter.createWorkspace(fromFolder:)`.
+    nonisolated public static func findExistingWorkspace(
+        byCwd url: URL,
+        in workspaces: [Workspace]
+    ) -> WorkspaceID? {
+        let normalized = url.standardizedFileURL.path
+        return workspaces.first { ws in
+            URL(fileURLWithPath: ws.cwd).standardizedFileURL.path == normalized
+        }?.id
     }
 
     @discardableResult
