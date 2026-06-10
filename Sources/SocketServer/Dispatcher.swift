@@ -1449,6 +1449,28 @@ public final class JSONRPCDispatcher {
                     surfaces = try paneIDs.flatMap { try router.paneSurfaces(pane: $0, workspace: wid) }
                 }
                 return .init(id: id, result: encode(surfaces))
+            case "mirror.snapshot":
+                // Collapses the iOS load() N per-pane pane.surfaces round-trips into ONE call.
+                // "panes" is the verbatim pane.list encoding; each "surfaces" is the verbatim
+                // pane.surfaces encoding so iOS reuses its existing decoders unchanged.
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let panes = try router.paneList(workspace: wid)
+                let paneIDs = panes.compactMap { row in
+                    row["kind"]?.stringValue == "pane"
+                        ? row["id"]?.stringValue.flatMap(UUID.init).map(PaneID.init)
+                        : nil
+                }
+                let perPane: [JSONValue] = try paneIDs.map { pid in
+                    let surfaces = try router.paneSurfaces(pane: pid, workspace: wid)
+                    return .object([
+                        "pane_id": .string(pid.value.uuidString),
+                        "surfaces": encode(surfaces)
+                    ])
+                }
+                return .init(id: id, result: .object([
+                    "panes": .array(panes.map { .object($0) }),
+                    "pane_surfaces": .array(perPane)
+                ]))
             case "pane.resize":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let split = params["split_id"]?.stringValue.flatMap(UUID.init) else { throw JSONRPCError.invalidParams }

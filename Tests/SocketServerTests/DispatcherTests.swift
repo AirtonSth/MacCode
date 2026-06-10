@@ -5,7 +5,7 @@ import Persistence
 import AgentRuntime
 
 @MainActor
-final class FakeRouter: CommandRouting, TerminalCommandRouting {
+class FakeRouter: CommandRouting, TerminalCommandRouting {
     var workspaces: [Workspace] = []
     var window = AppWindow()
 
