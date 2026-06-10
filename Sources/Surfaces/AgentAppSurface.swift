@@ -589,6 +589,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline.pendingUserInputs.filter { $0.state == .pending }
     }
 
+    /// Builds the decline payload for a supervised-mode approval decision.
+    /// A non-empty reason is included so the agent can steer future requests;
+    /// blank/nil reason produces a plain decline with no annotation.
+    nonisolated public static func declinePayload(reason: String?) -> AgentProviderRequestResponse {
+        let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .decline(trimmed.flatMap { $0.isEmpty ? nil : $0 })
+    }
+
     public func respondToPendingRequest(_ request: AssistantPendingRequest, response: AgentProviderRequestResponse) {
         guard let threadId = selectedThreadId else { return }
         let state: AssistantRequestState
@@ -1869,6 +1877,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         default: return "terminal"
         }
     }
+
 }
 
 private final class TimelineScrollScheduler {
@@ -1911,6 +1920,7 @@ public struct AgentAppView: View {
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: AssistantPendingRequest?
     @State private var expandedRequestPreviews: Set<String> = []
+    @State private var declineReasonDrafts: [String: String] = [:]
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
@@ -3095,18 +3105,46 @@ public struct AgentAppView: View {
                 // UX-MAC_AGENT-005: emphasize the safe one-time Approve;
                 // de-emphasize/warning-tint the session-wide auto-approve;
                 // separate Decline.
-                HStack(spacing: DS.Space.sm) {
-                    Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
-                        .buttonStyle(.borderedProminent)
-                    Button("Approve Session") { pendingSessionApproval = request }
-                        .buttonStyle(.bordered)
-                        .tint(DS.Palette.warning)
-                        .help("Auto-approve every request like this for the rest of this session")
-                    Spacer(minLength: DS.Space.md)
-                    Button("Decline") { vm.respondToPendingRequest(request, response: .decline(nil)) }
-                        .buttonStyle(.bordered)
+                if declineReasonDrafts[request.id] != nil {
+                    // Inline decline-with-reason form.
+                    let reasonBinding = Binding(
+                        get: { declineReasonDrafts[request.id] ?? "" },
+                        set: { declineReasonDrafts[request.id] = $0 }
+                    )
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        TextField("Reason (optional)", text: reasonBinding)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.small)
+                        HStack(spacing: DS.Space.sm) {
+                            Button("Send Decline") {
+                                let draft = declineReasonDrafts[request.id]
+                                declineReasonDrafts[request.id] = nil
+                                vm.respondToPendingRequest(
+                                    request,
+                                    response: AgentAppViewModel.declinePayload(reason: draft)
+                                )
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            Button("Cancel") { declineReasonDrafts[request.id] = nil }
+                                .buttonStyle(.plain)
+                                .controlSize(.small)
+                        }
+                    }
+                } else {
+                    HStack(spacing: DS.Space.sm) {
+                        Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
+                            .buttonStyle(.borderedProminent)
+                        Button("Approve Session") { pendingSessionApproval = request }
+                            .buttonStyle(.bordered)
+                            .tint(DS.Palette.warning)
+                            .help("Auto-approve every request like this for the rest of this session")
+                        Spacer(minLength: DS.Space.md)
+                        Button("Decline") { declineReasonDrafts[request.id] = "" }
+                            .buttonStyle(.bordered)
+                    }
+                    .controlSize(.small)
                 }
-                .controlSize(.small)
             }
         }
         .padding(DS.Space.md)
