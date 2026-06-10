@@ -257,6 +257,7 @@ final class FileTreeStore<Item: FileTreeItem> {
 }
 
 extension FileEntry: FileTreeItem {}
+extension FileEntry: FileNameFilterable {}
 
 // MARK: - Pure path helpers (no AppKit, no MainActor; tested in FilesNewFolderMoveTests)
 
@@ -292,6 +293,78 @@ func validateMove(src: String, dstDir: String, workspaceRoot: String) -> Bool {
     // dstDir must not be a descendant of src.
     guard !dstN.hasPrefix(srcN) else { return false }
     return true
+}
+
+// MARK: - Pure name-filter helper (no AppKit, no MainActor; tested in FilesNameFilterTests)
+
+/// Minimal protocol surface that `filterFileEntries` requires, so the helper can be tested
+/// with a lightweight stub without constructing a real `FileEntry`.
+protocol FileNameFilterable {
+    var name: String { get }
+}
+
+/// A lightweight stub used by `FilesNameFilterTests`; production code uses `FileEntry` directly.
+struct FilterableFileEntry: FileNameFilterable {
+    let name: String
+    let isDirectory: Bool
+}
+
+/// Filter `entries` to those whose `name` contains `query` as a case-insensitive substring or
+/// subsequence. Returns the original array unchanged when `query` is empty/whitespace.
+/// Preserves the original order of matching entries.
+func filterFileEntries<T: FileNameFilterable>(_ entries: [T], query: String) -> [T] {
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return entries }
+    let lower = trimmed.lowercased()
+    return entries.filter { entry in
+        let name = entry.name.lowercased()
+        if name.contains(lower) { return true }
+        return CommandPaletteFilter.isSubsequence(lower, of: name)
+    }
+}
+
+// MARK: - Editor color palette (no AppKit environment needed; tested in EditorColorPaletteTests)
+
+/// Color set for the code editor and its line-number gutter. Chosen per appearance so the editor
+/// doesn't show a near-black background inside a light-mode macOS window.
+///
+/// Equality is defined by the `isDark` flag because all colors are fully determined by it;
+/// this avoids conforming NSColor to Equatable (it doesn't conform natively).
+struct EditorColorPalette: Equatable {
+    let isDark: Bool
+    let background: NSColor
+    let text: NSColor
+    let insertionPoint: NSColor
+    let lineNumberBackground: NSColor
+    let lineNumberText: NSColor
+
+    static func == (lhs: EditorColorPalette, rhs: EditorColorPalette) -> Bool {
+        lhs.isDark == rhs.isDark
+    }
+
+    /// Choose the palette for the current system appearance. `isDark` is passed as a plain `Bool`
+    /// so the helper stays pure (no AppKit environment) and testable without a running NSApp.
+    nonisolated static func resolve(isDark: Bool) -> EditorColorPalette {
+        if isDark {
+            return EditorColorPalette(
+                isDark:              true,
+                background:          NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1),
+                text:                NSColor(red: 0.83, green: 0.83, blue: 0.83, alpha: 1),
+                insertionPoint:      .white,
+                lineNumberBackground: NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1),
+                lineNumberText:      NSColor(red: 0.45, green: 0.47, blue: 0.50, alpha: 1)
+            )
+        } else {
+            return EditorColorPalette(
+                isDark:              false,
+                background:          NSColor(red: 0.97, green: 0.97, blue: 0.97, alpha: 1),
+                text:                NSColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 1),
+                insertionPoint:      .black,
+                lineNumberBackground: NSColor(red: 0.91, green: 0.91, blue: 0.91, alpha: 1),
+                lineNumberText:      NSColor(red: 0.42, green: 0.44, blue: 0.47, alpha: 1)
+            )
+        }
+    }
 }
 
 private struct FileTabDragModifier: ViewModifier {
@@ -944,6 +1017,7 @@ private struct FilesSurfaceRoot: View {
     @State private var pathInvalid = false
     @State private var dropTargeted = false
     @FocusState private var newFileFieldFocused: Bool
+    @State private var nameFilter = ""
 
     var body: some View {
         GeometryReader { proxy in
@@ -1074,6 +1148,16 @@ private struct FilesSurfaceRoot: View {
                     .accessibilityIdentifier("files.path.field")
                 breadcrumb
             }
+            TextField("Filter files\u{2026}", text: $nameFilter)
+                .textFieldStyle(.plain)
+                .font(DS.Font.bodyDense)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(DS.Palette.surfaceOverlay, in: RoundedRectangle(cornerRadius: DS.Radius.control))
+                .foregroundStyle(DS.Palette.text)
+                .accessibilityLabel("Filter files by name")
+                .accessibilityIdentifier("files.nameFilter.field")
+                .onChange(of: model.currentDirectory) { _ in nameFilter = "" }
             List(selection: $selectedFileIDs) {
                 if !model.currentDirectory.isEmpty {
                     Button {
@@ -1110,8 +1194,10 @@ private struct FilesSurfaceRoot: View {
     }
 
     // Dotfiles are hidden unless the user opts in via the sidebar toggle (IMP-MAC_FILES-014).
+    // Name filter further narrows the visible set when the user types in the filter field.
     private var visibleEntries: [FileEntry] {
-        showHidden ? model.entries : model.entries.filter { !$0.isHidden }
+        let base = showHidden ? model.entries : model.entries.filter { !$0.isHidden }
+        return filterFileEntries(base, query: nameFilter)
     }
 
     private func visibleChildren(of directory: FileEntry) -> [FileEntry] {
@@ -1990,9 +2076,11 @@ private struct CodeTextEditor: NSViewRepresentable {
         textView.isIncrementalSearchingEnabled = true
         textView.delegate = context.coordinator
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1)
-        textView.textColor = NSColor(red: 0.83, green: 0.83, blue: 0.83, alpha: 1)
-        textView.insertionPointColor = .white
+        let palette = EditorColorPalette.resolve(isDark: NSApp.effectiveAppearance.isDark)
+        textView.backgroundColor = palette.background
+        textView.textColor = palette.text
+        textView.insertionPointColor = palette.insertionPoint
+        context.coordinator.currentPalette = palette
         textView.textContainerInset = NSSize(width: 12, height: 12)
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -2015,6 +2103,19 @@ private struct CodeTextEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let textView = context.coordinator.textView ?? scroll.documentView as? NSTextView else { return }
+        // Re-apply palette when the system appearance changes (e.g. user switches light/dark mode
+        // while the editor is open). The check avoids redundant attribute churn on every unrelated
+        // @Published change.
+        let newPalette = EditorColorPalette.resolve(isDark: NSApp.effectiveAppearance.isDark)
+        if newPalette != context.coordinator.currentPalette {
+            context.coordinator.currentPalette = newPalette
+            textView.backgroundColor = newPalette.background
+            textView.textColor = newPalette.text
+            textView.insertionPointColor = newPalette.insertionPoint
+            context.coordinator.lineNumberRuler?.currentPalette = newPalette
+            context.coordinator.applyHighlight(to: textView)
+            return
+        }
         if textView.string != text {
             let selectedRanges = textView.selectedRanges
             textView.string = text
@@ -2035,6 +2136,8 @@ private struct CodeTextEditor: NSViewRepresentable {
         weak var textView: NSTextView?
         weak var lineNumberRuler: CodeLineNumberRulerView?
         private var applyingHighlight = false
+        /// Last applied palette; compared in `updateNSView` to skip redundant attribute churn.
+        var currentPalette: EditorColorPalette = EditorColorPalette.resolve(isDark: true)
 
         init(onChange: @escaping (String) -> Void) {
             self.onChange = onChange
@@ -2064,8 +2167,9 @@ private struct CodeTextEditor: NSViewRepresentable {
             let safeEdited = NSRange(location: clampedLocation,
                                      length: min(edited.length, nsText.length - clampedLocation))
             let paragraphRange = nsText.paragraphRange(for: safeEdited)
+            let baseAttrs = codeBaseAttributes(for: currentPalette)
             storage.beginEditing()
-            storage.setAttributes(codeBaseAttributes, range: paragraphRange)
+            storage.setAttributes(baseAttrs, range: paragraphRange)
             nsText.enumerateSubstrings(in: paragraphRange, options: [.byLines, .substringNotRequired]) { _, range, _, _ in
                 let lineText = nsText.substring(with: range)
                 applyHighlightSpans(highlightCodeLine(lineText), lineRange: range, to: storage)
@@ -2079,7 +2183,7 @@ private struct CodeTextEditor: NSViewRepresentable {
             let selectedRanges = textView.selectedRanges
             let scrollOrigin = textView.enclosingScrollView?.contentView.bounds.origin
             let text = textView.string
-            let attributed = NSMutableAttributedString(string: text, attributes: codeBaseAttributes)
+            let attributed = NSMutableAttributedString(string: text, attributes: codeBaseAttributes(for: currentPalette))
             highlightCode(text, in: attributed)
             textView.textStorage?.setAttributedString(attributed)
             textView.selectedRanges = selectedRanges
@@ -2096,10 +2200,14 @@ private struct CodeTextEditor: NSViewRepresentable {
 private final class CodeLineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
     private var lastVisibleGlyphRange = NSRange(location: NSNotFound, length: 0)
-    private let attributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-        .foregroundColor: NSColor(red: 0.45, green: 0.47, blue: 0.50, alpha: 1)
-    ]
+    /// Mutable so `updateNSView` can push a new palette when appearance changes.
+    var currentPalette: EditorColorPalette = EditorColorPalette.resolve(isDark: true) {
+        didSet { needsDisplay = true }
+    }
+    private var lineNumberAttributes: [NSAttributedString.Key: Any] {
+        [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+         .foregroundColor: currentPalette.lineNumberText]
+    }
 
     init(textView: NSTextView) {
         self.textView = textView
@@ -2139,9 +2247,10 @@ private final class CodeLineNumberRulerView: NSRulerView {
               let layoutManager = textView.layoutManager,
               let textContainer = textView.textContainer,
               let clipView = textView.enclosingScrollView?.contentView else { return }
-        NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1).setFill()
+        currentPalette.lineNumberBackground.setFill()
         bounds.fill()
 
+        let attrs = lineNumberAttributes
         let visibleRect = clipView.bounds
         let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
         guard glyphRange.location < layoutManager.numberOfGlyphs else { return }
@@ -2155,8 +2264,8 @@ private final class CodeLineNumberRulerView: NSRulerView {
             let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &lineRange, withoutAdditionalLayout: true)
             let y = lineRect.minY + textView.textContainerOrigin.y - visibleRect.minY
             let value = "\(lineNumber)" as NSString
-            let size = value.size(withAttributes: attributes)
-            value.draw(at: NSPoint(x: ruleThickness - size.width - 8, y: y + 1), withAttributes: attributes)
+            let size = value.size(withAttributes: attrs)
+            value.draw(at: NSPoint(x: ruleThickness - size.width - 8, y: y + 1), withAttributes: attrs)
             glyphIndex = NSMaxRange(lineRange)
             lineNumber += 1
         }
@@ -2186,11 +2295,13 @@ private func highlightedHTML(text: String, language: String?) -> String {
     return "<!doctype html><html><head><meta charset=\"utf-8\"><style>\(css)</style></head><body><pre data-language=\"\(language ?? "text")\">\(html)</pre></body></html>"
 }
 
-private let codeBaseAttributes: [NSAttributedString.Key: Any] = [
-    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-    .foregroundColor: NSColor(red: 0.83, green: 0.83, blue: 0.83, alpha: 1),
-    .backgroundColor: NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1)
-]
+/// Build NSAttributedString base attributes from a resolved palette so the editor and gutter
+/// use consistent colors when the appearance changes (P2).
+private func codeBaseAttributes(for palette: EditorColorPalette) -> [NSAttributedString.Key: Any] {
+    [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+     .foregroundColor: palette.text,
+     .backgroundColor: palette.background]
+}
 
 private func highlightCode(_ text: String, in attributed: NSMutableAttributedString) {
     let nsText = text as NSString
@@ -2457,5 +2568,12 @@ private extension JSONValue {
     var doubleValue: Double? {
         if case .number(let value) = self { return value }
         return nil
+    }
+}
+
+private extension NSAppearance {
+    /// Returns `true` when the effective appearance is a dark-aqua variant.
+    var isDark: Bool {
+        bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 }
