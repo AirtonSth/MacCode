@@ -31,6 +31,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private var dragStartSidebarWidth: CGFloat?
     private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface?
+    private var sessionAliveTimer: DispatchSourceTimer?
     private var activeTransferCount = 0
     // Path-pairs the user cancelled while in flight. The router runs scp
     // opaquely, so cancel is cooperative: the surface honors the request when the
@@ -143,6 +144,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         viewModel.onConnect = { [weak self] host in self?.connect(host) }
         viewModel.onOpenNewConnection = { [weak self] host in self?.openNewConnection(host) }
         viewModel.onDelete = { [weak self] host in self?.delete(host) }
+        viewModel.onImportFromConfig = { [weak self] in self?.importFromConfig() }
+        viewModel.onDisconnect = { [weak self] in self?.disconnect() }
         viewModel.onSidebarCollapsedChange = { [weak self] collapsed in
             self?.setSidebarCollapsed(collapsed)
         }
@@ -308,11 +311,13 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         do {
             try router?.sshHostDelete(host.id, workspace: workspaceID)
             if viewModel.selectedHost?.id == host.id {
+                stopSessionAliveTimer()
                 terminal?.close()
                 terminal = nil
                 descriptor.metadata["ssh_status"] = "disconnected"
                 viewModel.selectedHost = nil
                 viewModel.status = "Disconnected"
+                viewModel.sessionDead = false
                 viewModel.transferSidebarVisible = false
                 showPlaceholder()
                 syncTransferSidebarWidth(animated: true)
@@ -336,7 +341,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         sshLog.info("ssh connect start: \(host.destination, privacy: .private)")
         do {
             let saved = try router?.sshHostForConnection(host, workspace: workspaceID) ?? host
+            stopSessionAliveTimer()
             terminal?.close()
+            viewModel.sessionDead = false
             let next = try TerminalSurface(workspaceID: workspaceID, title: saved.label, launch: .ssh(profile: saved, cwd: cwd))
             terminal = next
             descriptor.metadata = next.descriptor.metadata
@@ -351,6 +358,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             syncTransferSidebarWidth(animated: true)
             refreshLocalFiles()
             refreshRemoteFiles()
+            startSessionAliveTimer()
             next.focus()
             EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
                 "surface_id": .string(descriptor.id.value.uuidString),
@@ -365,6 +373,100 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             viewModel.error = error.localizedDescription
             sshLog.error("ssh connect failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    // Explicit user-initiated disconnect: close the terminal, reset status/UI.
+    private func disconnect() {
+        stopSessionAliveTimer()
+        terminal?.close()
+        terminal = nil
+        descriptor.metadata["ssh_status"] = "disconnected"
+        viewModel.selectedHost = nil
+        viewModel.status = "Disconnected"
+        viewModel.sessionDead = false
+        viewModel.transferSidebarVisible = false
+        showPlaceholder()
+        syncTransferSidebarWidth(animated: true)
+        sshLog.info("ssh disconnect: user requested")
+    }
+
+    // Import hosts from ~/.ssh/config. Each non-wildcard Host block whose
+    // HostName resolves becomes a saved SSHHostProfile. Duplicate destinations
+    // (same destination+port) are not deduplicated here; the router upsert is
+    // by ID so each import always creates a fresh profile.
+    private func importFromConfig() {
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".ssh/config")
+        let profiles = SSHConfigParser.parse(fileURL: url)
+        guard !profiles.isEmpty else {
+            viewModel.error = "No importable hosts found in ~/.ssh/config."
+            return
+        }
+        var importedCount = 0
+        for profile in profiles {
+            do {
+                try router?.sshHostUpsert(profile, workspace: workspaceID)
+                importedCount += 1
+            } catch {
+                sshLog.error("ssh config import upsert failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        reloadHosts()
+        viewModel.error = importedCount == 0 ? "Import failed - could not save any hosts." : nil
+        sshLog.info("ssh config import: imported \(importedCount, privacy: .public) hosts")
+    }
+
+    // Starts a repeating timer that checks whether the SSH child process is
+    // still alive. Flips viewModel.status to "Disconnected" when the child
+    // exits without an explicit user-disconnect. The timer fires off the main
+    // queue and dispatches UI updates back to main.
+    private func startSessionAliveTimer() {
+        stopSessionAliveTimer()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.descriptor.metadata["ssh_status"] == "connected" else { return }
+                let alive = self.terminal?.runtimeHealth().processAlive ?? false
+                if !alive {
+                    self.stopSessionAliveTimer()
+                    self.terminal = nil
+                    self.descriptor.metadata["ssh_status"] = "disconnected"
+                    self.viewModel.status = "Disconnected"
+                    self.viewModel.sessionDead = true
+                    sshLog.info("ssh session: child exited, status flipped to Disconnected")
+                }
+            }
+        }
+        timer.resume()
+        sessionAliveTimer = timer
+    }
+
+    private func stopSessionAliveTimer() {
+        sessionAliveTimer?.cancel()
+        sessionAliveTimer = nil
+    }
+
+    // Testing accessor so tests can trigger the disconnect path without a timer.
+    func disconnectForTesting() {
+        disconnect()
+    }
+
+    // Testing accessor for import - allows injecting a custom file URL.
+    func importFromConfigURLForTesting(_ url: URL) {
+        let profiles = SSHConfigParser.parse(fileURL: url)
+        guard !profiles.isEmpty else {
+            viewModel.error = "No importable hosts found."
+            return
+        }
+        var importedCount = 0
+        for profile in profiles {
+            do {
+                try router?.sshHostUpsert(profile, workspace: workspaceID)
+                importedCount += 1
+            } catch {}
+        }
+        reloadHosts()
+        viewModel.error = importedCount == 0 ? "Import failed." : nil
     }
 
     private func runTransfer(upload: Bool, localPath: String, remotePath: String) {
@@ -553,6 +655,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     func close() {
+        stopSessionAliveTimer()
         terminal?.close()
     }
 
@@ -742,6 +845,111 @@ enum SSHLargeTreeConfirm {
     }
 }
 
+// Pure parser for ~/.ssh/config files. Reads Host blocks and extracts
+// HostName (destination), User, Port, and IdentityFile per stanza.
+// Wildcard patterns ("*", "?", "!") and pattern-only hosts are skipped
+// because they cannot map to a single connectable address.
+// Comments (#) and blank lines are ignored. Non-MainActor + pure for testing.
+enum SSHConfigParser {
+    // Parsed representation of a single Host block.
+    struct HostEntry: Equatable {
+        let hostAlias: String   // The literal token after "Host"
+        let hostName: String    // HostName value (falls back to hostAlias)
+        let user: String?
+        let port: Int?
+        let identityFile: String?
+    }
+
+    // Parse the text content of an ssh_config file into host entries,
+    // skipping wildcard-only aliases. Returns entries in declaration order.
+    static func parseText(_ text: String) -> [HostEntry] {
+        var results: [HostEntry] = []
+        var currentAlias: String?
+        var currentHostName: String?
+        var currentUser: String?
+        var currentPort: Int?
+        var currentIdentityFile: String?
+
+        func flush() {
+            guard let alias = currentAlias, !Self.isWildcard(alias) else { return }
+            let destination: String
+            if let u = currentUser, !u.isEmpty {
+                destination = "\(u)@\(currentHostName ?? alias)"
+            } else {
+                destination = currentHostName ?? alias
+            }
+            results.append(HostEntry(
+                hostAlias: alias,
+                hostName: destination,
+                user: currentUser,
+                port: currentPort,
+                identityFile: currentIdentityFile
+            ))
+        }
+
+        for rawLine in text.components(separatedBy: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            let parts = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+            guard parts.count >= 2 else { continue }
+            let keyword = parts[0].lowercased()
+            let value = parts[1...].joined(separator: " ")
+            switch keyword {
+            case "host":
+                flush()
+                currentAlias = value
+                currentHostName = nil
+                currentUser = nil
+                currentPort = nil
+                currentIdentityFile = nil
+            case "hostname":
+                currentHostName = value
+            case "user":
+                currentUser = value
+            case "port":
+                currentPort = Int(value)
+            case "identityfile":
+                currentIdentityFile = Self.expandTilde(value)
+            default:
+                break
+            }
+        }
+        flush()
+        return results
+    }
+
+    // Convert entries to SSHHostProfile values ready for upsert.
+    // The profile label is the hostAlias; destination is user@hostname or hostname.
+    static func parse(text: String) -> [SSHHostProfile] {
+        parseText(text).map { entry in
+            SSHHostProfile(
+                label: entry.hostAlias,
+                destination: entry.hostName,
+                port: entry.port,
+                identityFile: entry.identityFile
+            )
+        }
+    }
+
+    // Read and parse the file at the given URL. Returns [] when the file is
+    // unreadable (missing, permission denied).
+    static func parse(fileURL: URL) -> [SSHHostProfile] {
+        guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
+        return parse(text: text)
+    }
+
+    // Returns true when the host pattern is a glob/wildcard that cannot map to
+    // a single connectable address (*, ?, ! prefix, or multi-token patterns).
+    static func isWildcard(_ token: String) -> Bool {
+        token.contains("*") || token.contains("?") || token.hasPrefix("!")
+    }
+
+    private static func expandTilde(_ path: String) -> String {
+        guard path.hasPrefix("~") else { return path }
+        return NSHomeDirectory() + path.dropFirst()
+    }
+}
+
 private struct SSHPaneDerived {
     var directories: [SSHFileEntry] = []
     var fileCount = 0
@@ -838,11 +1046,17 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     @Published var queueItems: [SSHTransferQueueItem] = []
     @Published var selectedQueueState: SSHTransferState = .queued
 
+    // True while the SSH child process is known to have exited without an explicit
+    // user disconnect - drives the "Disconnected" pill in SSHHostRow.
+    @Published var sessionDead = false
+
     var onRefresh: (() -> Void)?
     var onSave: ((SSHHostDraft) -> Void)?
     var onConnect: ((SSHHostProfile) -> Void)?
     var onOpenNewConnection: ((SSHHostProfile) -> Void)?
     var onDelete: ((SSHHostProfile) -> Void)?
+    var onImportFromConfig: (() -> Void)?
+    var onDisconnect: (() -> Void)?
     var onSidebarCollapsedChange: ((Bool) -> Void)?
     var onTransferSidebarCollapsedChange: ((Bool) -> Void)?
     var onTransfer: ((Bool, String, String) -> Void)?
@@ -1274,6 +1488,10 @@ private struct SSHSidebarView: View {
                                 vm.sidebarCollapsed = true
                             }
                             .accessibilityIdentifier("ssh.sidebar.host.toggle")
+                            DSIconButton("square.and.arrow.down", help: "Import hosts from ~/.ssh/config") {
+                                vm.onImportFromConfig?()
+                            }
+                            .accessibilityIdentifier("ssh.host.import")
                             DSIconButton("plus", help: "Add SSH host") {
                                 vm.resetDraft()
                             }
@@ -1383,11 +1601,13 @@ private struct SSHSidebarView: View {
                         SSHHostRow(
                             host: host,
                             connected: vm.selectedHost?.id == host.id && vm.status == "Connected",
+                            sessionDead: vm.selectedHost?.id == host.id && vm.sessionDead,
                             onConnect: { vm.onConnect?(host) },
                             onOpenNewConnection: { vm.onOpenNewConnection?(host) },
                             onEdit: { vm.edit(host) },
                             onDuplicate: { vm.duplicate(host) },
-                            onDelete: { vm.onDelete?(host) }
+                            onDelete: { vm.onDelete?(host) },
+                            onDisconnect: { vm.onDisconnect?() }
                         )
                     }
                 }
@@ -2122,11 +2342,15 @@ private struct SSHHostFormSheet: View {
 private struct SSHHostRow: View {
     let host: SSHHostProfile
     let connected: Bool
+    // True when the SSH child exited without an explicit user disconnect;
+    // shown as an orange "Disconnected" pill so the user knows to reconnect.
+    let sessionDead: Bool
     let onConnect: () -> Void
     let onOpenNewConnection: () -> Void
     let onEdit: () -> Void
     let onDuplicate: () -> Void
     let onDelete: () -> Void
+    let onDisconnect: () -> Void
     @State private var confirmingDelete = false
 
     var body: some View {
@@ -2165,6 +2389,35 @@ private struct SSHHostRow: View {
                     )
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Connected")
+                    // Disconnect button: visible only while connected so the
+                    // user can end the session without deleting the host.
+                    Button(action: onDisconnect) {
+                        Image(systemName: "xmark.circle")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .help("Disconnect")
+                    .accessibilityLabel("Disconnect")
+                    .accessibilityIdentifier("ssh.host.disconnect.\(host.id.value.uuidString)")
+                } else if sessionDead {
+                    // Child exited without user disconnect: show an orange
+                    // "Disconnected" pill so the dead-session state is visible.
+                    HStack(spacing: 3) {
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("Disconnected")
+                            .font(DS.Font.caption2.weight(.semibold))
+                    }
+                    .foregroundColor(DS.Palette.warning)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(
+                        Capsule().fill(DS.Palette.warning.opacity(0.14))
+                    )
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Disconnected")
+                    .accessibilityIdentifier("ssh.host.pill.disconnected")
                 }
                 Button { confirmingDelete = true } label: {
                     Image(systemName: "trash")
@@ -2189,6 +2442,10 @@ private struct SSHHostRow: View {
         .buttonStyle(.plain)
         .accessibilityIdentifier("ssh.host.connect.\(host.id.value.uuidString)")
         .contextMenu {
+            if connected {
+                Button("Disconnect", action: onDisconnect)
+                    .accessibilityIdentifier("ssh.host.contextmenu.disconnect")
+            }
             Button("Open New Connection", action: onOpenNewConnection)
             Button("Edit Host", action: onEdit)
             Button("Duplicate Host", action: onDuplicate)
