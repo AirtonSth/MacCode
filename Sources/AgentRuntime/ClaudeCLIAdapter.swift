@@ -8,12 +8,18 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
     private var handles: [AgentThreadID: AgentRunHandle] = [:]
     private var events: [AgentThreadID: [AssistantEvent]] = [:]
     private let maxReadableEvents: Int
+    private let maxSessions: Int
+    /// Insertion-ordered list of finished threads eligible for cap-based eviction.
+    private var finishedOrder: [AgentThreadID] = []
+    /// Threads that have had rollbackThread called; exempt from cap eviction.
+    private var rolledBackThreadIds: Set<AgentThreadID> = []
 
     public var provider: AgentProvider { .claude }
 
-    public init(runner: AgentProviderRunner, maxReadableEvents: Int = 5_000) {
+    public init(runner: AgentProviderRunner, maxReadableEvents: Int = 5_000, maxSessions: Int = 200) {
         self.runner = runner
         self.maxReadableEvents = max(1, maxReadableEvents)
+        self.maxSessions = max(1, maxSessions)
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -60,6 +66,8 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         lock.lock()
         sessions.removeValue(forKey: threadId)
         handles.removeValue(forKey: threadId)
+        finishedOrder.removeAll { $0 == threadId }
+        rolledBackThreadIds.remove(threadId)
         lock.unlock()
     }
 
@@ -95,6 +103,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         }
         stream = Array(stream.prefix(through: index))
         events[threadId] = stream
+        rolledBackThreadIds.insert(threadId)
     }
 
     public func stopAll() {
@@ -102,6 +111,8 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         let activeHandles = Array(handles.values)
         sessions.removeAll()
         handles.removeAll()
+        finishedOrder.removeAll()
+        rolledBackThreadIds.removeAll()
         lock.unlock()
         activeHandles.forEach { $0.cancel() }
     }
@@ -127,6 +138,10 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
             let current = sessions[threadId]
             sessions[threadId] = AgentProviderSessionSummary(threadId: threadId, provider: .claude, status: status, providerThreadId: providerThreadId ?? current?.providerThreadId)
             handles.removeValue(forKey: threadId)
+            if !finishedOrder.contains(threadId) {
+                finishedOrder.append(threadId)
+            }
+            pruneSessionsIfNeeded()
         default:
             break
         }
@@ -141,6 +156,33 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
     private func pruneReadableEvents(threadId: AgentThreadID) {
         guard let stream = events[threadId], stream.count > maxReadableEvents else { return }
         events[threadId] = Array(stream.suffix(maxReadableEvents))
+    }
+
+    /// Called under lock after a thread finishes. Evicts oldest eligible threads when over cap.
+    private func pruneSessionsIfNeeded() {
+        let toEvict = ClaudeCLIAdapter.pruneEligible(
+            finishedOrder: finishedOrder,
+            rolledBackThreadIds: rolledBackThreadIds,
+            cap: maxSessions
+        )
+        for threadId in toEvict {
+            sessions.removeValue(forKey: threadId)
+            events.removeValue(forKey: threadId)
+            finishedOrder.removeAll { $0 == threadId }
+        }
+    }
+
+    /// Pure helper: returns finished thread IDs to evict, oldest first, skipping rollback-reachable threads.
+    /// Called under lock; extracted as static so it can be unit-tested without adapter state.
+    nonisolated static func pruneEligible(
+        finishedOrder: [AgentThreadID],
+        rolledBackThreadIds: Set<AgentThreadID>,
+        cap: Int
+    ) -> [AgentThreadID] {
+        let eligible = finishedOrder.filter { !rolledBackThreadIds.contains($0) }
+        let excess = eligible.count - cap
+        guard excess > 0 else { return [] }
+        return Array(eligible.prefix(excess))
     }
 }
 
