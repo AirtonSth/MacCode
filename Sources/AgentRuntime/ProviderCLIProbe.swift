@@ -1,6 +1,20 @@
 import Foundation
 import CoreModel
 
+/// Accumulates pipe chunks drained concurrently and decodes to a UTF-8 String.
+/// Pure value helper — no actor state, safe to use on any thread.
+struct PipeAccumulator: Sendable {
+    private(set) var data: Data = Data()
+
+    mutating func append(_ chunk: Data) {
+        data.append(chunk)
+    }
+
+    var string: String {
+        String(decoding: data, as: UTF8.self)
+    }
+}
+
 public enum ProviderCLIProbe {
     public struct AuthStatus: Equatable, Sendable {
         public let authenticated: Bool?
@@ -134,6 +148,37 @@ public enum ProviderCLIProbe {
         proc.standardOutput = out
         proc.standardError = err
 
+        // Drain both pipes on background threads concurrently with process
+        // execution. Reading must start BEFORE proc.run() returns so that a
+        // child emitting >64 KB does not fill the OS pipe buffer (~64 KB on
+        // macOS), stall, and prevent the process from exiting — which would
+        // burn the full timeout before SIGTERM.
+        //
+        // Each background thread calls readDataToEndOfFile() which blocks
+        // inside the kernel until EOF (pipe closed by child exit). The
+        // terminationHandler semaphore is signalled only after the child has
+        // exited, at which point the pipe write-ends are closed and the reads
+        // unblock. drainDone.wait() then collects the results safely because
+        // no concurrent mutation occurs after that point.
+        let drainDone = DispatchGroup()
+        let resultLock = NSLock()
+        var stdoutData = Data()
+        var stderrData = Data()
+
+        drainDone.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            resultLock.lock(); stdoutData = data; resultLock.unlock()
+            drainDone.leave()
+        }
+
+        drainDone.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let data = err.fileHandleForReading.readDataToEndOfFile()
+            resultLock.lock(); stderrData = data; resultLock.unlock()
+            drainDone.leave()
+        }
+
         let finished = DispatchSemaphore(value: 0)
         proc.terminationHandler = { _ in finished.signal() }
 
@@ -149,8 +194,12 @@ public enum ProviderCLIProbe {
             return nil
         }
 
-        let stdout = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let stderr = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        // Child has exited; pipe write-ends are now closed; drain tasks will
+        // return readDataToEndOfFile imminently. Wait for them before reading.
+        drainDone.wait()
+
+        let stdout = String(decoding: stdoutData, as: UTF8.self)
+        let stderr = String(decoding: stderrData, as: UTF8.self)
         return CommandResult(status: proc.terminationStatus, stdout: stdout, stderr: stderr)
     }
 
