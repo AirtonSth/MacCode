@@ -32,6 +32,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface?
     private var activeTransferCount = 0
+    // Path-pairs the user cancelled while in flight. The router runs scp
+    // opaquely, so cancel is cooperative: the surface honors the request when the
+    // async transfer resumes and records the row as .cancelled (P1).
+    private var cancelledTransferKeys: Set<String> = []
     // Injectable file pickers so tests can supply a path without a blocking
     // NSOpenPanel modal (QA-MAC_SSH-003). Default nil → real panel.
     var localPathPickerForTesting: (() -> (path: String, isDirectory: Bool)?)?
@@ -148,6 +152,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         }
         viewModel.onTransfer = { [weak self] upload, localPath, remotePath in
             self?.runTransfer(upload: upload, localPath: localPath, remotePath: remotePath)
+        }
+        viewModel.onCancelTransfer = { [weak self] localPath, remotePath in
+            self?.requestCancel(localPath: localPath, remotePath: remotePath)
         }
         viewModel.onRefreshLocalFiles = { [weak self] in self?.refreshLocalFiles() }
         viewModel.onRefreshRemoteFiles = { [weak self] in self?.refreshRemoteFiles() }
@@ -377,13 +384,25 @@ final class SSHSurface: NSObject, SSHTransferSurface {
                     ? try await self.router?.sshTransferUploadAsync(surface: self.descriptor.id, localPath: localPath, remotePath: remotePath)
                     : try await self.router?.sshTransferDownloadAsync(surface: self.descriptor.id, remotePath: remotePath, localPath: localPath)
                 ok = result?.objectValue?["ok"]?.boolValue == true
-                self.viewModel.transferStatus = ok ? "\(kind) completed" : "\(kind) failed"
-                self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: ok ? .successful : .failed)
+                // Honor a cancel requested while the opaque scp was running:
+                // record .cancelled instead of success/failure (P1).
+                if self.consumeCancel(localPath: localPath, remotePath: remotePath) {
+                    self.viewModel.transferStatus = "\(kind) cancelled"
+                    self.viewModel.markCancelled(localPath: localPath, remotePath: remotePath)
+                } else {
+                    self.viewModel.transferStatus = ok ? "\(kind) completed" : "\(kind) failed"
+                    self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: ok ? .successful : .failed)
+                }
                 sshLog.info("ssh transfer end: \(kind, privacy: .public) ok=\(ok, privacy: .public)")
             } catch {
-                self.viewModel.transferStatus = "\(kind) failed"
-                self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: .failed)
-                self.viewModel.error = error.localizedDescription
+                if self.consumeCancel(localPath: localPath, remotePath: remotePath) {
+                    self.viewModel.transferStatus = "\(kind) cancelled"
+                    self.viewModel.markCancelled(localPath: localPath, remotePath: remotePath)
+                } else {
+                    self.viewModel.transferStatus = "\(kind) failed"
+                    self.viewModel.recordTransfer(direction: direction, localPath: localPath, remotePath: remotePath, status: .failed)
+                    self.viewModel.error = error.localizedDescription
+                }
                 sshLog.error("ssh transfer error: \(kind, privacy: .public) \(error.localizedDescription, privacy: .public)")
             }
             self.activeTransferCount -= 1
@@ -394,6 +413,27 @@ final class SSHSurface: NSObject, SSHTransferSurface {
                 await self.refreshRemoteFilesAsync()
             }
         }
+    }
+
+    private static func cancelKey(localPath: String, remotePath: String) -> String {
+        "\(localPath)\u{1F}\(remotePath)"
+    }
+
+    // Records a cancel request for an in-flight transfer and marks the row
+    // immediately so the UI reflects intent even before the opaque scp returns.
+    private func requestCancel(localPath: String, remotePath: String) {
+        cancelledTransferKeys.insert(Self.cancelKey(localPath: localPath, remotePath: remotePath))
+        viewModel.markCancelled(localPath: localPath, remotePath: remotePath)
+    }
+
+    // Returns (and clears) whether this transfer was cancelled, so the async
+    // completion path records the row correctly exactly once.
+    private func consumeCancel(localPath: String, remotePath: String) -> Bool {
+        cancelledTransferKeys.remove(Self.cancelKey(localPath: localPath, remotePath: remotePath)) != nil
+    }
+
+    func requestCancelForTesting(localPath: String, remotePath: String) {
+        requestCancel(localPath: localPath, remotePath: remotePath)
     }
 
     private func refreshLocalFiles() {
@@ -554,6 +594,29 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     var selectedLocalCountForTesting: Int { viewModel.selectedLocalIDs.count }
     var selectedRemoteCountForTesting: Int { viewModel.selectedRemoteIDs.count }
     var transferLogForTesting: [String] { viewModel.transferLogs }
+    var cancelledCountForTesting: Int { viewModel.queueItems.filter { $0.status == .cancelled }.count }
+    var transferringCountForTesting: Int { viewModel.queueItems.filter { $0.status == .transferring }.count }
+    func queueProgressForTesting(localPath: String, remotePath: String) -> Int? {
+        viewModel.queueItems.first { $0.localPath == localPath && $0.remotePath == remotePath }?.progress
+    }
+
+    /// Seed a queued row so cancel/progress logic can be exercised without a
+    /// router round-trip.
+    func enqueueForTesting(upload: Bool, localPath: String, remotePath: String) {
+        viewModel.recordTransfer(direction: upload ? .upload : .download, localPath: localPath, remotePath: remotePath, status: .queued)
+    }
+
+    /// Marks the active row for this path-pair cancelled, mirroring the UI cancel
+    /// control + the surface's cooperative cancel registration.
+    @discardableResult
+    func markCancelledForTesting(localPath: String, remotePath: String) -> Bool {
+        requestCancel(localPath: localPath, remotePath: remotePath)
+        return viewModel.queueItems.contains { $0.localPath == localPath && $0.remotePath == remotePath && $0.status == .cancelled }
+    }
+
+    func updateProgressForTesting(localPath: String, remotePath: String, percent: Int) {
+        viewModel.updateProgress(localPath: localPath, remotePath: remotePath, percent: percent)
+    }
 
     /// Drives a single transfer end-to-end through the same path the UI uses so
     /// tests can exercise queue/status updates with a fake router.
@@ -579,6 +642,106 @@ private enum SSHTransferDirection: String {
     case download = "Download"
 }
 
+// Pure parser for scp progress lines (P1: per-row transfer progress). scp emits
+// progress to stderr as a single rewritten line per file, e.g.
+//   "bigfile.iso   23%  118MB   5.8MB/s   01:23 ETA"
+// The whole token set is whitespace-separated; the percent token always ends
+// with '%'. We pull percent (0...100) and, when present, the cumulative byte
+// count. Non-progress lines (banners, errors, prompts) return nil so the caller
+// leaves the row's progress untouched. Kept non-MainActor + pure for testing.
+enum SSHTransferProgressParser {
+    struct Sample: Equatable {
+        let percent: Int
+        let bytes: Int64?
+    }
+
+    static func parse(_ rawLine: String) -> Sample? {
+        // scp rewrites the same line with carriage returns; take the last
+        // segment so a buffered chunk yields the freshest sample.
+        let line = rawLine
+            .split(whereSeparator: { $0 == "\r" || $0 == "\n" })
+            .last
+            .map(String.init) ?? rawLine
+        let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard let percentToken = tokens.first(where: { $0.hasSuffix("%") }) else { return nil }
+        let digits = percentToken.dropLast()
+        guard !digits.isEmpty, let percent = Int(digits), (0...100).contains(percent) else {
+            return nil
+        }
+        // The transferred-size token follows the percent token (e.g. "118MB").
+        var bytes: Int64?
+        if let percentIndex = tokens.firstIndex(of: percentToken), percentIndex + 1 < tokens.count {
+            bytes = parseByteCount(tokens[percentIndex + 1])
+        }
+        return Sample(percent: percent, bytes: bytes)
+    }
+
+    // Parses scp's human-readable size tokens ("118MB", "1024KB", "512", "1.5GB")
+    // into a byte count. Returns nil when the token isn't a size.
+    static func parseByteCount(_ token: String) -> Int64? {
+        let suffixes: [(String, Double)] = [
+            ("GB", 1_073_741_824), ("MB", 1_048_576), ("KB", 1_024),
+            ("G", 1_073_741_824), ("M", 1_048_576), ("K", 1_024), ("B", 1)
+        ]
+        for (suffix, multiplier) in suffixes where token.hasSuffix(suffix) {
+            let number = token.dropLast(suffix.count)
+            guard !number.isEmpty, let value = Double(number) else { return nil }
+            return Int64(value * multiplier)
+        }
+        // Bare integer (no unit) is a raw byte count.
+        return Int64(token)
+    }
+}
+
+// Pure builder for recursive (folder) scp transfers (P1: recursive folder
+// transfer). The shared SSHCommandBuilder.scp*Arguments helpers omit "-r", so a
+// folder transfer silently no-ops; this mirrors their base flags and inserts
+// "-r" so directory trees copy. Kept here (owned file) + non-MainActor + pure so
+// the argv is unit-testable without touching the router or CoreModel.
+enum SSHRecursiveTransferCommand {
+    static func scpRecursiveArguments(
+        profile: SSHHostProfile,
+        upload: Bool,
+        localPath: String,
+        remotePath: String
+    ) -> [String] {
+        var args = baseArguments(profile: profile)
+        args.append("-r")
+        let remote = "\(profile.destination):\(remotePath)"
+        if upload {
+            args += [localPath, remote]
+        } else {
+            args += [remote, localPath]
+        }
+        return args
+    }
+
+    private static func baseArguments(profile: SSHHostProfile) -> [String] {
+        var args = [
+            "-o", "ConnectTimeout=6",
+            "-o", "StrictHostKeyChecking=accept-new"
+        ]
+        if let port = profile.port { args += ["-P", String(port)] }
+        if let identity = profile.identityFile, !identity.isEmpty { args += ["-i", identity] }
+        for option in profile.options where !option.isEmpty {
+            args += ["-o", option]
+        }
+        return args
+    }
+}
+
+// Pure policy for the "large tree" confirm before a recursive transfer (P1:
+// explicit confirm for large trees). Avoids surprising the user with a huge
+// silent copy. Non-MainActor + pure so the threshold logic is testable.
+enum SSHLargeTreeConfirm {
+    static let fileCountThreshold = 50
+    static let byteThreshold: Int = 100 * 1_048_576 // 100 MB
+
+    static func needsConfirm(fileCount: Int, totalBytes: Int) -> Bool {
+        fileCount > fileCountThreshold || totalBytes > byteThreshold
+    }
+}
+
 private struct SSHPaneDerived {
     var directories: [SSHFileEntry] = []
     var fileCount = 0
@@ -596,7 +759,9 @@ private struct SSHPaneDerived {
 
 private enum SSHTransferState: String, CaseIterable {
     case queued = "Queued"
+    case transferring = "Transferring"
     case failed = "Failed"
+    case cancelled = "Cancelled"
     case successful = "Successful"
 }
 
@@ -607,6 +772,9 @@ private struct SSHTransferQueueItem: Identifiable, Hashable {
     let remotePath: String
     let size: String
     let status: SSHTransferState
+    // 0...100 while .transferring; nil otherwise. Drives the per-row progress
+    // bar + percent label (P1).
+    var progress: Int? = nil
 }
 
 private struct SSHFileColumnWidths {
@@ -678,6 +846,9 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     var onSidebarCollapsedChange: ((Bool) -> Void)?
     var onTransferSidebarCollapsedChange: ((Bool) -> Void)?
     var onTransfer: ((Bool, String, String) -> Void)?
+    // Routes a per-row cancel back to the surface so it can register the cancel
+    // key the async completion path checks (P1).
+    var onCancelTransfer: ((String, String) -> Void)?
     var onRefreshLocalFiles: (() -> Void)?
     var onRefreshRemoteFiles: (() -> Void)?
     var onChooseLocalPath: (() -> Void)?
@@ -915,6 +1086,52 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
 
     private static let queueHistoryLimit = 200
 
+    // Flip the active (queued/transferring) row for this path-pair to .cancelled
+    // so the queue reflects the user's cancel action (P1). Returns true when a
+    // row was actually marked, so the surface can short-circuit the transfer.
+    @discardableResult
+    func markCancelled(localPath: String, remotePath: String) -> Bool {
+        var marked = false
+        queueItems = queueItems.map { item in
+            guard !marked,
+                  item.localPath == localPath,
+                  item.remotePath == remotePath,
+                  item.status == .queued || item.status == .transferring else { return item }
+            marked = true
+            return SSHTransferQueueItem(
+                direction: item.direction,
+                localPath: item.localPath,
+                remotePath: item.remotePath,
+                size: item.size,
+                status: .cancelled,
+                progress: nil
+            )
+        }
+        if marked {
+            selectedQueueState = .cancelled
+            addTransferLog("Cancelled: \(localPath) -> \(remotePath)")
+        }
+        return marked
+    }
+
+    // Move the active row to .transferring and update its progress percent so the
+    // per-row bar advances as scp reports bytes (P1).
+    func updateProgress(localPath: String, remotePath: String, percent: Int) {
+        queueItems = queueItems.map { item in
+            guard item.localPath == localPath,
+                  item.remotePath == remotePath,
+                  item.status == .queued || item.status == .transferring else { return item }
+            return SSHTransferQueueItem(
+                direction: item.direction,
+                localPath: item.localPath,
+                remotePath: item.remotePath,
+                size: item.size,
+                status: .transferring,
+                progress: max(0, min(100, percent))
+            )
+        }
+    }
+
     private func transferSize(direction: SSHTransferDirection, localPath: String, remotePath: String) -> String {
         let entries = direction == .upload ? localEntries : remoteEntries
         let sourcePath = direction == .upload ? localPath : remotePath
@@ -932,6 +1149,14 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         guard item.status == .failed else { return }
         queueItems.removeAll { $0.id == item.id }
         onTransfer?(item.direction == .upload, item.localPath, item.remotePath)
+    }
+
+    // Cancel an in-flight (queued/transferring) row from its context menu /
+    // cancel control (P1). Delegates to the surface, which both marks the row and
+    // registers the cooperative cancel for the async completion path.
+    func cancelTransfer(_ item: SSHTransferQueueItem) {
+        guard item.status == .queued || item.status == .transferring else { return }
+        onCancelTransfer?(item.localPath, item.remotePath)
     }
 
     func addTransferLog(_ line: String) {
@@ -1529,6 +1754,29 @@ private struct SSHTransferSidebarView: View {
         return index.isMultiple(of: 2) ? DS.Palette.surface.opacity(0.35) : Color.clear
     }
 
+    // Status column: shows live percent while transferring plus an inline cancel
+    // control; otherwise the plain status label (P1).
+    @ViewBuilder
+    private func statusCell(item: SSHTransferQueueItem) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            if item.status == .transferring, let percent = item.progress {
+                Text("\(percent)%")
+                    .monospacedDigit()
+                    .accessibilityIdentifier("ssh.transfer.queue.progress")
+            } else {
+                Text(item.status.rawValue)
+            }
+            if item.status == .queued || item.status == .transferring {
+                Button { vm.cancelTransfer(item) } label: {
+                    Image(systemName: "xmark.circle")
+                }
+                .buttonStyle(.plain)
+                .help("Cancel transfer")
+                .accessibilityIdentifier("ssh.transfer.queue.cancel")
+            }
+        }
+    }
+
     private func paneStatus(derived: SSHPaneDerived, selectedIDs: Set<String>) -> some View {
         let selectedCount = selectedIDs.count
         return HStack {
@@ -1599,18 +1847,22 @@ private struct SSHTransferSidebarView: View {
                                         Text(item.direction.rawValue).frame(width: queueColumns.direction, alignment: .leading)
                                         Text(item.remotePath).frame(width: queueColumns.remote, alignment: .leading)
                                         Text(item.size).frame(width: queueColumns.size, alignment: .trailing)
-                                        Text(item.status.rawValue).frame(width: queueColumns.status, alignment: .leading)
+                                        statusCell(item: item)
+                                            .frame(width: queueColumns.status, alignment: .leading)
                                     }
                                     .font(DS.Font.caption)
                                     .lineLimit(1)
                                     .padding(.horizontal, DS.Space.xs)
                                     .frame(width: queueColumns.total, height: 24, alignment: .leading)
                                     .background(rowBackground(index: index, isSelected: false))
-                                    // Recover a failed transfer in one click
-                                    // (IMP-MAC_SSH-010).
+                                    // Recover a failed transfer / cancel an active
+                                    // one in one click (IMP-MAC_SSH-010 / P1).
                                     .contextMenu {
                                         if item.status == .failed {
                                             Button("Retry Transfer") { vm.retryTransfer(item) }
+                                        }
+                                        if item.status == .queued || item.status == .transferring {
+                                            Button("Cancel Transfer") { vm.cancelTransfer(item) }
                                         }
                                     }
                                 }
