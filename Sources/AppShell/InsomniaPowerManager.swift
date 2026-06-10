@@ -76,11 +76,18 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
         }
 
         if !options.allowSystemSleepWhenDisplayClosed {
-            let closedDisplayReady = createClosedDisplaySleepAssertion()
-                && ensureClamshellSleepDisabled()
-            guard closedDisplayReady else {
+            guard createClosedDisplaySleepAssertion() else {
                 deactivate()
                 return false
+            }
+            // PERF: privileged pmset path is slow (admin dialog + poll).
+            // Fire it on a background Task so activate() returns to the
+            // main actor immediately; deactivate() is called if it fails.
+            Task { [weak self] in
+                guard let self else { return }
+                if !(await self.ensureClamshellSleepDisabledAsync()) {
+                    self.deactivate()
+                }
             }
         }
         if shouldPreventDisplaySleep(), !createDisplaySleepAssertion() {
@@ -109,15 +116,14 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
         releaseProcessAssertions()
         if clamshellSleepDisabled {
             if !setClamshellSleepDisabled(false) || rootDomainSleepDisabled() {
-                if privilegedPMSet.disableUsingCachedPermission() {
-                    if !waitForRootDomainSleepDisabled(false) {
-                        NSLog("RemoteCode Insomnia cached pmset disable did not clear before timeout.")
-                    }
-                } else {
-                    _ = runPrivilegedPMSetDisableSleep(false)
+                // PERF: privileged pmset + verification poll are blocking ops.
+                // Dispatch async so deactivate() returns to main actor immediately.
+                Task { [weak self] in
+                    await self?.runPrivilegedDeactivateAsync()
                 }
+            } else {
+                clamshellSleepDisabled = rootDomainSleepDisabled()
             }
-            clamshellSleepDisabled = rootDomainSleepDisabled()
         }
     }
 
@@ -183,32 +189,66 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
         return (value as? Bool) == true
     }
 
-    private func runPrivilegedPMSetDisableSleep(_ disabled: Bool) -> Bool {
-        guard privilegedPMSet.setDisabled(disabled) else {
-            NSLog("RemoteCode Insomnia privileged pmset failed.")
-            return false
+    // PERF: async poll — uses Task.sleep instead of Thread.sleep so the
+    // calling thread (never main) is not burned during the 2 s wait.
+    private func waitForRootDomainSleepDisabledAsync(_ disabled: Bool) async -> Bool {
+        let timeout: TimeInterval = 2
+        let intervalNs: UInt64 = 50_000_000 // 50 ms
+        let start = Date()
+        while true {
+            let elapsed = Date().timeIntervalSince(start)
+            let satisfied = rootDomainSleepDisabled() == disabled
+            switch InsomniaPollDecider.pollDecision(elapsed: elapsed, timeout: timeout, satisfied: satisfied) {
+            case .done: return true
+            case .timedOut: return false
+            case .keepPolling: try? await Task.sleep(nanoseconds: intervalNs)
+            }
         }
-        let effective = rootDomainSleepDisabled()
-        guard effective == disabled else { return false }
-        clamshellSleepDisabled = disabled
-        return true
     }
 
-    private func waitForRootDomainSleepDisabled(_ disabled: Bool) -> Bool {
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline {
-            if rootDomainSleepDisabled() == disabled { return true }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        return rootDomainSleepDisabled() == disabled
-    }
-
-    private func ensureClamshellSleepDisabled() -> Bool {
+    // PERF: async variant of ensureClamshellSleepDisabled — the privileged
+    // pmset path (NSAppleScript admin dialog) is dispatched to a detached
+    // background task so the main actor is never blocked.
+    private func ensureClamshellSleepDisabledAsync() async -> Bool {
         if rootDomainSleepDisabled() {
             clamshellSleepDisabled = true
             return true
         }
-        return setClamshellSleepDisabled(true) || runPrivilegedPMSetDisableSleep(true)
+        if setClamshellSleepDisabled(true) { return true }
+        // Capture privilegedPMSet reference so the detached task can call it
+        // without capturing self (avoids retain cycle and actor isolation issues).
+        let pmSet = privilegedPMSet
+        let succeeded = await Task.detached(priority: .userInitiated) {
+            pmSet.setDisabled(true)
+        }.value
+        guard succeeded else {
+            NSLog("RemoteCode Insomnia privileged pmset failed.")
+            return false
+        }
+        let effective = rootDomainSleepDisabled()
+        if effective { clamshellSleepDisabled = true }
+        return effective
+    }
+
+    // PERF: async variant of the privileged-pmset disable path used in deactivate.
+    // Both the cached-helper wait and the one-shot NSAppleScript call are kept
+    // off the main actor.
+    private func runPrivilegedDeactivateAsync() async {
+        if privilegedPMSet.disableUsingCachedPermission() {
+            if !(await waitForRootDomainSleepDisabledAsync(false)) {
+                NSLog("RemoteCode Insomnia cached pmset disable did not clear before timeout.")
+            }
+        } else {
+            // One-shot privileged disable — NSAppleScript blocks; run detached.
+            let pmSet = privilegedPMSet
+            let succeeded = await Task.detached(priority: .userInitiated) {
+                pmSet.setDisabled(false)
+            }.value
+            if succeeded {
+                clamshellSleepDisabled = false
+            }
+        }
+        clamshellSleepDisabled = rootDomainSleepDisabled()
     }
 
     private func runPrivilegedShellCommand(_ command: String) -> Bool {
@@ -297,7 +337,33 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     }
 }
 
-final class PrivilegedPMSetSleepDisabler {
+// MARK: - Poll decision helper (pure, testable)
+
+/// Decides the next action for a verification poll loop.
+enum InsomniaPollDecision: Equatable {
+    case keepPolling
+    case done
+    case timedOut
+}
+
+/// Pure, nonisolated decision logic for the root-domain sleep-disabled
+/// verification poll. Extracted so it can be unit-tested without any
+/// manager state or async machinery.
+enum InsomniaPollDecider {
+    nonisolated static func pollDecision(
+        elapsed: TimeInterval,
+        timeout: TimeInterval,
+        satisfied: Bool
+    ) -> InsomniaPollDecision {
+        if satisfied { return .done }
+        if elapsed >= timeout { return .timedOut }
+        return .keepPolling
+    }
+}
+
+// MARK: -
+
+final class PrivilegedPMSetSleepDisabler: @unchecked Sendable {
     private struct Session {
         let directory: URL
         let stopFile: URL
