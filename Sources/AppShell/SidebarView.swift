@@ -14,6 +14,24 @@ public extension Notification.Name {
 
 @MainActor
 public final class SidebarViewModel: ObservableObject {
+    /// Pure view-state for the Insomnia keep-awake status pill. Carries no UI
+    /// dependency so the view can render + wire one-click disable from it.
+    public struct InsomniaStatusPillState: Equatable {
+        public let isVisible: Bool
+        public let label: String
+        public let disablesInsomniaOnTap: Bool
+    }
+
+    /// Derives the status-pill state from whether keep-awake assertions are held.
+    /// Visible (with a disable-on-tap intent + human-readable label) only when on.
+    nonisolated public static func insomniaStatusPill(enabled: Bool) -> InsomniaStatusPillState {
+        InsomniaStatusPillState(
+            isVisible: enabled,
+            label: enabled ? "Keeping Mac awake" : "",
+            disablesInsomniaOnTap: enabled
+        )
+    }
+
     public enum InsomniaBatteryDecision {
         case disable
         case keepEnabled
