@@ -106,6 +106,23 @@ public func connectionMetricsJSON(
     ]
 }
 
+/// Pure helper: builds the `WWW-Authenticate` header value for 401 responses.
+/// Extracted so callers can unit-test the scheme/realm without a live socket.
+public func wwwAuthenticateHeaderValue(scheme: String, realm: String) -> String {
+    return "\(scheme) realm=\"\(realm)\""
+}
+
+/// Pure helper: builds the `server.listener` EventBus event payload.
+/// `bound`=true on success; `address`+`port` reflect the actual bind address.
+/// Extracted for unit-testability - no I/O, no actor.
+public func serverListenerEventPayload(bound: Bool, address: String, port: UInt16) -> [String: Any] {
+    return [
+        "bound": bound,
+        "address": address,
+        "port": Int(port)
+    ]
+}
+
 public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
@@ -158,6 +175,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
         if rc < 0 {
             let msg = String(cString: strerror(errno))
             close(listenFD); listenFD = -1
+            let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
+            let failPayload = serverListenerEventPayload(bound: false, address: bindAddr, port: port)
+            EventBus.shared.publish(kind: "server.listener", payload: .object(failPayload.mapValues { v in
+                if let b = v as? Bool { return .bool(b) }
+                if let i = v as? Int { return .number(Double(i)) }
+                if let s = v as? String { return .string(s) }
+                return .string("\(v)")
+            }))
             throw NSError(domain: "RC2.HTTP", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: msg])
         }
         if Darwin.listen(listenFD, 32) < 0 {
@@ -169,6 +194,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
         t.name = "RC2.HTTPAccept"
         t.start()
         accept = t
+        let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
+        let successPayload = serverListenerEventPayload(bound: true, address: bindAddr, port: port)
+        EventBus.shared.publish(kind: "server.listener", payload: .object(successPayload.mapValues { v in
+            if let b = v as? Bool { return .bool(b) }
+            if let i = v as? Int { return .number(Double(i)) }
+            if let s = v as? String { return .string(s) }
+            return .string("\(v)")
+        }))
     }
 
     public func stop() {
@@ -379,7 +412,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let t = token, auth.verify(token: t) {
                 // ok
             } else {
-                send(fd: fd, status: 401, contentType: "text/plain", body: "unauthorized\n".data(using: .utf8)!); return
+                send(fd: fd, status: 401, contentType: "text/plain",
+                     body: "unauthorized\n".data(using: .utf8)!,
+                     additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
             }
         }
 
@@ -596,7 +631,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return slot.value ?? (try? JSONEncoder().encode(JSONRPCResponse(id: nil, error: .internalError))) ?? Data("{}".utf8)
     }
 
-    private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil) {
+    private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil, additionalHeaders: [String: String] = [:]) {
         var responseBody = body
         var extraHeaders = ""
         if contentType.contains("application/json"),
@@ -606,6 +641,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
            compressed.count < body.count {
             responseBody = compressed
             extraHeaders += "Content-Encoding: \(codec.wireName)\r\n"
+        }
+        for (k, v) in additionalHeaders {
+            extraHeaders += "\(k): \(v)\r\n"
         }
         let head = "HTTP/1.1 \(status) \(reasonPhrase(status))\r\nContent-Type: \(contentType)\r\n\(extraHeaders)Content-Length: \(responseBody.count)\r\nConnection: close\r\n\r\n"
         // PERF-010: write headers then body separately (as sendFile does)
