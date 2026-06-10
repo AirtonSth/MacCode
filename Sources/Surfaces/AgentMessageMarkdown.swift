@@ -10,6 +10,8 @@ struct AgentMessageMarkdownBlock: Equatable {
         case bullet(indent: Int)
         case numbered(number: Int, indent: Int)
         case code(language: String)
+        case table(headers: [String], rows: [[String]])
+        case blockquote
     }
 
     let kind: Kind
@@ -24,17 +26,64 @@ enum AgentMessageMarkdown {
         var fenceLanguage = ""
         var fenceLines: [String] = []
 
+        // Table accumulation: pending header cells + confirmed rows
+        var tableHeaders: [String] = []
+        var tableRows: [[String]] = []
+        var inTable = false
+
         func flushParagraph() {
             guard !paragraph.isEmpty else { return }
             blocks.append(AgentMessageMarkdownBlock(kind: .paragraph, text: paragraph.joined(separator: "\n")))
             paragraph.removeAll()
         }
 
-        for rawLine in text.components(separatedBy: "\n") {
+        func flushTable() {
+            guard inTable, !tableHeaders.isEmpty else { return }
+            blocks.append(AgentMessageMarkdownBlock(
+                kind: .table(headers: tableHeaders, rows: tableRows),
+                text: ""
+            ))
+            tableHeaders.removeAll()
+            tableRows.removeAll()
+            inTable = false
+        }
+
+        // Parse a pipe-delimited row into trimmed cells (strips outer pipes).
+        func tableCells(from line: String) -> [String] {
+            var s = line.trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("|") { s = String(s.dropFirst()) }
+            if s.hasSuffix("|") { s = String(s.dropLast()) }
+            return s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+
+        // A GFM separator row contains only pipes, dashes, colons, and spaces.
+        func isSeparatorRow(_ line: String) -> Bool {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            guard s.hasPrefix("|") || s.contains("|") else { return false }
+            let stripped = s.replacingOccurrences(of: "|", with: "")
+                            .replacingOccurrences(of: "-", with: "")
+                            .replacingOccurrences(of: ":", with: "")
+                            .replacingOccurrences(of: " ", with: "")
+            return stripped.isEmpty && s.contains("-")
+        }
+
+        // A pipe row: trimmed starts or ends with "|", or contains "|".
+        func isPipeRow(_ line: String) -> Bool {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            return s.hasPrefix("|") || (s.contains("|") && !s.hasPrefix(">"))
+        }
+
+        let rawLines = text.components(separatedBy: "\n")
+        var i = rawLines.startIndex
+
+        while i < rawLines.endIndex {
+            let rawLine = rawLines[i]
             let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            i = rawLines.index(after: i)
 
             if inFence {
                 if trimmed.hasPrefix("```") {
+                    flushTable()
                     blocks.append(AgentMessageMarkdownBlock(
                         kind: .code(language: fenceLanguage),
                         text: fenceLines.joined(separator: "\n")
@@ -49,6 +98,7 @@ enum AgentMessageMarkdown {
             }
 
             if trimmed.hasPrefix("```") {
+                flushTable()
                 flushParagraph()
                 inFence = true
                 fenceLanguage = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
@@ -56,7 +106,46 @@ enum AgentMessageMarkdown {
             }
 
             if trimmed.isEmpty {
+                flushTable()
                 flushParagraph()
+                continue
+            }
+
+            // GFM table detection: pipe row followed by separator on next line.
+            if !inTable && isPipeRow(trimmed) {
+                let nextIndex = i  // i already advanced
+                if nextIndex < rawLines.endIndex {
+                    let nextTrimmed = rawLines[nextIndex].trimmingCharacters(in: .whitespaces)
+                    if isSeparatorRow(nextTrimmed) {
+                        // Confirmed table start -- flush any pending paragraph.
+                        flushParagraph()
+                        tableHeaders = tableCells(from: trimmed)
+                        tableRows.removeAll()
+                        inTable = true
+                        // Consume separator line.
+                        i = rawLines.index(after: i)
+                        continue
+                    }
+                }
+            }
+
+            // If inside table, consume data rows.
+            if inTable {
+                if isPipeRow(trimmed) {
+                    tableRows.append(tableCells(from: trimmed))
+                    continue
+                } else {
+                    // Non-pipe line ends the table.
+                    flushTable()
+                    // Fall through to re-process this line as normal.
+                }
+            }
+
+            // Blockquote: lines starting with "> ".
+            if trimmed.hasPrefix("> ") || trimmed == ">" {
+                flushParagraph()
+                let content = trimmed.hasPrefix("> ") ? String(trimmed.dropFirst(2)) : ""
+                blocks.append(AgentMessageMarkdownBlock(kind: .blockquote, text: content))
                 continue
             }
 
@@ -86,6 +175,7 @@ enum AgentMessageMarkdown {
                 text: fenceLines.joined(separator: "\n")
             ))
         }
+        flushTable()
         flushParagraph()
 
         return blocks.isEmpty ? [AgentMessageMarkdownBlock(kind: .paragraph, text: text)] : blocks
@@ -216,6 +306,57 @@ struct AgentMessageMarkdownView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.leading, CGFloat(indent) * 16)
+        case .table(let headers, let rows):
+            VStack(alignment: .leading, spacing: 0) {
+                // Header row
+                HStack(spacing: 0) {
+                    ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
+                        Text(AgentMessageMarkdown.attributedInline(header))
+                            .font(DS.Font.bodyStrong)
+                            .padding(.horizontal, DS.Space.sm)
+                            .padding(.vertical, DS.Space.xs)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .background(DS.Palette.surface)
+                Divider()
+                // Data rows
+                ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
+                    HStack(spacing: 0) {
+                        ForEach(Array(row.enumerated()), id: \.offset) { colIndex, cell in
+                            Text(AgentMessageMarkdown.attributedInline(cell))
+                                .font(DS.Font.body)
+                                .padding(.horizontal, DS.Space.sm)
+                                .padding(.vertical, DS.Space.xs)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if colIndex < row.count - 1 {
+                                Divider()
+                            }
+                        }
+                    }
+                    .background(rowIndex % 2 == 0 ? Color.clear : DS.Palette.surface.opacity(0.5))
+                    if rowIndex < rows.count - 1 {
+                        Divider()
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+
+        case .blockquote:
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(DS.Palette.accent.opacity(0.5))
+                    .frame(width: 3)
+                Text(AgentMessageMarkdown.attributedInline(block.text))
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineSpacing(compact ? 3 : 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, DS.Space.xs)
+
         case .code:
             // IMP-010: wrap code block in ZStack so a copy button can be
             // overlaid in the top-right corner without altering layout.
