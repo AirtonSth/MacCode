@@ -295,6 +295,16 @@ func validateMove(src: String, dstDir: String, workspaceRoot: String) -> Bool {
     return true
 }
 
+// MARK: - Pure recycle-URL helper (no AppKit, no MainActor; tested in FilesRecycleTests)
+
+/// Build the URL array for NSWorkspace.recycle from absolute file-system paths.
+/// Pure function: no AppKit dependency, no MainActor — accepts the absolute `path` values
+/// stored on each FileEntry, so the delete-to-Trash path is testable without constructing
+/// the full FileEntry or touching AppKit.
+func recycleURLs(forAbsolutePaths paths: [String]) -> [URL] {
+    paths.map { URL(fileURLWithPath: $0) }
+}
+
 // MARK: - Pure name-filter helper (no AppKit, no MainActor; tested in FilesNameFilterTests)
 
 /// Minimal protocol surface that `filterFileEntries` requires, so the helper can be tested
@@ -756,21 +766,26 @@ private final class FilesViewModel: ObservableObject {
     }
 
     func delete(_ entries: [FileEntry]) {
-        let targets = entries.map(\.relativePath)
-        guard !targets.isEmpty else { return }
-        if let selectedPath, targets.contains(selectedPath) {
+        let relativePaths = entries.map(\.relativePath)
+        guard !relativePaths.isEmpty else { return }
+        if let selectedPath, relativePaths.contains(selectedPath) {
             closeSessionIfSelected(path: selectedPath)
             selectedEntry = nil
             setDraft("")
             renderedText = ""
             isDirty = false
         }
-        do {
-            _ = try router?.fsWorkspaceDelete(workspace: workspaceID, paths: targets)
-            dirtyPaths.subtract(targets)
-            loadDirectory(currentDirectory)
-        } catch {
-            errorText = String(describing: error)
+        let urls = recycleURLs(forAbsolutePaths: entries.map(\.path))
+        dirtyPaths.subtract(relativePaths)
+        NSWorkspace.shared.recycle(urls) { [weak self] _, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.errorText = String(describing: error)
+                } else {
+                    self.loadDirectory(self.currentDirectory)
+                }
+            }
         }
     }
 
@@ -1087,10 +1102,10 @@ private struct FilesSurfaceRoot: View {
             Button("Cancel", role: .cancel) { renamingEntry = nil }
         }
         .alert(deleteTitle, isPresented: $confirmDelete) {
-            Button("Delete", role: .destructive) { commitDelete() }
+            Button("Move to Trash", role: .destructive) { commitDelete() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(deleteTargets.count == 1 ? deleteTargets[0].relativePath : "\(deleteTargets.count) selected items will be deleted from the workspace.")
+            Text(deleteTargets.count == 1 ? deleteTargets[0].relativePath : "\(deleteTargets.count) selected items will be moved to the Trash.")
         }
         .onAppear { pathInput = displayPath }
         .onChange(of: model.currentDirectory) { _ in
@@ -1379,7 +1394,7 @@ private struct FilesSurfaceRoot: View {
     }
 
     private var deleteTitle: String {
-        deleteTargets.count == 1 ? "Delete \(deleteTargets[0].name)?" : "Delete \(deleteTargets.count) items?"
+        deleteTargets.count == 1 ? "Move \(deleteTargets[0].name) to Trash?" : "Move \(deleteTargets.count) items to Trash?"
     }
 
     @ViewBuilder
@@ -1397,9 +1412,9 @@ private struct FilesSurfaceRoot: View {
             Divider()
             Button("Rename...") { beginRename(entry) }
             Divider()
-            Button("Delete", role: .destructive) { beginDelete(targets) }
+            Button("Move to Trash", role: .destructive) { beginDelete(targets) }
         } else {
-            Button("Delete \(targets.count) Items", role: .destructive) { beginDelete(targets) }
+            Button("Move \(targets.count) Items to Trash", role: .destructive) { beginDelete(targets) }
         }
     }
 
