@@ -1,6 +1,22 @@
 import SwiftUI
 import AppKit
 
+// MARK: - Focus ring
+
+public extension View {
+    /// Renders the DS focus ring (DS.Palette.focusRing, 2pt, cornerRadius DS.Radius.control)
+    /// around any interactive element that has keyboard focus.
+    /// Usage: myControl.dsFocusRing(isFocused: focused)
+    @ViewBuilder
+    func dsFocusRing(isFocused: Bool, cornerRadius: CGFloat = DS.Radius.control) -> some View {
+        self.overlay(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(DS.Palette.focusRing, lineWidth: 2)
+                .opacity(isFocused ? 1 : 0)
+        )
+    }
+}
+
 // MARK: - Surface containers
 
 public extension View {
@@ -64,15 +80,18 @@ public struct DSPill: View {
     }
 }
 
-// MARK: - Icon button (compact visual; 26x22pt frame; .contentShape expands hit area)
-// Minimum recommended hit target: 44x44pt — use .frame(width:height:) on the call site
-// or wrap in a larger .contentShape if placing in a tight toolbar.
+// MARK: - Icon button (compact visual; 26x22pt; 44x44pt hit target via contentShape)
 
 public struct DSIconButton: View {
     let systemName: String
     let help: String
     let action: () -> Void
     @State private var hovering = false
+
+    /// Minimum hit-target dimension applied inside the component (HIG Adaptivity and Layout).
+    nonisolated public static let hitTargetSize: CGFloat = 44
+    /// Visual icon frame (narrower than hit target).
+    nonisolated public static let visualSize: CGSize = CGSize(width: 26, height: 22)
 
     public init(_ systemName: String, help: String = "", action: @escaping () -> Void) {
         self.systemName = systemName; self.help = help; self.action = action
@@ -86,6 +105,8 @@ public struct DSIconButton: View {
                 .frame(width: 26, height: 22)
                 .background(hovering ? DS.Palette.hover : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                // Expand hit target to 44x44pt without changing the visual footprint.
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -267,10 +288,19 @@ public struct DSResizeDivider: View {
     private let onDrag: ((CGFloat) -> Void)?
     @State private var lastTranslation: CGFloat = 0
 
+    /// Step applied per arrow-key press via accessibilityAdjustableAction (20pt = ~2 text rows).
+    static let keyStep: CGFloat = 20
+
     public init(axis: DSResizeAxis, help: String = "", onDrag: ((CGFloat) -> Void)? = nil) {
         self.axis = axis
         self.help = help
         self.onDrag = onDrag
+    }
+
+    // Returns a non-empty accessible label: the caller-supplied help string, or a
+    // direction-aware fallback so VoiceOver users always hear a meaningful name.
+    var accessibleLabel: String {
+        help.isEmpty ? (axis == .vertical ? "Resize horizontally" : "Resize vertically") : help
     }
 
     public var body: some View {
@@ -295,8 +325,16 @@ public struct DSResizeDivider: View {
                     }
                     .onEnded { _ in lastTranslation = 0 }
             )
-            .help(help)
-            .accessibilityLabel(help)
+            .help(accessibleLabel)
+            .accessibilityLabel(accessibleLabel)
+            .accessibilityAdjustableAction { direction in
+                guard let onDrag else { return }
+                switch direction {
+                case .increment: onDrag(+DSResizeDivider.keyStep)
+                case .decrement: onDrag(-DSResizeDivider.keyStep)
+                @unknown default: break
+                }
+            }
     }
 }
 
