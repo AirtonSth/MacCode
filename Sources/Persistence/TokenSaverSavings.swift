@@ -32,16 +32,40 @@ public struct TokenSaverDailySavings: Sendable, Equatable {
     }
 }
 
+/// All-time saved-token totals for one (provider, mode) pair from the permanent
+/// accumulator. Feeds the breakdown table in the Token Saver details popover.
+public struct TokenSaverModeSavings: Sendable, Equatable {
+    public let provider: String
+    public let mode: String
+    public let savedTokens: Int
+    public let runs: Int
+
+    public init(provider: String, mode: String, savedTokens: Int, runs: Int) {
+        self.provider = provider
+        self.mode = mode
+        self.savedTokens = savedTokens
+        self.runs = runs
+    }
+}
+
 /// Aggregated saved tokens. Provider totals come from the permanent accumulator
 /// so the UI can show all tokens saved for the user. Daily buckets come from the
-/// retained event rows and feed the short-term reports/chart.
+/// retained event rows and feed the short-term reports/chart. Mode rows carry the
+/// same permanent totals split by (provider, mode) for the breakdown table.
 public struct TokenSaverSavingsSummary: Sendable, Equatable {
     public let providers: [TokenSaverProviderSavings]
     public let daily: [TokenSaverDailySavings]
+    /// Per-(provider, mode) breakdown from the permanent accumulator.
+    public let modes: [TokenSaverModeSavings]
 
-    public init(providers: [TokenSaverProviderSavings], daily: [TokenSaverDailySavings]) {
+    public init(
+        providers: [TokenSaverProviderSavings],
+        daily: [TokenSaverDailySavings],
+        modes: [TokenSaverModeSavings] = []
+    ) {
         self.providers = providers
         self.daily = daily
+        self.modes = modes
     }
 
     public var totalSavedTokens: Int { providers.reduce(0) { $0 + $1.savedTokens } }
@@ -58,7 +82,7 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
         providers.first { $0.provider == provider }
     }
 
-    public static let empty = TokenSaverSavingsSummary(providers: [], daily: [])
+    public static let empty = TokenSaverSavingsSummary(providers: [], daily: [], modes: [])
 }
 
 /// Persists Token Saver savings events to the local SQLite database, keeps event
@@ -179,7 +203,8 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
     }
 
     /// Aggregate measured savings. Provider totals are all-time accumulated
-    /// values; daily buckets cover the retained report window.
+    /// values; daily buckets cover the retained report window; mode rows carry
+    /// per-(provider, mode) all-time totals for the breakdown table.
     public func summary(now: Date = Date()) throws -> TokenSaverSavingsSummary {
         let cutoff = Int64(now.timeIntervalSince1970 * 1000) - retentionMs
         return try db.performSync { database in
@@ -223,7 +248,26 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                     runs: Int(perDay.columnInt64(2))
                 ))
             }
-            return TokenSaverSavingsSummary(providers: providers, daily: daily)
+
+            var modes: [TokenSaverModeSavings] = []
+            let perMode = try database.prepare("""
+                SELECT provider, mode,
+                       COALESCE(saved_tokens, 0),
+                       COALESCE(runs, 0)
+                FROM token_saver_savings_totals
+                ORDER BY provider, mode;
+            """)
+            defer { perMode.reset() }
+            while try perMode.step() {
+                modes.append(TokenSaverModeSavings(
+                    provider: perMode.columnText(0) ?? "unknown",
+                    mode: perMode.columnText(1) ?? "unknown",
+                    savedTokens: Int(perMode.columnInt64(2)),
+                    runs: Int(perMode.columnInt64(3))
+                ))
+            }
+
+            return TokenSaverSavingsSummary(providers: providers, daily: daily, modes: modes)
         }
     }
 }

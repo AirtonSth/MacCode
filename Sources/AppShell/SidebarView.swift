@@ -898,6 +898,48 @@ public struct SidebarKeyIntentMapper {
     }
 }
 
+// MARK: - Token Saver breakdown formatter (pure; no UI imports required)
+
+/// One display row in the Token Saver savings breakdown.
+public struct TokenSaverBreakdownRow: Equatable, Sendable {
+    /// Human-readable mode label (e.g. "command-output", "prompt", "sr1").
+    public let mode: String
+    /// All-time tokens saved for this mode across all providers.
+    public let savedTokens: Int
+    /// Number of compressed runs for this mode.
+    public let runs: Int
+
+    public init(mode: String, savedTokens: Int, runs: Int) {
+        self.mode = mode
+        self.savedTokens = savedTokens
+        self.runs = runs
+    }
+}
+
+/// Pure formatter: `TokenSaverSavingsSummary` -> `[TokenSaverBreakdownRow]`.
+///
+/// Aggregates the per-(provider, mode) rows from `summary.modes` into per-mode
+/// totals (collapsing across providers), then sorts descending by savedTokens so
+/// the most impactful modes appear first. Returns an empty array when
+/// `summary.modes` is empty (zero-state).
+public struct TokenSaverBreakdownFormatter {
+    public init() {}
+
+    /// Returns one `TokenSaverBreakdownRow` per distinct mode, sorted descending
+    /// by `savedTokens`. Modes with zero saved tokens are included so the UI can
+    /// show them as inactive rather than absent.
+    public func rows(from summary: TokenSaverSavingsSummary) -> [TokenSaverBreakdownRow] {
+        var byMode: [String: (saved: Int, runs: Int)] = [:]
+        for m in summary.modes {
+            let existing = byMode[m.mode] ?? (0, 0)
+            byMode[m.mode] = (existing.saved + m.savedTokens, existing.runs + m.runs)
+        }
+        return byMode
+            .map { mode, totals in TokenSaverBreakdownRow(mode: mode, savedTokens: totals.saved, runs: totals.runs) }
+            .sorted { $0.savedTokens > $1.savedTokens }
+    }
+}
+
 public struct SidebarRootView: View {
     private enum TokenSaverUsageScope: String, CaseIterable {
         case currentSession
@@ -1647,6 +1689,49 @@ public struct SidebarRootView: View {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 tokenSaverProviderRow(provider: .claude)
                 tokenSaverProviderRow(provider: .codex)
+            }
+
+            let breakdownRows = TokenSaverBreakdownFormatter().rows(from: vm.tokenSaverSavingsSummary)
+            if !breakdownRows.isEmpty {
+                Divider()
+
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                        Text("By mode")
+                            .font(DS.Font.captionStrong)
+                            .foregroundColor(DS.Palette.textSecondary)
+                        Spacer(minLength: 0)
+                        let avg = vm.tokenSaverSavingsSummary.averageSavedPerRun
+                        if avg > 0 {
+                            Text("~\(Self.formatTokenCount(avg)) avg/run")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .monospacedDigit()
+                                .accessibilityIdentifier("sidebar.tokenSaver.avgPerRun")
+                        }
+                    }
+                    ForEach(breakdownRows, id: \.mode) { row in
+                        HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                            Text(row.mode)
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.text)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            Text("\(Self.formatTokenCount(row.savedTokens)) saved")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.success)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                            Text("\(row.runs) run\(row.runs == 1 ? "" : "s")")
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("sidebar.tokenSaver.breakdown.\(row.mode)")
+                    }
+                }
             }
         }
         .padding(DS.Space.md)
