@@ -171,10 +171,8 @@ struct RPC {
             return ["error": ["code": -1, "message": "serialize failed"]]
         }
         data.append(0x0A)
-        let written = data.withUnsafeBytes { ptr -> Int in
-            return Darwin.write(fd, ptr.baseAddress, data.count)
-        }
-        if written < 0 { return ["error": ["code": -1, "message": "write failed"]] }
+        let writeResult = RC2CLIWriteLoop.writeAll(fd: fd, data: data)
+        if !writeResult.success { return ["error": ["code": -1, "message": "write failed"]] }
         // read until newline
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
@@ -190,6 +188,12 @@ struct RPC {
         return any
     }
 }
+
+// Ignore SIGPIPE so a server-side close between connect and write does not
+// kill the process via the default signal handler.  Without this, any write
+// to a half-closed socket delivers SIGPIPE and terminates the process before
+// the caller can handle the error.
+signal(SIGPIPE, SIG_IGN)
 
 let rpc = RPC(socketPath: socketPath, receiveTimeoutMS: receiveTimeoutMS)
 
