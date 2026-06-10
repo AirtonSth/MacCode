@@ -145,7 +145,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private let retryButton = NSButton()
     private var googleLegacyLayoutReloads = Set<String>()
     private var googleLegacyLayoutReloadOrder: [String] = []
-    private static let googleLegacyLayoutReloadCap = 32
+    // internal (not private) so tests can assert the cap value without
+    // instantiating a WKWebView; QA-MAC_BROWSER-043.
+    static let googleLegacyLayoutReloadCap = 32
     private var retainedURL: URL?
     private var isVisible = true
     /// Test-only read of the hidden/visible gate (QA-MAC_BROWSER-004) so tests
@@ -561,6 +563,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         let s = input.trimmingCharacters(in: .whitespaces)
         if s.isEmpty { return nil }
         if s.contains("://") { return URL(string: s) }
+        // Bare schemes with no authority (e.g. about:blank) are valid URLs and
+        // must pass through rather than becoming a search query.
+        if s.lowercased().hasPrefix("about:"), let u = URL(string: s) { return u }
         let looksLikeHost = !s.contains(" ") && s.contains(".")
         if looksLikeHost, let u = URL(string: "https://" + s) {
             return u
