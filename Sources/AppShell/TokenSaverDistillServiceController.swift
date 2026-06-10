@@ -3,6 +3,60 @@ import DistillCore
 import Foundation
 import Persistence
 
+// MARK: - Notification names
+
+public extension Notification.Name {
+    /// Posted on the main actor whenever `TokenSaverDistillServiceController.status`
+    /// changes. Observers (e.g. SidebarViewModel) can subscribe to refresh UI that
+    /// shows the sidecar running / warming / blocked / failed state.
+    /// The `object` of the notification is the controller instance.
+    static let rc2TokenSaverDistillStatusChanged = Notification.Name("rc2TokenSaverDistillStatusChanged")
+}
+
+// MARK: - Status display helpers
+
+/// Pure, nonisolated display helpers for `TokenSaverDistillServiceStatus`.
+/// Used by UI layers (e.g. the Token Saver details popover) and by log output
+/// to produce stable, ASCII-only human-readable labels without importing AppKit.
+public extension TokenSaverDistillServiceStatus {
+    /// Short, human-readable label suitable for a status row label or pill.
+    /// ASCII-only; never contains smart quotes.
+    var displayLabel: String {
+        switch self {
+        case .notStarted: return "not running"
+        case .starting:   return "warming up"
+        case .running:    return "running"
+        case .blocked:    return "blocked"
+        case .failed:     return "failed"
+        }
+    }
+
+    /// Optional supplementary reason string shown beneath the label.
+    /// Non-nil for `.blocked` and `.failed` states; nil for transient/healthy states.
+    var displayReason: String? {
+        switch self {
+        case .blocked(let reason): return reason
+        case .failed(let reason):  return reason
+        default:                   return nil
+        }
+    }
+
+    /// True when the sidecar is actively serving requests.
+    var isRunning: Bool {
+        if case .running = self { return true }
+        return false
+    }
+
+    /// True when the sidecar is in a terminal non-operational state (blocked or
+    /// failed) and compression requests will fall through to the local fallback.
+    var isOperationallyBlocked: Bool {
+        switch self {
+        case .blocked, .failed: return true
+        default:                return false
+        }
+    }
+}
+
 public enum TokenSaverDistillLaunchDecision: Sendable, Equatable {
     case start
     case skip(reason: String)
@@ -368,7 +422,15 @@ private struct TokenSaverDistillProcessEvent: Codable {
 public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
 
-    public private(set) var status: TokenSaverDistillServiceStatus = .notStarted
+    public private(set) var status: TokenSaverDistillServiceStatus = .notStarted {
+        didSet {
+            guard status != oldValue else { return }
+            NotificationCenter.default.post(
+                name: .rc2TokenSaverDistillStatusChanged,
+                object: self
+            )
+        }
+    }
     public private(set) var bearerToken: String?
 
     private let appSupportDirectory: URL
