@@ -207,6 +207,42 @@ struct BoundedReceiptCache {
     var count: Int { store.count }
 }
 
+/// Pure coalesce-decision helper for device-initiated pairing requests.
+///
+/// When a device repeatedly connects (e.g. re-pair-every-connect, IP drift,
+/// Bonjour TXT race), it sends a fresh POST /v1/pair each time. Without
+/// coalescing, each POST creates a new `pairing_requests` row and fires a new
+/// Mac modal -- the user sees a flood of identical prompts.
+///
+/// `coalescePairingRequest` answers: "is there already an outstanding,
+/// non-expired pending request for `deviceName` within the TTL window?" If yes,
+/// return it so the caller can reuse it (no new row, no new modal). If no,
+/// return `nil` so the caller creates a new one as normal.
+///
+/// Pure, deterministic, no I/O. The `now` parameter is injected for
+/// deterministic unit tests. Call-site feeds the live `outstanding` slice from
+/// the repository query.
+///
+/// - Parameters:
+///   - deviceName: Name sent by the device in the pairing POST body.
+///   - outstanding: All currently-pending (non-decided) `PairingRequest` rows.
+///   - now: Current time (injected so tests need no sleep).
+///   - ttl: Maximum age of an existing request for it to be reused (seconds).
+/// - Returns: An existing `PairingRequest` to reuse, or `nil` if a new one
+///   should be created.
+public func coalescePairingRequest(
+    deviceName: String,
+    outstanding: [PairingRequest],
+    now: Date,
+    ttl: TimeInterval
+) -> PairingRequest? {
+    outstanding.first { req in
+        req.deviceName == deviceName
+            && req.status == "pending"
+            && now.timeIntervalSince(req.createdAt) < ttl
+    }
+}
+
 @MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
