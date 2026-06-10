@@ -159,6 +159,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         auth.onPairingRequest = { [weak self] prompt in
             DispatchQueue.main.async { self?.presentPairingPrompt(prompt) }
         }
+        // The device can cancel its own outstanding request (POST
+        // /v1/pair/cancel). Fired off the listener thread; hop to main and
+        // dismiss the approve/deny modal if it is showing that request.
+        auth.onPairingCancelled = { [weak self] requestId in
+            DispatchQueue.main.async { self?.dismissPairingSheetIfShowing(requestId: requestId) }
+        }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
         configureDirectAccess()
@@ -765,6 +771,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     @objc private func pairingDeny() {
         guard let prompt = pairingPromptPending else { return }
         localAuth?.denyPairingRequest(prompt.requestId)
+        dismissPairingSheet()
+    }
+
+    /// Dismiss the approve/deny modal only if it is currently showing the
+    /// request the device just cancelled. A no-op when no sheet is open or a
+    /// different request is shown, so it never disturbs an unrelated prompt.
+    private func dismissPairingSheetIfShowing(requestId: String) {
+        guard pairingPromptPending?.requestId == requestId else { return }
         dismissPairingSheet()
     }
 

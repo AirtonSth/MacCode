@@ -369,6 +369,28 @@ public final class DeviceTrustRepository {
         _ = try st.step()
     }
 
+    /// Device-initiated cancel: move a still-pending request to a terminal
+    /// 'cancelled' state so a later `pairingRequest` reports it as such and
+    /// it no longer shows as outstanding. Returns true only when an
+    /// existing, still-pending request was actually transitioned; an
+    /// unknown id, or one already approved/denied/expired, returns false so
+    /// the HTTP layer can answer 404. Additive: does not touch redeem or
+    /// status semantics, and the guarded UPDATE (status = 'pending') cannot
+    /// race past an in-flight approve/deny.
+    @discardableResult
+    public func cancelPairingRequest(id: String) throws -> Bool {
+        guard let req = try pairingRequest(id: id), req.status == "pending", !req.isExpired else { return false }
+        let st = try db.prepare("""
+            UPDATE pairing_requests SET status = 'cancelled', decided_at = ? WHERE id = ? AND status = 'pending';
+        """)
+        try st.bind(1, iso.string(from: Date())); try st.bind(2, id)
+        _ = try st.step()
+        // Confirm we won the pending->cancelled transition (a concurrent
+        // approve/deny may have moved it first). Only report success when
+        // the row now reads 'cancelled'.
+        return try pairingRequest(id: id)?.status == "cancelled"
+    }
+
     /// Verify `token` and conditionally update `last_seen_at`.
     ///
     /// The update is debounced: it is skipped when the stored `last_seen_at`

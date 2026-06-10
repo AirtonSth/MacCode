@@ -72,4 +72,40 @@ final class DeviceTrustTests: XCTestCase {
         XCTAssertEqual(try repo.pairingRequest(id: req.id)?.effectiveStatus, "expired")
         XCTAssertNil(try repo.approvePairingRequest(id: req.id))
     }
+
+    /// WHY: cancelling a pending request must report success and make the
+    /// status terminal ('cancelled'), so a later /v1/pair/status returns the
+    /// terminal state and the device stops polling. This is the backing
+    /// invariant for POST /v1/pair/cancel.
+    func test_cancelPendingRequest_makesStatusTerminal() throws {
+        let repo = try freshRepo()
+        let req = try repo.createPairingRequest(deviceName: "iPhone")
+        XCTAssertEqual(try repo.pairingRequest(id: req.id)?.status, "pending")
+
+        XCTAssertTrue(try repo.cancelPairingRequest(id: req.id))
+        XCTAssertEqual(try repo.pairingRequest(id: req.id)?.status, "cancelled")
+    }
+
+    /// WHY: cancel must be single-shot and must never resurrect a decided
+    /// request. An unknown id, or a request already approved, must return
+    /// false so the HTTP layer answers 404 instead of a false "cancelled".
+    func test_cancelUnknownOrDecidedRequest_returnsFalse() throws {
+        let repo = try freshRepo()
+        XCTAssertFalse(try repo.cancelPairingRequest(id: "no-such-id"))
+
+        let req = try repo.createPairingRequest(deviceName: "x")
+        _ = try XCTUnwrap(try repo.approvePairingRequest(id: req.id))
+        // Already approved -> cancel is a no-op and must not flip it back.
+        XCTAssertFalse(try repo.cancelPairingRequest(id: req.id))
+        XCTAssertEqual(try repo.pairingRequest(id: req.id)?.status, "approved")
+    }
+
+    /// WHY: an expired pending request is effectively gone; cancelling it
+    /// must return false (404 at the wire) rather than transitioning a
+    /// stale row, mirroring approve's expired guard.
+    func test_cancelExpiredRequest_returnsFalse() throws {
+        let repo = try freshRepo()
+        let req = try repo.createPairingRequest(deviceName: "x", ttlSeconds: -10)
+        XCTAssertFalse(try repo.cancelPairingRequest(id: req.id))
+    }
 }

@@ -43,6 +43,11 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     /// asks to pair; the closure hops to main and shows the modal.
     public var onPairingRequest: (@Sendable (PairingPrompt) -> Void)?
 
+    /// Set by AppDelegate. Invoked (off the main thread) with the request id
+    /// when a device cancels its own outstanding request; the closure hops
+    /// to main and dismisses the approve/deny modal if it is showing that id.
+    public var onPairingCancelled: (@Sendable (String) -> Void)?
+
     /// requestId → freshly minted plaintext token, held in RAM only and
     /// delivered to the device exactly once (never persisted — mirrors
     /// the redeem path's no-plaintext-at-rest invariant).
@@ -166,6 +171,23 @@ public final class LocalAuthAdapter: DirectAuthProvider {
             return ("approved", r.deviceID ?? pending?.deviceId, liveToken)
         }
         return (r.effectiveStatus, nil, nil)
+    }
+
+    /// Device-initiated cancel of an outstanding request. Moves the pending
+    /// request to a terminal state in the store (so a later status poll
+    /// returns "cancelled") and drops any RAM-held pending token for it.
+    /// Returns true only when a still-pending request was transitioned.
+    public func cancelPairingRequest(requestId: String) -> Bool {
+        let cancelled = (try? repo.cancelPairingRequest(id: requestId)) ?? false
+        guard cancelled else { return false }
+        // Defensive: if a token was minted in a race before cancel landed,
+        // never deliver it. Pending tokens are RAM-only and one-shot.
+        pendingLock.lock()
+        pendingTokens.removeValue(forKey: requestId)
+        pendingLock.unlock()
+        try? repo.audit(actor: "device", action: "pairing.cancel", detail: requestId)
+        onPairingCancelled?(requestId)
+        return true
     }
 
     public func createPairingCode() -> String? {

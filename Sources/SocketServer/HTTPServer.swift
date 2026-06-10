@@ -24,6 +24,11 @@ public protocol DirectAuthProvider: AnyObject {
     /// Poll a request. `token` is non-nil exactly once, on the first
     /// poll after approval, and is never persisted server-side.
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)?
+    /// Device-initiated cancel of an outstanding pairing request. Returns
+    /// true when a known request was moved to a terminal state, false when
+    /// the request is unknown/expired. Mirrors the approve/deny store edit
+    /// so a later `pairingRequestStatus` reports the terminal state.
+    func cancelPairingRequest(requestId: String) -> Bool
     func listDevices() -> [[String: Any]]
     func revokeDevice(_ id: String)
 }
@@ -36,6 +41,7 @@ public extension DirectAuthProvider {
         createPairingRequest(deviceName: deviceName)
     }
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? { nil }
+    func cancelPairingRequest(requestId: String) -> Bool { false }
 }
 
 /// Thread-safe counters for active WS connections, backpressure, and
@@ -430,7 +436,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // it makes every LAN connect fail with 401 → permanent
         // "Not authorized". It must be exempt like discovery.
         if !bindLoopbackOnly, path.hasPrefix("/v1"),
-           !["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem", "/v1/pair/status"].contains(path),
+           !["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem", "/v1/pair/status", "/v1/pair/cancel"].contains(path),
            let auth = auth {
             let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
             if let t = token, auth.verify(token: t) {
@@ -528,6 +534,24 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let d = s.deviceId { resp["device_id"] = d }
             if let t = s.token { resp["token"] = t }
             sendJSON(fd: fd, status: 200, body: resp, acceptEncoding: headers["accept-encoding"])
+        case ("POST", "/v1/pair/cancel"):
+            // Device-initiated cancel of its own outstanding request. Moves
+            // the request to a terminal state so the Mac modal can dismiss
+            // and the outstanding-request slot is freed. Unauthenticated,
+            // same allowlist as /v1/pair/status above.
+            guard let auth = auth else {
+                send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
+            }
+            guard let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+                  let requestId = obj["request_id"] as? String else {
+                send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
+            }
+            if auth.cancelPairingRequest(requestId: requestId) {
+                pairingThrottle.releaseOutstanding(peer: peer)
+                sendJSON(fd: fd, status: 200, body: ["cancelled": true], acceptEncoding: headers["accept-encoding"])
+            } else {
+                send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!)
+            }
         case ("POST", "/v1/pair/redeem"):
             guard let auth = auth,
                   let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
