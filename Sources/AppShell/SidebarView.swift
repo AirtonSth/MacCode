@@ -456,9 +456,11 @@ public final class SidebarViewModel: ObservableObject {
 
     public func newWorkspace() {
         let panel = NSOpenPanel()
-        panel.canChooseFiles = false; panel.canChooseDirectories = true
-        if panel.runModal() == .OK, let url = panel.url {
-            _ = createWorkspace(fromFolder: url)
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            _ = createWorkspaces(fromFolders: Self.uniqueFolderURLs(panel.urls, excluding: workspaces))
         }
     }
 
@@ -497,6 +499,30 @@ public final class SidebarViewModel: ObservableObject {
         return workspaces.first { ws in
             URL(fileURLWithPath: ws.cwd).standardizedFileURL.path == normalized
         }?.id
+    }
+
+    /// Pure helper: deduplicates a raw panel URL list before workspace-add.
+    ///
+    /// Removes:
+    /// - intra-selection duplicates (same standardized path appearing more than
+    ///   once, e.g. a folder and its alias both selected).
+    /// - URLs whose cwd already exists in `workspaces` (reuses the same
+    ///   path-normalization as `findExistingWorkspace(byCwd:in:)`).
+    ///
+    /// Input order is preserved.  This is the canonical single place for
+    /// multi-folder add dedup; `newWorkspace()` passes the NSOpenPanel result
+    /// here before calling `createWorkspaces(fromFolders:)`.
+    nonisolated public static func uniqueFolderURLs(
+        _ urls: [URL],
+        excluding workspaces: [Workspace]
+    ) -> [URL] {
+        var seen = Set<String>()
+        return urls.compactMap { url in
+            let path = url.standardizedFileURL.path
+            guard seen.insert(path).inserted else { return nil }
+            guard findExistingWorkspace(byCwd: url, in: workspaces) == nil else { return nil }
+            return url
+        }
     }
 
     /// P2-SIDEBAR-SEPARATOR: Returns the index at which a pinned/unpinned
