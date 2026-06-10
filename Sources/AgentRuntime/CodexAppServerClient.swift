@@ -387,8 +387,11 @@ public final class CodexAppServerClient: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object)
         var line = data
         line.append(0x0A)
-        writeQueue.sync {
-            stdinPipe.fileHandleForWriting.write(line)
+        try writeQueue.sync {
+            try GuardedStdinWrite.write(line,
+                                        to: stdinPipe.fileHandleForWriting,
+                                        process: process,
+                                        notFound: { CodexAppServerError.processExited })
         }
     }
 

@@ -650,8 +650,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let data = try JSONSerialization.data(withJSONObject: payload)
         var line = data
         line.append(0x0A)
-        session.writeQueue.sync {
-            session.stdinPipe.fileHandleForWriting.write(line)
+        try session.writeQueue.sync {
+            try GuardedStdinWrite.write(line,
+                                        to: session.stdinPipe.fileHandleForWriting,
+                                        process: session.process,
+                                        notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })
         }
     }
 
