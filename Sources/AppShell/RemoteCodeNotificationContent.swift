@@ -7,10 +7,45 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
     public let title: String
     public let body: String
     public let categoryIdentifier: String
+    public let threadIdentifier: String
     public let userInfo: [String: String]
 
     public static let threadUpdateCategoryIdentifier = "RemoteCodeThreadUpdate"
     public static let openActionIdentifier = "thread.open"
+
+    /// Pure helper: maps a run outcome to (title, body, identifier suffix, threadIdentifier).
+    /// Extracted for testability without touching UNUserNotificationCenter.
+    nonisolated static func outcomeNotificationParts(
+        threadId: String,
+        displayTitle: String,
+        phase: AgentRunStatus
+    ) -> (title: String, body: String, identifierSuffix: String, threadIdentifier: String)? {
+        switch phase {
+        case .completed:
+            return (
+                title: "Thread finished",
+                body: "\(displayTitle) response is ready.",
+                identifierSuffix: "completed",
+                threadIdentifier: threadId
+            )
+        case .failed, .interrupted:
+            return (
+                title: "Thread failed",
+                body: "\(displayTitle) ended with an error.",
+                identifierSuffix: "failed",
+                threadIdentifier: threadId
+            )
+        case .cancelled:
+            return (
+                title: "Thread cancelled",
+                body: "\(displayTitle) was stopped before finishing.",
+                identifierSuffix: "cancelled",
+                threadIdentifier: threadId
+            )
+        case .pending, .running:
+            return nil
+        }
+    }
 
     public static func threadOutcome(
         threadId: String,
@@ -20,26 +55,21 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
 
-        switch phase {
-        case .completed:
-            return RemoteCodeNotificationContent(
-                identifier: "thread.\(threadId).completed",
-                title: "Thread finished",
-                body: "\(displayTitle) response is ready.",
-                categoryIdentifier: Self.threadUpdateCategoryIdentifier,
-                userInfo: ["threadId": threadId, "outcome": "completed"]
-            )
-        case .failed, .cancelled, .interrupted:
-            return RemoteCodeNotificationContent(
-                identifier: "thread.\(threadId).failed",
-                title: "Thread failed",
-                body: "\(displayTitle) ended with an error.",
-                categoryIdentifier: Self.threadUpdateCategoryIdentifier,
-                userInfo: ["threadId": threadId, "outcome": "failed"]
-            )
-        case .pending, .running:
-            return nil
-        }
+        guard let parts = outcomeNotificationParts(
+            threadId: threadId,
+            displayTitle: displayTitle,
+            phase: phase
+        ) else { return nil }
+
+        let outcome = parts.identifierSuffix
+        return RemoteCodeNotificationContent(
+            identifier: "thread.\(threadId).\(outcome)",
+            title: parts.title,
+            body: parts.body,
+            categoryIdentifier: Self.threadUpdateCategoryIdentifier,
+            threadIdentifier: parts.threadIdentifier,
+            userInfo: ["threadId": threadId, "outcome": outcome]
+        )
     }
 
     public func makeRequest() -> UNNotificationRequest {
@@ -48,6 +78,7 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         content.body = body
         content.sound = .default
         content.categoryIdentifier = categoryIdentifier
+        content.threadIdentifier = threadIdentifier
         content.userInfo = userInfo
         return UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
     }
