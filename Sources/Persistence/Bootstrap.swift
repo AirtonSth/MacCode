@@ -8,6 +8,25 @@ public struct BootstrapReport: Equatable {
     public let path: String
     public let firstRun: Bool
     public let touchedPaths: [String]
+    public let recoveredFromCorruption: Bool
+
+    public init(
+        createdAppSupport: Bool,
+        createdSchema: Bool,
+        schemaVersion: Int,
+        path: String,
+        firstRun: Bool,
+        touchedPaths: [String],
+        recoveredFromCorruption: Bool = false
+    ) {
+        self.createdAppSupport = createdAppSupport
+        self.createdSchema = createdSchema
+        self.schemaVersion = schemaVersion
+        self.path = path
+        self.firstRun = firstRun
+        self.touchedPaths = touchedPaths
+        self.recoveredFromCorruption = recoveredFromCorruption
+    }
 }
 
 public final class Bootstrap {
@@ -34,17 +53,74 @@ public final class Bootstrap {
         let dbPath = dbPathOverride ?? supportURL.appendingPathComponent("remotecode.sqlite").path
         let firstRun = !FileManager.default.fileExists(atPath: dbPath)
         touched.append(dbPath)
+
+        do {
+            let db = try openAndMigrate(dbPath: dbPath)
+            return (BootstrapReport(
+                createdAppSupport: createdAS,
+                createdSchema: firstRun,
+                schemaVersion: Schema.currentVersion,
+                path: dbPath,
+                firstRun: firstRun,
+                touchedPaths: touched,
+                recoveredFromCorruption: false
+            ), db)
+        } catch let error where Bootstrap.isCorruptionFailure(error) {
+            // The existing DB (or its WAL/SHM) is unusable. Quarantine the bad files
+            // under .corrupt-<ts> names instead of terminating, then recreate fresh so
+            // the app can keep running and surface a "previous data backed up" dialog.
+            let timestamp = Bootstrap.corruptBackupTimestamp(Date())
+            for (original, backup) in Bootstrap.corruptBackupNames(dbPath: dbPath, timestamp: timestamp) {
+                if FileManager.default.fileExists(atPath: original) {
+                    try? FileManager.default.removeItem(atPath: backup)
+                    try FileManager.default.moveItem(atPath: original, toPath: backup)
+                }
+            }
+            let db = try openAndMigrate(dbPath: dbPath)
+            return (BootstrapReport(
+                createdAppSupport: createdAS,
+                createdSchema: true,
+                schemaVersion: Schema.currentVersion,
+                path: dbPath,
+                firstRun: true,
+                touchedPaths: touched,
+                recoveredFromCorruption: true
+            ), db)
+        }
+    }
+
+    private func openAndMigrate(dbPath: String) throws -> SQLiteDB {
         let db = try SQLiteDB(path: dbPath)
         try Schema.migrate(db)
         try initDefaults(db: db)
-        return (BootstrapReport(
-            createdAppSupport: createdAS,
-            createdSchema: firstRun,
-            schemaVersion: Schema.currentVersion,
-            path: dbPath,
-            firstRun: firstRun,
-            touchedPaths: touched
-        ), db)
+        return db
+    }
+
+    /// Files to quarantine when the database is corrupt: the db itself plus its
+    /// WAL/SHM siblings, each renamed to `<file>.corrupt-<timestamp>`.
+    /// Pure helper (no I/O, no Date()) so the naming contract is deterministically testable.
+    nonisolated public static func corruptBackupNames(
+        dbPath: String,
+        timestamp: String
+    ) -> [(original: String, backup: String)] {
+        [dbPath, dbPath + "-wal", dbPath + "-shm"].map { original in
+            (original: original, backup: original + ".corrupt-" + timestamp)
+        }
+    }
+
+    nonisolated private static func corruptBackupTimestamp(_ date: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withTimeZone]
+        return f.string(from: date)
+    }
+
+    nonisolated private static func isCorruptionFailure(_ error: Error) -> Bool {
+        switch error {
+        case is SQLiteError, is SchemaError:
+            return true
+        default:
+            return false
+        }
     }
 
     private func initDefaults(db: SQLiteDB) throws {
