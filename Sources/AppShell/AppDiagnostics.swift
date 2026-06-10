@@ -8,25 +8,79 @@ import os
 private let appDiagnosticsLog = Logger(subsystem: "io.remotecode.app", category: "diagnostics")
 
 enum AppDiagnostics {
-    @MainActor
-    static func heartbeat(reason: String, activeAgentThreads: Int) {
-        let surfaces = SurfaceRegistry.shared.all()
-        let terminalHealth = surfaces.compactMap { ($0 as? TerminalSurface)?.runtimeHealth() }
-        let runningTerminals = terminalHealth.filter(\.processAlive).count
-        let pendingBytes = terminalHealth.reduce(0) { $0 + $1.outputPendingBytes }
-        let droppedBytes = terminalHealth.reduce(0) { $0 + $1.droppedOutputBytes }
-        let historyFailures = terminalHealth.reduce(0) { $0 + $1.historyWriteFailures }
-        let providerProcesses = ProviderProcessSweeper.currentProviderProcesses()
-        let providerRSSKB = providerProcesses.reduce(0) { $0 + $1.rssKB }
-        let orphanProviders = providerProcesses.filter { $0.ppid == 1 }.count
-        let rssKB = currentProcessFootprintKB()
+    /// Snapshot of surface-level counters captured on the main actor before
+    /// dispatching the blocking process scan to a background task.
+    struct SurfaceSnapshot: Sendable {
+        let surfaceCount: Int
+        let terminalCount: Int
+        let runningTerminals: Int
+        let pendingBytes: Int
+        let droppedBytes: Int
+        let historyFailures: Int
+    }
 
-        appDiagnosticsLog.info(
-            "app.heartbeat reason=\(reason, privacy: .public) pid=\(ProcessInfo.processInfo.processIdentifier, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(surfaces.count, privacy: .public) terminals=\(terminalHealth.count, privacy: .public) runningTerminals=\(runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerProcesses=\(providerProcesses.count, privacy: .public) providerRSSKB=\(providerRSSKB, privacy: .public) orphanProviders=\(orphanProviders, privacy: .public) terminalPendingBytes=\(pendingBytes, privacy: .public) terminalDroppedBytes=\(droppedBytes, privacy: .public) terminalHistoryFailures=\(historyFailures, privacy: .public)"
+    /// Aggregated provider-process stats derived from a list of processes.
+    /// Pure, `nonisolated`-safe: no actor context required.
+    ///
+    /// WHY: the caller (`heartbeat`) dispatches `currentProviderProcesses()`
+    /// to a background queue; the aggregation must therefore be testable in
+    /// isolation without any actor or AppKit state.
+    struct ProviderStats: Sendable {
+        let processCount: Int
+        let totalRSSKB: Int
+        let orphanCount: Int
+    }
+
+    /// Aggregates provider stats from a list of processes.
+    /// This is the pure helper that runs off the main thread in `heartbeat`.
+    nonisolated static func aggregateProviderStats(
+        processes: [ProviderRuntimeProcess]
+    ) -> ProviderStats {
+        ProviderStats(
+            processCount: processes.count,
+            totalRSSKB: processes.reduce(0) { $0 + $1.rssKB },
+            orphanCount: processes.filter { $0.ppid == 1 }.count
         )
     }
 
-    private static func currentProcessFootprintKB() -> Int {
+    /// Heartbeat entry point — must remain `@MainActor` because it reads
+    /// `SurfaceRegistry` (itself `@MainActor`).
+    ///
+    /// The blocking work (`/bin/ps` via `currentProviderProcesses`) is
+    /// dispatched to a background `Task` with `.utility` priority so it
+    /// never competes with UI rendering on the main thread. The log entry
+    /// is written back on the main actor once the scan completes.
+    @MainActor
+    static func heartbeat(reason: String, activeAgentThreads: Int) {
+        // Snapshot main-actor surface state before leaving the actor.
+        let surfaces = SurfaceRegistry.shared.all()
+        let terminalHealth = surfaces.compactMap { ($0 as? TerminalSurface)?.runtimeHealth() }
+        let snapshot = SurfaceSnapshot(
+            surfaceCount: surfaces.count,
+            terminalCount: terminalHealth.count,
+            runningTerminals: terminalHealth.filter(\.processAlive).count,
+            pendingBytes: terminalHealth.reduce(0) { $0 + $1.outputPendingBytes },
+            droppedBytes: terminalHealth.reduce(0) { $0 + $1.droppedOutputBytes },
+            historyFailures: terminalHealth.reduce(0) { $0 + $1.historyWriteFailures }
+        )
+        // Cheap mach call; no I/O — sample here while still on the main actor.
+        let rssKB = currentProcessFootprintKB()
+        let pid = ProcessInfo.processInfo.processIdentifier
+
+        // Dispatch the blocking /bin/ps scan off the main thread.
+        Task.detached(priority: .utility) {
+            let processes = ProviderProcessSweeper.currentProviderProcesses()
+            let stats = aggregateProviderStats(processes: processes)
+            await MainActor.run {
+                appDiagnosticsLog.info(
+                    "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerProcesses=\(stats.processCount, privacy: .public) providerRSSKB=\(stats.totalRSSKB, privacy: .public) orphanProviders=\(stats.orphanCount, privacy: .public) terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    // internal (not private) so Tests/@testable can verify the mach call succeeds.
+    static func currentProcessFootprintKB() -> Int {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {
