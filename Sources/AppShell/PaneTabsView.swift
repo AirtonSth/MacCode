@@ -762,6 +762,12 @@ public final class PaneTabsView: NSObject {
     }
 
     private func appendDroppedSurface(_ surface: SurfaceID) -> Bool {
+        // Guard the lone-tab self-drop: re-dropping a pane's only surface onto its
+        // own tab strip would remove-then-reinsert into a pane that the removal can
+        // prune, risking data loss. It is also a visual no-op, so refuse it early.
+        if pane.surfaces.count == 1, pane.surfaces.first?.id == surface {
+            return false
+        }
         let position = adjustedPositionForSamePane(surface, targetPosition: pane.surfaces.count)
         return performReorderSurface(surface, toPane: pane.id, position: position)
     }

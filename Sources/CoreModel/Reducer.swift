@@ -198,6 +198,11 @@ public struct LayoutReducer {
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
             guard let desc = findSurface(in: ws.layout, id: sid) else { throw LayoutError.surfaceNotFound }
             ws.layout = try removeSurface(in: ws.layout, surfaceID: sid)
+            // Guard the lone-tab self-reorder data-loss path: removing the dragged
+            // surface can prune its (now-empty) pane, so the target pane may have
+            // vanished. insertSurface silently no-ops on a missing pane, which would
+            // drop the surface. Refuse instead of losing data.
+            guard ws.layout.find(paneID: toPane) != nil else { throw LayoutError.paneNotFound }
             ws.layout = try insertSurface(in: ws.layout, paneID: toPane, descriptor: desc, position: position)
             next.workspaces[wid] = ws
             return next
