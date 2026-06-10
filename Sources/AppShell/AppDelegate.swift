@@ -11,7 +11,7 @@ import os
 private let appLifecycleLog = Logger(subsystem: "io.remotecode.app", category: "lifecycle")
 
 @MainActor
-public final class AppDelegate: NSObject, NSApplicationDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     public var context: AppContext!
     public var router: AppCommandRouter!
     public var windowController: MainWindowController!
@@ -368,9 +368,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
         appMenu.addItem(NSMenuItem(title: "About RemoteCode", action: #selector(showAbout), keyEquivalent: ""))
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        let settingsItem = NSMenuItem(title: "Settings\u{2026}", action: #selector(showSettings), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
+        let checkUpdatesItem = NSMenuItem(title: "Check for Updates\u{2026}", action: #selector(checkForUpdatesAction), keyEquivalent: "")
+        checkUpdatesItem.target = self
+        appMenu.addItem(checkUpdatesItem)
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "Hide RemoteCode", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         appMenu.addItem(NSMenuItem(title: "Quit RemoteCode", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -560,6 +564,28 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             settings?.show()
         }
+    }
+
+    @objc func checkForUpdatesAction() {
+        updater?.checkForUpdates()
+    }
+
+    // MARK: - NSMenuItemValidation
+
+    /// Pure helper: given a menu item action selector and whether an updater is
+    /// configured, returns whether the item should be enabled.
+    /// Extracted for unit-testing without any AppKit or @MainActor dependency.
+    public static func menuItemEnabled(action: Selector, updaterConfigured: Bool) -> Bool {
+        if action == #selector(AppDelegate.checkForUpdatesAction) {
+            return updaterConfigured
+        }
+        // All other items this delegate owns are unconditionally enabled.
+        return true
+    }
+
+    public func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard let action = menuItem.action else { return true }
+        return Self.menuItemEnabled(action: action, updaterConfigured: updater != nil)
     }
 
     @objc private func newWorkspace() {
