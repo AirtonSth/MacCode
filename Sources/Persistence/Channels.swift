@@ -22,6 +22,22 @@ public enum ReleaseChannel: String, Sendable {
     }
 }
 
+// MARK: - Bundle-ID derivation
+
+extension ReleaseChannel {
+    /// Derives the release channel from a CFBundleIdentifier string.
+    /// Priority: exact bundle-id match -> .debug fallback.
+    /// This is the inverse of `ReleaseChannel.bundleID` and is used at launch
+    /// so that a notarized stable bundle (io.remotecode.desktop) automatically
+    /// gets .stable without relying solely on the RC2_CHANNEL env var.
+    public static func channelFromBundleID(_ bundleID: String) -> ReleaseChannel {
+        for channel in [ReleaseChannel.stable, .canary, .debug] {
+            if channel.bundleID == bundleID { return channel }
+        }
+        return .debug
+    }
+}
+
 public enum AppPaths {
     public static func appSupportDirectory(for channel: ReleaseChannel, override: String? = nil) -> URL {
         if let override { return URL(fileURLWithPath: override) }

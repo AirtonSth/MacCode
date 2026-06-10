@@ -9,6 +9,18 @@ CONFIG="${RC2_CONFIG:-release}"
 DIST="dist"
 BUNDLE="RemoteCode.app"
 BUNDLE_ID="${RC2_BUNDLE_ID:-io.remotecode.desktop}"
+# Derive RC2_CHANNEL_VALUE from BUNDLE_ID so LSEnvironment is always consistent
+# with the bundle id — stable=io.remotecode.desktop, canary=io.remotecode.desktop.canary,
+# debug=io.remotecode.desktop.debug. RC2_CHANNEL env var always wins if set.
+if [ -n "${RC2_CHANNEL:-}" ]; then
+  RC2_CHANNEL_VALUE="$RC2_CHANNEL"
+elif [ "$BUNDLE_ID" = "io.remotecode.desktop" ]; then
+  RC2_CHANNEL_VALUE="stable"
+elif [ "$BUNDLE_ID" = "io.remotecode.desktop.canary" ]; then
+  RC2_CHANNEL_VALUE="canary"
+else
+  RC2_CHANNEL_VALUE="debug"
+fi
 VERSION="${RC2_VERSION:-2.0.37}"
 SPARKLE_FEED_URL="${RC2_SPARKLE_FEED_URL:-https://github.com/samuelfaj/remotecode.io/releases/latest/download/appcast.xml}"
 SPARKLE_PUBLIC_ED_KEY="${RC2_SPARKLE_PUBLIC_ED_KEY:-}"
@@ -151,6 +163,10 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSSupportsAutomaticTermination</key><false/>
   <key>NSSupportsSuddenTermination</key><false/>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>RC2_CHANNEL</key><string>${RC2_CHANNEL_VALUE}</string>
+  </dict>
 </dict>
 </plist>
 EOF
