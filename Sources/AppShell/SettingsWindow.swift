@@ -83,6 +83,46 @@ public struct AuditLogRowFormatter {
     }
 }
 
+/// Pure helpers for the keybindings config reveal button.
+///
+/// Extracted as a value type so tests can assert the path and template without
+/// touching the file system or running on MainActor.
+public struct KeybindingConfigReveal {
+    /// Absolute path to the user-editable keybindings config file.
+    /// Mirrors `KeybindingConfig.defaultPath` so the Reveal button and the
+    /// parser always agree on the file location.
+    public static var configPath: String {
+        NSHomeDirectory() + "/.remotecode/keybindings.json"
+    }
+
+    /// A valid JSON array with a commented header block that serves as a
+    /// starter template for new users. The file must be parseable by
+    /// `KeybindingConfig.parse` (empty array = no custom bindings).
+    public static var defaultTemplate: String {
+        """
+        // RemoteCode keybindings - edit and save; changes take effect immediately.
+        // Format: [{"key":"mod+shift+p","command":"commandPalette.toggle","when":"terminalFocus"}]
+        // "when" is optional. Modifiers: mod ctrl alt shift. Last matching rule wins.
+        []
+        """
+    }
+
+    /// Ensures the file exists (creating it with `defaultTemplate` if absent)
+    /// then asks Finder to reveal it. No-op if the file cannot be created.
+    @MainActor
+    public static func revealCreatingIfAbsent() {
+        let path = configPath
+        let url = URL(fileURLWithPath: path)
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: path) {
+            let dir = url.deletingLastPathComponent().path
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? defaultTemplate.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+}
+
 /// Pure, non-MainActor commit-policy helper for CLI path text fields.
 ///
 /// Business rule: a mid-edit draft must not trigger provider-adapter replacement
@@ -959,6 +999,19 @@ public struct SettingsView: View {
                 }
                 .buttonStyle(DSSecondaryButtonStyle())
                 .accessibilityIdentifier("settings.stateDirectory.reveal")
+            }
+            Text("Keybindings config")
+                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
+            HStack(spacing: DS.Space.md) {
+                Text(KeybindingConfigReveal.configPath)
+                    .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
+                    .textSelection(.enabled)
+                Spacer(minLength: 0)
+                Button("Reveal config") {
+                    KeybindingConfigReveal.revealCreatingIfAbsent()
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("settings.keybindingsConfig.reveal")
             }
         }
         .dsPanel(padding: DS.Space.lg)
