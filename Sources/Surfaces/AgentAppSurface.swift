@@ -1945,6 +1945,9 @@ public struct AgentAppView: View {
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
+    /// P1: true when the user has tapped the "N earlier items hidden" row to
+    /// reveal the pre-run history read-only. Reset to false on each new run.
+    @State private var transcriptHistoryRevealed = false
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -2289,7 +2292,7 @@ public struct AgentAppView: View {
         return items.suffix(liveTurnRenderableItemLimit).map(liveRenderableCopy)
     }
 
-    private enum TranscriptEntry: Identifiable {
+    enum TranscriptEntry: Identifiable {
         case message(AgentMessage)
         case turn(AssistantTurnSnapshot)
 
@@ -2309,6 +2312,17 @@ public struct AgentAppView: View {
                 return started.map { TimeInterval($0) / 1000 } ?? 0
             }
         }
+    }
+
+    /// Returns the ordered slice of `allItems` not present in `visibleWindow`.
+    /// These are the older entries hidden while a run is active, available for
+    /// read-only audit when the user taps the "N earlier items hidden" row.
+    nonisolated static func hiddenTranscriptSlice(
+        allItems: [TranscriptEntry],
+        visibleWindow: [TranscriptEntry]
+    ) -> [TranscriptEntry] {
+        let visibleIDs = Set(visibleWindow.map(\.id))
+        return allItems.filter { !visibleIDs.contains($0.id) }
     }
 
     // PERF-MAC_AGENT-001: the merged+sorted transcript is read from `body`, so
@@ -2882,7 +2896,10 @@ public struct AgentAppView: View {
                         // visible window and keep full history in the model.
                         VStack(alignment: .leading, spacing: 32) {
                             let entries = visibleTranscriptEntries
-                            let hiddenEntryCount = transcriptEntries.count - entries.count
+                            let hiddenEntries = Self.hiddenTranscriptSlice(
+                                allItems: transcriptEntries,
+                                visibleWindow: entries
+                            )
                             TimelineScrollFollower(
                                 slack: Self.timelineBottomRevealSlack,
                                 pinned: timelineSticksToBottom,
@@ -2894,8 +2911,22 @@ public struct AgentAppView: View {
                             // Full thread is loaded up front (no infinite-scroll paging),
                             // so there are no top/bottom history sentinels and no per-row
                             // body hydrate/evict.
-                            if hiddenEntryCount > 0 {
-                                runningHiddenTranscriptRow(hiddenEntryCount)
+                            if !hiddenEntries.isEmpty {
+                                runningHiddenTranscriptRow(
+                                    hiddenEntries.count,
+                                    revealed: transcriptHistoryRevealed,
+                                    onReveal: { transcriptHistoryRevealed = true }
+                                )
+                            }
+                            if transcriptHistoryRevealed {
+                                ForEach(hiddenEntries) { entry in
+                                    switch entry {
+                                    case .message(let message):
+                                        messageRow(message)
+                                    case .turn(let turn):
+                                        turnView(turn)
+                                    }
+                                }
                             }
                             ForEach(entries) { entry in
                                 switch entry {
@@ -2982,6 +3013,11 @@ public struct AgentAppView: View {
                 }
             }
             .onChange(of: vm.status) { _ in scheduleTimelineScrollToBottom(proxy) }
+            // P1: collapse revealed history whenever a new run starts so the
+            // window resets to the live context automatically.
+            .onChange(of: vm.runStartedAt) { newValue in
+                if newValue != nil { transcriptHistoryRevealed = false }
+            }
         }
     }
 
@@ -3471,21 +3507,35 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func runningHiddenTranscriptRow(_ count: Int) -> some View {
-        HStack(spacing: DS.Space.sm) {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-            Text("\(count) earlier transcript items hidden while this run is active")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .lineLimit(1)
-            Spacer(minLength: 0)
+    private func runningHiddenTranscriptRow(
+        _ count: Int,
+        revealed: Bool,
+        onReveal: @escaping () -> Void
+    ) -> some View {
+        Button(action: { if !revealed { onReveal() } }) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: revealed ? "chevron.up" : "ellipsis")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(revealed
+                    ? "\(count) earlier transcript items (read-only)"
+                    : "\(count) earlier transcript items hidden — tap to view")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.vertical, 6)
+            .background(DS.Palette.surface.opacity(0.55))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, DS.Space.sm)
-        .padding(.vertical, 6)
-        .background(DS.Palette.surface.opacity(0.55))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .buttonStyle(.plain)
+        .disabled(revealed)
+        .accessibilityLabel(revealed
+            ? "\(count) earlier transcript items visible, read-only"
+            : "Show \(count) earlier transcript items")
         .accessibilityIdentifier("agent.runningHiddenTranscript")
     }
 
