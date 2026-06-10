@@ -17,6 +17,10 @@ private let terminalLog = Logger(subsystem: "io.remotecode.surfaces", category: 
 @MainActor
 final class TerminalTextView: NSTextView {
     var onKey: ((Data) -> Void)?
+    /// Called when a paste is classified as requiring confirmation.
+    /// The receiver should present a sheet and, on confirmation, call
+    /// `onKey` with the text encoded as UTF-8.
+    var onPasteNeedsConfirm: ((String) -> Void)?
 
     convenience init() {
         self.init(frame: .zero)
@@ -112,7 +116,12 @@ final class TerminalTextView: NSTextView {
                 return false
             case "v":
                 let s = NSPasteboard.general.string(forType: .string) ?? ""
-                if let d = s.data(using: .utf8) { onKey?(d) }
+                switch PasteGuard.classify(s) {
+                case .safe:
+                    if let d = s.data(using: .utf8) { onKey?(d) }
+                case .needsConfirm:
+                    onPasteNeedsConfirm?(s)
+                }
                 return true
             case "a", "x": // select-all / cut-as-copy fall through to default copy
                 return super.performKeyEquivalent(with: event)
@@ -294,6 +303,52 @@ public enum TerminalRestartDecision {
         guard descriptor.type == .terminal,
               let cwd = descriptor.metadata["cwd"], !cwd.isEmpty else { return nil }
         return (cwd, descriptor.title)
+    }
+}
+
+// MARK: - Paste guard (pure, non-MainActor, testable)
+
+/// Classifies a candidate paste payload so the terminal can confirm before
+/// sending multi-line or control-character content to the shell.
+///
+/// Keeping this pure (no AppKit, no actor) lets unit tests cover the logic
+/// without a live UI.
+public enum PasteGuard {
+    /// The result of classifying a paste string.
+    public enum Classification: Equatable {
+        /// Safe to send immediately (single-line, no control characters).
+        case safe
+        /// Requires user confirmation before sending; `reason` is a
+        /// short human-readable explanation.
+        case needsConfirm(reason: String)
+    }
+
+    /// Whether bracketed-paste mode is enabled by default.
+    /// When `true`, the terminal should send the bracketed-paste escape
+    /// sequences (ESC[?2004h / ESC[?2004l) around pasted content.
+    public static let bracketedPasteEnabled = true
+
+    /// Classify `text` as safe or requiring confirmation.
+    ///
+    /// Rules:
+    /// - Empty → `.safe`
+    /// - Contains a newline character (`\n`, `\r`) → `.needsConfirm(reason: "multi-line")`
+    /// - Contains a C0 control character (U+0000–U+001F, excluding `\t`),
+    ///   DEL (U+007F), or ESC (U+001B) → `.needsConfirm(reason: "control-characters")`
+    /// - Otherwise → `.safe`
+    public static func classify(_ text: String) -> Classification {
+        guard !text.isEmpty else { return .safe }
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            // Newlines
+            if v == 0x0A || v == 0x0D { return .needsConfirm(reason: "multi-line") }
+            // C0 controls (0x00-0x1F) except horizontal tab (0x09)
+            // ESC (0x1B) is in this range and also blocked
+            if v <= 0x1F && v != 0x09 { return .needsConfirm(reason: "control-characters") }
+            // DEL
+            if v == 0x7F { return .needsConfirm(reason: "control-characters") }
+        }
+        return .safe
     }
 }
 
