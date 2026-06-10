@@ -68,13 +68,35 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private let openTimeout: TimeInterval
     private let rollbackTimeout: TimeInterval
 
+    // Model-list cache (guarded by `lock`).
+    private var cachedModels: [AgentModelDescriptor]? = nil
+    private var modelCacheLastFetchedAt: Date? = nil
+    private let modelCacheTTL: TimeInterval
+    // Injectable for tests; production default calls CodexAppServerModelDiscovery.
+    private let modelListDiscovery: @Sendable () async -> [AgentModelDescriptor]
+
     public init(binaryNameOverride: String? = nil,
                 clientFactory: ClientFactory? = nil,
                 openTimeout: TimeInterval = 10,
-                rollbackTimeout: TimeInterval = 30) {
+                rollbackTimeout: TimeInterval = 30,
+                modelCacheTTL: TimeInterval = 300,
+                modelListDiscovery: (@Sendable () async -> [AgentModelDescriptor])? = nil) {
         self.binaryNameOverride = binaryNameOverride
         self.openTimeout = openTimeout
         self.rollbackTimeout = rollbackTimeout
+        self.modelCacheTTL = modelCacheTTL
+        if let modelListDiscovery {
+            self.modelListDiscovery = modelListDiscovery
+        } else {
+            let nameOverride = binaryNameOverride
+            self.modelListDiscovery = {
+                let binary = nameOverride ?? "codex"
+                return await CodexAppServerModelDiscovery.listModels(
+                    binary: binary,
+                    cwd: FileManager.default.currentDirectoryPath
+                )
+            }
+        }
         self.clientFactory = clientFactory ?? { request, notificationHandler, serverRequestHandler in
             let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                 ? request.providerBinary!
@@ -91,7 +113,48 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        await CodexRunner(binaryNameOverride: binaryNameOverride).listModels()
+        return await resolvedModels(forceRefresh: false)
+    }
+
+    /// Force the next `listModels()` call to bypass the TTL and re-fetch from
+    /// the live Codex app-server. Call when the user explicitly refreshes the
+    /// model picker. The method itself triggers one fetch immediately.
+    public func refreshModels() async -> [AgentModelDescriptor] {
+        return await resolvedModels(forceRefresh: true)
+    }
+
+    private func resolvedModels(forceRefresh: Bool) async -> [AgentModelDescriptor] {
+        let now = Date()
+        // Read cached value under lock.
+        lock.lock()
+        let cached = cachedModels
+        let lastFetched = modelCacheLastFetchedAt
+        lock.unlock()
+
+        let needsFetch = forceRefresh || ModelListTTLDecision.shouldRefetch(
+            lastFetchedAt: lastFetched,
+            ttl: modelCacheTTL,
+            now: now
+        )
+
+        if !needsFetch, let cached {
+            return cached
+        }
+
+        // Attempt live discovery.
+        let discovered = await modelListDiscovery()
+
+        if !discovered.isEmpty {
+            lock.lock()
+            cachedModels = discovered
+            modelCacheLastFetchedAt = now
+            lock.unlock()
+            return discovered
+        }
+
+        // Fallback: return the hardcoded list from CodexRunner (always non-empty).
+        let fallback = await CodexRunner(binaryNameOverride: binaryNameOverride).listModels()
+        return fallback
     }
 
     public func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
