@@ -363,6 +363,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         streamEventsSincePrune.removeValue(forKey: threadId)
         pendingStreamWrites.removeValue(forKey: threadId)
         lastStreamFlushMs.removeValue(forKey: threadId)
+        // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
+        // cancelled threads do not retain their final-answer text indefinitely.
+        lastPersistedAssistantContent.removeValue(forKey: threadId)
         lock.unlock()
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)
@@ -720,7 +723,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return nil
         }
         guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-            lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
+            // Warm the cache on history-scan hit too, subject to the same size cap.
+            let byteCountHit = text.utf8.count
+            if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCountHit) {
+                lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
+            }
             return nil
         }
         let message = AgentMessage(threadId: threadId, role: .assistant, content: text)
@@ -730,7 +737,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             emitPersistenceIssue("message.append.assistant", error: error, runId: runId, threadId: threadId)
             return nil
         }
-        lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
+        // PERF-MAC_AGENT-008: only cache if the entry is within the byte cap;
+        // oversized entries skip the cache and rely on the full-history scan for
+        // dedup, bounding per-entry retained memory for very long responses.
+        let byteCount = text.utf8.count
+        if !Self.shouldEvictLastPersistedContent(threadClosed: false, entryByteCount: byteCount) {
+            lock.lock(); lastPersistedAssistantContent[threadId] = text; lock.unlock()
+        }
         onMessageAppended?(message)
         return message
     }
@@ -1012,6 +1025,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // above; drop the per-thread batch + flush clock so they don't leak.
             pendingStreamWrites.removeValue(forKey: threadId)
             lastStreamFlushMs.removeValue(forKey: threadId)
+            // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
+            // finished threads do not retain their final-answer text indefinitely.
+            lastPersistedAssistantContent.removeValue(forKey: threadId)
             lock.unlock()
             if pendingPrune {
                 do {
@@ -1405,6 +1421,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             items.removeAll(keepingCapacity: true)
             return snapshot
         }
+    }
+
+    // PERF-MAC_AGENT-008: the lastPersistedAssistantContent dedup cache stores one
+    // String per thread and is only removed on revertThreadToCheckpoint. In
+    // multi-thread sessions the dead entries accumulate and can retain MBs of final-
+    // answer text. Evict the entry on thread close/idle (finished or cancelled) and
+    // refuse to cache entries whose UTF-8 byte count exceeds the cap (they fall back
+    // to the full-history dedup scan, which is correct and rare).
+    //
+    // lastPersistedAssistantContentSizeCap: entries larger than this are not held in
+    // the cache, bounding the per-entry overhead for extremely long responses.
+    nonisolated static let lastPersistedAssistantContentSizeCap = 32_768
+
+    /// Pure eviction decision for the lastPersistedAssistantContent dedup cache.
+    /// Evict when the thread is no longer active (closed/idle) OR when the entry
+    /// is oversized. nonisolated so it is directly unit-testable.
+    nonisolated static func shouldEvictLastPersistedContent(
+        threadClosed: Bool,
+        entryByteCount: Int,
+        sizeCapBytes: Int = lastPersistedAssistantContentSizeCap
+    ) -> Bool {
+        threadClosed || entryByteCount > sizeCapBytes
     }
 
     /// How many buffered stream events force a flush. Bounds both the in-memory
