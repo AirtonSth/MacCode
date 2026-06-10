@@ -678,6 +678,76 @@ public final class PaneTabsView: NSObject {
         return normalized[paneIndex] <= 0.08
     }
 
+    /// Pure keyboard-resize helper. Maps (direction, current ratios, paneIndex, step)
+    /// to new ratios with the target pane grown or shrunk by `step`.
+    ///
+    /// Direction semantics (matches tmux / iTerm muscle memory):
+    ///   .right / .down  -- grow the target pane (increase its ratio)
+    ///   .left  / .up    -- shrink the target pane (decrease its ratio)
+    ///
+    /// Invariants upheld:
+    ///   - sum of returned ratios == 1.0
+    ///   - every ratio is clamped to [min, 1 - min]
+    ///   - out-of-bounds paneIndex or single-pane ratios return input unchanged
+    ///
+    /// Pure: only arithmetic -- no AppKit, no MainActor.
+    nonisolated public static func paneResizeRatios(
+        direction: SplitDirection,
+        ratios: [Double],
+        paneIndex: Int,
+        step: Double = 0.05,
+        min: Double = 0.05
+    ) -> [Double] {
+        guard ratios.count > 1, ratios.indices.contains(paneIndex) else { return ratios }
+
+        let delta: Double = (direction == .right || direction == .down) ? step : -step
+
+        // Compute new target ratio, clamped.
+        let maxRatio = 1.0 - min
+        let rawTarget = ratios[paneIndex] + delta
+        let clampedTarget = Swift.max(min, Swift.min(maxRatio, rawTarget))
+
+        // If clamping absorbed the full delta the target pane is at a bound -- no-op.
+        guard clampedTarget != ratios[paneIndex] else { return ratios }
+
+        let actualDelta = clampedTarget - ratios[paneIndex]
+
+        // Distribute the opposite delta evenly among the other panes.
+        let otherCount = Double(ratios.count - 1)
+        let sharePerOther = -actualDelta / otherCount
+
+        var result = ratios.indices.map { i -> Double in
+            if i == paneIndex { return clampedTarget }
+            return ratios[i] + sharePerOther
+        }
+
+        // Re-normalize to guarantee sum == 1 despite floating-point drift.
+        result = SplitNode.normalize(result)
+        return result
+    }
+
+    /// Keyboard pane resize: adjust the enclosing split's ratios by one step in
+    /// the given arrow direction and route through the paneResize reducer.
+    /// Returns false when there is no splitContext or the router call fails.
+    @discardableResult
+    public func performKeyboardPaneResize(direction: SplitDirection, step: Double = 0.05) -> Bool {
+        guard let wid = currentWorkspaceID(), let splitContext else { return false }
+        let newRatios = Self.paneResizeRatios(
+            direction: direction,
+            ratios: splitContext.ratios,
+            paneIndex: splitContext.paneIndex,
+            step: step
+        )
+        // No-op if ratios are unchanged (already at bound).
+        guard newRatios != splitContext.ratios else { return false }
+        do {
+            try router?.paneResize(workspace: wid, splitID: splitContext.splitID, ratios: newRatios)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// Testable drop-position math. The index is the count of tab
     /// midpoints strictly left of the drop point.
     public static func dropInsertionIndex(tabMidXs: [CGFloat], dropX: CGFloat) -> Int {
