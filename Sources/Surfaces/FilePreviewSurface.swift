@@ -30,9 +30,32 @@ public struct FilePreviewScrollCache {
     }
 }
 
+// Render strategy for a given file extension.
+// .native  - handled by a first-class renderer (image / PDF / text).
+// .quicklook - no native renderer; fall back to QLPreviewView.
+public enum FileRenderStrategy: Equatable {
+    case native
+    case quicklook
+}
+
 @MainActor
 public final class FilePreviewSurface: NSObject, Surface {
     private nonisolated static let maxTextPreviewBytes = 512 * 1024
+
+    /// Pure helper: decide render strategy from a lowercased file extension.
+    /// Never touches AppKit state; safe to call from any isolation context.
+    public nonisolated static func renderStrategy(for ext: String) -> FileRenderStrategy {
+        let lowered = ext.lowercased()
+        let nativeExts: Set<String> = [
+            "png", "jpg", "jpeg", "gif", "bmp", "tiff", "heic", "webp",
+            "pdf",
+            "txt", "md", "swift", "py", "js", "ts", "json", "yaml", "yml",
+            "sh", "bash", "zsh", "rb", "go", "rs", "c", "cpp", "h", "hpp",
+            "java", "kt", "cs", "html", "css", "xml", "toml", "ini", "cfg",
+            "log", "gitignore", "env"
+        ]
+        return nativeExts.contains(lowered) ? .native : .quicklook
+    }
 
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
@@ -78,12 +101,17 @@ public final class FilePreviewSurface: NSObject, Surface {
             return
         }
         let ext = (p as NSString).pathExtension.lowercased()
-        if ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "heic", "webp"].contains(ext) {
-            renderImage(path: p)
-        } else if ext == "pdf" {
-            renderPDF(path: p)
-        } else {
-            renderText(path: p)
+        switch Self.renderStrategy(for: ext) {
+        case .quicklook:
+            renderQuickLook(path: p)
+        case .native:
+            if ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "heic", "webp"].contains(ext) {
+                renderImage(path: p)
+            } else if ext == "pdf" {
+                renderPDF(path: p)
+            } else {
+                renderText(path: p)
+            }
         }
     }
 
@@ -179,6 +207,16 @@ public final class FilePreviewSurface: NSObject, Surface {
         }
         let suffix = data.count > limit ? "at least " : ""
         return "[binary file, \(suffix)\(data.count) bytes]"
+    }
+
+    private func renderQuickLook(path: String) {
+        let ql = QLPreviewView()
+        ql.previewItem = URL(fileURLWithPath: path) as QLPreviewItem
+        ql.autostarts = true
+        ql.translatesAutoresizingMaskIntoConstraints = false
+        ql.setAccessibilityIdentifier("filePreview.quicklook")
+        containerStack.addSubview(ql)
+        pin(ql)
     }
 
     private func pin(_ v: NSView) {
