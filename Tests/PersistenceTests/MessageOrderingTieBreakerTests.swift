@@ -30,9 +30,12 @@ final class MessageOrderingTieBreakerTests: XCTestCase {
 
         // UUID ordering (alphabetic) is INTENTIONALLY inverse to insertion order so the
         // test fails if ORDER BY uses 'id' instead of 'rowid'.
-        // "z-first" would sort AFTER "a-second" alphabetically, but "z-first" is inserted
-        // FIRST, so rowid-order returns ["z-first", "a-second"].
-        let idFirst  = AgentMessageID(UUID(uuidString: "ZFFFFFFF-0000-0000-0000-000000000001")!)
+        // idFirst's UUID sorts AFTER idSecond's alphabetically (F > A), but is
+        // inserted FIRST, so rowid-order returns [idFirst, idSecond] while a
+        // buggy ORDER BY id would invert them. ("F" not "Z": UUID hex is
+        // 0-9A-F; "Z" is invalid and made UUID(uuidString:) return nil -> the
+        // force-unwrap crashed the whole PersistenceTests process.)
+        let idFirst  = AgentMessageID(UUID(uuidString: "FFFFFFFF-0000-0000-0000-000000000001")!)
         let idSecond = AgentMessageID(UUID(uuidString: "A0000000-0000-0000-0000-000000000002")!)
 
         try mr.append(AgentMessage(id: idFirst,  threadId: tid, role: .user,      content: "z-first",  createdAt: sharedDate))
