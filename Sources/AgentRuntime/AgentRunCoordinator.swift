@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import CryptoKit
 import Persistence
 import os
 
@@ -1236,8 +1237,58 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                   let data = try? Data(contentsOf: url) else {
                 return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: nil)
             }
-            return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: data.base64EncodedString())
+            // P2: cap transient allocation + DB row size. Large or binary files
+            // are not base64'd into the checkpoint; we store a nil-content marker
+            // (same restore path as a deleted file -> restore from HEAD) and log
+            // a content hash so the skip is diagnosable.
+            let decision = Self.checkpointSnapshotDecision(
+                byteCount: data.count,
+                isBinary: Self.dataLooksBinary(data),
+                cap: Self.checkpointSnapshotByteCap,
+                hash: { Self.sha256Hex(data) }
+            )
+            switch decision {
+            case .snapshot:
+                return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: data.base64EncodedString())
+            case .skipMarker(let hash):
+                agentRunLog.info("checkpoint.snapshot.skipped path=\(file.path, privacy: .public) bytes=\(data.count, privacy: .public) hash=\(hash, privacy: .public)")
+                return AgentTurnCheckpointFileSnapshot(path: file.path, kind: file.kind, contentsBase64: nil)
+            }
         }
+    }
+
+    /// P2: per-file checkpoint snapshot decision. Pure + nonisolated so it is
+    /// directly unit-testable without standing up a coordinator. A file is only
+    /// base64-snapshotted when it is text AND within the byte cap; otherwise the
+    /// caller stores a content-hash skip marker instead of the bytes.
+    enum CheckpointSnapshotDecision: Equatable {
+        case snapshot
+        case skipMarker(hash: String)
+    }
+
+    /// 1 MiB. Files at or under this (and not binary) are snapshotted inline.
+    nonisolated static let checkpointSnapshotByteCap = 1 << 20
+
+    nonisolated static func checkpointSnapshotDecision(
+        byteCount: Int,
+        isBinary: Bool,
+        cap: Int,
+        hash: () -> String
+    ) -> CheckpointSnapshotDecision {
+        if isBinary || byteCount > cap {
+            return .skipMarker(hash: hash())
+        }
+        return .snapshot
+    }
+
+    /// Matches the repo's text/binary convention (GitDiff): a NUL byte anywhere
+    /// means the content cannot be treated as text.
+    nonisolated static func dataLooksBinary(_ data: Data) -> Bool {
+        data.contains(0)
+    }
+
+    nonisolated static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private func captureFileDiffs(files: [AgentTurnCheckpointFile], cwd: String) -> [AgentTurnCheckpointFileDiff] {
