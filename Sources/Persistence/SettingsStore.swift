@@ -72,10 +72,26 @@ public struct AppSettings: Codable, Sendable, Equatable {
     }
 }
 
+/// Minimal write surface used by SettingsStore. Allows injection of a
+/// test double without touching callers that use SettingsRepository directly.
+public protocol SettingsWriteRepository {
+    func get(_ key: String) throws -> String?
+    func set(_ key: String, _ value: String) throws
+}
+
+extension SettingsRepository: SettingsWriteRepository {}
+
 public final class SettingsStore {
-    private let repo: SettingsRepository
+    private let repo: any SettingsWriteRepository
     private let key = "app_settings"
+    /// Called on the calling thread when a user-initiated write fails.
+    /// Nil = silent (legacy behaviour, only use for non-user-initiated paths).
+    public var onWriteError: ((Error) -> Void)?
+
     public init(db: SQLiteDB) { self.repo = SettingsRepository(db: db) }
+
+    /// Seam for testing: inject any SettingsWriteRepository.
+    init(repo: any SettingsWriteRepository) { self.repo = repo }
 
     public func load() -> AppSettings {
         guard let json = try? repo.get(key), let data = json.data(using: .utf8),
@@ -88,7 +104,11 @@ public final class SettingsStore {
     public func save(_ settings: AppSettings) {
         guard let data = try? JSONEncoder().encode(settings),
               let json = String(data: data, encoding: .utf8) else { return }
-        try? repo.set(key, json)
+        do {
+            try repo.set(key, json)
+        } catch {
+            onWriteError?(error)
+        }
     }
 
     /// Read-modify-write a single field without clobbering the others.
