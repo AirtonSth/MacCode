@@ -94,6 +94,38 @@ hdiutil convert "$RW_DMG" \
 codesign --force --sign "$SIGN_IDENTITY" "$OUTPUT"
 codesign --verify --verbose=4 "$OUTPUT"
 
+# ---------------------------------------------------------------------------
+# Optional local notarization (Apple notary service + staple).
+#
+# Activate by setting:
+#   RC2_NOTARIZE=1
+#   RC2_NOTARIZE_PROFILE=<keychain-profile>   # created with:
+#       xcrun notarytool store-credentials <profile> \
+#           --apple-id <apple-id> \
+#           --team-id  <team-id> \
+#           --password <app-specific-password>
+#
+# The default path (RC2_NOTARIZE unset or empty) is completely unchanged.
+# ---------------------------------------------------------------------------
+if [[ "${RC2_NOTARIZE:-}" == "1" ]]; then
+  NOTARIZE_PROFILE="${RC2_NOTARIZE_PROFILE:-}"
+  if [[ -z "$NOTARIZE_PROFILE" ]]; then
+    echo "[package] RC2_NOTARIZE=1 requires RC2_NOTARIZE_PROFILE to be set" >&2
+    exit 1
+  fi
+
+  echo "[package] submitting $OUTPUT to Apple notary service (profile: $NOTARIZE_PROFILE)..."
+  xcrun notarytool submit "$OUTPUT" \
+    --keychain-profile "$NOTARIZE_PROFILE" \
+    --wait
+
+  echo "[package] stapling notarization ticket to $OUTPUT..."
+  xcrun stapler staple "$OUTPUT"
+
+  xcrun stapler validate "$OUTPUT"
+  echo "[package] notarization + staple verified OK"
+fi
+
 rm -rf "$DMG_ROOT" "$DMG_BUILD_ROOT" "$RW_DMG"
 
 echo "[package] dmg ready at $OUTPUT"
