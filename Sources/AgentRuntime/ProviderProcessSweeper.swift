@@ -163,6 +163,49 @@ public enum ProviderProcessSweeper {
             .compactMap(parsePSRow)
     }
 
+    // MARK: - Tagged-orphan periodic sweep
+
+    /// Entry point for the periodic sweeper.
+    /// Accepts `SpawnedProcessTag` records written by `ProcessSpawnTagger.tagProcess`
+    /// at spawn time. Injectable predicates keep the logic pure and fully testable.
+    ///
+    /// A tag is reapable when `ProcessSpawnTagger.isEligibleForReap` returns true
+    /// (alive AND older than minAge). `terminate(pgid)` is called for every eligible
+    /// pgid; the caller should use `killpg(pgid, SIGTERM/SIGKILL)` to reap the
+    /// whole process-group.
+    @discardableResult
+    public static func sweepTaggedOrphans(
+        tags: [SpawnedProcessTag],
+        minAge: TimeInterval = ProcessSpawnTagger.defaultMinAge,
+        isAlive: (pid_t) -> Bool,
+        now: Date = Date(),
+        terminate: (pid_t) -> Bool
+    ) -> ProviderProcessSweepResult {
+        var orphanRoots: [Int32] = []
+        var terminated: [Int32] = []
+        var failed: [Int32] = []
+        for tag in tags.sorted(by: { $0.pgid < $1.pgid }) {
+            guard ProcessSpawnTagger.isEligibleForReap(
+                pgid: tag.pgid,
+                spawnedAt: tag.spawnedAt,
+                minAge: minAge,
+                isAlive: isAlive,
+                now: now
+            ) else { continue }
+            orphanRoots.append(tag.pgid)
+            if terminate(tag.pgid) {
+                terminated.append(tag.pgid)
+            } else {
+                failed.append(tag.pgid)
+            }
+        }
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: orphanRoots,
+            terminatedPIDs: terminated,
+            failedPIDs: failed
+        )
+    }
+
     static func parsePSRow(_ row: Substring) -> ProviderRuntimeProcess? {
         let trimmed = row.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }

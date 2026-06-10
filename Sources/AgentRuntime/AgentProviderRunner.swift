@@ -2,6 +2,55 @@ import Foundation
 import Darwin
 import CoreModel
 
+// MARK: - Spawn tagging
+
+/// Immutable record written when a provider process is spawned.
+/// The pgid is set to the child pid via setpgid(0,0) so the periodic
+/// sweeper can identify and reap the process-group by its leader pid.
+public struct SpawnedProcessTag: Sendable, Equatable {
+    public let pgid: pid_t
+    public let spawnedAt: Date
+
+    public init(pgid: pid_t, spawnedAt: Date) {
+        self.pgid = pgid
+        self.spawnedAt = spawnedAt
+    }
+}
+
+/// Pure helpers for tagging a spawned provider process and deciding
+/// reap eligibility. nonisolated static so tests run without @MainActor.
+public enum ProcessSpawnTagger {
+    /// Default minimum age before a tagged process is eligible for reap.
+    public static let defaultMinAge: TimeInterval = 30.0
+
+    /// Call immediately after `proc.run()` to tag the child as a new
+    /// process-group leader (setpgid(pid, 0) == setpgid(pid, pid)).
+    /// Returns a tag on success, nil if the call fails (e.g. ESRCH race).
+    @discardableResult
+    public static func tagProcess(_ process: Process, now: Date = Date()) -> SpawnedProcessTag? {
+        let pid = process.processIdentifier
+        guard pid > 0 else { return nil }
+        let rc = Darwin.setpgid(pid, 0)
+        guard rc == 0 || errno == EPERM else { return nil }
+        return SpawnedProcessTag(pgid: pid, spawnedAt: now)
+    }
+
+    /// Pure eligibility decision: a tagged process is reapable when
+    ///   - it is still alive (process exists)
+    ///   - it has lived longer than minAge (not just freshly spawned)
+    /// The caller supplies isAlive and now so this stays fully testable.
+    public static func isEligibleForReap(
+        pgid: pid_t,
+        spawnedAt: Date,
+        minAge: TimeInterval = defaultMinAge,
+        isAlive: (pid_t) -> Bool,
+        now: Date = Date()
+    ) -> Bool {
+        guard isAlive(pgid) else { return false }
+        return now.timeIntervalSince(spawnedAt) >= minAge
+    }
+}
+
 public enum AgentRunEvent: Sendable {
     case event(AssistantEvent)
     case status(AgentRunStatus)
