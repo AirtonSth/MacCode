@@ -34,6 +34,39 @@ private func lifecycleSignalHandler(_ signo: Int32) {
     raise(signo)
 }
 
+// MARK: - Log rotation helpers (pure, no I/O - fully testable)
+
+/// Returns true when the current log file should be rotated before the next
+/// append. Rotation triggers when `size` exceeds `cap`. Both values must be
+/// non-negative; a zero cap disables rotation (cap == 0 => never rotate).
+public func shouldRotate(size: Int, cap: Int) -> Bool {
+    guard cap > 0 else { return false }
+    return size >= cap
+}
+
+/// Describes a pending rotation: the source file to rename and the destination
+/// it should be moved to. The caller owns all I/O.
+public struct LogRotationPlan: Equatable {
+    /// The live log file that will become the backup.
+    public let source: URL
+    /// Where the backup copy will land (overwrites any existing .1 backup).
+    public let backup: URL
+
+    public init(source: URL, backup: URL) {
+        self.source = source
+        self.backup = backup
+    }
+}
+
+/// Produces a rotation plan for `logURL` without touching the filesystem.
+/// The backup file gets a `.1` suffix appended to the source URL's last path
+/// component (e.g. `lifecycle.log` -> `lifecycle.log.1`).
+public func rotationPlan(for logURL: URL) -> LogRotationPlan {
+    let backupName = logURL.lastPathComponent + ".1"
+    let backup = logURL.deletingLastPathComponent().appendingPathComponent(backupName)
+    return LogRotationPlan(source: logURL, backup: backup)
+}
+
 /// Records app start/stop, periodic heartbeats and termination signals to a
 /// persistent on-disk log so a silent disappearance leaves a forensic trail even
 /// when the app was launched from a terminal (invisible to unified logging).
@@ -45,14 +78,26 @@ private func lifecycleSignalHandler(_ signo: Int32) {
 /// (SIGKILL/jetsam) with no chance to record anything. If an `atexit` line is
 /// present but no `will_terminate`, the process exited via `exit()` outside the
 /// AppKit terminate flow (e.g. a fatal `exit()` inside an embedded library).
+///
+/// Log rotation: before each append the file size is checked. When the file
+/// exceeds `rotationCapBytes` (default 2 MB) the log is renamed to
+/// `lifecycle.log.1` (overwriting any existing backup) and a fresh
+/// `lifecycle.log` is started. Only one backup generation is kept to bound
+/// disk usage.
 public final class AppLifecycleRecorder {
+    /// Default rotation cap: 2 MB.
+    public static let defaultRotationCapBytes: Int = 2 * 1024 * 1024
+
     private let directory: URL
     private let logURL: URL
     private let markerURL: URL
     private var heartbeatSeq = 0
+    /// Maximum lifecycle.log size before rotation. 0 = disabled.
+    public let rotationCapBytes: Int
 
-    public init(directory: URL) {
+    public init(directory: URL, rotationCapBytes: Int = AppLifecycleRecorder.defaultRotationCapBytes) {
         self.directory = directory
+        self.rotationCapBytes = rotationCapBytes
         self.logURL = directory.appendingPathComponent("lifecycle.log")
         self.markerURL = directory.appendingPathComponent("running.marker")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -146,6 +191,7 @@ public final class AppLifecycleRecorder {
     // MARK: Helpers
 
     private func append(_ text: String) {
+        rotateIfNeeded()
         let data = Data(text.utf8)
         if let handle = try? FileHandle(forWritingTo: logURL) {
             defer { try? handle.close() }
@@ -154,6 +200,20 @@ public final class AppLifecycleRecorder {
         } else {
             try? data.write(to: logURL)
         }
+    }
+
+    /// Rotates lifecycle.log -> lifecycle.log.1 when the current file size
+    /// meets or exceeds `rotationCapBytes`. The backup overwrites any existing
+    /// .1 file; only one backup generation is kept.
+    private func rotateIfNeeded() {
+        guard rotationCapBytes > 0 else { return }
+        let currentSize = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int) ?? 0
+        guard shouldRotate(size: currentSize, cap: rotationCapBytes) else { return }
+        let plan = rotationPlan(for: logURL)
+        // Overwrite any existing backup, then remove the live log so the next
+        // append creates a fresh file.
+        try? FileManager.default.removeItem(at: plan.backup)
+        try? FileManager.default.moveItem(at: plan.source, to: plan.backup)
     }
 
     private static func timestamp() -> String {

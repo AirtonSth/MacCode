@@ -423,6 +423,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // C5: ~/.remotecode/keybindings.json may rebind the palette.
         applyKeybindingOverride(to: paletteItem, command: "commandPalette.toggle")
         viewMenu.addItem(paletteItem)
+        viewMenu.addItem(.separator())
+        let revealDiagnostics = NSMenuItem(title: "Reveal Diagnostics in Finder", action: #selector(revealDiagnosticsInFinder), keyEquivalent: "")
+        revealDiagnostics.target = self
+        viewMenu.addItem(revealDiagnostics)
         viewItem.submenu = viewMenu
 
         // Surface
@@ -494,6 +498,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "RemoteCode"
         alert.informativeText = "Native Swift macOS rewrite. cmux-style panes + Agent App surface."
         alert.runModal()
+    }
+
+    /// Opens the diagnostics folder in Finder so users can locate and attach
+    /// lifecycle.log when filing a bug report about silent app disappearances.
+    @objc private func revealDiagnosticsInFinder() {
+        let dir = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
+            .appendingPathComponent("diagnostics", isDirectory: true)
+        // Ensure directory exists even if no events have been recorded yet.
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([dir])
     }
 
     /// Approve/deny modal for a device-initiated pairing request. The
