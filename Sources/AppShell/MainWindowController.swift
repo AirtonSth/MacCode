@@ -184,8 +184,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// targets die with them, so they must outlive a layout rebuild.
     private var paneControllers: [PaneTabsView] = []
     private var sidebarCollapsed = false
-    private static let defaultSidebarWidth: CGFloat = 444
-    private static let sidebarWidthSettingsKey = "sidebar.width"
+    static let defaultSidebarWidth: CGFloat = 444
+    static let sidebarWidthSettingsKey = "sidebar.width"
     private static let sidebarCollapsedSettingsKey = "sidebar.collapsed"
     /// IMP-MAC_SHELL_WINDOW-005: AppKit frame-autosave key for the main
     /// window so its size/position survive relaunch.
@@ -1067,7 +1067,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
     }
 
-    private static func storedSidebarWidth(context: AppContext) -> CGFloat {
+    static func storedSidebarWidth(context: AppContext) -> CGFloat {
         guard let raw = (try? context.settingsRepo.get(sidebarWidthSettingsKey)) ?? nil,
               let value = Double(raw) else {
             return defaultSidebarWidth
