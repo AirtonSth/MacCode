@@ -198,6 +198,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// One DispatchWorkItem replaces the previous on each tick; only the
     /// item that survives the 0.3 s idle period actually calls settingsRepo.
     private var sidebarWidthDebounceItem: DispatchWorkItem?
+    /// PERF-MAC_SHELL_WINDOW-004: coalesce refreshFromState calls per
+    /// runloop tick. Multiple requests arriving within one tick (e.g. an
+    /// agent event burst) share one scheduled async flush instead of each
+    /// triggering a full sidebar reload + signature walk.
+    private var hasPendingRefresh = false
     private let collapsedHeaderHeight: CGFloat = 34
     private var splitTopConstraint: NSLayoutConstraint?
     private var workspaceContentTopConstraint: NSLayoutConstraint?
@@ -550,6 +555,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
 
     public func refreshFromState() {
+        guard refreshCoalesceShouldSchedule(wasPending: hasPendingRefresh) else { return }
+        hasPendingRefresh = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.hasPendingRefresh = false
+            self._performRefreshFromState()
+        }
+    }
+
+    private func _performRefreshFromState() {
         let focusedInput = protectedFocusedView()
         sidebar.refresh()
         updateCollapsedWorkspaceHeader()
@@ -1100,6 +1115,22 @@ nonisolated func sidebarWidthShouldWrite(
 ) -> Bool {
     guard let last = lastWriteAt else { return true }
     return now.timeIntervalSince(last) >= interval
+}
+
+// MARK: - Refresh coalesce decision helper
+
+/// Returns whether a new async refresh flush should be scheduled.
+///
+/// Contract (enforced by RefreshCoalesceDecisionTests):
+///   - Returns true when no flush is pending (first or post-flush request).
+///   - Returns false when a flush is already pending (burst suppression).
+///
+/// Pure function: no side effects, no AppKit, no @MainActor needed.
+/// MainWindowController uses this to coalesce multiple refreshFromState()
+/// calls that arrive within the same runloop tick into a single flush,
+/// avoiding one sidebar.refresh() + signature walk per agent event.
+nonisolated func refreshCoalesceShouldSchedule(wasPending: Bool) -> Bool {
+    !wasPending
 }
 
 // MARK: - Detached workspace frame autosave helper
