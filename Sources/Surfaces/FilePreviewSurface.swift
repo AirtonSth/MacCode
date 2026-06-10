@@ -4,6 +4,32 @@ import ImageIO
 import Quartz
 import CoreModel
 
+// Pure scroll/page cache -- no AppKit deps; safe to test without a display.
+// Keyed by absolute file path. Scroll offset is a Y-axis CGFloat (points from top).
+// PDF page is a zero-based Int. Unknown key returns (offset: 0, page: 0).
+public struct FilePreviewScrollCache {
+    public struct Entry: Equatable {
+        public var scrollOffsetY: CGFloat
+        public var pdfPageIndex: Int
+        public init(scrollOffsetY: CGFloat = 0, pdfPageIndex: Int = 0) {
+            self.scrollOffsetY = scrollOffsetY
+            self.pdfPageIndex = pdfPageIndex
+        }
+    }
+
+    private var store: [String: Entry] = [:]
+
+    public init() {}
+
+    public mutating func store(path: String, entry: Entry) {
+        store[path] = entry
+    }
+
+    public func entry(for path: String) -> Entry {
+        store[path] ?? Entry()
+    }
+}
+
 @MainActor
 public final class FilePreviewSurface: NSObject, Surface {
     private nonisolated static let maxTextPreviewBytes = 512 * 1024
@@ -13,6 +39,7 @@ public final class FilePreviewSurface: NSObject, Surface {
     public private(set) var filePath: String?
     private let containerStack: NSView
     private var isVisible = true
+    var scrollCache = FilePreviewScrollCache()
 
     public init(workspaceID: WorkspaceID, filePath: String?, title: String = "preview") {
         self.descriptor = SurfaceDescriptor(
@@ -99,6 +126,13 @@ public final class FilePreviewSurface: NSObject, Surface {
         pdf.setAccessibilityIdentifier("filePreview.pdf")
         containerStack.addSubview(pdf)
         pin(pdf)
+        let saved = scrollCache.entry(for: path)
+        if saved.pdfPageIndex > 0,
+           let doc = pdf.document,
+           saved.pdfPageIndex < doc.pageCount,
+           let page = doc.page(at: saved.pdfPageIndex) {
+            pdf.go(to: page)
+        }
     }
 
     private func renderText(path: String) {
@@ -122,6 +156,11 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.string = Self.previewText(path: path)
         containerStack.addSubview(scroll)
         pin(scroll)
+        let saved = scrollCache.entry(for: path)
+        if saved.scrollOffsetY != 0 {
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: saved.scrollOffsetY))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
     }
 
     static func previewText(path: String, maxBytes: Int = FilePreviewSurface.maxTextPreviewBytes) -> String {
@@ -162,6 +201,17 @@ public final class FilePreviewSurface: NSObject, Surface {
     public func didBecomeHidden() {
         guard isVisible else { return }
         isVisible = false
+        if let path = filePath {
+            var entry = FilePreviewScrollCache.Entry()
+            for sub in containerStack.subviews {
+                if let scroll = sub as? NSScrollView {
+                    entry.scrollOffsetY = scroll.contentView.bounds.origin.y
+                } else if let pdf = sub as? PDFView {
+                    entry.pdfPageIndex = pdf.currentPage.flatMap { pdf.document?.index(for: $0) } ?? 0
+                }
+            }
+            scrollCache.store(path: path, entry: entry)
+        }
         for sub in containerStack.subviews { sub.removeFromSuperview() }
     }
     public func close() {}
