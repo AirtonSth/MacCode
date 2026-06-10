@@ -78,6 +78,44 @@ public enum FindResultFormatter {
     }
 }
 
+/// Builds the JS snippet used by BrowserSurface.waitFor to observe the DOM
+/// instead of polling on a 50 ms timer.
+/// Pure logic — no AppKit/WebKit/MainActor dependency — fully unit-testable.
+public enum BrowserWaitForJS {
+    /// Returns a self-executing JS expression that resolves to `true` once
+    /// `selector` appears in the document, or `false` on timeout.
+    ///
+    /// Implementation uses a MutationObserver so the page notifies Swift the
+    /// instant the element is inserted (O(1)) instead of a repeating 50 ms
+    /// asyncAfter chain (O(deadline/50ms) timer callbacks).
+    ///
+    /// - Parameters:
+    ///   - selector: CSS selector to wait for. Backtick characters are escaped
+    ///               so the selector is safe to embed inside a JS template literal.
+    ///   - timeoutMs: Maximum milliseconds to wait before resolving `false`.
+    /// - Returns: A JS string whose evaluation yields a `Promise<Bool>`.
+    public static func mutationObserverScript(selector: String, timeoutMs: Int) -> String {
+        // Escape backticks and backslashes so the selector is safe inside ``...``.
+        let escaped = selector
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "`", with: "\\`")
+        return """
+        (function(){
+          return new Promise(function(resolve){
+            if(document.querySelector(`\(escaped)`)){resolve(true);return;}
+            var t=setTimeout(function(){obs.disconnect();resolve(false);},\(timeoutMs));
+            var obs=new MutationObserver(function(){
+              if(document.querySelector(`\(escaped)`)){
+                clearTimeout(t);obs.disconnect();resolve(true);
+              }
+            });
+            obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true});
+          });
+        })()
+        """
+    }
+}
+
 @MainActor
 public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUIDelegate {
     public static let defaultInitialURLString = "https://www.remotecode.io/from-app"
@@ -670,27 +708,20 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     }
 
     public func waitFor(_ selector: String, timeoutMs: Int, completion: @escaping (String) -> Void) {
-        let deadline = Date().addingTimeInterval(TimeInterval(timeoutMs) / 1000.0)
-        let escaped = selector.replacingOccurrences(of: "`", with: "\\`")
         waitForToken &+= 1
         let token = waitForToken
-        func poll() {
-            let probe = "(function(){ return document.querySelector(`\(escaped)`) ? true : false; })()"
-            self.evaluate(probe) { [weak self] value, _ in
-                guard let self, !self.isClosed, self.waitForToken == token else {
-                    completion("{\"ok\":false,\"error\":\"cancelled\"}")
-                    return
-                }
-                if (value as? Bool) == true {
-                    completion("{\"ok\":true}")
-                } else if Date() > deadline {
-                    completion("{\"ok\":false,\"error\":\"timeout\"}")
-                } else {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { poll() }
-                }
+        let js = BrowserWaitForJS.mutationObserverScript(selector: selector, timeoutMs: timeoutMs)
+        self.evaluate(js) { [weak self] value, _ in
+            guard let self, !self.isClosed, self.waitForToken == token else {
+                completion("{\"ok\":false,\"error\":\"cancelled\"}")
+                return
+            }
+            if (value as? Bool) == true {
+                completion("{\"ok\":true}")
+            } else {
+                completion("{\"ok\":false,\"error\":\"timeout\"}")
             }
         }
-        poll()
     }
 
     public func screenshotPNG() -> Data? {
