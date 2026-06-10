@@ -55,7 +55,18 @@ public final class ANSIRenderer {
     private var cachedANSIWithScrollback: (version: UInt64, value: String)?
     private var cachedANSIViewport: (version: UInt64, value: String)?
 
-    public init(rows: Int = 40, cols: Int = 120, scrollbackLimit: Int = ANSIRenderer.defaultScrollbackLimit) {
+    private var basicColors: [NSColor]
+    private var brightColors: [NSColor]
+
+    public init(
+        rows: Int = 40,
+        cols: Int = 120,
+        scrollbackLimit: Int = ANSIRenderer.defaultScrollbackLimit,
+        themeColors: ANSIThemeColors? = nil
+    ) {
+        let palette = ANSIPaletteMapper.palette(from: themeColors)
+        self.basicColors = palette.basic
+        self.brightColors = palette.bright
         self.rows = rows
         self.cols = cols
         self.scrollback = []
@@ -406,19 +417,19 @@ public final class ANSIRenderer {
             case 23: italic = false
             case 24: underline = false
             case 27: inverse = false
-            case 30...37: fg = ANSIRenderer.basicColors[p - 30]
+            case 30...37: fg = basicColors[p - 30]
             case 39: fg = ANSIRenderer.Cell.defaultFG
-            case 40...47: bg = ANSIRenderer.basicColors[p - 40]
+            case 40...47: bg = basicColors[p - 40]
             case 49: bg = ANSIRenderer.Cell.defaultBG
-            case 90...97: fg = ANSIRenderer.brightColors[p - 90]
-            case 100...107: bg = ANSIRenderer.brightColors[p - 100]
+            case 90...97: fg = brightColors[p - 90]
+            case 100...107: bg = brightColors[p - 100]
             case 38, 48:
                 // extended color: 38;5;N or 38;2;R;G;B
                 if i + 1 < params.count {
                     let mode = params[i + 1]
                     if mode == 5, i + 2 < params.count {
                         let idx = params[i + 2]
-                        let c = ANSIRenderer.color256(idx)
+                        let c = color256(idx)
                         if p == 38 { fg = c } else { bg = c }
                         i += 2
                     } else if mode == 2, i + 4 < params.count {
@@ -441,24 +452,7 @@ public final class ANSIRenderer {
         bold = false; italic = false; underline = false; inverse = false
     }
 
-    private static let basicColors: [NSColor] = [
-        NSColor(srgbRed: 0.10, green: 0.10, blue: 0.10, alpha: 1),  // black
-        NSColor(srgbRed: 0.80, green: 0.20, blue: 0.20, alpha: 1),  // red
-        NSColor(srgbRed: 0.18, green: 0.60, blue: 0.18, alpha: 1),  // green
-        NSColor(srgbRed: 0.80, green: 0.60, blue: 0.20, alpha: 1),  // yellow
-        NSColor(srgbRed: 0.20, green: 0.40, blue: 0.80, alpha: 1),  // blue
-        NSColor(srgbRed: 0.70, green: 0.30, blue: 0.70, alpha: 1),  // magenta
-        NSColor(srgbRed: 0.20, green: 0.60, blue: 0.60, alpha: 1),  // cyan
-        NSColor(srgbRed: 0.85, green: 0.85, blue: 0.85, alpha: 1)   // white
-    ]
-    private static let brightColors: [NSColor] = basicColors.map { c in
-        let r = (c.redComponent + 1.0) / 2.0
-        let g = (c.greenComponent + 1.0) / 2.0
-        let b = (c.blueComponent + 1.0) / 2.0
-        return NSColor(srgbRed: r, green: g, blue: b, alpha: 1)
-    }
-
-    private static func color256(_ idx: Int) -> NSColor {
+    private func color256(_ idx: Int) -> NSColor {
         if idx < 8 { return basicColors[idx] }
         if idx < 16 { return brightColors[idx - 8] }
         if idx < 232 {
