@@ -546,27 +546,140 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         NSWorkspace.shared.activateFileViewerSelecting([dir])
     }
 
-    /// Approve/deny modal for a device-initiated pairing request. The
-    /// device shows the SAME code — the user confirms they match before
-    /// approving (anti-MITM). Decision routes to the auth adapter; once
-    /// approved the device's token is trusted and it never re-pairs.
+    /// Non-blocking pairing sheet with live countdown tied to the request TTL.
+    /// Replaces the blocking runModal so the main run loop is never stalled.
+    /// Auto-dismisses when the TTL expires; the user can Approve or Deny at
+    /// any point before expiry. Once dismissed (any path) the timer is cancelled.
+    private var pairingSheet: NSPanel?
+    private var pairingSheetTimer: Timer?
+    private var pairingCountdownLabel: NSTextField?
+    private var pairingPromptPending: PairingPrompt?
+
     private func presentPairingPrompt(_ prompt: PairingPrompt) {
-        let alert = NSAlert()
-        alert.messageText = "Allow “\(prompt.deviceName)” to connect?"
-        alert.informativeText = """
-        A device wants to remote-control this Mac.
+        // Only one pairing sheet at a time. If a new request arrives while one
+        // is open, deny the pending one first to avoid leaking approval state.
+        if let pending = pairingPromptPending {
+            localAuth?.denyPairingRequest(pending.requestId)
+            dismissPairingSheet()
+        }
+        pairingPromptPending = prompt
 
-        Confirm this code matches the one shown on the device:
+        let ttl = prompt.expiresAt.timeIntervalSince(prompt.createdAt)
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 260),
+            styleMask: [.titled, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        panel.title = "Pairing Request"
+        panel.isMovableByWindowBackground = true
+        panel.level = .modalPanel
 
-        \(prompt.code)
-        """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Approve")
-        alert.addButton(withTitle: "Deny")
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 260))
+
+        // Device name label
+        let heading = NSTextField(labelWithString: "Allow \"\(prompt.deviceName)\" to connect?")
+        heading.font = NSFont.boldSystemFont(ofSize: 14)
+        heading.alignment = .center
+        heading.frame = NSRect(x: 20, y: 210, width: 360, height: 20)
+        content.addSubview(heading)
+
+        // Informative text
+        let infoText: String
+        if let ip = prompt.sourceIP {
+            infoText = "Source: \(ip)"
+        } else {
+            infoText = "Confirm this code matches the device:"
+        }
+        let info = NSTextField(labelWithString: infoText)
+        info.alignment = .center
+        info.textColor = .secondaryLabelColor
+        info.frame = NSRect(x: 20, y: 185, width: 360, height: 18)
+        content.addSubview(info)
+
+        // Code display
+        let codeField = NSTextField(labelWithString: prompt.code)
+        codeField.font = NSFont.monospacedDigitSystemFont(ofSize: 36, weight: .bold)
+        codeField.alignment = .center
+        codeField.frame = NSRect(x: 20, y: 125, width: 360, height: 50)
+        content.addSubview(codeField)
+
+        // Created-at detail
+        let fmt = DateFormatter()
+        fmt.dateStyle = .none
+        fmt.timeStyle = .medium
+        let createdLabel = NSTextField(labelWithString: "Requested at \(fmt.string(from: prompt.createdAt))")
+        createdLabel.alignment = .center
+        createdLabel.font = NSFont.systemFont(ofSize: 11)
+        createdLabel.textColor = .secondaryLabelColor
+        createdLabel.frame = NSRect(x: 20, y: 105, width: 360, height: 16)
+        content.addSubview(createdLabel)
+
+        // Countdown label
+        let countdown = NSTextField(labelWithString: "")
+        countdown.alignment = .center
+        countdown.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        countdown.textColor = .secondaryLabelColor
+        countdown.frame = NSRect(x: 20, y: 75, width: 360, height: 20)
+        content.addSubview(countdown)
+        pairingCountdownLabel = countdown
+
+        // Approve button
+        let approveBtn = NSButton(title: "Approve", target: self, action: #selector(pairingApprove))
+        approveBtn.keyEquivalent = "\r"
+        approveBtn.frame = NSRect(x: 220, y: 16, width: 160, height: 44)
+        content.addSubview(approveBtn)
+
+        // Deny button
+        let denyBtn = NSButton(title: "Deny", target: self, action: #selector(pairingDeny))
+        denyBtn.frame = NSRect(x: 20, y: 16, width: 160, height: 44)
+        content.addSubview(denyBtn)
+
+        panel.contentView = content
+        pairingSheet = panel
+
+        // Update countdown immediately, then each second.
+        updatePairingCountdown(prompt: prompt, ttl: ttl)
+        pairingSheetTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let p = self.pairingPromptPending else { return }
+            if PairingCountdown.expired(createdAt: p.createdAt, ttl: ttl, now: Date()) {
+                self.localAuth?.denyPairingRequest(p.requestId)
+                self.dismissPairingSheet()
+            } else {
+                self.updatePairingCountdown(prompt: p, ttl: ttl)
+            }
+        }
+
         NSApp.activate(ignoringOtherApps: true)
-        let approved = alert.runModal() == .alertFirstButtonReturn
-        if approved { localAuth?.approvePairingRequest(prompt.requestId) }
-        else { localAuth?.denyPairingRequest(prompt.requestId) }
+        panel.center()
+        panel.orderFrontRegardless()
+    }
+
+    private func updatePairingCountdown(prompt: PairingPrompt, ttl: TimeInterval) {
+        let secs = PairingCountdown.remainingSecs(createdAt: prompt.createdAt, ttl: ttl, now: Date())
+        let intSecs = Int(secs.rounded(.up))
+        pairingCountdownLabel?.stringValue = "Expires in \(intSecs)s"
+    }
+
+    @objc private func pairingApprove() {
+        guard let prompt = pairingPromptPending else { return }
+        localAuth?.approvePairingRequest(prompt.requestId)
+        dismissPairingSheet()
+    }
+
+    @objc private func pairingDeny() {
+        guard let prompt = pairingPromptPending else { return }
+        localAuth?.denyPairingRequest(prompt.requestId)
+        dismissPairingSheet()
+    }
+
+    private func dismissPairingSheet() {
+        pairingSheetTimer?.invalidate()
+        pairingSheetTimer = nil
+        pairingSheet?.orderOut(nil)
+        pairingSheet = nil
+        pairingCountdownLabel = nil
+        pairingPromptPending = nil
     }
 
     private func applyKeybindingOverride(to item: NSMenuItem, command: String) {
@@ -786,6 +899,30 @@ public struct NotificationRouteIntent: Equatable {
     public init(threadId: AgentThreadID, workspaceId: WorkspaceID?) {
         self.threadId = threadId
         self.workspaceId = workspaceId
+    }
+}
+
+/// Pure, nonisolated helper for pairing sheet countdown math.
+/// Extracted from AppDelegate so it can be tested without AppKit or @MainActor.
+///
+/// WHY: The non-blocking pairing sheet must accurately reflect the server-side
+/// 300-second TTL. Errors here cause "time left" / actual expiry drift, which
+/// means the user could see an expired prompt or be dismissed before the real
+/// deadline. The helper is pure (injected `now`) so tests are deterministic.
+public enum PairingCountdown {
+    /// Seconds remaining until the request expires, clamped to [0, ttl].
+    /// - Parameters:
+    ///   - createdAt: When the request was created.
+    ///   - ttl: Total TTL in seconds (default 300 for device-initiated pair).
+    ///   - now: Current time (injected for testability).
+    public static func remainingSecs(createdAt: Date, ttl: TimeInterval, now: Date) -> Double {
+        let elapsed = now.timeIntervalSince(createdAt)
+        return max(0, ttl - elapsed)
+    }
+
+    /// Returns true when `now` is at or past the expiry instant.
+    public static func expired(createdAt: Date, ttl: TimeInterval, now: Date) -> Bool {
+        now.timeIntervalSince(createdAt) >= ttl
     }
 }
 

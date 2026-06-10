@@ -7,6 +7,23 @@ public struct PairingPrompt: Sendable {
     public let requestId: String
     public let code: String
     public let deviceName: String
+    /// When the pairing request was created on the server (used for countdown).
+    public let createdAt: Date
+    /// When the pairing request expires (createdAt + TTL).
+    public let expiresAt: Date
+    /// Source IP of the device that initiated the request, if known.
+    public let sourceIP: String?
+
+    public init(requestId: String, code: String, deviceName: String,
+                createdAt: Date = Date(), expiresAt: Date = Date().addingTimeInterval(300),
+                sourceIP: String? = nil) {
+        self.requestId = requestId
+        self.code = code
+        self.deviceName = deviceName
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.sourceIP = sourceIP
+    }
 }
 
 public final class LocalAuthAdapter: DirectAuthProvider {
@@ -48,7 +65,8 @@ public final class LocalAuthAdapter: DirectAuthProvider {
             try? repo.audit(actor: "account", action: "pairing.auto_approve", detail: deviceName)
             return (req.id, req.code)
         }
-        onPairingRequest?(PairingPrompt(requestId: req.id, code: req.code, deviceName: deviceName))
+        onPairingRequest?(PairingPrompt(requestId: req.id, code: req.code, deviceName: deviceName,
+                                         createdAt: req.createdAt, expiresAt: req.expiresAt))
         return (req.id, req.code)
     }
 
