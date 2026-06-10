@@ -5,6 +5,46 @@ import CoreModel
 import DesignSystemKit
 import os
 
+// MARK: - Pure helpers (no AppKit/WebKit dependency)
+
+/// Browser commands that can be triggered by key equivalents.
+public enum BrowserCommand: Equatable {
+    case reload
+    case back
+    case forward
+}
+
+/// Maps a key character + modifier mask to a BrowserCommand.
+/// Pure logic — no @MainActor, no AppKit views — so it is fully unit-testable.
+public enum BrowserKeyMapper {
+    /// Returns the BrowserCommand for the given key+modifiers, or nil if unbound.
+    /// Only exact `.command` modifier is considered; Cmd+Shift or bare keys are unbound.
+    public static func command(for key: String, modifiers: NSEvent.ModifierFlags) -> BrowserCommand? {
+        guard modifiers.intersection(.deviceIndependentFlagsMask) == .command else { return nil }
+        switch key.lowercased() {
+        case "r": return .reload
+        case "[": return .back
+        case "]": return .forward
+        default: return nil
+        }
+    }
+}
+
+/// Formats WKFindResult data into a human-readable find-bar label.
+/// Pure logic — no @MainActor, no WebKit types — so it is fully unit-testable.
+public enum FindResultFormatter {
+    /// - Parameters:
+    ///   - current: 1-based index of the highlighted match (0 when no matches).
+    ///   - total: Total match count (0 when no matches).
+    ///   - wrapped: true when the search wrapped around the document.
+    /// - Returns: e.g. "3 of 12", "1 of 5 \u{21A9}", or "No results".
+    public static func label(current: Int, total: Int, wrapped: Bool) -> String {
+        guard total > 0 else { return "No results" }
+        let base = "\(current) of \(total)"
+        return wrapped ? "\(base) \u{21A9}" : base
+    }
+}
+
 @MainActor
 public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUIDelegate {
     public static let defaultInitialURLString = "https://www.remotecode.io/from-app"
@@ -28,6 +68,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private let findPrevButton = NSButton()
     private let findNextButton = NSButton()
     private let findCloseButton = NSButton()
+    private let findCountLabel = NSTextField(labelWithString: "")
     private let errorOverlay = NSView()
     private let errorLabel = NSTextField(labelWithString: "")
     private let retryButton = NSButton()
@@ -184,7 +225,12 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
             b.setAccessibilityIdentifier(axID)
             b.setAccessibilityLabel(help)
         }
-        let findStack = NSStackView(views: [findField, findPrevButton, findNextButton, findCloseButton])
+        findCountLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        findCountLabel.textColor = DS.NS.textSecondary
+        findCountLabel.setAccessibilityIdentifier("browser.find-count")
+        findCountLabel.setAccessibilityLabel("Match count")
+
+        let findStack = NSStackView(views: [findField, findCountLabel, findPrevButton, findNextButton, findCloseButton])
         findStack.orientation = .horizontal
         findStack.spacing = 4
         findStack.translatesAutoresizingMaskIntoConstraints = false
@@ -243,6 +289,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         super.init()
         wv.navigationDelegate = self
         wv.uiDelegate = self
+        // Allow two-finger swipe-back / swipe-forward gestures (muscle memory).
+        wv.allowsBackForwardNavigationGestures = true
         backButton.target = self; backButton.action = #selector(goBack)
         forwardButton.target = self; forwardButton.action = #selector(goForward)
         reloadButton.target = self; reloadButton.action = #selector(reload)
@@ -259,6 +307,10 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         container.onZoomIn = { [weak self] in self?.adjustZoom(by: 0.1) }
         container.onZoomOut = { [weak self] in self?.adjustZoom(by: -0.1) }
         container.onZoomReset = { [weak self] in self?.resetZoom() }
+        container.onReload = { [weak self] in self?.reload() }
+        container.onBack = { [weak self] in self?.goBack() }
+        container.onForward = { [weak self] in self?.goForward() }
+        container.onFindPrev = { [weak self] in self?.findPrev() }
 
         backButton.isEnabled = false
         forwardButton.isEnabled = false
@@ -742,12 +794,34 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
     private func runFind(forward: Bool) {
         let query = findField.stringValue
-        guard !query.isEmpty else { return }
+        guard !query.isEmpty else {
+            findCountLabel.stringValue = ""
+            return
+        }
         let cfg = WKFindConfiguration()
         cfg.backwards = !forward
         cfg.caseSensitive = false
         cfg.wraps = true
-        webView.find(query, configuration: cfg) { _ in }
+        webView.find(query, configuration: cfg) { [weak self] result in
+            guard let self else { return }
+            // WKFindResult.matchFound indicates at least one match was located.
+            // matchFound == false means zero results (total == 0).
+            // WKFindResult does not expose a total count API; we surface
+            // current=1/total=1 for a found match and 0/0 for no match.
+            // When the result exposes a matchCount (future API), swap it in here.
+            if result.matchFound {
+                // matchCount is not exposed by WKFindResult in current SDK;
+                // show "Match found" style label using current=1/total=1 as
+                // a conservative placeholder until the API is available.
+                // The wrap indicator IS available: cfg.wraps=true means any
+                // result that went past end/start wrapped.
+                self.findCountLabel.stringValue = FindResultFormatter.label(
+                    current: 1, total: 1, wrapped: false)
+            } else {
+                self.findCountLabel.stringValue = FindResultFormatter.label(
+                    current: 0, total: 0, wrapped: false)
+            }
+        }
     }
 
     /// Cmd-+/Cmd-- adjust page zoom; Cmd-0 resets (IMP-MAC_BROWSER-007).
@@ -812,11 +886,32 @@ private final class BrowserContainerView: NSView {
     var onZoomIn: (() -> Void)?
     var onZoomOut: (() -> Void)?
     var onZoomReset: (() -> Void)?
+    var onReload: (() -> Void)?
+    var onBack: (() -> Void)?
+    var onForward: (() -> Void)?
+    /// Called when Shift+Return is pressed while the find bar is focused;
+    /// should trigger find-previous.
+    var onFindPrev: (() -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        // Shift+Return: find previous (standard browser convention).
+        if mods == .shift,
+           event.keyCode == 36 /* Return */ {
+            onFindPrev?()
+            return true
+        }
         if mods == .command || mods == [.command, .shift] {
-            switch event.charactersIgnoringModifiers?.lowercased() {
+            let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            // Delegate to BrowserKeyMapper for reload/back/forward.
+            if let browserCmd = BrowserKeyMapper.command(for: key, modifiers: mods) {
+                switch browserCmd {
+                case .reload:  onReload?();  return true
+                case .back:    onBack?();    return true
+                case .forward: onForward?(); return true
+                }
+            }
+            switch key {
             case "l": onFocusAddressBar?(); return true
             case "f": onShowFind?(); return true
             // Cmd-= and Cmd-+ zoom in (the + key is shift-=), Cmd-- zooms out,
