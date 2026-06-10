@@ -83,12 +83,87 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
         return roots.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
 
+    // MARK: - Bounded tail reader
+
+    /// Returns the last `maxEvents` non-empty lines from `data` without
+    /// materialising the entire file as a String.
+    /// Exposed as `internal` so tests can reach it without @testable gymnastics.
+    static func tailLines(from data: Data, maxEvents: Int) -> [String] {
+        guard maxEvents > 0, !data.isEmpty else { return [] }
+        // Scan backwards through raw UTF-8 bytes, collecting newline-terminated
+        // slices.  Stop once we have maxEvents lines (plus one partial leading
+        // line that we may discard).
+        let newline = UInt8(ascii: "\n")
+        var lines: [String] = []
+        var end = data.endIndex
+
+        while end > data.startIndex && lines.count < maxEvents {
+            // Find the preceding newline (or the start of the buffer).
+            var start = data.index(before: end)
+            // Step back past the newline that ended the *previous* line.
+            if start > data.startIndex && data[start] == newline {
+                start = data.index(before: start)
+            }
+            while start > data.startIndex && data[data.index(before: start)] != newline {
+                start = data.index(before: start)
+            }
+            let slice = data[start..<end]
+            // Trim the trailing newline before decoding.
+            let trimmed = slice.last == newline ? slice.dropLast() : slice
+            if !trimmed.isEmpty, let s = String(bytes: trimmed, encoding: .utf8), !s.isEmpty {
+                lines.append(s)
+            }
+            end = start
+        }
+
+        lines.reverse()
+        return lines
+    }
+
     private func readTranscript(file: URL, providerThreadId: String) -> [AssistantEvent] {
-        guard let content = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return [] }
+        defer { try? handle.close() }
+
+        // Read only the tail portion we need.  Each JSONL line for a full
+        // assistant turn is typically a few KB; we over-read by 2x to make
+        // sure we collect enough lines even for large events, then trim.
+        let chunkSize = maxEvents * 4_096
+        let fileSize: Int
+        if #available(macOS 10.15.4, *) {
+            fileSize = Int((try? handle.seekToEnd()) ?? 0)
+        } else {
+            handle.seekToEndOfFile()
+            fileSize = Int(handle.offsetInFile)
+        }
+        let readSize = min(fileSize, chunkSize)
+        let offset = fileSize - readSize
+        let rawData: Data
+        if #available(macOS 10.15.4, *) {
+            do {
+                try handle.seek(toOffset: UInt64(offset))
+                rawData = (try handle.read(upToCount: readSize)) ?? Data()
+            } catch {
+                return []
+            }
+        } else {
+            handle.seek(toFileOffset: UInt64(offset))
+            rawData = handle.readData(ofLength: readSize)
+        }
+
+        // If we did not start at the file beginning, the first slice may be a
+        // partial line; drop it.
+        let candidateLines: [String]
+        if offset > 0 {
+            let allLines = Self.tailLines(from: rawData, maxEvents: maxEvents + 1)
+            candidateLines = allLines.count > 1 ? Array(allLines.dropFirst()) : []
+        } else {
+            candidateLines = Self.tailLines(from: rawData, maxEvents: maxEvents)
+        }
+
         var events: [AssistantEvent] = [.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)]
         var emittedMessageIds = Set<String>()
 
-        for line in content.split(whereSeparator: \.isNewline).map(String.init) {
+        for line in candidateLines {
             guard let object = Self.jsonObject(from: line),
                   (object["type"] as? String) == "assistant",
                   let message = object["message"] as? [String: Any] else {
