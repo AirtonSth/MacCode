@@ -666,6 +666,75 @@ private extension String {
     }
 }
 
+// MARK: - ChatSession prompt-cache key
+
+/// Pure, nonisolated cache-key type for `ChatSession` reuse.
+/// Two requests with identical system instructions and the same maxTokens
+/// budget can share a `ChatSession` instance, avoiding repeated object
+/// allocation and the `SerialAccessContainer` setup cost on every call.
+///
+/// The key is intentionally value-typed and `Sendable` so it can be used
+/// freely across concurrency domains without import overhead.
+public struct ChatSessionCacheKey: Hashable, Sendable {
+    /// The full system-instructions string.  Stored verbatim so that `==`
+    /// is exact (hash collisions cannot produce a false cache hit).
+    public let instructions: String
+    public let maxTokens: Int
+
+    /// Stable hash of `instructions` for external inspection / logging.
+    /// NOT used for `Hashable` conformance — Swift synthesizes `hash(into:)`
+    /// from `instructions` + `maxTokens` directly, so there is no collision risk.
+    public var instructionsHash: Int {
+        var hasher = Hasher()
+        hasher.combine(instructions)
+        return hasher.finalize()
+    }
+
+    public init(instructions: String, maxTokens: Int) {
+        self.instructions = instructions
+        self.maxTokens = maxTokens
+    }
+
+    /// Decision helper: returns `true` when a cached session built from
+    /// `cachedKey` can be reused for a new request described by `newKey`.
+    /// Both the instructions string and the maxTokens budget must match exactly.
+    public static func canReuse(cached: ChatSessionCacheKey, new: ChatSessionCacheKey) -> Bool {
+        cached == new
+    }
+}
+
+/// Thread-safe store that maps `ChatSessionCacheKey` to a live `ChatSession`.
+/// Each lookup either returns the existing session (cache hit) or creates a
+/// new one via the provided factory closure (cache miss + insert).
+///
+/// The caller is responsible for calling `session.clear()` before reusing a
+/// session so prior KV history never leaks into an independent distill call.
+actor ChatSessionStore {
+    private var sessions: [ChatSessionCacheKey: ChatSession] = [:]
+
+    /// Return the cached session for `key`, or create-and-store one using
+    /// `factory()`.  The `factory` closure is called at most once per key.
+    func session(
+        for key: ChatSessionCacheKey,
+        creating factory: () -> ChatSession
+    ) -> ChatSession {
+        if let existing = sessions[key] {
+            return existing
+        }
+        let fresh = factory()
+        sessions[key] = fresh
+        return fresh
+    }
+
+    /// Evict all cached sessions (e.g. after `reclaimIdleMemory`).
+    func evictAll() {
+        sessions.removeAll()
+    }
+
+    /// Number of cached sessions (for testing).
+    var count: Int { sessions.count }
+}
+
 public struct MLXDistillRuntime: DistillRuntime {
     private let modelContainer: ModelContainer
 
@@ -689,6 +758,12 @@ public struct MLXDistillRuntime: DistillRuntime {
     /// admission gate). Protects against Metal memory pressure and renderer contention.
     private let lane = MLXGenerationLane()
 
+    /// Prompt-cache: one `ChatSession` per (mode, maxTokens) key.  Reusing the
+    /// same session object avoids repeated object allocation and
+    /// `SerialAccessContainer` setup on the hot path.  The session is cleared
+    /// before each independent distill call so prior KV history never leaks.
+    private let sessionStore = ChatSessionStore()
+
     public init(modelDirectory: URL) async throws {
         MLX.Memory.memoryLimit = Self.gpuMemoryLimitBytes
         MLX.Memory.cacheLimit = Self.gpuCacheLimitBytes
@@ -700,8 +775,11 @@ public struct MLXDistillRuntime: DistillRuntime {
     }
 
     /// Return the bounded GPU buffer cache to the OS once the server drains to idle.
+    /// Also evicts cached `ChatSession` instances so the next burst starts fresh
+    /// (avoids holding references to KV buffers that were just reclaimed).
     public func reclaimIdleMemory() {
         MLX.Memory.clearCache()
+        Task { await sessionStore.evictAll() }
     }
 
     /// Pay the cold-start cost (Metal kernel JIT, first allocation) before the
@@ -735,18 +813,26 @@ public struct MLXDistillRuntime: DistillRuntime {
             return routed.output
         }
 
+        let instructions = Self.systemInstructions(for: request.mode)
+        let maxTokens = Self.maxTokens(for: request)
+        let cacheKey = ChatSessionCacheKey(instructions: instructions, maxTokens: maxTokens)
         let parameters = GenerateParameters(
-            maxTokens: Self.maxTokens(for: request),
+            maxTokens: maxTokens,
             temperature: 0,
             topP: 0.9,
             topK: 20
         )
-        let session = ChatSession(
-            modelContainer,
-            instructions: Self.systemInstructions(for: request.mode),
-            generateParameters: parameters,
-            additionalContext: ["enable_thinking": false]
-        )
+        let session = await sessionStore.session(for: cacheKey) {
+            ChatSession(
+                modelContainer,
+                instructions: instructions,
+                generateParameters: parameters,
+                additionalContext: ["enable_thinking": false]
+            )
+        }
+        // Clear prior KV history so this independent distill call cannot
+        // observe responses from previous, unrelated requests.
+        await session.clear()
         await lane.acquire()
         let raw: String
         do {
