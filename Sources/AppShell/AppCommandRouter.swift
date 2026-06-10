@@ -55,6 +55,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
     private var suppressedLayoutEventDepth = 0
+    private var closedTabBuffer = ClosedTabRingBuffer(capacity: 10)
 
     public convenience init(context: AppContext) {
         self.init(context: context, sshPasswordStore: KeychainSSHPasswordStore())
@@ -592,14 +593,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func closeSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
+        // Capture the descriptor before removing it from the layout so
+        // reopenClosedSurface can re-create the tab with cwd restored.
+        let closedDescriptor = (try? locateSurface(surface))?.descriptor
+            ?? SurfaceRegistry.shared.surface(surface)?.descriptor
+        let workspaceCwdForReopen = context?.state.workspaces[workspace]?.cwd ?? ""
         try context?.apply(.closeSurface(workspace, surface))
         if let s = SurfaceRegistry.shared.surface(surface) {
             s.close()
             SurfaceRegistry.shared.unregister(surface)
         }
+        if let desc = closedDescriptor {
+            let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwdForReopen)
+            closedTabBuffer.push(entry, for: workspace)
+        }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         publishSurfaceClosed(workspace: workspace, surface: surface)
+    }
+
+    /// Reopen the most-recently-closed tab in `workspace`, restoring its cwd.
+    /// Returns the new descriptor, or nil when the closed-tab buffer is empty.
+    @discardableResult
+    public func reopenClosedSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor? {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let entry = closedTabBuffer.pop(for: workspace) else { return nil }
+        let cwd = entry.workspaceCwd.isEmpty
+            ? (ctx.state.workspaces[workspace]?.cwd ?? "/")
+            : entry.workspaceCwd
+        let desc = makeSurface(type: entry.descriptor.type, title: entry.descriptor.title,
+                               workspace: workspace, cwd: cwd)
+        try ctx.apply(.addSurface(workspace, paneID: nil, descriptor: desc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspace, surface: desc)
+        return desc
     }
 
     /// Replaces a dead terminal surface with a fresh shell in the same pane

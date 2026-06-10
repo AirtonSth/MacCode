@@ -402,6 +402,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let closeTab = NSMenuItem(title: "Close Tab", action: #selector(closeActiveTabOrWindow), keyEquivalent: "w")
         closeTab.target = self
         fileMenu.addItem(closeTab)
+        let reopenTab = NSMenuItem(title: "Reopen Closed Tab", action: #selector(reopenClosedTab), keyEquivalent: "t")
+        reopenTab.keyEquivalentModifierMask = [.command, .shift]
+        reopenTab.target = self
+        fileMenu.addItem(reopenTab)
         let closeWin = NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         closeWin.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(closeWin)
@@ -654,6 +658,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // window only when no surface is open.
         if windowController?.closeFocusedSurface() == true { return }
         (NSApp.keyWindow ?? window)?.performClose(nil)
+    }
+
+    @objc private func reopenClosedTab() {
+        guard let wid = context?.state.window.selectedWorkspaceID,
+              let router else { NSSound.beep(); return }
+        do {
+            // Returns nil when the closed-tab buffer is empty; beep in that case.
+            if try router.reopenClosedSurface(workspace: wid) == nil {
+                NSSound.beep()
+            }
+        } catch {
+            NSSound.beep()
+        }
     }
 
     @objc private func focusNextPane() {
