@@ -8,15 +8,36 @@ public struct CommandPaletteFilter {
                              subtitle: String = "", keywords: [String] = []) -> Int? {
         let q = query.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         if q.isEmpty { return 0 }
+
+        // Multi-word AND matching: every token must match some field.
+        // Single-token path preserves existing tier semantics exactly.
+        let tokens = q.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        if tokens.count > 1 {
+            var minScore = Int.max
+            for token in tokens {
+                guard let s = scoreToken(token, title: title, subtitle: subtitle, keywords: keywords) else {
+                    return nil // any unmatched token -> exclude
+                }
+                if s < minScore { minScore = s }
+            }
+            return minScore == Int.max ? nil : minScore
+        }
+
+        return scoreToken(q, title: title, subtitle: subtitle, keywords: keywords)
+    }
+
+    /// Score a single, already-lowercased token against the item fields.
+    private static func scoreToken(_ token: String, title: String,
+                                   subtitle: String, keywords: [String]) -> Int? {
         let t = title.lowercased()
-        if t == q { return 100 }
-        if t.hasPrefix(q) { return 80 }
-        if t.contains(q) { return 60 }
-        if subtitle.lowercased().contains(q) { return 40 }
-        if keywords.contains(where: { $0.lowercased().contains(q) }) { return 20 }
+        if t == token { return 100 }
+        if t.hasPrefix(token) { return 80 }
+        if t.contains(token) { return 60 }
+        if subtitle.lowercased().contains(token) { return 40 }
+        if keywords.contains(where: { $0.lowercased().contains(token) }) { return 20 }
         // IMP-004: subsequence tier — "ntm" matches "New Terminal Surface".
         // Ranked below all substring tiers so exact/prefix/contains always win.
-        if isSubsequence(q, of: t) { return 10 }
+        if isSubsequence(token, of: t) { return 10 }
         return nil
     }
 
