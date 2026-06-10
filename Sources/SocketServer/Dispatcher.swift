@@ -1527,7 +1527,7 @@ public final class JSONRPCDispatcher {
         }
     }
 
-    public static func isReadOnlyBatchMethod(_ method: String) -> Bool {
+    nonisolated public static func isReadOnlyBatchMethod(_ method: String) -> Bool {
         method.hasPrefix("system.")
             || method == "workspace.list"
             || method == "workspace.current"
@@ -1537,6 +1537,68 @@ public final class JSONRPCDispatcher {
             || method.hasSuffix(".read")
             || method.hasSuffix(".status")
             || method.hasSuffix(".get")
+    }
+
+    // MARK: - P2 per-route capability scopes
+
+    /// RPC namespaces the dispatcher actually serves. A method whose namespace
+    /// is not here is "unknown" and fails closed for any scoped device (only a
+    /// "*" device may invoke it). Kept in sync with the dispatch `switch` by
+    /// prefix, not an exact method list, so it tolerates the switch growing
+    /// within an existing namespace.
+    nonisolated private static let knownMethodNamespaces: Set<String> = [
+        "system", "events", "settings", "rpc",
+        "ssh", "fs", "files",
+        "workspace", "window", "surface", "pane",
+        "agent", "git", "project", "browser",
+        "notification", "private"
+    ]
+
+    /// Required capability for a known method, or nil when the method is not
+    /// recognized (unknown -> caller must hold "*").
+    ///
+    /// Buckets, matching the conventions already used elsewhere in this file:
+    ///   - "file": filesystem + file-editor surface (`fs.*`, `files.*`).
+    ///   - "read": read-only methods (`isReadOnlyBatchMethod`), e.g. *.list /
+    ///     *.read / *.status / *.get, system.*, events.recent, settings.get.
+    ///   - "write": every other known (mutating) method.
+    nonisolated static func requiredCapability(for method: String) -> String? {
+        guard let namespace = method.split(separator: ".").first.map(String.init),
+              knownMethodNamespaces.contains(namespace) else {
+            return nil
+        }
+        if namespace == "fs" || namespace == "files" {
+            return "file"
+        }
+        if isReadOnlyBatchMethod(method) {
+            return "read"
+        }
+        return "write"
+    }
+
+    /// Parse a stored `DeviceTrust.capabilities` string into a granted set.
+    /// "*" (anywhere in the list) means "all capabilities". Tokens are
+    /// separated by commas and/or whitespace; empty tokens are ignored.
+    nonisolated static func parseCapabilities(_ raw: String) -> Set<String> {
+        let tokens = raw
+            .split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\t" })
+            .map { $0.lowercased() }
+        return Set(tokens)
+    }
+
+    /// Authorization decision for one RPC `method` given a device's stored
+    /// `grantedCapabilities` string. Pure: no actor state, no I/O.
+    ///
+    /// Contract:
+    ///   - "*" grants everything (back-compat: every already-paired device).
+    ///   - otherwise the method's required capability (`requiredCapability`)
+    ///     must be in the granted set; an unknown method has no required
+    ///     capability and is denied (fail closed).
+    nonisolated static func isAuthorized(method: String, grantedCapabilities: String) -> Bool {
+        let granted = parseCapabilities(grantedCapabilities)
+        if granted.contains("*") { return true }
+        guard let needed = requiredCapability(for: method) else { return false }
+        return granted.contains(needed)
     }
 
     /// Accept the lowercased/underscored tokens the CLI documents
