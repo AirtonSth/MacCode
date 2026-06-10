@@ -1225,7 +1225,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// IMP-MAC_AGENT-013: serialize a full thread (read from the durable store,
     /// not the paged in-memory window) to shareable markdown.
-    public func exportThreadMarkdown(_ id: AgentThreadID) -> (fileName: String, contents: String)? {
+    public func exportThreadMarkdown(
+        _ id: AgentThreadID,
+        includeTimeline: Bool = false
+    ) -> (fileName: String, contents: String)? {
         guard let thread = threads.first(where: { $0.id == id }) ?? (try? threadRepo.get(id: id)) else { return nil }
         let rows = (try? messageRepo.list(threadId: id)) ?? []
         var lines = ["# \(thread.title)", ""]
@@ -1240,6 +1243,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             lines.append("")
             lines.append(message.content)
             lines.append("")
+        }
+        if includeTimeline {
+            let tlLines = ThreadMarkdownFormatter.timelineMarkdownLines(
+                turns: timeline.turns,
+                approvals: timeline.pendingRequests
+            )
+            if !tlLines.isEmpty {
+                lines.append("## Timeline")
+                lines.append("")
+                lines.append(contentsOf: tlLines)
+                lines.append("")
+            }
         }
         let safeName = thread.title
             .components(separatedBy: CharacterSet(charactersIn: "/\\:?%*|\"<>"))
@@ -1950,6 +1965,93 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         }
     }
 
+}
+
+// MARK: - ThreadMarkdownFormatter
+
+/// Pure, nonisolated formatter that converts live timeline data (tool-call items
+/// and approval requests) into markdown lines suitable for inclusion in the
+/// exported thread markdown when the caller opts in via `includeTimeline: true`.
+///
+/// Kept separate from `AgentAppViewModel` so it is fully testable without any
+/// actor or SwiftUI state. All inputs are value types.
+public enum ThreadMarkdownFormatter {
+
+    /// Render timeline items (tool calls, commands, etc.) and approval requests
+    /// as ordered markdown lines.  Items are sorted chronologically by
+    /// `startedAtMs`; approvals are interleaved by `createdAtMs`.
+    ///
+    /// Returns an empty array when both collections are empty, so callers can
+    /// skip the section header when there is nothing to show.
+    public static func timelineMarkdownLines(
+        turns: [AssistantTurnSnapshot],
+        approvals: [AssistantPendingRequest]
+    ) -> [String] {
+        struct Entry {
+            let sortKey: Int64
+            let line: String
+        }
+
+        var entries: [Entry] = []
+
+        // Tool-call items from all turns.
+        for turn in turns {
+            for item in turn.items {
+                guard isTimelineItem(item) else { continue }
+                let label = itemLabel(item)
+                let statePart = item.state.rawValue
+                let durPart = itemDurationString(item).map { " [\($0)]" } ?? ""
+                let line = "- \(label) (\(statePart))\(durPart)"
+                entries.append(Entry(sortKey: item.startedAtMs, line: line))
+            }
+        }
+
+        // Approval requests.
+        for req in approvals {
+            let statePart = req.state.rawValue
+            let durPart = approvalDurationString(req).map { " [\($0)]" } ?? ""
+            let line = "- Approval: \(req.title) (\(statePart))\(durPart)"
+            entries.append(Entry(sortKey: req.createdAtMs, line: line))
+        }
+
+        guard !entries.isEmpty else { return [] }
+
+        entries.sort { $0.sortKey < $1.sortKey }
+        return entries.map(\.line)
+    }
+
+    // MARK: - Private helpers
+
+    /// Exclude assistant-message items and reasoning from the work log since
+    /// those are already captured in the role-based export.
+    private static func isTimelineItem(_ item: AssistantItem) -> Bool {
+        switch item.type {
+        case .assistantMessage, .reasoning: return false
+        default: return true
+        }
+    }
+
+    private static func itemLabel(_ item: AssistantItem) -> String {
+        if let s = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            return s
+        }
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? item.type.rawValue : String(body.prefix(120))
+    }
+
+    private static func itemDurationString(_ item: AssistantItem) -> String? {
+        guard let finished = item.finishedAtMs, finished >= item.startedAtMs else { return nil }
+        let seconds = Int((finished - item.startedAtMs) / 1000)
+        guard seconds > 0 else { return nil }
+        return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
+    }
+
+    private static func approvalDurationString(_ req: AssistantPendingRequest) -> String? {
+        guard let resolved = req.resolvedAtMs, resolved >= req.createdAtMs else { return nil }
+        let seconds = Int((resolved - req.createdAtMs) / 1000)
+        guard seconds > 0 else { return nil }
+        return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
+    }
 }
 
 private final class TimelineScrollScheduler {
