@@ -51,25 +51,7 @@ func usage(_ exit: Int32 = 0) -> Never {
 }
 
 func parseFlags(_ a: [String]) -> ([String: String], [String]) {
-    var dict: [String: String] = [:]
-    var positional: [String] = []
-    var i = 0
-    while i < a.count {
-        let s = a[i]
-        if s.hasPrefix("--") {
-            let key = String(s.dropFirst(2))
-            if i + 1 < a.count && !a[i+1].hasPrefix("--") {
-                dict[key] = a[i+1]
-                i += 2; continue
-            } else {
-                dict[key] = "true"
-            }
-        } else {
-            positional.append(s)
-        }
-        i += 1
-    }
-    return (dict, positional)
+    CLIArgParser.parseFlagsWithTerminator(a)
 }
 
 let envChannel = ProcessInfo.processInfo.environment["RC2_CHANNEL"] ?? "debug"
@@ -77,14 +59,55 @@ let releaseChannel = ReleaseChannel(rawValue: envChannel) ?? .debug
 var socketPath = AppPaths.socketPath(for: releaseChannel)
 var jsonOutput = false
 
+// Per-subcommand help strings for undocumented and advanced commands.
+let subcommandHelp: [String: String] = [
+    "ping":           "Usage: \(prog) ping\n\n  Send a liveness ping to the RemoteCode daemon.",
+    "capabilities":   "Usage: \(prog) capabilities\n\n  List daemon capabilities.",
+    "workspaces":     "Usage: \(prog) workspaces\n\n  List all open workspaces.",
+    "new-workspace":  "Usage: \(prog) new-workspace --cwd PATH [--name NAME]\n\n  Create a new workspace at PATH.",
+    "new-surface":    "Usage: \(prog) new-surface --workspace WID --type TYPE [--title T]\n\n  Types: terminal browser agent markdown filepreview rightsidebartool",
+    "new-split":      "Usage: \(prog) new-split --workspace WID --pane PID --direction DIR --type TYPE\n\n  Directions: right down left up",
+    "focus":          "Usage: \(prog) focus --workspace WID --id SID\n\n  Focus a surface.",
+    "close":          "Usage: \(prog) close --workspace WID --id SID\n\n  Close a surface.",
+    "send-text":      "Usage: \(prog) send-text --id SID --text TEXT\n\n  Send text to a terminal surface.\n  Use --text=TEXT to pass values that start with -.",
+    "send-key":       "Usage: \(prog) send-key --id SID --key KEY\n\n  Send a key event to a surface.",
+    "read-text":      "Usage: \(prog) read-text --id SID\n\n  Read terminal output from a surface.",
+    "clear-history":  "Usage: \(prog) clear-history --id SID\n\n  Clear the scrollback history of a surface.",
+    "health":         "Usage: \(prog) health --id SID\n\n  Get health status of a surface.",
+    "surface":        "Usage: \(prog) surface <subcommand> [args...]\n\n  Subcommands: move reorder",
+    "pane":           "Usage: \(prog) pane <subcommand> [args...]\n\n  Subcommands: list swap resize",
+    "window":         "Usage: \(prog) window <subcommand> [args...]\n\n  Subcommands: list current create focus close",
+    "workspace":      "Usage: \(prog) workspace move-to-window --workspace WID --window WIDX",
+    "events":         "Usage: \(prog) events <subcommand> [args...]\n\n  Subcommands:\n    recent           Print recent events\n    stream [--after-seq N]  Stream events in real-time (NDJSON)",
+    "notification":   "Usage: \(prog) notification <subcommand> [args...]\n\n  Subcommands: create list mark-read dismiss",
+    "browser":        "Usage: \(prog) browser <subcommand> [args...]\n\n  Subcommands: navigate back forward reload url snapshot click focus hover check uncheck fill type select wait screenshot eval",
+    "agent":          "Usage: \(prog) agent <subcommand> [args...]\n\n  Subcommands:\n    open --workspace WID\n    thread list [--workspace WID]\n    thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]\n    send --thread TID --text TEXT [--provider P] [--model M]\n    stop --thread TID\n    models [--provider codex|claude]",
+]
+
 var rest: [String] = []
+var globalTerminated = false
 var i = 1
 while i < args.count {
     let s = args[i]
+    if globalTerminated { rest.append(s); i += 1; continue }
+    if s == "--" { globalTerminated = true; i += 1; continue }
+    if s == "--version" {
+        print(RC2CLIVersion.versionString())
+        Darwin.exit(0)
+    }
     if s == "--socket", i + 1 < args.count { socketPath = args[i+1]; i += 2; continue }
     if s == "--json" { jsonOutput = true; i += 1; continue }
     if s == "--help" || s == "-h" { usage(0) }
     rest.append(s); i += 1
+}
+// Check for per-subcommand help: rc2 <cmd> --help
+if rest.count >= 2 && (rest[1] == "--help" || rest[1] == "-h") {
+    let cmdName = rest[0]
+    if let helpText = subcommandHelp[cmdName] {
+        print(helpText)
+        Darwin.exit(0)
+    }
+    usage(0)
 }
 if rest.isEmpty { usage(RC2ExitCode.usageError) }
 
