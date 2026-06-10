@@ -1599,7 +1599,14 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
             }
             queueItems = trimmed
         }
-        selectedQueueState = status
+        // Only auto-switch the queue tab when the user is watching an active-state
+        // tab (.queued/.transferring). If they navigated to .failed/.cancelled/.successful
+        // to review results, don't yank them away when an unrelated transfer updates
+        // (P2 don't-yank-queue-tab).
+        let userIsWatchingActiveTab = selectedQueueState == .queued || selectedQueueState == .transferring
+        if userIsWatchingActiveTab {
+            selectedQueueState = status
+        }
         addTransferLog("\(direction.rawValue): \(status.rawValue)")
     }
 
@@ -1627,7 +1634,8 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
             )
         }
         if marked {
-            selectedQueueState = .cancelled
+            let userIsWatchingActiveTab = selectedQueueState == .queued || selectedQueueState == .transferring
+            if userIsWatchingActiveTab { selectedQueueState = .cancelled }
             addTransferLog("Cancelled: \(localPath) -> \(remotePath)")
         }
         return marked
@@ -2326,11 +2334,16 @@ private struct SSHTransferSidebarView: View {
 
     private func paneStatus(derived: SSHPaneDerived, selectedIDs: Set<String>) -> some View {
         let selectedCount = selectedIDs.count
+        let totalFormatted = ByteCountFormatter.string(fromByteCount: Int64(derived.totalBytes), countStyle: .file)
+        let statusText = selectedCount > 0
+            ? "Selected \(selectedCount) item\(selectedCount == 1 ? "" : "s")."
+            : "\(derived.fileCount) files. Total size: \(totalFormatted)"
         return HStack {
-            Text(selectedCount > 0 ? "Selected \(selectedCount) item\(selectedCount == 1 ? "" : "s")." : "\(derived.fileCount) files. Total size: \(derived.totalBytes) bytes")
+            Text(statusText)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1)
+                .accessibilityIdentifier("ssh.pane.status")
             Spacer()
         }
         .padding(.horizontal, DS.Space.sm)
@@ -2648,9 +2661,22 @@ private struct SSHHostFormSheet: View {
                 }
             }
             formField("Password", requirement: "Optional") {
-                SecureField("Saved password", text: $vm.draft.passwordText)
+                VStack(alignment: .leading, spacing: 4) {
+                    SecureField(
+                        vm.draft.hasSavedPassword ? "Leave blank to keep saved password" : "Optional password",
+                        text: $vm.draft.passwordText
+                    )
                     .textFieldStyle(.roundedBorder)
                     .accessibilityIdentifier("ssh.form.password")
+                    // Surface the "saved" state so editing a host makes the existing
+                    // password visible without exposing its value (P2 hasSavedPassword).
+                    if vm.draft.hasSavedPassword && vm.draft.passwordText.isEmpty {
+                        Text("Password saved - leave blank to keep it.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .accessibilityIdentifier("ssh.form.password.savedHint")
+                    }
+                }
             }
             fieldLabel("SSH options", requirement: "Optional")
             TextEditor(text: $vm.draft.optionLines)

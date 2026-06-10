@@ -1015,13 +1015,18 @@ public struct DiffPanelView: View {
                 Button {
                     withAnimation(DS.Motion.micro) { vm.lastError = nil }
                 } label: {
-                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+                    // Enlarged hit area (P3: was 8x8pt icon-only, now 24x24pt target).
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
                 .accessibilityLabel("Dismiss error")
                 .accessibilityIdentifier("diff.error.dismiss")
-                .help("Dismiss error")
+                .help("Dismiss error (Esc)")
+                .keyboardShortcut(.cancelAction)
             }
             // UX-015: when the friendly copy differs from the raw git stderr,
             // offer a "Copy details" affordance so the original is recoverable.

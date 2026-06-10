@@ -628,6 +628,9 @@ private final class FilesViewModel: ObservableObject {
     @Published var syncLabel = "Up to date"
     @Published var syncDetail = ""
     @Published var conflictActive = false
+    /// Non-nil when the most recent explicit Save failed. Shown as an inline
+    /// banner instead of replacing the editor with the empty-state (P1 save-fail).
+    @Published var saveError: String?
 
     let surfaceID: SurfaceID
     let workspaceID: WorkspaceID
@@ -836,12 +839,17 @@ private final class FilesViewModel: ObservableObject {
         guard let sessionID else { return }
         do {
             let result = try router?.filesEditSave(sessionID: sessionID)
+            saveError = nil
             applyEditPayload(result?.objectValue ?? [:], remote: false)
         } catch {
             logFailure("save", error: error)
-            errorText = String(describing: error)
+            // Show save failure as a dismissible banner (P1: do NOT replace the
+            // editor with the empty-state, so the unsaved draft remains visible).
+            saveError = String(describing: error)
         }
     }
+
+    func dismissSaveError() { saveError = nil }
 
     func discard() {
         guard let sessionID else { return }
@@ -1581,6 +1589,15 @@ private struct FilesSurfaceRoot: View {
             Divider()
             Button("Move to Trash", role: .destructive) { beginDelete(targets) }
         } else {
+            Button("Open \(targets.count) Files in New Tabs") {
+                targets.filter { !$0.isDirectory }.forEach { model.openInNewTab($0) }
+            }
+            .accessibilityIdentifier("files.contextMenu.openAllInTabs")
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting(targets.map { URL(fileURLWithPath: $0.path) })
+            }
+            .accessibilityIdentifier("files.contextMenu.revealAll")
+            Divider()
             Button("Move \(targets.count) Items to Trash", role: .destructive) { beginDelete(targets) }
         }
     }
@@ -1636,6 +1653,10 @@ private struct FilesSurfaceRoot: View {
                 Divider().overlay(DS.Palette.line)
                 if model.conflictActive {
                     conflictBanner
+                    Divider().overlay(DS.Palette.line)
+                }
+                if let saveErr = model.saveError {
+                    saveErrorBanner(saveErr)
                     Divider().overlay(DS.Palette.line)
                 }
                 if let error = model.errorText {
@@ -1714,6 +1735,35 @@ private struct FilesSurfaceRoot: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(DS.Palette.surfaceRaised)
+    }
+
+    /// Inline banner for save failures (P1: keep editor visible so the user's
+    /// draft is not hidden behind an empty-state while they have unsaved work).
+    private func saveErrorBanner(_ message: String) -> some View {
+        let mapped = Self.friendlyError(message)
+        return HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(DS.Palette.danger)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Save failed")
+                    .font(DS.Font.bodyStrong)
+                Text(mapped.detail)
+                    .font(DS.Font.caption)
+                    .foregroundStyle(DS.Palette.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            Button("Dismiss") { model.dismissSaveError() }
+                .help("Dismiss this error")
+                .accessibilityIdentifier("files.saveError.dismiss")
+            Button("Retry") { model.save() }
+                .help("Try saving again")
+                .accessibilityIdentifier("files.saveError.retry")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(DS.Palette.surfaceRaised)
+        .accessibilityIdentifier("files.saveError.banner")
     }
 
     private var readerHeader: some View {

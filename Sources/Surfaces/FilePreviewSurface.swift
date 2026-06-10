@@ -143,6 +143,10 @@ public final class FilePreviewSurface: NSObject, Surface {
             let label = NSTextField(labelWithString: "No file selected")
             label.translatesAutoresizingMaskIntoConstraints = false
             label.textColor = .secondaryLabelColor
+            // a11y identifier so UI automation and VoiceOver can locate the
+            // placeholder (P3 empty-state a11y).
+            label.setAccessibilityIdentifier("filePreview.empty")
+            label.setAccessibilityLabel("No file selected")
             containerStack.addSubview(label)
             NSLayoutConstraint.activate([
                 label.centerXAnchor.constraint(equalTo: containerStack.centerXAnchor),
@@ -219,11 +223,31 @@ public final class FilePreviewSurface: NSObject, Surface {
                     PDFDocument(url: url)
                 }.value
                 guard let self, self.filePath == path, let pdf else { return }
-                if let doc { self.pdfCache.store(path: path, document: doc) }
-                pdf.document = doc
-                Self.applyPDFScrollRestore(pdf: pdf, doc: doc, saved: saved)
+                if let doc {
+                    self.pdfCache.store(path: path, document: doc)
+                    pdf.document = doc
+                    Self.applyPDFScrollRestore(pdf: pdf, doc: doc, saved: saved)
+                } else {
+                    // PDFDocument(url:) returned nil — show an error state instead
+                    // of leaving a silently blank pane (P2 PDF-nil error state).
+                    self.showPDFError(over: pdf)
+                }
             }
         }
+    }
+
+    /// Overlay a simple error label on `pdfView` when the PDF fails to load.
+    private func showPDFError(over pdfView: NSView) {
+        let label = NSTextField(labelWithString: "Unable to load PDF")
+        label.textColor = .secondaryLabelColor
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setAccessibilityIdentifier("filePreview.pdfError")
+        pdfView.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: pdfView.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: pdfView.centerYAnchor)
+        ])
     }
 
     @MainActor
