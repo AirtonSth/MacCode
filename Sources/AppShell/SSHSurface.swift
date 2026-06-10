@@ -162,6 +162,9 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         viewModel.onRefreshLocalFiles = { [weak self] in self?.refreshLocalFiles() }
         viewModel.onRefreshRemoteFiles = { [weak self] in self?.refreshRemoteFiles() }
         viewModel.onChooseLocalPath = { [weak self] in self?.chooseLocalTransferPath() }
+        viewModel.onRemoteMkdir = { [weak self] path in self?.runRemoteMkdir(path: path) }
+        viewModel.onRemoteRename = { [weak self] from, to in self?.runRemoteRename(from: from, to: to) }
+        viewModel.onRemoteDelete = { [weak self] path, isDirectory in self?.runRemoteDelete(path: path, isDirectory: isDirectory) }
         showPlaceholder()
         reloadHosts()
         syncTransferSidebarWidth(animated: false)
@@ -538,6 +541,89 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         requestCancel(localPath: localPath, remotePath: remotePath)
     }
 
+    // MARK: - Remote file management
+
+    private func runRemoteMkdir(path: String) {
+        guard let profile = viewModel.selectedHost else { return }
+        let argv = SSHRemoteManagementCommand.mkdirArguments(profile: profile, path: path)
+        let password = profile.password
+        viewModel.addTransferLog("Remote mkdir: \(path)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let ok = try await self.router?.sshRemoteManageAsync(argv: argv, password: password) ?? false
+                if ok {
+                    self.viewModel.addTransferLog("Mkdir ok: \(path)")
+                    await self.refreshRemoteFilesAsync()
+                } else {
+                    self.viewModel.addTransferLog("Mkdir failed: \(path)")
+                }
+            } catch {
+                self.viewModel.addTransferLog("Mkdir failed: \(error.localizedDescription)")
+                sshLog.error("ssh mkdir failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    private func runRemoteRename(from: String, to: String) {
+        guard let profile = viewModel.selectedHost else { return }
+        let argv = SSHRemoteManagementCommand.renameArguments(profile: profile, from: from, to: to)
+        let password = profile.password
+        viewModel.addTransferLog("Remote rename: \(from) -> \(to)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let ok = try await self.router?.sshRemoteManageAsync(argv: argv, password: password) ?? false
+                if ok {
+                    self.viewModel.addTransferLog("Rename ok: \(to)")
+                    await self.refreshRemoteFilesAsync()
+                } else {
+                    self.viewModel.addTransferLog("Rename failed: \(from) -> \(to)")
+                }
+            } catch {
+                self.viewModel.addTransferLog("Rename failed: \(error.localizedDescription)")
+                sshLog.error("ssh rename failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    private func runRemoteDelete(path: String, isDirectory: Bool) {
+        guard let profile = viewModel.selectedHost else { return }
+        let argv = SSHRemoteManagementCommand.deleteArguments(profile: profile, path: path, isDirectory: isDirectory)
+        let password = profile.password
+        viewModel.addTransferLog("Remote delete: \(path)")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let ok = try await self.router?.sshRemoteManageAsync(argv: argv, password: password) ?? false
+                if ok {
+                    self.viewModel.addTransferLog("Delete ok: \(path)")
+                    await self.refreshRemoteFilesAsync()
+                } else {
+                    self.viewModel.addTransferLog("Delete failed: \(path)")
+                }
+            } catch {
+                self.viewModel.addTransferLog("Delete failed: \(error.localizedDescription)")
+                sshLog.error("ssh delete failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// Testing accessor: trigger remote mkdir synchronously via the same path
+    /// the UI uses. The router call is async, so callers must await the returned
+    /// task or observe viewModel.transferLogs for the result.
+    func runRemoteMkdirForTesting(path: String) {
+        runRemoteMkdir(path: path)
+    }
+
+    func runRemoteRenameForTesting(from: String, to: String) {
+        runRemoteRename(from: from, to: to)
+    }
+
+    func runRemoteDeleteForTesting(path: String, isDirectory: Bool) {
+        runRemoteDelete(path: path, isDirectory: isDirectory)
+    }
+
     private func refreshLocalFiles() {
         do {
             let listing = try router?.sshFilesLocalList(path: viewModel.localSitePath)
@@ -833,6 +919,78 @@ enum SSHRecursiveTransferCommand {
     }
 }
 
+// Pure builders for remote file-management commands (mkdir/rename/delete) sent
+// to the remote host via the existing SSH exec channel. Kept non-MainActor +
+// pure so the exact argv shape can be tested without any network or router.
+// All paths are single-quoted with the standard POSIX escape so spaces, dollar
+// signs, backticks, and other shell metacharacters reach the remote shell
+// verbatim.
+enum SSHRemoteManagementCommand {
+
+    // POSIX single-quote escaping: wrap the value in single-quotes and replace
+    // every embedded single-quote with the sequence '\'' (end-quote, literal
+    // apostrophe, re-open-quote). This is the safest shell-quoting approach
+    // because single-quoting suppresses ALL expansion: variables, globs,
+    // history, command substitution -- regardless of the remote shell variant.
+    static func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    // Returns the full ssh argv to create a remote directory and all parents.
+    // The remote script is: mkdir -p 'QUOTED_PATH'
+    static func mkdirArguments(profile: SSHHostProfile, path: String) -> [String] {
+        sshBaseArguments(profile: profile) + ["sh", "-c", "mkdir -p \(shellQuote(path))"]
+    }
+
+    // Returns the full ssh argv to rename (move) a remote path.
+    // The remote script is: mv -- 'SRC' 'DST'
+    // The -- sentinel prevents paths starting with '-' from being parsed as flags.
+    static func renameArguments(profile: SSHHostProfile, from: String, to: String) -> [String] {
+        sshBaseArguments(profile: profile) + ["sh", "-c", "mv -- \(shellQuote(from)) \(shellQuote(to))"]
+    }
+
+    // Returns the full ssh argv to delete a remote path.
+    // Files: rm -f -- 'PATH'; Directories: rm -rf -- 'PATH'
+    // The -f flag suppresses errors on already-absent targets; -- guards against
+    // flag-like path names (e.g. a file named "-rf").
+    static func deleteArguments(profile: SSHHostProfile, path: String, isDirectory: Bool) -> [String] {
+        let rmCmd = isDirectory ? "rm -rf -- \(shellQuote(path))" : "rm -f -- \(shellQuote(path))"
+        return sshBaseArguments(profile: profile) + ["sh", "-c", rmCmd]
+    }
+
+    // Mirrors SSHCommandBuilder.sshArguments(for:) base flags without the
+    // terminal-interaction options (ServerAlive, BatchMode) that are unnecessary
+    // for short management exec commands.
+    private static func sshBaseArguments(profile: SSHHostProfile) -> [String] {
+        var args: [String] = [
+            "-o", "ConnectTimeout=6",
+            "-o", "StrictHostKeyChecking=accept-new"
+        ]
+        if let port = profile.port { args += ["-p", String(port)] }
+        if let identity = profile.identityFile, !identity.isEmpty { args += ["-i", identity] }
+        for option in profile.options where !option.isEmpty {
+            args += ["-o", option]
+        }
+        args.append(profile.destination)
+        return args
+    }
+}
+
+// Extension on AppCommandRouter (same module) that adds the remote management
+// async exec channel. Resolves the SSHHostProfile from the surface registry so
+// this code lives entirely in the owned file and avoids touching AppCommandRouter.swift.
+extension AppCommandRouter {
+    /// Run a one-shot remote shell command on the SSH host attached to `surface`.
+    /// Returns true when the remote exit code is 0. Runs off the main run loop
+    /// via Task.detached so the caller's actor is never blocked.
+    func sshRemoteManageAsync(argv: [String], password: String?) async throws -> Bool {
+        let result = try await Task.detached {
+            try Self.runCommandBlocking(executable: "/usr/bin/ssh", arguments: argv, password: password)
+        }.value
+        return result.exitCode == 0
+    }
+}
+
 // Pure policy for the "large tree" confirm before a recursive transfer (P1:
 // explicit confirm for large trees). Avoids surprising the user with a huge
 // silent copy. Non-MainActor + pure so the threshold logic is testable.
@@ -1066,6 +1224,10 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     var onRefreshLocalFiles: (() -> Void)?
     var onRefreshRemoteFiles: (() -> Void)?
     var onChooseLocalPath: (() -> Void)?
+    // Remote file-management callbacks wired to the surface's exec channel.
+    var onRemoteMkdir: ((String) -> Void)?
+    var onRemoteRename: ((String, String) -> Void)?
+    var onRemoteDelete: ((String, Bool) -> Void)?
     // Injectable identity-file picker so the form sheet can be driven without a
     // blocking NSOpenPanel modal (QA-MAC_SSH-003). Default nil → real panel.
     var identityFilePicker: (() -> String?)?
@@ -1943,6 +2105,24 @@ private struct SSHTransferSidebarView: View {
                                             pasteboard.clearContents()
                                             pasteboard.setString(entry.path, forType: .string)
                                         }
+                                    }
+                                    // Remote file management: mkdir/delete available
+                                    // in the remote pane so single-entry operations
+                                    // don't require opening a terminal. Rename requires
+                                    // user input; it is wired but not surfaced here
+                                    // pending a modal rename sheet.
+                                    if !isLocal {
+                                        Divider()
+                                        Button("New Folder Here") {
+                                            let parent = entry.isDirectory ? entry.path
+                                                : (entry.path as NSString).deletingLastPathComponent
+                                            vm.onRemoteMkdir?((parent as NSString).appendingPathComponent("new_folder"))
+                                        }
+                                        .accessibilityIdentifier("ssh.remote.mkdir")
+                                        Button("Delete", role: .destructive) {
+                                            vm.onRemoteDelete?(entry.path, entry.isDirectory)
+                                        }
+                                        .accessibilityIdentifier("ssh.remote.delete")
                                     }
                                 }
                             }
