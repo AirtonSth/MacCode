@@ -1,7 +1,7 @@
 import Foundation
 import CoreModel
 
-private let iso = ISO8601DateFormatter()
+let iso = ISO8601DateFormatter()
 
 public enum PersistenceDataError: Error, CustomStringConvertible {
     case corruptProviderEventLog(String)
@@ -1605,7 +1605,7 @@ public final class SettingsRepository {
         """)
         try st.bind(1, key)
         try st.bind(2, value)
-        try st.bind(3, ISO8601DateFormatter().string(from: Date()))
+        try st.bind(3, iso.string(from: Date()))
         _ = try st.step()
     }
 }
