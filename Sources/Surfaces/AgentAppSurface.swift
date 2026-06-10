@@ -1477,6 +1477,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Stop a specific thread by id, regardless of which thread is currently selected.
+    /// Allows the thread rail to stop any running thread without switching selection.
+    public func stopThread(_ id: AgentThreadID) {
+        coordinator.stopRun(threadId: id)
+    }
+
     // PERF-MAC_AGENT-006: last assistant text this VM persisted per thread, to
     // skip the O(history) reload when re-deduping the same completed answer.
     private var lastPersistedAssistantContentByThread: [AgentThreadID: String] = [:]
@@ -2518,12 +2524,33 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(t.title)
             .accessibilityIdentifier("agent.thread.row.\(t.id.value.uuidString)")
+            .overlay(alignment: .trailing) {
+                if running {
+                    Button {
+                        vm.stopThread(t.id)
+                    } label: {
+                        Image(systemName: "stop.circle")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(DS.Palette.danger.opacity(0.75))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, DS.Space.md)
+                    .accessibilityLabel("Stop thread")
+                    .accessibilityIdentifier("agent.thread.row.stop.\(t.id.value.uuidString)")
+                    .help("Stop this thread")
+                }
+            }
             .onDrag {
                 draggingThreadId = t.id
                 return NSItemProvider(object: t.id.value.uuidString as NSString)
             }
             .onDrop(of: [.text], delegate: AgentThreadDropDelegate(vm: vm, draggingThreadId: $draggingThreadId, target: t))
             .contextMenu {
+                if running {
+                    Button("Stop", role: .destructive) { vm.stopThread(t.id) }
+                        .accessibilityIdentifier("agent.thread.contextmenu.stop.\(t.id.value.uuidString)")
+                    Divider()
+                }
                 Button(t.pinned ? "Unpin" : "Pin") { vm.setThreadPinned(t.id, !t.pinned) }
                 Divider()
                 Button("Rename…") { renameText = t.title; renamingThreadId = t.id }
@@ -5539,6 +5566,22 @@ enum AgentThreadRowPresentation {
         multiSelected: Bool
     ) -> Bool {
         multiSelected && !selected && !isRunning(threadStatus: threadStatus, selected: selected, surfaceStatus: surfaceStatus)
+    }
+}
+
+/// Pure eligibility helper for per-thread stop affordances in the thread rail.
+/// Determines whether a stop action is available for a given thread and, if so,
+/// which threadId should be targeted. Extracted as a pure type so it can be
+/// tested without touching any MainActor surface.
+public enum AgentThreadStopEligibility {
+    /// True when the thread has a running status, meaning a stop affordance should be shown.
+    public static func isEligible(threadStatus: AgentRunStatus) -> Bool {
+        threadStatus == .running
+    }
+
+    /// Returns the threadId to target with stopThread(_:) when eligible, nil otherwise.
+    public static func targetThreadId(thread: AgentThread) -> AgentThreadID? {
+        isEligible(threadStatus: thread.status) ? thread.id : nil
     }
 }
 
