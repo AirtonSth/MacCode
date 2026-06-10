@@ -56,7 +56,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             return
         }
         installLifecycleRecorder()
-        terminateOrphanedProviderRuntimes(reason: "launch")
+        // PERF (cold launch): the orphan provider sweep is a process scan and
+        // the event-log decode + PTY restore are heavy. StartupPlan defers them
+        // past the first frame; see runDeferredStartup().
         router = AppCommandRouter(context: context)
         context.router = router
 
@@ -71,28 +73,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             let json = String(data: payloadData, encoding: .utf8) ?? "null"
             _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
         }
-        if let rows = try? log.read(since: 0, limit: 256) {
-            let events = rows.compactMap { row -> EventBus.Event? in
-                guard let data = row.payloadJSON.data(using: .utf8),
-                      let val = try? JSONDecoder().decode(JSONValue.self, from: data)
-                else { return nil }
-                return EventBus.Event(seq: row.seq, kind: row.kind, payload: val, ts: Date().timeIntervalSince1970)
-            }
-            EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
-        }
         updater = SparkleAppUpdater.defaultIfConfigured()
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()
         }
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
-        // Rebuild Surface objects from restored layout descriptors, then
-        // refresh so the restored workspaces + tabs actually render
-        // (the controller's init refresh ran before surfaces existed).
-        router.reinstantiateRestoredSurfaces()
-        // UX-MAC_SHELL_WINDOW-014: surfaces now exist; drop the restoring
-        // affordance and render the real layout.
-        windowController.markRestorationComplete()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)
@@ -144,6 +130,38 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         startDiagnosticsHeartbeat()
         logDiagnosticsHeartbeat(reason: "launch")
         checkForUpdatesAfterOpeningApp()
+
+        // PERF (cold launch): the first frame has now painted (show() above), so
+        // the "Restoring workspaces..." affordance can animate while the heavy,
+        // frame-irrelevant restore work runs. StartupPlan.deferredSteps decide
+        // what lands here. Hopping back through the main queue yields one runloop
+        // turn for the frame before the PTY spawns / process scan begin.
+        DispatchQueue.main.async { [weak self] in
+            self?.runDeferredStartup()
+        }
+    }
+
+    /// PERF (cold launch): the StartupPlan-deferred steps -- orphan provider
+    /// sweep (process scan), persisted event-log read + JSON decode of up to 256
+    /// payloads, and reinstantiating restored surfaces (a PTY spawn per restored
+    /// terminal). Runs after the first frame so launch is not blocked.
+    private func runDeferredStartup() {
+        terminateOrphanedProviderRuntimes(reason: "launch")
+
+        if let log = context?.eventLog, let rows = try? log.read(since: 0, limit: 256) {
+            let events = rows.compactMap { row -> EventBus.Event? in
+                guard let data = row.payloadJSON.data(using: .utf8),
+                      let val = try? JSONDecoder().decode(JSONValue.self, from: data)
+                else { return nil }
+                return EventBus.Event(seq: row.seq, kind: row.kind, payload: val, ts: Date().timeIntervalSince1970)
+            }
+            EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
+        }
+
+        // Rebuild Surface objects from restored layout descriptors, then drop
+        // the restoring affordance and render the real layout.
+        router?.reinstantiateRestoredSurfaces()
+        windowController?.markRestorationComplete()
     }
 
     public func checkForUpdatesAfterOpeningApp() {
