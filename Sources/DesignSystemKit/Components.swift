@@ -70,7 +70,9 @@ public struct DSPill: View {
     }
 }
 
-// MARK: - Icon button (compact, 44pt hit area, on-style states)
+// MARK: - Icon button (compact visual; 26x22pt frame; .contentShape expands hit area)
+// Minimum recommended hit target: 44x44pt — use .frame(width:height:) on the call site
+// or wrap in a larger .contentShape if placing in a tight toolbar.
 
 public struct DSIconButton: View {
     let systemName: String
@@ -94,13 +96,28 @@ public struct DSIconButton: View {
         }
         .buttonStyle(.plain)
         .help(help)
+        .accessibilityLabel(help)
         .onHover { hovering = $0 }
+    }
+}
+
+// MARK: - Button opacity helper (pure, testable seam)
+
+/// Computes the effective opacity for a DS button given its interaction state.
+/// - isEnabled: false => DS.Alpha.disabled (hard floor, overrides hover)
+/// - isHovering: true => 1.0 + DS.Alpha.hoverDelta (clamped to 1.0)
+/// - normal     => 1.0
+public enum DSButtonOpacity {
+    public static func effectiveOpacity(isEnabled: Bool, isHovering: Bool) -> Double {
+        guard isEnabled else { return DS.Alpha.disabled }
+        return isHovering ? min(1.0, 1.0 + DS.Alpha.hoverDelta) : 1.0
     }
 }
 
 // MARK: - Primary / secondary button styles
 
 public struct DSPrimaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
     public init() {}
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -110,25 +127,31 @@ public struct DSPrimaryButtonStyle: ButtonStyle {
             .padding(.vertical, DS.Space.md)
             .background(DS.Palette.accent.opacity(configuration.isPressed ? 0.82 : 1.0))
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .opacity(1.0)
+            .opacity(DSButtonOpacity.effectiveOpacity(isEnabled: isEnabled, isHovering: false))
     }
 }
 
 public struct DSSecondaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
     @State private var hovering = false
     public init() {}
     public func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        let bg: Color = configuration.isPressed
+            ? DS.Palette.pressed
+            : (hovering ? DS.Palette.hover : DS.Palette.surfaceRaised)
+        return configuration.label
             .font(DS.Font.body)
             .foregroundColor(DS.Palette.text)
             .padding(.horizontal, DS.Space.lg)
             .padding(.vertical, DS.Space.sm)
-            .background(configuration.isPressed ? DS.Palette.pressed : DS.Palette.surfaceRaised)
+            .background(bg)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                     .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
             )
+            .opacity(DSButtonOpacity.effectiveOpacity(isEnabled: isEnabled, isHovering: hovering))
+            .onHover { hovering = $0 }
     }
 }
 

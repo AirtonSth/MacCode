@@ -81,6 +81,15 @@ public enum DS {
         }
     }
 
+    // MARK: Alpha tokens
+
+    public enum Alpha {
+        /// Opacity applied to disabled interactive elements.
+        public static let disabled: Double = 0.38
+        /// Additive opacity delta applied on hover (multiplied into the base layer).
+        public static let hoverDelta: Double = 0.07
+    }
+
     // MARK: Spacing — 4/8 rhythm
 
     public enum Space {
