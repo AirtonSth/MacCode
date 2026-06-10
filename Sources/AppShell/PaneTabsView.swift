@@ -39,6 +39,9 @@ public final class PaneTabsView: NSObject {
     // order to patch the strip in place instead of rebuilding it.
     private var currentSurfaceIDs: [SurfaceID] = []
     private var eventToken: UUID?
+    // UX-P3: holds the surface ID shown in a missing-surface placeholder so
+    // the "Close Tab" recovery button can route through closeSurface.
+    private var pendingMissingSurfaceID: SurfaceID?
 
     public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil, workspaceID: WorkspaceID? = nil) {
         self.pane = pane
@@ -96,17 +99,51 @@ public final class PaneTabsView: NSObject {
                 sv.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
             ])
         } else {
-            let label = NSTextField(labelWithString: pane.surfaces.isEmpty
-                ? "Empty pane — use + to add a surface"
-                : "missing surface")
-            label.textColor = DS.NS.textTertiary
-            label.font = NSFont.systemFont(ofSize: 12)
-            label.translatesAutoresizingMaskIntoConstraints = false
-            contentArea.addSubview(label)
-            NSLayoutConstraint.activate([
-                label.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
-                label.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
-            ])
+            if pane.surfaces.isEmpty {
+                let label = NSTextField(labelWithString: "Empty pane \u{2014} use + to add a surface")
+                label.textColor = DS.NS.textTertiary
+                label.font = NSFont.systemFont(ofSize: 12)
+                label.translatesAutoresizingMaskIntoConstraints = false
+                contentArea.addSubview(label)
+                NSLayoutConstraint.activate([
+                    label.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+                    label.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
+                ])
+            } else {
+                // UX-P3: surface registered in the pane model but not in
+                // SurfaceRegistry (e.g. session-restore failure). Show
+                // user-readable copy and a recovery action.
+                let label = NSTextField(labelWithString: "This tab could not be loaded")
+                label.textColor = DS.NS.textTertiary
+                label.font = NSFont.systemFont(ofSize: 13)
+                label.translatesAutoresizingMaskIntoConstraints = false
+
+                let hint = NSTextField(labelWithString: "The surface is unavailable. Close the tab to continue.")
+                hint.textColor = DS.NS.textTertiary
+                hint.font = NSFont.systemFont(ofSize: 11)
+                hint.translatesAutoresizingMaskIntoConstraints = false
+
+                let closeBtn = NSButton(title: "Close Tab", target: nil, action: nil)
+                closeBtn.bezelStyle = .rounded
+                closeBtn.controlSize = .small
+                closeBtn.translatesAutoresizingMaskIntoConstraints = false
+                if let failedID = selectedID {
+                    pendingMissingSurfaceID = failedID
+                    closeBtn.target = self
+                    closeBtn.action = #selector(closeMissingSurface(_:))
+                }
+
+                let stack = NSStackView(views: [label, hint, closeBtn])
+                stack.orientation = .vertical
+                stack.alignment = .centerX
+                stack.spacing = DS.Space.sm
+                stack.translatesAutoresizingMaskIntoConstraints = false
+                contentArea.addSubview(stack)
+                NSLayoutConstraint.activate([
+                    stack.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+                    stack.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
+                ])
+            }
         }
 
         // Chrome-style flat "+" that sits right after the last tab.
@@ -334,9 +371,26 @@ public final class PaneTabsView: NSObject {
         icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
         icon.contentTintColor = DS.NS.textSecondary
         icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.toolTip = selected?.title ?? "Minimized pane"
+        // UX-P2: tooltip lists all tab titles so the user knows what is
+        // hidden behind the minimized rail without having to restore it.
+        let allTitles = pane.surfaces.map(\.title).joined(separator: "\n")
+        icon.toolTip = allTitles.isEmpty ? "Minimized pane" : allTitles
 
-        let stack = NoDragStack(views: [restore, icon])
+        // UX-P2: show a tab-count badge when more than one tab is hidden
+        // so the user knows there are additional surfaces in this pane.
+        var stackViews: [NSView] = [restore, icon]
+        if pane.surfaces.count > 1 {
+            let badge = NSTextField(labelWithString: "\(pane.surfaces.count)")
+            badge.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+            badge.textColor = DS.NS.textSecondary
+            badge.alignment = .center
+            badge.translatesAutoresizingMaskIntoConstraints = false
+            badge.setAccessibilityIdentifier("pane.minimized.tabCount")
+            badge.toolTip = "\(pane.surfaces.count) tabs"
+            stackViews.append(badge)
+        }
+
+        let stack = NoDragStack(views: stackViews)
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = DS.Space.md
@@ -533,6 +587,11 @@ public final class PaneTabsView: NSObject {
 
     private static func title(for type: SurfaceType) -> String {
         surfaceChoices.first(where: { $0.1 == type })?.0 ?? type.rawValue
+    }
+
+    @objc private func closeMissingSurface(_ sender: NSButton) {
+        guard let id = pendingMissingSurfaceID else { return }
+        closeSurface(id)
     }
 
     /// A token-styled square icon button used for the split controls.
@@ -1381,7 +1440,27 @@ final class PaneTabButton: NSView {
 
     private func routeManualDrop(hit: NSView, contentPoint point: NSPoint, in contentView: NSView) {
         if let target = enclosingView(from: hit, as: PaneTabButton.self), target !== self {
-            _ = target.onDropSurface?(surfaceID)
+            // UX-P3: half-tab drop placement — pointer in the right half
+            // of the target tab means "insert after", so we route to the
+            // NEXT sibling tab (insert before next = insert after current).
+            // If there is no next tab, fall through to the strip (append).
+            let targetFrameInContent = target.convert(target.bounds, to: contentView)
+            let pointerX = point.x
+            let wantAfter = pointerX >= targetFrameInContent.midX
+
+            if wantAfter, let strip = target.superview as? PaneTabDropStack {
+                let tabs = strip.arrangedSubviews.compactMap { $0 as? PaneTabButton }
+                if let idx = tabs.firstIndex(where: { $0 === target }),
+                   idx + 1 < tabs.count {
+                    // There is a next tab: insert before it.
+                    _ = tabs[idx + 1].onDropSurface?(surfaceID)
+                } else {
+                    // No next tab: append to the strip.
+                    _ = strip.onDropSurface?(surfaceID)
+                }
+            } else {
+                _ = target.onDropSurface?(surfaceID)
+            }
             return
         }
         if let strip = enclosingView(from: hit, as: PaneTabDropStack.self) {
