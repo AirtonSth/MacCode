@@ -23,6 +23,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// app delegate must own it for the process lifetime.
     private var authProvider: DirectAuthProvider?
     private var localAuth: LocalAuthAdapter?
+
+    /// GAP-5 retention seam. `DirectHTTPServer.auth` is a *weak* ref, so the
+    /// app delegate is the sole strong owner; this method makes that ownership
+    /// the single, named, testable assignment. A regression that turns
+    /// `authProvider` into a weak/unowned ref (or drops this call) lets the
+    /// provider deallocate and silently disables pairing AND the LAN auth gate.
+    /// `authProviderIsRetained` lets a test observe the strong ref survives a
+    /// dropped local reference without spinning up the full HTTP stack.
+    func retainAuthProvider(_ provider: DirectAuthProvider) {
+        authProvider = provider
+    }
+
+    /// True iff a strong reference to an auth provider is currently held.
+    /// Used by the GAP-5 regression test to fail loud if the strong owner
+    /// is ever removed.
+    var authProviderIsRetained: Bool { authProvider != nil }
     private var bonjour: NetService?
     private let bonjourDelegate = BonjourDelegate()
     public var palette: CommandPalette?
@@ -150,7 +166,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             repo: trustRepo,
             privateAccountStore: PrivateAccountSessionStore(repo: context.settingsRepo)
         )
-        authProvider = auth   // GAP-5: retain for process lifetime
+        retainAuthProvider(auth)   // GAP-5: retain for process lifetime
         localAuth = auth
         // A device-initiated pair request pops an approve/deny modal on
         // the Mac. The HTTP handler invokes this off the listener thread;
@@ -441,12 +457,36 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// mobile client's identity pin (RCA-022) does not break on every
     /// restart and force a re-pair.
     private func stableServerId() -> String {
-        if let existing = (try? context.settingsRepo.get("server_id")) ?? nil, !existing.isEmpty {
+        let persisted = (try? context.settingsRepo.get("server_id")) ?? nil
+        if let existing = Self.resolveServerId(persisted: persisted, fresh: nil) {
             return existing
         }
         let fresh = UUID().uuidString
         try? context.settingsRepo.set("server_id", fresh)
         return fresh
+    }
+
+    /// Pure decision for `stableServerId` (GAP-2/T020). Returns the persisted
+    /// id only when it is present AND non-empty; otherwise nil to signal the
+    /// caller must mint+persist a fresh one. Empty-string must NOT be treated
+    /// as a valid id, or the identity pin (RCA-022) would key on "" and break.
+    /// `fresh` lets a test inject a deterministic mint value for the miss case.
+    nonisolated static func resolveServerId(persisted: String?, fresh: String?) -> String? {
+        if let persisted, !persisted.isEmpty { return persisted }
+        return fresh
+    }
+
+    /// Pure builder for the Bonjour TXT record (GAP-4/T021). Extracted so the
+    /// exact keys/values the iOS client reads before connecting are pinned by
+    /// a test; a dropped or renamed key silently makes this Mac undiscoverable
+    /// or mis-identified. Values are UTF-8 Data exactly as `setTXTRecord` needs.
+    nonisolated static func bonjourTXTRecord(serverId: String, version: String) -> [String: Data] {
+        [
+            "server_id": Data(serverId.utf8),
+            "app": Data("remotecode".utf8),
+            "version": Data(version.utf8),
+            "api": Data("2".utf8)
+        ]
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -1010,12 +1050,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private func publishBonjour(serverId: String) {
         let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: 18217)
-        let txt: [String: Data] = [
-            "server_id": Data(serverId.utf8),
-            "app": Data("remotecode".utf8),
-            "version": Data(AppVersion.short.utf8),
-            "api": Data("2".utf8)
-        ]
+        let txt = Self.bonjourTXTRecord(serverId: serverId, version: AppVersion.short)
         svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
         svc.delegate = bonjourDelegate
         svc.publish()
