@@ -76,4 +76,42 @@ final class WWWAuthenticateAndListenerEventTests: XCTestCase {
         XCTAssertEqual(keys, ["bound", "address", "port"],
                        "payload must contain exactly the three keys: bound, address, port")
     }
+
+    // MARK: wsUpgradeRequiresToken (P1 security gate)
+
+    func test_wsUpgrade_nonLoopback_withAuth_requiresToken() {
+        // WHY (P1, worst defect found): the /v1/ws upgrade runs BEFORE the HTTP
+        // auth gate and returns early. Without this gate an unauthenticated
+        // non-loopback LAN peer could subscribe to /v1/ws and receive terminal
+        // output, agent messages, and file-edit contents. On a LAN bind with an
+        // auth provider configured, the upgrade MUST demand a valid token.
+        XCTAssertTrue(
+            DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: false, hasAuthProvider: true),
+            "LAN bind + auth enabled must gate /v1/ws upgrade behind a token")
+    }
+
+    func test_wsUpgrade_loopbackOnly_isOpen() {
+        // WHY: loopback is trusted, matching the HTTP /v1/* gate (which skips
+        // auth when bindLoopbackOnly). The loopbackOnly:true test harness relies
+        // on the upgrade staying open without a token.
+        XCTAssertFalse(
+            DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: true, hasAuthProvider: true),
+            "loopback-only bind must NOT require a token for /v1/ws (trusted)")
+    }
+
+    func test_wsUpgrade_noAuthProvider_isOpen() {
+        // WHY: a nil auth provider means auth is disabled for this server; the
+        // gate must not block the upgrade when there is no token to verify
+        // against, mirroring the HTTP gate's `let auth = auth` guard.
+        XCTAssertFalse(
+            DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: false, hasAuthProvider: false),
+            "no auth provider means /v1/ws upgrade stays open (auth disabled)")
+    }
+
+    func test_wsUpgrade_loopbackAndNoAuth_isOpen() {
+        // WHY: boundary - both trust signals present; must remain open.
+        XCTAssertFalse(
+            DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: true, hasAuthProvider: false),
+            "loopback + no auth must remain open")
+    }
 }

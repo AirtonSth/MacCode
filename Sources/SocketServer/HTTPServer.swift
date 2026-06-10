@@ -130,6 +130,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     static let wsHeartbeatInterval: TimeInterval = 20
 
+    /// Pure helper: decides whether the `/v1/ws` upgrade must present a valid
+    /// bearer token. Mirrors the HTTP `/v1/*` auth gate: loopback-only binds are
+    /// trusted (open), and a missing auth provider means auth is disabled.
+    /// Extracted so the gate decision is unit-testable without a live socket.
+    nonisolated static func wsUpgradeRequiresToken(loopbackOnly: Bool, hasAuthProvider: Bool) -> Bool {
+        !loopbackOnly && hasAuthProvider
+    }
+
     public let port: UInt16
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
@@ -311,6 +319,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
         if method == "GET", path == "/v1/ws",
            headers["upgrade"]?.lowercased() == "websocket",
            let key = headers["sec-websocket-key"] {
+            // SECURITY (P1, worst defect found): gate the /v1/ws upgrade with the
+            // SAME bearer-token check as the other /v1/* routes below. The upgrade
+            // block runs before the HTTP auth gate and returns, so without this an
+            // unauthenticated non-loopback LAN peer could subscribe to /v1/ws and
+            // receive terminal output, agent messages, and file-edit contents.
+            // Loopback-only mode stays open, matching the HTTP gate (loopback is
+            // trusted) and preserving the loopbackOnly: true test harness.
+            if Self.wsUpgradeRequiresToken(loopbackOnly: bindLoopbackOnly, hasAuthProvider: auth != nil),
+               let auth = auth {
+                let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
+                guard let t = token, auth.verify(token: t) else {
+                    send(fd: fd, status: 401, contentType: "text/plain",
+                         body: "unauthorized\n".data(using: .utf8)!,
+                         additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
+                }
+            }
             performWSHandshake(fd: fd, key: key)
             let wsCompressionEnabled = headers["x-rc2-ws-encoding"]?
                 .split(separator: ",")
