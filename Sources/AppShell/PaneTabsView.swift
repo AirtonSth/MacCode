@@ -195,6 +195,22 @@ public final class PaneTabsView: NSObject {
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
 
+        // Focus-follows-click: a mouseDown anywhere inside the pane root
+        // (content area or tab header) records this pane as focused so
+        // Cmd+W / Cmd+D act on the right pane. The closure is pure-ID
+        // routing: no surface selection, no UI side effects.
+        let paneID = pane.id
+        v.onContentAreaMouseDown = { [weak self] in
+            guard let self,
+                  let wid = currentWorkspaceID(),
+                  let ws = router?.context?.state.workspaces[wid],
+                  let target = Self.focusPaneCommand(
+                      currentFocusedPaneID: ws.focusedPaneID,
+                      paneID: paneID,
+                      workspaceID: wid) else { return }
+            try? router?.focusPane(workspace: target.workspace, pane: target.pane)
+        }
+
         // PERF-MAC_SHELL_WINDOW-001: the tab strip only reacts to
         // `files.state.updated`. Drop every other kind on the publishing
         // thread instead of bouncing the full EventBus firehose to main
@@ -694,6 +710,21 @@ public final class PaneTabsView: NSObject {
                 && lhs.inserts.count == rhs.inserts.count
                 && zip(lhs.inserts, rhs.inserts).allSatisfy { $0.id == $1.id && $0.index == $1.index }
         }
+    }
+
+    /// Pure focus-follows-click resolver. Returns the (workspaceID, paneID)
+    /// that should receive focus when the user clicks into a pane's content
+    /// area. Returns nil when the pane is already the focused one so the
+    /// caller can skip a redundant state write (idempotent path).
+    ///
+    /// Pure: only ID comparisons — no AppKit, no MainActor dependency.
+    nonisolated public static func focusPaneCommand(
+        currentFocusedPaneID: PaneID?,
+        paneID: PaneID,
+        workspaceID: WorkspaceID
+    ) -> (workspace: WorkspaceID, pane: PaneID)? {
+        guard currentFocusedPaneID != paneID else { return nil }
+        return (workspaceID, paneID)
     }
 
     /// Pure tab-strip diff. Order-preserving: `updates` and the surviving
@@ -1459,8 +1490,16 @@ class NoDragView: NSView {
 final class PaneRootView: NoDragView {
     static let splitDropOverlayLayerName = "split-drop-preview"
     var paneID: PaneID?
+    /// Called before super.mouseDown so content-area clicks route pane focus
+    /// before AppKit dispatches the event into the surface subview hierarchy.
+    var onContentAreaMouseDown: (() -> Void)?
     private let splitDropOverlay = CALayer()
     private var splitDropDirection: SplitDirection?
+
+    override func mouseDown(with event: NSEvent) {
+        onContentAreaMouseDown?()
+        super.mouseDown(with: event)
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

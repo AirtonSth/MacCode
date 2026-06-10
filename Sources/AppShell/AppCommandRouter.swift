@@ -671,6 +671,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         publishSurfaceFocused(workspace: workspace, surface: surface)
     }
 
+    /// Focus-follows-click: route a pane-content mouseDown to make the clicked
+    /// pane the focused one so Cmd+W/Cmd+D act on the pane the user is typing in.
+    public func focusPane(workspace: WorkspaceID, pane: PaneID) throws {
+        try context?.apply(.focusPane(workspace, pane))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+    }
+
     public func repairSelectedTerminalFocus(reason: String) {
         guard let ctx = context else { return }
         var workspaceIDs = Set(ctx.state.windows.compactMap(\.selectedWorkspaceID))
