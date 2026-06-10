@@ -1034,6 +1034,23 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 }
 
+// MARK: - Detached workspace frame autosave helper
+
+/// Returns the AppKit frameAutosaveName for a detached workspace window.
+///
+/// Contract (all enforced by DetachedFrameAutosaveNameTests):
+///   - Stable: same workspaceID always returns the same string.
+///   - Unique: distinct IDs produce distinct names.
+///   - Namespaced under "io.remotecode.detachedWorkspace." so it cannot
+///     collide with the main window key ("io.remotecode.mainWindow").
+///
+/// Pure function: no AppKit interaction, no side effects.
+/// Called from WorkspaceWindowController.init so the detached window
+/// restores its frame across launches just like the main window does.
+func detachedFrameAutosaveName(workspaceID: WorkspaceID) -> String {
+    "io.remotecode.detachedWorkspace.\(workspaceID.value.uuidString)"
+}
+
 @MainActor
 private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
     let window: NSWindow
@@ -1070,7 +1087,15 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
         win.delegate = self
         setupLayout()
         refreshFromState()
-        win.center()
+        // P2-MAC_SHELL_WINDOW: restore the saved frame for this workspace's
+        // detached window, falling back to center() on first open (no saved
+        // frame). The autosave name is stable per workspace UUID so each
+        // workspace remembers its own position independently.
+        let autosaveName = detachedFrameAutosaveName(workspaceID: workspaceID)
+        if !win.setFrameUsingName(autosaveName) {
+            win.center()
+        }
+        win.setFrameAutosaveName(autosaveName)
     }
 
     func show() {
