@@ -46,8 +46,42 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     /// requestId → freshly minted plaintext token, held in RAM only and
     /// delivered to the device exactly once (never persisted — mirrors
     /// the redeem path's no-plaintext-at-rest invariant).
+    ///
+    /// Each entry carries an `issuedAt` timestamp so that entries whose
+    /// device stopped polling (e.g. user cancelled before the token was
+    /// retrieved) are lazily swept on the next `pairingRequestStatus` call.
     private let pendingLock = NSLock()
-    private var pendingTokens: [String: (deviceId: String, token: String)] = [:]
+    private var pendingTokens: [String: (deviceId: String, token: String, issuedAt: Date)] = [:]
+
+    /// How long a pending (unpolled) approved-token is retained in RAM.
+    /// Matches the pairing-request TTL so a device that polls right up to
+    /// expiry can still retrieve its token.
+    static let pendingTokenTTL: TimeInterval = 300   // 5 min
+
+    // MARK: - Pure helpers (testable, no side effects)
+
+    /// Returns `true` when a pending token that was issued at `issuedAt`
+    /// should no longer be delivered because more than `ttl` seconds have
+    /// elapsed since issuance.
+    ///
+    /// Pure helper — no state. `nonisolated static` so tests can call it
+    /// directly without constructing a `LocalAuthAdapter`.
+    nonisolated static func isPendingTokenExpired(
+        issuedAt: Date, now: Date, ttl: TimeInterval
+    ) -> Bool {
+        now.timeIntervalSince(issuedAt) > ttl
+    }
+
+    /// Returns a copy of `tokens` with all entries whose `issuedAt` is older
+    /// than `ttl` removed.  Pure helper — callers are responsible for writing
+    /// the result back under the lock.
+    nonisolated static func sweepExpiredPendingTokens(
+        _ tokens: [String: (deviceId: String, token: String, issuedAt: Date)],
+        now: Date,
+        ttl: TimeInterval
+    ) -> [String: (deviceId: String, token: String, issuedAt: Date)] {
+        tokens.filter { !isPendingTokenExpired(issuedAt: $0.value.issuedAt, now: now, ttl: ttl) }
+    }
 
     public func verify(token: String) -> Bool {
         ((try? repo.verify(token: token)) ?? nil) != nil
@@ -71,6 +105,14 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     }
 
     private func canAutoApprovePairing(privateAccountAccessToken: String?) -> Bool {
+        // SAFETY: this function blocks the calling thread (DispatchSemaphore.wait)
+        // for up to 8 seconds.  It MUST NOT be called on the main actor — doing so
+        // would deadlock the run loop.  Today callers are HTTP listener threads
+        // (safe); if a future refactor routes here from the main actor, the
+        // precondition below will surface the bug at call-site.
+        precondition(!Thread.isMainThread,
+                     "canAutoApprovePairing must not run on the main thread — it blocks up to 8 s")
+
         guard let privateAccountAccessToken,
               let localSession = privateAccountStore?.load(),
               localSession.user.subscribed else { return false }
@@ -92,7 +134,9 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     /// Called from the Mac modal's Approve button.
     public func approvePairingRequest(_ requestId: String) {
         guard let (trust, token) = try? repo.approvePairingRequest(id: requestId) else { return }
-        pendingLock.lock(); pendingTokens[requestId] = (trust.id, token); pendingLock.unlock()
+        pendingLock.lock()
+        pendingTokens[requestId] = (trust.id, token, Date())
+        pendingLock.unlock()
         try? repo.audit(actor: trust.id, action: "pairing.approve", detail: trust.displayName)
     }
 
@@ -105,10 +149,21 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     public func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? {
         guard let r = try? repo.pairingRequest(id: requestId) else { return nil }
         if r.effectiveStatus == "approved" {
+            let now = Date()
             pendingLock.lock()
+            // Lazily sweep TTL-expired entries on every approved-status poll.
+            pendingTokens = LocalAuthAdapter.sweepExpiredPendingTokens(
+                pendingTokens, now: now, ttl: LocalAuthAdapter.pendingTokenTTL
+            )
             let pending = pendingTokens.removeValue(forKey: requestId)
             pendingLock.unlock()
-            return ("approved", r.deviceID ?? pending?.deviceId, pending?.token)
+            // Deliver the token only when it has not already expired.
+            let liveToken: String? = pending.flatMap { entry in
+                LocalAuthAdapter.isPendingTokenExpired(
+                    issuedAt: entry.issuedAt, now: now, ttl: LocalAuthAdapter.pendingTokenTTL
+                ) ? nil : entry.token
+            }
+            return ("approved", r.deviceID ?? pending?.deviceId, liveToken)
         }
         return (r.effectiveStatus, nil, nil)
     }
@@ -149,6 +204,24 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         try? repo.audit(actor: "system", action: "device.revoke", detail: id)
     }
 }
+
+#if DEBUG
+extension LocalAuthAdapter {
+    /// Back-dates the `issuedAt` of a pending-token entry by `seconds`.
+    /// Only available in DEBUG builds for TTL-expiry unit tests; must not
+    /// ship in production.
+    func testBackdatePendingToken(requestId: String, by seconds: TimeInterval) {
+        pendingLock.lock()
+        defer { pendingLock.unlock() }
+        guard let entry = pendingTokens[requestId] else { return }
+        pendingTokens[requestId] = (
+            entry.deviceId,
+            entry.token,
+            entry.issuedAt.addingTimeInterval(-seconds)
+        )
+    }
+}
+#endif
 
 private final class LockedAccountVerificationBox: @unchecked Sendable {
     private let lock = NSLock()
