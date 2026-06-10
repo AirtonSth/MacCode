@@ -501,11 +501,39 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         NSApp.mainMenu = mainMenu
     }
 
+    // MARK: - About panel
+
+    /// Pure helper: builds the options dict for `orderFrontStandardAboutPanel`.
+    ///
+    /// Rules:
+    ///   - `version` is always included as `.applicationVersion`.
+    ///   - `build` is included as `.version` only when it is non-nil and
+    ///     differs from `version` (avoids a redundant "1.2.3 (1.2.3)" line).
+    ///   - For non-stable channels a credits line naming the channel is
+    ///     included so the build provenance is visible in the About panel.
+    nonisolated static func aboutPanelOptions(
+        version: String,
+        build: String?,
+        channel: ReleaseChannel
+    ) -> [NSApplication.AboutPanelOptionKey: Any] {
+        var opts: [NSApplication.AboutPanelOptionKey: Any] = [:]
+        opts[.applicationVersion] = version
+        if let build, build != version {
+            opts[.version] = build
+        }
+        if channel != .stable {
+            opts[.credits] = NSAttributedString(string: channel.rawValue)
+        }
+        return opts
+    }
+
     @objc private func showAbout() {
-        let alert = NSAlert()
-        alert.messageText = "RemoteCode"
-        alert.informativeText = "Native Swift macOS rewrite. cmux-style panes + Agent App surface."
-        alert.runModal()
+        let opts = Self.aboutPanelOptions(
+            version: AppVersion.short,
+            build: Bundle.main.infoDictionary?["CFBundleVersion"] as? String,
+            channel: channel
+        )
+        NSApp.orderFrontStandardAboutPanel(options: opts)
     }
 
     /// Opens the diagnostics folder in Finder so users can locate and attach
