@@ -25,12 +25,6 @@ public extension View {
             }
     }
 
-    func dsFocusRing(_ visible: Bool) -> some View {
-        overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.focusRing, lineWidth: visible ? 2 : 0)
-        )
-    }
 }
 
 // MARK: - Status pill
@@ -174,6 +168,50 @@ public struct DSSectionHeader: View {
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.md)
+    }
+}
+
+/// Generic variant of DSSectionHeader that accepts a concrete @ViewBuilder trailing view,
+/// preserving SwiftUI identity (no AnyView erasure). Prefer this over DSSectionHeader
+/// on hot paths (lists, frequently-updating sections).
+public struct DSSectionHeaderG<Trailing: View>: View {
+    let title: String
+    let trailing: Trailing
+
+    public init(_ title: String, @ViewBuilder trailing: () -> Trailing) {
+        self.title = title
+        self.trailing = trailing()
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.md) {
+            Text(title.uppercased())
+                .font(DS.Font.caption2.weight(.semibold))
+                .tracking(0.6)
+                .foregroundColor(DS.Palette.textTertiary)
+            Spacer(minLength: 0)
+            trailing
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.md)
+    }
+}
+
+/// Convenience init for the no-trailing case (trailing = EmptyView).
+extension DSSectionHeaderG where Trailing == EmptyView {
+    public init(_ title: String) {
+        self.title = title
+        self.trailing = EmptyView()
+    }
+}
+
+// MARK: - DSSectionHeaderG pure helpers (testable seam; no SwiftUI host required)
+
+extension DSSectionHeaderG {
+    /// Returns the display text exactly as rendered: uppercased, matching Text(title.uppercased()).
+    /// Exists as a nonisolated static seam so tests can verify the transform without a View host.
+    nonisolated public static func displayTitle(for rawTitle: String) -> String {
+        rawTitle.uppercased()
     }
 }
 
