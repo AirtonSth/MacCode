@@ -42,6 +42,14 @@ public final class FeedPanelViewModel: ObservableObject {
 
     private var pending: [Item] = []
 
+    /// Pure drop-oldest trim: returns `buffer` capped to `cap` items (newest kept).
+    /// Called on the pending buffer after every enqueue while paused (PERF-PENDING-CAP).
+    /// Extracted as a `nonisolated static` so it can be unit-tested without @MainActor.
+    nonisolated public static func trimmed(_ buffer: [Item], cap: Int) -> [Item] {
+        guard buffer.count > cap else { return buffer }
+        return Array(buffer.suffix(cap))
+    }
+
     /// Number of buffered events waiting to be flushed when the feed resumes.
     public var pendingCount: Int { pending.count }
 
@@ -63,7 +71,11 @@ public final class FeedPanelViewModel: ObservableObject {
 
     public func receive(seq: Int64, kind: String, title: String, ts: Double) {
         let item = Item(id: seq, kind: kind, title: title, ts: Date(timeIntervalSince1970: ts))
-        if paused { pending.append(item); return }
+        if paused {
+            pending.append(item)
+            if pending.count > Self.cap { pending = Self.trimmed(pending, cap: Self.cap) }
+            return
+        }
         append(item)
     }
 
