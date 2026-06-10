@@ -180,8 +180,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             existing.providerThreadId = request.providerThreadId
             existing.onEvent = onEvent
             existing.environment = request.environment
-            seedTranscriptIfNeeded(session: existing)
             lock.unlock()
+            seedTranscriptOutsideLock(session: existing)
             return
         }
         lock.unlock()
@@ -192,8 +192,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.status = .completed
         session.onEvent = onEvent
         session.environment = request.environment
-        seedTranscriptIfNeeded(session: session)
         lock.unlock()
+        seedTranscriptOutsideLock(session: session)
     }
 
     public func listSessions() -> [AgentProviderSessionSummary] {
@@ -209,9 +209,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+        lock.lock()
+        let session = sessions[threadId]
+        lock.unlock()
+        guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
+        seedTranscriptOutsideLock(session: session)
         lock.lock(); defer { lock.unlock() }
-        guard let session = sessions[threadId] else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
-        seedTranscriptIfNeeded(session: session)
         return session.events
     }
 
@@ -587,15 +590,60 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.unlock()
     }
 
-    private func seedTranscriptIfNeeded(session: Session) {
-        guard !Self.hasReadableTurn(session.events),
-              let providerThreadId = session.providerThreadId,
-              !providerThreadId.isEmpty else {
+    /// Seeds in-memory transcript without holding `lock` across the recursive
+    /// disk enumeration in `ClaudeTranscriptStore.readSession`. The disk read is
+    /// the slow part (filesystem walk of ~/.claude/projects + file reads); doing
+    /// it under the adapter lock stalled every pipe-readability callback and any
+    /// other adapter API. Sequence:
+    ///   1. snapshot the seed inputs under the lock, then release it,
+    ///   2. perform the disk read with NO lock held,
+    ///   3. re-take the lock only to merge the result, re-checking the guard so a
+    ///      concurrent live turn that produced a readable turn meanwhile wins
+    ///      (no double-seed / no clobbering live events).
+    /// Callers MUST invoke this WITHOUT holding `lock`.
+    private func seedTranscriptOutsideLock(session: Session) {
+        lock.lock()
+        let currentEvents = session.events
+        let providerThreadId = session.providerThreadId
+        let environment = session.environment
+        lock.unlock()
+
+        guard Self.shouldReadTranscript(currentEvents: currentEvents, providerThreadId: providerThreadId),
+              let providerThreadId else {
             return
         }
-        let transcriptEvents = transcriptStore.readSession(providerThreadId: providerThreadId, environment: session.environment)
-        guard !transcriptEvents.isEmpty else { return }
-        session.events = Array(transcriptEvents.suffix(maxReadableEvents))
+        // Disk I/O performed with the lock released.
+        let transcriptEvents = transcriptStore.readSession(providerThreadId: providerThreadId, environment: environment)
+
+        lock.lock()
+        // Re-check against the latest events under the lock so a concurrent
+        // live turn cannot be clobbered by a stale transcript snapshot.
+        if let merged = Self.transcriptSeedMerge(currentEvents: session.events,
+                                                 transcriptEvents: transcriptEvents,
+                                                 maxReadableEvents: maxReadableEvents) {
+            session.events = merged
+        }
+        lock.unlock()
+    }
+
+    /// Pure pre-read guard: should we even hit disk for this session? Disk read
+    /// is wasted when the session already has a readable turn or has no provider
+    /// thread to read from. No I/O, no isolation. Extracted for unit testing.
+    nonisolated static func shouldReadTranscript(currentEvents: [AssistantEvent], providerThreadId: String?) -> Bool {
+        guard let providerThreadId, !providerThreadId.isEmpty else { return false }
+        return !hasReadableTurn(currentEvents)
+    }
+
+    /// Pure merge step: given the latest in-memory events and the events read
+    /// from the transcript, return the events to assign, or nil to skip. Skips
+    /// when the session already has a readable turn (a live turn won the race)
+    /// or the transcript is empty. No I/O, no isolation. Extracted for unit
+    /// testing the concurrent-safe merge.
+    nonisolated static func transcriptSeedMerge(currentEvents: [AssistantEvent],
+                                                transcriptEvents: [AssistantEvent],
+                                                maxReadableEvents: Int) -> [AssistantEvent]? {
+        guard !hasReadableTurn(currentEvents), !transcriptEvents.isEmpty else { return nil }
+        return Array(transcriptEvents.suffix(maxReadableEvents))
     }
 
     private static func hasReadableTurn(_ events: [AssistantEvent]) -> Bool {
