@@ -5,6 +5,7 @@ import CoreModel
 import AgentRuntime
 import Persistence
 import DesignSystemKit
+import CoreServices
 
 public enum GitPanelMode: String, CaseIterable, Sendable {
     case changes, history
@@ -57,6 +58,10 @@ public final class DiffPanelViewModel: ObservableObject {
     /// overwrite the diff of a newer selection (PERF-007).
     private var diffGeneration = 0
     private let settings: SettingsStore?
+    /// FSEvents stream token for cwd watch; nil until `startFSWatcher()` is called.
+    private var fsStream: FSEventStreamRef?
+    /// Wall-clock time of the last auto-refresh triggered by FSEvents.
+    private var lastFSRefresh: Date = .distantPast
 
     /// C8: diff view prefs persist across launches via SettingsStore.
     public init(cwd: String, settings: SettingsStore? = nil) {
@@ -323,6 +328,91 @@ public final class DiffPanelViewModel: ObservableObject {
     public func push() {
         let branch = branches.current ?? "branch"
         runAction(successMessage: "Pushed \(branch)") { GitDiff.push(in: $0) }
+    }
+
+    /// Fetch remote refs (`git fetch --prune`) without touching the working tree.
+    /// Safe at any time; surfaces auth/network failures in the error banner.
+    public func fetch() {
+        runAction(successMessage: "Fetched remote refs") { GitDiff.fetch(in: $0) }
+    }
+
+    /// Pull the current branch (`git pull --ff-only`). Fails loud on diverged
+    /// history or local conflicts so the user is never silently surprised.
+    public func pull() {
+        let branch = branches.current ?? "branch"
+        runAction(successMessage: "Pulled \(branch)") { GitDiff.pull(in: $0) }
+    }
+
+    /// Called when the panel becomes visible (tab selected, window shown).
+    /// Triggers a lightweight refresh so stale state is never the first thing
+    /// a user sees after switching away and back.
+    public func didBecomeVisible() {
+        refresh()
+        startFSWatcher()
+    }
+
+    /// Minimum wall-clock interval between FSEvent-triggered auto-refreshes.
+    /// Exposed as `nonisolated static` so it is testable without @MainActor.
+    nonisolated static let fsDebounceInterval: TimeInterval = 2.0
+
+    /// Pure debounce decision: returns `true` when `elapsed` seconds have
+    /// passed since the last refresh, meaning a new refresh should fire.
+    /// Extracted from the FSEvents callback so this logic is unit-testable
+    /// without FSEvents infrastructure.
+    nonisolated static func shouldRefresh(elapsed: TimeInterval) -> Bool {
+        elapsed >= fsDebounceInterval
+    }
+
+    // MARK: FSEvents watcher
+
+    private func startFSWatcher() {
+        guard fsStream == nil else { return }
+        let cwd = self.cwd as CFString
+        let paths = [cwd] as CFArray
+        // Context box carries `self` to the C callback via an unmanaged pointer.
+        // Bridged through a retaining void* so the callback can call back onto
+        // the main actor without capturing `self` directly in the C closure.
+        var ctx = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passRetained(self).toOpaque(),
+            retain: nil,
+            release: { ptr in
+                guard let p = ptr else { return }
+                Unmanaged<DiffPanelViewModel>.fromOpaque(p).release()
+            },
+            copyDescription: nil
+        )
+        let stream = FSEventStreamCreate(
+            nil,
+            { _, info, _, _, _, _ in
+                guard let info else { return }
+                let vm = Unmanaged<DiffPanelViewModel>.fromOpaque(info).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    let elapsed = Date().timeIntervalSince(vm.lastFSRefresh)
+                    guard DiffPanelViewModel.shouldRefresh(elapsed: elapsed) else { return }
+                    vm.lastFSRefresh = Date()
+                    vm.refresh()
+                }
+            },
+            &ctx,
+            paths,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            // latency: coalesce rapid bursts (save storms) into one callback
+            1.5,
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents)
+        )
+        guard let stream else { return }
+        FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        FSEventStreamStart(stream)
+        fsStream = stream
+    }
+
+    deinit {
+        if let s = fsStream {
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+        }
     }
 
     /// D2: open a PR/MR page for the current branch in the browser.
@@ -932,6 +1022,28 @@ public struct DiffPanelView: View {
             .animation(DS.Motion.micro, value: vm.isBusy)
             .accessibilityIdentifier("diff.commitButton")
             HStack(spacing: DS.Space.sm) {
+                Button(action: vm.fetch) {
+                    HStack(spacing: DS.Space.xs) {
+                        Image(systemName: "arrow.down.to.line").font(.system(size: 11))
+                        Text("Fetch")
+                    }.frame(maxWidth: .infinity)
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(vm.isBusy)
+                .help("git fetch --prune (updates remote refs without changing local files)")
+                .accessibilityIdentifier("diff.fetchButton")
+                Button(action: vm.pull) {
+                    HStack(spacing: DS.Space.xs) {
+                        Image(systemName: "arrow.down.circle").font(.system(size: 11))
+                        Text("Pull")
+                    }.frame(maxWidth: .infinity)
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(vm.isBusy)
+                .help("git pull --ff-only (fast-forward only)")
+                .accessibilityIdentifier("diff.pullButton")
+            }
+            HStack(spacing: DS.Space.sm) {
                 Button(action: vm.push) {
                     HStack(spacing: DS.Space.xs) {
                         Image(systemName: "arrow.up.circle").font(.system(size: 11))
@@ -1232,6 +1344,9 @@ public final class DiffPanelSurface: NSObject, Surface {
     public func focus() { view.window?.makeFirstResponder(view) }
     public func unfocus() {}
     public func close() {}
+    /// Called by the shell when the panel becomes visible so stale state is
+    /// never the first thing the user sees after switching tabs or windows.
+    public func didBecomeVisible() { viewModel.didBecomeVisible() }
     public func sendText(_ text: String) {}
     public func readText() -> String { viewModel.rawDiff }
     public func snapshot() -> [String: String] { ["selected": viewModel.selectedPath ?? ""] }

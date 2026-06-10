@@ -562,6 +562,23 @@ public enum GitDiff {
         return GitDeliveryResult(ok: true, plan: plan, phases: phases, pullRequestURL: pullRequest.url)
     }
 
+    /// `git fetch --prune` - updates remote-tracking refs without touching the
+    /// working tree. Safe to run at any time (no merge). Fails loud on auth errors.
+    public static func fetch(in cwd: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let r = run(["fetch", "--prune"], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
+    /// `git pull --ff-only` - fast-forward only, refuses to create a merge
+    /// commit so the panel never silently mangles history. Callers should
+    /// present the error copy from `humanizeError` on failure.
+    public static func pull(in cwd: String) -> GitActionResult {
+        guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
+        let r = run(["pull", "--ff-only"], cwd: cwd)
+        return GitActionResult(ok: r.exit == 0, message: actionMessage(r))
+    }
+
     /// `git push`; if there is no upstream, set one (`-u origin HEAD`).
     public static func push(in cwd: String) -> GitActionResult {
         guard isGit(cwd) else { return GitActionResult(ok: false, message: "Not a git repository.") }
@@ -632,8 +649,21 @@ public enum GitDiff {
         if lower.contains("nothing to commit") {
             return "Nothing to commit — the working tree is clean."
         }
-        if lower.contains("'origin' does not appear") || lower.contains("no such remote") {
+        if lower.contains("’origin’ does not appear") || lower.contains("no such remote") {
             return "No ‘origin’ remote is configured for this repository."
+        }
+        // Pull-specific patterns:
+        if lower.contains("conflict") || lower.contains("merge conflict") {
+            return "Pull stopped due to conflicts. Resolve conflicts in the affected files, then commit."
+        }
+        if lower.contains("cannot fast-forward") || lower.contains("not possible to fast-forward") {
+            return "Cannot fast-forward -- your branch has diverged from the remote. Merge or rebase manually."
+        }
+        if lower.contains("your local changes to the following files would be overwritten by merge") {
+            return "Pull would overwrite your local changes. Commit or stash them first."
+        }
+        if lower.contains("already up to date") {
+            return "Already up to date -- nothing to pull."
         }
         return raw
     }
