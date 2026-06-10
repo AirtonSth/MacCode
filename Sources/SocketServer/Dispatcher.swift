@@ -86,6 +86,7 @@ public protocol CommandRouting: AnyObject {
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor]
     func listAgentProviderSnapshots() async -> [AgentProviderSnapshot]
     func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue
+    func agentPromptHistory(workspace: WorkspaceID?, limit: Int) throws -> [String]
     // git
     func gitStatus(workspace: WorkspaceID) throws -> GitSummary
     func gitBranches(workspace: WorkspaceID) throws -> GitBranches
@@ -1331,6 +1332,11 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .object([
                     "selected_workspace_id": w.selectedWorkspaceID.map { .string($0.value.uuidString) } ?? .null
                 ]))
+            case "agent.prompt_history":
+                let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
+                let limit = params["limit"]?.intValue ?? PromptHistoryStore.limit
+                let prompts = try router.agentPromptHistory(workspace: wid, limit: limit)
+                return .init(id: id, result: .object(["prompts": .array(prompts.map { .string($0) })]))
             case "browser.navigate":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let url = params["url"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -1569,6 +1575,7 @@ public final class JSONRPCDispatcher {
             || method == "workspace.current"
             || method == "events.recent"
             || method == "settings.get"
+            || method == "agent.prompt_history"
             || method.hasSuffix(".list")
             || method.hasSuffix(".read")
             || method.hasSuffix(".status")

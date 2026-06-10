@@ -1787,6 +1787,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ])
     }
 
+    public func agentPromptHistory(workspace: WorkspaceID?, limit: Int) throws -> [String] {
+        guard let ctx = context else { throw NSError(domain: "rc2", code: 0) }
+        // Resolve workspace: prefer explicit param, fall back to the currently
+        // selected workspace. If neither is available (no workspace open yet),
+        // return an empty list -- do not error, matching the iOS client's
+        // empty-history graceful-fallback behaviour.
+        let wid = workspace ?? ctx.state.window.selectedWorkspaceID
+        guard let wid else { return [] }
+        let store = PromptHistoryStore(db: ctx.db)
+        let history = store.load(workspaceID: wid)
+        // store.load returns oldest-first (chronological append order).
+        // iOS expects most-recent-first (newest at index 0).
+        let capped = Array(history.suffix(limit))
+        return capped.reversed()
+    }
+
     private func providerInstanceConfigs() -> [AgentProviderInstanceConfig] {
         guard let raw = try? context?.settingsRepo.get("agent.provider.instances")?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,

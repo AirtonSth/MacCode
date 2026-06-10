@@ -617,6 +617,13 @@ final class FakeRouter: CommandRouting, TerminalCommandRouting {
     func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {}
     func surfaceMove(workspace: WorkspaceID, surface: SurfaceID, targetPane: PaneID) throws {}
     func surfaceReorder(workspace: WorkspaceID, surface: SurfaceID, toPane: PaneID, position: Int) throws {}
+    var promptHistoryByWorkspace: [WorkspaceID: [String]] = [:]
+    func agentPromptHistory(workspace: WorkspaceID?, limit: Int) throws -> [String] {
+        let wid = workspace ?? window.selectedWorkspaceID
+        guard let wid else { return [] }
+        let history = promptHistoryByWorkspace[wid, default: []]
+        return Array(history.suffix(limit).reversed())
+    }
 }
 
 final class DispatcherTests: XCTestCase {
