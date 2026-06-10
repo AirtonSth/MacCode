@@ -1,9 +1,32 @@
 import Foundation
 import CoreModel
 
+/// Pure in-memory cache: providerThreadId -> transcript file URL.
+/// Thread-safety is the caller's responsibility (ClaudeTranscriptStore is
+/// @unchecked Sendable and guards access itself).
+public struct TranscriptPathIndex {
+    private var storage: [String: URL] = [:]
+
+    public init() {}
+
+    /// Returns the cached path for `providerThreadId`, or nil on a miss.
+    public func path(forProviderThreadId id: String) -> URL? {
+        guard !id.isEmpty else { return nil }
+        return storage[id]
+    }
+
+    /// Stores or replaces the path for `providerThreadId`.
+    /// Silently ignores empty ids to match ClaudeTranscriptStore's guard.
+    public mutating func setPath(_ url: URL, forProviderThreadId id: String) {
+        guard !id.isEmpty else { return }
+        storage[id] = url
+    }
+}
+
 public final class ClaudeTranscriptStore: @unchecked Sendable {
     private let fileManager: FileManager
     private let maxEvents: Int
+    private var pathIndex = TranscriptPathIndex()
 
     public init(fileManager: FileManager = .default, maxEvents: Int = 5_000) {
         self.fileManager = fileManager
@@ -19,9 +42,16 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
     }
 
     private func transcriptFile(providerThreadId: String, environment: [String: String]) -> URL? {
+        if let cached = pathIndex.path(forProviderThreadId: providerThreadId) {
+            if fileManager.fileExists(atPath: cached.path) {
+                return cached
+            }
+            // Cached path no longer valid — fall through to re-enumerate.
+        }
         for projectsRoot in projectsRoots(environment: environment) {
             let direct = projectsRoot.appendingPathComponent(providerThreadId + ".jsonl")
             if fileManager.fileExists(atPath: direct.path) {
+                pathIndex.setPath(direct, forProviderThreadId: providerThreadId)
                 return direct
             }
             guard let enumerator = fileManager.enumerator(
@@ -33,6 +63,7 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
             }
             for case let url as URL in enumerator {
                 guard url.lastPathComponent == providerThreadId + ".jsonl" else { continue }
+                pathIndex.setPath(url, forProviderThreadId: providerThreadId)
                 return url
             }
         }
