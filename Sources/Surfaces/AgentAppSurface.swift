@@ -164,6 +164,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
 
+    // PERF-MAC_AGENT-009: cache thread->workspace membership so didChangeStatus
+    // does not issue a DB read per status event of every thread. Populated on
+    // every reloadThreads() call; threads from other workspaces arrive via the
+    // coordinator's multi-workspace broadcast but are filtered out cheaply here.
+    private var threadWorkspaceCache: [AgentThreadID: WorkspaceID] = [:]
+
+    // PERF-MAC_AGENT-010: batch streaming events into one main-actor hop per
+    // tick. Fast token streams produce thousands of events/sec; without batching
+    // every event allocates an independent Task, each of which pays the Swift
+    // concurrency scheduler overhead. Accumulate events here (protected by a
+    // lock for nonisolated callers) and drain the whole buffer in one hop when
+    // the first event of each tick schedules the flush Task.
+    private let streamEventBatch = StreamEventBatch()
+
     public init(
         workspaceID: WorkspaceID,
         cwd: String,
@@ -239,6 +253,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func reloadThreads() {
         threads = (try? threadRepo.list(workspaceId: workspaceID)) ?? []
+        // PERF-MAC_AGENT-009: refresh the thread->workspace cache so didChangeStatus
+        // can filter by workspace with an O(1) lookup instead of a DB read.
+        for t in threads {
+            if let wid = t.workspaceId {
+                threadWorkspaceCache[t.id] = wid
+            }
+        }
         repairPlaceholderThreadTitles()
         if selectedThreadId == nil, let first = threads.first {
             selectThread(first.id)
@@ -1698,9 +1719,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     // MARK: AgentRunObserver
 
-    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {
-        Task { @MainActor in
-            guard threadId == self.selectedThreadId else { return }
+    // PERF-MAC_AGENT-010: accumulate streaming events and flush all of them in
+    // a single main-actor hop. A fast token stream emits thousands of events/sec;
+    // the old code allocated one Task per event. Now the first event schedules
+    // ONE flush Task; subsequent events in the same tick just append to the buffer
+    // and the flush Task drains everything atomically. Event order is preserved.
+    private func flushStreamEvents() {
+        let pending = streamEventBatch.drain()
+        guard !pending.isEmpty else { return }
+        for (event, run, threadId) in pending {
+            guard threadId == self.selectedThreadId else { continue }
             if !self.terminalRunIds.contains(run) {
                 self.currentRunId = run
                 self.runThreads[run] = threadId
@@ -1714,7 +1742,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             } else {
                 self.lastErrorRecoverable = false
             }
-            self.scheduleTimelineUpdateTick()
+        }
+        self.scheduleTimelineUpdateTick()
+    }
+
+    nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {
+        // PERF-MAC_AGENT-010: append to the batch buffer. If the buffer was
+        // empty (first event of this tick), schedule a single flush Task.
+        // Later events in the same tick just append — no extra Task allocation.
+        let shouldSchedule = streamEventBatch.append(event: event, run: run, threadId: threadId)
+        if shouldSchedule {
+            Task { @MainActor in
+                self.flushStreamEvents()
+            }
         }
     }
 
@@ -1773,7 +1813,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {
         Task { @MainActor in
-            let threadWorkspace = try? self.threadRepo.get(id: threadId)?.workspaceId
+            // PERF-MAC_AGENT-009: use the cache for the workspace filter; fall back to
+            // DB only on a cache miss (first event for a thread not yet loaded here).
+            let threadWorkspace: WorkspaceID?
+            if let cached = self.threadWorkspaceCache[threadId] {
+                threadWorkspace = cached
+            } else {
+                threadWorkspace = try? self.threadRepo.get(id: threadId)?.workspaceId
+                if let wid = threadWorkspace {
+                    self.threadWorkspaceCache[threadId] = wid
+                }
+            }
             guard threadWorkspace == self.workspaceID else { return }
             if status == .running, var t = try? self.threadRepo.get(id: threadId), t.hasUnread {
                 t.hasUnread = false
@@ -1812,6 +1862,42 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         case .pending, .running:
             return false
         }
+    }
+}
+
+// PERF-MAC_AGENT-010: lock-protected buffer used by runCoordinator(_:didReceive:)
+// to coalesce streaming events. Safe to access from both the coordinator's
+// background thread (append) and the main actor (drain).
+final class StreamEventBatch: @unchecked Sendable {
+    private struct Entry {
+        let event: AssistantEvent
+        let run: AgentRunID
+        let threadId: AgentThreadID
+    }
+    private let lock = NSLock()
+    private var buffer: [Entry] = []
+    private var flushScheduled = false
+
+    /// Appends an event. Returns `true` iff the caller should schedule a flush Task
+    /// (i.e. the buffer was empty before this append — first event of the tick).
+    func append(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        buffer.append(Entry(event: event, run: run, threadId: threadId))
+        if flushScheduled { return false }
+        flushScheduled = true
+        return true
+    }
+
+    /// Drains and returns all buffered entries, resetting the buffer and the
+    /// scheduled flag so the next incoming event will schedule a new flush.
+    func drain() -> [(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)] {
+        lock.lock()
+        defer { lock.unlock() }
+        let out = buffer.map { ($0.event, $0.run, $0.threadId) }
+        buffer.removeAll(keepingCapacity: true)
+        flushScheduled = false
+        return out
     }
 }
 
@@ -2629,14 +2715,49 @@ public struct AgentAppView: View {
     /// side collapses to count + first/last id — capturing every add/remove/revert
     /// without walking all N messages on every body eval (critical now that N is the
     /// whole thread, not a 30-row window).
-    private var transcriptSignature: String {
-        var sig = "m\(vm.messages.count)|\(vm.messages.first?.id.value.uuidString ?? "-")|\(vm.messages.last?.id.value.uuidString ?? "-")|t\(vm.timeline.turns.count)|"
-        for turn in vm.timeline.turns {
+    ///
+    /// Extracted as `nonisolated static` so it is testable without a view context and
+    /// shared by every consumer in a single body pass through `SignatureCache`.
+    nonisolated static func buildTranscriptSignature(messages: [AgentMessage],
+                                                     turns: [AssistantTurnSnapshot]) -> String {
+        var sig = "m\(messages.count)|\(messages.first?.id.value.uuidString ?? "-")|\(messages.last?.id.value.uuidString ?? "-")|t\(turns.count)|"
+        for turn in turns {
             sig += turn.turnId
             // A turn's sortTime derives from its items' min startedAtMs; fold item count
             // in so the sort refreshes on item add (not on pure text deltas).
             sig += "#\(turn.items.count)"
         }
+        return sig
+    }
+
+    // PERF-MAC_AGENT-011: cache the signature string so a single SwiftUI body
+    // pass computes it only once regardless of how many consumers read it.
+    private final class SignatureCache {
+        var lastMessages: Int = -1
+        var lastFirstId: String = ""
+        var lastLastId: String = ""
+        var lastTurnsCount: Int = -1
+        var lastTurnsItemCountsHash: Int = 0
+        var cached: String = ""
+    }
+    private let signatureCache = SignatureCache()
+
+    private var transcriptSignature: String {
+        let msgCount = vm.messages.count
+        let firstId = vm.messages.first?.id.value.uuidString ?? "-"
+        let lastId = vm.messages.last?.id.value.uuidString ?? "-"
+        let turnCount = vm.timeline.turns.count
+        // Cheap hash of per-turn item counts — changes when an item is added to any turn.
+        let itemCountsHash = vm.timeline.turns.reduce(0) { $0 ^ ($1.items.count &* 2654435761) }
+        let c = signatureCache
+        if c.lastMessages == msgCount && c.lastFirstId == firstId && c.lastLastId == lastId
+            && c.lastTurnsCount == turnCount && c.lastTurnsItemCountsHash == itemCountsHash {
+            return c.cached
+        }
+        let sig = Self.buildTranscriptSignature(messages: vm.messages, turns: vm.timeline.turns)
+        c.lastMessages = msgCount; c.lastFirstId = firstId; c.lastLastId = lastId
+        c.lastTurnsCount = turnCount; c.lastTurnsItemCountsHash = itemCountsHash
+        c.cached = sig
         return sig
     }
 
@@ -2665,6 +2786,8 @@ public struct AgentAppView: View {
     }
 
     private var hiddenPersistedAssistantMessageIDs: Set<AgentMessageID> {
+        // PERF-MAC_AGENT-011: transcriptSignature is now cached in SignatureCache so
+        // this call and the call in transcriptEntries share one computation per body pass.
         let key = "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")|\(transcriptSignature)|u\(vm.timelineUpdateTick)"
         if hiddenPersistedAssistantMessageCache.key == key {
             return hiddenPersistedAssistantMessageCache.ids
