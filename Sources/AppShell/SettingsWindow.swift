@@ -170,6 +170,7 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var auditLogEntries: [AuditLogEntry] = []
     @Published public var newPairingCode: String?
     @Published public var pairingCodeExpiresAt: Date?
+    @Published public var pairingCodeError: String?
     @Published public var updatingProviders: Set<AgentProvider> = []
     @Published public var providerUpdateMessages: [AgentProvider: String] = [:]
     @Published public var customModelsByProvider: [AgentProvider: [String]] = [:]
@@ -180,6 +181,12 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var privateAccountBusy: Bool = false
     @Published public var privateBillingPortalURL: URL?
     @Published public var updateAvailability: AppUpdateAvailability = .unknown
+    /// Non-nil while a revoke failure message is pending display.
+    @Published public var revokeErrorMessage: String?
+    /// Mirrors `UNAuthorizationStatus` so the Settings view can react to
+    /// permission changes made in System Settings between open/close cycles.
+    /// `.notDetermined` is the safe default before the first async probe.
+    @Published public var notificationAuthStatus: UNAuthorizationStatus = .notDetermined
 
     /// True only when an updater is configured (Sparkle feed present). The
     /// Settings "App Updates" row is hidden otherwise so unsigned/dev builds
@@ -274,7 +281,10 @@ public final class SettingsViewModel: ObservableObject {
         committedClaudePath = claudePath
         codexAvailable = resolveAvailable(codexPath)
         claudeAvailable = resolveAvailable(claudePath)
-        providerUpdateMessages = [:]
+        // Do NOT clear providerUpdateMessages here — an account/remote-access
+        // notification-driven reload was erasing update results the user may
+        // be reading (P2-Settings-6).  Messages are cleared only by the setters
+        // that trigger a new update attempt (setCodexPath / setClaudePath).
         customModelsByProvider = Dictionary(uniqueKeysWithValues: AgentProvider.allCases.map { provider in
             (provider, customModelStore.list(provider: provider))
         })
@@ -384,15 +394,12 @@ public final class SettingsViewModel: ObservableObject {
 
     public func setCustomModel(provider: AgentProvider, index: Int, value: String) {
         customModelStore.update(provider: provider, index: index, value: value)
-        // Mutate the affected element in place rather than re-listing the whole
-        // provider on every keystroke; avoids a full DB read + dict replacement
-        // (which re-rendered the entire Custom Models section per character).
-        if var values = customModelsByProvider[provider], values.indices.contains(index) {
-            values[index] = value
-            customModelsByProvider[provider] = values
-        } else {
-            customModelsByProvider[provider] = customModelStore.list(provider: provider)
-        }
+        // When the value is empty the store removes the row, shrinking the array.
+        // Any subsequent in-place mutation at the same index would then hit an
+        // out-of-bounds guard inside AgentCustomModelStore.update, silently
+        // dropping keystrokes until the next full reload.  Always reload from the
+        // store after an update so the local cache matches the persisted array length.
+        customModelsByProvider[provider] = customModelStore.list(provider: provider)
     }
 
     public func removeCustomModel(provider: AgentProvider, index: Int) {
@@ -432,14 +439,23 @@ public final class SettingsViewModel: ObservableObject {
     }
 
     public func createPairingCode() {
-        if let pc = try? trustRepo.createPairingCode(ttlSeconds: 600) {
+        do {
+            let pc = try trustRepo.createPairingCode(ttlSeconds: 600)
             newPairingCode = pc.code
             pairingCodeExpiresAt = Date().addingTimeInterval(600)
+            pairingCodeError = nil
+        } catch {
+            pairingCodeError = "Could not generate a pairing code: \(error.localizedDescription)"
         }
     }
 
     public func revoke(_ id: String) {
-        try? trustRepo.revoke(id: id)
+        do {
+            try trustRepo.revoke(id: id)
+            revokeErrorMessage = nil
+        } catch {
+            revokeErrorMessage = "Revoke failed: \(error.localizedDescription). The device may still be able to connect."
+        }
         reload()
     }
 
@@ -543,6 +559,13 @@ public final class SettingsViewModel: ObservableObject {
         updateAvailability = updater?.availability ?? updateAvailability
     }
 
+    /// Probe the current notification authorization status and publish it so
+    /// the Settings view always reflects what System Settings shows, even when
+    /// the user fixed or denied permission between two open/close cycles.
+    public func refreshNotificationStatus() async {
+        notificationAuthStatus = await SystemNotifier.shared.authorizationStatus()
+    }
+
     private func resolveAvailable(_ path: String) -> Bool {
         ProcessLocator.resolve(path).map { !$0.isEmpty } ?? false
     }
@@ -574,6 +597,14 @@ public struct SettingsView: View {
 
     // Hoisted so device rows don't each allocate a formatter on every render.
     private static let deviceDateFormatter = ISO8601DateFormatter()
+    /// Medium-style date for the device subtitle ("Jun 9, 2026") — more
+    /// readable than raw ISO8601 for the paired-date caption (P3-Settings-14).
+    private static let deviceMediumDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f
+    }()
     private static let deviceRelativeFormatter: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .abbreviated
@@ -582,7 +613,9 @@ public struct SettingsView: View {
 
     @State private var deviceToRevoke: DeviceTrust?
     @State private var expandedUpdateDetails: Set<AgentProvider> = []
-    @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
+    // notificationStatus is now owned by the ViewModel (notificationAuthStatus)
+    // so show() can refresh it without re-creating the hosting view (P2-Settings-7).
+    private var notificationStatus: UNAuthorizationStatus { vm.notificationAuthStatus }
     /// Local draft values for CLI path fields; committed on end-editing so
     /// mid-edit keystrokes don't fire saveCLIPath / replaceProviderAdapter.
     @State private var codexPathDraft: String = ""
@@ -622,9 +655,9 @@ public struct SettingsView: View {
             }
         }
         .padding(DS.Space.xl)
-        .frame(width: 620, height: 560)
+        .frame(minWidth: 620, maxWidth: .infinity, minHeight: 480)
         .background(DS.Palette.bg)
-        .task { notificationStatus = await SystemNotifier.shared.authorizationStatus() }
+        .task { await vm.refreshNotificationStatus() }
         .onAppear {
             codexPathDraft = vm.codexPath
             claudePathDraft = vm.claudePath
@@ -638,6 +671,10 @@ public struct SettingsView: View {
             Text(label).font(DS.Font.body).foregroundColor(DS.Palette.text)
             Spacer()
             control()
+                // P3-Settings-15: .labelsHidden() removes the toggle's own label
+                // so VoiceOver fell back to an empty accessible name. Combining the
+                // row children preserves the sibling label text as the accessible name.
+                .accessibilityLabel(label)
         }
         .padding(.vertical, DS.Space.sm)
     }
@@ -884,6 +921,21 @@ public struct SettingsView: View {
                     .buttonStyle(DSSecondaryButtonStyle())
                     .accessibilityIdentifier("settings.pairing.generate")
             }
+            // P2-Settings-4: surface pairing-code generation failures.
+            if let err = vm.pairingCodeError {
+                Text(err)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityIdentifier("settings.pairing.error")
+            }
+            // P1-Settings-3: surface revoke failures so the user knows the
+            // device was not actually disconnected.
+            if let err = vm.revokeErrorMessage {
+                Text(err)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityIdentifier("settings.revoke.error")
+            }
             let hasRevoked = vm.devices.contains { $0.revokedAt != nil }
             if hasRevoked {
                 HStack {
@@ -953,11 +1005,12 @@ public struct SettingsView: View {
         }
     }
 
-    /// Device row caption: short id, paired date, and a relative "last seen"
-    /// when the device has connected since pairing so users can recognize an
-    /// active device instead of only an 8-char hash.
+    /// Device row caption: short id, localized medium paired date, and a
+    /// relative "last seen" when the device has connected since pairing so
+    /// users can recognize an active device instead of only an 8-char hash.
+    /// Uses DateFormatter.medium instead of ISO8601 per P3-Settings-14.
     private func deviceSubtitle(_ d: DeviceTrust) -> String {
-        var parts = [d.id.prefix(8) + " \u{00B7} " + Self.deviceDateFormatter.string(from: d.createdAt)]
+        var parts = [d.id.prefix(8) + " \u{00B7} " + Self.deviceMediumDateFormatter.string(from: d.createdAt)]
         if let lastSeen = d.lastSeenAt {
             parts.append("seen " + Self.deviceRelativeFormatter.localizedString(for: lastSeen, relativeTo: Date()))
         }
@@ -1059,7 +1112,7 @@ public struct SettingsView: View {
                 } else {
                     Button("Test notification") {
                         SystemNotifier.shared.postTestNotification()
-                        Task { notificationStatus = await SystemNotifier.shared.authorizationStatus() }
+                        Task { await vm.refreshNotificationStatus() }
                     }
                     .buttonStyle(DSSecondaryButtonStyle())
                     .accessibilityIdentifier("settings.notifications.test")
@@ -1231,7 +1284,8 @@ public struct AccountView: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
                 Spacer()
-                DSPill(vm.privateAccountStatus, tone: .warning)
+                DSPill(vm.privateAccountStatus,
+                       tone: SettingsViewModel.signInFailureStatuses.contains(vm.privateAccountStatus) ? .danger : .warning)
             }
 
             VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -1467,6 +1521,7 @@ public final class SettingsWindowController: NSObject {
 
     public func show() {
         viewModel.reload()
+        Task { await viewModel.refreshNotificationStatus() }
         if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
             show(attachedTo: parent)
         } else {
@@ -1476,6 +1531,7 @@ public final class SettingsWindowController: NSObject {
 
     public func show(attachedTo parent: NSWindow) {
         viewModel.reload()
+        Task { await viewModel.refreshNotificationStatus() }
         if parent.attachedSheet === window { return }
         if window.sheetParent != nil { window.sheetParent?.endSheet(window) }
         parent.beginSheet(window)

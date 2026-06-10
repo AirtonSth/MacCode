@@ -16,10 +16,23 @@ import DesignSystemKit
 private final class PalettePanel: NSPanel {
     /// Set by CommandPalette after init.
     var quickRunHandler: ((Int) -> Void)?
+    /// Set by CommandPalette after init — handles Return when the table
+    /// (not the search field) holds first-responder focus (P1-CP-1).
+    var returnHandler: (() -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return super.performKeyEquivalent(with: event) }
+
+        // Return key (keyCode 36 / carriage return character) from any
+        // responder — fires submit() whether the table or the field has focus.
+        // P1-CP-1: after a mouse click the table became first-responder so the
+        // text-field doCommandBy delegate no longer saw insertNewline.
+        if event.keyCode == 36, !event.modifierFlags.contains([.command, .control, .option]) {
+            returnHandler?()
+            return true
+        }
+
         guard event.modifierFlags.contains(.command),
-              event.type == .keyDown,
               let char = event.charactersIgnoringModifiers,
               char.count == 1,
               let digit = Int(char), digit >= 1, digit <= 9
@@ -80,7 +93,8 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     public let window: NSPanel
     private let searchField = NSTextField()
     /// P2: footer hint shown below the list: "⌘1–⌘9 quick-run".
-    private let footerHint = NSTextField(labelWithString: "\u{2318}1\u{2013}\u{2318}9 quick-run visible rows")
+    // P3-CP-7: show full keyboard contract so new users understand navigation.
+    private let footerHint = NSTextField(labelWithString: "\u{2191}\u{2193} navigate \u{00B7} \u{23CE} run \u{00B7} esc dismiss \u{00B7} \u{2318}1\u{2013}\u{2318}9 quick-run")
     private let tableView = NSTableView()
     private let scroll = NSScrollView()
     private var all: [PaletteCommand] = []
@@ -145,6 +159,9 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         super.init()
         panel.delegate = self
         panel.quickRunHandler = { [weak self] digit in self?.runQuickRun(digit: digit) }
+        // P1-CP-1: wire Return so a single-click-then-Enter sequence works even
+        // after mouse focus shifts from the search field to the table row.
+        panel.returnHandler = { [weak self] in self?.submit() }
 
         // UX-012: hint that scripts/threads/workspaces are searchable too.
         searchField.placeholderString = "Search commands, scripts, threads, workspaces…"
@@ -389,6 +406,9 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         if window.isVisible {
             hide()
         } else {
+            // P3-CP-6: restore the Recent section from the persisted frecency
+            // store so the last few used commands survive an app restart.
+            loadRecentFromStore()
             currentQuery = ""
             rebuildCommands()
             searchField.stringValue = ""
@@ -397,6 +417,27 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(searchField)
         }
+    }
+
+    /// P3-CP-6: populate `recentCommandIDs` from the top-N frecency entries
+    /// so the Recent section is non-empty after a restart. Dynamic per-instance
+    /// IDs (workspace/model/thread jumps) are excluded (same rule as recordRecent).
+    private func loadRecentFromStore() {
+        guard let store = resolvedFrecencyStore() else { return }
+        let entries = store.load()
+        let now = Date()
+        let sorted = entries
+            .filter { !$0.id.contains(".jump.") }
+            .sorted { PaletteFrecencyScorer.score(uses: $0.useCount, lastUsedAt: $0.lastUsedAt, now: now)
+                    > PaletteFrecencyScorer.score(uses: $1.useCount, lastUsedAt: $1.lastUsedAt, now: now) }
+            .prefix(recentLimit)
+            .map(\.id)
+        // Merge with any in-memory recents (in-session uses win over persisted order).
+        var merged = recentCommandIDs
+        for id in sorted.reversed() {
+            if !merged.contains(id) { merged.insert(id, at: merged.endIndex) }
+        }
+        recentCommandIDs = Array(merged.prefix(recentLimit))
     }
 
     /// PERF-009: hide the panel and release the per-open command arrays so the
