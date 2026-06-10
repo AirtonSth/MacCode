@@ -820,6 +820,7 @@ final class PaneTabButton: NSView {
     private var mouseDownLocation: NSPoint?
     private var selected: Bool
     private var busy = false
+    private var dirty = false
     // PERF: in-place tab reconcile. These subviews used to be local to
     // init (baked once, then the whole strip was rebuilt on any change).
     // Storing them lets `setSelected`/`setTitle`/`setColor` patch a tab in
@@ -829,6 +830,17 @@ final class PaneTabButton: NSView {
     private let underline = NSView()
     private let colorRail = NSView()
     private static let dragActivationDistance: CGFloat = 8
+
+    // MARK: - A11y helper (pure, no AppKit dependency, testable without MainActor)
+
+    /// Builds the VoiceOver label string for a tab button.
+    /// Pure: only string manipulation — safe to call from any context.
+    nonisolated static func tabA11yLabel(title: String, isSelected: Bool, isDirty: Bool) -> String {
+        var parts: [String] = [title]
+        if isDirty { parts.append("unsaved changes") }
+        if isSelected { parts.append("selected") }
+        return parts.joined(separator: ", ")
+    }
 
     init(surfaceID: SurfaceID, title: String, symbol: String, selected: Bool, busy: Bool = false,
          dirty: Bool = false,
@@ -853,12 +865,19 @@ final class PaneTabButton: NSView {
         self.onDropSurface = onDropSurface
         self.onSplitSurface = onSplitSurface
         self.selected = selected
+        self.dirty = dirty
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.backgroundColor = (selected ? DS.NS.bg : DS.NS.surface).cgColor
         // QA-MAC_SHELL_WINDOW-001: addressable tab for UI automation.
         setAccessibilityIdentifier("pane.tab.\(surfaceID.value.uuidString)")
+        // A11y: role, label, selected state, and actions so VoiceOver can
+        // navigate and operate tabs without a mouse.
+        setAccessibilityRole(.radioButton)
+        setAccessibilityLabel(Self.tabA11yLabel(title: title, isSelected: selected, isDirty: dirty))
+        setAccessibilitySelected(selected)
+        applyA11yCustomActions()
 
         iconContainer.translatesAutoresizingMaskIntoConstraints = false
         iconContainer.setContentHuggingPriority(.required, for: .horizontal)
@@ -1000,6 +1019,8 @@ final class PaneTabButton: NSView {
         // Icon tint tracks selection; reinstall to recolor (cheap, and
         // preserves the spinner when busy).
         installIcon(busy: busy)
+        setAccessibilitySelected(selected)
+        setAccessibilityLabel(Self.tabA11yLabel(title: title, isSelected: selected, isDirty: dirty))
     }
 
     /// PERF: in-place title update used by the reconcile (rename).
@@ -1007,6 +1028,7 @@ final class PaneTabButton: NSView {
         guard self.title != title else { return }
         self.title = title
         label.stringValue = title
+        setAccessibilityLabel(Self.tabA11yLabel(title: title, isSelected: selected, isDirty: dirty))
     }
 
     var titleForTesting: String { title }
@@ -1320,7 +1342,32 @@ final class PaneTabButton: NSView {
     @objc private func closeClicked() { onClose() }
 
     func setDirty(_ dirty: Bool) {
+        self.dirty = dirty
         subviews.first { $0.toolTip == "Unsaved changes" }?.isHidden = !dirty
+        setAccessibilityLabel(Self.tabA11yLabel(title: title, isSelected: selected, isDirty: dirty))
+    }
+
+    /// A11y: register close and rename as named custom actions so
+    /// VoiceOver users can invoke them from the Actions rotor without
+    /// moving focus to the sub-buttons.
+    private func applyA11yCustomActions() {
+        var actions: [NSAccessibilityCustomAction] = []
+        actions.append(NSAccessibilityCustomAction(name: "Close tab") { [weak self] in
+            self?.onClose()
+            return true
+        })
+        if onRename != nil {
+            actions.append(NSAccessibilityCustomAction(name: "Rename tab") { [weak self] in
+                self?.onRename?()
+                return true
+            })
+        }
+        setAccessibilityCustomActions(actions)
+    }
+
+    /// Test seam: how many custom actions are registered on this tab.
+    var accessibilityCustomActionCountForTesting: Int {
+        (accessibilityCustomActions() ?? []).count
     }
 
     static func hasMovedBeyondDragThreshold(from start: NSPoint?, to current: NSPoint, threshold: CGFloat) -> Bool {
