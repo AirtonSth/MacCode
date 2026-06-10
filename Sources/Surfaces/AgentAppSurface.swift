@@ -13,6 +13,55 @@ import os
 // field issues and flakes are diagnosable beyond transient UI strings.
 private let agentSurfaceLog = Logger(subsystem: "io.remotecode.agent", category: "surface")
 
+/// PERF: pure id -> (turnIndex, itemIndex) index for AssistantTimelineState.turns.
+///
+/// Opening a long thread replays every persisted event through `timeline.apply`;
+/// each `itemDelta`/`itemState` resolves its item via `mutateItem`, an O(turns x items)
+/// linear scan over the whole timeline (AssistantEvents.swift mutateItem). At the
+/// ~5000-event prune cap that is O(events x items) on the main actor.
+///
+/// This is the pure, isolation-testable structure: build from `turns`, look up an id
+/// in O(1), and update on insert as items/turns are appended during replay. It mirrors
+/// `mutateItem`'s "first occurrence wins" semantics so a fast-path lookup is byte-for-byte
+/// equivalent to the linear scan. `nonisolated`/value-typed so it needs no MainActor.
+struct TimelineItemIndex: Sendable, Equatable {
+    struct Location: Sendable, Equatable {
+        let turnIndex: Int
+        let itemIndex: Int
+    }
+
+    private var map: [String: Location] = [:]
+
+    /// Build from a timeline's turns. First occurrence of an id wins, matching
+    /// `mutateItem`, which returns on its first match.
+    init(turns: [AssistantTurnSnapshot]) {
+        map.reserveCapacity(turns.reduce(0) { $0 + $1.items.count })
+        for ti in turns.indices {
+            for ii in turns[ti].items.indices {
+                let id = turns[ti].items[ii].id
+                if map[id] == nil {
+                    map[id] = Location(turnIndex: ti, itemIndex: ii)
+                }
+            }
+        }
+    }
+
+    /// O(1) location lookup. Returns nil for an unknown id (e.g. an itemDelta that
+    /// arrived before its itemStarted), so the caller can buffer the delta instead
+    /// of mutating the wrong item.
+    func location(of id: String) -> Location? {
+        map[id]
+    }
+
+    /// Record a newly appended item. First-occurrence-wins is preserved: an id
+    /// already present is not overwritten.
+    mutating func insert(id: String, turnIndex: Int, itemIndex: Int) {
+        if map[id] == nil {
+            map[id] = Location(turnIndex: turnIndex, itemIndex: itemIndex)
+        }
+    }
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
@@ -206,6 +255,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// threads mid-typing doesn't lose the draft.
     private var composerDraftsByThread: [AgentThreadID: String] = [:]
 
+    /// PERF: O(1) id -> (turn,item) index over `timeline.turns`, rebuilt once after a
+    /// thread's replay. Lets post-replay item-location lookups avoid the O(turns x items)
+    /// scan that AssistantTimelineState.mutateItem performs. Behavior-preserving: it is a
+    /// derived view of `timeline.turns`, never a source of timeline content.
+    private(set) var timelineItemIndex = TimelineItemIndex(turns: [])
+
+    /// O(1) location of a timeline item by id, equivalent to a linear scan of
+    /// `timeline.turns`. Returns nil when the id is not present.
+    func timelineItemLocation(_ id: String) -> TimelineItemIndex.Location? {
+        timelineItemIndex.location(of: id)
+    }
+
     public func selectThread(_ id: AgentThreadID) {
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
@@ -260,6 +321,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for event in replayEvents {
             timeline.apply(event)
         }
+        // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
+        // subsequent item-location lookups skip the O(turns x items) linear scan.
+        timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
         rehydrateProposedPlans(threadId: id)
         rehydratePendingCallbacks(threadId: id)
         reloadCheckpoints()
