@@ -1982,6 +1982,44 @@ private struct BinaryMetadataView: View {
     }
 }
 
+// MARK: - Pure debounce gate (no AppKit, no MainActor; tested in DebouncedPreviewRenderingTests)
+
+/// Decides whether the preview web view should re-render at `now` given the last render
+/// timestamp and the minimum interval between renders.
+///
+/// Returns `true` when enough time has elapsed (interval has passed or no render has
+/// happened yet), `false` when called within the debounce window. Pure — no side effects.
+struct PreviewDebounceGate {
+    /// Minimum seconds between successive preview renders.
+    let interval: TimeInterval
+
+    /// Returns `true` when a new render should fire.
+    /// - Parameters:
+    ///   - lastRenderAt: `nil` if the preview has never rendered.
+    ///   - now: the current timestamp (seconds; same epoch as `lastRenderAt`).
+    func shouldRender(lastRenderAt: TimeInterval?, now: TimeInterval) -> Bool {
+        guard let last = lastRenderAt else { return true }
+        return now - last >= interval
+    }
+}
+
+// MARK: - Pure scroll-restore token (no AppKit, no MainActor; tested in DebouncedPreviewRenderingTests)
+
+/// Carries a captured scroll position so the web view can restore it after an HTML reload.
+/// Round-trips through a plain `Double` so it is easy to pass across the JS boundary.
+struct PreviewScrollToken: Equatable {
+    /// Captured `window.scrollY` value in CSS pixels.
+    let scrollY: Double
+
+    /// A sentinel that means "no scroll position to restore" (e.g. first load).
+    static let none = PreviewScrollToken(scrollY: 0)
+
+    /// JavaScript fragment that writes back `scrollY` when injected after page load.
+    var restoreScript: String {
+        "window.scrollTo(0, \(scrollY));"
+    }
+}
+
 // Light placeholder while the web view first paints, so large markdown/HTML previews don't show
 // a blank pane that then pops in (UX-MAC_FILES-015).
 private struct PreviewWebView: View {
@@ -2015,27 +2053,75 @@ private struct WebHTMLView: NSViewRepresentable {
         return view
     }
 
-    // Only reload when the HTML actually changes. Previously every unrelated @Published change
-    // (sync label, dirty flag) re-ran updateNSView and reloaded the web view, causing a full
-    // reflow/flash and CPU spike — amplified in split mode while typing (PERF-MAC_FILES-006).
+    // Only reload when the HTML actually changes, and throttle reloads with a ~200ms debounce
+    // so split-mode typing does not cause a full WKWebView reflow per keystroke.
+    // Scroll position is captured before each reload and restored via JS after the page settles
+    // so the user's viewport is preserved across renders (PERF-MAC_FILES-006/P2).
     func updateNSView(_ view: WKWebView, context: Context) {
-        guard context.coordinator.lastHTML != html else { return }
-        context.coordinator.lastHTML = html
-        view.loadHTMLString(html, baseURL: baseURL)
+        let coordinator = context.coordinator
+        guard coordinator.lastRenderedHTML != html else { return }
+        coordinator.pendingHTML = html
+        coordinator.pendingBaseURL = baseURL
+        coordinator.scheduleDebounced(in: view)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(onFirstPaint: onFirstPaint) }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
-        var lastHTML: String?
+        // The HTML that was most recently sent to WKWebView.loadHTMLString.
+        var lastRenderedHTML: String?
+        // The HTML waiting to be rendered once the debounce window closes.
+        var pendingHTML: String?
+        var pendingBaseURL: URL?
         private let onFirstPaint: (() -> Void)?
         private var firstPaintReported = false
+        // Scroll token to restore after the next load completes.
+        private var pendingScrollToken = PreviewScrollToken.none
+        private var debounceTimer: Timer?
+        private static let gate = PreviewDebounceGate(interval: 0.2)
+        private var lastRenderAt: TimeInterval?
 
         init(onFirstPaint: (() -> Void)?) {
             self.onFirstPaint = onFirstPaint
         }
 
+        /// Schedule (or reschedule) a debounced render. Captures the current scroll position
+        /// before each render so it can be restored via JS once the page settles.
+        func scheduleDebounced(in webView: WKWebView) {
+            let now = Date().timeIntervalSinceReferenceDate
+            if Self.gate.shouldRender(lastRenderAt: lastRenderAt, now: now) {
+                // Enough time has passed — render immediately.
+                commit(in: webView, now: now)
+            } else {
+                // Within the debounce window — defer to the end of the interval.
+                debounceTimer?.invalidate()
+                let remaining = Self.gate.interval - (now - (lastRenderAt ?? now))
+                debounceTimer = Timer.scheduledTimer(withTimeInterval: max(remaining, 0.01), repeats: false) { [weak self, weak webView] _ in
+                    guard let self, let webView else { return }
+                    self.commit(in: webView, now: Date().timeIntervalSinceReferenceDate)
+                }
+            }
+        }
+
+        private func commit(in webView: WKWebView, now: TimeInterval) {
+            guard let html = pendingHTML else { return }
+            // Capture current scroll position before the reload.
+            webView.evaluateJavaScript("window.scrollY") { [weak self] result, _ in
+                let scrollY = (result as? Double) ?? 0
+                self?.pendingScrollToken = PreviewScrollToken(scrollY: scrollY)
+            }
+            lastRenderedHTML = html
+            lastRenderAt = now
+            pendingHTML = nil
+            webView.loadHTMLString(html, baseURL: pendingBaseURL)
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Restore scroll position after every reload, not just the first.
+            if pendingScrollToken.scrollY > 0 {
+                webView.evaluateJavaScript(pendingScrollToken.restoreScript, completionHandler: nil)
+            }
+            pendingScrollToken = .none
             guard !firstPaintReported else { return }
             firstPaintReported = true
             onFirstPaint?()
