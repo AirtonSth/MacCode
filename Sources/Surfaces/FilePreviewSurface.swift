@@ -4,6 +4,54 @@ import ImageIO
 import Quartz
 import CoreModel
 
+// Pure text-content cache -- no AppKit deps; safe to test without a display.
+// Caches the UTF-8 string result of previewText(path:) keyed by absolute file path
+// to avoid re-running up to 512KB FileHandle reads on every didBecomeVisible.
+public struct FilePreviewTextCache {
+    private var store: [String: String] = [:]
+
+    public init() {}
+
+    public mutating func store(path: String, text: String) {
+        store[path] = text
+    }
+
+    public func text(for path: String) -> String? {
+        store[path]
+    }
+
+    public mutating func evict(path: String) {
+        store.removeValue(forKey: path)
+    }
+
+    /// Pure helper: returns true when cachedPath differs from newPath (reload required).
+    /// Nonisolated -- touches no AppKit state; callable from any context.
+    public nonisolated static func shouldReload(cachedPath: String?, newPath: String) -> Bool {
+        cachedPath != newPath
+    }
+}
+
+// PDF-document cache -- keyed by absolute file path.
+// PDFDocument is a reference type and not Equatable; stored separately from the text cache.
+// Avoids re-running PDFDocument(url:) (synchronous disk parse) on every didBecomeVisible.
+public final class FilePreviewPDFCache {
+    private var store: [String: PDFDocument] = [:]
+
+    public init() {}
+
+    public func store(path: String, document: PDFDocument) {
+        store[path] = document
+    }
+
+    public func document(for path: String) -> PDFDocument? {
+        store[path]
+    }
+
+    public func evict(path: String) {
+        store.removeValue(forKey: path)
+    }
+}
+
 // Pure scroll/page cache -- no AppKit deps; safe to test without a display.
 // Keyed by absolute file path. Scroll offset is a Y-axis CGFloat (points from top).
 // PDF page is a zero-based Int. Unknown key returns (offset: 0, page: 0).
@@ -63,6 +111,8 @@ public final class FilePreviewSurface: NSObject, Surface {
     private let containerStack: NSView
     private var isVisible = true
     var scrollCache = FilePreviewScrollCache()
+    var textCache = FilePreviewTextCache()
+    let pdfCache = FilePreviewPDFCache()
 
     public init(workspaceID: WorkspaceID, filePath: String?, title: String = "preview") {
         self.descriptor = SurfaceDescriptor(
@@ -148,19 +198,41 @@ public final class FilePreviewSurface: NSObject, Surface {
 
     private func renderPDF(path: String) {
         let pdf = PDFView()
-        pdf.document = PDFDocument(url: URL(fileURLWithPath: path))
         pdf.autoScales = true
         pdf.translatesAutoresizingMaskIntoConstraints = false
         pdf.setAccessibilityIdentifier("filePreview.pdf")
         containerStack.addSubview(pdf)
         pin(pdf)
         let saved = scrollCache.entry(for: path)
-        if saved.pdfPageIndex > 0,
-           let doc = pdf.document,
-           saved.pdfPageIndex < doc.pageCount,
-           let page = doc.page(at: saved.pdfPageIndex) {
-            pdf.go(to: page)
+        let url = URL(fileURLWithPath: path)
+
+        // Load PDFDocument off the main thread to avoid blocking the render path
+        // (PERF: PDFDocument(url:) reads/parses the PDF file synchronously).
+        // Re-use cached result if this path was already loaded.
+        if let cached = pdfCache.document(for: path) {
+            // Cache hit -- apply document immediately on main (no I/O).
+            pdf.document = cached
+            Self.applyPDFScrollRestore(pdf: pdf, doc: cached, saved: saved)
+        } else {
+            Task { [weak self, weak pdf] in
+                let doc = await Task.detached(priority: .userInitiated) {
+                    PDFDocument(url: url)
+                }.value
+                guard let self, self.filePath == path, let pdf else { return }
+                if let doc { self.pdfCache.store(path: path, document: doc) }
+                pdf.document = doc
+                Self.applyPDFScrollRestore(pdf: pdf, doc: doc, saved: saved)
+            }
         }
+    }
+
+    @MainActor
+    private static func applyPDFScrollRestore(pdf: PDFView, doc: PDFDocument?, saved: FilePreviewScrollCache.Entry) {
+        guard saved.pdfPageIndex > 0,
+              let doc,
+              saved.pdfPageIndex < doc.pageCount,
+              let page = doc.page(at: saved.pdfPageIndex) else { return }
+        pdf.go(to: page)
     }
 
     private func renderText(path: String) {
@@ -181,17 +253,38 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.isIncrementalSearchingEnabled = true
         tv.setAccessibilityIdentifier("filePreview.text")
         scroll.documentView = tv
-        tv.string = Self.previewText(path: path)
         containerStack.addSubview(scroll)
         pin(scroll)
         let saved = scrollCache.entry(for: path)
-        if saved.scrollOffsetY != 0 {
-            scroll.contentView.scroll(to: NSPoint(x: 0, y: saved.scrollOffsetY))
-            scroll.reflectScrolledClipView(scroll.contentView)
+
+        // Load text bytes off the main thread to avoid blocking the render path
+        // (PERF: previewText reads up to 512KB synchronously via FileHandle).
+        // Re-use cached result if this path was already loaded.
+        if let cached = textCache.text(for: path) {
+            // Cache hit -- apply text immediately on main (no I/O).
+            tv.string = cached
+            Self.applyTextScrollRestore(scroll: scroll, saved: saved)
+        } else {
+            Task { [weak self, weak tv, weak scroll] in
+                let text = await Task.detached(priority: .userInitiated) {
+                    Self.previewText(path: path)
+                }.value
+                guard let self, self.filePath == path, let tv, let scroll else { return }
+                self.textCache.store(path: path, text: text)
+                tv.string = text
+                Self.applyTextScrollRestore(scroll: scroll, saved: saved)
+            }
         }
     }
 
-    static func previewText(path: String, maxBytes: Int = FilePreviewSurface.maxTextPreviewBytes) -> String {
+    @MainActor
+    private static func applyTextScrollRestore(scroll: NSScrollView, saved: FilePreviewScrollCache.Entry) {
+        guard saved.scrollOffsetY != 0 else { return }
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: saved.scrollOffsetY))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+
+    nonisolated static func previewText(path: String, maxBytes: Int = FilePreviewSurface.maxTextPreviewBytes) -> String {
         guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
             return "[unable to read file]"
         }
