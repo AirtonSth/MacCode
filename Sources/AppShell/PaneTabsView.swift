@@ -727,6 +727,27 @@ public final class PaneTabsView: NSObject {
         return (workspaceID, paneID)
     }
 
+    /// Pure cross-window drop hit-test. Resolves a screen-coordinate drop
+    /// point against a set of window frames and returns the id of the window
+    /// that should receive the drop, or nil when the point is outside every
+    /// frame.
+    ///
+    /// Ordering contract: `windows` must be supplied in back-to-front order
+    /// (matching NSApp.windows, where index 0 is the rearmost window). When
+    /// two frames overlap the last match wins — i.e. the topmost window.
+    ///
+    /// Pure: only NSRect geometry — no AppKit, no MainActor dependency.
+    nonisolated public static func windowTarget(
+        forScreenPoint point: NSPoint,
+        in windows: [(id: UUID, frame: NSRect)]
+    ) -> UUID? {
+        var result: UUID? = nil
+        for entry in windows where entry.frame.contains(point) {
+            result = entry.id
+        }
+        return result
+    }
+
     /// Pure tab-strip diff. Order-preserving: `updates` and the surviving
     /// order are taken from `new`. `reordered` compares the surviving ids'
     /// order in `old` vs `new`.
