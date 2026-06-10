@@ -235,6 +235,105 @@ public final class ModelChecksumCache: @unchecked Sendable {
     }
 }
 
+// MARK: - Distill --status diagnostics formatter
+
+/// Snapshot of inputs needed to produce a distill --status summary line set.
+/// All fields are plain value types so the formatter remains MainActor-free.
+public struct TokenSaverDistillStatusInput: Sendable, Equatable {
+    public let status: TokenSaverDistillServiceStatus
+    /// Live metrics fetched from /metrics, or nil when the service is not running.
+    public let metrics: DistillServiceMetrics?
+    /// Total bytes in the CCR reversible-content store, or nil when unavailable.
+    public let storeSizeBytes: Int64?
+    /// Result of a /readyz probe: true = 200, false = non-200, nil = not probed.
+    public let readyzOK: Bool?
+
+    public init(
+        status: TokenSaverDistillServiceStatus,
+        metrics: DistillServiceMetrics? = nil,
+        storeSizeBytes: Int64? = nil,
+        readyzOK: Bool? = nil
+    ) {
+        self.status = status
+        self.metrics = metrics
+        self.storeSizeBytes = storeSizeBytes
+        self.readyzOK = readyzOK
+    }
+}
+
+/// Pure, side-effect-free formatter that converts a `TokenSaverDistillStatusInput`
+/// into an ordered list of ASCII diagnostic lines suitable for `distill --status`
+/// output or a diagnostics UI panel.
+///
+/// Extracted as a standalone enum so every output rule is testable without
+/// MainActor isolation or a live sidecar process (Rule 8).
+public enum TokenSaverDistillStatusFormatter {
+    /// Returns an ordered list of ASCII diagnostic lines.
+    /// Each line is `key: value`. Keys never contain smart quotes or non-ASCII.
+    public static func lines(for input: TokenSaverDistillStatusInput) -> [String] {
+        var result: [String] = []
+
+        // Early-return for terminal/non-connectable states to avoid emitting
+        // url / metrics lines that would mislead diagnostics readers.
+        switch input.status {
+        case .blocked(let reason):
+            result.append("status: blocked")
+            result.append("reason: \(reason)")
+            appendStoreSize(&result, input.storeSizeBytes)
+            return result
+        case .failed(let reason):
+            result.append("status: failed")
+            result.append("reason: \(reason)")
+            appendStoreSize(&result, input.storeSizeBytes)
+            return result
+        default:
+            break
+        }
+
+        // --- state label for non-terminal cases ---
+        let stateLabel: String
+        switch input.status {
+        case .notStarted: stateLabel = "not-running"
+        case .starting:   stateLabel = "starting"
+        default:          stateLabel = "running"
+        }
+
+        result.append("status: \(stateLabel)")
+
+        // --- url / service details (only when running) ---
+        if case .running(let ready) = input.status {
+            result.append("url: \(ready.baseURL)")
+            result.append("pid: \(ready.pid)")
+            result.append("runtime: \(ready.runtime)")
+            result.append("model: \(ready.modelID)")
+        }
+
+        // --- readyz probe result ---
+        if let ok = input.readyzOK {
+            let readyLabel = ok ? "yes" : "no"
+            result.append("ready: \(readyLabel)")
+        }
+
+        // --- live metrics ---
+        if let m = input.metrics {
+            result.append(
+                "metrics: total=\(m.totalRequests) active=\(m.activeRequests) success=\(m.successfulRequests) failed=\(m.failedRequests) max=\(m.maxConcurrentRequests)"
+            )
+        }
+
+        // --- store size ---
+        appendStoreSize(&result, input.storeSizeBytes)
+
+        return result
+    }
+
+    private static func appendStoreSize(_ result: inout [String], _ bytes: Int64?) {
+        if let bytes {
+            result.append("store: \(bytes) bytes")
+        }
+    }
+}
+
 private struct TokenSaverDistillCLIState: Codable {
     let baseURL: String
     let authToken: String
