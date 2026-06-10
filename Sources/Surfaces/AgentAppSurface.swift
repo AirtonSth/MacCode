@@ -157,6 +157,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
     private var timelineUpdateTickTask: Task<Void, Never>?
+    /// PERF: tracks thread ids whose placeholder titles have already been repaired
+    /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
+    private var repairedThreadIds: Set<AgentThreadID> = []
 
     public init(
         workspaceID: WorkspaceID,
@@ -239,8 +242,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Pure helper: indices of threads that still need a placeholder-title repair.
+    /// A thread is excluded when its id is in `alreadyRepaired` (already fixed this
+    /// session) or when its title is not a placeholder (no repair needed).
+    /// `nonisolated static` so it is testable without a MainActor context.
+    nonisolated static func indicesNeedingRepair(
+        in threads: [AgentThread],
+        alreadyRepaired: Set<AgentThreadID>
+    ) -> [Int] {
+        threads.indices.filter { i in
+            !alreadyRepaired.contains(threads[i].id) &&
+            AgentThreadTitle.isPlaceholder(threads[i].title)
+        }
+    }
+
     private func repairPlaceholderThreadTitles() {
-        for index in threads.indices where AgentThreadTitle.isPlaceholder(threads[index].title) {
+        let toRepair = Self.indicesNeedingRepair(in: threads, alreadyRepaired: repairedThreadIds)
+        for index in toRepair {
+            // Mark as visited regardless of whether a user message exists — a thread
+            // with no user messages won't get a better title on the next call either.
+            repairedThreadIds.insert(threads[index].id)
             guard let firstUserMessage = ((try? messageRepo.list(threadId: threads[index].id)) ?? [])
                 .first(where: { $0.role == .user }) else { continue }
             var thread = threads[index]
