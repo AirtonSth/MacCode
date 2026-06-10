@@ -198,10 +198,13 @@ public final class SettingsViewModel: ObservableObject {
         settingsStore.update { $0.diffIgnoreWhitespace = on }
     }
 
-    /// Update the Codex CLI path draft. Pass `committed: true` only on
-    /// end-editing (Return key, focus loss, or Browse picker) so mid-edit
-    /// keystrokes do NOT replace the live provider adapter or write the DB.
-    public func setCodexPath(_ path: String, committed: Bool = false) {
+    /// Update the Codex CLI path draft. The UI passes `committed: false` on
+    /// mid-edit keystrokes (display only) and `committed: true` on end-editing
+    /// (Return key, focus loss, or Browse picker) so mid-edit keystrokes do NOT
+    /// replace the live provider adapter or write the DB. The default is
+    /// `committed: true` so programmatic callers (restore, tests, update action)
+    /// apply immediately, matching the pre-debounce behaviour.
+    public func setCodexPath(_ path: String, committed: Bool = true) {
         codexPath = path
         codexAvailable = resolveAvailable(path)
         if CLIPathCommitPolicy.shouldApply(old: committedCodexPath, new: path, committed: committed) {
@@ -211,10 +214,13 @@ public final class SettingsViewModel: ObservableObject {
         }
     }
 
-    /// Update the Claude CLI path draft. Pass `committed: true` only on
-    /// end-editing (Return key, focus loss, or Browse picker) so mid-edit
-    /// keystrokes do NOT replace the live provider adapter or write the DB.
-    public func setClaudePath(_ path: String, committed: Bool = false) {
+    /// Update the Claude CLI path draft. The UI passes `committed: false` on
+    /// mid-edit keystrokes (display only) and `committed: true` on end-editing
+    /// (Return key, focus loss, or Browse picker) so mid-edit keystrokes do NOT
+    /// replace the live provider adapter or write the DB. The default is
+    /// `committed: true` so programmatic callers (restore, tests, update action)
+    /// apply immediately, matching the pre-debounce behaviour.
+    public func setClaudePath(_ path: String, committed: Bool = true) {
         claudePath = path
         claudeAvailable = resolveAvailable(path)
         if CLIPathCommitPolicy.shouldApply(old: committedClaudePath, new: path, committed: committed) {
