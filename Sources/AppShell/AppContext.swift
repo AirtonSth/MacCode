@@ -944,6 +944,43 @@ public final class AppContext {
         ) {
             activeThreadIds
         }
-        return try reaper.reapIdleSessions(olderThan: cutoff)
+        let result = try reaper.reapIdleSessions(olderThan: cutoff)
+        // Marking the session stopped in the DB does not free the underlying
+        // provider process (codex app-server / node bridge). Release every
+        // reaped thread's adapter session so the idle processes are actually
+        // terminated. stopRun(threadId:) hits the adapter.stopSession path for
+        // threads with no active run, which is exactly the idle/reaped case.
+        for threadId in result.stoppedThreadIds {
+            coordinator.stopRun(threadId: threadId)
+        }
+        return result
+    }
+
+    /// A reap candidate, reduced to the only two facts that decide eligibility:
+    /// the thread's last-activity timestamp and whether the thread is still
+    /// active. Pure, DB-free, so the selection rule can be tested directly.
+    public struct ReapCandidate: Sendable, Equatable {
+        public let threadId: AgentThreadID
+        public let lastActivityAt: Date
+        public let isActive: Bool
+
+        public init(threadId: AgentThreadID, lastActivityAt: Date, isActive: Bool) {
+            self.threadId = threadId
+            self.lastActivityAt = lastActivityAt
+            self.isActive = isActive
+        }
+    }
+
+    /// Pure selection mirroring ProviderSessionReaper.reapIdleSessions: a thread
+    /// is reap-eligible iff it is idle strictly past the cutoff AND not active.
+    /// The returned set is exactly the threads that get marked stopped AND have
+    /// adapter.stopSession called on them.
+    nonisolated public static func reapEligibleThreadIds(
+        candidates: [ReapCandidate],
+        idleCutoff: Date
+    ) -> [AgentThreadID] {
+        candidates
+            .filter { !$0.isActive && $0.lastActivityAt < idleCutoff }
+            .map(\.threadId)
     }
 }
