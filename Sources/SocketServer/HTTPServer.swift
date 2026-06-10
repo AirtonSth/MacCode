@@ -38,6 +38,74 @@ public extension DirectAuthProvider {
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? { nil }
 }
 
+/// Thread-safe counters for active WS connections, backpressure, and
+/// slow-client evictions. Used by /v1/health to answer \"why is sync slow\".
+/// Public so the test suite can inject controlled values.
+public final class WSConnectionTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _activeClients: Int = 0
+    private var _totalQueuedBytes: Int = 0
+    private var _slowClientDrops: Int = 0
+
+    public init() {}
+
+    public var activeClients: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _activeClients
+    }
+
+    public var totalQueuedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _totalQueuedBytes
+    }
+
+    public var slowClientDrops: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _slowClientDrops
+    }
+
+    /// Called when a WS connection is established.
+    public func clientConnected() {
+        lock.lock(); _activeClients += 1; lock.unlock()
+    }
+
+    /// Called when a WS connection exits. `queuedBytes` is the final
+    /// snapshot of the outbound queue for this connection.
+    public func clientDisconnected(queuedBytes: Int) {
+        lock.lock()
+        _activeClients = max(0, _activeClients - 1)
+        _totalQueuedBytes = max(0, _totalQueuedBytes - queuedBytes)
+        lock.unlock()
+    }
+
+    /// Called when the outbound queue for a connection changes (sampled on
+    /// enqueue). Replaces the previous sample for this connection.
+    public func updateQueuedBytes(previous: Int, current: Int) {
+        lock.lock()
+        _totalQueuedBytes = max(0, _totalQueuedBytes - previous + current)
+        lock.unlock()
+    }
+
+    /// Called when the WS outbound queue drops a slow client.
+    public func recordSlowClientDrop() {
+        lock.lock(); _slowClientDrops += 1; lock.unlock()
+    }
+}
+
+/// Pure helper: assembles the `connections` sub-object for /v1/health from
+/// plain counter inputs. No I/O, no actor, fully unit-testable.
+public func connectionMetricsJSON(
+    activeClients: Int,
+    totalQueuedBytes: Int,
+    slowClientDrops: Int
+) -> [String: Any] {
+    return [
+        "active_clients": activeClients,
+        "total_queued_bytes": totalQueuedBytes,
+        "slow_client_drops": slowClientDrops
+    ]
+}
+
 public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
@@ -57,6 +125,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Per-peer brute-force brake for the LAN pairing endpoints. The 6-digit
     /// code is brute-forceable over LAN without this throttle.
     let pairingThrottle = PairingThrottle()
+
+    /// Live connection-level metrics surfaced via /v1/health.
+    let wsTracker = WSConnectionTracker()
 
     private var listenFD: Int32 = -1
     private var running = false
@@ -226,6 +297,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     // single diagnostic.ws_slow_client event.
                     NSLog("[RC2.WS] slow-client close: reason=%@ baseline_required=true", reason)
                     if let id = subIDBox.value { EventBus.shared.unsubscribe(id) }
+                    // METRICS: count slow-client drops for /v1/health diagnostics.
+                    self?.wsTracker.recordSlowClientDrop()
                     EventBus.shared.publish(kind: "diagnostic.ws_slow_client", payload: .object([
                         "reason": .string(reason),
                         "baseline_required": .bool(true)
@@ -274,10 +347,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 _ = outbound.enqueue(data)
             }
             heartbeat.resume()
+            // METRICS: track active client count for /v1/health.
+            wsTracker.clientConnected()
             // keep connection open; read incoming frames (ping/pong/close)
             wsServeLoop(fd: fd, outbound: outbound)
             heartbeat.cancel()
             outbound.drain()
+            wsTracker.clientDisconnected(queuedBytes: outbound.queuedByteCount)
             return
         }
 
@@ -331,8 +407,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // the /v1 auth check above (not in the exempt list). Sourced from
             // EventBus's public snapshot — last emitted seq plus the retained
             // replay window (count + encoded bytes) the client re-baselines
-            // against. Subscriber/WS-client counts and provider-session status
-            // need the reserved EventBus/Dispatcher surface and are omitted.
+            // against. Connection-level metrics (active WS clients, backpressure,
+            // slow-client evictions) are sourced from wsTracker.
             let snap = EventBus.shared.snapshot()
             let retainedBytes = snap.recent.reduce(0) { acc, ev in
                 acc + ((try? JSONEncoder().encode(ev).count) ?? 0)
@@ -346,7 +422,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     "retained_count": snap.recent.count,
                     "retained_bytes": retainedBytes,
                     "oldest_retained_seq": snap.recent.first?.seq ?? 0
-                ]
+                ],
+                "connections": connectionMetricsJSON(
+                    activeClients: wsTracker.activeClients,
+                    totalQueuedBytes: wsTracker.totalQueuedBytes,
+                    slowClientDrops: wsTracker.slowClientDrops
+                )
             ]
             sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/rpc"):
