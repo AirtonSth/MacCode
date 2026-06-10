@@ -945,7 +945,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         emit(events, threadId: threadId)
         if let finished {
-            sessionSnapshot(threadId: threadId)?.onEvent?(finished)
+            // PERF: use onEventCallback to avoid a second full-Session copy for the terminal event.
+            SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
+                .broadcastEvent(finished)
         }
     }
 
@@ -996,11 +998,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return sessions[threadId]?.streamedItemIds.contains(key) ?? false
     }
 
+    // PERF: extract only the onEvent closure under lock — avoids copying the full
+    // Session struct (2 dicts + 3 sets + growing string) for every notification batch.
+    private func onEventCallback(threadId: AgentThreadID) -> (@Sendable (AgentRunEvent) -> Void)? {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.onEvent
+    }
+
     private func emit(_ events: [AssistantEvent], threadId: AgentThreadID) {
-        let onEvent = sessionSnapshot(threadId: threadId)?.onEvent
-        for event in events {
-            onEvent?(.event(event))
-        }
+        SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
+            .broadcastEvents(events)
     }
 
     private func settlePendingCallbacks(session: Session) {
