@@ -143,7 +143,15 @@ private struct FileEntry: Identifiable, Equatable {
         self.isEditable = identity["is_editable"]?.boolValue == true
         self.editabilityReason = identity["editability_reason"]?.stringValue ?? "not editable"
         self.language = identity["language"]?.stringValue
-        self.icon = Self.icon(isDirectory: isDirectory, kind: kind)
+        // Use per-extension icon for files when the extension is recognised; fall back to the
+        // coarser kind-based icon so MIME-detected files (e.g. a detected image with no
+        // recognisable extension) still get the right icon.
+        if isDirectory {
+            self.icon = "folder"
+        } else {
+            let extIcon = fileIcon(for: name)
+            self.icon = extIcon != "doc" ? extIcon : Self.icon(isDirectory: false, kind: kind)
+        }
     }
 
     static func icon(isDirectory: Bool, kind: String) -> String {
@@ -258,6 +266,46 @@ final class FileTreeStore<Item: FileTreeItem> {
 
 extension FileEntry: FileTreeItem {}
 extension FileEntry: FileNameFilterable {}
+
+// MARK: - Pure per-extension icon helper (no AppKit, no MainActor; tested in FileExtensionIconTests)
+
+/// Map a filename (or bare extension) to a distinct SF Symbol name based on its extension.
+/// Extension matching is case-insensitive. Returns "doc" for unrecognised extensions.
+/// This is a pure free function — no MainActor, no AppKit — so it can be unit-tested directly.
+func fileIcon(for filename: String) -> String {
+    let ext = (filename as NSString).pathExtension.lowercased()
+    switch ext {
+    case "swift":                   return "swift"
+    case "js", "jsx":               return "curlybraces"
+    case "ts", "tsx":               return "curlybraces.square"
+    case "json":                    return "ellipsis.curlybraces"
+    case "yml", "yaml":             return "gearshape"
+    case "md", "markdown":          return "doc.richtext"
+    case "png", "jpg", "jpeg",
+         "gif", "webp", "bmp",
+         "tiff", "tif", "heic":     return "photo"
+    case "svg":                     return "paintpalette"
+    case "html", "htm":             return "globe"
+    case "css", "scss", "less":     return "paintbrush"
+    case "sh", "bash", "zsh",
+         "fish", "command":         return "terminal"
+    case "py":                      return "chevron.left.forwardslash.chevron.right"
+    case "rb":                      return "diamond"
+    case "go":                      return "hare"
+    case "rs":                      return "gearshape.2"
+    case "pdf":                     return "doc.text.magnifyingglass"
+    case "mp4", "mov", "avi",
+         "mkv", "webm":             return "play.rectangle"
+    case "mp3", "wav", "aiff",
+         "flac", "m4a":             return "music.note"
+    case "zip", "tar", "gz",
+         "bz2", "xz", "7z",
+         "rar":                     return "archivebox"
+    case "txt":                     return "doc.text"
+    case "xml", "plist":            return "chevron.left.forwardslash.chevron.right"
+    default:                        return "doc"
+    }
+}
 
 // MARK: - Pure path helpers (no AppKit, no MainActor; tested in FilesNewFolderMoveTests)
 
