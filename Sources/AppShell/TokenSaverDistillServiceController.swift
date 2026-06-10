@@ -176,6 +176,65 @@ public enum TokenSaverIdlePolicy {
     }
 }
 
+/// Cached sha256 result keyed on (size, mtime) for a single model file.
+///
+/// The entry is considered valid only when both the file size and modification
+/// timestamp match what was recorded at hash time. Any drift in either field
+/// means the file may have changed and a full re-hash is required.
+public struct ModelChecksumCacheEntry: Sendable, Equatable {
+    public let sizeBytes: Int64
+    public let mtime: Date
+    public let sha256Hex: String
+
+    public init(sizeBytes: Int64, mtime: Date, sha256Hex: String) {
+        self.sizeBytes = sizeBytes
+        self.mtime = mtime
+        self.sha256Hex = sha256Hex
+    }
+}
+
+/// Pure cache-decision helper: given a file's current attributes and an optional
+/// cached entry, returns `true` when a full SHA-256 re-hash is needed.
+///
+/// Rules (all three must hold to skip rehash):
+///   - a cached entry exists, AND
+///   - cached.sizeBytes == size, AND
+///   - cached.mtime    == mtime
+///
+/// This function has no side effects and requires no MainActor isolation, so it
+/// is safely testable from any context.
+public enum ModelChecksumPolicy {
+    public static func needsRehash(size: Int64, mtime: Date, cached: ModelChecksumCacheEntry?) -> Bool {
+        guard let cached else { return true }
+        return cached.sizeBytes != size || cached.mtime != mtime
+    }
+}
+
+/// Thread-safe cache that maps a file URL to its last-known checksum entry.
+///
+/// The cache stores (size, mtime) -> sha256 so that repeated calls to
+/// `validateInstalledModel` skip the O(file-size) SHA-256 loop when the file
+/// has not changed. Only `needsRehash` decides whether the cached entry is
+/// still valid; the cache itself performs no I/O.
+public final class ModelChecksumCache: @unchecked Sendable {
+    private var entries: [URL: ModelChecksumCacheEntry] = [:]
+    private let lock = NSLock()
+
+    public init() {}
+
+    public func entry(for url: URL) -> ModelChecksumCacheEntry? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[url]
+    }
+
+    public func store(_ entry: ModelChecksumCacheEntry, for url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        entries[url] = entry
+    }
+}
+
 private struct TokenSaverDistillCLIState: Codable {
     let baseURL: String
     let authToken: String
