@@ -14,6 +14,26 @@ extension Notification.Name {
     static let rc2PrivateAccountChanged = Notification.Name("rc2PrivateAccountChanged")
 }
 
+/// Pure, non-MainActor commit-policy helper for CLI path text fields.
+///
+/// Business rule: a mid-edit draft must not trigger provider-adapter replacement
+/// or DB writes. Only a committed value (end-of-editing or Browse picker) that
+/// differs from the previously persisted value should be applied.
+///
+/// - Parameters:
+///   - old: The last value that was actually persisted/applied.
+///   - new: The candidate value (may be a partial draft).
+///   - committed: True when the edit session has ended (Return / focus-loss /
+///     Browse picker). False on every intermediate keystroke.
+/// - Returns: `true` iff the new value should be persisted and wired into the
+///   live coordinator.
+public struct CLIPathCommitPolicy {
+    public static func shouldApply(old: String, new: String, committed: Bool) -> Bool {
+        guard committed else { return false }
+        return new != old
+    }
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -31,6 +51,10 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var appSettings: AppSettings = AppSettings()
     @Published public var codexPath: String = ""
     @Published public var claudePath: String = ""
+    /// Last value that was actually persisted + wired into the coordinator.
+    /// Used by CLIPathCommitPolicy to skip no-op commits.
+    public var committedCodexPath: String = ""
+    public var committedClaudePath: String = ""
     @Published public var codexAvailable: Bool = false
     @Published public var claudeAvailable: Bool = false
     @Published public var devices: [DeviceTrust] = []
@@ -136,6 +160,8 @@ public final class SettingsViewModel: ObservableObject {
         appSettings = settingsStore.load()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
+        committedCodexPath = codexPath
+        committedClaudePath = claudePath
         codexAvailable = resolveAvailable(codexPath)
         claudeAvailable = resolveAvailable(claudePath)
         providerUpdateMessages = [:]
@@ -172,18 +198,30 @@ public final class SettingsViewModel: ObservableObject {
         settingsStore.update { $0.diffIgnoreWhitespace = on }
     }
 
-    public func setCodexPath(_ path: String) {
+    /// Update the Codex CLI path draft. Pass `committed: true` only on
+    /// end-editing (Return key, focus loss, or Browse picker) so mid-edit
+    /// keystrokes do NOT replace the live provider adapter or write the DB.
+    public func setCodexPath(_ path: String, committed: Bool = false) {
         codexPath = path
         codexAvailable = resolveAvailable(path)
-        providerUpdateMessages[.codex] = nil
-        saveCLIPath(key: "cli.codex.path", provider: .codex, path: path)
+        if CLIPathCommitPolicy.shouldApply(old: committedCodexPath, new: path, committed: committed) {
+            committedCodexPath = path
+            providerUpdateMessages[.codex] = nil
+            saveCLIPath(key: "cli.codex.path", provider: .codex, path: path)
+        }
     }
 
-    public func setClaudePath(_ path: String) {
+    /// Update the Claude CLI path draft. Pass `committed: true` only on
+    /// end-editing (Return key, focus loss, or Browse picker) so mid-edit
+    /// keystrokes do NOT replace the live provider adapter or write the DB.
+    public func setClaudePath(_ path: String, committed: Bool = false) {
         claudePath = path
         claudeAvailable = resolveAvailable(path)
-        providerUpdateMessages[.claude] = nil
-        saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
+        if CLIPathCommitPolicy.shouldApply(old: committedClaudePath, new: path, committed: committed) {
+            committedClaudePath = path
+            providerUpdateMessages[.claude] = nil
+            saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
+        }
     }
 
     public func setCustomModel(provider: AgentProvider, index: Int, value: String) {
@@ -380,6 +418,10 @@ public struct SettingsView: View {
     @State private var deviceToRevoke: DeviceTrust?
     @State private var expandedUpdateDetails: Set<AgentProvider> = []
     @State private var notificationStatus: UNAuthorizationStatus = .notDetermined
+    /// Local draft values for CLI path fields; committed on end-editing so
+    /// mid-edit keystrokes don't fire saveCLIPath / replaceProviderAdapter.
+    @State private var codexPathDraft: String = ""
+    @State private var claudePathDraft: String = ""
 
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -414,6 +456,12 @@ public struct SettingsView: View {
         .frame(width: 620, height: 560)
         .background(DS.Palette.bg)
         .task { notificationStatus = await SystemNotifier.shared.authorizationStatus() }
+        .onAppear {
+            codexPathDraft = vm.codexPath
+            claudePathDraft = vm.claudePath
+        }
+        .onChange(of: vm.codexPath) { codexPathDraft = $0 }
+        .onChange(of: vm.claudePath) { claudePathDraft = $0 }
     }
 
     private func settingRow<Content: View>(_ label: String, @ViewBuilder _ control: () -> Content) -> some View {
@@ -612,14 +660,22 @@ public struct SettingsView: View {
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeader("Diagnostics")
-            cliPathRow(label: "Codex path",
-                       value: Binding(get: { vm.codexPath }, set: { vm.setCodexPath($0) }),
-                       available: vm.codexAvailable,
-                       provider: .codex)
-            cliPathRow(label: "Claude path",
-                       value: Binding(get: { vm.claudePath }, set: { vm.setClaudePath($0) }),
-                       available: vm.claudeAvailable,
-                       provider: .claude)
+            cliPathRow(
+                label: "Codex path",
+                draft: $codexPathDraft,
+                onDraftChange: { vm.setCodexPath($0, committed: false) },
+                onCommit: { vm.setCodexPath(codexPathDraft, committed: true) },
+                available: vm.codexAvailable,
+                provider: .codex
+            )
+            cliPathRow(
+                label: "Claude path",
+                draft: $claudePathDraft,
+                onDraftChange: { vm.setClaudePath($0, committed: false) },
+                onCommit: { vm.setClaudePath(claudePathDraft, committed: true) },
+                available: vm.claudeAvailable,
+                provider: .claude
+            )
             if vm.showsAppUpdates {
                 appUpdatesRow
             }
@@ -712,7 +768,20 @@ public struct SettingsView: View {
         return false
     }
 
-    private func cliPathRow(label: String, value: Binding<String>, available: Bool, provider: AgentProvider) -> some View {
+    /// Render a CLI path row.
+    ///
+    /// `draft` is the local keystroke-level binding; `onDraftChange` is called
+    /// on every keystroke (updates display/availability pill only); `onCommit`
+    /// is called only when the user ends editing (Return key or focus loss) so
+    /// that saveCLIPath / replaceProviderAdapter are not hit mid-edit.
+    private func cliPathRow(
+        label: String,
+        draft: Binding<String>,
+        onDraftChange: @escaping (String) -> Void,
+        onCommit: @escaping () -> Void,
+        available: Bool,
+        provider: AgentProvider
+    ) -> some View {
         let updating = vm.updatingProviders.contains(provider)
         return VStack(alignment: .leading, spacing: DS.Space.xs) {
             HStack(spacing: DS.Space.md) {
@@ -732,12 +801,13 @@ public struct SettingsView: View {
                 .accessibilityIdentifier("settings.cli.\(provider.rawValue).update")
             }
             HStack(spacing: DS.Space.sm) {
-                TextField("", text: value)
+                TextField("", text: draft, onCommit: onCommit)
                     .textFieldStyle(.roundedBorder)
                     .font(DS.Font.monoSmall)
                     .foregroundColor(DS.Palette.text)
+                    .onChange(of: draft.wrappedValue, perform: onDraftChange)
                     .accessibilityIdentifier("settings.cli.\(provider.rawValue).field")
-                Button("Browse...") { browseForBinary(into: value) }
+                Button("Browse...") { browseForBinary(into: draft, onCommit: onCommit) }
                     .buttonStyle(DSSecondaryButtonStyle())
                     .accessibilityIdentifier("settings.cli.\(provider.rawValue).browse")
             }
@@ -746,7 +816,7 @@ public struct SettingsView: View {
                 let expanded = expandedUpdateDetails.contains(provider)
                 let isLong = message.count > 200 || message.contains("\n")
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(expanded || !isLong ? message : String(message.prefix(200)) + "…")
+                    Text(expanded || !isLong ? message : String(message.prefix(200)) + "...")
                         .font(DS.Font.caption)
                         .foregroundColor(isError ? DS.Palette.danger : DS.Palette.textSecondary)
                         .textSelection(.enabled)
@@ -765,7 +835,10 @@ public struct SettingsView: View {
         }
     }
 
-    private func browseForBinary(into value: Binding<String>) {
+    /// Opens an NSOpenPanel and, if the user picks a file, writes the path into
+    /// `value` and immediately calls `onCommit` so the picker acts as an
+    /// end-editing event (same as pressing Return in the text field).
+    private func browseForBinary(into value: Binding<String>, onCommit: @escaping () -> Void) {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -774,6 +847,7 @@ public struct SettingsView: View {
         panel.message = "Choose the CLI executable"
         if panel.runModal() == .OK, let url = panel.url {
             value.wrappedValue = url.path
+            onCommit()
         }
     }
 }
