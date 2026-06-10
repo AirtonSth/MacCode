@@ -2161,6 +2161,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try WorkspaceFileService().delete(root: try workspaceCwd(workspace), paths: paths)
     }
 
+    public func fsWorkspaceCreateDirectory(workspace: WorkspaceID, path: String) throws -> JSONValue {
+        try WorkspaceFileService().createDirectory(root: try workspaceCwd(workspace), path: path)
+    }
+
+    public func fsWorkspaceMoveItem(workspace: WorkspaceID, sourcePath: String, destinationDirectoryPath: String) throws -> JSONValue {
+        try WorkspaceFileService().moveItem(root: try workspaceCwd(workspace), sourcePath: sourcePath, destinationDirectoryPath: destinationDirectoryPath)
+    }
+
     public func filesStateGet(surface: SurfaceID) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)

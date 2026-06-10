@@ -77,6 +77,29 @@ private struct FileTabDragPayload {
     }
 }
 
+/// Drag payload for sidebar move-to-folder. Encodes workspace + relative source path so the
+/// drop target (a directory row) knows which item to move and into which workspace.
+private struct SidebarMoveDragPayload {
+    static let prefix = "rc-sidebar-move|"
+    let workspaceID: String
+    let relativePath: String
+
+    static func encode(workspaceID: WorkspaceID, relativePath: String) -> String {
+        let encoded = Data(relativePath.utf8).base64EncodedString()
+        return "\(prefix)\(workspaceID.value.uuidString)|\(encoded)"
+    }
+
+    static func decode(_ value: String) -> SidebarMoveDragPayload? {
+        guard value.hasPrefix(prefix) else { return nil }
+        let raw = String(value.dropFirst(prefix.count))
+        let parts = raw.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2,
+              let data = Data(base64Encoded: parts[1]),
+              let path = String(data: data, encoding: .utf8) else { return nil }
+        return SidebarMoveDragPayload(workspaceID: parts[0], relativePath: path)
+    }
+}
+
 private struct FileEntry: Identifiable, Equatable {
     let id: String
     let name: String
@@ -96,6 +119,8 @@ private struct FileEntry: Identifiable, Equatable {
     // which holds the workspace/surface IDs the payload needs.
     let icon: String
     var dragPayload: String?
+    // Sidebar move drag payload (both files and directories can be dragged into a folder).
+    var moveDragPayload: String?
 
     init?(value: JSONValue) {
         guard let object = value.objectValue,
@@ -233,6 +258,42 @@ final class FileTreeStore<Item: FileTreeItem> {
 
 extension FileEntry: FileTreeItem {}
 
+// MARK: - Pure path helpers (no AppKit, no MainActor; tested in FilesNewFolderMoveTests)
+
+/// Build the relative path for a new folder inside `parent`, uniquifying the name when a sibling
+/// with the same name already exists. `existingNames` is the set of names already present directly
+/// under `parent`; the helper appends " 2", " 3", ... until it finds an unused slot.
+/// Both `parent` and the returned path use forward-slash separators and no leading slash.
+func newFolderTargetPath(parent: String, name: String, existingNames: Set<String>) -> String {
+    var candidate = name
+    var counter = 2
+    while existingNames.contains(candidate) {
+        candidate = "\(name) \(counter)"
+        counter += 1
+    }
+    return parent.isEmpty ? candidate : "\(parent)/\(candidate)"
+}
+
+/// Validate whether moving `src` into the directory `dstDir` is safe within `workspaceRoot`.
+/// Returns `false` (reject) when:
+///  - `src` or `dstDir` escapes `workspaceRoot`
+///  - `dstDir` is the same as `src` (move-into-self)
+///  - `dstDir` is a descendant of `src` (would create a cycle)
+/// All paths should be absolute (starting with "/").
+func validateMove(src: String, dstDir: String, workspaceRoot: String) -> Bool {
+    let root = workspaceRoot.hasSuffix("/") ? workspaceRoot : workspaceRoot + "/"
+    let srcN = src.hasSuffix("/") ? src : src + "/"
+    let dstN = dstDir.hasSuffix("/") ? dstDir : dstDir + "/"
+    // Both must be inside the workspace.
+    guard srcN.hasPrefix(root) || src == workspaceRoot else { return false }
+    guard dstN.hasPrefix(root) || dstDir == workspaceRoot else { return false }
+    // dstDir must not be src itself.
+    guard dstDir != src else { return false }
+    // dstDir must not be a descendant of src.
+    guard !dstN.hasPrefix(srcN) else { return false }
+    return true
+}
+
 private struct FileTabDragModifier: ViewModifier {
     let payload: String?
 
@@ -246,9 +307,58 @@ private struct FileTabDragModifier: ViewModifier {
     }
 }
 
+private struct SidebarMoveDragModifier: ViewModifier {
+    let payload: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let payload {
+            content.draggable(payload)
+        } else {
+            content
+        }
+    }
+}
+
+private struct SidebarMoveDropModifier: ViewModifier {
+    let enabled: Bool
+    let workspaceID: String
+    let onDrop: (String) -> Bool
+    let isTargeted: (Bool) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.dropDestination(for: String.self) { values, _ in
+                guard let raw = values.first,
+                      let payload = SidebarMoveDragPayload.decode(raw),
+                      payload.workspaceID == workspaceID else { return false }
+                return onDrop(payload.relativePath)
+            } isTargeted: { targeted in
+                isTargeted(targeted)
+            }
+        } else {
+            content
+        }
+    }
+}
+
 private extension View {
     func fileTabDragPayload(_ payload: String?) -> some View {
         modifier(FileTabDragModifier(payload: payload))
+    }
+
+    func sidebarMoveDragPayload(_ payload: String?) -> some View {
+        modifier(SidebarMoveDragModifier(payload: payload))
+    }
+
+    func sidebarMoveDropDestination(
+        enabled: Bool,
+        workspaceID: String,
+        onDrop: @escaping (String) -> Bool,
+        isTargeted: @escaping (Bool) -> Void
+    ) -> some View {
+        modifier(SidebarMoveDropModifier(enabled: enabled, workspaceID: workspaceID, onDrop: onDrop, isTargeted: isTargeted))
     }
 }
 
@@ -379,6 +489,8 @@ private final class FilesViewModel: ObservableObject {
             if !entry.isDirectory {
                 entry.dragPayload = FileTabDragPayload.encode(workspaceID: workspaceID, sourceSurfaceID: surfaceID, path: entry.relativePath)
             }
+            // All entries (files and directories) can be dragged to move them into a folder.
+            entry.moveDragPayload = SidebarMoveDragPayload.encode(workspaceID: workspaceID, relativePath: entry.relativePath)
             return entry
         }
     }
@@ -394,6 +506,12 @@ private final class FilesViewModel: ObservableObject {
     /// retrying every redraw (P1).
     func childEntries(for directory: FileEntry) -> [FileEntry] {
         treeStore.children(at: directory.relativePath)
+    }
+
+    /// Look up an entry by its relative path across both the top-level entries and any cached
+    /// subtree children, so move-drop works even when the dragged item is in an expanded subdir.
+    func allKnownEntry(relativePath: String) -> FileEntry? {
+        entries.first(where: { $0.relativePath == relativePath })
     }
 
     func isExpanded(_ directory: FileEntry) -> Bool {
@@ -498,6 +616,50 @@ private final class FilesViewModel: ObservableObject {
                 selectedEntry = created
                 loadFile(created)
             }
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    func createFolder(named rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let existingNames = Set(entries.map(\.name))
+        let path = newFolderTargetPath(parent: currentDirectory, name: name, existingNames: existingNames)
+        do {
+            _ = try router?.fsWorkspaceCreateDirectory(workspace: workspaceID, path: path)
+            loadDirectory(currentDirectory)
+        } catch {
+            errorText = String(describing: error)
+        }
+    }
+
+    /// Move `entry` into `destinationDirectory`. Validates that the move does not create a cycle
+    /// (moving a dir into itself or a descendant) before calling the router. The `root` param is
+    /// the workspace's absolute root path, used only for the cycle check.
+    func moveEntry(_ entry: FileEntry, intoDirWithPath destRelativePath: String) {
+        let absRoot = root
+        // Build absolute paths for the cycle/workspace check.
+        let absSrc = entry.path
+        let absDst = destRelativePath.isEmpty
+            ? absRoot
+            : (absRoot as NSString).appendingPathComponent(destRelativePath)
+        guard validateMove(src: absSrc, dstDir: absDst, workspaceRoot: absRoot) else {
+            errorText = "Cannot move a folder into itself or a descendant."
+            return
+        }
+        if selectedEntry?.id == entry.id {
+            closeSessionIfSelected(path: entry.relativePath)
+        }
+        do {
+            _ = try router?.fsWorkspaceMoveItem(workspace: workspaceID, sourcePath: entry.relativePath, destinationDirectoryPath: destRelativePath)
+            if selectedEntry?.id == entry.id {
+                selectedEntry = nil
+                setDraft("")
+                renderedText = ""
+                isDirty = false
+            }
+            loadDirectory(currentDirectory)
         } catch {
             errorText = String(describing: error)
         }
@@ -771,6 +933,10 @@ private struct FilesSurfaceRoot: View {
     @State private var confirmDiscard = false
     @State private var showNewFileDialog = false
     @State private var newFileName = ""
+    @State private var showNewFolderDialog = false
+    @State private var newFolderName = ""
+    @FocusState private var newFolderFieldFocused: Bool
+    @State private var dropTargetedFolderPath: String? = nil
     @State private var renamingEntry: FileEntry?
     @State private var renameText = ""
     @State private var deleteTargets: [FileEntry] = []
@@ -824,6 +990,20 @@ private struct FilesSurfaceRoot: View {
         .onChange(of: showNewFileDialog) { presented in
             if presented { newFileFieldFocused = true }
         }
+        .alert("New Folder", isPresented: $showNewFolderDialog) {
+            TextField("Folder name", text: $newFolderName)
+                .focused($newFolderFieldFocused)
+                .onSubmit { createNewFolder() }
+                .accessibilityIdentifier("files.newFolder.field")
+            Button("Create") { createNewFolder() }
+                .accessibilityIdentifier("files.newFolder.create")
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(model.currentDirectory.isEmpty ? "Create in workspace root." : "Create in \(model.currentDirectory).")
+        }
+        .onChange(of: showNewFolderDialog) { presented in
+            if presented { newFolderFieldFocused = true }
+        }
         .alert("Rename", isPresented: Binding(
             get: { renamingEntry != nil },
             set: { if !$0 { renamingEntry = nil } }
@@ -876,6 +1056,12 @@ private struct FilesSurfaceRoot: View {
                     }
                     .accessibilityLabel("New file")
                     .accessibilityIdentifier("files.newFile.button")
+                    DSIconButton("folder.badge.plus", help: "New folder") {
+                        newFolderName = ""
+                        showNewFolderDialog = true
+                    }
+                    .accessibilityLabel("New folder")
+                    .accessibilityIdentifier("files.newFolder.button")
                 }
                 TextField("Path", text: $pathInput)
                     .font(DS.Font.monoSmall)
@@ -949,7 +1135,8 @@ private struct FilesSurfaceRoot: View {
     }
 
     private func entryRow(_ entry: FileEntry, depth: Int) -> some View {
-        HStack(spacing: 0) {
+        let isDropTarget = dropTargetedFolderPath == entry.relativePath
+        return HStack(spacing: 0) {
             if depth > 0 {
                 Spacer().frame(width: CGFloat(depth) * 14)
             }
@@ -970,12 +1157,35 @@ private struct FilesSurfaceRoot: View {
                 Spacer().frame(width: 14)
             }
             row(icon: entry.icon, name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath), dirtyPath: entry.relativePath)
+                .overlay {
+                    if isDropTarget {
+                        RoundedRectangle(cornerRadius: DS.Radius.control)
+                            .stroke(DS.Palette.accent, lineWidth: 1.5)
+                            .allowsHitTesting(false)
+                            .accessibilityIdentifier("files.moveDropIndicator.\(entry.relativePath)")
+                    }
+                }
         }
         .tag(entry.id)
         .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
         .listRowBackground(Color.clear)
         .contextMenu { fileContextMenu(for: entry) }
         .fileTabDragPayload(entry.dragPayload)
+        // Any entry can be dragged to move it. Directories also accept drops.
+        .sidebarMoveDragPayload(entry.moveDragPayload)
+        .sidebarMoveDropDestination(
+            enabled: entry.isDirectory,
+            workspaceID: model.workspaceID.value.uuidString,
+            onDrop: { relativePath in
+                guard let src = model.entries.first(where: { $0.relativePath == relativePath })
+                    ?? model.allKnownEntry(relativePath: relativePath) else { return false }
+                model.moveEntry(src, intoDirWithPath: entry.relativePath)
+                return true
+            },
+            isTargeted: { targeted in
+                dropTargetedFolderPath = targeted ? entry.relativePath : nil
+            }
+        )
         .help(entry.relativePath.isEmpty ? entry.name : entry.relativePath)
         .accessibilityIdentifier("files.row.\(entry.relativePath)")
     }
@@ -1110,6 +1320,11 @@ private struct FilesSurfaceRoot: View {
     private func createNewFile() {
         model.createFile(named: newFileName)
         newFileName = ""
+    }
+
+    private func createNewFolder() {
+        model.createFolder(named: newFolderName)
+        newFolderName = ""
     }
 
     // Escape hatches to the real file via Finder / default app, for binaries and large media

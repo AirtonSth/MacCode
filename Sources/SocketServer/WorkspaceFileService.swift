@@ -134,6 +134,53 @@ public struct WorkspaceFileService: Sendable {
         return .object(entryJSON(root: rootURL, url: destination))
     }
 
+    public func createDirectory(root: String, path: String) throws -> JSONValue {
+        let rootURL = try safeRoot(root)
+        let dir = try resolve(root: rootURL, path: path, mustExist: false)
+        guard dir.path != rootURL.path else {
+            throw JSONRPCError(code: -32602, message: "directory name required", data: .string(path))
+        }
+        guard !FileManager.default.fileExists(atPath: dir.path) else {
+            throw JSONRPCError(code: -32602, message: "file already exists", data: .string(relativePath(root: rootURL, url: dir)))
+        }
+        let parent = dir.deletingLastPathComponent()
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDir), isDir.boolValue else {
+            throw JSONRPCError(code: -32602, message: "parent directory not found", data: .string(relativePath(root: rootURL, url: parent)))
+        }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
+        return .object(entryJSON(root: rootURL, url: dir))
+    }
+
+    public func moveItem(root: String, sourcePath: String, destinationDirectoryPath: String) throws -> JSONValue {
+        let rootURL = try safeRoot(root)
+        let source = try resolve(root: rootURL, path: sourcePath, mustExist: true)
+        guard source.path != rootURL.path else {
+            throw JSONRPCError(code: -32602, message: "cannot move workspace root", data: .string(sourcePath))
+        }
+        let destDir = try resolve(root: rootURL, path: destinationDirectoryPath, mustExist: true)
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: destDir.path, isDirectory: &isDir), isDir.boolValue else {
+            throw JSONRPCError(code: -32602, message: "destination is not a directory", data: .string(destinationDirectoryPath))
+        }
+        let destination = destDir.appendingPathComponent(source.lastPathComponent)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        try ensureInside(root: rootURL, url: destination, requested: destinationDirectoryPath)
+        // Reject moving a directory into itself or a descendant.
+        let srcPath = source.path
+        let dstPath = destination.path
+        guard dstPath != srcPath,
+              !dstPath.hasPrefix(srcPath + "/") else {
+            throw JSONRPCError(code: -32602, message: "cannot move a directory into itself or a descendant", data: .string(sourcePath))
+        }
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw JSONRPCError(code: -32602, message: "destination already exists", data: .string(relativePath(root: rootURL, url: destination)))
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
+        return .object(entryJSON(root: rootURL, url: destination))
+    }
+
     public func delete(root: String, paths: [String]) throws -> JSONValue {
         let rootURL = try safeRoot(root)
         guard !paths.isEmpty else {
