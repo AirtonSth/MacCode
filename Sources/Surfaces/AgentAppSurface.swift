@@ -103,6 +103,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let checkpointRepo: AgentTurnCheckpointRepository?
     public let promptHistoryStore: PromptHistoryStore?
     public let customModelStore: AgentCustomModelStore?
+    public let planNotesStore: PlanNotesStore?
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
@@ -119,7 +120,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         proposedPlanRepo: AgentProposedPlanRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
         promptHistoryStore: PromptHistoryStore? = nil,
-        customModelStore: AgentCustomModelStore? = nil
+        customModelStore: AgentCustomModelStore? = nil,
+        planNotesStore: PlanNotesStore? = nil
     ) {
         self.workspaceID = workspaceID
         self.cwd = cwd
@@ -132,6 +134,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.checkpointRepo = checkpointRepo
         self.promptHistoryStore = promptHistoryStore
         self.customModelStore = customModelStore
+        self.planNotesStore = planNotesStore
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
         reloadCustomModels()
         self.coordinator.addObserver(self)
@@ -262,9 +265,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
+        // Restore persisted plan notes for the opened thread.
+        planNotes = planNotesStore?.load(threadId: id) ?? ""
         // UX-MAC_AGENT-001: route first-responder to the composer on every
         // open/switch so the user can type without a manual click.
         focusTick &+= 1
+    }
+
+    /// Called by the plan sidebar whenever planNotes changes to persist the
+    /// current text keyed by the active thread.
+    public func savePlanNotes() {
+        guard let id = selectedThreadId else { return }
+        planNotesStore?.save(planNotes, threadId: id)
     }
 
     public func reloadQueuedMessages() {
@@ -5021,6 +5033,7 @@ public struct AgentAppView: View {
                 .scrollContentBackground(.hidden)
                 .padding(DS.Space.md)
                 .background(DS.Palette.surface)
+                .onChange(of: vm.planNotes) { _ in vm.savePlanNotes() }
         }
         .background(DS.Palette.surface)
         .overlay(alignment: .leading) {
@@ -5749,9 +5762,9 @@ public final class AgentAppSurface: NSObject, Surface {
     /// this already-open surface (wired by AppCommandRouter, like Feed).
     public var subscriptionToken: AnyHashable?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, title: String = "Agent App") {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()
