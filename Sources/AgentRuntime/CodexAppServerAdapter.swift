@@ -470,7 +470,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let message = string(error, "message") ?? string(payload, "message") ?? Self.jsonString(error) ?? "Codex error"
             let details = string(error, "additionalDetails") ?? string(error, "additional_details")
             let full = [message, details].compactMap { $0?.nilIfEmpty }.joined(separator: "\n")
-            events.append(.error(message: full.nilIfEmpty ?? "Codex error", recoverable: (payload["willRetry"] as? Bool) == true))
+            let willRetry = (payload["willRetry"] as? Bool) == true
+            events.append(.error(message: full.nilIfEmpty ?? "Codex error", recoverable: willRetry))
+            if let outcome = Self.classifyFatalOutcome(eventKind: "error", willRetry: willRetry, errorCode: Self.errorCode(from: payload, error: error)) {
+                finished = Self.failedEvent(for: outcome, message: full.nilIfEmpty ?? "Codex error", providerThreadId: providerThreadId(threadId: threadId))
+                markFinished(threadId: threadId, status: .failed, turnId: activeTurnId(threadId: threadId))
+            }
         case "thread/status/changed", "thread.status.changed":
             let turnId = activeTurnId(threadId: threadId) ?? ""
             let itemId = "thread-status-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)"
@@ -861,6 +866,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             events.append(.turnCompleted(turnId: turnId, finalMessage: final.isEmpty ? nil : final))
             finished = .finished(.completed, finalMessage: final.isEmpty ? nil : final, providerThreadId: providerThreadId(threadId: threadId))
             markFinished(threadId: threadId, status: .completed, turnId: turnId)
+        case "turn/failed", "turn.failed":
+            let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) ?? activeTurnId(threadId: threadId) ?? ""
+            let error = payload["error"] as? [String: Any] ?? payload
+            let message = string(error, "message") ?? string(payload, "message") ?? Self.jsonString(error) ?? "Codex turn failed"
+            let outcome = Self.classifyFatalOutcome(eventKind: "turn/failed", willRetry: false, errorCode: Self.errorCode(from: payload, error: error)) ?? .failed(isAuth: false)
+            events.append(.error(message: message, recoverable: false))
+            finished = Self.failedEvent(for: outcome, message: message, providerThreadId: providerThreadId(threadId: threadId))
+            markFinished(threadId: threadId, status: .failed, turnId: turnId.isEmpty ? nil : turnId)
         default:
             break
         }
@@ -1282,6 +1295,62 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
         if let value = value as? Int { return value != 0 }
         return nil
+    }
+
+    // P1: pure classifier mapping an app-server failure signal to a terminal
+    // RunOutcome. Returns nil to keep the run alive (retry-able), or a `.failed`
+    // outcome that the adapter turns into `finished(.failed)` immediately so a
+    // fatal mid-turn error (e.g. auth death) does not leave a stuck spinner.
+    // `isAuth` lets the UI surface a 'Sign in' CTA instead of a generic error.
+    enum RunOutcome: Equatable {
+        case failed(isAuth: Bool)
+    }
+
+    static func classifyFatalOutcome(eventKind: String, willRetry: Bool, errorCode: String?) -> RunOutcome? {
+        switch eventKind {
+        case "turn/failed", "turn.failed":
+            return .failed(isAuth: isAuthErrorCode(errorCode))
+        case "error":
+            // Retry-able errors keep the run alive; the adapter still emits a
+            // recoverable `.error` event for them.
+            guard !willRetry else { return nil }
+            return .failed(isAuth: isAuthErrorCode(errorCode))
+        default:
+            return nil
+        }
+    }
+
+    static func errorCode(from payload: [String: Any], error: [String: Any]) -> String? {
+        for key in ["code", "errorCode", "error_code", "type", "kind", "status"] {
+            if let value = error[key] as? String, !value.isEmpty { return value }
+            if let value = payload[key] as? String, !value.isEmpty { return value }
+            if let value = error[key] as? Int { return String(value) }
+            if let value = payload[key] as? Int { return String(value) }
+        }
+        // Fall back to the human-readable message so auth death is still
+        // recognized when no machine error code is provided.
+        return (error["message"] as? String) ?? (payload["message"] as? String)
+    }
+
+    // P1: turns a terminal RunOutcome into the `finished(.failed)` event. For an
+    // auth-class failure we prefix the message with a stable marker so the UI
+    // layer can route to a 'Sign in' CTA instead of a generic failure banner.
+    static func failedEvent(for outcome: RunOutcome, message: String, providerThreadId: String?) -> AgentRunEvent {
+        switch outcome {
+        case .failed(let isAuth):
+            let finalMessage = isAuth ? "\(authFailureMarker) \(message)" : message
+            return .finished(.failed, finalMessage: finalMessage, providerThreadId: providerThreadId)
+        }
+    }
+
+    static let authFailureMarker = "[auth-required]"
+
+    static func isAuthErrorCode(_ errorCode: String?) -> Bool {
+        guard let errorCode else { return false }
+        let normalized = errorCode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+        let authMarkers = ["401", "unauthorized", "unauthenticated", "auth", "login", "credential", "token_expired", "expired_token", "invalid_api_key", "permission_denied", "forbidden", "403"]
+        return authMarkers.contains { normalized.contains($0) }
     }
 
     private static func recoveryActiveTurnId(from extraArgs: [String]) -> String? {
