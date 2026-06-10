@@ -674,6 +674,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         ])
         win.contentView = v
         win.center()
+        win.delegate = self
         win.makeKeyAndOrderFront(nil)
         extraWindows[w.id] = win
     }
@@ -990,11 +991,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 
     // MARK: NSWindowDelegate
     public func windowWillClose(_ notification: Notification) {
-        context?.saveSnapshot()
-        disableInsomniaForAppClose()
+        guard let closing = notification.object as? NSWindow else { return }
+        if closing === window {
+            context?.saveSnapshot()
+            disableInsomniaForAppClose()
+        } else {
+            extraWindows = extraWindowsRemoving(closing, from: extraWindows)
+        }
     }
 
     public func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Extra windows (openAdditionalWindow) are allowed to close normally;
+        // windowWillClose handles removing them from extraWindows.
+        guard sender === window else { return true }
         context?.saveSnapshot()
         sender.orderOut(nil)
         router?.reconcileSurfaceVisibility()
@@ -1073,6 +1082,21 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 /// restores its frame across launches just like the main window does.
 func detachedFrameAutosaveName(workspaceID: WorkspaceID) -> String {
     "io.remotecode.detachedWorkspace.\(workspaceID.value.uuidString)"
+}
+
+/// Returns a new dictionary identical to `windows` with every entry whose
+/// value is `closing` removed.
+///
+/// Pure function: no AppKit side-effects, no state captured.
+/// Extracted so the removal policy is unit-testable without AppKit/MainActor.
+///
+/// WHY: closed extra windows were retained forever because the dict held the
+/// only strong reference; removing on close lets ARC deallocate them.
+nonisolated func extraWindowsRemoving(
+    _ closing: NSWindow,
+    from windows: [WindowID: NSWindow]
+) -> [WindowID: NSWindow] {
+    windows.filter { $0.value !== closing }
 }
 
 @MainActor
