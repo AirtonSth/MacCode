@@ -71,6 +71,27 @@ public struct PayloadCodec: Sendable, Equatable {
         return nil
     }
 
+    /// Returns the best codec for a response whose uncompressed size is `payloadSize`.
+    /// Prefers lzfse (lower CPU, no CRC table walk) over gzip when the client accepts it.
+    /// Returns nil when `payloadSize < threshold` or no accepted encoding matches.
+    /// - Parameters:
+    ///   - payloadSize: Byte count of the uncompressed payload.
+    ///   - acceptEncoding: Value of the client Accept-Encoding header, or nil.
+    ///   - threshold: Minimum payload size (inclusive) at which compression is applied. Default 128.
+    public static func selectResponseCodec(
+        payloadSize: Int,
+        acceptEncoding: String?,
+        threshold: Int = 128
+    ) -> PayloadCodec? {
+        guard payloadSize >= threshold else { return nil }
+        let accepted = acceptEncoding?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? []
+        if accepted.contains(lzfse.wireName) { return .lzfse }
+        if accepted.contains(gzip.wireName) { return .gzip }
+        return nil
+    }
+
     private static func encodeGzip(_ data: Data) throws -> Data {
         let deflated = try (data as NSData).compressed(using: .zlib) as Data
         var out = Data([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff])
