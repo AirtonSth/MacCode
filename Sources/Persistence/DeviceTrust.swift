@@ -154,6 +154,21 @@ public final class PairingThrottle: @unchecked Sendable {
     }
 }
 
+/// A single row from the audit_log table. Immutable value type; never persists
+/// back to the DB. Used by the Devices Settings panel to render the audit trail.
+public struct AuditLogEntry: Sendable, Equatable {
+    public let id: Int64
+    public let ts: Date
+    public let actor: String?
+    public let action: String
+    public let detail: String?
+
+    public init(id: Int64, ts: Date, actor: String?, action: String, detail: String?) {
+        self.id = id; self.ts = ts; self.actor = actor
+        self.action = action; self.detail = detail
+    }
+}
+
 public final class DeviceTrustRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -380,6 +395,13 @@ public final class DeviceTrustRepository {
         _ = try st.step()
     }
 
+    /// Delete all device_trust rows that have been revoked (revoked_at IS NOT NULL).
+    /// Keeps active devices intact. Called from the Devices Settings panel.
+    public func deleteRevoked() throws {
+        let st = try db.prepare("DELETE FROM device_trust WHERE revoked_at IS NOT NULL;")
+        _ = try st.step()
+    }
+
     public func audit(actor: String?, action: String, detail: String?) throws {
         let st = try db.prepare("INSERT INTO audit_log(ts, actor, action, detail) VALUES(?, ?, ?, ?);")
         try st.bind(1, iso.string(from: Date()))
@@ -387,5 +409,25 @@ public final class DeviceTrustRepository {
         try st.bind(3, action)
         try st.bind(4, detail)
         _ = try st.step()
+    }
+
+    /// Fetch the most recent audit log entries, newest first. Does not touch
+    /// the device_trust schema; reads only the audit_log table.
+    public func listAuditLog(limit: Int = 50) throws -> [AuditLogEntry] {
+        let st = try db.prepare(
+            "SELECT id, ts, actor, action, detail FROM audit_log ORDER BY id DESC LIMIT ?;"
+        )
+        try st.bind(1, limit)
+        var out: [AuditLogEntry] = []
+        while try st.step() {
+            out.append(AuditLogEntry(
+                id: st.columnInt64(0),
+                ts: iso.date(from: st.columnText(1) ?? "") ?? Date(timeIntervalSince1970: 0),
+                actor: st.columnText(2),
+                action: st.columnText(3) ?? "",
+                detail: st.columnText(4)
+            ))
+        }
+        return out
     }
 }

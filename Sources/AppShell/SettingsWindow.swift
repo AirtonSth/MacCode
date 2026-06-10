@@ -35,6 +35,54 @@ public struct AppSettingsKeys {
     ]
 }
 
+// MARK: - Devices panel pure formatters
+
+/// Pure display fields derived from a DeviceTrust value. No MainActor needed;
+/// all inputs are value types. Tested directly without constructing a ViewModel.
+public struct DeviceRowFormatter {
+    /// Short device name + abbreviated id so users distinguish devices without
+    /// reading a full UUID. Example: "Sam's iPhone (abc12345)"
+    public static func title(_ d: DeviceTrust) -> String {
+        "\(d.displayName) (\(d.id.prefix(8)))"
+    }
+
+    /// Subtitle: ISO paired date, optional relative last-seen, revoked badge.
+    /// Uses the shared formatters injected as parameters so tests can pass
+    /// deterministic formatters without monkey-patching global state.
+    public static func subtitle(
+        _ d: DeviceTrust,
+        isoFormatter: ISO8601DateFormatter,
+        relativeFormatter: RelativeDateTimeFormatter,
+        now: Date = Date()
+    ) -> String {
+        var parts: [String] = ["paired " + isoFormatter.string(from: d.createdAt)]
+        if let ls = d.lastSeenAt {
+            parts.append("seen " + relativeFormatter.localizedString(for: ls, relativeTo: now))
+        }
+        if d.revokedAt != nil { parts.append("revoked") }
+        return parts.joined(separator: " \u{00B7} ")
+    }
+
+    /// True iff the device has been revoked and can be deleted from the list.
+    public static func isRevoked(_ d: DeviceTrust) -> Bool { d.revokedAt != nil }
+}
+
+/// Pure formatter for a single AuditLogEntry row. No MainActor needed.
+public struct AuditLogRowFormatter {
+    /// One-line display string: timestamp + actor (if any) + action + detail (if any).
+    /// Example: "2026-06-09T12:00:00Z  device \u{2192} pairing.redeem  MyPhone"
+    public static func line(
+        _ entry: AuditLogEntry,
+        isoFormatter: ISO8601DateFormatter
+    ) -> String {
+        var parts: [String] = [isoFormatter.string(from: entry.ts)]
+        if let actor = entry.actor { parts.append(actor) }
+        parts.append(entry.action)
+        if let detail = entry.detail { parts.append(detail) }
+        return parts.joined(separator: "  ")
+    }
+}
+
 /// Pure, non-MainActor commit-policy helper for CLI path text fields.
 ///
 /// Business rule: a mid-edit draft must not trigger provider-adapter replacement
@@ -79,6 +127,7 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var codexAvailable: Bool = false
     @Published public var claudeAvailable: Bool = false
     @Published public var devices: [DeviceTrust] = []
+    @Published public var auditLogEntries: [AuditLogEntry] = []
     @Published public var newPairingCode: String?
     @Published public var pairingCodeExpiresAt: Date?
     @Published public var updatingProviders: Set<AgentProvider> = []
@@ -190,6 +239,7 @@ public final class SettingsViewModel: ObservableObject {
             (provider, customModelStore.list(provider: provider))
         })
         devices = (try? trustRepo.list()) ?? []
+        auditLogEntries = (try? trustRepo.listAuditLog()) ?? []
         if let updater { updateAvailability = updater.availability }
         if let session = privateAccountStore.load() {
             privateAccountUser = session.user
@@ -350,6 +400,13 @@ public final class SettingsViewModel: ObservableObject {
 
     public func revoke(_ id: String) {
         try? trustRepo.revoke(id: id)
+        reload()
+    }
+
+    /// Remove all revoked device rows from the device_trust table so the list
+    /// stays clean. Only affects rows where revoked_at IS NOT NULL.
+    public func deleteRevoked() {
+        try? trustRepo.deleteRevoked()
         reload()
     }
 
@@ -787,6 +844,15 @@ public struct SettingsView: View {
                     .buttonStyle(DSSecondaryButtonStyle())
                     .accessibilityIdentifier("settings.pairing.generate")
             }
+            let hasRevoked = vm.devices.contains { $0.revokedAt != nil }
+            if hasRevoked {
+                HStack {
+                    Spacer()
+                    Button("Delete Revoked") { vm.deleteRevoked() }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                        .accessibilityIdentifier("settings.devices.deleteRevoked")
+                }
+            }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.sm) {
                     if vm.devices.isEmpty {
@@ -814,6 +880,27 @@ public struct SettingsView: View {
                     }
                 }
             }.frame(maxHeight: 150)
+
+            if !vm.auditLogEntries.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text("Audit Log")
+                        .font(DS.Font.caption2.weight(.semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(vm.auditLogEntries, id: \.id) { entry in
+                                Text(AuditLogRowFormatter.line(entry, isoFormatter: Self.deviceDateFormatter))
+                                    .font(DS.Font.monoSmall)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .textSelection(.enabled)
+                                    .accessibilityIdentifier("settings.auditLog.\(entry.id)")
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 100)
+                }
+            }
         }
         .dsPanel(padding: DS.Space.lg)
         .alert("Revoke device?",
@@ -830,11 +917,11 @@ public struct SettingsView: View {
     /// when the device has connected since pairing so users can recognize an
     /// active device instead of only an 8-char hash.
     private func deviceSubtitle(_ d: DeviceTrust) -> String {
-        var parts = [d.id.prefix(8) + " · " + Self.deviceDateFormatter.string(from: d.createdAt)]
+        var parts = [d.id.prefix(8) + " \u{00B7} " + Self.deviceDateFormatter.string(from: d.createdAt)]
         if let lastSeen = d.lastSeenAt {
             parts.append("seen " + Self.deviceRelativeFormatter.localizedString(for: lastSeen, relativeTo: Date()))
         }
-        return parts.joined(separator: " · ")
+        return parts.joined(separator: " \u{00B7} ")
     }
 
     private var diagnosticsSection: some View {
