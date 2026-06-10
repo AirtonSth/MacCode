@@ -376,6 +376,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Pure reorder helper: moves the element at `from` to `to` within `queue`.
+    /// Out-of-bounds indices or a single-item queue are no-ops.
+    /// Positions in returned elements are NOT updated — caller persists as needed.
+    nonisolated static func reorderQueue(
+        _ queue: [AgentQueuedMessage],
+        from: Int,
+        to: Int
+    ) -> [AgentQueuedMessage] {
+        guard queue.count > 1,
+              queue.indices.contains(from),
+              queue.indices.contains(to),
+              from != to else { return queue }
+        var result = queue
+        let item = result.remove(at: from)
+        result.insert(item, at: to)
+        return result
+    }
+
+    /// Reorders a queued message from one index to another, persisting new positions.
+    public func reorderQueuedMessage(from: IndexSet, to: Int) {
+        guard let queuedMessageRepo, let fromIndex = from.first else { return }
+        // SwiftUI List onMove passes destination after removal; normalise to an
+        // inclusive target index so the pure helper contract is simple.
+        let dest = fromIndex < to ? to - 1 : to
+        let reordered = AgentAppViewModel.reorderQueue(queuedMessages, from: fromIndex, to: dest)
+        do {
+            let now = Date()
+            for (index, var message) in reordered.enumerated() {
+                message.position = index + 1
+                message.updatedAt = now
+                try queuedMessageRepo.upsert(message)
+            }
+            reloadQueuedMessages()
+            for queued in queuedMessages {
+                onQueuedMessageEvent?("agent.message.queue.updated", queued)
+            }
+        } catch {
+            queueStatusMessage = "Queue reorder failed: \(error)"
+        }
+    }
+
 
     public func reloadCheckpoints() {
         guard let selectedThreadId, let checkpointRepo else {
@@ -4096,6 +4137,7 @@ public struct AgentAppView: View {
                 ForEach(vm.queuedMessages, id: \.id) { message in
                     queuedMessageRow(message)
                 }
+                .onMove { from, to in vm.reorderQueuedMessage(from: from, to: to) }
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.vertical, DS.Space.md)
