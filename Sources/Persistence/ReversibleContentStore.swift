@@ -154,4 +154,47 @@ public final class ReversibleContentStore: @unchecked Sendable {
             return Int(stmt.columnInt64(0))
         }
     }
+
+    /// Total bytes of all stored originals. Used by diagnostics to show store size.
+    public func storeSizeBytes() throws -> Int64 {
+        try db.performSync { database in
+            let stmt = try database.prepare("SELECT COALESCE(SUM(byte_count), 0) FROM rc_reversible_content;")
+            defer { stmt.reset() }
+            guard try stmt.step() else { return 0 }
+            return stmt.columnInt64(0)
+        }
+    }
+}
+
+// MARK: - Retention Job
+
+/// Pure, schedulable retention job for the CCR store.
+/// The caller (app launch, daily timer) calls `runRetention(now:cutoffMs:)`.
+/// All state lives in SQLite; this struct is stateless.
+public struct CCRRetentionJob {
+
+    /// Derive the cutoff timestamp (ms since epoch) from a reference instant and a
+    /// retention window. Rows last accessed before this value are eligible for pruning.
+    ///
+    /// - Parameters:
+    ///   - now: The reference instant (pass explicitly so callers and tests control time).
+    ///   - retentionDays: Number of days to keep. Default is 30.
+    /// - Returns: `Int64` millisecond timestamp. Rows older than this may be pruned.
+    public static func olderThanMs(now: Date, retentionDays: Int = 30) -> Int64 {
+        let cutoffDate = now.addingTimeInterval(-Double(retentionDays) * 86_400)
+        return Int64(cutoffDate.timeIntervalSince1970 * 1000)
+    }
+
+    /// Run a prune pass and return the number of rows removed.
+    ///
+    /// - Parameters:
+    ///   - store: The CCR store to prune.
+    ///   - now: Current instant; passed explicitly for testability.
+    ///   - cutoffMs: Rows last accessed before this ms timestamp are candidates.
+    ///               Derive it with `olderThanMs(now:retentionDays:)`.
+    /// - Returns: Number of rows removed.
+    @discardableResult
+    public static func runRetention(store: ReversibleContentStore, now: Date, cutoffMs: Int64) throws -> Int {
+        try store.pruneUnreferenced(olderThanMs: cutoffMs)
+    }
 }
