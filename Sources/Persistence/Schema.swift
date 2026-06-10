@@ -89,6 +89,10 @@ public enum Schema {
             FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_turn_snapshots_thread ON agent_turn_snapshots(thread_id);
+        -- DEAD TABLE: workspace_selection
+        -- No repository or call sites exist for this table beyond Bootstrap seeding.
+        -- Candidate for removal in a future destructive migration once confirmed safe.
+        -- Listed in Schema.knownDeadTableNames.
         CREATE TABLE IF NOT EXISTS workspace_selection (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             selected_workspace_id TEXT,
@@ -104,6 +108,11 @@ public enum Schema {
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        -- DEAD TABLE: terminal_sessions
+        -- No repository or call sites reference this table; terminal output is
+        -- stored in terminal_output_chunks (step 7) instead.
+        -- Candidate for removal in a future destructive migration once confirmed safe.
+        -- Listed in Schema.knownDeadTableNames.
         CREATE TABLE IF NOT EXISTS terminal_sessions (
             id TEXT PRIMARY KEY,
             surface_id TEXT NOT NULL,
@@ -113,6 +122,11 @@ public enum Schema {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- DEAD TABLE: browser_profiles
+        -- No repository or call sites reference this table; browser-profile
+        -- management was never implemented in the current codebase.
+        -- Candidate for removal in a future destructive migration once confirmed safe.
+        -- Listed in Schema.knownDeadTableNames.
         CREATE TABLE IF NOT EXISTS browser_profiles (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -410,6 +424,18 @@ public enum Schema {
         ALTER TABLE token_saver_savings ADD COLUMN cache_state TEXT NOT NULL DEFAULT 'unknown';
         """)
     ]
+
+    /// Tables that exist in the schema for historical reasons but have no
+    /// active repository or call sites in the current codebase.  They are
+    /// retained to avoid a destructive migration step; they are candidates for
+    /// removal once a future migration cycle confirms they are safe to drop.
+    ///
+    /// - workspace_selection: seeded by Bootstrap only; no queries elsewhere.
+    /// - terminal_sessions: superseded by terminal_output_chunks (step 7).
+    /// - browser_profiles: browser-profile feature was never implemented.
+    public static func knownDeadTableNames() -> Set<String> {
+        ["workspace_selection", "terminal_sessions", "browser_profiles"]
+    }
 
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
