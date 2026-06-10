@@ -97,6 +97,43 @@ private func ghosttyRuntimeReadClipboardCallback(
 
 // MARK: - Action effect mapper
 
+/// Classifies a raw string token from a Ghostty open-url action into the
+/// appropriate host action. Pure value type: nonisolated, no AppKit imports.
+///
+/// Rules:
+/// - `http://` or `https://` → `.url`  (open in default browser)
+/// - `file://` → `.filePath` (extract POSIX path, route to FilePreview)
+/// - Starts with `/` → `.filePath`     (absolute POSIX path, route to FilePreview)
+/// - Anything else → `.none`
+///
+/// Relative paths (e.g. `./foo`) are intentionally `.none`: Ghostty resolves
+/// paths against the terminal cwd before firing `GHOSTTY_ACTION_OPEN_URL`, so
+/// a relative-path token is not a genuine Ghostty-generated file reference.
+enum TerminalLinkClassifier {
+    enum Result {
+        case url(URL)
+        case filePath(String)
+        case none
+    }
+
+    nonisolated static func classify(_ raw: String) -> Result {
+        guard !raw.isEmpty else { return .none }
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://") {
+            guard let url = URL(string: raw) else { return .none }
+            return .url(url)
+        }
+        if raw.hasPrefix("file://") {
+            guard let url = URL(string: raw),
+                  let path = url.path.isEmpty ? nil : Optional(url.path) else { return .none }
+            return .filePath(path)
+        }
+        if raw.hasPrefix("/") {
+            return .filePath(raw)
+        }
+        return .none
+    }
+}
+
 /// The side-effect a Ghostty surface action should produce in the host app.
 /// Pure value type: no @MainActor, no AppKit imports needed to construct it.
 enum GhosttyActionEffect {
@@ -104,6 +141,10 @@ enum GhosttyActionEffect {
     case setTitle(String)
     /// CSS cursor name from the terminal program — update the system cursor shape.
     case mouseShape(ghostty_action_mouse_shape_e)
+    /// Cmd+click on a http/https URL — open in the default browser.
+    case openURL(URL)
+    /// Cmd+click on an absolute file path or file:// URL — route to FilePreview.
+    case openFilePath(String)
 }
 
 /// Pure mapper from a raw Ghostty action struct to an optional host effect.
@@ -117,6 +158,17 @@ enum GhosttyActionMapper {
             return .setTitle(title)
         case GHOSTTY_ACTION_MOUSE_SHAPE:
             return .mouseShape(action.action.mouse_shape)
+        case GHOSTTY_ACTION_OPEN_URL:
+            guard let ptr = action.action.open_url.url else { return nil }
+            let raw = String(cString: ptr)
+            switch TerminalLinkClassifier.classify(raw) {
+            case .url(let url):
+                return .openURL(url)
+            case .filePath(let path):
+                return .openFilePath(path)
+            case .none:
+                return nil
+            }
         default:
             return nil
         }
@@ -477,6 +529,10 @@ final class GhosttyTerminalView: NSView {
     var onTerminalSizeChange: ((TerminalViewportSize) -> Void)?
     /// Called on the main thread when the terminal program changes its title (OSC 2).
     var onTitleChange: ((String) -> Void)?
+    /// Called on the main thread when the user Cmd+clicks an absolute file path
+    /// (or file:// URL) in the terminal. The owning surface routes this to
+    /// FilePreview / Diff. When nil, file-path Cmd+clicks are silently ignored.
+    var onCmdClickFilePath: ((String) -> Void)?
 
     /// Injected by the owning TerminalSurface to persist font zoom per workspace.
     /// When nil, zoom changes are session-only (not persisted).
@@ -775,6 +831,16 @@ final class GhosttyTerminalView: NSView {
             NSCursor.pop()
             if let cursor = Self.cursor(for: shape) {
                 cursor.push()
+            }
+        case .openURL(let url):
+            NSWorkspace.shared.open(url)
+        case .openFilePath(let path):
+            if let handler = onCmdClickFilePath {
+                handler(path)
+            } else {
+                // Fallback: open in the default app (e.g. Xcode for .swift files)
+                // when no in-app routing is configured.
+                NSWorkspace.shared.open(URL(fileURLWithPath: path))
             }
         }
     }
