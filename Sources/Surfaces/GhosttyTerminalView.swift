@@ -3,6 +3,7 @@ import CoreModel
 import Darwin
 import DesignSystemKit
 import GhosttyKit
+import Persistence
 import QuartzCore
 
 private final class RemoteCodeGhosttyIOContext {
@@ -162,6 +163,42 @@ enum TerminalScrollbackSearch {
             return wrap ? 0 : count - 1
         }
         return candidate
+    }
+}
+
+/// Per-workspace font zoom persistence helper.
+///
+/// Zoom is tracked as an integer step delta where each step equals 1 pt
+/// (matching Ghostty's `increase_font_size:1` / `decrease_font_size:1`
+/// binding actions). Storing the delta — rather than an absolute pt size —
+/// avoids needing to know the user's configured base font size at restore
+/// time: the app simply replays the same number of zoom steps.
+///
+/// All members are `nonisolated` so this can be tested without @MainActor.
+enum FontZoomLevel {
+    /// Inclusive lower bound on stored steps (20-pt reduction is an extreme
+    /// floor; below this text becomes invisible on any sane base font size).
+    static let minSteps: Int = -20
+    /// Inclusive upper bound on stored steps (40-pt increase is generous;
+    /// above this the font grid no longer fits usable terminal content).
+    static let maxSteps: Int = 40
+
+    /// Clamp `steps` to the safe `[minSteps, maxSteps]` range.
+    nonisolated static func clamp(_ steps: Int) -> Int {
+        min(maxSteps, max(minSteps, steps))
+    }
+
+    /// Serialize a (pre-clamped) step delta to a KV-storable string.
+    nonisolated static func serialize(_ steps: Int) -> String {
+        String(clamp(steps))
+    }
+
+    /// Deserialize a KV string back to a clamped step delta.
+    /// Returns `nil` when the string is empty or non-numeric — the caller
+    /// should treat `nil` as \"no stored zoom\" (delta 0).
+    nonisolated static func deserialize(_ raw: String) -> Int? {
+        guard !raw.isEmpty, let parsed = Int(raw) else { return nil }
+        return clamp(parsed)
     }
 }
 
@@ -441,6 +478,13 @@ final class GhosttyTerminalView: NSView {
     /// Called on the main thread when the terminal program changes its title (OSC 2).
     var onTitleChange: ((String) -> Void)?
 
+    /// Injected by the owning TerminalSurface to persist font zoom per workspace.
+    /// When nil, zoom changes are session-only (not persisted).
+    var fontZoomStore: (any SettingsWriteRepository)?
+    /// KV key suffix that scopes zoom persistence to the workspace.
+    /// Set to the workspace UUID string before the surface is first shown.
+    var fontZoomWorkspaceID: String?
+
     private let surfaceSlot = GhosttySurfaceSlot()
     private let ioContext = RemoteCodeGhosttyIOContext()
     private var pendingOutput = Data()
@@ -449,6 +493,9 @@ final class GhosttyTerminalView: NSView {
     private var lastScale = NSSize(width: 0, height: 0)
     private var renderGeneration = 0
     private var visibleInUI = true
+    /// Accumulated font zoom step delta for this surface (1 step = 1 pt).
+    /// Persisted to and restored from the KV settings store keyed by workspace.
+    private var zoomDelta: Int = 0
     /// Latched true by closeSurface() so a queued AppKit pass (layout/backing/move)
     /// cannot resurrect a freed surface via ensureSurface() on a view that is being
     /// torn down — that would bind a fresh ghostty surface (renderer + IO threads)
@@ -914,6 +961,19 @@ final class GhosttyTerminalView: NSView {
             return
         }
         ghostty_surface_set_display_id(created, displayID)
+        // Restore persisted zoom before the first size update so the grid
+        // dimensions reported to the PTY already reflect the correct cell size.
+        // Guard: if zoomDelta is already non-zero (e.g. this surface was
+        // restarted via resetSurfaceOutput and the in-memory delta is still
+        // set), skip the store read to avoid a double-apply.
+        if zoomDelta == 0 {
+            restoreZoomDelta()
+        } else {
+            let bindingAction = zoomDelta > 0
+                ? "increase_font_size:\(zoomDelta)"
+                : "decrease_font_size:\(-zoomDelta)"
+            performBindingAction(bindingAction)
+        }
         updateGhosttySize(force: true)
         updateFocus()
         flushPendingOutput(to: created, render: isRenderable)
@@ -1216,10 +1276,55 @@ final class GhosttyTerminalView: NSView {
 
     // Cmd-+/Cmd--/Cmd-0 zoom: drive Ghostty's font-size action, then re-derive
     // and re-emit the grid size so the PTY winsize follows the new cell metrics
-    // (UX-008).
+    // (UX-008). The delta is also persisted so the zoom survives restart.
     private func changeFontSize(_ action: String) {
         performBindingAction(action)
         updateGhosttySize(force: true)
+        updateZoomDelta(for: action)
+    }
+
+    /// Update `zoomDelta` to reflect the zoom action and persist to the KV store.
+    private func updateZoomDelta(for action: String) {
+        if action.hasPrefix("increase_font_size:"),
+           let n = Int(action.dropFirst("increase_font_size:".count)) {
+            zoomDelta = FontZoomLevel.clamp(zoomDelta + n)
+        } else if action.hasPrefix("decrease_font_size:"),
+                  let n = Int(action.dropFirst("decrease_font_size:".count)) {
+            zoomDelta = FontZoomLevel.clamp(zoomDelta - n)
+        } else if action == "reset_font_size" {
+            zoomDelta = 0
+        }
+        persistZoomDelta()
+    }
+
+    private func persistZoomDelta() {
+        guard let store = fontZoomStore,
+              let wsID = fontZoomWorkspaceID else { return }
+        let key = "terminal.font_zoom.\(wsID)"
+        try? store.set(key, FontZoomLevel.serialize(zoomDelta))
+    }
+
+    private func restoreZoomDelta() {
+        guard let store = fontZoomStore,
+              let wsID = fontZoomWorkspaceID else { return }
+        let key = "terminal.font_zoom.\(wsID)"
+        // `try? store.get(key)` produces `String??`; flatten with nil-coalescing.
+        let rawOptional: String?? = try? store.get(key)
+        guard let raw = rawOptional ?? nil,
+              let stored = FontZoomLevel.deserialize(raw),
+              stored != 0 else { return }
+        zoomDelta = stored
+        // Replay the stored delta as binding actions so Ghostty's internal
+        // font-size state matches; do NOT call changeFontSize which would
+        // re-persist and call updateGhosttySize prematurely (ensureSurface
+        // already calls updateGhosttySize after this).
+        let bindingAction: String
+        if stored > 0 {
+            bindingAction = "increase_font_size:\(stored)"
+        } else {
+            bindingAction = "decrease_font_size:\(-stored)"
+        }
+        performBindingAction(bindingAction)
     }
 
     // MARK: - Find in scrollback (Cmd+F)
