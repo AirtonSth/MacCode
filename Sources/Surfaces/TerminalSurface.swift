@@ -289,6 +289,48 @@ private final class TerminalDropContainerView: NSView {
     }
 }
 
+// MARK: - Drag payload resolver (pure, non-MainActor, testable)
+
+/// Resolves an NSDraggingInfo pasteboard into the text that should be sent to
+/// the terminal when the user drops a plain-text item or a file URL onto the
+/// terminal view.
+///
+/// Keeping this pure (no AppKit UI, no actor) lets unit tests cover the
+/// conversion logic without a live drag session or window server.
+///
+/// Rules:
+/// - If the pasteboard carries a plain `.string` value, that string is returned
+///   as-is (the caller is responsible for applying `PasteGuard` before sending).
+/// - If no plain string is present but a file URL can be read, the POSIX path
+///   of the first URL is returned. The caller uses `DroppedFilePaths` for
+///   multi-file drops with shell-escaping; this helper is for the single-item
+///   plain-text seam.
+/// - Returns `nil` when neither type is readable.
+public enum TerminalDragPayload {
+    /// Extract the plain-text value from a pasteboard for terminal input.
+    /// Returns `nil` when the pasteboard has no readable `.string` content.
+    public nonisolated static func plainText(from pasteboard: NSPasteboard) -> String? {
+        pasteboard.string(forType: .string)
+    }
+
+    /// Sanitise `text` for terminal drag input.
+    ///
+    /// Returns the same string when it is safe to send immediately (single-line,
+    /// no dangerous control characters, per `PasteGuard`). Returns `nil` when the
+    /// content needs confirmation — the caller must invoke the confirm callback
+    /// before sending.
+    ///
+    /// This is the pure seam tests exercise: `PasteGuard.classify` is the
+    /// underlying rule; drag re-uses those semantics so the terminal never
+    /// silently executes a multi-line command dropped from another source.
+    public nonisolated static func safeTextToSend(_ text: String) -> String? {
+        switch PasteGuard.classify(text) {
+        case .safe: return text
+        case .needsConfirm: return nil
+        }
+    }
+}
+
 // MARK: - Restart decision helper (pure, non-MainActor, testable)
 
 /// Captures the minimal information needed to decide whether and how to

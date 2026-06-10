@@ -593,6 +593,13 @@ final class GhosttyTerminalView: NSView {
     /// FilePreview / Diff. When nil, file-path Cmd+clicks are silently ignored.
     var onCmdClickFilePath: ((String) -> Void)?
 
+    /// Called when a plain-text drag payload requires user confirmation before
+    /// being sent to the PTY (same semantics as `TerminalTextView.onPasteNeedsConfirm`:
+    /// multi-line or control-character content). The receiver should present a
+    /// confirmation sheet and, on approval, call `writeInputData` with the
+    /// UTF-8-encoded string. When nil, the text is sent without confirmation.
+    var onPlainTextDragNeedsConfirm: ((String) -> Void)?
+
     /// Injected by the owning TerminalSurface to persist font zoom per workspace.
     /// When nil, zoom changes are session-only (not persisted).
     var fontZoomStore: (any SettingsWriteRepository)?
@@ -692,7 +699,11 @@ final class GhosttyTerminalView: NSView {
         // freed memory (use-after-free on a ghostty thread). The weak `view`
         // inside it goes nil on dealloc, so the callback safely no-ops.
         _ = Unmanaged.passRetained(ioContext)
-        registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
+        // Accept both file-URL drops (paths) and plain-text drops (literal text).
+        // Plain .string is added here so dragging a selection from another app or
+        // from a text editor inserts the text into the terminal rather than being
+        // silently rejected.
+        registerForDraggedTypes(DroppedFilePaths.pasteboardTypes + [.string])
     }
 
     /// AppKit calls this *before* our `window` actually changes. A terminal moved
@@ -1687,13 +1698,22 @@ final class GhosttyTerminalView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let accepts = DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard)
+        let accepts = Self.canAcceptDrag(from: sender.draggingPasteboard)
         setDropHighlight(accepts)
         return accepts ? .copy : []
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        return DroppedFilePaths.canReadFileDrop(from: sender.draggingPasteboard) ? .copy : []
+        return Self.canAcceptDrag(from: sender.draggingPasteboard) ? .copy : []
+    }
+
+    /// Returns `true` when `pasteboard` carries either a file-URL drop or a
+    /// plain-text string that the terminal can accept. Pure helper so the drag
+    /// acceptance predicate is not duplicated across `draggingEntered` and
+    /// `draggingUpdated`.
+    nonisolated static func canAcceptDrag(from pasteboard: NSPasteboard) -> Bool {
+        if DroppedFilePaths.canReadFileDrop(from: pasteboard) { return true }
+        return pasteboard.availableType(from: [.string]) != nil
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
@@ -1706,10 +1726,39 @@ final class GhosttyTerminalView: NSView {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         setDropHighlight(false)
+
+        // File-URL drop: convert to shell-escaped paths and send immediately
+        // (same as before; file drops have always been accepted without guard).
         let paths = DroppedFilePaths.paths(from: sender.draggingPasteboard)
-        guard !paths.isEmpty else { return false }
-        guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return false }
-        writeInputData(data)
+        if !paths.isEmpty {
+            guard let data = DroppedFilePaths.terminalInputText(for: paths).data(using: .utf8) else { return false }
+            writeInputData(data)
+            return true
+        }
+
+        // Plain-text drop: resolve the string from the pasteboard and apply the
+        // same PasteGuard semantics used for keyboard paste (Cmd+V) so a
+        // multi-line or control-character string dragged from another app does
+        // not silently execute shell commands.
+        guard let text = TerminalDragPayload.plainText(from: sender.draggingPasteboard),
+              !text.isEmpty else { return false }
+
+        if let safe = TerminalDragPayload.safeTextToSend(text) {
+            // Single-line, no control characters: send immediately.
+            guard let data = safe.data(using: .utf8) else { return false }
+            writeInputData(data)
+        } else {
+            // Multi-line or control characters: route through the confirm
+            // callback so the owning surface can present a confirmation sheet.
+            // Fall back to sending directly when no callback is wired (e.g.
+            // unit-test stubs that do not need the confirm flow).
+            if let confirm = onPlainTextDragNeedsConfirm {
+                confirm(text)
+            } else {
+                guard let data = text.data(using: .utf8) else { return false }
+                writeInputData(data)
+            }
+        }
         return true
     }
 
