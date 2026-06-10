@@ -254,6 +254,65 @@ enum FontZoomLevel {
     }
 }
 
+/// Pure helper that formats a human-readable scrollback position label.
+///
+/// Rules (matches common terminal conventions):
+/// - `offset == 0` (at bottom, no lines above viewport): returns "Bottom"
+/// - `offset >= total` (at top, cannot scroll further): returns "Top"
+/// - Otherwise: "\(offset) lines from bottom" or, when total > 0, the percent
+///   distance from the bottom expressed as 0-100%.
+///
+/// `offset` = lines scrolled above the bottom (0 = bottom).
+/// `total`  = total scrollback line count (> 0 for a meaningful percent).
+/// Both must be >= 0; negative inputs are treated as 0.
+enum ScrollbackPositionLabel {
+    /// Returns a display string for the current scrollback position.
+    /// Pure: nonisolated, no AppKit.
+    nonisolated static func label(offset: Int, total: Int) -> String {
+        let safeOffset = max(0, offset)
+        let safeTotal  = max(0, total)
+        if safeOffset == 0 { return "Bottom" }
+        if safeTotal > 0, safeOffset >= safeTotal { return "Top" }
+        if safeTotal > 0 {
+            let pct = Int(Double(safeOffset) / Double(safeTotal) * 100.0)
+            let clamped = min(100, max(1, pct))
+            return "\(clamped)% from bottom"
+        }
+        return "\(safeOffset) lines from bottom"
+    }
+}
+
+/// Maps a keyboard event (keyCode + modifiers) to the Ghostty binding-action
+/// string for scrollback navigation, or nil if the event is not a scroll shortcut.
+///
+/// Handled bindings:
+///   Shift+Page Up   -> "scroll_page_up"
+///   Shift+Page Down -> "scroll_page_down"
+///   Cmd+Home        -> "scroll_to_top"
+///   Cmd+End         -> "scroll_to_bottom"
+///
+/// Pure: nonisolated static, no AppKit import dependency beyond NSEvent types.
+/// Tested without a live surface or window server.
+enum ScrollbackKeyAction {
+    // macOS virtual key codes for navigation keys (hardware-independent).
+    private static let keyCodePageUp:   UInt16 = 116
+    private static let keyCodePageDown: UInt16 = 121
+    private static let keyCodeHome:     UInt16 = 115
+    private static let keyCodeEnd:      UInt16 = 119
+
+    /// Returns the Ghostty binding-action string, or nil if not a scroll shortcut.
+    nonisolated static func action(for keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> String? {
+        let device = modifiers.intersection(.deviceIndependentFlagsMask)
+        switch keyCode {
+        case keyCodePageUp   where device == .shift:  return "scroll_page_up"
+        case keyCodePageDown where device == .shift:  return "scroll_page_down"
+        case keyCodeHome     where device == .command: return "scroll_to_top"
+        case keyCodeEnd      where device == .command: return "scroll_to_bottom"
+        default: return nil
+        }
+    }
+}
+
 enum GhosttyTerminalKeyInput {
     static func text(for event: NSEvent) -> String? {
         guard let text = event.characters, !text.isEmpty else { return nil }
@@ -579,6 +638,10 @@ final class GhosttyTerminalView: NSView {
     private var findMatchCount = 0
     private var findCurrentMatch: Int?
 
+    /// Scrollback position indicator overlay (bottom-right corner). Lazily created
+    /// on first `updateScrollbackPosition` call. Hidden when at the bottom.
+    private var scrollbackIndicator: NSTextField?
+
     private static let immediateOutputFlushBytes = 64 * 1024
     private static let maxPendingOutputBytes = 1024 * 1024
     private static let outputFlushDelay: TimeInterval = 0.02
@@ -703,6 +766,7 @@ final class GhosttyTerminalView: NSView {
     override func layout() {
         super.layout()
         updateGhosttySize(force: false)
+        repositionScrollbackIndicator()
     }
 
     // Without a .mouseMoved tracking area, AppKit never delivers mouseMoved:, so
@@ -1191,6 +1255,13 @@ final class GhosttyTerminalView: NSView {
             closeFindBar()
             return
         }
+        // Scrollback keyboard navigation: Shift+PgUp/PgDn, Cmd+Home/End.
+        // Intercepted before the Ghostty key path so these bindings work
+        // regardless of whether the running program handles PgUp/PgDn.
+        if let scrollAction = ScrollbackKeyAction.action(for: event.keyCode, modifiers: event.modifierFlags) {
+            performBindingAction(scrollAction)
+            return
+        }
         if TerminalKeyboardInput.shouldUseTextInput(for: event) {
             // Route printable input through AppKit's text-input system so the
             // active keyboard layout owns composition. Dead keys (´ ` ^ ~ ¨ on
@@ -1327,6 +1398,55 @@ final class GhosttyTerminalView: NSView {
 
     @objc private func contextClear(_ sender: Any?) {
         performBindingAction("clear_screen")
+    }
+
+    // MARK: - Scrollback position indicator
+
+    /// Update the scrollback position indicator. Call whenever the scroll
+    /// position changes (driven by the owning TerminalSurface).
+    /// `offset` = lines scrolled above the bottom (0 = at bottom).
+    /// `total`  = total scrollback line count available.
+    func updateScrollbackPosition(offset: Int, total: Int) {
+        let text = ScrollbackPositionLabel.label(offset: offset, total: total)
+        let atBottom = offset <= 0
+        if atBottom {
+            scrollbackIndicator?.isHidden = true
+            return
+        }
+        let label = scrollbackIndicator ?? makeScrollbackIndicator()
+        scrollbackIndicator = label
+        label.stringValue = text
+        label.isHidden = false
+        label.sizeToFit()
+        repositionScrollbackIndicator()
+    }
+
+    private func makeScrollbackIndicator() -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        label.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        label.textColor = DS.NS.textSecondary
+        label.backgroundColor = DS.NS.surface.withAlphaComponent(0.85)
+        label.drawsBackground = true
+        label.isBordered = false
+        label.wantsLayer = true
+        label.layer?.cornerRadius = 4
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setAccessibilityIdentifier("terminal.scrollback-indicator")
+        label.setAccessibilityLabel("Scrollback position")
+        addSubview(label)
+        return label
+    }
+
+    private func repositionScrollbackIndicator() {
+        guard let label = scrollbackIndicator else { return }
+        let size = label.fittingSize
+        let margin: CGFloat = 8
+        label.frame = NSRect(
+            x: bounds.maxX - size.width - margin,
+            y: margin,
+            width: size.width + 8,
+            height: size.height + 2
+        )
     }
 
     private func performBindingAction(_ action: String) {
