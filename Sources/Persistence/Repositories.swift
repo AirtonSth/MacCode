@@ -337,17 +337,17 @@ public final class AgentMessageRepository {
             SELECT id, thread_id, role, content, created_at
             FROM agent_messages
             WHERE thread_id = ? AND (created_at > ? OR (created_at = ? AND id > ?))
-            ORDER BY created_at ASC, id ASC
+            ORDER BY created_at ASC, rowid ASC
             LIMIT ?;
             """
         } else if beforeCursor == nil {
-            sql = "SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?;"
+            sql = "SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?;"
         } else {
             sql = """
             SELECT id, thread_id, role, content, created_at
             FROM agent_messages
             WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
-            ORDER BY created_at DESC, id DESC
+            ORDER BY created_at DESC, rowid DESC
             LIMIT ?;
             """
         }
