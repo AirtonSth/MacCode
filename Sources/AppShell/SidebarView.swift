@@ -451,14 +451,19 @@ public final class SidebarViewModel: ObservableObject {
 
     private func extendWorkspaceSelection(to id: WorkspaceID) {
         let anchor = selectionAnchorID ?? selectedWorkspaceID ?? id
-        guard let start = workspaces.firstIndex(where: { $0.id == anchor }),
-              let end = workspaces.firstIndex(where: { $0.id == id }) else {
+        // UX-SIDEBAR-P1-SHIFTRANGE: use filteredWorkspaces so a range selection
+        // when a filter is active never includes workspaces the user cannot see.
+        // Using the full `workspaces` array would produce a range spanning hidden
+        // rows, causing "Remove" to silently delete workspaces outside the filter.
+        let visible = filteredWorkspaces
+        guard let start = visible.firstIndex(where: { $0.id == anchor }),
+              let end = visible.firstIndex(where: { $0.id == id }) else {
             selectedWorkspaceIDs.insert(id)
             selectionAnchorID = id
             return
         }
         let range = start <= end ? start...end : end...start
-        selectedWorkspaceIDs = Set(range.map { workspaces[$0].id })
+        selectedWorkspaceIDs = Set(range.map { visible[$0].id })
     }
 
     /// IMP-MAC_SHELL_WINDOW-009: the workspace rows to render, narrowed by
@@ -737,6 +742,30 @@ public final class SidebarViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: Row accessibility value
+
+    /// Pure helper: builds the VoiceOver value string for a workspace row from
+    /// pre-computed state flags.  Returns an empty string for an idle, normal row.
+    ///
+    /// - Parameters:
+    ///   - busyDescription: output of `busyTooltip(...)`, or nil when idle.
+    ///   - unreadCount: `ws.notificationsUnread`
+    ///   - pinned: whether `ws.metadata["pinned"] == "true"`
+    ///   - checked: whether the row is in `selectedWorkspaceIDs`
+    nonisolated public static func workspaceRowAccessibilityValue(
+        busyDescription: String?,
+        unreadCount: Int,
+        pinned: Bool,
+        checked: Bool
+    ) -> String {
+        var parts: [String] = []
+        if let desc = busyDescription { parts.append(desc) }
+        if unreadCount > 0 { parts.append("\(unreadCount) unread") }
+        if pinned { parts.append("pinned") }
+        if checked { parts.append("selected") }
+        return parts.joined(separator: ", ")
     }
 
     // MARK: Busy tooltip
@@ -2233,7 +2262,9 @@ public struct SidebarRootView: View {
             .frame(width: 32, height: 18)
         }
         .buttonStyle(.plain)
-        .frame(width: 36, height: 24)
+        // UX-SIDEBAR-P3-INSOMNIAHIT: 36x36 matches the adjacent options
+        // chevron hit area; the previous 36x24 was inconsistent.
+        .frame(width: 36, height: 36)
         .contentShape(Rectangle())
         .help(insomniaHelpText)
         .accessibilityLabel("Insomnia")
@@ -2425,6 +2456,25 @@ public struct SidebarRootView: View {
         return prefix.isEmpty ? "RC" : String(prefix).uppercased()
     }
 
+    // MARK: Row accessibility helpers
+
+    /// Builds the VoiceOver value string for a workspace row by forwarding to
+    /// the pure `SidebarViewModel.workspaceRowAccessibilityValue(...)` helper.
+    private func workspaceRowAccessibilityValue(
+        ws: Workspace,
+        busy: Bool,
+        checked: Bool,
+        pinned: Bool
+    ) -> String {
+        let busyDesc = busy ? vm.busyTooltip(for: ws) : nil
+        return SidebarViewModel.workspaceRowAccessibilityValue(
+            busyDescription: busyDesc,
+            unreadCount: ws.notificationsUnread,
+            pinned: pinned,
+            checked: checked
+        )
+    }
+
     // MARK: Row highlight helpers
 
     private func rowHighlightColor(for tone: SidebarHighlightTone) -> Color {
@@ -2491,11 +2541,16 @@ public struct SidebarRootView: View {
                 }
                 Spacer(minLength: 0)
                 if busy {
+                    let busyLabel = vm.busyTooltip(for: ws) ?? "Workspace busy"
                     ProgressView()
                         .controlSize(.small)
                         .scaleEffect(0.7)
                         .frame(width: 16, height: 16)
-                        .accessibilityLabel("Workspace busy")
+                        // UX-SIDEBAR-P3-BUSYTIP: use the per-workspace busy
+                        // source description instead of the generic label so
+                        // VoiceOver and tooltip convey agent-run vs terminal.
+                        .help(busyLabel)
+                        .accessibilityLabel(busyLabel)
                 }
                 if ws.notificationsUnread > 0 {
                     DSPill("\(ws.notificationsUnread)", tone: .accent)
@@ -2532,6 +2587,11 @@ public struct SidebarRootView: View {
         }
         .buttonStyle(.plain)
         .help(ws.cwd.isEmpty ? ws.name : ws.cwd)
+        // UX-SIDEBAR-P3-A11Y: expose a combined label so VoiceOver reads
+        // name + status in one focused element rather than a string of
+        // context-free sub-elements (number pill, icon-only pin state, etc).
+        .accessibilityLabel(ws.name)
+        .accessibilityValue(workspaceRowAccessibilityValue(ws: ws, busy: busy, checked: checked, pinned: pinned))
         .accessibilityIdentifier("sidebar.workspaceRow.\(ws.id.value.uuidString)")
         .onDrag {
             vm.draggingWorkspaceID = ws.id
