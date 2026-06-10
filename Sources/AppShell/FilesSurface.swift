@@ -343,6 +343,24 @@ func validateMove(src: String, dstDir: String, workspaceRoot: String) -> Bool {
     return true
 }
 
+// MARK: - Pure edit-session close-on-switch helper (no AppKit, no MainActor; tested in FilesEditSessionCloseTests)
+
+/// Decide whether the previous edit session should be closed when switching to a different file.
+///
+/// Returns `true` (close the prior session) when ALL of:
+///  - `prevPath` is non-nil (there was a prior file open)
+///  - `prevPath != newPath` (user switched to a different file)
+///  - `prevIsDirty == false` (clean sessions have no unsaved work; close them to bound host-side
+///    session count. Dirty sessions are kept open so the snapshotted sessionID remains valid for
+///    a future restore, preserving unsaved edits across file switches.)
+///
+/// This is the sole decision point for the session-close-on-switch policy so it can be
+/// exercised without constructing FilesViewModel or touching AppKit.
+nonisolated func shouldClosePriorEditSession(prevPath: String?, prevIsDirty: Bool, newPath: String) -> Bool {
+    guard let prevPath, prevPath != newPath else { return false }
+    return !prevIsDirty
+}
+
 // MARK: - Pure recycle-URL helper (no AppKit, no MainActor; tested in FilesRecycleTests)
 
 /// Build the URL array for NSWorkspace.recycle from absolute file-system paths.
@@ -696,6 +714,14 @@ private final class FilesViewModel: ObservableObject {
 
     func loadFile(_ entry: FileEntry) {
         snapshotCurrentSession()
+        // Close the previous clean session now that it has been snapshotted (or there was nothing
+        // to snapshot). Dirty sessions stay open so the snapshotted sessionID remains valid for a
+        // later restore. This bounds the number of live host edit sessions to (dirty open files + 1).
+        if shouldClosePriorEditSession(prevPath: sessionPath, prevIsDirty: isDirty, newPath: entry.relativePath),
+           let prevSessionID = sessionID {
+            _ = try? router?.filesEditClose(sessionID: prevSessionID)
+            sessionID = nil
+        }
         do {
             _ = try router?.filesStateUpdate(surface: surfaceID, patch: [
                 "selected_path": .string(entry.relativePath),
