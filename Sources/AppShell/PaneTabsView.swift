@@ -239,7 +239,7 @@ public final class PaneTabsView: NSObject {
     /// inserted button is wired identically to an initially-built one.
     private func makeTabButton(for desc: SurfaceDescriptor, in pane: PaneNode, selectedID: SurfaceID?) -> PaneTabButton {
         let sid = desc.id
-        return PaneTabButton(
+        let btn = PaneTabButton(
             surfaceID: sid,
             title: desc.title,
             symbol: Self.symbol(for: desc.type),
@@ -252,7 +252,7 @@ public final class PaneTabsView: NSObject {
             onCloseOthers: pane.surfaces.count > 1 ? { [weak self] in _ = self?.performCloseAllOthers(around: sid) } : nil,
             onCloseToLeft: Self.surfaceIDs(in: pane, before: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToLeft(of: sid) },
             onCloseToRight: Self.surfaceIDs(in: pane, after: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToRight(of: sid) },
-            onRename: { [weak self] in self?.promptRenameSurface(sid, current: desc.title) },
+            onRename: { [weak self] in self?.beginInlineRename(sid, current: desc.title) },
             onSetColor: { [weak self] raw in
                 guard let wid = self?.currentWorkspaceID() else { return }
                 try? self?.router?.setSurfaceColor(wid, sid, raw)
@@ -264,6 +264,8 @@ public final class PaneTabsView: NSObject {
                 self?.performSplitSurface(draggedID, targetPane: targetPane, direction: direction) ?? false
             }
         )
+        btn.toolTip = Self.tabTooltipString(title: desc.title, type: desc.type)
+        return btn
     }
 
     /// PERF (P1): in-place tab-strip reconcile keyed by SurfaceID. Drives
@@ -366,18 +368,16 @@ public final class PaneTabsView: NSObject {
         try? router?.focusSurface(workspace: wid, surface: id)
     }
 
-    private func promptRenameSurface(_ id: SurfaceID, current: String) {
-        guard let wid = currentWorkspaceID() else { return }
-        let alert = NSAlert()
-        alert.messageText = "Rename tab"
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
-        field.stringValue = current
-        alert.accessoryView = field
-        if alert.runModal() == .alertFirstButtonReturn {
-            let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !v.isEmpty { try? router?.renameSurface(wid, id, v) }
+    /// Starts an inline rename editor on the tab button for `id`.
+    /// When the user commits, routes the new name through the router.
+    /// Falls back to no-op if the tab button is not found (structural delta in flight).
+    private func beginInlineRename(_ id: SurfaceID, current: String) {
+        guard let wid = currentWorkspaceID(), let tab = tabButtons[id] else { return }
+        tab.beginInlineRename { [weak self] newName in
+            guard let self else { return }
+            let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            try? self.router?.renameSurface(wid, id, trimmed)
         }
     }
 
@@ -682,6 +682,32 @@ public final class PaneTabsView: NSObject {
     /// midpoints strictly left of the drop point.
     public static func dropInsertionIndex(tabMidXs: [CGFloat], dropX: CGFloat) -> Int {
         tabMidXs.filter { dropX > $0 }.count
+    }
+
+    /// Pure half-tab drop placement. Returns the insertion index for a
+    /// surface dropped onto the tab at `index`: left half -> `index`
+    /// (insert before), right half -> `index + 1` (insert after).
+    /// Pure: only CGRect geometry and arithmetic -- no AppKit, no MainActor.
+    nonisolated public static func halfTabDropIndex(pointerX: CGFloat, tabFrame: NSRect, index: Int) -> Int {
+        pointerX < tabFrame.midX ? index : index + 1
+    }
+
+    /// Pure tooltip string for a tab button. Format: "<title> -- <type label>".
+    /// Pure: only string operations -- no AppKit, no MainActor.
+    nonisolated public static func tabTooltipString(title: String, type: SurfaceType) -> String {
+        let label: String
+        switch type {
+        case .terminal: label = "Terminal"
+        case .ssh: label = "SSH"
+        case .browser: label = "Browser"
+        case .agentApp: label = "Agent App"
+        case .files: label = "Files"
+        case .markdown: label = "Markdown"
+        case .filePreview: label = "File Preview"
+        case .rightSidebarTool: label = "Git"
+        @unknown default: label = type.rawValue
+        }
+        return "\(title) -- \(label)"
     }
 
     /// PERF: in-place tab-strip reconcile. Pure diff between the old and
@@ -1234,6 +1260,9 @@ final class PaneTabButton: NSView {
             } else {
                 onClose()
             }
+        } else if event.clickCount == 2 {
+            // UX-P3: double-click opens inline rename editor.
+            onRename?()
         } else {
             onSelect()
         }
@@ -1392,6 +1421,30 @@ final class PaneTabButton: NSView {
     func performSelectFromTitlebarClick() { onSelect() }
 
     @objc private func closeClicked() { onClose() }
+
+    /// Starts an inline rename editor overlaid on the tab label.
+    /// Calls `commit` with the trimmed new name when the user confirms
+    /// (Return / Tab); cancels silently on Escape or focus-loss with empty input.
+    func beginInlineRename(_ commit: @escaping (String) -> Void) {
+        // Guard: don't stack editors.
+        guard !subviews.contains(where: { $0 is InlineRenameField }) else { return }
+        let field = InlineRenameField(frame: label.frame)
+        field.stringValue = title
+        field.onCommit = { [weak self, weak field] in
+            guard let self, let field else { return }
+            let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            field.removeFromSuperview()
+            if !value.isEmpty { commit(value) }
+        }
+        field.onCancel = { [weak field] in field?.removeFromSuperview() }
+        addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            field.trailingAnchor.constraint(equalTo: label.trailingAnchor),
+            field.centerYAnchor.constraint(equalTo: label.centerYAnchor)
+        ])
+        window?.makeFirstResponder(field)
+    }
 
     func setDirty(_ dirty: Bool) {
         self.dirty = dirty
@@ -1693,4 +1746,48 @@ final class HorizontalTabScrollView: NoDragScroll {
 
 final class NoDragButton: NSButton {
     override var mouseDownCanMoveWindow: Bool { false }
+}
+
+// MARK: - Inline rename text field
+
+/// Lightweight NSTextField subclass used for double-click tab rename.
+/// Commits on Return or Tab; cancels on Escape or when it loses focus
+/// with the stringValue still equal to the original value.
+@MainActor
+final class InlineRenameField: NSTextField {
+    var onCommit: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        textColor = DS.NS.text
+        backgroundColor = DS.NS.bg
+        isBordered = true
+        isBezeled = true
+        bezelStyle = .roundedBezel
+        usesSingleLineMode = true
+        lineBreakMode = .byTruncatingTail
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 36, 48: // Return (36), Tab (48)
+            onCommit?()
+        case 53: // Escape
+            onCancel?()
+        default:
+            super.keyDown(with: event)
+        }
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let result = super.resignFirstResponder()
+        if result { onCommit?() }
+        return result
+    }
 }
