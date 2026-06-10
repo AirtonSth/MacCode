@@ -499,6 +499,20 @@ public final class SidebarViewModel: ObservableObject {
         }?.id
     }
 
+    /// P2-SIDEBAR-SEPARATOR: Returns the index at which a pinned/unpinned
+    /// divider should be inserted in `rows`, or `nil` when no divider is
+    /// needed (empty list, all rows pinned, or no rows pinned).
+    ///
+    /// The index equals the count of leading pinned rows, i.e. the position
+    /// of the first unpinned row.  Only rows whose metadata["pinned"] == "true"
+    /// are considered pinned.
+    nonisolated public static func pinnedSeparatorIndex(in rows: [Workspace]) -> Int? {
+        guard !rows.isEmpty else { return nil }
+        let count = rows.prefix(while: { $0.metadata["pinned"] == "true" }).count
+        guard count > 0, count < rows.count else { return nil }
+        return count
+    }
+
     @discardableResult
     public func createWorkspaces(fromFolders urls: [URL]) -> Bool {
         urls.reduce(false) { created, url in
@@ -959,7 +973,11 @@ public struct SidebarRootView: View {
                             .padding(.horizontal, DS.Space.md)
                             .padding(.vertical, DS.Space.sm)
                     } else {
-                        ForEach(rows, id: \.id) { ws in
+                        let separatorIdx = SidebarViewModel.pinnedSeparatorIndex(in: rows)
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, ws in
+                            if index == separatorIdx {
+                                pinnedGroupDivider
+                            }
                             workspaceRow(ws)
                         }
                     }
@@ -1806,6 +1824,24 @@ public struct SidebarRootView: View {
             )
             return path
         }
+    }
+
+    /// P2-SIDEBAR-SEPARATOR: thin rule + "Pinned" caption rendered between
+    /// the pinned and unpinned groups.
+    private var pinnedGroupDivider: some View {
+        HStack(spacing: DS.Space.sm) {
+            Rectangle()
+                .fill(DS.Palette.line.opacity(0.5))
+                .frame(height: DS.Border.hairline)
+            Text("Pinned")
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize()
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.top, DS.Space.xxs)
+        .padding(.bottom, DS.Space.xxs)
+        .accessibilityHidden(true)
     }
 
     private var insomniaHelpText: String {
