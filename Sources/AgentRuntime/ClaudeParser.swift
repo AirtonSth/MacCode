@@ -34,20 +34,35 @@ public final class ClaudeParser {
         guard let type = obj["type"] as? String else { return [] }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
 
-        var out: [AssistantEvent] = []
-
         // Every line (incl. the cmux shim's hook_started/hook_response
         // lines that arrive BEFORE init) carries session_id — capture it
         // so the resume id is never lost.
         if let sid = obj["session_id"] as? String, !sid.isEmpty { sessionId = sid }
 
         if type == "stream_event", var event = obj["event"] as? [String: Any] {
+            // Inject session_id if the nested event omits it, then dispatch
+            // directly on the already-decoded dict — avoids the re-serialize +
+            // re-parse round trip that was costing 1-2 extra JSON parses per line.
             if event["session_id"] == nil, let sid = obj["session_id"] {
                 event["session_id"] = sid
             }
-            guard let nestedLine = jsonString(event) else { return [] }
-            return parseLine(nestedLine)
+            guard let eventType = event["type"] as? String else { return [] }
+            return parseDecodedObject(event, type: eventType, now: now)
         }
+
+        return parseDecodedObject(obj, type: type, now: now)
+    }
+
+    /// Core dispatch on an already-decoded JSON object.  Called both from
+    /// `parseLine` (after the initial `JSONSerialization` decode) and from the
+    /// `stream_event` fast-path (with the nested `event` dict that was already
+    /// decoded as part of the outer object).  This eliminates the previous
+    /// re-serialize + recursive-parseLine round trip for `stream_event` lines.
+    private func parseDecodedObject(_ obj: [String: Any], type: String, now: Int64) -> [AssistantEvent] {
+        var out: [AssistantEvent] = []
+
+        // Capture session_id from inner events too (stream_event path).
+        if let sid = obj["session_id"] as? String, !sid.isEmpty { sessionId = sid }
 
         if type == "system" {
             // Emit threadStarted only on init (the shim's hook_* lines must
