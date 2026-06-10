@@ -205,37 +205,71 @@ final class AgentCancelFlag: @unchecked Sendable {
     }
 }
 
+struct ProcessTerminationStep: Equatable {
+    let pid: Int32
+    let signal: Int32
+}
+
 enum ProcessTerminator {
+    // Grace window between SIGTERM and SIGKILL escalation.
+    static let graceInterval: TimeInterval = 2.0
+
     static func terminateTree(_ process: Process) {
         let root = process.processIdentifier
-        for pid in childPIDs(of: root).reversed() {
-            kill(pid, SIGTERM)
+        // Enumerate the tree once (children first so leaves die before parents),
+        // including the root, then signal each node.
+        let pids = processTreePIDs(root: root)
+
+        for step in terminationPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
+            kill(step.pid, step.signal)
         }
-        if process.isRunning {
-            process.terminate()
+
+        // Cancel must always win: give SIGTERM a brief grace period, then
+        // escalate any survivors to SIGKILL.
+        Thread.sleep(forTimeInterval: graceInterval)
+
+        let escalation = terminationPlan(pids: pids, isAlive: Self.isAlive(_:), graceElapsed: true)
+        for step in escalation {
+            kill(step.pid, step.signal)
         }
     }
 
-    private static func childPIDs(of pid: Int32) -> [Int32] {
-        let direct = directChildPIDs(of: pid)
-        return direct + direct.flatMap(childPIDs(of:))
+    // Pure helper: builds the signal plan for a set of pids.
+    // graceElapsed == false  -> phase 1: SIGTERM every pid.
+    // graceElapsed == true   -> phase 2: SIGKILL only pids still alive (skip dead).
+    static func terminationPlan(
+        pids: [Int32],
+        isAlive: (Int32) -> Bool,
+        graceElapsed: Bool
+    ) -> [ProcessTerminationStep] {
+        if !graceElapsed {
+            return pids.map { ProcessTerminationStep(pid: $0, signal: SIGTERM) }
+        }
+        return pids
+            .filter { isAlive($0) }
+            .map { ProcessTerminationStep(pid: $0, signal: SIGKILL) }
+    }
+
+    // Liveness probe via signal 0 (no signal sent, only error checking).
+    static func isAlive(_ pid: Int32) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        // EPERM means the process exists but we lack permission; still alive.
+        return errno == EPERM
+    }
+
+    // Returns the full process subtree rooted at `root` (children-first, root last)
+    // using libproc, enumerating once instead of recursive pgrep subprocesses.
+    private static func processTreePIDs(root: Int32) -> [Int32] {
+        directChildPIDs(of: root).flatMap(processTreePIDs(root:)) + [root]
     }
 
     private static func directChildPIDs(of pid: Int32) -> [Int32] {
-        let p = Process()
-        let out = Pipe()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-P", "\(pid)"]
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        do {
-            try p.run()
-            p.waitUntilExit()
-        } catch {
-            return []
-        }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        let text = String(data: data, encoding: .utf8) ?? ""
-        return text.split(whereSeparator: \.isNewline).compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        let size = proc_listchildpids(pid, nil, 0)
+        guard size > 0 else { return [] }
+        var buffer = [pid_t](repeating: 0, count: Int(size))
+        let written = proc_listchildpids(pid, &buffer, size * Int32(MemoryLayout<pid_t>.size))
+        guard written > 0 else { return [] }
+        let count = min(Int(written), buffer.count)
+        return buffer.prefix(count).filter { $0 > 0 }
     }
 }
