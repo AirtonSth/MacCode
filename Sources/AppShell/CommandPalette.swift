@@ -2,9 +2,18 @@ import Foundation
 import AppKit
 import Combine
 import CoreModel
+import Persistence
 import Surfaces
 import AgentRuntime
 import DesignSystemKit
+
+// P2: thin wrapper so SettingsRepository (Persistence) satisfies
+// PaletteFrecencyRepository (AppShell) without a retroactive conformance.
+private struct SettingsRepoFrecencyAdapter: PaletteFrecencyRepository {
+    let inner: SettingsRepository
+    func get(_ key: String) throws -> String? { try inner.get(key) }
+    func set(_ key: String, _ value: String) throws { try inner.set(key, value) }
+}
 
 /// UX-003: lightweight grouping used for section headers in the default view.
 /// `rawValue` is the visible header label; `order` fixes section sequence.
@@ -73,6 +82,12 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// float the last few used commands to the top of the empty-query view.
     private var recentCommandIDs: [String] = []
     private let recentLimit = 3
+
+    /// P2: frecency store — persists use count + last-used timestamp per command
+    /// ID so the default-view ranking improves over time ("New Terminal" beats
+    /// "New Browser" after the user has run it more).  Nil when no router/repo
+    /// is available (safe: frecency is best-effort, degrades to insertion order).
+    private var frecencyStore: PaletteFrecencyStore?
 
     /// QA-002: inspection seam — the ordered IDs currently visible (after
     /// filtering / sectioning) so unit tests can assert caps, ordering, and
@@ -295,6 +310,16 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         nonRunnableRowIDs.insert(id)
     }
 
+    /// P2: lazily build the frecency store on first need so the init path
+    /// doesn't depend on router.context being non-nil yet.
+    private func resolvedFrecencyStore() -> PaletteFrecencyStore? {
+        if let s = frecencyStore { return s }
+        guard let repo = router?.context?.settingsRepo else { return nil }
+        let s = PaletteFrecencyStore(repo: SettingsRepoFrecencyAdapter(inner: repo))
+        frecencyStore = s
+        return s
+    }
+
     /// PERF-003: serve project scripts from an in-memory cache so opening the
     /// palette never blocks on `ProjectScripts.discover` (a filesystem scan).
     /// On a cache miss the cmd+k path returns immediately with no scripts and
@@ -359,9 +384,14 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         if lower.isEmpty {
             // UX-006: the default view hides the long tail; search sees it all.
             let visible = all.filter { !$0.defaultHidden }
+            // P2: apply frecency-based reranking within the runnable rows so
+            // commands the user actually invokes surface earlier over time.
+            // Non-runnable rows (headers/overflow) are excluded from reranking
+            // and re-appended in sectioned() anyway.
+            let frecencyRanked = frecencyRanked(visible)
             // UX-007: float the last few used commands to the top, then group
             // the rest into UX-003 sections with non-selectable headers.
-            filtered = floatRecent(visible) + sectioned(visible, excludingRecent: true)
+            filtered = floatRecent(frecencyRanked) + sectioned(frecencyRanked, excludingRecent: true)
         } else {
             // UX-003: search results stay flat (no headers) for a tight list.
             // Overflow / loading rows (non-runnable) are excluded from ranking.
@@ -381,6 +411,25 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         tableView.reloadData()
         resizeToFit()
         selectFirstRunnableRow()
+    }
+
+    /// P2: reorder `visible` using persisted frecency data. Non-runnable rows
+    /// (headers, overflow) are passed through unchanged in their original
+    /// relative order.  When no frecency data is available, returns `visible`
+    /// unmodified so the default-view behavior is identical to pre-P2.
+    private func frecencyRanked(_ visible: [PaletteCommand]) -> [PaletteCommand] {
+        guard let store = resolvedFrecencyStore() else { return visible }
+        let entries = store.load()
+        guard !entries.isEmpty else { return visible }
+        let runnable = visible.filter { !nonRunnableRowIDs.contains($0.id) }
+        let nonRunnable = visible.filter { nonRunnableRowIDs.contains($0.id) }
+        let runnableIDs = runnable.map(\.id)
+        let reranked = PaletteFrecencyMerger.ranked(candidateIDs: runnableIDs, entries: entries, now: Date())
+        let byID = Dictionary(runnable.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let reorderedRunnable = reranked.compactMap { byID[$0] }
+        // Non-runnable rows stay in their original positions (they anchor sections).
+        // We return them concatenated after runnable so sectioned() re-groups correctly.
+        return reorderedRunnable + nonRunnable
     }
 
     /// UX-007: the recent commands (still present in `visible`), in MRU order,
@@ -473,6 +522,8 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         if recentCommandIDs.count > recentLimit {
             recentCommandIDs.removeLast(recentCommandIDs.count - recentLimit)
         }
+        // P2: also persist frecency so ranking improves across launches.
+        resolvedFrecencyStore()?.recordUse(id: id)
     }
 
     // MARK: NSWindowDelegate — resign-key dismissal
