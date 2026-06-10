@@ -173,7 +173,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), title: title)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title)
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                             DispatchQueue.main.async {
@@ -390,6 +390,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ws = ctx.state.workspaces[id] else { throw LayoutError.workspaceNotFound }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+        publishWorkspaceCreated(ws)
         return ws
     }
 
@@ -440,16 +441,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func renameWorkspace(_ id: WorkspaceID, _ newName: String) throws {
         try context?.apply(.renameWorkspace(id, newName))
         windowController?.refreshFromState()
+        publishWorkspaceRenamed(id, newName)
     }
 
     public func setWorkspaceDescription(_ id: WorkspaceID, _ text: String) throws {
         try context?.apply(.setWorkspaceDescription(id, text))
         windowController?.refreshFromState()
+        publishWorkspaceUpdated(id, metadata: ["description": .string(text)])
     }
 
     public func setWorkspaceColor(_ id: WorkspaceID, _ color: String) throws {
         try context?.apply(.setWorkspaceColor(id, color))
         windowController?.refreshFromState()
+        publishWorkspaceUpdated(id, metadata: ["color": .string(color)])
     }
 
     private func publishWorkspaceClosed(_ id: WorkspaceID) {
@@ -458,14 +462,78 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ]))
     }
 
+    // P1: publish workspace.created/renamed/updated/reordered from the router's
+    // own mutation paths so iOS mirrors mac-local sidebar edits live. The
+    // payloads below must match the Dispatcher schema exactly (Dispatcher.swift
+    // workspace.* cases) so iOS consumes router- and dispatcher-originated
+    // events through the same reducer. Builders are pure + nonisolated so they
+    // can be unit-tested without the main actor.
+    nonisolated static func workspaceCreatedPayload(_ workspace: Workspace) -> JSONValue {
+        // Mirrors Dispatcher's `encode(ws)` byte-for-byte: JSONEncoder ->
+        // JSONSerialization -> JSONValue.from (NOT JSONValue's own Decodable,
+        // which structures the object differently and dropped the top-level id).
+        guard let data = try? JSONEncoder().encode(workspace),
+              let any = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { return .null }
+        return JSONValue.from(any)
+    }
+
+    nonisolated static func workspaceRenamedPayload(id: WorkspaceID, name: String) -> JSONValue {
+        .object([
+            "workspace_id": .string(id.value.uuidString),
+            "name": .string(name)
+        ])
+    }
+
+    nonisolated static func workspaceUpdatedPayload(id: WorkspaceID, metadata: [String: JSONValue]) -> JSONValue {
+        .object([
+            "workspace_id": .string(id.value.uuidString),
+            "metadata": .object(metadata)
+        ])
+    }
+
+    nonisolated static func workspaceReorderedPayload(id: WorkspaceID, position: Int?, order: [WorkspaceID]) -> JSONValue {
+        var payload: [String: JSONValue] = [
+            "workspace_id": .string(id.value.uuidString),
+            "order": .array(order.map { .string($0.value.uuidString) })
+        ]
+        if let position {
+            payload["position"] = .number(Double(position))
+        }
+        return .object(payload)
+    }
+
+    private func publishWorkspaceCreated(_ workspace: Workspace) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "workspace.created", payload: Self.workspaceCreatedPayload(workspace))
+    }
+
+    private func publishWorkspaceRenamed(_ id: WorkspaceID, _ name: String) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "workspace.renamed", payload: Self.workspaceRenamedPayload(id: id, name: name))
+    }
+
+    private func publishWorkspaceUpdated(_ id: WorkspaceID, metadata: [String: JSONValue]) {
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "workspace.updated", payload: Self.workspaceUpdatedPayload(id: id, metadata: metadata))
+    }
+
+    private func publishWorkspaceReordered(_ id: WorkspaceID, position: Int?) {
+        guard shouldPublishLayoutEvents else { return }
+        let order = context?.state.window.workspaces ?? []
+        EventBus.shared.publish(kind: "workspace.reordered", payload: Self.workspaceReorderedPayload(id: id, position: position, order: order))
+    }
+
     public func setWorkspacePinned(_ id: WorkspaceID, _ pinned: Bool) throws {
         try context?.apply(.setWorkspacePinned(id, pinned))
         windowController?.refreshFromState()
+        publishWorkspaceUpdated(id, metadata: ["pinned": pinned ? .string("true") : .string("")])
+        publishWorkspaceReordered(id, position: nil)
     }
 
     public func reorderWorkspace(_ id: WorkspaceID, position: Int) throws {
         try context?.apply(.reorderWorkspace(id, position: position))
         windowController?.refreshFromState()
+        publishWorkspaceReordered(id, position: position)
     }
 
     public func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {
@@ -2312,7 +2380,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle)
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
