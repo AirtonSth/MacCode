@@ -2502,6 +2502,16 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.coordinator.replaceProvider(.codex, runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "second answer")))
         vm.prompt = "second prompt"
         await vm.send()
+        // The second run settles asynchronously: the user message is mirrored
+        // in-memory immediately, but a trailing run-state callback can reload
+        // `vm.messages` from the DB before the second prompt is durably
+        // persisted. Wait for the second turn to fully settle so the assertions
+        // observe a stable state instead of a mid-reload snapshot.
+        await waitAsync("second turn settles with prior history intact") {
+            vm.status == .completed &&
+            vm.messages.contains { $0.role == .user && $0.content == "second prompt" } &&
+            vm.messages.contains { $0.role == .assistant && $0.content == "first answer" }
+        }
 
         XCTAssertTrue(vm.timeline.turns.flatMap(\.items).contains {
             $0.type == .tool && $0.output == "tool output"
