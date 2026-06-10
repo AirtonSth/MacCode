@@ -76,7 +76,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        let session = try sessionFor(request, provisioningCallback: onEvent)
+        let session = try await sessionForAsync(request, provisioningCallback: onEvent)
         lock.lock()
         if session.inFlightRunId != nil {
             lock.unlock()
@@ -158,6 +158,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     public func stopSession(threadId: AgentThreadID) throws {
         lock.lock()
         let session = sessions.removeValue(forKey: threadId)
+        recoveredEvents.removeValue(forKey: threadId)
+        rollbackResumeSessionAt.removeValue(forKey: threadId)
+        rollbackProviderThreadIds.removeValue(forKey: threadId)
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         terminate(session)
@@ -167,7 +170,26 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK recovery requires providerThreadId")
         }
-        let session = try sessionFor(request)
+        // Drive the async session provisioning on the cooperative pool while blocking
+        // this (non-async) caller via a semaphore — no Thread.sleep, no pinned pool thread.
+        let sem = DispatchSemaphore(value: 0)
+        var outcome: Result<Session, Error>?
+        Task { [weak self] in
+            guard let self else {
+                outcome = .failure(AgentProviderAdapterError.sessionNotFound(request.threadId))
+                sem.signal()
+                return
+            }
+            do {
+                let s = try await self.sessionForAsync(request, provisioningCallback: nil)
+                outcome = .success(s)
+            } catch {
+                outcome = .failure(error)
+            }
+            sem.signal()
+        }
+        sem.wait()
+        let session = try outcome!.get()
         lock.lock()
         session.onEvent = onEvent
         session.status = .completed
@@ -217,6 +239,16 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if let resumeSessionAt { rollbackResumeSessionAt[threadId] = resumeSessionAt }
         if let providerThreadId { rollbackProviderThreadIds[threadId] = providerThreadId }
         sessions.removeValue(forKey: threadId)
+        // Prune stale recoveredEvents: entries that have no active session and no pending
+        // rollback re-use cursor are abandoned — remove them to bound memory.
+        let openIds = Set(sessions.keys)
+        let pendingIds = Set(rollbackProviderThreadIds.keys).union(rollbackResumeSessionAt.keys)
+        let staleKeys = Self.recoveredEventsPruneKeys(
+            recoveredKeys: Set(recoveredEvents.keys),
+            openIds: openIds,
+            pendingIds: pendingIds
+        )
+        for key in staleKeys { recoveredEvents.removeValue(forKey: key) }
         lock.unlock()
         emitSessionSnapshot(session: session, reason: "thread_rolled_back")
         terminate(session)
@@ -226,6 +258,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.lock()
         let active = Array(sessions.values)
         sessions.removeAll()
+        recoveredEvents.removeAll()
+        rollbackResumeSessionAt.removeAll()
+        rollbackProviderThreadIds.removeAll()
         lock.unlock()
         active.forEach(terminate)
     }
@@ -240,12 +275,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.unlock()
     }
 
-    private func sessionFor(_ request: AgentRunRequest) throws -> Session {
-        try sessionFor(request, provisioningCallback: nil)
-    }
-
-    private func sessionFor(_ request: AgentRunRequest,
-                            provisioningCallback: (@Sendable (AgentRunEvent) -> Void)?) throws -> Session {
+    // Async path used by sendTurn and recoverSession (via Task+semaphore) — no Thread.sleep, no cooperative-pool pinning.
+    private func sessionForAsync(_ request: AgentRunRequest,
+                                 provisioningCallback: (@Sendable (AgentRunEvent) -> Void)?) async throws -> Session {
         lock.lock()
         if let existing = sessions[request.threadId] {
             lock.unlock()
@@ -253,12 +285,17 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             return existing
         }
         lock.unlock()
-        return try startNewSession(request, provisioningCallback: provisioningCallback)
+        return try await startNewSession(request, provisioningCallback: provisioningCallback)
     }
 
     private func startNewSession(_ request: AgentRunRequest,
-                                 provisioningCallback: (@Sendable (AgentRunEvent) -> Void)? = nil) throws -> Session {
-        let bridgeScriptPath = try resolvedBridgeScriptPath(onProgress: provisioningCallback)
+                                 provisioningCallback: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> Session {
+        let bridgeScriptPath = try await resolvedBridgeScriptPath(onProgress: provisioningCallback)
+        return try spawnSession(request, bridgeScriptPath: bridgeScriptPath)
+    }
+
+    // Shared session spawn logic — validates binary, wires pipes, starts process, registers session.
+    private func spawnSession(_ request: AgentRunRequest, bridgeScriptPath: String) throws -> Session {
         guard FileManager.default.isReadableFile(atPath: bridgeScriptPath) else {
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK bridge script not found: \(bridgeScriptPath)")
         }
@@ -317,32 +354,38 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return session
     }
 
-    private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) throws -> String {
+    private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
+        guard let components = try resolvedBridgeScriptComponents() else { return bridgeScriptPath }
+        if !Self.installedSDKPackage(at: components.cacheDir.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json"), matches: components.packageSpec) {
+            try await installSDKPackage(in: components.cacheDir, packageSpec: components.packageSpec, onProgress: onProgress)
+        }
+        return components.cachedBridgePath
+    }
+
+    // Returns (cacheDir, cachedBridgePath, packageSpec) when install may be needed,
+    // or nil when the local/existing bridge script is already usable.
+    private func resolvedBridgeScriptComponents() throws -> (cacheDir: URL, cachedBridgePath: String, packageSpec: String)? {
         let url = URL(fileURLWithPath: bridgeScriptPath)
         guard FileManager.default.isReadableFile(atPath: url.path) else {
-            return bridgeScriptPath
+            return nil
         }
         let source = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         guard source.contains("@anthropic-ai/claude-agent-sdk") else {
-            return bridgeScriptPath
+            return nil
         }
         let localPackage = url.deletingLastPathComponent()
             .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
         if FileManager.default.isReadableFile(atPath: localPackage.path) {
-            return bridgeScriptPath
+            return nil
         }
         let cache = try sdkRuntimeCacheDirectory()
         let cachedBridge = cache.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
-        let cachedPackage = cache.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
             || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)
         }
         let packageSpec = Self.sdkPackageSpec()
-        if !Self.installedSDKPackage(at: cachedPackage, matches: packageSpec) {
-            try installSDKPackage(in: cache, packageSpec: packageSpec, onProgress: onProgress)
-        }
-        return cachedBridge.path
+        return (cache, cachedBridge.path, packageSpec)
     }
 
     static func sdkPackageSpec() -> String {
@@ -397,9 +440,52 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return cache
     }
 
+    // Async install — suspends the Swift task instead of pinning a cooperative-pool thread.
     private func installSDKPackage(in directory: URL,
                                    packageSpec: String,
-                                   onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) throws {
+                                   onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws {
+        let (process, outputPipe) = try Self.makeNpmInstallProcess(in: directory, packageSpec: packageSpec, onProgress: onProgress)
+        // Wait for termination via a continuation; the cooperative-pool thread is NOT blocked.
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            process.terminationHandler = { proc in
+                outputPipe.fileHandleForReading.readabilityHandler = nil
+                if proc.isRunning {
+                    // Should not happen since handler fires after exit, but guard defensively.
+                    ProcessTerminator.terminateTree(proc)
+                    continuation.resume(throwing: AgentProviderAdapterError.unsupported("Claude Agent SDK package install timed out"))
+                    return
+                }
+                if proc.terminationStatus != 0 {
+                    let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                    let text = String(data: data, encoding: .utf8) ?? ""
+                    continuation.resume(throwing: AgentProviderAdapterError.unsupported("Claude Agent SDK package install failed: \(text)"))
+                } else {
+                    continuation.resume()
+                }
+            }
+            // 120 s hard timeout via a background task so install can't run indefinitely.
+            let proc = process
+            Task.detached {
+                try? await Task.sleep(nanoseconds: Self.sdkInstallTimeoutNanoseconds())
+                if proc.isRunning {
+                    ProcessTerminator.terminateTree(proc)
+                }
+            }
+        }
+    }
+
+    // Pure helper — returns the install timeout; extracted for testability.
+    nonisolated static func sdkInstallTimeoutSeconds() -> Double { 120 }
+
+    // Pure helper — returns the install timeout in nanoseconds for Task.sleep.
+    nonisolated static func sdkInstallTimeoutNanoseconds() -> UInt64 {
+        UInt64(sdkInstallTimeoutSeconds() * 1_000_000_000)
+    }
+
+    // Shared npm install process setup (spawn only — caller awaits termination).
+    private static func makeNpmInstallProcess(in directory: URL,
+                                              packageSpec: String,
+                                              onProgress: (@Sendable (AgentRunEvent) -> Void)?) throws -> (Process, Pipe) {
         guard let npm = ProcessLocator.resolve("npm") else {
             throw AgentRunError.missingBinary("npm")
         }
@@ -411,7 +497,6 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = outputPipe
-
         if let onProgress {
             outputPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
@@ -424,27 +509,13 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             }
             onProgress(Self.provisioningEvent(payload: Self.provisioningPayload(stage: "starting", progress: 0.0, packageSpec: packageSpec)))
         }
-
         do {
             try process.run()
         } catch {
             outputPipe.fileHandleForReading.readabilityHandler = nil
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
-        let deadline = Date().addingTimeInterval(120)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-        outputPipe.fileHandleForReading.readabilityHandler = nil
-        if process.isRunning {
-            ProcessTerminator.terminateTree(process)
-            throw AgentProviderAdapterError.unsupported("Claude Agent SDK package install timed out")
-        }
-        if process.terminationStatus != 0 {
-            let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            let text = String(data: data, encoding: .utf8) ?? ""
-            throw AgentProviderAdapterError.unsupported("Claude Agent SDK package install failed: \(text)")
-        }
+        return (process, outputPipe)
     }
 
     private static func provisioningPayload(stage: String, progress: Double, packageSpec: String) -> [String: Any] {
@@ -807,5 +878,17 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             }
         }
         return nil
+    }
+
+    // Pure helper — returns recoveredEvents keys eligible for pruning.
+    // A key is eligible when it has no open session and no pending rollback re-use cursor,
+    // meaning the thread was rolled back but never resumed. Safe to call under lock.
+    // Extracted as nonisolated static for direct unit-testability without instantiating the adapter.
+    nonisolated static func recoveredEventsPruneKeys(
+        recoveredKeys: Set<AgentThreadID>,
+        openIds: Set<AgentThreadID>,
+        pendingIds: Set<AgentThreadID>
+    ) -> Set<AgentThreadID> {
+        recoveredKeys.subtracting(openIds).subtracting(pendingIds)
     }
 }
