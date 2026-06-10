@@ -185,34 +185,58 @@ public final class DeviceTrustRepository {
         return PairingCode(code: code, createdAt: now, expiresAt: exp, redeemedAt: nil, redeemedDeviceID: nil)
     }
 
-    public func redeemPairingCode(_ code: String, deviceName: String) throws -> (DeviceTrust, token: String)? {
-        let st = try db.prepare("SELECT expires_at, redeemed_at FROM pairing_codes WHERE code = ?;")
-        try st.bind(1, code)
-        guard try st.step() else { return nil }
-        let expS = st.columnText(0) ?? ""
-        let redeemed = st.columnText(1)
-        guard let exp = iso.date(from: expS), exp > Date(), redeemed == nil else { return nil }
+    /// Internal sentinel: a guard inside a pairing transaction lost the
+    /// single-use race (code already redeemed / request no longer pending /
+    /// expired). Thrown to force the surrounding `db.transaction` to ROLLBACK,
+    /// then translated back to a `nil` return so the public contract is
+    /// unchanged. Never escapes this type.
+    private struct PairingConflict: Error {}
 
+    public func redeemPairingCode(_ code: String, deviceName: String) throws -> (DeviceTrust, token: String)? {
         let deviceId = UUID().uuidString
         let token = DeviceTrustRepository.generateToken()
         let hash = DeviceTrustRepository.hash(token)
         let now = Date()
         let now_s = iso.string(from: now)
 
-        let ins = try db.prepare("""
-            INSERT INTO device_trust(id, display_name, token_hash, created_at, capabilities)
-            VALUES(?, ?, ?, ?, '*');
-        """)
-        try ins.bind(1, deviceId); try ins.bind(2, deviceName)
-        try ins.bind(3, hash); try ins.bind(4, now_s)
-        _ = try ins.step()
+        do {
+            let trust: DeviceTrust = try db.transaction {
+                // Atomic single-use gate: claim the code FIRST with a guarded
+                // UPDATE. Under BEGIN IMMEDIATE writers are serialized, so a
+                // second concurrent redeem of the same code sees redeemed_at
+                // already set (or expiry passed) and matches zero rows. We do
+                // NOT trust sqlite3_changes here (no accessor); instead we
+                // read the claimant back and confirm it is *this* device.
+                let upd = try db.prepare("""
+                    UPDATE pairing_codes
+                    SET redeemed_at = ?, redeemed_device_id = ?
+                    WHERE code = ? AND redeemed_at IS NULL AND expires_at > ?;
+                """)
+                try upd.bind(1, now_s); try upd.bind(2, deviceId)
+                try upd.bind(3, code); try upd.bind(4, now_s)
+                _ = try upd.step()
 
-        let upd = try db.prepare("UPDATE pairing_codes SET redeemed_at = ?, redeemed_device_id = ? WHERE code = ?;")
-        try upd.bind(1, now_s); try upd.bind(2, deviceId); try upd.bind(3, code)
-        _ = try upd.step()
+                let chk = try db.prepare("SELECT redeemed_device_id FROM pairing_codes WHERE code = ?;")
+                try chk.bind(1, code)
+                guard try chk.step(), chk.columnText(0) == deviceId else {
+                    // No such code, already redeemed by someone else, or expired.
+                    throw PairingConflict()
+                }
 
-        let trust = DeviceTrust(id: deviceId, displayName: deviceName, tokenHash: hash, createdAt: now)
-        return (trust, token: token)
+                let ins = try db.prepare("""
+                    INSERT INTO device_trust(id, display_name, token_hash, created_at, capabilities)
+                    VALUES(?, ?, ?, ?, '*');
+                """)
+                try ins.bind(1, deviceId); try ins.bind(2, deviceName)
+                try ins.bind(3, hash); try ins.bind(4, now_s)
+                _ = try ins.step()
+
+                return DeviceTrust(id: deviceId, displayName: deviceName, tokenHash: hash, createdAt: now)
+            }
+            return (trust, token: token)
+        } catch is PairingConflict {
+            return nil
+        }
     }
 
     // MARK: device-initiated request → user approves/denies in a modal
@@ -266,22 +290,43 @@ public final class DeviceTrustRepository {
         let now = Date()
         let now_s = iso.string(from: now)
 
-        let ins = try db.prepare("""
-            INSERT INTO device_trust(id, display_name, token_hash, created_at, capabilities)
-            VALUES(?, ?, ?, ?, '*');
-        """)
-        try ins.bind(1, deviceId); try ins.bind(2, req.deviceName)
-        try ins.bind(3, hash); try ins.bind(4, now_s)
-        _ = try ins.step()
+        do {
+            let trust: DeviceTrust = try db.transaction {
+                // Atomic single-use gate: claim the request FIRST with a guarded
+                // UPDATE (status must still be 'pending'). BEGIN IMMEDIATE
+                // serializes writers, so a concurrent approve/deny that already
+                // moved the request out of 'pending' wins and this UPDATE matches
+                // zero rows. We confirm by reading the claimant's device_id back
+                // (only the winner sees its own deviceId), so approve is
+                // idempotent and can never mint a second device.
+                let upd = try db.prepare("""
+                    UPDATE pairing_requests
+                    SET status = 'approved', device_id = ?, decided_at = ?
+                    WHERE id = ? AND status = 'pending';
+                """)
+                try upd.bind(1, deviceId); try upd.bind(2, now_s); try upd.bind(3, id)
+                _ = try upd.step()
 
-        let upd = try db.prepare("""
-            UPDATE pairing_requests SET status = 'approved', device_id = ?, decided_at = ? WHERE id = ?;
-        """)
-        try upd.bind(1, deviceId); try upd.bind(2, now_s); try upd.bind(3, id)
-        _ = try upd.step()
+                let chk = try db.prepare("SELECT device_id FROM pairing_requests WHERE id = ?;")
+                try chk.bind(1, id)
+                guard try chk.step(), chk.columnText(0) == deviceId else {
+                    throw PairingConflict()
+                }
 
-        let trust = DeviceTrust(id: deviceId, displayName: req.deviceName, tokenHash: hash, createdAt: now)
-        return (trust, token: token)
+                let ins = try db.prepare("""
+                    INSERT INTO device_trust(id, display_name, token_hash, created_at, capabilities)
+                    VALUES(?, ?, ?, ?, '*');
+                """)
+                try ins.bind(1, deviceId); try ins.bind(2, req.deviceName)
+                try ins.bind(3, hash); try ins.bind(4, now_s)
+                _ = try ins.step()
+
+                return DeviceTrust(id: deviceId, displayName: req.deviceName, tokenHash: hash, createdAt: now)
+            }
+            return (trust, token: token)
+        } catch is PairingConflict {
+            return nil
+        }
     }
 
     public func denyPairingRequest(id: String) throws {
