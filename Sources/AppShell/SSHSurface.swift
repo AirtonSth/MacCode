@@ -165,6 +165,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         viewModel.onRemoteMkdir = { [weak self] path in self?.runRemoteMkdir(path: path) }
         viewModel.onRemoteRename = { [weak self] from, to in self?.runRemoteRename(from: from, to: to) }
         viewModel.onRemoteDelete = { [weak self] path, isDirectory in self?.runRemoteDelete(path: path, isDirectory: isDirectory) }
+        viewModel.onDropOnRemotePane = { [weak self] urls in self?.handleFinderDropOnRemotePane(urls: urls) }
         showPlaceholder()
         reloadHosts()
         syncTransferSidebarWidth(animated: false)
@@ -812,6 +813,32 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     func runTransferForTesting(upload: Bool, localPath: String, remotePath: String) {
         runTransfer(upload: upload, localPath: localPath, remotePath: remotePath)
     }
+
+    // MARK: - Drag-and-drop (Finder -> remote pane)
+
+    /// Accepts file URLs dropped onto the remote pane and queues one upload per
+    /// valid URL. Returns the number of requests enqueued so tests can verify the
+    /// count without inspecting the full queue. The surface uses
+    /// viewModel.remoteSitePath as the destination directory, matching the
+    /// currently-browsed remote path visible in the UI.
+    @discardableResult
+    func handleFinderDropOnRemotePane(urls: [URL]) -> Int {
+        let requests = SSHDropPayloadResolver.resolve(
+            fileURLs: urls,
+            remotePath: viewModel.remoteSitePath
+        )
+        for req in requests {
+            runTransfer(upload: true, localPath: req.localPath, remotePath: req.remotePath)
+        }
+        return requests.count
+    }
+
+    /// Testing accessor — same as handleFinderDropOnRemotePane but callable from
+    /// test targets without spinning up a real Finder drag session.
+    @discardableResult
+    func handleFinderDropOnRemotePaneForTesting(urls: [URL]) -> Int {
+        handleFinderDropOnRemotePane(urls: urls)
+    }
 }
 
 private struct SSHFileEntry: Identifiable, Hashable {
@@ -1000,6 +1027,43 @@ enum SSHLargeTreeConfirm {
 
     static func needsConfirm(fileCount: Int, totalBytes: Int) -> Bool {
         fileCount > fileCountThreshold || totalBytes > byteThreshold
+    }
+}
+
+// Pure model for a single drag-and-drop upload request produced by the resolver
+// (P3: SSH drag-and-drop). Carries the three fields the surface's runTransfer
+// needs so no view or router dependency is required.
+struct SSHDropTransferRequest: Equatable, Sendable {
+    let localPath: String
+    let remotePath: String
+    let isDirectory: Bool
+}
+
+// Pure resolver that converts a raw drop payload (file URLs + current remote
+// path) into a list of upload requests. Non-MainActor so it is fully testable
+// without a window, surface, or router. Mirrors the FileZilla mental model:
+// every dropped item becomes an upload to remotePath/filename.
+enum SSHDropPayloadResolver {
+    // Resolves each URL to one SSHDropTransferRequest.
+    // Rules:
+    //  - URLs with an empty lastPathComponent (e.g. "/") are skipped.
+    //  - isDirectory is determined from the URL's hasDirectoryPath flag so
+    //    tests can control it by constructing URL(fileURLWithPath:isDirectory:).
+    //  - Trailing slashes on remotePath are stripped before joining.
+    static func resolve(fileURLs: [URL], remotePath: String) -> [SSHDropTransferRequest] {
+        let cleanRemote = remotePath.hasSuffix("/") && remotePath.count > 1
+            ? String(remotePath.dropLast())
+            : remotePath
+        return fileURLs.compactMap { url in
+            let name = url.lastPathComponent
+            guard !name.isEmpty, name != "/" else { return nil }
+            let destRemote = cleanRemote + "/" + name
+            return SSHDropTransferRequest(
+                localPath: url.path,
+                remotePath: destRemote,
+                isDirectory: url.hasDirectoryPath
+            )
+        }
     }
 }
 
@@ -1259,6 +1323,10 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     var onSidebarCollapsedChange: ((Bool) -> Void)?
     var onTransferSidebarCollapsedChange: ((Bool) -> Void)?
     var onTransfer: ((Bool, String, String) -> Void)?
+    // Drag-and-drop from Finder or local pane onto the remote pane (P3 DnD).
+    // The overlay fires this with the dropped file URLs; the surface resolves
+    // them and queues upload requests.
+    var onDropOnRemotePane: (([URL]) -> Void)?
     // Routes a per-row cancel back to the surface so it can register the cancel
     // key the async completion path checks (P1).
     var onCancelTransfer: ((String, String) -> Void)?
@@ -1945,6 +2013,10 @@ private struct SSHTransferSidebarView: View {
                              select: { vm.selectRemote($0, additive: $1) },
                              transferTitle: "Download",
                              transfer: { vm.downloadRemoteSelection(anchor: $0) })
+                // Transparent NSDraggingDestination overlay so Finder and local-pane
+                // drags land on the remote pane and queue uploads (P3 DnD).
+                .overlay(SSHRemoteDropOverlay { urls in vm.onDropOnRemotePane?(urls) })
+                .accessibilityIdentifier("ssh.transfer.remote.drop.target")
             }
         }
     }
@@ -2375,6 +2447,64 @@ private struct SSHTransferSidebarView: View {
                 }
             }
         }
+    }
+}
+
+// NSView subclass that acts as an NSDraggingDestination for the remote pane.
+// Accepts file-URL drags from Finder and from the local pane (NSFilenamesPboardType
+// / fileURL UTI). On a valid drop it calls onDrop([URL]) which the surface maps
+// to upload requests. The view is transparent and overlays the remote pane so the
+// existing SwiftUI hit-testing is not disrupted when no drag is in progress.
+private final class SSHRemotePaneDropNSView: NSView {
+    var onDrop: (([URL]) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        hasFileURLs(sender) ? .copy : []
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        hasFileURLs(sender) ? .copy : []
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = fileURLs(from: sender)
+        guard !urls.isEmpty else { return false }
+        onDrop?(urls)
+        return true
+    }
+
+    private func hasFileURLs(_ info: NSDraggingInfo) -> Bool {
+        info.draggingPasteboard.canReadObject(forClasses: [NSURL.self],
+                                              options: [.urlReadingFileURLsOnly: true])
+    }
+
+    private func fileURLs(from info: NSDraggingInfo) -> [URL] {
+        (info.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
+}
+
+// SwiftUI wrapper so the drop overlay can be placed with .overlay() inside the
+// existing SwiftUI layout without breaking the view hierarchy.
+private struct SSHRemoteDropOverlay: NSViewRepresentable {
+    let onDrop: ([URL]) -> Void
+
+    func makeNSView(context: Context) -> SSHRemotePaneDropNSView {
+        let v = SSHRemotePaneDropNSView()
+        v.onDrop = onDrop
+        return v
+    }
+
+    func updateNSView(_ nsView: SSHRemotePaneDropNSView, context: Context) {
+        nsView.onDrop = onDrop
     }
 }
 
