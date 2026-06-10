@@ -1,6 +1,20 @@
 import Foundation
 import Darwin
 
+/// Pure helper: builds the `server.listener` EventBus event payload for the
+/// Unix-domain socket server. Mirrors `serverListenerEventPayload` in
+/// HTTPServer.swift so subscribers can treat both servers uniformly.
+/// - Parameters:
+///   - bound: `true` on success, `false` on failure.
+///   - path: The filesystem path the socket was (attempted to be) bound to.
+public func unixSocketListenerEventPayload(bound: Bool, path: String) -> [String: Any] {
+    return [
+        "bound": bound,
+        "address": path,
+        "port": 0
+    ]
+}
+
 public final class UnixSocketServer: @unchecked Sendable {
     private static let maxClientLineBytes = 1024 * 1024
 
@@ -42,11 +56,25 @@ public final class UnixSocketServer: @unchecked Sendable {
         if bindResult < 0 {
             let msg = String(cString: strerror(errno))
             close(listenFD)
+            let failPayload = unixSocketListenerEventPayload(bound: false, path: socketPath)
+            EventBus.shared.publish(kind: "server.listener", payload: .object(failPayload.mapValues { v -> JSONValue in
+                if let b = v as? Bool { return .bool(b) }
+                if let i = v as? Int { return .number(Double(i)) }
+                if let s = v as? String { return .string(s) }
+                return .string("\(v)")
+            }))
             throw NSError(domain: "RemoteCode.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "bind: \(msg)"])
         }
         if Darwin.listen(listenFD, 16) < 0 {
             let msg = String(cString: strerror(errno))
             close(listenFD)
+            let failPayload = unixSocketListenerEventPayload(bound: false, path: socketPath)
+            EventBus.shared.publish(kind: "server.listener", payload: .object(failPayload.mapValues { v -> JSONValue in
+                if let b = v as? Bool { return .bool(b) }
+                if let i = v as? Int { return .number(Double(i)) }
+                if let s = v as? String { return .string(s) }
+                return .string("\(v)")
+            }))
             throw NSError(domain: "RemoteCode.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "listen: \(msg)"])
         }
         // tighten permissions
@@ -57,6 +85,16 @@ public final class UnixSocketServer: @unchecked Sendable {
         t.name = "RC2.SocketAccept"
         t.start()
         acceptThread = t
+
+        // Publish success event so AppDelegate (or any observer) can surface
+        // the server status without polling. Mirrors HTTPServer's pattern.
+        let successPayload = unixSocketListenerEventPayload(bound: true, path: socketPath)
+        EventBus.shared.publish(kind: "server.listener", payload: .object(successPayload.mapValues { v -> JSONValue in
+            if let b = v as? Bool { return .bool(b) }
+            if let i = v as? Int { return .number(Double(i)) }
+            if let s = v as? String { return .string(s) }
+            return .string("\(v)")
+        }))
     }
 
     public func stop() {
