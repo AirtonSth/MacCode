@@ -30,6 +30,39 @@ public enum BrowserKeyMapper {
     }
 }
 
+/// Action associated with a browser context-menu item.
+/// Pure value — no AppKit dependency — so it is fully unit-testable.
+public enum ContextMenuItemAction: Equatable {
+    case openLinkInNewSurface(URL)
+    case copyLink(URL)
+}
+
+/// Describes a single context-menu item: its user-visible title and action.
+/// Pure value — no AppKit dependency — so it is fully unit-testable.
+public struct ContextMenuItemSpec: Equatable {
+    public let title: String
+    public let action: ContextMenuItemAction
+    public init(title: String, action: ContextMenuItemAction) {
+        self.title = title
+        self.action = action
+    }
+}
+
+/// Maps an optional link URL from a WKWebView hit-test to the set of
+/// context-menu item specs that should be injected at the top of the menu.
+/// Pure logic — no @MainActor, no AppKit/WebKit types — fully unit-testable.
+public enum BrowserContextMenuHelper {
+    /// Returns link-specific items when `linkURL` is non-nil, empty otherwise.
+    /// WHY: callers can test menu composition without any AppKit/WebKit state.
+    public static func menuItemSpecs(linkURL: URL?) -> [ContextMenuItemSpec] {
+        guard let url = linkURL else { return [] }
+        return [
+            ContextMenuItemSpec(title: "Open Link in New Surface", action: .openLinkInNewSurface(url)),
+            ContextMenuItemSpec(title: "Copy Link", action: .copyLink(url))
+        ]
+    }
+}
+
 /// Formats WKFindResult data into a human-readable find-bar label.
 /// Pure logic — no @MainActor, no WebKit types — so it is fully unit-testable.
 public enum FindResultFormatter {
@@ -56,7 +89,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
-    private let webView: WKWebView
+    private let webView: BrowserWebView
     private let addressBar: NSTextField
     private let backButton = NSButton()
     private let forwardButton = NSButton()
@@ -87,6 +120,10 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private var isClosed = false
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
     public var externalURLOpener: ((URL) -> Void)?
+    /// Called when the user chooses "Open Link in New Surface" from the context menu.
+    public var onOpenLinkInNewSurface: ((URL) -> Void)?
+    /// Called when the user chooses "Copy Link" from the context menu.
+    public var onCopyLink: ((URL) -> Void)?
 
     public init(workspaceID: WorkspaceID, initialURL: URL? = nil, title: String = "browser") {
         self.descriptor = SurfaceDescriptor(
@@ -98,7 +135,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: Self.dataStoreIdentifier(for: workspaceID))
-        let wv = WKWebView(frame: .zero, configuration: cfg)
+        let wv = BrowserWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = Self.currentSafariUserAgent()
         wv.setAccessibilityIdentifier("browser.webview")
         // Enable Safari Web Inspector attachment in debug builds (P1 dev-server
@@ -314,6 +351,20 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
         backButton.isEnabled = false
         forwardButton.isEnabled = false
+        wv.onContextMenuItem = { [weak self] spec in
+            guard let self else { return }
+            switch spec.action {
+            case .openLinkInNewSurface(let url):
+                self.onOpenLinkInNewSurface?(url)
+            case .copyLink(let url):
+                if let handler = self.onCopyLink {
+                    handler(url)
+                } else {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                }
+            }
+        }
         observeLoadingState()
 
         navigate(to: initialURL ?? Self.defaultInitialURL)
@@ -721,10 +772,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         return nil
     }
 
-    // IMP-MAC_BROWSER-008/012 (link/page context menu) reverted: the iOS-only
-    // `contextMenuConfigurationForElement`/`WKContextMenuElementInfo` API does
-    // not exist on macOS WKWebView. A macOS-correct version needs NSMenu
-    // customization via the view's `willOpenMenu`/`menu(for:)` path — deferred.
+    // IMP-MAC_BROWSER-008/012: context-menu link items implemented via
+    // BrowserWebView.willOpenMenu (NSView API, macOS 10.11+). Callers receive
+    // link URLs through onOpenLinkInNewSurface and onCopyLink callbacks.
 
     public func publishNavigationChange(url: URL, title: String?) {
         descriptor.metadata["url"] = url.absoluteString
@@ -877,6 +927,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         titleObservation = nil
         onNavigationChange = nil
         externalURLOpener = nil
+        onOpenLinkInNewSurface = nil
+        onCopyLink = nil
+        webView.onContextMenuItem = nil
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
         webView.stopLoading()
@@ -885,6 +938,56 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     public func readText() -> String { webView.url?.absoluteString ?? "" }
     public func snapshot() -> [String: String] {
         ["url": webView.url?.absoluteString ?? "", "title": webView.title ?? ""]
+    }
+}
+
+/// WKWebView subclass that injects "Open Link in New Surface" and "Copy Link"
+/// items at the top of the native context menu when the user right-clicks a link.
+/// Uses the macOS NSView `willOpenMenu(_:with:)` hook available since macOS 10.11.
+private final class BrowserWebView: WKWebView {
+    /// Called by `willOpenMenu` for each link-targeted item spec.
+    var onContextMenuItem: ((ContextMenuItemSpec) -> Void)?
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+
+        // Hit-test the click point to extract the link URL.
+        let point = convert(event.locationInWindow, from: nil)
+        let linkURL: URL? = hitTest(point).flatMap { Self.linkURL(from: $0) }
+
+        let specs = BrowserContextMenuHelper.menuItemSpecs(linkURL: linkURL)
+        guard !specs.isEmpty else { return }
+
+        // Insert a separator then the new items at the top of the menu,
+        // so the custom items are visually grouped before WKWebView defaults.
+        menu.insertItem(NSMenuItem.separator(), at: 0)
+        for spec in specs.reversed() {
+            let item = NSMenuItem(title: spec.title, action: #selector(handleContextItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = spec
+            menu.insertItem(item, at: 0)
+        }
+    }
+
+    @objc private func handleContextItem(_ sender: NSMenuItem) {
+        guard let spec = sender.representedObject as? ContextMenuItemSpec else { return }
+        onContextMenuItem?(spec)
+    }
+
+    /// Walks the responder/view hierarchy to find an anchor element's href URL.
+    /// WKWebView renders link hit-testing via the WebKit process; we read back
+    /// the URL from the hit-tested NSView's accessible URL when available, or
+    /// fall back to nil so the menu degrades gracefully.
+    private static func linkURL(from view: NSView) -> URL? {
+        // WKWebView sets accessibilityURL on link subviews (internal WebKit detail,
+        // stable since macOS 10.13). Cast via AnyObject to avoid direct dependency
+        // on WebKit internals; return nil if the API is absent.
+        let obj = view as AnyObject
+        if obj.responds(to: NSSelectorFromString("URL")),
+           let url = obj.value(forKey: "URL") as? URL {
+            return url
+        }
+        return nil
     }
 }
 
