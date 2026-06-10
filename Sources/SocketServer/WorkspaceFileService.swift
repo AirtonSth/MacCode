@@ -7,6 +7,25 @@ public enum WorkspaceFileLimits {
     public static let sampleBytes = 64 * 1024
     public static let readBytes = 2 * 1024 * 1024
     public static let editBytes = 2 * 1024 * 1024
+    /// Head bytes returned when a file is too large to read in full.
+    public static let previewHeadBytes = 32 * 1024
+    /// Files larger than this are served as a preview instead of being read in full.
+    public static let previewThresholdBytes = 512 * 1024
+}
+
+public enum ReadStrategy: Equatable {
+    case full
+    case preview(headBytes: Int)
+}
+
+/// Pure helper: decide read strategy from file size and cap.
+/// Returns .preview when fileSize > cap; .full otherwise.
+/// - Parameters:
+///   - fileSize: Actual file size in bytes.
+///   - cap: Threshold above which preview is used.
+///   - headBytes: How many bytes to include in the preview head.
+public func readStrategy(fileSize: Int64, cap: Int64, headBytes: Int = WorkspaceFileLimits.previewHeadBytes) -> ReadStrategy {
+    fileSize > cap ? .preview(headBytes: headBytes) : .full
 }
 
 public struct WorkspaceFileService: Sendable {
@@ -60,24 +79,49 @@ public struct WorkspaceFileService: Sendable {
                 "identity": identity.json
             ])
         }
-        let limit = max(0, min(maxBytes ?? WorkspaceFileLimits.readBytes, WorkspaceFileLimits.readBytes))
-        let handle = try FileHandle(forReadingFrom: file)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: limit + 1) ?? Data()
-        let truncated = data.count > limit
-        let clipped = truncated ? data.prefix(limit) : data[...]
-        let decoded = try decodeText(Data(clipped))
-        return .object([
-            "path": .string(file.path),
-            "relative_path": .string(relativePath(root: rootURL, url: file)),
-            "kind": .string(identity.kind),
-            "mime": .string(identity.mime),
-            "size": .number(Double(identity.size)),
-            "encoding": .string(decoded.encoding),
-            "content": .string(decoded.text),
-            "truncated": .bool(truncated),
-            "identity": identity.json
-        ])
+        let strategy = readStrategy(
+            fileSize: identity.size,
+            cap: Int64(WorkspaceFileLimits.previewThresholdBytes)
+        )
+        switch strategy {
+        case .preview(let headBytes):
+            let handle = try FileHandle(forReadingFrom: file)
+            defer { try? handle.close() }
+            let data = try handle.read(upToCount: headBytes) ?? Data()
+            let decoded = try decodeText(data)
+            return .object([
+                "path": .string(file.path),
+                "relative_path": .string(relativePath(root: rootURL, url: file)),
+                "kind": .string(identity.kind),
+                "mime": .string(identity.mime),
+                "size": .number(Double(identity.size)),
+                "encoding": .string(decoded.encoding),
+                "content": .string(decoded.text),
+                "truncated": .bool(true),
+                "preview": .bool(true),
+                "identity": identity.json
+            ])
+        case .full:
+            let limit = max(0, min(maxBytes ?? WorkspaceFileLimits.readBytes, WorkspaceFileLimits.readBytes))
+            let handle = try FileHandle(forReadingFrom: file)
+            defer { try? handle.close() }
+            let data = try handle.read(upToCount: limit + 1) ?? Data()
+            let truncated = data.count > limit
+            let clipped = truncated ? data.prefix(limit) : data[...]
+            let decoded = try decodeText(Data(clipped))
+            return .object([
+                "path": .string(file.path),
+                "relative_path": .string(relativePath(root: rootURL, url: file)),
+                "kind": .string(identity.kind),
+                "mime": .string(identity.mime),
+                "size": .number(Double(identity.size)),
+                "encoding": .string(decoded.encoding),
+                "content": .string(decoded.text),
+                "truncated": .bool(truncated),
+                "preview": .bool(false),
+                "identity": identity.json
+            ])
+        }
     }
 
     public func previewURL(root: String, path: String) throws -> JSONValue {
