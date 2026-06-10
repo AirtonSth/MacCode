@@ -698,7 +698,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         // and scroll tick; only the strings/colors are updated on reuse.
         let cell = (tableView.makeView(withIdentifier: Self.rowReuseID, owner: self) as? PaletteRowCellView)
             ?? PaletteRowCellView(identifier: Self.rowReuseID)
-        cell.configure(with: cmd, dimmed: dimmed, isHeader: isHeader(cmd.id))
+        cell.configure(with: cmd, dimmed: dimmed, isHeader: isHeader(cmd.id), query: currentQuery)
         // QA-001: per-row stable identifier for XCUITest (commandPalette.row.<id>).
         cell.setAccessibilityIdentifier("commandPalette.row.\(cmd.id)")
         return cell
@@ -755,7 +755,7 @@ private final class PaletteRowCellView: NSTableCellView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
-    func configure(with cmd: PaletteCommand, dimmed: Bool, isHeader: Bool) {
+    func configure(with cmd: PaletteCommand, dimmed: Bool, isHeader: Bool, query: String = "") {
         if isHeader {
             // UX-003: caption-styled, no icon/subtitle/chord.
             icon.isHidden = true
@@ -767,7 +767,8 @@ private final class PaletteRowCellView: NSTableCellView {
             chord.isHidden = true
             return
         }
-        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        let baseFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.font = baseFont
         // UX-010: leading SF Symbol per command type. UX-011: destructive
         // commands (Quit) render title + icon in the danger tint.
         if let iconName = cmd.iconName, let image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil) {
@@ -778,8 +779,25 @@ private final class PaletteRowCellView: NSTableCellView {
             icon.image = nil
             icon.isHidden = true
         }
-        titleLabel.stringValue = cmd.title
-        titleLabel.textColor = cmd.destructive ? DS.NS.danger : (dimmed ? DS.NS.textTertiary : DS.NS.text)
+        let titleColor: NSColor = cmd.destructive ? DS.NS.danger : (dimmed ? DS.NS.textTertiary : DS.NS.text)
+        // P3: bold the matched character ranges so users see why the row was
+        // included. Falls back to plain string when query is empty or no ranges.
+        let matchedRanges = CommandPaletteFilter.matchedRanges(title: cmd.title, query: query)
+        if matchedRanges.isEmpty {
+            titleLabel.stringValue = cmd.title
+            titleLabel.textColor = titleColor
+        } else {
+            let boldFont = NSFont.systemFont(ofSize: 13, weight: .bold)
+            let attrStr = NSMutableAttributedString(
+                string: cmd.title,
+                attributes: [.font: baseFont, .foregroundColor: titleColor]
+            )
+            for range in matchedRanges {
+                let nsRange = NSRange(range, in: cmd.title)
+                attrStr.addAttribute(.font, value: boldFont, range: nsRange)
+            }
+            titleLabel.attributedStringValue = attrStr
+        }
         subtitleLabel.stringValue = cmd.subtitle
         subtitleLabel.isHidden = cmd.subtitle.isEmpty
         chord.stringValue = cmd.shortcut ?? ""

@@ -55,6 +55,43 @@ public struct CommandPaletteFilter {
         return true
     }
 
+    /// P3: pure helper - given a display `title` and a search `query`, return
+    /// the `String.Index` ranges inside `title` that should be bolded.
+    ///
+    /// Strategy (mirrors the filter tier order so highlighted chars always
+    /// correspond to the reason the row was included):
+    ///   1. Empty query or no-match -> []
+    ///   2. Prefix match  -> one range covering the prefix
+    ///   3. Substring match -> one range covering the first occurrence
+    ///   4. Subsequence match -> one range per query character (greedy-first)
+    ///
+    /// The helper is `nonisolated static` so tests can call it without
+    /// @MainActor and without instantiating any AppKit objects.
+    public nonisolated static func matchedRanges(title: String, query: String) -> [Range<String.Index>] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return [] }
+
+        // Prefix / substring: one contiguous range (case-insensitive, locale-safe).
+        if let range = title.range(of: q, options: .caseInsensitive) {
+            return [range]
+        }
+
+        // Subsequence: one range per query character (greedy-first, case-insensitive).
+        var result: [Range<String.Index>] = []
+        var searchFrom = title.startIndex
+        for qChar in q {
+            guard searchFrom < title.endIndex else { return [] }
+            guard let found = title.range(of: String(qChar),
+                                          options: .caseInsensitive,
+                                          range: searchFrom..<title.endIndex) else {
+                return []
+            }
+            result.append(found)
+            searchFrom = found.upperBound
+        }
+        return result
+    }
+
     /// Rank `items` against `query`, dropping non-matches. Ties keep the
     /// original (insertion) order so the palette is deterministic.
     public static func rank<T>(_ items: [T], query: String,
