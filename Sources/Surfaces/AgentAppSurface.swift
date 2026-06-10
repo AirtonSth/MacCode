@@ -128,6 +128,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var checkpointStatusMessage: String?
     /// B3: file paths attached to the next message (composer chips).
     @Published public var attachments: [String] = []
+    /// P1: tracks whether the last submitted message included attachments so
+    /// retryLastPrompt can warn the user they will not be re-sent.
+    @Published public var lastSentAttachmentCount: Int = 0
     @Published public var queuedMessages: [AgentQueuedMessage] = []
     @Published public var queueStatusMessage: String?
     @Published public var editingQueuedMessage: AgentQueuedMessage?
@@ -1065,9 +1068,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
     }
 
-    /// A1: the provider (source) is fixed once the thread has a
+    /// A1: the provider (source) is fixed once the thread has a real
     /// conversation — only model/effort stay changeable after that.
-    public var providerLocked: Bool { selectedThreadId != nil && !messages.isEmpty }
+    /// P3: system notes (from /status, /clear, etc.) must not count as
+    /// "a conversation started", otherwise the source locks after the very
+    /// first /status call before any user turn.
+    public var providerLocked: Bool {
+        selectedThreadId != nil && messages.contains { $0.role != .system }
+    }
     public var executionLocked: Bool { providerLocked || status == .running }
 
     public func setProviderInstance(_ id: String) {
@@ -1401,6 +1409,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         switch cmd {
         case "clear":
             createThread(title: "New thread")
+            // P2: /clear creates a new thread (CLI semantics); tell the user so
+            // the silent switch doesn't look like a bug.
+            systemNote("/clear — started a new thread. Previous thread is still in the rail.")
         case "fork":
             forkCurrentThread()
         case "model":
@@ -1448,6 +1459,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func send() async {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
+        lastSentAttachmentCount = attachments.count
         recordPromptHistory(text)
         if selectedThreadCanQueuePrompt {
             await enqueuePromptWhileRunning(text: text, attached: attachments)
@@ -1618,8 +1630,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
     /// without forcing the user to retype it.
+    /// P1: if the original message included attachments they are NOT re-sent
+    /// (resolver paths may be stale); post a system note so the user sees why.
     public func retryLastPrompt() async {
         guard let last = promptHistory.last, !last.isEmpty else { return }
+        if lastSentAttachmentCount > 0 {
+            systemNote("Retry: \(lastSentAttachmentCount) attachment(s) from the original message are not re-sent. Re-attach if needed.")
+        }
         lastErrorRecoverable = false
         _ = await startProviderRun(text: last, attached: [], recordHistory: false, interactionMode: interactionMode)
     }
@@ -2180,6 +2197,10 @@ public struct AgentAppView: View {
     @State private var pendingSessionApproval: AssistantPendingRequest?
     @State private var expandedRequestPreviews: Set<String> = []
     @State private var declineReasonDrafts: [String: String] = [:]
+    // P1: thread delete confirmation — ids staged here until user confirms.
+    @State private var pendingDeleteThreadIds: Set<AgentThreadID> = []
+    // P3: user-message "show more" — message ids the user has expanded past 28 lines.
+    @State private var expandedUserMessages: Set<AgentMessageID> = []
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
@@ -2691,6 +2712,22 @@ public struct AgentAppView: View {
             }
         }
         .onDeleteCommand { deleteSelectedThreads() }
+        // P1: confirm before deleting threads — irreversible and instant otherwise.
+        .confirmationDialog(
+            pendingDeleteThreadIds.count == 1
+                ? "Delete this thread?"
+                : "Delete \(pendingDeleteThreadIds.count) threads?",
+            isPresented: Binding(
+                get: { !pendingDeleteThreadIds.isEmpty },
+                set: { if !$0 { pendingDeleteThreadIds = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) { commitPendingDelete() }
+            Button("Cancel", role: .cancel) { pendingDeleteThreadIds = [] }
+        } message: {
+            Text("Deleted threads and their history cannot be recovered.")
+        }
     }
 
     // UX-MAC_AGENT-002: ⌘N starts a thread even when the rail (and its "+"
@@ -2877,7 +2914,7 @@ public struct AgentAppView: View {
                 Button("Export…") { exportThread(t) }
                 Divider()
                 Button("Delete", role: .destructive) {
-                    deleteThreads(selectedThreadIds.isEmpty ? [t.id] : selectedThreadIds)
+                    pendingDeleteThreadIds = selectedThreadIds.isEmpty ? [t.id] : selectedThreadIds
                 }
             }
         }
@@ -3035,6 +3072,18 @@ public struct AgentAppView: View {
     }
     private var effortLabel: String { vm.reasoningEffort.displayName }
     private var serviceTierLabel: String { vm.serviceTier == .fast ? "Fast" : "Auto" }
+    /// P3: VoiceOver label for the model picker pill that reads as structured
+    /// text rather than the raw concatenated visual tokens.
+    private var modelMenuAccessibilityLabel: String {
+        var parts = ["Model \(modelLabel)"]
+        if vm.supportsReasoningForSelectedModel {
+            parts.append("effort \(effortLabel)")
+        }
+        if vm.serviceTier == .fast {
+            parts.append("tier Fast")
+        }
+        return parts.joined(separator: ", ")
+    }
 
     private var threadRailIntent: AdaptiveSidebarIntent {
         get { AdaptiveSidebarIntent(rawValue: threadRailIntentRaw) ?? .auto }
@@ -3945,6 +3994,11 @@ public struct AgentAppView: View {
         switch msg.role {
         case .user:
             let displayText = Self.userMessageDisplayText(msg.content)
+            let messageExpanded = expandedUserMessages.contains(msg.id)
+            // P3: messages longer than 28 lines get a "Show more" toggle so the
+            // user can read the full text without the copy-only hint.
+            let lineCount = displayText.components(separatedBy: "\n").count
+            let showExpandToggle = !messageExpanded && lineCount > 28
             HStack(spacing: 0) {
                 Spacer(minLength: 32)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
@@ -3952,7 +4006,7 @@ public struct AgentAppView: View {
                         .font(DS.Font.body)
                         .foregroundColor(DS.Palette.text)
                         .textSelection(.enabled)
-                        .lineLimit(28)
+                        .lineLimit(messageExpanded ? nil : 28)
                         .truncationMode(.tail)
                         .padding(.horizontal, 22)
                         .padding(.vertical, 14)
@@ -3960,6 +4014,18 @@ public struct AgentAppView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .frame(maxWidth: 600, alignment: .trailing)
                         .accessibilityIdentifier("agent.userMessageBubble")
+                    if showExpandToggle {
+                        Button {
+                            expandedUserMessages.insert(msg.id)
+                        } label: {
+                            Text("Show more")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Show full message")
+                        .accessibilityIdentifier("agent.userMessage.showMore.\(msg.id.value.uuidString)")
+                    }
                     // UX-MAC_AGENT-017: subtle relative timestamp so long threads
                     // show when each message was sent.
                     HStack(spacing: DS.Space.xs) {
@@ -3980,7 +4046,17 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
             if !hiddenPersistedAssistantMessageIDs.contains(msg.id) {
-                assistantProse(msg.content)
+                if msg.content.isEmpty {
+                    // P2: body was blanked by the 24 MB budget safety valve.
+                    Text("(content omitted — message too large to display)")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .italic()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityLabel("Content omitted: message body was too large to display")
+                } else {
+                    assistantProse(msg.content)
+                }
             }
         case .system:
             Text(msg.content)
@@ -4677,6 +4753,9 @@ public struct AgentAppView: View {
             modelMenuLabel
         }
         .buttonStyle(.plain)
+        // P3: expose a meaningful VoiceOver label instead of the raw concatenated
+        // pill text (e.g. "gpt-5.5 · medium · ..." becomes "Model gpt-5.5, effort medium").
+        .accessibilityLabel(modelMenuAccessibilityLabel)
         .accessibilityIdentifier("agent.model.menu")
         // UX-MAC_AGENT-016: keep the menu openable while running so the user can
         // read the current model/effort/tier; the mutating rows inside disable
@@ -4695,9 +4774,14 @@ public struct AgentAppView: View {
     }
 
     private var modelOptionsPopover: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            // UX-MAC_AGENT-016: readable while running; the rows below disable.
-            if vm.status == .running {
+        // P2: "Retry loading models" must remain tappable even mid-run so a
+        // failed model-list fetch can be retried without stopping the run.
+        // Only mutation rows (set provider/model/effort/tier) are disabled
+        // while running; the retry and recovery rows are excluded.
+        let running = vm.status == .running
+        return VStack(alignment: .leading, spacing: DS.Space.xs) {
+            // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
+            if running {
                 Text("Read-only while running")
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textTertiary)
@@ -4710,6 +4794,7 @@ public struct AgentAppView: View {
                         compactMenuRow(snapshot.displayName, selected: snapshot.id == vm.providerInstanceId) {
                             vm.setProviderInstance(snapshot.id)
                         }
+                        .disabled(running)
                     }
                     compactMenuDivider
                 } else {
@@ -4719,6 +4804,7 @@ public struct AgentAppView: View {
                             vm.setProvider(provider)
                             Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
                         }
+                        .disabled(running)
                     }
                     compactMenuDivider
                 }
@@ -4737,6 +4823,8 @@ public struct AgentAppView: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
             }
+            // P2: retry stays enabled while running so a model-list failure
+            // mid-run can be recovered without stopping the agent.
             if vm.modelListStatusMessage != nil || vm.providerSnapshotStatusMessage != nil {
                 compactMenuRow("Retry loading models", selected: false) {
                     Task {
@@ -4767,12 +4855,14 @@ public struct AgentAppView: View {
                         vm.setModel(model.id)
                         showModelOptions = false
                     }
+                    .disabled(running)
                 }
                 ForEach(visibleCustomModels, id: \.self) { customModel in
                     compactMenuRow(customModel, selected: customModel == vm.model) {
                         vm.setCustomModel(customModel)
                         showModelOptions = false
                     }
+                    .disabled(running)
                 }
                 if modelOptions.count + customModels.count > 3, !showAllModelOptions {
                     compactMenuRow("More...", selected: false) {
@@ -4787,6 +4877,7 @@ public struct AgentAppView: View {
                             customModelDraft = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
                             showCustomModelField = true
                         }
+                        .disabled(running)
                     }
                 }
             }
@@ -4800,6 +4891,7 @@ public struct AgentAppView: View {
                         vm.setReasoningEffort(effort)
                         showModelOptions = false
                     }
+                    .disabled(running)
                 }
             }
             if vm.supportsServiceTierForSelectedModel {
@@ -4808,10 +4900,12 @@ public struct AgentAppView: View {
                     vm.setServiceTier(.auto)
                     showModelOptions = false
                 }
+                .disabled(running)
                 compactMenuRow("Fast", selected: vm.serviceTier == .fast) {
                     vm.setServiceTier(.fast)
                     showModelOptions = false
                 }
+                .disabled(running)
             }
             if let providerStatus = vm.providerStatusMessage {
                 compactMenuDivider
@@ -4833,7 +4927,6 @@ public struct AgentAppView: View {
                     .foregroundColor(DS.Palette.danger)
             }
         }
-        .disabled(vm.status == .running)
         .padding(DS.Space.sm)
         .background(DS.Palette.surfaceOverlay)
         .fixedSize(horizontal: true, vertical: false)
@@ -5113,7 +5206,10 @@ public struct AgentAppView: View {
     private func pickAttachments() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
-        panel.canChooseDirectories = true
+        // P2: directories are rejected at send time by AgentAttachmentResolver;
+        // disallow them at pick time so the error surfaces immediately instead
+        // of silently after the run starts.
+        panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK {
             vm.addAttachments(panel.urls.map { $0.path })
@@ -5154,7 +5250,10 @@ public struct AgentAppView: View {
 
     private func deleteSelectedThreads() {
         let fallback = vm.selectedThreadId.map { Set([$0]) } ?? []
-        deleteThreads(selectedThreadIds.isEmpty ? fallback : selectedThreadIds)
+        let ids = selectedThreadIds.isEmpty ? fallback : selectedThreadIds
+        guard !ids.isEmpty else { return }
+        // P1: route through confirmation dialog — destructive and instant.
+        pendingDeleteThreadIds = ids
     }
 
     private func deleteThreads(_ ids: Set<AgentThreadID>) {
@@ -5164,6 +5263,12 @@ public struct AgentAppView: View {
         if let lastSelectedThreadId, ids.contains(lastSelectedThreadId) {
             self.lastSelectedThreadId = selectedThreadIds.first
         }
+    }
+
+    private func commitPendingDelete() {
+        let ids = pendingDeleteThreadIds
+        pendingDeleteThreadIds = []
+        deleteThreads(ids)
     }
 
     // MARK: Plan notes sidebar
@@ -5542,7 +5647,9 @@ enum PromptComposerKeyAction: Equatable {
             if keyCode == 125 { return .nextHistory }
         }
         guard keyCode == 36 || keyCode == 76 else { return .ignore }
-        return modifiers.contains(.shift) ? .insertNewline : .send
+        // P2: Shift+Enter and Option+Enter both insert a newline; plain Enter sends.
+        let wantsNewline = modifiers.contains(.shift) || modifiers.contains(.option)
+        return wantsNewline ? .insertNewline : .send
     }
 }
 
