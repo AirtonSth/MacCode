@@ -34,6 +34,10 @@ public final class PaneTabsView: NSObject {
     private let splitRightMenu = NSMenu()
     private let splitDownMenu = NSMenu()
     private var tabButtons: [SurfaceID: PaneTabButton] = [:]
+    // PERF: ordered SurfaceIDs currently rendered in the strip. The diff
+    // seam (`PaneTabsView.diffTabs`) compares this against the fresh pane
+    // order to patch the strip in place instead of rebuilding it.
+    private var currentSurfaceIDs: [SurfaceID] = []
     private var eventToken: UUID?
 
     public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil, workspaceID: WorkspaceID? = nil) {
@@ -69,36 +73,9 @@ public final class PaneTabsView: NSObject {
         tabScrollView.translatesAutoresizingMaskIntoConstraints = false
         tabScrollView.documentView = tabStrip
         for desc in pane.surfaces {
-            let isSel = desc.id == selectedID
-            let busy = Self.isSurfaceBusy(desc, router: router)
-            let colorHex = TabColor.from(desc.metadata["color"])?.hex
-            let sid = desc.id
-            let tab = PaneTabButton(
-                surfaceID: sid,
-                title: desc.title,
-                symbol: Self.symbol(for: desc.type),
-                selected: isSel,
-                busy: busy,
-                dirty: surfaceIsUnsaved(sid),
-                colorHex: colorHex,
-                onSelect: { [weak self] in self?.selectSurface(sid) },
-                onClose: { [weak self] in self?.closeSurface(sid) },
-                onCloseOthers: pane.surfaces.count > 1 ? { [weak self] in _ = self?.performCloseAllOthers(around: sid) } : nil,
-                onCloseToLeft: Self.surfaceIDs(in: pane, before: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToLeft(of: sid) },
-                onCloseToRight: Self.surfaceIDs(in: pane, after: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToRight(of: sid) },
-                onRename: { [weak self] in self?.promptRenameSurface(sid, current: desc.title) },
-                onSetColor: { [weak self] raw in
-                    guard let wid = self?.currentWorkspaceID() else { return }
-                    try? self?.router?.setSurfaceColor(wid, sid, raw)
-                },
-                onDropSurface: { [weak self] draggedID in
-                    self?.dropSurface(draggedID, before: sid) ?? false
-                },
-                onSplitSurface: { [weak self] draggedID, targetPane, direction in
-                    self?.performSplitSurface(draggedID, targetPane: targetPane, direction: direction) ?? false
-                }
-            )
-            tabButtons[sid] = tab
+            let tab = makeTabButton(for: desc, in: pane, selectedID: selectedID)
+            tabButtons[desc.id] = tab
+            currentSurfaceIDs.append(desc.id)
             tabStrip.addArrangedSubview(tab)
         }
 
@@ -232,6 +209,96 @@ public final class PaneTabsView: NSObject {
     private func scrollSelectedTabIntoView(_ selectedID: SurfaceID?) {
         guard let selectedID, let tab = tabButtons[selectedID] else { return }
         tabScrollView.scrollDocumentViewToVisible(tab)
+    }
+
+    /// Test seam: the live button bound to `id` (nil if none), so the
+    /// reconcile's in-place patching can be asserted without a window.
+    func tabButtonForTesting(_ id: SurfaceID) -> PaneTabButton? { tabButtons[id] }
+
+    /// Test seam: the SurfaceIDs currently rendered, in display order.
+    var currentSurfaceIDsForTesting: [SurfaceID] { currentSurfaceIDs }
+
+    /// Builds one tab button bound to `desc` within `pane`. Shared by the
+    /// initial strip build and the reconcile's insert path so a freshly
+    /// inserted button is wired identically to an initially-built one.
+    private func makeTabButton(for desc: SurfaceDescriptor, in pane: PaneNode, selectedID: SurfaceID?) -> PaneTabButton {
+        let sid = desc.id
+        return PaneTabButton(
+            surfaceID: sid,
+            title: desc.title,
+            symbol: Self.symbol(for: desc.type),
+            selected: desc.id == selectedID,
+            busy: Self.isSurfaceBusy(desc, router: router),
+            dirty: surfaceIsUnsaved(sid),
+            colorHex: TabColor.from(desc.metadata["color"])?.hex,
+            onSelect: { [weak self] in self?.selectSurface(sid) },
+            onClose: { [weak self] in self?.closeSurface(sid) },
+            onCloseOthers: pane.surfaces.count > 1 ? { [weak self] in _ = self?.performCloseAllOthers(around: sid) } : nil,
+            onCloseToLeft: Self.surfaceIDs(in: pane, before: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToLeft(of: sid) },
+            onCloseToRight: Self.surfaceIDs(in: pane, after: sid).isEmpty ? nil : { [weak self] in _ = self?.performCloseToRight(of: sid) },
+            onRename: { [weak self] in self?.promptRenameSurface(sid, current: desc.title) },
+            onSetColor: { [weak self] raw in
+                guard let wid = self?.currentWorkspaceID() else { return }
+                try? self?.router?.setSurfaceColor(wid, sid, raw)
+            },
+            onDropSurface: { [weak self] draggedID in
+                self?.dropSurface(draggedID, before: sid) ?? false
+            },
+            onSplitSurface: { [weak self] draggedID, targetPane, direction in
+                self?.performSplitSurface(draggedID, targetPane: targetPane, direction: direction) ?? false
+            }
+        )
+    }
+
+    /// PERF (P1): in-place tab-strip reconcile keyed by SurfaceID. Drives
+    /// the pure `diffTabs` seam: when the SurfaceID set and order are
+    /// unchanged, every surviving button is patched in place
+    /// (selection / title / color / dirty) with NO structural mutation of
+    /// the strip -- eliminating the full-rebuild flash. Structural deltas
+    /// (insert / remove / reorder) rebuild only this pane's buttons; pane
+    /// identity for the unchanged-shape case is preserved.
+    ///
+    /// Returns true when the strip was patched in place (no structural
+    /// change), so the caller can skip a container teardown entirely.
+    @discardableResult
+    public func reconcile(to pane: PaneNode) -> Bool {
+        let newIDs = pane.surfaces.map(\.id)
+        let diff = Self.diffTabs(old: currentSurfaceIDs, new: newIDs)
+        let selectedID = pane.selectedSurfaceID ?? pane.surfaces.first?.id
+        let structural = !diff.inserts.isEmpty || !diff.removes.isEmpty || diff.reordered
+
+        if structural {
+            // Set or order changed: rebuild this pane's buttons. Cheaper
+            // than the old whole-workspace teardown and still keyed off the
+            // diff decision.
+            for view in tabStrip.arrangedSubviews where view is PaneTabButton {
+                tabStrip.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            tabButtons.removeAll(keepingCapacity: true)
+            currentSurfaceIDs.removeAll(keepingCapacity: true)
+            var insertIndex = 0
+            for desc in pane.surfaces {
+                let tab = makeTabButton(for: desc, in: pane, selectedID: selectedID)
+                tabButtons[desc.id] = tab
+                currentSurfaceIDs.append(desc.id)
+                tabStrip.insertArrangedSubview(tab, at: insertIndex)
+                insertIndex += 1
+            }
+            DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
+            return false
+        }
+
+        // Unchanged shape: patch each surviving button in place.
+        for desc in pane.surfaces {
+            guard let tab = tabButtons[desc.id] else { continue }
+            tab.setSelected(desc.id == selectedID)
+            tab.setTitle(desc.title)
+            tab.setColorHex(TabColor.from(desc.metadata["color"])?.hex)
+            tab.setDirty(surfaceIsUnsaved(desc.id))
+            tab.setBusy(Self.isSurfaceBusy(desc, router: router))
+        }
+        return true
     }
 
     private func buildMinimizedSideRail(in root: NSView, selectedSurfaceID: SurfaceID?) {
@@ -601,6 +668,58 @@ public final class PaneTabsView: NSObject {
         tabMidXs.filter { dropX > $0 }.count
     }
 
+    /// PERF: in-place tab-strip reconcile. Pure diff between the old and
+    /// new ordered SurfaceID lists so the strip can be patched in place —
+    /// existing buttons keep their identity (no container rebuild, no
+    /// resize-end flash). Buttons whose id survives are *updated* in
+    /// place; only `inserts`/`removes` change the button set, and
+    /// `reordered` flags when the surviving ids changed relative order.
+    public struct TabStripDiff: Equatable {
+        /// ids present in `old` but absent from `new` — buttons to remove.
+        public let removes: [SurfaceID]
+        /// (id, index-in-new) for ids absent from `old` — buttons to
+        /// insert at that position in the new order.
+        public let inserts: [(id: SurfaceID, index: Int)]
+        /// ids present in BOTH lists, in new order — buttons to update in
+        /// place (selection/title/color/dirty) without rebuilding.
+        public let updates: [SurfaceID]
+        /// true when the relative order of surviving ids differs between
+        /// old and new (buttons must be reordered, not just updated).
+        public let reordered: Bool
+
+        public static func == (lhs: TabStripDiff, rhs: TabStripDiff) -> Bool {
+            lhs.removes == rhs.removes
+                && lhs.updates == rhs.updates
+                && lhs.reordered == rhs.reordered
+                && lhs.inserts.count == rhs.inserts.count
+                && zip(lhs.inserts, rhs.inserts).allSatisfy { $0.id == $1.id && $0.index == $1.index }
+        }
+    }
+
+    /// Pure tab-strip diff. Order-preserving: `updates` and the surviving
+    /// order are taken from `new`. `reordered` compares the surviving ids'
+    /// order in `old` vs `new`.
+    public static func diffTabs(old: [SurfaceID], new: [SurfaceID]) -> TabStripDiff {
+        let oldSet = Set(old)
+        let newSet = Set(new)
+        let removes = old.filter { !newSet.contains($0) }
+        var inserts: [(id: SurfaceID, index: Int)] = []
+        var updates: [SurfaceID] = []
+        for (index, id) in new.enumerated() {
+            if oldSet.contains(id) {
+                updates.append(id)
+            } else {
+                inserts.append((id: id, index: index))
+            }
+        }
+        // Surviving ids in each list's own order; if those sequences
+        // differ, the survivors were reordered.
+        let survivorsOld = old.filter { newSet.contains($0) }
+        let survivorsNew = new.filter { oldSet.contains($0) }
+        let reordered = survivorsOld != survivorsNew
+        return TabStripDiff(removes: removes, inserts: inserts, updates: updates, reordered: reordered)
+    }
+
     public static func splitDropDirection(in bounds: NSRect, at point: NSPoint) -> SplitDirection? {
         guard bounds.contains(point) else { return nil }
         let rightIntent = point.x - bounds.midX
@@ -670,7 +789,7 @@ final class PaneTabButton: NSView {
     private static weak var highlightedSplitRoot: PaneRootView?
     private static weak var dragGhost: TabDragGhostView?
     private let surfaceID: SurfaceID
-    private let title: String
+    private var title: String
     private let symbol: String
     private let onSelect: () -> Void
     private let onClose: () -> Void
@@ -686,8 +805,16 @@ final class PaneTabButton: NSView {
     private var hovering = false
     private var dragStarted = false
     private var mouseDownLocation: NSPoint?
-    private let selected: Bool
+    private var selected: Bool
     private var busy = false
+    // PERF: in-place tab reconcile. These subviews used to be local to
+    // init (baked once, then the whole strip was rebuilt on any change).
+    // Storing them lets `setSelected`/`setTitle`/`setColor` patch a tab in
+    // place keyed by SurfaceID, so a selection/title/color change does not
+    // tear down and recreate the button (no resize-end flash).
+    private let label = NSTextField(labelWithString: "")
+    private let underline = NSView()
+    private let colorRail = NSView()
     private static let dragActivationDistance: CGFloat = 8
 
     init(surfaceID: SurfaceID, title: String, symbol: String, selected: Bool, busy: Bool = false,
@@ -725,7 +852,7 @@ final class PaneTabButton: NSView {
         self.busy = busy
         installIcon(busy: busy)
 
-        let label = NSTextField(labelWithString: title)
+        label.stringValue = title
         label.font = NSFont.systemFont(ofSize: 12, weight: selected ? .medium : .regular)
         label.textColor = selected ? DS.NS.text : DS.NS.textSecondary
         label.lineBreakMode = .byTruncatingTail
@@ -793,33 +920,32 @@ final class PaneTabButton: NSView {
             sep.widthAnchor.constraint(equalToConstant: 1)
         ])
 
-        if selected {
-            let underline = NSView()
-            underline.wantsLayer = true
-            underline.layer?.backgroundColor = DS.NS.accent.cgColor
-            underline.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(underline)
-            NSLayoutConstraint.activate([
-                underline.leadingAnchor.constraint(equalTo: leadingAnchor),
-                underline.trailingAnchor.constraint(equalTo: trailingAnchor),
-                underline.bottomAnchor.constraint(equalTo: bottomAnchor),
-                underline.heightAnchor.constraint(equalToConstant: 2)
-            ])
-        }
+        // Always create the selection underline and color rail (hidden
+        // when inactive) so `setSelected`/`setColor` can toggle them in
+        // place during reconcile instead of forcing a button rebuild.
+        underline.wantsLayer = true
+        underline.layer?.backgroundColor = DS.NS.accent.cgColor
+        underline.translatesAutoresizingMaskIntoConstraints = false
+        underline.isHidden = !selected
+        addSubview(underline)
+        NSLayoutConstraint.activate([
+            underline.leadingAnchor.constraint(equalTo: leadingAnchor),
+            underline.trailingAnchor.constraint(equalTo: trailingAnchor),
+            underline.bottomAnchor.constraint(equalTo: bottomAnchor),
+            underline.heightAnchor.constraint(equalToConstant: 2)
+        ])
 
-        if let hex = colorHex {
-            let rail = NSView()
-            rail.wantsLayer = true
-            rail.layer?.backgroundColor = NSColor(hex: hex).cgColor
-            rail.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(rail)
-            NSLayoutConstraint.activate([
-                rail.leadingAnchor.constraint(equalTo: leadingAnchor),
-                rail.topAnchor.constraint(equalTo: topAnchor),
-                rail.bottomAnchor.constraint(equalTo: bottomAnchor),
-                rail.widthAnchor.constraint(equalToConstant: 3)
-            ])
-        }
+        colorRail.wantsLayer = true
+        colorRail.layer?.backgroundColor = colorHex.map { NSColor(hex: $0).cgColor }
+        colorRail.translatesAutoresizingMaskIntoConstraints = false
+        colorRail.isHidden = colorHex == nil
+        addSubview(colorRail)
+        NSLayoutConstraint.activate([
+            colorRail.leadingAnchor.constraint(equalTo: leadingAnchor),
+            colorRail.topAnchor.constraint(equalTo: topAnchor),
+            colorRail.bottomAnchor.constraint(equalTo: bottomAnchor),
+            colorRail.widthAnchor.constraint(equalToConstant: 3)
+        ])
 
         dropIndicator.wantsLayer = true
         dropIndicator.layer?.backgroundColor = DS.NS.accent.cgColor
@@ -844,6 +970,39 @@ final class PaneTabButton: NSView {
         guard self.busy != busy else { return }
         self.busy = busy
         installIcon(busy: busy)
+    }
+
+    /// PERF: in-place selection update used by the tab-strip reconcile.
+    /// Re-styles this existing button instead of recreating it, so a focus
+    /// change does not rebuild the strip.
+    func setSelected(_ selected: Bool) {
+        guard self.selected != selected else { return }
+        self.selected = selected
+        if !(hovering && !selected) {
+            layer?.backgroundColor = (selected ? DS.NS.bg : DS.NS.surface).cgColor
+        }
+        label.font = NSFont.systemFont(ofSize: 12, weight: selected ? .medium : .regular)
+        label.textColor = selected ? DS.NS.text : DS.NS.textSecondary
+        underline.isHidden = !selected
+        // Icon tint tracks selection; reinstall to recolor (cheap, and
+        // preserves the spinner when busy).
+        installIcon(busy: busy)
+    }
+
+    /// PERF: in-place title update used by the reconcile (rename).
+    func setTitle(_ title: String) {
+        guard self.title != title else { return }
+        self.title = title
+        label.stringValue = title
+    }
+
+    var titleForTesting: String { title }
+    var selectedForTesting: Bool { selected }
+
+    /// PERF: in-place color-rail update used by the reconcile.
+    func setColorHex(_ hex: UInt32?) {
+        colorRail.layer?.backgroundColor = hex.map { NSColor(hex: $0).cgColor }
+        colorRail.isHidden = hex == nil
     }
 
     private func installIcon(busy: Bool) {

@@ -749,7 +749,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         // already correct.
         let signature = workspaceContainerSignature()
         if signature == lastWorkspaceContainerSignature, !paneControllers.isEmpty {
-            shellLog.debug("rebuildWorkspaceContainer skipped (signature unchanged)")
+            // P1: structure unchanged. Selection/title/color/dirty are NOT
+            // in the structural signature, so patch each live pane strip in
+            // place via PaneTabsView.reconcile(to:) (diffTabs seam) instead
+            // of tearing the container down -- this is what removes the
+            // resize-end strip flash on focus/rename/color changes.
+            reconcilePaneControllersInPlace()
+            shellLog.debug("rebuildWorkspaceContainer reconciled in place (structure unchanged)")
             return
         }
         lastWorkspaceContainerSignature = signature
@@ -789,9 +795,23 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
     }
 
+    /// P1: applies non-structural changes (selection / title / color /
+    /// dirty) to the existing pane strips in place. Reached only when the
+    /// structural signature is unchanged, so every controller's pane still
+    /// exists in the live layout with the same id set/order.
+    private func reconcilePaneControllersInPlace() {
+        guard let ctx = context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid] else { return }
+        for controller in paneControllers {
+            guard let freshPane = ws.layout.find(paneID: controller.pane.id) else { continue }
+            controller.reconcile(to: freshPane)
+        }
+    }
+
     /// Structural fingerprint of what `rebuildWorkspaceContainer` would
     /// produce: selected workspace, sidebar/detached state, and the
-    /// pane/surface/selection/title shape of the layout tree.
+    /// pane/surface shape (id set + order) of the layout tree.
     private func workspaceContainerSignature() -> String {
         guard let ctx = context,
               let wid = ctx.state.window.selectedWorkspaceID,
@@ -807,9 +827,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     private func appendLayoutSignature(_ node: LayoutNode, into parts: inout [String]) {
         switch node {
         case .pane(let p):
-            let sel = (p.selectedSurfaceID ?? p.surfaces.first?.id)?.value.uuidString ?? "none"
-            let surfaces = p.surfaces.map { "\($0.id.value.uuidString):\($0.title)" }.joined(separator: ",")
-            parts.append("pane(\(p.id.value.uuidString);sel=\(sel);[\(surfaces)])")
+            // P1: STRUCTURAL fingerprint only -- pane id + ordered surface
+            // id SET. Selection and title are deliberately excluded so a
+            // focus/rename does NOT trigger a full teardown; those are
+            // applied in place by PaneTabsView.reconcile(to:) (driven by
+            // the diffTabs seam). Only an id-set/order change rebuilds.
+            let surfaces = p.surfaces.map { $0.id.value.uuidString }.joined(separator: ",")
+            parts.append("pane(\(p.id.value.uuidString);[\(surfaces)])")
         case .split(let s):
             parts.append("split(\(s.orientation);\(s.ratios.map { String(format: "%.3f", $0) }.joined(separator: ",")){")
             for child in s.children { appendLayoutSignature(child, into: &parts) }
