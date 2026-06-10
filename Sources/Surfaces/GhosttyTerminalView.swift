@@ -600,6 +600,13 @@ final class GhosttyTerminalView: NSView {
     /// UTF-8-encoded string. When nil, the text is sent without confirmation.
     var onPlainTextDragNeedsConfirm: ((String) -> Void)?
 
+    /// Called when a Cmd+V paste payload requires user confirmation before
+    /// being sent to the PTY (multi-line or control-character content).
+    /// The receiver should present a confirmation sheet and, on approval, call
+    /// `writeInputData` with the UTF-8-encoded string. When nil, the text is
+    /// sent without confirmation (same fall-through as the drag path).
+    var onPasteNeedsConfirm: ((String) -> Void)?
+
     /// Injected by the owning TerminalSurface to persist font zoom per workspace.
     /// When nil, zoom changes are session-only (not persisted).
     var fontZoomStore: (any SettingsWriteRepository)?
@@ -649,6 +656,23 @@ final class GhosttyTerminalView: NSView {
     /// on first `updateScrollbackPosition` call. Hidden when at the bottom.
     private var scrollbackIndicator: NSTextField?
 
+    /// The most recent OSC 2 / SET_TITLE value received from the running program.
+    /// Used to form the VoiceOver accessibility label "Terminal — <title>".
+    /// Empty string means no title has been set yet; the label falls back to "Terminal".
+    private var currentTitle: String = ""
+
+    /// Transient font-zoom HUD overlay (bottom-left corner). Lazily created on
+    /// first zoom action and auto-hidden after a brief delay.
+    private var fontZoomHUD: NSTextField?
+    /// Generation counter so only the most-recent zoom action dismisses the HUD.
+    private var fontZoomHUDGeneration = 0
+
+    /// Timestamp of the last VoiceOver `valueChanged` notification. Used to
+    /// coalesce rapid-output notifications so VO is not spammed every 20ms.
+    private var lastVOValueChangedAt: TimeInterval = 0
+    /// Minimum interval between VoiceOver `valueChanged` notifications (seconds).
+    private static let voValueChangedInterval: TimeInterval = 0.5
+
     private static let immediateOutputFlushBytes = 64 * 1024
     private static let maxPendingOutputBytes = 1024 * 1024
     private static let outputFlushDelay: TimeInterval = 0.02
@@ -678,6 +702,11 @@ final class GhosttyTerminalView: NSView {
     // VoiceOver can read what the terminal currently shows (QA-001).
     override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
     override func accessibilityValue() -> Any? { readViewportText() }
+    /// "Terminal — <title>" when an OSC title is set, otherwise "Terminal".
+    /// VoiceOver reads this on focus so users know which tab they landed on.
+    override func accessibilityLabel() -> String? {
+        currentTitle.isEmpty ? "Terminal" : "Terminal \u{2014} \(currentTitle)"
+    }
 
     override func makeBackingLayer() -> CALayer {
         guard Self.nativeRendererEnabled else { return CALayer() }
@@ -894,6 +923,16 @@ final class GhosttyTerminalView: NSView {
         // cf_release_thread). Only post an async refresh so Ghostty's single
         // renderer thread draws.
         ghostty_surface_refresh(surface)
+        // Notify VoiceOver that the terminal content changed so screen readers
+        // can re-read the viewport. Coalesced to avoid spamming VO on rapid output.
+        postVOValueChangedIfNeeded()
+    }
+
+    private func postVOValueChangedIfNeeded() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastVOValueChangedAt >= Self.voValueChangedInterval else { return }
+        lastVOValueChangedAt = now
+        NSAccessibility.post(element: self, notification: .valueChanged)
     }
 
     /// Apply an effect produced by the Ghostty runtime action callback.
@@ -901,6 +940,7 @@ final class GhosttyTerminalView: NSView {
     func applyActionEffect(_ effect: GhosttyActionEffect) {
         switch effect {
         case .setTitle(let title):
+            currentTitle = title
             onTitleChange?(title)
         case .mouseShape(let shape):
             NSCursor.pop()
@@ -1478,6 +1518,7 @@ final class GhosttyTerminalView: NSView {
         performBindingAction(action)
         updateGhosttySize(force: true)
         updateZoomDelta(for: action)
+        showFontZoomHUD()
     }
 
     /// Update `zoomDelta` to reflect the zoom action and persist to the KV store.
@@ -1656,6 +1697,60 @@ final class GhosttyTerminalView: NSView {
         }
     }
 
+    // MARK: - Font zoom HUD
+
+    /// Show a brief bottom-left overlay indicating the current zoom level, then
+    /// auto-hide it after a short delay. "Base" means delta == 0 (no zoom).
+    private func showFontZoomHUD() {
+        let text = Self.fontZoomHUDText(for: zoomDelta)
+        let label = fontZoomHUD ?? makeFontZoomHUD()
+        fontZoomHUD = label
+        label.stringValue = text
+        label.isHidden = false
+        label.sizeToFit()
+        repositionFontZoomHUD()
+        fontZoomHUDGeneration &+= 1
+        let gen = fontZoomHUDGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.fontZoomHUDGeneration == gen else { return }
+            self.fontZoomHUD?.isHidden = true
+        }
+    }
+
+    /// Human-readable HUD text for a zoom delta. Pure, nonisolated for tests.
+    nonisolated static func fontZoomHUDText(for delta: Int) -> String {
+        if delta == 0 { return "Font: Base" }
+        return delta > 0 ? "Font: +\(delta)pt" : "Font: \(delta)pt"
+    }
+
+    private func makeFontZoomHUD() -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        label.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        label.textColor = DS.NS.textSecondary
+        label.backgroundColor = DS.NS.surface.withAlphaComponent(0.85)
+        label.drawsBackground = true
+        label.isBordered = false
+        label.wantsLayer = true
+        label.layer?.cornerRadius = 4
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setAccessibilityIdentifier("terminal.font-zoom-hud")
+        label.setAccessibilityLabel("Font zoom level")
+        addSubview(label)
+        return label
+    }
+
+    private func repositionFontZoomHUD() {
+        guard let label = fontZoomHUD else { return }
+        let size = label.fittingSize
+        let margin: CGFloat = 8
+        label.frame = NSRect(
+            x: margin,
+            y: margin,
+            width: size.width + 8,
+            height: size.height + 2
+        )
+    }
+
     override func otherMouseDown(with event: NSEvent) {
         // Middle-click pastes the current terminal selection (X11/iTerm style)
         // when the program isn't reporting mouse events; otherwise forward the
@@ -1807,7 +1902,18 @@ final class GhosttyTerminalView: NSView {
 
     private func pasteText(to surface: ghostty_surface_t) {
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
-        sendText(text, to: surface)
+        switch PasteGuard.classify(text) {
+        case .safe:
+            sendText(text, to: surface)
+        case .needsConfirm:
+            if let confirm = onPasteNeedsConfirm {
+                confirm(text)
+            } else {
+                // No confirmation handler wired (e.g. unit tests / preview): send
+                // directly as a safe fall-through, matching TerminalTextView behaviour.
+                sendText(text, to: surface)
+            }
+        }
     }
 
     private func pasteSelection(from surface: ghostty_surface_t) {

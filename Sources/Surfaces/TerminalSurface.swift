@@ -394,6 +394,58 @@ public enum PasteGuard {
     }
 }
 
+// MARK: - Bell detector (pure, non-MainActor, testable)
+
+/// Detects whether a PTY data chunk contains a real BEL (0x07) — one that is
+/// NOT the OSC string-terminator in an `ESC ] ... BEL` sequence.
+///
+/// Background: OSC (Operating System Command) sequences use BEL as one of the
+/// two legal string terminators (the other is `ESC \`). A title-set sequence
+/// looks like: `ESC (0x1B) ] (0x5D) 0 ; <title> BEL (0x07)`. The 0x07 there
+/// terminates the OSC and must NOT be treated as an audible bell — doing so
+/// produces spurious "unread" activity dots every time the shell changes the tab
+/// title (UX-TERM-BEL-FALSE-POSITIVE).
+///
+/// Keeping this pure (no AppKit, no actor) lets unit tests cover the scanning
+/// logic without a live terminal.
+public enum BellDetector {
+    /// Returns `true` when `data` contains at least one BEL byte (0x07) that
+    /// is NOT acting as an OSC string-terminator.
+    ///
+    /// State machine:
+    /// - Scanning normally: 0x1B starts `.afterESC`.
+    /// - `.afterESC + 0x5D` → `.inOSC` (inside OSC payload).
+    /// - `.inOSC + 0x07` → OSC-terminator BEL, ignored; back to `.scanning`.
+    /// - `.inOSC + 0x1B` → starts `.afterESCinOSC` (two-byte ST path).
+    /// - `.afterESCinOSC + 0x5C` → two-byte ST, back to `.scanning`.
+    /// - `.afterESCinOSC + anything-else` → not ST, back to `.inOSC`.
+    /// - `.scanning + 0x07` → real BEL, return `true`.
+    /// - Any other byte resets `.afterESC` back to `.scanning`.
+    public nonisolated static func containsStandaloneBEL(_ data: Data) -> Bool {
+        var state: State = .scanning
+        for byte in data {
+            switch state {
+            case .scanning:
+                if byte == 0x07 { return true }
+                if byte == 0x1B { state = .afterESC }
+            case .afterESC:
+                if byte == 0x5D { state = .inOSC } else { state = .scanning }
+            case .inOSC:
+                if byte == 0x07 { state = .scanning }      // OSC BEL terminator
+                else if byte == 0x1B { state = .afterESCinOSC }
+                // else: still inside OSC payload — remain in .inOSC
+            case .afterESCinOSC:
+                // 0x5C = '\\' completes the two-byte ST (ESC \)
+                state = .inOSC
+                if byte == 0x5C { state = .scanning }
+            }
+        }
+        return false
+    }
+
+    private enum State { case scanning, afterESC, inOSC, afterESCinOSC }
+}
+
 // MARK: - Bell preferences (pure, non-MainActor, testable)
 
 /// User-configurable bell preferences.
@@ -664,6 +716,26 @@ public final class TerminalSurface: NSObject, Surface {
                 NSSound.beep()
             }
         }
+        // Forward paste-confirmation requests from the Ghostty view to any
+        // app-level handler wired on this surface (e.g. AppCommandRouter).
+        terminalView.onPasteNeedsConfirm = { [weak self] (text: String) in
+            guard let self else { return }
+            let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
+            let alert = NSAlert()
+            alert.messageText = "Paste \(lineCount) lines into the terminal?"
+            alert.informativeText = "The pasted text spans multiple lines or contains control characters and will run immediately."
+            alert.addButton(withTitle: "Paste")
+            alert.addButton(withTitle: "Cancel")
+            let onResponse: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+                guard resp == .alertFirstButtonReturn, let data = text.data(using: .utf8) else { return }
+                _ = self?.writeToPTY(data)
+            }
+            if let window = self.ghosttyView.window {
+                alert.beginSheetModal(for: window, completionHandler: onResponse)
+            } else {
+                onResponse(alert.runModal())
+            }
+        }
         terminalView.onTerminalSizeChange = { [weak self] size in
             guard let self else { return }
             self.applyTerminalSize(size, sendToPTY: self.masterFD >= 0)
@@ -837,8 +909,10 @@ public final class TerminalSurface: NSObject, Surface {
         descriptor.hasUnreadActivity = true
         // BEL (0x07): keep activity feedback non-visual. Some long-running CLIs
         // emit repeated bells, and repainting the terminal background reads as
-        // pane flicker.
-        if data.contains(0x07) { handleBell() }
+        // pane flicker. Use BellDetector so that 0x07 acting as an OSC string-
+        // terminator (e.g. inside ESC ] 0 ; title BEL) does not trigger a false
+        // unread-activity dot (UX-TERM-BEL-FALSE-POSITIVE).
+        if BellDetector.containsStandaloneBEL(data) { handleBell() }
         // HC-1: stream raw PTY output to the mirror in real time.
         outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
