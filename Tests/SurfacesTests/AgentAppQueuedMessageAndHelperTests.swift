@@ -378,6 +378,38 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         }
     }
 
+    // MARK: - isImageAttachment (P3 thumbnail chip helper)
+
+    func test_isImageAttachment_trueForImageExtensions() {
+        // WHY: thumbnail branch in attachmentChipLeadingContent fires iff
+        // isImageAttachment returns true; wrong false-negative => no thumbnail shown.
+        let imagePaths = ["photo.png", "banner.jpg", "shot.jpeg", "raw.heic", "anim.gif",
+                          "cap.PNG", "cap.JPG", "cap.JPEG", "cap.HEIC", "cap.GIF"]
+        for path in imagePaths {
+            XCTAssertTrue(AgentAppView.isImageAttachment(path),
+                          "isImageAttachment must be true for \(path) — chip thumbnail depends on this")
+        }
+    }
+
+    func test_isImageAttachment_falseForNonImageExtensions() {
+        // WHY: non-image files must fall back to icon+name, not attempt thumbnail.
+        let nonImagePaths = ["notes.txt", "report.pdf", "main.swift", "data.json", "noextension"]
+        for path in nonImagePaths {
+            XCTAssertFalse(AgentAppView.isImageAttachment(path),
+                           "isImageAttachment must be false for \(path) — should not attempt image thumbnail")
+        }
+    }
+
+    func test_isImageAttachment_isCaseInsensitive() {
+        // WHY: macOS file-system is case-insensitive; mixed-case extensions are real.
+        XCTAssertTrue(AgentAppView.isImageAttachment("IMG_0001.HEIC"),
+                      "isImageAttachment must handle uppercase HEIC — common iPhone export format")
+        XCTAssertTrue(AgentAppView.isImageAttachment("photo.Jpeg"),
+                      "isImageAttachment must handle mixed-case .Jpeg")
+        XCTAssertFalse(AgentAppView.isImageAttachment("doc.PDF"),
+                       "isImageAttachment must return false for PDF regardless of case")
+    }
+
     // MARK: - turnDurationLabel
 
     func test_turnDurationLabel_returnsNilForEmptyTurn() {

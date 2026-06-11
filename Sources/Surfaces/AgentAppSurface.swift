@@ -4106,11 +4106,17 @@ public struct AgentAppView: View {
         absoluteTimestampFormatter.string(from: date)
     }
 
-    // UX-MAC_AGENT-018: composer chips classify by extension for the icon.
-    private static let imageChipExtensions: Set<String> = [
+    // UX-MAC_AGENT-018: composer chips classify by extension for the icon/thumbnail.
+    // nonisolated: immutable Sendable set; read from both MainActor (isImagePath)
+    // and nonisolated (isImageAttachment) contexts.
+    nonisolated private static let imageChipExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"
     ]
     static func isImagePath(_ path: String) -> Bool {
+        imageChipExtensions.contains((path as NSString).pathExtension.lowercased())
+    }
+    // P3: nonisolated static so tests need no MainActor wrapper.
+    nonisolated static func isImageAttachment(_ path: String) -> Bool {
         imageChipExtensions.contains((path as NSString).pathExtension.lowercased())
     }
 
@@ -5319,13 +5325,27 @@ public struct AgentAppView: View {
         .help("Stop running agent")
     }
 
+    // P3: thumbnail for image attachments; falls back to doc icon for non-images.
+    @ViewBuilder private func attachmentChipLeadingContent(_ path: String) -> some View {
+        if Self.isImageAttachment(path), let img = NSImage(contentsOfFile: path) {
+            Image(nsImage: img)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 18, height: 18)
+                .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+        } else {
+            Image(systemName: Self.isImagePath(path) ? "photo" : "doc")
+                .font(.system(size: 9))
+        }
+    }
+
     private var attachmentChips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: DS.Space.sm) {
                 ForEach(vm.attachments, id: \.self) { path in
                     HStack(spacing: DS.Space.xs) {
-                        // UX-MAC_AGENT-018: image attachments read as images.
-                        Image(systemName: Self.isImagePath(path) ? "photo" : "doc").font(.system(size: 9))
+                        // P3: render thumbnail for image files; icon+name for others.
+                        attachmentChipLeadingContent(path)
                         Text((path as NSString).lastPathComponent)
                             .font(DS.Font.caption2).lineLimit(1)
                         Button { vm.removeAttachment(path) } label: {
