@@ -748,7 +748,7 @@ public struct SettingsView: View {
 
     private var remoteAccessSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Remote Access")
+            DSSectionHeaderG("Remote Access")
             settingRow("Allow iPhone or iPad on your network") {
                 Toggle("", isOn: Binding(
                     get: { vm.remoteAccessEnabled },
@@ -766,7 +766,7 @@ public struct SettingsView: View {
 
     private var diffDefaultsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Diff Defaults")
+            DSSectionHeaderG("Diff Defaults")
             settingRow("Word wrap") {
                 Toggle("", isOn: Binding(
                     get: { vm.appSettings.diffWordWrap },
@@ -792,7 +792,7 @@ public struct SettingsView: View {
 
     private var sidebarSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Sidebar")
+            DSSectionHeaderG("Sidebar")
             settingRow("Workspace sort order") {
                 Picker("", selection: Binding(
                     get: { vm.appSettings.sidebarSort },
@@ -812,7 +812,7 @@ public struct SettingsView: View {
 
     private var insomniaSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Insomnia")
+            DSSectionHeaderG("Insomnia")
             settingRow("Keep Mac awake while agents run") {
                 Toggle("", isOn: Binding(
                     get: { vm.appSettings.insomniaEnabled },
@@ -856,7 +856,7 @@ public struct SettingsView: View {
 
     private var tokenSaverSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Token Saver")
+            DSSectionHeaderG("Token Saver")
             settingRow("Enable Token Saver (requires subscription)") {
                 Toggle("", isOn: Binding(
                     get: { vm.appSettings.tokenSaverEnabled },
@@ -874,7 +874,7 @@ public struct SettingsView: View {
 
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Advanced")
+            DSSectionHeaderG("Advanced")
             settingRow("Session Learn (writes to CLAUDE.md / AGENTS.md)") {
                 Toggle("", isOn: Binding(
                     get: { vm.appSettings.sessionLearnEnabled },
@@ -900,7 +900,7 @@ public struct SettingsView: View {
 
     private var customModelsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Custom Models")
+            DSSectionHeaderG("Custom Models")
             let hasModels = AgentProvider.allCases.contains { !(vm.customModelsByProvider[$0] ?? []).isEmpty }
             if !hasModels {
                 Text("No custom models saved. Add one from the Agent model menu.")
@@ -947,7 +947,7 @@ public struct SettingsView: View {
 
     private var trustedDevicesSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Trusted Devices")
+            DSSectionHeaderG("Trusted Devices")
             if !vm.remoteAccessEnabled {
                 Text("Turn on Remote Access for paired devices to reach this Mac. A pairing code generated while it's off won't be reachable from another device.")
                     .font(DS.Font.caption)
@@ -1086,7 +1086,7 @@ public struct SettingsView: View {
 
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeader("Diagnostics")
+            DSSectionHeaderG("Diagnostics")
             cliPathRow(
                 label: "Codex path",
                 draft: $codexPathDraft,

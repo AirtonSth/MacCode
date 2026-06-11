@@ -1057,7 +1057,7 @@ public struct DiffPanelView: View {
 
     private var changesView: some View {
         VStack(spacing: 0) {
-            DSSectionHeader("Changes · \(vm.summary.files.count)")
+            DSSectionHeaderG("Changes · \(vm.summary.files.count)")
             if vm.summary.files.isEmpty {
                 DSEmptyState(icon: "checkmark.seal", title: "No changes",
                              subtitle: "The working tree is clean.")
@@ -1387,7 +1387,7 @@ public struct DiffPanelView: View {
                          subtitle: "No commits found for this repository.")
         } else {
             VStack(spacing: 0) {
-                DSSectionHeader("History · \(vm.filteredCommits.count)\(vm.historyFilter.isEmpty ? "" : " (filtered)")")
+                DSSectionHeaderG("History · \(vm.filteredCommits.count)\(vm.historyFilter.isEmpty ? "" : " (filtered)")")
                 historyFilterField
                 let displayed = vm.filteredCommits
                 if displayed.isEmpty {

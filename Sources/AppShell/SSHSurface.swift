@@ -1811,7 +1811,7 @@ private struct SSHSidebarView: View {
                 collapsedRail
             } else {
                 VStack(alignment: .leading, spacing: 0) {
-                    DSSectionHeader("SSH", trailing: AnyView(
+                    DSSectionHeaderG("SSH") {
                         HStack(spacing: DS.Space.xs) {
                             DSIconButton("sidebar.left", help: "Hide hosts") {
                                 vm.hostSidebarIntent = .forcedHidden
@@ -1827,7 +1827,7 @@ private struct SSHSidebarView: View {
                             }
                             .accessibilityIdentifier("ssh.host.add")
                         }
-                    ))
+                    }
                     Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
@@ -1993,7 +1993,7 @@ private struct SSHTransferSidebarView: View {
         GeometryReader { proxy in
             let boundedQueueHeight = min(max(queueHeight, 112), max(112, proxy.size.height * 0.42))
             VStack(alignment: .leading, spacing: 0) {
-                DSSectionHeader("Files", trailing: AnyView(
+                DSSectionHeaderG("Files") {
                     HStack(spacing: DS.Space.xs) {
                         DSIconButton("arrow.clockwise", help: "Refresh both panes") {
                             vm.onRefreshLocalFiles?()
@@ -2005,7 +2005,7 @@ private struct SSHTransferSidebarView: View {
                         }
                         .accessibilityIdentifier("ssh.sidebar.transfer.toggle")
                     }
-                ))
+                }
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
                 GeometryReader { contentProxy in
                     let panesHeight = max(220, contentProxy.size.height - boundedQueueHeight - 9)

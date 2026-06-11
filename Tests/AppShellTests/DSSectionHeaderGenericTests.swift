@@ -65,4 +65,41 @@ final class DSSectionHeaderGenericTests: XCTestCase {
         XCTAssertEqual(header.title, "raw title",
             "Stored title must be the raw string; uppercasing happens at render time via displayTitle")
     }
+
+    // MARK: - Call-site migration: AnyView erasure eliminated (PERF-DS-001)
+
+    // WHY: DSSectionHeader call sites in SettingsWindow/DiffPanelSurface/SSHSurface were
+    // migrated to DSSectionHeaderG to remove AnyView erasure on sidebar/list hot paths.
+    // This test verifies the migration invariant: a no-trailing DSSectionHeaderG produces
+    // EmptyView (never AnyView), and a @ViewBuilder trailing produces the concrete content
+    // type.  If the invariant breaks, SwiftUI structural identity is lost and the diffing
+    // perf regression returns silently.
+
+    func testMigratedNoTrailingCallSiteIsNotAnyView() {
+        // Matches the migrated SettingsWindow / DiffPanelSurface pattern:
+        //   DSSectionHeaderG("Remote Access")  (no trailing)
+        let header = DSSectionHeaderG<EmptyView>("Remote Access")
+        XCTAssertFalse(header.trailing is AnyView,
+            "No-trailing call site must store EmptyView; AnyView erasure defeats SwiftUI identity diffing on sidebar hot path")
+        XCTAssertTrue(header.trailing is EmptyView,
+            "No-trailing init must store EmptyView so SwiftUI can short-circuit unchanged subtrees")
+    }
+
+    func testMigratedViewBuilderTrailingIsConcreteHStack() {
+        // Matches the migrated SSHSurface pattern:
+        //   DSSectionHeaderG("SSH") { HStack { ... } }
+        let header = DSSectionHeaderG("Files") {
+            HStack { Text("Refresh") }
+        }
+        // Trailing must be a concrete HStack<Text>, not AnyView.
+        // Compile-time: Trailing == HStack<Text> proves no erasure.
+        // Runtime mirror check confirms the stored value is not AnyView.
+        let mirror = Mirror(reflecting: header)
+        let trailingChild = mirror.children.first(where: { $0.label == "trailing" })
+        XCTAssertNotNil(trailingChild,
+            "DSSectionHeaderG must expose a 'trailing' stored property for Mirror inspection")
+        XCTAssertFalse(trailingChild?.value is AnyView,
+            "ViewBuilder trailing call site must store a concrete HStack, not AnyView; " +
+            "AnyView erasure here would silently re-introduce the identity regression on the SSH sidebar hot path")
+    }
 }
