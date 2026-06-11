@@ -723,10 +723,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         heading.frame = NSRect(x: 20, y: 210, width: 360, height: 20)
         content.addSubview(heading)
 
-        // Informative text
+        // UX-P2: always show the confirmation instruction; append source IP when
+        // available so the user can cross-check the device identity without losing
+        // the "check the code" prompt that was previously replaced by the IP.
         let infoText: String
         if let ip = prompt.sourceIP {
-            infoText = "Source: \(ip)"
+            infoText = "Confirm this code matches the device (from \(ip)):"
         } else {
             infoText = "Confirm this code matches the device:"
         }

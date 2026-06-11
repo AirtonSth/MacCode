@@ -1822,17 +1822,31 @@ private struct FilesSurfaceRoot: View {
             .frame(width: 190)
             .onChange(of: model.readerMode) { newValue in model.setReaderMode(newValue) }
             .accessibilityIdentifier("files.readerMode.picker")
+            // UX-P3: visible text labels so the Save/Discard affordance is legible
+            // without relying on the tooltip or icon recognition alone.
             Button { model.save() } label: {
-                DisketteIcon()
-                    .frame(width: 16, height: 16)
+                HStack(spacing: 4) {
+                    DisketteIcon()
+                        .frame(width: 14, height: 14)
+                    Text("Save")
+                        .font(DS.Font.captionStrong)
+                }
             }
-                .help("Save")
+                .help("Save (Command-S)")
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(!model.isDirty)
+                .accessibilityLabel("Save file")
                 .accessibilityIdentifier("files.save.button")
-            Button { confirmDiscard = true } label: { Image(systemName: "arrow.uturn.backward") }
-                .help("Discard")
+            Button { confirmDiscard = true } label: {
+                Label("Discard", systemImage: "arrow.uturn.backward")
+                    .font(DS.Font.captionStrong)
+            }
+                .help("Discard unsaved changes (Command-Delete)")
+                // UX-P3: keyboard shortcut for discard so keyboard users can trigger
+                // the confirm dialog without reaching for the mouse.
+                .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(!model.isDirty)
+                .accessibilityLabel("Discard unsaved changes")
                 .accessibilityIdentifier("files.discard.button")
         }
         .buttonStyle(.borderless)
