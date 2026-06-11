@@ -713,6 +713,7 @@ public struct SettingsView: View {
                     sidebarSection
                     insomniaSection
                     tokenSaverSection
+                    keybindingsSection
                     advancedSection
                     customModelsSection
                     trustedDevicesSection
@@ -870,6 +871,13 @@ public struct SettingsView: View {
                 .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    // todo/macos-app.md :142 - Keybindings editor pane (list parsed bindings +
+    // warnings, conflict detection vs the static menu map, record-a-shortcut,
+    // live-reload watcher). Heavy view code lives in KeybindingsSettingsPane.swift.
+    private var keybindingsSection: some View {
+        KeybindingsSettingsPane()
     }
 
     private var advancedSection: some View {
