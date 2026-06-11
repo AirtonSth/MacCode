@@ -86,16 +86,21 @@ public struct KeybindingConfig: Equatable {
     /// it once and serve the cached config. `loadDefaultPath()` previously
     /// re-read + re-parsed the file on every menu-item override. Call
     /// `invalidateCache()` from a file-watch event if live reload is wired.
-    private static var cached: KeybindingConfig?
+    ///
+    /// `@MainActor` enforces the documented invariant that the cache is only
+    /// accessed from the main thread, preventing a data race if a background
+    /// consumer is ever added (PERF note: currently only AppDelegate on MainActor
+    /// calls these).
+    @MainActor private static var cached: KeybindingConfig?
 
-    public static func loadDefaultPath() -> KeybindingConfig {
+    @MainActor public static func loadDefaultPath() -> KeybindingConfig {
         if let cached { return cached }
         let config = load(path: defaultPath)
         cached = config
         return config
     }
 
-    public static func invalidateCache() {
+    @MainActor public static func invalidateCache() {
         cached = nil
     }
 }

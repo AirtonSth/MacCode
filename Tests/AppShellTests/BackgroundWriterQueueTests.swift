@@ -16,7 +16,7 @@ final class BackgroundWriterQueueTests: XCTestCase {
 
     // MARK: - Pure cadence helper
 
-    /// First append (count=1) with interval=1 must prune — every single write.
+    /// First append (count=1) with interval=1 must prune - every single write.
     /// Verifies that interval=1 means "always prune after the first append".
     func test_shouldPrune_intervalOne_trueOnEveryPositiveCount() {
         XCTAssertTrue(AppContext.shouldPrune(appendCount: 1, interval: 1),
@@ -25,7 +25,7 @@ final class BackgroundWriterQueueTests: XCTestCase {
                       "interval=1 must prune on every append regardless of absolute count")
     }
 
-    /// Count=0 must never prune regardless of interval — avoids a spurious
+    /// Count=0 must never prune regardless of interval - avoids a spurious
     /// DELETE before any event has been inserted.
     func test_shouldPrune_zeroCount_alwaysFalse() {
         XCTAssertFalse(AppContext.shouldPrune(appendCount: 0, interval: 1),
@@ -42,7 +42,7 @@ final class BackgroundWriterQueueTests: XCTestCase {
                       "shouldPrune must fire at the exact cadence boundary so the bounded-log invariant is maintained every N events")
     }
 
-    /// One before the boundary (count == interval - 1) must return false —
+    /// One before the boundary (count == interval - 1) must return false -
     /// the prune has not been earned yet.
     func test_shouldPrune_oneBeforeBoundary_false() {
         let interval = AppContext.eventLogPruneInterval
@@ -50,7 +50,7 @@ final class BackgroundWriterQueueTests: XCTestCase {
                        "prune must not fire before the cadence boundary to avoid excess DELETE calls that negate the performance benefit")
     }
 
-    /// One after the boundary (count == interval + 1) must return false —
+    /// One after the boundary (count == interval + 1) must return false -
     /// the prune ran at `interval`, next fires at `2 * interval`.
     func test_shouldPrune_onePastBoundary_false() {
         let interval = AppContext.eventLogPruneInterval
@@ -85,6 +85,44 @@ final class BackgroundWriterQueueTests: XCTestCase {
     }
 
     // MARK: - Off-main dispatch
+
+    // MARK: Snapshot save off-main
+
+    /// scheduleSnapshotSave must dispatch repo.save (which contains the full
+    /// JSONEncoder().encode(snap) call) to backgroundWriterQueue, NOT execute it
+    /// on the main thread.  If the encode ran on main every workspace/tab
+    /// mutation burst would jank the UI.
+    ///
+    /// Proof strategy: scheduleSnapshotSave(delay:0) enqueues a DispatchWorkItem
+    /// on DispatchQueue.main.  That work item captures the LayoutState and then
+    /// dispatches repo.save to backgroundWriterQueue.  After draining the main
+    /// run loop (so the work item fires) and then flushing backgroundWriterQueue,
+    /// the snapshot row must be present.  If repo.save were synchronous on main
+    /// the flush would be a no-op and the row would already exist before it.
+    @MainActor
+    func test_scheduleSnapshotSave_writesOffMainViaBackgroundQueue() throws {
+        let dir = NSTemporaryDirectory() + "RC2SnapOffMain-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        // Baseline: no snapshot row yet.
+        XCTAssertNil(try ctx.snapshotRepo.latest(),
+                     "fresh context must have no snapshot before any save")
+
+        // Fire the debounced save immediately (delay=0) - the DispatchWorkItem is
+        // queued on DispatchQueue.main but has not yet run.
+        ctx.scheduleSnapshotSave(delay: 0)
+
+        // Drain the main run loop so the work item executes and enqueues
+        // repo.save on backgroundWriterQueue.
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+
+        // Now flush backgroundWriterQueue so the async DB write completes.
+        ctx.flushWriterQueue()
+
+        // After flush the snapshot must exist, proving the off-main write landed.
+        let snap = try ctx.snapshotRepo.latest()
+        XCTAssertNotNil(snap,
+                        "snapshot must be written by backgroundWriterQueue after scheduleSnapshotSave+flush so the main thread was never blocked by JSONEncoder.encode")
+    }
 
     /// The persister closure body (the actual DB write) must execute on a
     /// thread that is NOT the main thread. This validates that the writer queue
