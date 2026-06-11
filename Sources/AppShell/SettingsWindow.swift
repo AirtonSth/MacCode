@@ -183,6 +183,10 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var updateAvailability: AppUpdateAvailability = .unknown
     /// Non-nil while a revoke failure message is pending display.
     @Published public var revokeErrorMessage: String?
+    /// Non-nil when a settings toggle write fails so the UI can surface the
+    /// error and tell the user the value will revert on next launch
+    /// (P2-Settings-5: try? repo.set was silently swallowing errors).
+    @Published public var settingsWriteError: String?
     /// Mirrors `UNAuthorizationStatus` so the Settings view can react to
     /// permission changes made in System Settings between open/close cycles.
     /// `.notDetermined` is the safe default before the first async probe.
@@ -256,6 +260,14 @@ public final class SettingsViewModel: ObservableObject {
         self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
         self.updateAvailability = updater?.availability ?? .unknown
         reload()
+        // P2-Settings-5: surface toggle write failures instead of silently
+        // swallowing them. Assigned after stored-property init so the closure may
+        // capture self. Called on the calling thread (MainActor for all callers).
+        self.settingsStore.onWriteError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.settingsWriteError = "Settings could not be saved: \(error.localizedDescription). The change will revert on next launch."
+            }
+        }
         // Keep separate Settings/Account window instances in sync: when either
         // posts an account/remote-access change, refresh this instance too so it
         // never shows stale status (mirrors SidebarViewModel's observer).
@@ -637,6 +649,30 @@ public struct SettingsView: View {
                     .buttonStyle(DSSecondaryButtonStyle())
                     .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier("settings.done")
+            }
+
+            // P2-Settings-5: surface toggle write errors as a dismissible banner.
+            if let err = vm.settingsWriteError {
+                HStack(spacing: DS.Space.sm) {
+                    Text(err)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.danger)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        vm.settingsWriteError = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityLabel("Dismiss")
+                    .accessibilityIdentifier("settings.writeError.dismiss")
+                }
+                .padding(DS.Space.sm)
+                .background(DS.Palette.danger.opacity(0.10))
+                .cornerRadius(DS.Radius.card)
+                .accessibilityIdentifier("settings.writeError")
             }
 
             ScrollView {
