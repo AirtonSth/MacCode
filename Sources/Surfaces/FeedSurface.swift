@@ -139,6 +139,11 @@ public final class FeedPanelViewModel: ObservableObject {
 
 public struct FeedPanelView: View {
     @ObservedObject var vm: FeedPanelViewModel
+    // UX-P2: re-render relative timestamps every second so "12s ago" stays
+    // accurate instead of going stale while the feed is paused or idle.
+    @State private var timestampTick: Int = 0
+    // UX-P2: require confirmation before clearing -- irreversible and instant.
+    @State private var showClearConfirm: Bool = false
     public init(vm: FeedPanelViewModel) { self.vm = vm }
 
     public var body: some View {
@@ -174,10 +179,17 @@ public struct FeedPanelView: View {
                             .accessibilityIdentifier("feed.pause.badge")
                     }
                 }
-                DSIconButton("trash", help: "Clear feed") { vm.clear() }
+                // UX-P2: confirm before clearing -- instant and irreversible.
+                DSIconButton("trash", help: "Clear feed") { showClearConfirm = true }
                     .accessibilityLabel("Clear feed")
                     .accessibilityIdentifier("feed.clear")
                     .disabled(vm.items.isEmpty)
+                    .confirmationDialog("Clear all feed events?", isPresented: $showClearConfirm) {
+                        Button("Clear Feed", role: .destructive) { vm.clear() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This removes all events and cannot be undone.")
+                    }
                 HStack(spacing: DS.Space.xs) {
                     TextField("filter", text: $vm.filter)
                         .textFieldStyle(.plain)
@@ -222,6 +234,8 @@ public struct FeedPanelView: View {
                                     Text(vm.relativeTime(for: item))
                                         .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
                                         .help(item.ts.formatted(date: .abbreviated, time: .standard))
+                                        // Force re-render each tick so relative time stays accurate.
+                                        .id("ts-\(item.id)-\(timestampTick)")
                                 }
                                 if !item.title.isEmpty {
                                     Text(item.title).font(DS.Font.caption)
@@ -251,6 +265,9 @@ public struct FeedPanelView: View {
             }
         }
         .background(DS.Palette.surface)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            timestampTick &+= 1
+        }
     }
 
     private func kindTone(_ k: String) -> DSPill.Tone {
