@@ -1,10 +1,11 @@
 import Foundation
 import CoreModel
 
+#if DEBUG
 /// Test-only deterministic fixture builder. Never used by production builds.
 /// Each scenario returns a fully formed in-memory or disk-backed state that
 /// downstream tests/UI suites can rely on without reading real user data.
-public enum FixtureScenario: String, Sendable {
+public enum FixtureScenario: String, CaseIterable, Sendable {
     case empty
     case singleWorkspaceAgentApp
     case threeSurfaceLayout
@@ -31,7 +32,7 @@ public final class FixtureFactory {
     }
 
     public func build(_ scenario: FixtureScenario, dbPath: String) throws -> Built {
-        // legacySchemaV13 must NOT run Schema.migrate upfront — it builds a DB
+        // legacySchemaV13 must NOT run Schema.migrate upfront - it builds a DB
         // stopped at v13 so forward-migration tests can apply the remaining steps.
         if scenario == .legacySchemaV13 {
             return try buildLegacySchemaV13(dbPath: dbPath)
@@ -141,3 +142,4 @@ public final class FixtureFactory {
         return Built(db: db, state: LayoutState(), threads: [], messages: [])
     }
 }
+#endif

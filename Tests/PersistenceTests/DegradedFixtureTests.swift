@@ -31,6 +31,42 @@ final class DegradedFixtureTests: XCTestCase {
             "latest() must return the valid snapshot row even when a newer corrupt row is present; returning nil would cause the app to start with an empty layout")
     }
 
+    /// WHY: Asserting non-nil is insufficient - latest() could return the
+    /// corrupt row deserialized as some default struct, or a row from an
+    /// unrelated test that leaked into the DB. This test pins the CONTENT of
+    /// the returned snapshot to the known-valid row so any regression in the
+    /// skip-and-fallback logic is caught by a meaningful assertion, not a
+    /// silent wrong-version return.
+    func test_corruptSnapshot_latestReturnsCorrectVersion() throws {
+        let tmp = NSTemporaryDirectory() + "RC2DegradedFixture-corruptSnapshotVersion-" + UUID().uuidString + ".sqlite"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+        let built = try FixtureFactory().build(.corruptSnapshot, dbPath: tmp)
+
+        let repo = SessionSnapshotRepository(db: built.db)
+        let snap = try XCTUnwrap(repo.latest(),
+            "pre-condition: latest() must find the valid row before the version assertion can run")
+
+        XCTAssertEqual(snap.version, SessionSnapshot.currentVersion,
+            "the fallback row must carry version == currentVersion; returning a wrong version would silently decode an incompatible layout and wipe the user's workspace arrangement on boot")
+    }
+
+    /// WHY: the fixture inserts exactly two rows (one valid, one corrupt).
+    /// latest() walks rows newest-first and returns the first decodable one.
+    /// This test verifies that exactly one row is skipped, not more, so a
+    /// future corruption scenario that adds extra corrupt rows is caught early.
+    func test_corruptSnapshot_exactlyTwoRowsExistInDB() throws {
+        let tmp = NSTemporaryDirectory() + "RC2DegradedFixture-corruptSnapshotCount-" + UUID().uuidString + ".sqlite"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+
+        let built = try FixtureFactory().build(.corruptSnapshot, dbPath: tmp)
+
+        let countSt = try built.db.prepare("SELECT COUNT(*) FROM session_snapshots;")
+        XCTAssertTrue(try countSt.step())
+        XCTAssertEqual(Int(countSt.columnInt64(0)), 2,
+            "corruptSnapshot fixture must insert exactly 2 rows (1 valid + 1 corrupt) so tests asserting row-skip behavior are precise about what they prove")
+    }
+
     // MARK: - legacySchemaV13
 
     /// WHY: a DB left at schema v13 by a downgraded or partially-updated build
@@ -70,7 +106,7 @@ final class DegradedFixtureTests: XCTestCase {
 
         // Insert a thread using columns added after step 6 (reasoning_effort,
         // execution_mode, base_branch, worktree_path, service_tier,
-        // model_selection_json — steps 6+). All of these must exist post-migration.
+        // model_selection_json - steps 6+). All of these must exist post-migration.
         let thread = AgentThread(
             title: "post-v13",
             provider: .codex,
@@ -83,7 +119,7 @@ final class DegradedFixtureTests: XCTestCase {
 
         let listed = try AgentThreadRepository(db: built.db).list()
         XCTAssertEqual(listed.count, 1,
-            "a thread inserted after forward migration must be retrievable — a missing column would produce an empty row")
+            "a thread inserted after forward migration must be retrievable - a missing column would produce an empty row")
         XCTAssertEqual(listed[0].reasoningEffort, .high,
             "columns added after v13 must round-trip after migration so user-selected reasoning effort is not silently reset")
     }
