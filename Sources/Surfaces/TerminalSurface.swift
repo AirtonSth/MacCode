@@ -418,7 +418,8 @@ public enum BellDetector {
     /// - `.inOSC + 0x07` → OSC-terminator BEL, ignored; back to `.scanning`.
     /// - `.inOSC + 0x1B` → starts `.afterESCinOSC` (two-byte ST path).
     /// - `.afterESCinOSC + 0x5C` → two-byte ST, back to `.scanning`.
-    /// - `.afterESCinOSC + anything-else` → not ST, back to `.inOSC`.
+    /// - `.afterESCinOSC + anything-else` → ESC aborted the OSC; re-evaluate the
+    ///   byte in ground state (a following 0x07 is a real BEL).
     /// - `.scanning + 0x07` → real BEL, return `true`.
     /// - Any other byte resets `.afterESC` back to `.scanning`.
     public nonisolated static func containsStandaloneBEL(_ data: Data) -> Bool {
@@ -435,9 +436,18 @@ public enum BellDetector {
                 else if byte == 0x1B { state = .afterESCinOSC }
                 // else: still inside OSC payload — remain in .inOSC
             case .afterESCinOSC:
-                // 0x5C = '\\' completes the two-byte ST (ESC \)
-                state = .inOSC
-                if byte == 0x5C { state = .scanning }
+                // 0x5C = '\\' completes the two-byte ST (ESC \), terminating the
+                // OSC with no bell. Any other byte means the ESC did NOT form ST:
+                // a bare ESC aborts the OSC string and returns to ground (xterm
+                // treats ESC as an anywhere->escape transition), so this byte is
+                // re-evaluated as if scanning -- a following 0x07 is a real BEL.
+                if byte == 0x5C {
+                    state = .scanning
+                } else {
+                    state = .scanning
+                    if byte == 0x07 { return true }
+                    if byte == 0x1B { state = .afterESC }
+                }
             }
         }
         return false
