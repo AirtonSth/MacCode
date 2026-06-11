@@ -630,6 +630,20 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         id.hasPrefix("palette.section.") || id == "palette.noresults"
     }
 
+    // MARK: Accessibility label (P3-CP-VO)
+
+    /// Composes the VoiceOver label for a runnable palette row.
+    /// Pure function - exposed as `internal static` so tests can assert the output
+    /// without instantiating a full CommandPalette or driving an NSPanel.
+    /// Business rule: title is always present; subtitle and shortcut are appended
+    /// only when non-empty so VO doesn't announce trailing commas.
+    static func accessibilityLabel(title: String, subtitle: String, shortcut: String?) -> String {
+        var parts: [String] = [title]
+        if !subtitle.isEmpty { parts.append(subtitle) }
+        if let sc = shortcut, !sc.isEmpty { parts.append(sc) }
+        return parts.joined(separator: ", ")
+    }
+
     public func windowDidResignKey(_ notification: Notification) {
         if CommandPalette.shouldDismissOnResignKey() { hide() }
     }
@@ -827,14 +841,21 @@ private final class PaletteRowCellView: NSTableCellView {
             subtitleLabel.isHidden = true
             chord.stringValue = ""
             chord.isHidden = true
+            // P3-CP-VO: section headers are non-interactive labels; role .staticText
+            // lets VoiceOver announce them as plain text without "button" suffix.
+            setAccessibilityRole(.staticText)
+            setAccessibilityLabel(cmd.title)
             return
         }
         let baseFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
         titleLabel.font = baseFont
         // UX-010: leading SF Symbol per command type. UX-011: destructive
         // commands (Quit) render title + icon in the danger tint.
+        // P3-CP-VO: icon is decorative - the row a11y label covers it, so hide from
+        // the VO tree to avoid announcing a redundant "image" element.
         if let iconName = cmd.iconName, let image = NSImage(systemSymbolName: iconName, accessibilityDescription: nil) {
             icon.image = image
+            icon.setAccessibilityHidden(true)
             icon.contentTintColor = cmd.destructive ? DS.NS.danger : (dimmed ? DS.NS.textTertiary : DS.NS.textSecondary)
             icon.isHidden = false
         } else {
@@ -864,5 +885,12 @@ private final class PaletteRowCellView: NSTableCellView {
         subtitleLabel.isHidden = cmd.subtitle.isEmpty
         chord.stringValue = cmd.shortcut ?? ""
         chord.isHidden = cmd.shortcut == nil
+        // P3-CP-VO: compose a descriptive VoiceOver label so the cell announces
+        // itself as "New Terminal Surface, In current workspace, Command+T" rather
+        // than reading the raw concatenated text of three child labels.
+        setAccessibilityLabel(CommandPalette.accessibilityLabel(
+            title: cmd.title, subtitle: cmd.subtitle, shortcut: cmd.shortcut))
+        // Runnable rows act as buttons; VoiceOver appends "button" automatically.
+        setAccessibilityRole(.button)
     }
 }
