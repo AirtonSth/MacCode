@@ -493,18 +493,21 @@ public final class AppContext {
         }
     }
 
-    private static func refreshAccountUsageWithTimeout(
+    static func refreshAccountUsageWithTimeout(
         refresher: TokenSaverAccountUsageRefreshing,
-        request: TokenSaverAccountUsageRefreshRequest
+        request: TokenSaverAccountUsageRefreshRequest,
+        timeoutNanoseconds: UInt64 = 60_000_000_000
     ) async -> [AssistantAccountUsage] {
         await withCheckedContinuation { continuation in
             let lock = NSLock()
             var resumed = false
+            var watchdog: Task<Void, Never>?
             func resume(_ usages: [AssistantAccountUsage]) {
                 lock.lock()
                 defer { lock.unlock() }
                 guard !resumed else { return }
                 resumed = true
+                watchdog?.cancel()
                 continuation.resume(returning: usages)
             }
 
@@ -512,8 +515,8 @@ public final class AppContext {
                 let usages = await refresher.refreshAccountUsage(request)
                 resume(usages)
             }
-            Task.detached {
-                try? await Task.sleep(nanoseconds: 60_000_000_000)
+            watchdog = Task.detached {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
                 work.cancel()
                 resume([])
             }

@@ -920,6 +920,54 @@ final class TokenSaverAppContextTests: XCTestCase {
         controller.stop()
     }
 
+    func test_refreshAccountUsageWithTimeoutReturnsRealResultAndDoesNotReturnEmptyOnFastRefresher() async {
+        // WHY: the watchdog task must be cancelled when the work completes normally.
+        // Before this fix the watchdog lingered for 60 s per call; now it is cancelled
+        // inside resume() on the first winner. This test pins that a fast refresher
+        // returns the real result (not []) and completes well within the tight
+        // timeoutNanoseconds budget, proving the normal-finish path is hit.
+        let expected = [
+            AssistantAccountUsage(provider: .claude, weeklyUsedPercent: 42)
+        ]
+        let refresher = FakeTokenSaverAccountUsageRefresher(response: expected)
+        let request = TokenSaverAccountUsageRefreshRequest(codexBinary: "codex", claudeBinary: "claude")
+
+        // 5-second timeout: more than enough for an in-process fake; tight enough that
+        // a regression returning [] (watchdog fires first) would be caught quickly.
+        let result = await AppContext.refreshAccountUsageWithTimeout(
+            refresher: refresher,
+            request: request,
+            timeoutNanoseconds: 5_000_000_000
+        )
+
+        XCTAssertEqual(result.count, 1, "fast refresher must return the real result, not the timeout empty fallback")
+        XCTAssertEqual(result.first?.provider, .claude)
+        XCTAssertEqual(result.first?.weeklyUsedPercent, 42,
+                       "watchdog cancellation on normal completion must not discard the real usage data")
+    }
+
+    func test_refreshAccountUsageWithTimeoutReturnsEmptyWhenWorkExceedsTimeout() async {
+        // WHY: the timeout path must still fire if work hangs; returning [] is the
+        // correct sentinel that the caller treats as "no data this cycle".
+        struct HangingRefresher: TokenSaverAccountUsageRefreshing {
+            func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+                // Simulate a hang; respect cooperative cancellation so the test finishes.
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                return [AssistantAccountUsage(provider: .claude, weeklyUsedPercent: 99)]
+            }
+        }
+
+        // 10 ms timeout: work hangs => watchdog fires => returns [].
+        let result = await AppContext.refreshAccountUsageWithTimeout(
+            refresher: HangingRefresher(),
+            request: TokenSaverAccountUsageRefreshRequest(codexBinary: "codex", claudeBinary: "claude"),
+            timeoutNanoseconds: 10_000_000
+        )
+
+        XCTAssertTrue(result.isEmpty,
+                      "when work exceeds the watchdog timeout the function must return [] so the caller skips this cycle")
+    }
+
     func test_tokenSaverDistillServiceControllerPostsUsageChangedForSavingsEvents() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2PaidTokenSaverSavingsEvent-\(UUID().uuidString)", isDirectory: true)
