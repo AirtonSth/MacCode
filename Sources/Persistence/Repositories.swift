@@ -399,9 +399,12 @@ public final class AgentMessageRepository {
 
     public func delete(ids: [AgentMessageID]) throws {
         guard !ids.isEmpty else { return }
-        for id in ids {
-            let st = try db.prepare("DELETE FROM agent_messages WHERE id = ?;")
-            try st.bind(1, id.value.uuidString)
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        try db.transaction {
+            let st = try db.prepare("DELETE FROM agent_messages WHERE id IN (\(placeholders));")
+            for (index, id) in ids.enumerated() {
+                try st.bind(Int32(index + 1), id.value.uuidString)
+            }
             _ = try st.step()
         }
     }
