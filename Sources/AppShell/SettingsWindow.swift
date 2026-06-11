@@ -143,6 +143,21 @@ public struct CLIPathCommitPolicy {
     }
 }
 
+/// Pure helper that encodes the cross-VM reload policy for
+/// rc2RemoteAccessSettingChanged.
+///
+/// WHY: when this VM posts the notification itself (_postingRemoteAccess == true)
+/// we must skip the reload to avoid the double-reload on every toggle.
+/// Cross-VM notifications (isSelfOriginated == false) must always reload so
+/// other open Settings windows stay in sync.
+public struct RemoteAccessNotificationPolicy {
+    /// Returns true iff a reload should be performed for an incoming
+    /// rc2RemoteAccessSettingChanged notification.
+    public static func shouldReload(isSelfOriginated: Bool) -> Bool {
+        !isSelfOriginated
+    }
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -158,6 +173,9 @@ public final class SettingsViewModel: ObservableObject {
 
     @Published public var remoteAccessEnabled: Bool = false
     @Published public var appSettings: AppSettings = AppSettings()
+    /// True while this VM is mid-post for rc2RemoteAccessSettingChanged so the
+    /// observer can skip the redundant self-triggered reload (L91 perf fix).
+    private var _postingRemoteAccess = false
     @Published public var codexPath: String = ""
     @Published public var claudePath: String = ""
     /// Last value that was actually persisted + wired into the coordinator.
@@ -271,13 +289,24 @@ public final class SettingsViewModel: ObservableObject {
         // Keep separate Settings/Account window instances in sync: when either
         // posts an account/remote-access change, refresh this instance too so it
         // never shows stale status (mirrors SidebarViewModel's observer).
-        for name in [Notification.Name.rc2PrivateAccountChanged, .rc2RemoteAccessSettingChanged] {
-            changeObservers.append(NotificationCenter.default.addObserver(
-                forName: name, object: nil, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in self?.reload() }
-            })
-        }
+        // rc2RemoteAccessSettingChanged: skip if this VM is the one posting
+        // (self-originated) to avoid the double reload on each toggle (L91 fix).
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: .rc2PrivateAccountChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.reload() }
+        })
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: .rc2RemoteAccessSettingChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            // Capture the flag synchronously (before the Task hop) while
+            // _postingRemoteAccess is still true for self-originated posts.
+            let selfOriginated = self?._postingRemoteAccess ?? false
+            Task { @MainActor [weak self] in
+                guard let self, !selfOriginated else { return }
+                self.reload()
+            }
+        })
     }
 
     deinit {
@@ -318,7 +347,9 @@ public final class SettingsViewModel: ObservableObject {
     public func setRemoteAccess(_ on: Bool) {
         remoteAccessEnabled = on
         try? settingsRepo.set("remote_access_enabled", on ? "1" : "0")
+        _postingRemoteAccess = true
         NotificationCenter.default.post(name: .rc2RemoteAccessSettingChanged, object: nil)
+        _postingRemoteAccess = false
     }
 
     public func setDiffWordWrap(_ on: Bool) {

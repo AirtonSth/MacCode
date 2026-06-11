@@ -168,6 +168,28 @@ final class SettingsVMInvariantTests: XCTestCase {
         _ = first  // suppress unused-variable warning; randomness means equality is not guaranteed
     }
 
+    // MARK: - RemoteAccessNotificationPolicy (L91 double-reload guard)
+
+    /// WHY: when this VM posts rc2RemoteAccessSettingChanged (isSelfOriginated=true)
+    /// it must NOT reload -- doing so doubles the I/O on every toggle with no benefit.
+    func test_remoteAccessNotificationPolicy_selfOriginated_doesNotReload() {
+        XCTAssertFalse(
+            RemoteAccessNotificationPolicy.shouldReload(isSelfOriginated: true),
+            "self-originated notification must be skipped to prevent the double " +
+            "reload on every Remote Access toggle"
+        )
+    }
+
+    /// WHY: a notification posted by another VM instance (isSelfOriginated=false)
+    /// must trigger a reload so multiple open Settings windows stay in sync.
+    func test_remoteAccessNotificationPolicy_crossVM_reloads() {
+        XCTAssertTrue(
+            RemoteAccessNotificationPolicy.shouldReload(isSelfOriginated: false),
+            "cross-VM notification must trigger reload so other Settings windows " +
+            "never show stale remote-access state"
+        )
+    }
+
     // MARK: - CLIPathCommitPolicy invariant
 
     /// WHY: CLIPathCommitPolicy.shouldApply is the gate between mid-edit
