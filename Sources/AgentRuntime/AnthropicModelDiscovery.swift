@@ -61,7 +61,15 @@ public enum AnthropicModelDiscovery {
     // Actor-isolated mutable cache; avoids data races under Swift 6 strict concurrency.
     private static let _cache = ModelDiscoveryCache()
 
-    public static func listModels(environment: [String: String] = [:]) async -> [AgentModelDescriptor] {
+    // For testing only: clears the static in-process cache so each test starts clean.
+    static func _resetCacheForTesting() async {
+        await _cache.reset()
+    }
+
+    public static func listModels(
+        environment: [String: String] = [:],
+        session: URLSession = .shared
+    ) async -> [AgentModelDescriptor] {
         let env = CodexRunner.processEnvironment(overrides: environment)
 
         // Cache hit?
@@ -72,7 +80,7 @@ public enum AnthropicModelDiscovery {
         guard let request = AnthropicDiscoveryRequestBuilder.build(environment: env) else { return [] }
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200,
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
             let models = modelDescriptors(fromListResponse: object)
@@ -138,5 +146,9 @@ actor ModelDiscoveryCache {
 
     func store(_ e: ModelDiscoveryCacheEntry) {
         entry = e
+    }
+
+    func reset() {
+        entry = nil
     }
 }
