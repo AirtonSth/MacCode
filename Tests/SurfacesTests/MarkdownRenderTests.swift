@@ -25,6 +25,20 @@ final class MarkdownRenderTests: XCTestCase {
         XCTAssertTrue(html.contains("<a href=\"https://x.y\">foo</a>"))
     }
 
+    // UX-016 / L17 ordering fix: the scroll-offset must be stored BEFORE blanking.
+    // This test pins the decoder used inside the completion handler; if the
+    // type-switch is ever broken the offset silently stays 0, breaking restore.
+    func test_scrollYFromJS_decodesDoubleAndNSNumber() {
+        XCTAssertEqual(MarkdownSurface.scrollYFromJS(Double(42.5)), 42.5,
+                       "evaluateJavaScript returns Double on modern WebKit - must decode")
+        XCTAssertEqual(MarkdownSurface.scrollYFromJS(NSNumber(value: 99.0)), 99.0,
+                       "evaluateJavaScript may return NSNumber - must decode to preserve offset")
+        XCTAssertNil(MarkdownSurface.scrollYFromJS(nil),
+                     "nil value (eval error) must leave savedScrollY unchanged")
+        XCTAssertNil(MarkdownSurface.scrollYFromJS("unexpected"),
+                     "unexpected type must leave savedScrollY unchanged")
+    }
+
     @MainActor func test_markdownPreviewReadsBoundedPrefixForLargeFiles() throws {
         let file = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-large-markdown-\(UUID().uuidString).md")

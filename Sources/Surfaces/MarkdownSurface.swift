@@ -249,12 +249,23 @@ public final class MarkdownSurface: NSObject, Surface, WKNavigationDelegate {
         isVisible = false
         // UX-016: remember scroll position before blanking so returning to
         // the surface restores it instead of snapping to the top.
+        // Blanking is deferred into the completion handler so the offset is
+        // captured BEFORE the webview is cleared (fixes scroll-offset race).
         webView.evaluateJavaScript("window.scrollY") { [weak self] value, _ in
-            if let y = value as? Double { self?.savedScrollY = y }
-            else if let n = value as? NSNumber { self?.savedScrollY = n.doubleValue }
+            guard let self else { return }
+            if let y = Self.scrollYFromJS(value) { self.savedScrollY = y }
+            self.webView.stopLoading()
+            self.webView.loadHTMLString("", baseURL: nil)
         }
-        webView.stopLoading()
-        webView.loadHTMLString("", baseURL: nil)
+    }
+
+    /// Decode the `Any?` value returned by WKWebView evaluateJavaScript("window.scrollY").
+    /// WKWebView may return the JS Number as Double or NSNumber depending on platform/version.
+    /// Returns nil when the value is missing or an unexpected type (offset is left unchanged).
+    nonisolated static func scrollYFromJS(_ value: Any?) -> Double? {
+        if let y = value as? Double { return y }
+        if let n = value as? NSNumber { return n.doubleValue }
+        return nil
     }
 
     // MARK: UX-017 escape-hatch links
