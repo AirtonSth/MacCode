@@ -251,9 +251,11 @@ public final class AgentThreadRepository {
             list = try self.list(workspaceId: workspaceId)
         }
         let sorted = list.filter(\.pinned) + list.filter { !$0.pinned }
-        for (idx, var t) in sorted.enumerated() {
-            t.sortOrder = idx
-            try upsert(t)
+        try db.transaction {
+            for (idx, var t) in sorted.enumerated() {
+                t.sortOrder = idx
+                try upsert(t)
+            }
         }
     }
 }
@@ -515,12 +517,14 @@ public final class AgentQueuedMessageRepository {
         guard let target = try get(id: id) else { return nil }
         let ordered = [target] + (try list(threadId: target.threadId)).filter { $0.id != id }
         let now = Date()
-        for (index, message) in ordered.enumerated() {
-            let st = try db.prepare("UPDATE agent_queued_messages SET position = ?, updated_at = ? WHERE id = ?;")
-            try st.bind(1, Int64(index + 1))
-            try st.bind(2, iso.string(from: now))
-            try st.bind(3, message.id.value.uuidString)
-            _ = try st.step()
+        try db.transaction {
+            for (index, message) in ordered.enumerated() {
+                let st = try db.prepare("UPDATE agent_queued_messages SET position = ?, updated_at = ? WHERE id = ?;")
+                try st.bind(1, Int64(index + 1))
+                try st.bind(2, iso.string(from: now))
+                try st.bind(3, message.id.value.uuidString)
+                _ = try st.step()
+            }
         }
         return try get(id: id)
     }
@@ -533,12 +537,15 @@ public final class AgentQueuedMessageRepository {
 
     private func normalizePositions(threadId: AgentThreadID) throws {
         let queued = try list(threadId: threadId)
-        for (index, message) in queued.enumerated() where message.position != index + 1 {
-            let st = try db.prepare("UPDATE agent_queued_messages SET position = ?, updated_at = ? WHERE id = ?;")
-            try st.bind(1, Int64(index + 1))
-            try st.bind(2, iso.string(from: Date()))
-            try st.bind(3, message.id.value.uuidString)
-            _ = try st.step()
+        let now = Date()
+        try db.transaction {
+            for (index, message) in queued.enumerated() where message.position != index + 1 {
+                let st = try db.prepare("UPDATE agent_queued_messages SET position = ?, updated_at = ? WHERE id = ?;")
+                try st.bind(1, Int64(index + 1))
+                try st.bind(2, iso.string(from: now))
+                try st.bind(3, message.id.value.uuidString)
+                _ = try st.step()
+            }
         }
     }
 
