@@ -1548,14 +1548,31 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     }
 
     func uploadLocalSelection(anchor: SSHFileEntry) {
-        for entry in localTransferEntries(anchor: anchor) {
+        let entries = localTransferEntries(anchor: anchor)
+        // UX-P2: directories are silently skipped by scp; tell the user so it
+        // does not look like the transfer was accepted (mac-aux-surfaces §SSH P2).
+        if entries.isEmpty {
+            transferStatus = anchor.isDirectory
+                ? "Folders cannot be transferred - select individual files"
+                : "No files selected"
+            return
+        }
+        for entry in entries {
             let remotePath = (remoteSitePath as NSString).appendingPathComponent(entry.name)
             onTransfer?(true, entry.path, remotePath)
         }
     }
 
     func downloadRemoteSelection(anchor: SSHFileEntry) {
-        for entry in remoteTransferEntries(anchor: anchor) {
+        let entries = remoteTransferEntries(anchor: anchor)
+        // UX-P2: same directory guard for the download direction.
+        if entries.isEmpty {
+            transferStatus = anchor.isDirectory
+                ? "Folders cannot be transferred - select individual files"
+                : "No files selected"
+            return
+        }
+        for entry in entries {
             let localPath = (localSitePath as NSString).appendingPathComponent(entry.name)
             onTransfer?(false, localPath, entry.path)
         }

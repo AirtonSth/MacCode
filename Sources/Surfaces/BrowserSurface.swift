@@ -117,7 +117,7 @@ public enum BrowserWaitForJS {
 }
 
 @MainActor
-public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUIDelegate {
+public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
     public static let defaultInitialURLString = "https://www.remotecode.io/from-app"
 
     // Structured navigation/diagnostics logging (QA-MAC_BROWSER-006) so mirror
@@ -375,6 +375,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         retryButton.target = self; retryButton.action = #selector(reload)
         tf.target = self; tf.action = #selector(goAddress)
         findField.target = self; findField.action = #selector(findNext)
+        findField.delegate = self
         findPrevButton.target = self; findPrevButton.action = #selector(findPrev)
         findNextButton.target = self; findNextButton.action = #selector(findNext)
         findCloseButton.target = self; findCloseButton.action = #selector(closeFind)
@@ -884,6 +885,16 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         guard !findBar.isHidden else { return }
         findBar.isHidden = true
         view.window?.makeFirstResponder(webView)
+    }
+
+    // NSTextFieldDelegate: Esc while the find field has focus closes the find bar
+    // (UX-MAC_BROWSER-009). The field editor consumes the Esc keyDown before it
+    // reaches BrowserContainerView.keyDown, so we intercept it here via
+    // cancelOperation: instead.
+    public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === findField, commandSelector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+        closeFind()
+        return true
     }
 
     @objc private func findNext() { runFind(forward: true) }
