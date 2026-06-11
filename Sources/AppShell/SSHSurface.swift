@@ -2268,6 +2268,12 @@ private struct SSHTransferSidebarView: View {
                                     // pending a modal rename sheet.
                                     if !isLocal {
                                         Divider()
+                                        Button("Copy Path") {
+                                            let pasteboard = NSPasteboard.general
+                                            pasteboard.clearContents()
+                                            pasteboard.setString(entry.path, forType: .string)
+                                        }
+                                        .accessibilityIdentifier("ssh.remote.copypath")
                                         Button("New Folder Here") {
                                             let parent = entry.isDirectory ? entry.path
                                                 : (entry.path as NSString).deletingLastPathComponent
