@@ -312,7 +312,11 @@ public final class AgentMessageRepository {
         while try st.step() {
             out.append(message(from: st))
         }
-        return out.reversed()
+        // PERF: reverse() in-place avoids allocating a second Array copy.
+        // Result is identical: rows were fetched newest-first (DESC), reversing
+        // gives oldest-first display order, same as the previous out.reversed().
+        out.reverse()
+        return out
     }
 
     public func get(id: AgentMessageID) throws -> AgentMessage? {
