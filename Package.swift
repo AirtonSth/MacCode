@@ -130,9 +130,13 @@ let package = Package(
             dependencies: ["Persistence", "CoreModel"],
             path: "Tests/PersistenceTests"
         ),
+        .target(
+            name: "GitTestSupport",
+            path: "Tests/GitTestSupport"
+        ),
         .testTarget(
             name: "AgentRuntimeTests",
-            dependencies: ["AgentRuntime", "CoreModel"],
+            dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport"],
             path: "Tests/AgentRuntimeTests"
         ),
         .testTarget(
@@ -147,7 +151,7 @@ let package = Package(
         ),
         .testTarget(
             name: "SurfacesTests",
-            dependencies: ["Surfaces", "CoreModel", "AgentRuntime"],
+            dependencies: ["Surfaces", "CoreModel", "AgentRuntime", "GitTestSupport"],
             path: "Tests/SurfacesTests"
         ),
         .testTarget(
