@@ -708,7 +708,14 @@ public final class SidebarViewModel: ObservableObject {
     public func renameWorkspace(_ ws: Workspace) {
         guard let name = prompt(title: "Rename workspace",
                                 message: "New name for \"\(ws.name)\".",
-                                initial: ws.name), !name.isEmpty else { return }
+                                initial: ws.name) else { return }
+        // UX-P3: whitespace-only rename must show an error rather than silently
+        // doing nothing, so the user knows the save was rejected.
+        guard !name.isEmpty else {
+            showOperationError("Rename not saved",
+                               detail: "A workspace name cannot be blank. Please enter at least one non-whitespace character.")
+            return
+        }
         do {
             try router?.renameWorkspace(ws.id, name)
         } catch {

@@ -644,7 +644,15 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         guard let focusedPaneID,
               let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
                 ?? paneControllers.first else { return false }
-        return controller.performSplit(direction, type: .terminal, title: "Terminal") != nil
+        // UX-P3: default to the active tab's surface type so ⌘D/⌘⇧] mirror
+        // what the mouse split-buttons would open. Fall back to Terminal when
+        // no surface is selected.
+        let selectedSurface = controller.pane.selectedSurfaceID
+            .flatMap { id in controller.pane.surfaces.first(where: { $0.id == id }) }
+            ?? controller.pane.surfaces.first
+        let splitType = selectedSurface?.type ?? .terminal
+        let splitTitle = PaneTabsView.surfaceChoices.first(where: { $0.1 == splitType })?.0 ?? "Terminal"
+        return controller.performSplit(direction, type: splitType, title: splitTitle) != nil
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
