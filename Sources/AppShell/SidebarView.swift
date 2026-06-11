@@ -403,6 +403,11 @@ public final class SidebarViewModel: ObservableObject {
         guard insomniaPower.activate(reason: "RemoteCode Insomnia", options: insomniaPowerOptions) else {
             NSLog("RemoteCode Insomnia failed to activate macOS power assertions.")
             finishInsomniaSession()
+            // UX-P2: surface the failure so the user knows why the toggle snapped off.
+            showOperationError(
+                "Insomnia could not keep the display or system awake",
+                detail: "macOS denied the power assertion. RemoteCode may use `pmset` to disable clamshell sleep, which requires administrator privileges. Insomnia has been turned off."
+            )
             return
         }
     }
@@ -580,6 +585,18 @@ public final class SidebarViewModel: ObservableObject {
         for provider in fileProviders {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { [weak self] item, _ in
                 guard let url = Self.fileURL(fromDroppedItem: item) else { return }
+                // UX-P2: reject non-folder drops; only directories can be workspaces.
+                var isDir: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+                      isDir.boolValue else {
+                    DispatchQueue.main.async {
+                        self?.showOperationError(
+                            "Cannot add \"\(url.lastPathComponent)\" as a workspace",
+                            detail: "Only folders can be added as workspaces. Please drop a folder instead."
+                        )
+                    }
+                    return
+                }
                 DispatchQueue.main.async {
                     _ = self?.createWorkspace(fromFolder: url)
                 }
