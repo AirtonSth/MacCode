@@ -188,6 +188,9 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         // UX-009: double-clicking a row runs it (single click just selects).
         tableView.target = self
         tableView.doubleAction = #selector(submit)
+        // P3-CP-4: align rowHeight with resizeToFit's 30pt assumption so the
+        // 8-row cap math matches the actual rendered height.
+        tableView.rowHeight = 30
         let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("cmd"))
         col.width = 500
         tableView.addTableColumn(col)
