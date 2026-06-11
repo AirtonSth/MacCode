@@ -1183,7 +1183,16 @@ public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
     @State private var showsInsomniaOptions = false
     @State private var showsTokenSaverDetails = false
-    @State private var tokenSaverDetailsScope: TokenSaverUsageScope = .week
+    @AppStorage("sidebar.tokenSaver.detailsScope") private var tokenSaverDetailsScopeRaw: String = TokenSaverUsageScope.week.rawValue
+    private var tokenSaverDetailsScope: TokenSaverUsageScope {
+        TokenSaverUsageScope(rawValue: tokenSaverDetailsScopeRaw) ?? .week
+    }
+    private var tokenSaverDetailsScopeBinding: Binding<TokenSaverUsageScope> {
+        Binding(
+            get: { TokenSaverUsageScope(rawValue: tokenSaverDetailsScopeRaw) ?? .week },
+            set: { tokenSaverDetailsScopeRaw = $0.rawValue }
+        )
+    }
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
     private let onOpenSettings: () -> Void
@@ -1655,7 +1664,7 @@ public struct SidebarRootView: View {
         if user.subscribed {
             if vm.tokenSaverEnabled {
                 let saved = vm.tokenSaverSavingsSummary.totalSavedTokens
-                return saved > 0 ? "Saved \(Self.formatTokenCount(saved)) tokens" : "Tracking after next run"
+                return saved > 0 ? "Saved \(Self.formatTokenCount(saved)) tokens" : "Tracking savings per agent run"
             }
             return "Enable savings"
         }
@@ -1667,7 +1676,7 @@ public struct SidebarRootView: View {
         guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
         let used = vm.tokenSaverUsageSnapshot.usedTokens
         if user.subscribed {
-            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Local MLX model first enable"
+            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Enable to save tokens locally"
         }
         return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Subscribe to activate local savings"
     }
@@ -1907,7 +1916,7 @@ public struct SidebarRootView: View {
                 .accessibilityIdentifier("sidebar.tokenSaver.toggle")
             }
 
-            Picker("Usage scope", selection: $tokenSaverDetailsScope) {
+            Picker("Usage scope", selection: tokenSaverDetailsScopeBinding) {
                 ForEach(TokenSaverUsageScope.allCases, id: \.self) { scope in
                     Text(tokenSaverScopeTitle(scope)).tag(scope)
                 }
