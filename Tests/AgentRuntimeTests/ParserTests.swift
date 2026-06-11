@@ -381,13 +381,13 @@ extension CodexParserTests {
             return nil
         }.first
 
-        // Document the current behavior: assembled bleeds, so the second
-        // finalAssistantMessage is "A\nB" not "B".
-        // When this bug is fixed, change the assertion to XCTAssertEqual(turn2Final, "B").
-        XCTAssertEqual(turn2Final, "A\nB",
-                       "T027 bleed characterization: assembled is not reset on turn.completed, so " +
-                       "a second turn without turn.started concatenates the previous text; " +
-                       "fix = reset assembled in turn.completed, then change this assertion to 'B'")
+        // FIXED: assembled now resets on turn.completed, so the second turn's
+        // final message is just "B" (no bleed of the previous turn's "A"), even
+        // when the second turn arrives without a turn.started.
+        XCTAssertEqual(turn2Final, "B",
+                       "assembled must reset on turn.completed so a second turn (even without " +
+                       "turn.started) does not concatenate the previous turn text -- prevents " +
+                       "the doubled-transcript bug in the iOS mirror")
     }
 
     // MARK: - T028: turn.completed without prior turn.started uses ensureTurn id

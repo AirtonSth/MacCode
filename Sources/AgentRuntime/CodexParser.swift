@@ -107,6 +107,10 @@ public final class CodexParser {
             let final = (obj["final_message"] as? String ?? obj["message"] as? String)
                 ?? (assembled.isEmpty ? nil : assembled)
             currentTurnId = nil
+            // Reset the agent_message accumulator so a subsequent turn (even one
+            // that arrives without a turn.started) does not bleed this turn's text
+            // into its own final message (was: doubled transcript in the mirror).
+            assembled = ""
             return [.turnCompleted(turnId: tid, finalMessage: final)]
         case "request.opened":
             let id = obj["request_id"] as? String ?? obj["id"] as? String ?? UUID().uuidString
